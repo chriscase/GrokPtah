@@ -860,10 +860,11 @@ fn computer_work_owner(state: &AppState, session_id: &str) -> Result<Uuid, Strin
 pub fn computer_use_cockpit_snapshot(
     state: State<'_, AppState>,
     session_id: String,
+    run_id: Option<String>,
 ) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
     state
         .computer_use
-        .cockpit_snapshot(computer_owner(&state, &session_id)?)
+        .cockpit_snapshot(computer_owner(&state, &session_id)?, run_id.as_deref())
 }
 
 #[tauri::command]
@@ -1000,6 +1001,7 @@ pub async fn computer_use_cockpit_stage_action(
 pub async fn computer_use_cockpit_approve(
     state: State<'_, AppState>,
     session_id: String,
+    run_id: String,
     approval_id: String,
     request_id: String,
 ) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
@@ -1007,6 +1009,7 @@ pub async fn computer_use_cockpit_approve(
         .computer_use
         .approve_simulator_action(
             computer_work_owner(&state, &session_id)?,
+            &run_id,
             &approval_id,
             &request_id,
         )
@@ -1017,10 +1020,11 @@ pub async fn computer_use_cockpit_approve(
 pub fn computer_use_cockpit_discard_approval(
     state: State<'_, AppState>,
     session_id: String,
+    run_id: String,
 ) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
     state
         .computer_use
-        .discard_simulator_approval(computer_owner(&state, &session_id)?)
+        .discard_simulator_approval(computer_owner(&state, &session_id)?, &run_id)
 }
 
 #[tauri::command]

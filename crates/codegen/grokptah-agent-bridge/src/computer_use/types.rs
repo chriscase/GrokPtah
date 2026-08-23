@@ -927,6 +927,29 @@ impl ComputerAuthorityToken {
     }
 }
 
+/// Opaque authority that can only enter the service through revoking
+/// emergency-control methods. A background Lane may receive this token so
+/// Pause, Take over, and Stop remain app-owned, but it cannot be passed to
+/// observation, authorization, approval, or action APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputerEmergencyControlToken {
+    principal: ComputerPrincipal,
+}
+
+impl ComputerEmergencyControlToken {
+    pub(crate) fn local_operator(session_id: Uuid) -> ComputerResult<Self> {
+        let principal = ComputerPrincipal::local_operator(session_id);
+        principal.validate()?;
+        Ok(Self { principal })
+    }
+
+    pub(crate) fn authority(&self) -> ComputerAuthorityToken {
+        ComputerAuthorityToken {
+            principal: self.principal.clone(),
+        }
+    }
+}
+
 /// Observation-scoped isolation binding. Missing fields deserialize empty and
 /// cannot authorize background, isolated, pointer, or key actions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

@@ -23,6 +23,7 @@ import {
   type RemoteSessionTarget,
   type RunOrigin,
   type WorkspaceStatus,
+  type ComputerCockpitSnapshot,
 } from "./lib/protocol";
 import { BrandMark } from "./components/BrandMark";
 import {
@@ -30,6 +31,10 @@ import {
   type ContextMenuState,
 } from "./components/ContextMenu";
 import { ComputerCockpit } from "./components/ComputerCockpit";
+import {
+  PersistentComputerRuns,
+  type AppOwnedComputerRun,
+} from "./components/PersistentComputerRuns";
 import { FleetStrip } from "./components/FleetStrip";
 import { SearchPanel } from "./components/SearchPanel";
 import { SessionBrowser } from "./components/SessionBrowser";
@@ -417,11 +422,99 @@ export default function App() {
   const splitOk = maxDocks >= 2;
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("build");
   const [computerOpen, setComputerOpen] = useState(false);
-  const [computerRunState, setComputerRunState] = useState<string | null>(null);
+  const [computerRunSnapshots, setComputerRunSnapshots] = useState<
+    Record<string, ComputerCockpitSnapshot>
+  >({});
+  const computerSnapshotPolls = useRef(new Set<string>());
+  const computerDiscoveryPolls = useRef(new Set<string>());
+  const recordComputerSnapshot = useCallback(
+    (sessionId: string, snapshot: ComputerCockpitSnapshot) => {
+      setComputerRunSnapshots((current) => {
+        if (!snapshot.local && !current[sessionId]) return current;
+        return { ...current, [sessionId]: snapshot };
+      });
+    },
+    [],
+  );
+  const activeComputerSnapshot = activeSessionId
+    ? computerRunSnapshots[activeSessionId]
+    : undefined;
+  const computerRunState = activeComputerSnapshot?.local?.state ?? null;
+  const boundComputerRunId =
+    activeComputerSnapshot?.local &&
+    !["completed", "failed", "cancelled", "interrupted", "limit_reached"].includes(
+      activeComputerSnapshot.local.state,
+    )
+      ? activeComputerSnapshot.local.runId
+      : null;
   const chromeRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
   const runsRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
   const runsRefreshInFlight = useRef<{ sessionId: string; request: number } | null>(null);
   const runOriginSyncInFlight = useRef(false);
+
+  // Recover app-owned bindings for open local Lanes, including a run started
+  // after launch. An unbound lookup is permitted only for discovery; all
+  // subsequent reads and controls carry the exact durable Run id returned by
+  // the host.
+  useEffect(() => {
+    const discover = () => {
+      for (const tab of tabs) {
+        const current = computerRunSnapshots[tab.id]?.local;
+        if (
+          (current &&
+            !["completed", "failed", "cancelled", "interrupted", "limit_reached"].includes(
+              current.state,
+            )) ||
+          computerDiscoveryPolls.current.has(tab.id)
+        ) {
+          continue;
+        }
+        computerDiscoveryPolls.current.add(tab.id);
+        void api
+          .computerUseCockpitSnapshot(tab.id, null)
+          .then((snapshot) => {
+            if (snapshot.local) recordComputerSnapshot(tab.id, snapshot);
+          })
+          .catch((error) => {
+            console.warn("Computer Run discovery failed closed", error);
+          })
+          .finally(() => computerDiscoveryPolls.current.delete(tab.id));
+      }
+    };
+    discover();
+    const timer = window.setInterval(discover, 5_000);
+    return () => window.clearInterval(timer);
+  }, [computerRunSnapshots, recordComputerSnapshot, tabs]);
+
+  // The controller belongs to the application shell, not the cockpit panel.
+  // Keep exact live bindings fresh while the panel is closed or another Lane
+  // is selected so Stop/Take over never disappear with navigation.
+  useEffect(() => {
+    const poll = () => {
+      for (const [sessionId, snapshot] of Object.entries(computerRunSnapshots)) {
+        const run = snapshot.local;
+        if (
+          !run ||
+          ["completed", "failed", "cancelled", "interrupted", "limit_reached"].includes(
+            run.state,
+          ) ||
+          computerSnapshotPolls.current.has(sessionId)
+        ) {
+          continue;
+        }
+        computerSnapshotPolls.current.add(sessionId);
+        void api
+          .computerUseCockpitSnapshot(sessionId, run.runId)
+          .then((next) => recordComputerSnapshot(sessionId, next))
+          .catch((error) => {
+            console.warn("Exact Computer Run refresh failed closed", error);
+          })
+          .finally(() => computerSnapshotPolls.current.delete(sessionId));
+      }
+    };
+    const timer = window.setInterval(poll, 2_000);
+    return () => window.clearInterval(timer);
+  }, [computerRunSnapshots, recordComputerSnapshot]);
 
   const syncOpenQueues = useCallback(
     async (sessionIds: string[]) => {
@@ -770,6 +863,17 @@ export default function App() {
   const activeTab = useMemo(
     () => tabs.find((t) => t.id === activeSessionId) ?? null,
     [tabs, activeSessionId],
+  );
+  const appOwnedComputerRuns = useMemo<AppOwnedComputerRun[]>(
+    () =>
+      Object.entries(computerRunSnapshots).map(([sessionId, snapshot]) => ({
+        sessionId,
+        sessionTitle:
+          tabs.find((tab) => tab.id === sessionId)?.title ??
+          sessions.find((session) => session.id === sessionId)?.title,
+        snapshot,
+      })),
+    [computerRunSnapshots, sessions, tabs],
   );
 
   // Focusing a tab clears its unseen badge.
@@ -3048,6 +3152,16 @@ export default function App() {
         </div>
       </header>
 
+      <PersistentComputerRuns
+        runs={appOwnedComputerRuns}
+        preferredSessionId={activeSessionId}
+        onSnapshot={recordComputerSnapshot}
+        onOpen={(sessionId) => {
+          void focusSession(sessionId);
+          setComputerOpen(true);
+        }}
+      />
+
       <aside
         className={`sidebar ${sidebarCollapsed ? "is-collapsed" : ""}`}
         aria-expanded={!sidebarCollapsed}
@@ -3357,6 +3471,7 @@ export default function App() {
         {computerCockpitVisible && (
           <ComputerCockpit
             sessionId={activeSessionId}
+            boundRunId={boundComputerRunId}
             sessionTitle={activeTab?.title ?? activeSummary?.title}
             scope={focusedLaneScope}
             model={status?.model ?? "unknown"}
@@ -3367,7 +3482,8 @@ export default function App() {
             }
             sessionBusy={busy}
             onClose={() => setComputerOpen(false)}
-            onRunState={setComputerRunState}
+            onSnapshot={recordComputerSnapshot}
+            emergencyKeysManaged
             onSteer={async (text) => {
               if (!activeSessionId) {
                 throw new Error("Select a session before steering");

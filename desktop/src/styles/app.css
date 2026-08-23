@@ -162,9 +162,10 @@ button:disabled {
 .app-shell {
   display: grid;
   grid-template-columns: minmax(180px, 220px) minmax(0, 1fr) minmax(200px, 280px);
-  grid-template-rows: 40px minmax(0, 1fr) 24px;
+  grid-template-rows: 40px auto minmax(0, 1fr) 24px;
   grid-template-areas:
     "title title title"
+    "computer computer computer"
     "side main tools"
     "status status status";
   height: 100%;
@@ -415,6 +416,7 @@ button:disabled {
     grid-template-columns: minmax(0, 1fr);
     grid-template-areas:
       "title"
+      "computer"
       "main"
       "status";
   }
@@ -1619,6 +1621,8 @@ button:disabled {
 }
 
 .computer-story-shell {
+  display: flex;
+  flex-direction: column;
   width: 100%;
   height: 100%;
   overflow: hidden;
@@ -4844,6 +4848,109 @@ button:disabled {
   border-radius: 50%;
   background: var(--accent);
   box-shadow: 0 0 0 2px rgba(45, 212, 168, 0.14);
+}
+
+.persistent-computer-runs {
+  grid-area: computer;
+  position: relative;
+  z-index: 35;
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  min-width: 0;
+  padding: 0.38rem 0.65rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border-soft));
+  background: color-mix(in srgb, var(--surface-deep) 90%, var(--accent) 10%);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.persistent-computer-heading,
+.persistent-computer-list,
+.persistent-computer-run,
+.persistent-computer-actions {
+  display: flex;
+  align-items: center;
+}
+
+.persistent-computer-heading {
+  gap: 0.4rem;
+  flex: 0 0 auto;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.persistent-computer-list {
+  gap: 0.45rem;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow-x: auto;
+}
+
+.persistent-computer-run {
+  gap: 0.4rem;
+  min-width: min(390px, 70vw);
+  padding: 0.25rem 0.3rem 0.25rem 0.45rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--bg-panel) 92%, transparent);
+}
+
+.persistent-computer-identity {
+  display: grid;
+  gap: 0.05rem;
+  min-width: 0;
+  margin-right: auto;
+  padding: 0.15rem 0.25rem;
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
+
+.persistent-computer-identity strong,
+.persistent-computer-identity span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.persistent-computer-identity strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.persistent-computer-identity span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.persistent-computer-actions {
+  gap: 0.25rem;
+  flex: 0 0 auto;
+}
+
+.persistent-computer-actions button {
+  min-height: 26px;
+  padding: 0.2rem 0.45rem;
+  font-size: 10px;
+}
+
+@media (max-width: 760px) {
+  .persistent-computer-runs {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.35rem;
+    max-height: 38vh;
+    overflow: auto;
+  }
+
+  .persistent-computer-list,
+  .persistent-computer-run {
+    width: 100%;
+  }
+
+  .persistent-computer-run {
+    min-width: 0;
+  }
 }
 
 .computer-mode-entry {

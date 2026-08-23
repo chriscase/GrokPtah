@@ -345,9 +345,10 @@ export const api = {
     invoke<ComputerObservationPreview>("computer_use_observe_once", {
       selectionToken,
     }),
-  computerUseCockpitSnapshot: (sessionId: string) =>
+  computerUseCockpitSnapshot: (sessionId: string, runId?: string | null) =>
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_snapshot", {
       sessionId,
+      runId: runId ?? null,
     }),
   computerUseCockpitAgentEligibility: (sessionId: string) =>
     invoke<ComputerAgentEligibility>("computer_use_cockpit_agent_eligibility", {
@@ -417,17 +418,20 @@ export const api = {
     }),
   computerUseCockpitApprove: (
     sessionId: string,
+    runId: string,
     approvalId: string,
     requestId: string,
   ) =>
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_approve", {
       sessionId,
+      runId,
       approvalId,
       requestId,
     }),
-  computerUseCockpitDiscardApproval: (sessionId: string) =>
+  computerUseCockpitDiscardApproval: (sessionId: string, runId: string) =>
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_discard_approval", {
       sessionId,
+      runId,
     }),
   computerUseCockpitPause: (sessionId: string, runId: string) =>
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_pause", {

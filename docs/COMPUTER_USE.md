@@ -157,6 +157,16 @@ advertises `Control+Shift+S` / `Control+Shift+T` keyboard paths. These changes c
 surface reachability and stale-version race only. The native backend still needs a genuinely
 out-of-band cancellation channel before takeover is physically preemptive.
 
+The app-owned surface candidate binds every open cockpit and shell control to an exact durable
+Run ID. An unbound lookup is used only to discover a unique non-terminal Run and fails closed when
+more than one exists; one-shot observation previews are never eligible. Pending approvals are
+stored per Run, so reading or controlling another Lane cannot clear them. While a Run remains
+live, the application shell polls that exact binding and keeps Pause, Take over, and Stop visible
+after the cockpit closes, the user focuses another Lane, or the owning Lane is archived. Owners
+receive an opaque host-issued emergency-control token that can enter only those revoking service methods; ordinary
+observation, grant, proposal, approval, and action authority still requires the foreground Lane.
+This is persistent control-plane reachability, not proof of native physical preemption.
+
 ## Foundation (#268)
 
 `grokptah-agent-bridge::computer_use` provides:
@@ -348,7 +358,8 @@ attestation, packaging requirements, and disposable smoke fixture.
 | Out-of-band native cancellation channel | later | Physically preempt work that has already entered the native action gate |
 | Isolated helper / input domain | later | Host-native independently isolated visual input, not a simulator fixture |
 | Semantic-first isolated visual fallback | later | Isolated visual input after semantic miss, never boolean-upgraded native AX |
-| Cockpit agent cursor / always-available Stop | later | Agent-owned cursor UI on an isolated surface |
+| App-owned exact Run surface / always-available Stop | stacked candidate | Exact binding, per-Run approvals, persistent shell controls; external Rust qualification pending |
+| Cockpit agent cursor | later | Agent-owned cursor UI on an isolated surface |
 | Other platforms | #275, #276 | Windows and Linux adapters behind the same contract |
 
 Provider support is capability-based, not model-name based. OpenAI-compatible corporate gateways

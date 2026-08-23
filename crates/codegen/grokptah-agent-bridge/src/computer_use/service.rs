@@ -17,9 +17,10 @@ use super::projection::{
 use super::store::{ComputerStore, MutationClaim, MutationStamp};
 use super::types::{
     validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerAuthorityToken,
-    ComputerBackend, ComputerBackendAttestation, ComputerControlDisposition, ComputerError,
-    ComputerErrorCode, ComputerObservation, ComputerResult, ComputerRun, ComputerRunState,
-    ComputerTarget, ComputerUseLimits, ObservationAuthority, ResolvedAgentComputerRunAdmission,
+    ComputerBackend, ComputerBackendAttestation, ComputerControlDisposition,
+    ComputerEmergencyControlToken, ComputerError, ComputerErrorCode, ComputerObservation,
+    ComputerResult, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
+    ObservationAuthority, ResolvedAgentComputerRunAdmission,
 };
 
 pub struct ComputerUseService {
@@ -1313,6 +1314,18 @@ impl ComputerUseService {
         result
     }
 
+    /// Background-safe app-shell entry point. The opaque token cannot enter
+    /// observation, grant, approval, or action APIs; it is downgraded to the
+    /// owning local principal only inside this revoking transition.
+    pub async fn emergency_pause(
+        &self,
+        request_id: &str,
+        caller: &ComputerEmergencyControlToken,
+        run_id: &str,
+    ) -> ComputerResult<ComputerRun> {
+        self.pause(request_id, &caller.authority(), run_id).await
+    }
+
     /// Yields durable operator control. Authorization is evaluated against the
     /// current durable Run while the store is locked, never a client-held Run
     /// version. This is bookkeeping-safe takeover: it revokes grants, bumps
@@ -1352,6 +1365,17 @@ impl ComputerUseService {
         };
         self.finish_mutation(request_id, &result)?;
         result
+    }
+
+    /// Background-safe app-shell takeover; see [`Self::emergency_pause`].
+    pub async fn emergency_take_over(
+        &self,
+        request_id: &str,
+        caller: &ComputerEmergencyControlToken,
+        run_id: &str,
+    ) -> ComputerResult<ComputerRun> {
+        self.take_over(request_id, &caller.authority(), run_id)
+            .await
     }
 
     /// Explicitly quarantine an uncertain physical dispatch after the local
@@ -1458,6 +1482,16 @@ impl ComputerUseService {
         };
         self.finish_mutation(request_id, &result)?;
         result
+    }
+
+    /// Background-safe app-shell stop; see [`Self::emergency_pause`].
+    pub async fn emergency_cancel(
+        &self,
+        request_id: &str,
+        caller: &ComputerEmergencyControlToken,
+        run_id: &str,
+    ) -> ComputerResult<ComputerRun> {
+        self.cancel(request_id, &caller.authority(), run_id).await
     }
 
     pub fn complete(

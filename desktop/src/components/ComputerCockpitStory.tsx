@@ -6,6 +6,7 @@ import type {
   ComputerLocalApproval,
 } from "../lib/protocol";
 import { ComputerCockpit } from "./ComputerCockpit";
+import { PersistentComputerRuns } from "./PersistentComputerRuns";
 
 const target = {
   appId: "com.grokptah.computer-use-simulator",
@@ -344,24 +345,39 @@ api.computerUseCockpitStop = async () => {
 
 export function ComputerCockpitStory() {
   const [closed, setClosed] = useState(false);
-  if (closed) {
-    return (
-      <main className="computer-story-closed">
-        <button type="button" onClick={() => setClosed(false)}>Open Computer Run</button>
-      </main>
-    );
-  }
+  const [appSnapshot, setAppSnapshot] = useState<ComputerCockpitSnapshot>(current);
   return (
     <main className="computer-story-shell">
-      <ComputerCockpit
-        sessionId="story-session"
-        sessionTitle="Disposable demo build"
-        model="grok-4.5"
-        effort="high"
-        sessionBusy
-        onClose={() => setClosed(true)}
-        onSteer={async () => "Steering will apply at the next safe step."}
+      <PersistentComputerRuns
+        runs={[
+          {
+            sessionId: "story-session",
+            sessionTitle: "Disposable demo build",
+            snapshot: appSnapshot,
+          },
+        ]}
+        preferredSessionId="story-session"
+        onSnapshot={(_sessionId, snapshot) => setAppSnapshot(snapshot)}
+        onOpen={() => setClosed(false)}
       />
+      {closed ? (
+        <div className="computer-story-closed">
+          <button type="button" onClick={() => setClosed(false)}>Open Computer Run</button>
+        </div>
+      ) : (
+        <ComputerCockpit
+          sessionId="story-session"
+          boundRunId={appSnapshot.local?.runId ?? null}
+          sessionTitle="Disposable demo build"
+          model="grok-4.5"
+          effort="high"
+          sessionBusy
+          emergencyKeysManaged
+          onClose={() => setClosed(true)}
+          onSnapshot={(_sessionId, snapshot) => setAppSnapshot(snapshot)}
+          onSteer={async () => "Steering will apply at the next safe step."}
+        />
+      )}
     </main>
   );
 }

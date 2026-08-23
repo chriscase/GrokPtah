@@ -3807,6 +3807,26 @@ impl AgentHostHandle {
             .map_err(|error| anyhow!(error))
     }
 
+    /// Host-issued authority for out-of-band Pause, Take over, and Stop.
+    /// Unlike ordinary Computer Use authority, this remains available when
+    /// the owning Lane is in the background or archived so application-shell
+    /// controls do not disappear or become inert after navigation. The opaque
+    /// type can enter only revoking service transitions; it does not authorize
+    /// a new observation, grant, approval, or action.
+    pub fn computer_emergency_control_token(
+        &self,
+        session_id: Uuid,
+    ) -> Result<crate::computer_use::ComputerEmergencyControlToken> {
+        {
+            let g = self.inner.lock();
+            let _session = g.sessions.get(&session_id).ok_or_else(|| {
+                anyhow!("unknown session cannot issue Computer Use emergency authority")
+            })?;
+        }
+        crate::computer_use::ComputerEmergencyControlToken::local_operator(session_id)
+            .map_err(|error| anyhow!(error))
+    }
+
     /// Host-owned Computer Use Agent issuance. Resolves the durable Agent and
     /// exact current immutable spec revision on every call. Public callers
     /// cannot turn an Agent-shaped string into Computer Use authority.
@@ -12385,6 +12405,9 @@ mod computer_agent_host_tests {
             arbitrary.to_string().contains("unknown session"),
             "arbitrary UUID minting must fail: {arbitrary}"
         );
+        assert!(host
+            .computer_emergency_control_token(Uuid::new_v4())
+            .is_err());
 
         let first = host.session_new().unwrap();
         let second = host.session_new().unwrap();
@@ -12393,6 +12416,10 @@ mod computer_agent_host_tests {
             background.to_string().contains("background"),
             "background Lane minting must fail: {background}"
         );
+        assert!(
+            host.computer_emergency_control_token(first.id).is_ok(),
+            "the app shell must retain revoking controls for a background owner"
+        );
 
         host.session_archive(second.id, true).unwrap();
         let inactive = host.computer_operator_token(second.id).unwrap_err();
@@ -12400,6 +12427,7 @@ mod computer_agent_host_tests {
             inactive.to_string().contains("inactive"),
             "inactive Lane minting must fail: {inactive}"
         );
+        assert!(host.computer_emergency_control_token(second.id).is_ok());
 
         host.session_load(first.id).unwrap();
         assert!(host.computer_operator_token(first.id).is_ok());
@@ -12409,6 +12437,7 @@ mod computer_agent_host_tests {
             archived_live.to_string().contains("inactive"),
             "archiving the live Lane must fail closed: {archived_live}"
         );
+        assert!(host.computer_emergency_control_token(first.id).is_ok());
 
         drop(host);
         crate::set_grokptah_home_override(None);

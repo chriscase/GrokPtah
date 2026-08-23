@@ -247,6 +247,25 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ComputerCockpit", () => {
+  it("reopens only the exact app-owned Run binding", async () => {
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
+    const onSnapshot = vi.fn();
+    render(
+      <ComputerCockpit
+        {...props}
+        boundRunId="run-1"
+        onSnapshot={onSnapshot}
+      />,
+    );
+
+    await screen.findByText("Frame 1");
+    expect(mocks.snapshot).toHaveBeenCalledWith("session-1", "run-1");
+    expect(onSnapshot).toHaveBeenCalledWith(
+      "session-1",
+      expect.objectContaining({ local: expect.objectContaining({ runId: "run-1" }) }),
+    );
+  });
+
   it("keeps Computer Run ownership visible beyond the focused tab", async () => {
     render(
       <ComputerCockpit
@@ -438,7 +457,12 @@ describe("ComputerCockpit", () => {
     expect(
       await screen.findByRole("button", { name: "Reauthorize and observe" }),
     ).toBeTruthy();
-    expect(mocks.approve).toHaveBeenCalledTimes(1);
+    expect(mocks.approve).toHaveBeenCalledWith(
+      "session-1",
+      "run-1",
+      "approval-1",
+      expect.any(String),
+    );
   });
 
   it("shows measured model eligibility without expanding local approval", async () => {

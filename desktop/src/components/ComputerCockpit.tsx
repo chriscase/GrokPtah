@@ -21,6 +21,9 @@ const SIMULATOR_APP_ID = "com.grokptah.computer-use-simulator";
 
 type ComputerCockpitProps = {
   sessionId: string | null;
+  /** Exact app-owned Run identity. Once set, the cockpit must never follow a
+      newer preview or another Run merely because it changed recently. */
+  boundRunId?: string | null;
   sessionTitle?: string;
   scope?: LaneScope;
   model: string;
@@ -31,6 +34,10 @@ type ComputerCockpitProps = {
   onClose: () => void;
   onSteer: (text: string) => Promise<string>;
   onRunState?: (state: string | null) => void;
+  onSnapshot?: (sessionId: string, snapshot: ComputerCockpitSnapshot) => void;
+  /** The app shell owns global emergency keys in production. Stories and
+      focused component tests may leave this false for standalone behavior. */
+  emergencyKeysManaged?: boolean;
 };
 
 const DEFAULT_AGENT_OBJECTIVE =
@@ -118,6 +125,7 @@ function coordinationCopy(coordination: ComputerSurfaceCoordination) {
 
 export function ComputerCockpit({
   sessionId,
+  boundRunId = null,
   sessionTitle,
   scope,
   model,
@@ -128,6 +136,8 @@ export function ComputerCockpit({
   onClose,
   onSteer,
   onRunState,
+  onSnapshot,
+  emergencyKeysManaged = false,
 }: ComputerCockpitProps) {
   const [snapshot, setSnapshot] = useState<ComputerCockpitSnapshot | null>(null);
   const [launchMode, setLaunchMode] = useState<"simulator" | "macos">("simulator");
@@ -148,6 +158,15 @@ export function ComputerCockpit({
   const emergencyEpoch = useRef(0);
   const proposalFocus = useRef<HTMLButtonElement | null>(null);
 
+  const publishSnapshot = useCallback(
+    (next: ComputerCockpitSnapshot) => {
+      setSnapshot(next);
+      onRunState?.(next.local?.state ?? null);
+      if (sessionId) onSnapshot?.(sessionId, next);
+    },
+    [onRunState, onSnapshot, sessionId],
+  );
+
   useEffect(() => {
     const epoch = ++requestEpoch.current;
     setSnapshot(null);
@@ -167,11 +186,10 @@ export function ComputerCockpit({
       return;
     }
     void api
-      .computerUseCockpitSnapshot(sessionId)
+      .computerUseCockpitSnapshot(sessionId, boundRunId)
       .then((next) => {
         if (requestEpoch.current !== epoch) return;
-        setSnapshot(next);
-        onRunState?.(next.local?.state ?? null);
+        publishSnapshot(next);
       })
       .catch((reason) => {
         if (requestEpoch.current !== epoch) return;
@@ -189,7 +207,7 @@ export function ComputerCockpit({
     return () => {
       void api.computerUseCockpitCancelAgent(sessionId).catch(() => {});
     };
-  }, [sessionId, onRunState]);
+  }, [boundRunId, onRunState, publishSnapshot, sessionId]);
 
   const apply = async (
     mutation: () => Promise<ComputerCockpitSnapshot>,
@@ -207,9 +225,8 @@ export function ComputerCockpit({
       ) {
         return false;
       }
-      setSnapshot(next);
+      publishSnapshot(next);
       setNotice(success ?? null);
-      onRunState?.(next.local?.state ?? null);
       return true;
     } catch (reason) {
       if (
@@ -244,9 +261,8 @@ export function ComputerCockpit({
         ) {
           return;
         }
-        setSnapshot(next);
+        publishSnapshot(next);
         setNotice(success);
-        onRunState?.(next.local?.state ?? null);
       } catch (reason) {
         if (
           requestEpoch.current === epoch &&
@@ -256,7 +272,7 @@ export function ComputerCockpit({
         }
       }
     },
-    [onRunState],
+    [publishSnapshot],
   );
 
   const run = snapshot?.local ?? null;
@@ -290,7 +306,7 @@ export function ComputerCockpit({
     agentEligibility?.model === model ? agentEligibility.source : computerCapabilitySource;
 
   useEffect(() => {
-    if (!sessionId || !run || isTerminal(run)) return;
+    if (emergencyKeysManaged || !sessionId || !run || isTerminal(run)) return;
     const onEmergencyKey = (event: KeyboardEvent) => {
       if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return;
       const key = event.key.toLowerCase();
@@ -316,7 +332,7 @@ export function ComputerCockpit({
     };
     window.addEventListener("keydown", onEmergencyKey);
     return () => window.removeEventListener("keydown", onEmergencyKey);
-  }, [applyEmergency, run, sessionId]);
+  }, [applyEmergency, emergencyKeysManaged, run, sessionId]);
 
   const qualifyAgent = async () => {
     if (!sessionId) return;
@@ -351,8 +367,7 @@ export function ComputerCockpit({
         objective.trim(),
       );
       if (requestEpoch.current !== epoch) return;
-      setSnapshot(result.snapshot);
-      onRunState?.(result.snapshot.local?.state ?? null);
+      publishSnapshot(result.snapshot);
       setNotice(
         result.completed
           ? `Model marked the run complete: ${result.summary}`
@@ -1040,9 +1055,9 @@ export function ComputerCockpit({
                   type="button"
                   disabled={busy}
                   onClick={() =>
-                    void apply(() => api.computerUseCockpitDiscardApproval(sessionId)).finally(() =>
-                      proposalFocus.current?.focus(),
-                    )
+                    void apply(() =>
+                      api.computerUseCockpitDiscardApproval(sessionId, run.runId),
+                    ).finally(() => proposalFocus.current?.focus())
                   }
                 >
                   Reject
@@ -1057,6 +1072,7 @@ export function ComputerCockpit({
                       () =>
                         api.computerUseCockpitApprove(
                           sessionId,
+                          run.runId,
                           approval.approvalId,
                           crypto.randomUUID(),
                         ),
