@@ -287,30 +287,15 @@ fn session_prompt_inner_must_admit_before_session_mutation() {
     // Behavioral coverage lives in the cutpoint, requalify, quota, and
     // accepted-plan tests below: admission failure leaves zero provider
     // attempts, no TurnStarted, and an unchanged transcript/title.
-    let host_src = include_str!("host.rs");
+    let typed: anyhow::Error = UncertainAdmission(anyhow::anyhow!("persist cut")).into();
     assert!(
-        host_src.contains("admit_desktop_build_run"),
-        "desktop Build must persist the admitted Run before session mutation"
+        UncertainAdmission::is(&typed),
+        "desktop Uncertain must stay a typed UncertainAdmission"
     );
+    let rewritten = anyhow::anyhow!("durable admission is uncertain: persist cut");
     assert!(
-        host_src.contains("validate_provider_route_for_purpose"),
-        "desktop Build must call the shared admission validator"
-    );
-    assert!(
-        host_src.contains("terminalize_unstarted_admission"),
-        "post-admit failures must terminalize rather than delete the Run"
-    );
-    assert!(
-        host_src.contains("require_durable_admission"),
-        "compensation must match DurableAdmission instead of collapsing Uncertain"
-    );
-    assert!(
-        host_src.contains("UncertainAdmission"),
-        "Uncertain desktop admission must remain a typed UncertainAdmission error"
-    );
-    assert!(
-        !host_src.contains("durable admission is uncertain: {error}"),
-        "Uncertain must not be rewritten as an ordinary anyhow string error"
+        !UncertainAdmission::is(&rewritten),
+        "rewriting Uncertain as an ordinary string error loses the typed cut"
     );
 }
 

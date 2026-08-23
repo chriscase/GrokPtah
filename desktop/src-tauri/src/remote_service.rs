@@ -1912,27 +1912,23 @@ mod tests {
 
     #[test]
     fn tauri_run_surfaces_must_return_public_runs() {
-        let commands = include_str!("commands.rs");
-        assert!(commands.contains("list_public_session_runs_page"));
-        assert!(commands.contains("get_public_session_run"));
-        assert!(commands.contains("promote_public_session_run"));
-        assert!(commands.contains("discard_public_session_run"));
-        assert!(commands.contains("Result<PublicRunPage"));
-        assert!(commands.contains("Result<Option<PublicRun>"));
-        assert!(!commands.contains("host.get_session_run("));
-        assert!(!commands.contains("host.promote_run("));
-        assert!(!commands.contains("host.discard_run("));
-        assert!(!commands.contains("Result<Vec<grokptah_agent_bridge::PublicRun>"));
-        let remote = include_str!("remote_service.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
-        assert!(remote.contains("Result<PublicRunPage>"));
-        assert!(remote.contains("decode_remote_run_page"));
-        assert!(remote.contains("merge_remote_run_pages"));
+        // Local run_list / run_get / run_promote / run_discard return
+        // PublicRunPage / PublicRun by their command signatures. Remote list
+        // decode must reject leaked RunRecord keys the same way.
+        let page = decode_remote_run_page(serde_json::json!({
+            "runs": [sample_public_run("keep-page", "2026-01-01T00:00:01Z")],
+            "totalCount": 1,
+            "truncated": false
+        }))
+        .expect("allowlisted public page");
+        assert_eq!(page.runs[0].run_id, "keep-page");
+        let mut leaked = serde_json::to_value(&page).unwrap();
+        leaked["runs"][0]["providerRoute"] = serde_json::json!({
+            "baseUrl": "http://leak-base-url-sentinel-pr352.example/v1"
+        });
         assert!(
-            !remote.contains("RunRecord"),
-            "remote list/get must decode PublicRun instead of RunRecord"
+            decode_remote_run_page(leaked).is_err(),
+            "remote page decode must fail closed on leaked providerRoute"
         );
     }
 
