@@ -29,6 +29,7 @@ pub mod mcp_control_client;
 mod mcp_runtime;
 mod memory;
 mod models_catalog;
+mod native_coding_readiness;
 pub mod orchestration;
 mod permission;
 mod process_tree;
@@ -138,6 +139,11 @@ pub use mcp_control_client::{
 };
 /// List MCP tools for the project (spawns stdio servers when allowed).
 pub use mcp_runtime::list_mcp_tools;
+pub use native_coding_readiness::{
+    project_for_owner as project_native_coding_readiness, AdmissionEligibility,
+    AdmissionReasonCode, ComputerUseAdmission, NativeCodingReadinessProjection, PurposeAdmission,
+    QualificationEvidence, DESKTOP_OWNER_ID, NATIVE_CODING_READINESS_SCHEMA,
+};
 pub use orchestration::{
     is_recognized_test_command, merge_bounds, prompt_preview, safe_id_filename,
     ActivationDisposition, ActivationRecord, AgentAuthorityPolicy, AgentContinuationPlan,
@@ -148,11 +154,12 @@ pub use orchestration::{
     ContinuationMemoryScope, ContinuationOmission, ContinuationReason, ContinuationReasonCode,
     ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef, FakeClock,
     ManagedExecutionPolicy, MissedRunPolicy, NativeExecutorStatus, OrchStore, OrchestrationConfig,
-    OrchestrationService, PromotionState, RetentionPolicy, RetentionReport,
-    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot,
-    RoutineTrigger, RunApproval, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState,
-    RunStopCause, WorkAttemptView, WorkDecision, WorkItem, WorkItemSnapshot, WorkMessage,
-    WorkPolicy, WorkTemplate, WorkerProjection, WorkloadReconciliationReport, WorkloadSupervisor,
+    OrchestrationService, PromotionState, PublicProviderExecution, PublicRun, PublicRunPage,
+    PublicRunProgress, RetentionPolicy, RetentionReport, RoutineConcurrencyPolicy,
+    RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger,
+    RunApproval, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState, RunStopCause,
+    WorkAttemptView, WorkDecision, WorkItem, WorkItemSnapshot, WorkMessage, WorkPolicy,
+    WorkTemplate, WorkerProjection, WorkloadReconciliationReport, WorkloadSupervisor,
     WorkloadSupervisorStatus, WorkspaceAllowlist, AGENT_SPEC_SCHEMA_VERSION,
     CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION, CONTROL_TOOLS,
     DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,

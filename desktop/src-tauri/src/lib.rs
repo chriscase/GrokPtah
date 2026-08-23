@@ -218,6 +218,7 @@ pub fn run() {
             commands::cancel_background_task,
             commands::schedule_background_task,
             commands::settings_snapshot,
+            commands::native_coding_readiness,
             commands::set_sandbox,
             commands::set_subagent_isolation,
             commands::set_appearance,

@@ -5,9 +5,10 @@ use grokptah_agent_bridge::{
     ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate, EffortLevel,
     JournalPage, McpServerInfo, ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry,
     PromptQueueRunNextResult, PromptQueueSnapshot, PromptQueueTakeResult, ProviderDeadlineClass,
-    ProviderProfileUpdate, ProviderQualificationReport, RunExecutionMode, RunReview, RunState,
-    SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo,
-    SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
+    ProviderProfileUpdate, ProviderQualificationReport, PublicRun, PublicRunPage, RunExecutionMode,
+    RunReview, RunState, SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary,
+    SkillInfo, SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION,
+    PRODUCT_NAME,
 };
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
@@ -145,9 +146,7 @@ pub async fn remote_service_task_submit(
 }
 
 #[tauri::command]
-pub async fn remote_service_run_list(
-    state: State<'_, AppState>,
-) -> Result<Vec<grokptah_agent_bridge::RunRecord>, String> {
+pub async fn remote_service_run_list(state: State<'_, AppState>) -> Result<PublicRunPage, String> {
     state
         .remote_service
         .list_runs()
@@ -596,7 +595,7 @@ pub async fn remote_service_run_get(
     session_id: String,
     workspace: String,
     run_id: String,
-) -> Result<grokptah_agent_bridge::RunRecord, String> {
+) -> Result<PublicRun, String> {
     let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state
         .remote_service
@@ -1510,10 +1509,16 @@ pub async fn session_completion_history(
 pub async fn run_list(
     state: State<'_, AppState>,
     session_id: String,
-) -> Result<Vec<grokptah_agent_bridge::RunRecord>, String> {
+    cursor: Option<String>,
+    limit: Option<usize>,
+) -> Result<PublicRunPage, String> {
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    run_blocking(move || host.list_session_runs(id).map_err(map_err)).await
+    run_blocking(move || {
+        host.list_public_session_runs_page(id, cursor.as_deref(), limit)
+            .map_err(map_err)
+    })
+    .await
 }
 
 /// Read one durable Build run, scoped to its owning session.
@@ -1522,10 +1527,10 @@ pub async fn run_get(
     state: State<'_, AppState>,
     session_id: String,
     run_id: String,
-) -> Result<Option<grokptah_agent_bridge::RunRecord>, String> {
+) -> Result<Option<PublicRun>, String> {
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    run_blocking(move || host.get_session_run(id, &run_id).map_err(map_err)).await
+    run_blocking(move || host.get_public_session_run(id, &run_id).map_err(map_err)).await
 }
 
 /// Read the bounded, durable event journal for one run.
@@ -1555,7 +1560,7 @@ pub async fn run_review(
 ) -> Result<RunReview, String> {
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    run_blocking(move || host.review_run(id, &run_id).map_err(map_err)).await
+    run_blocking(move || host.review_public_run(id, &run_id).map_err(map_err)).await
 }
 
 /// Persist an exact-scope approval for an MCP-owned isolated run. The desktop
@@ -1567,7 +1572,7 @@ pub async fn run_approve(
     session_id: String,
     run_id: String,
     ttl_ms: Option<u64>,
-) -> Result<grokptah_agent_bridge::RunRecord, String> {
+) -> Result<PublicRun, String> {
     let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
     let (orch, token) = desktop_mcp_orchestration(&state)?;
     let auth = orch
@@ -1579,7 +1584,7 @@ pub async fn run_approve(
     }
     let source = state
         .host
-        .get_session_run(session_id, &run_id)
+        .get_public_session_run(session_id, &run_id)
         .map_err(map_err)?
         .ok_or_else(|| "unknown run for this session".to_string())?;
     if source.client_id.as_deref() != Some("mcp") {
@@ -1611,7 +1616,7 @@ pub async fn run_approve(
     .map_err(map_err)?;
     state
         .host
-        .get_session_run(session_id, &run_id)
+        .get_public_session_run(session_id, &run_id)
         .map_err(map_err)?
         .ok_or_else(|| "run disappeared after approval".into())
 }
@@ -1622,20 +1627,22 @@ pub async fn run_promote(
     state: State<'_, AppState>,
     session_id: String,
     run_id: String,
-) -> Result<grokptah_agent_bridge::RunRecord, String> {
+) -> Result<PublicRun, String> {
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     run_blocking(move || {
         let run = host
-            .get_session_run(id, &run_id)
+            .get_public_session_run(id, &run_id)
             .map_err(map_err)?
             .ok_or_else(|| "unknown run for this session".to_string())?;
-        match run.approval.as_ref() {
-            Some(approval) => host
-                .promote_run_with_approval(id, &run_id, Some(&approval.approval_id))
-                .map_err(map_err),
-            None => host.promote_run(id, &run_id).map_err(map_err),
-        }
+        host.promote_public_session_run(
+            id,
+            &run_id,
+            run.approval
+                .as_ref()
+                .map(|approval| approval.approval_id.as_str()),
+        )
+        .map_err(map_err)
     })
     .await
 }
@@ -1646,10 +1653,14 @@ pub async fn run_discard(
     state: State<'_, AppState>,
     session_id: String,
     run_id: String,
-) -> Result<grokptah_agent_bridge::RunRecord, String> {
+) -> Result<PublicRun, String> {
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    run_blocking(move || host.discard_run(id, &run_id).map_err(map_err)).await
+    run_blocking(move || {
+        host.discard_public_session_run(id, &run_id)
+            .map_err(map_err)
+    })
+    .await
 }
 
 /// Explicitly retry an interrupted MCP-owned run through the shared
@@ -1673,7 +1684,7 @@ pub async fn run_retry(
     }
     let source = state
         .host
-        .get_session_run(session_id, &run_id)
+        .get_public_session_run(session_id, &run_id)
         .map_err(map_err)?
         .ok_or_else(|| "unknown run for this session".to_string())?;
     if source.client_id.as_deref() != Some("mcp") {
@@ -1718,7 +1729,7 @@ pub async fn run_steer(
     }
     let source = state
         .host
-        .get_session_run(session_id, &run_id)
+        .get_public_session_run(session_id, &run_id)
         .map_err(map_err)?
         .ok_or_else(|| "unknown run for this session".to_string())?;
     if source.client_id.as_deref() != Some("mcp") {
@@ -1757,7 +1768,7 @@ pub async fn run_cancel(
     }
     let source = state
         .host
-        .get_session_run(session_id, &run_id)
+        .get_public_session_run(session_id, &run_id)
         .map_err(map_err)?
         .ok_or_else(|| "unknown run for this session".to_string())?;
     if source.client_id.as_deref() != Some("mcp") {
@@ -2114,6 +2125,15 @@ pub fn schedule_background_task(state: State<'_, AppState>, title: String) -> Ba
 #[tauri::command]
 pub fn settings_snapshot(state: State<'_, AppState>) -> serde_json::Value {
     state.host.settings_snapshot()
+}
+
+#[tauri::command]
+pub fn native_coding_readiness(
+    state: State<'_, AppState>,
+    provider_id: String,
+    model_id: String,
+) -> grokptah_agent_bridge::NativeCodingReadinessProjection {
+    state.host.native_coding_readiness(&provider_id, &model_id)
 }
 
 #[tauri::command]

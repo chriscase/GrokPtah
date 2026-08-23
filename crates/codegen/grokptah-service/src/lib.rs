@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+#[cfg(test)]
+use grokptah_agent_bridge::orchestration::AuthorityRole;
 use grokptah_agent_bridge::{
     start_control_server_with_bind, AgentHost, AgentHostHandle, AuthCredential,
     ControlServerHandle, ControlServerLimits, HostConfig, OrchStore, OrchestrationConfig,
@@ -287,10 +289,22 @@ fn env_bool(name: &str) -> bool {
 }
 
 fn parse_client_credential(spec: &str) -> Result<AuthCredential> {
-    let (id, token) = spec
+    let (identity, token) = spec
         .split_once('=')
-        .with_context(|| "client credential must use ID=TOKEN format")?;
-    AuthCredential::new(id, token).map_err(|error| anyhow::anyhow!(error.message))
+        .with_context(|| "client credential must use [ROLE:]ID=TOKEN format")?;
+    let (role, id) = identity
+        .split_once(':')
+        .map(|(role, id)| (role.trim(), id.trim()))
+        .unwrap_or(("coordinator", identity.trim()));
+    let credential = match role {
+        "coordinator" => AuthCredential::new(id, token),
+        "operator" => AuthCredential::operator(id, token),
+        "observer" => AuthCredential::observer(id, token),
+        _ => {
+            bail!("client credential role must be coordinator, operator, or observer")
+        }
+    };
+    credential.map_err(|error| anyhow::anyhow!(error.message))
 }
 
 fn parse_client_credentials(value: &str) -> Result<Vec<AuthCredential>> {
@@ -302,7 +316,7 @@ fn parse_client_credentials(value: &str) -> Result<Vec<AuthCredential>> {
 }
 
 pub fn help_text() -> &'static str {
-    "GrokPtah headless service\n\nUsage: grokptah-service [options]\n\nOptions:\n  --listen ADDR                 Bind address (default 127.0.0.1:39200)\n  --token TOKEN                 Bearer token (or GROKPTAH_SERVICE_TOKEN)\n  --workspace PATH              Allowlisted workspace; repeatable\n  --client ID=TOKEN             Additional named device credential; repeatable\n  --allow-remote                Permit non-loopback bind; health requires auth\n  --max-concurrent N            Concurrent request/run ceiling (default 4)\n  --request-timeout-ms N        Request deadline (default 120000)\n  -h, --help                    Show this help\n      --version                 Show the service version\n\nGROKPTAH_SERVICE_CLIENTS accepts comma-separated ID=TOKEN entries.\nGROKPTAH_SERVICE_AGENT_OWNER names the durable Agent owner account.\nSet GROKPTAH_HOME to choose the durable service data directory."
+    "GrokPtah headless service\n\nUsage: grokptah-service [options]\n\nOptions:\n  --listen ADDR                 Bind address (default 127.0.0.1:39200)\n  --token TOKEN                 Coordinator bearer (or GROKPTAH_SERVICE_TOKEN)\n  --workspace PATH              Allowlisted workspace; repeatable\n  --client [ROLE:]ID=TOKEN      Named coordinator/operator/observer credential\n  --allow-remote                Permit non-loopback bind; health requires auth\n  --max-concurrent N            Concurrent request/run ceiling (default 4)\n  --request-timeout-ms N        Request deadline (default 120000)\n  -h, --help                    Show this help\n      --version                 Show the service version\n\nGROKPTAH_SERVICE_CLIENTS accepts comma-separated [ROLE:]ID=TOKEN entries.\nThe default role is coordinator; local-operator authority is never bearer-selectable.\nGROKPTAH_SERVICE_AGENT_OWNER names the durable Agent owner account.\nSet GROKPTAH_HOME to choose the durable service data directory."
 }
 
 pub struct ServiceHandle {
@@ -461,7 +475,9 @@ mod tests {
             "--workspace",
             "/tmp/project",
             "--client",
-            "laptop=secondary-token",
+            "operator:laptop=secondary-token",
+            "--client",
+            "observer:dashboard=observer-token",
         ])
         .unwrap();
         let StartupAction::Run(config) = action else {
@@ -470,7 +486,13 @@ mod tests {
         assert!(config
             .client_credentials
             .iter()
-            .any(|credential| credential.id == "laptop"));
+            .any(|credential| credential.id == "laptop"
+                && credential.role() == AuthorityRole::RemoteOperator));
+        assert!(config
+            .client_credentials
+            .iter()
+            .any(|credential| credential.id == "dashboard"
+                && credential.role() == AuthorityRole::Observer));
 
         let mut duplicate = config;
         duplicate

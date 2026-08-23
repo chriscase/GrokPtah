@@ -346,18 +346,20 @@ async function runCapacity429Mode() {
   record("loweredCapacityConfigured", Number(hj.maxConcurrent) === 2, {
     maxConcurrent: hj.maxConcurrent,
   });
+  const mcpSession = await openMcpSession("capacity-429-soak");
   // Hold 2 permits (inject ~400ms, timeout 5s) then overflow must 429.
   const holders = [1, 2].map((id) =>
-    mcpFetch("tools/list", {}, { id, timeoutMs: 8000 }).catch((e) => ({
+    mcpFetch("tools/list", {}, { id, sessionId: mcpSession, timeoutMs: 8000 }).catch((e) => ({
       status: 0,
       error: String(e),
     }))
   );
   await new Promise((r) => setTimeout(r, 120));
-  const overflow = await mcpFetch("tools/list", {}, { id: 99, timeoutMs: 3000 }).catch((e) => ({
-    status: 0,
-    error: String(e),
-  }));
+  const overflow = await mcpFetch("tools/list", {}, {
+    id: 99,
+    sessionId: mcpSession,
+    timeoutMs: 3000,
+  }).catch((e) => ({ status: 0, error: String(e) }));
   record("capacity429", overflow.status === 429, {
     overflowStatus: overflow.status,
     capacity429: metrics.capacity429,
@@ -373,11 +375,13 @@ async function runCapacityTimeoutMode() {
   const health = await fetch(`${base}/health`);
   const hj = await health.json();
   record("loopbackHealth", health.status === 200 && hj.ok === true, hj);
+  const mcpSession = await openMcpSession("capacity-timeout-soak");
   // inject 500ms > request timeout 80ms → 504 timeout
-  const timed = await mcpFetch("tools/list", {}, { id: 100, timeoutMs: 5000 }).catch((e) => ({
-    status: 0,
-    error: String(e),
-  }));
+  const timed = await mcpFetch("tools/list", {}, {
+    id: 100,
+    sessionId: mcpSession,
+    timeoutMs: 5000,
+  }).catch((e) => ({ status: 0, error: String(e) }));
   const timedOut =
     timed.status === 504 ||
     timed.json?.error?.data?.code === "timeout" ||

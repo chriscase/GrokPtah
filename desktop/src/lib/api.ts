@@ -18,10 +18,12 @@ import type {
   SubagentInfo,
   DurableRun,
   DurableRunEventPage,
+  DurableRunPage,
   RunExecutionMode,
   RunReview,
   WorkspaceUiState,
   ProviderQualificationReport,
+  NativeCodingReadinessProjection,
   PersistentAgent,
   PersistentAgentResumePlan,
   LaneSummary,
@@ -74,7 +76,7 @@ export const api = {
       allowQueue,
     }),
   remoteServiceRunList: () =>
-    invoke<DurableRun[]>("remote_service_run_list"),
+    invoke<DurableRunPage>("remote_service_run_list"),
   remoteServiceWorkList: (sessionId: string, workspace: string) =>
     invoke<DurableWorkItem[]>("remote_service_work_list", {
       sessionId,
@@ -646,8 +648,8 @@ export const api = {
     invoke<SessionCompletionRecord[]>("session_completion_history", {
       sessionId,
     }),
-  runList: (sessionId: string) =>
-    invoke<DurableRun[]>("run_list", { sessionId }),
+  runList: (sessionId: string, cursor?: string, limit?: number) =>
+    invoke<DurableRunPage>("run_list", { sessionId, cursor, limit }),
   runGet: (sessionId: string, runId: string) =>
     invoke<DurableRun | null>("run_get", { sessionId, runId }),
   runEvents: (sessionId: string, runId: string, afterSeq = 0, limit = 80) =>
@@ -772,6 +774,11 @@ export const api = {
   scheduleBackgroundTask: (title: string) =>
     invoke("schedule_background_task", { title }),
   settingsSnapshot: () => invoke<Record<string, unknown>>("settings_snapshot"),
+  nativeCodingReadiness: (providerId: string, modelId: string) =>
+    invoke<NativeCodingReadinessProjection>("native_coding_readiness", {
+      providerId,
+      modelId,
+    }),
   setSandbox: (profile: string) => invoke<void>("set_sandbox", { profile }),
   setSubagentIsolation: (mode: "worktree" | "shared") =>
     invoke<void>("set_subagent_isolation", { mode }),

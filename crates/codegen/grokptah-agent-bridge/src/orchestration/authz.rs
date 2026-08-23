@@ -2,9 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
+use super::authority::{
+    AuthorityCapabilityDocument, AuthorityOperation, AuthorityRole, AuthorityStamp,
+    EffectiveAuthority,
+};
 use super::types::{OrchError, OrchErrorCode};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct AuthContext {
     /// Stable credential identity used for audit and attribution. This is not
     /// the secret itself and may safely appear in durable records.
@@ -13,6 +17,104 @@ pub struct AuthContext {
     /// device credentials. A later multi-tenant service can map credentials to
     /// different owner identities without changing the protocol shape.
     pub owner_id: String,
+    authority: EffectiveAuthority,
+}
+
+impl std::fmt::Debug for AuthContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthContext")
+            .field("token_id", &self.token_id)
+            .field("owner_id", &self.owner_id)
+            .field("stamp", &self.authority.stamp)
+            .field("operations", &self.authority.operations)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthContext {
+    #[cfg(test)]
+    pub(crate) fn remote_coordinator(
+        token_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        allowlist: &WorkspaceAllowlist,
+    ) -> Result<Self, OrchError> {
+        Self::remote_with_role(
+            token_id,
+            owner_id,
+            allowlist,
+            AuthorityRole::RemoteCoordinator,
+        )
+    }
+
+    fn remote_with_role(
+        token_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        allowlist: &WorkspaceAllowlist,
+        role: AuthorityRole,
+    ) -> Result<Self, OrchError> {
+        let token_id = token_id.into();
+        let owner_id = owner_id.into();
+        let authority =
+            EffectiveAuthority::remote_default(&token_id, &owner_id, allowlist.roots(), role)?;
+        Ok(Self {
+            token_id,
+            owner_id,
+            authority,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn trusted_local_test(
+        token_id: impl Into<String>,
+        owner_id: impl Into<String>,
+        allowlist: &WorkspaceAllowlist,
+    ) -> Result<Self, OrchError> {
+        let token_id = token_id.into();
+        let owner_id = owner_id.into();
+        let authority = EffectiveAuthority::trusted_local_operator(&owner_id, allowlist.roots())?;
+        Ok(Self {
+            token_id,
+            owner_id,
+            authority,
+        })
+    }
+
+    pub(crate) fn trusted_local_operator(
+        owner_id: impl Into<String>,
+        allowlist: &WorkspaceAllowlist,
+    ) -> Result<Self, OrchError> {
+        let owner_id = owner_id.into();
+        let authority = EffectiveAuthority::trusted_local_operator(&owner_id, allowlist.roots())?;
+        Ok(Self {
+            token_id: "trusted-local-adapter".to_string(),
+            owner_id,
+            authority,
+        })
+    }
+
+    pub fn require_operation(&self, operation: AuthorityOperation) -> Result<(), OrchError> {
+        self.authority.require_operation(operation)
+    }
+
+    pub fn require_workspace(
+        &self,
+        operation: AuthorityOperation,
+        workspace: &Path,
+    ) -> Result<PathBuf, OrchError> {
+        self.authority.require_workspace(operation, workspace)
+    }
+
+    pub fn authority_stamp(&self) -> &AuthorityStamp {
+        &self.authority.stamp
+    }
+
+    pub fn capability_document(&self) -> &AuthorityCapabilityDocument {
+        &self.authority.capability_document
+    }
+
+    pub fn role(&self) -> AuthorityRole {
+        self.authority.stamp.role
+    }
 }
 
 /// One named bearer credential accepted by a service instance.
@@ -24,6 +126,8 @@ pub struct AuthContext {
 pub struct AuthCredential {
     pub id: String,
     token: String,
+    role: AuthorityRole,
+    workspace_roots: Option<Vec<PathBuf>>,
 }
 
 impl std::fmt::Debug for AuthCredential {
@@ -31,6 +135,11 @@ impl std::fmt::Debug for AuthCredential {
         f.debug_struct("AuthCredential")
             .field("id", &self.id)
             .field("token", &"[redacted]")
+            .field("role", &self.role)
+            .field(
+                "workspace_grants",
+                &self.workspace_roots.as_ref().map(Vec::len),
+            )
             .finish()
     }
 }
@@ -56,11 +165,86 @@ impl AuthCredential {
                 "auth credential token must not be empty",
             ));
         }
-        Ok(Self { id, token })
+        Ok(Self {
+            id,
+            token,
+            role: AuthorityRole::RemoteCoordinator,
+            workspace_roots: None,
+        })
+    }
+
+    pub fn observer(id: impl Into<String>, token: impl Into<String>) -> Result<Self, OrchError> {
+        let mut credential = Self::new(id, token)?;
+        credential.role = AuthorityRole::Observer;
+        Ok(credential)
+    }
+
+    /// Explicit operator bearer for deployments that require remote approval
+    /// and promotion. Unlike the trusted local adapter, it never receives
+    /// Computer Use authority.
+    pub fn operator(id: impl Into<String>, token: impl Into<String>) -> Result<Self, OrchError> {
+        let mut credential = Self::new(id, token)?;
+        credential.role = AuthorityRole::RemoteOperator;
+        Ok(credential)
+    }
+
+    /// Unit-test-only transport adapter credential. Production bearer
+    /// constructors can never request local-operator authority.
+    #[cfg(test)]
+    pub(crate) fn trusted_local_test(
+        id: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Result<Self, OrchError> {
+        let mut credential = Self::new(id, token)?;
+        credential.role = AuthorityRole::LocalOperator;
+        Ok(credential)
     }
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    pub fn role(&self) -> AuthorityRole {
+        self.role
+    }
+
+    pub fn with_workspace_roots(
+        mut self,
+        roots: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Self, OrchError> {
+        let roots = roots.into_iter().collect::<Vec<_>>();
+        if roots.is_empty() || roots.len() > 64 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "credential workspace grants must contain between 1 and 64 roots",
+            ));
+        }
+        let mut canonical = Vec::with_capacity(roots.len());
+        for root in roots {
+            canonical.push(canonical_workspace(&root)?);
+        }
+        canonical.sort();
+        canonical.dedup();
+        self.workspace_roots = Some(canonical);
+        Ok(self)
+    }
+
+    pub(crate) fn effective_allowlist(
+        &self,
+        service_allowlist: &WorkspaceAllowlist,
+    ) -> Result<WorkspaceAllowlist, OrchError> {
+        let Some(roots) = self.workspace_roots.as_ref() else {
+            return Ok(service_allowlist.clone());
+        };
+        if roots.iter().any(|root| !service_allowlist.contains(root)) {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "credential workspace grant exceeds the service allowlist",
+            ));
+        }
+        Ok(WorkspaceAllowlist {
+            roots: roots.clone(),
+        })
     }
 }
 
@@ -121,10 +305,11 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub fn authenticate_bearer(
+pub(crate) fn authenticate_bearer(
     header: Option<&str>,
     credentials: &[AuthCredential],
     owner_id: &str,
+    allowlist: &WorkspaceAllowlist,
 ) -> Result<AuthContext, OrchError> {
     if credentials.is_empty() || owner_id.trim().is_empty() {
         return Err(OrchError::new(
@@ -159,17 +344,37 @@ pub fn authenticate_bearer(
             "invalid bearer token",
         ));
     };
-    Ok(AuthContext {
-        token_id: credential.id.clone(),
-        owner_id: owner_id.trim().to_string(),
-    })
+    let credential_allowlist = credential.effective_allowlist(allowlist)?;
+    #[cfg(test)]
+    if credential.role == AuthorityRole::LocalOperator {
+        return AuthContext::trusted_local_test(
+            credential.id.clone(),
+            owner_id.trim().to_string(),
+            &credential_allowlist,
+        );
+    }
+    AuthContext::remote_with_role(
+        credential.id.clone(),
+        owner_id.trim().to_string(),
+        &credential_allowlist,
+        credential.role,
+    )
 }
 
 /// Backward-compatible single-credential helper used by pure policy tests and
 /// embedders that have not adopted named credentials yet.
-pub fn require_bearer(header: Option<&str>, expected: &str) -> Result<AuthContext, OrchError> {
+#[cfg(test)]
+pub(crate) fn require_bearer(
+    header: Option<&str>,
+    expected: &str,
+) -> Result<AuthContext, OrchError> {
     let credential = AuthCredential::new("primary", expected)?;
-    authenticate_bearer(header, &[credential], "primary")
+    authenticate_bearer(
+        header,
+        &[credential],
+        "primary",
+        &WorkspaceAllowlist::default(),
+    )
 }
 
 pub fn require_workspace_match(
@@ -222,11 +427,62 @@ mod tests {
             AuthCredential::new("primary", "tok").unwrap(),
             AuthCredential::new("laptop", "other-tok").unwrap(),
         ];
-        let auth =
-            authenticate_bearer(Some("Bearer other-tok"), &credentials, "account-1").unwrap();
+        let auth = authenticate_bearer(
+            Some("Bearer other-tok"),
+            &credentials,
+            "account-1",
+            &WorkspaceAllowlist::default(),
+        )
+        .unwrap();
         assert_eq!(auth.token_id, "laptop");
         assert_eq!(auth.owner_id, "account-1");
-        assert!(authenticate_bearer(Some("Bearer unknown"), &credentials, "account-1").is_err());
+        assert!(authenticate_bearer(
+            Some("Bearer unknown"),
+            &credentials,
+            "account-1",
+            &WorkspaceAllowlist::default(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn credential_workspace_grants_can_only_narrow_the_service_scope() {
+        let allowed_a = tempdir().unwrap();
+        let allowed_b = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let service_allowlist = WorkspaceAllowlist::new([
+            allowed_a.path().to_path_buf(),
+            allowed_b.path().to_path_buf(),
+        ]);
+        let credential = AuthCredential::new("narrow", "token")
+            .unwrap()
+            .with_workspace_roots([allowed_a.path().to_path_buf()])
+            .unwrap();
+        let auth = authenticate_bearer(
+            Some("Bearer token"),
+            &[credential],
+            "owner",
+            &service_allowlist,
+        )
+        .unwrap();
+        assert!(auth
+            .require_workspace(AuthorityOperation::SessionsRead, allowed_a.path())
+            .is_ok());
+        assert!(auth
+            .require_workspace(AuthorityOperation::SessionsRead, allowed_b.path())
+            .is_err());
+
+        let outside_credential = AuthCredential::new("outside", "outside-token")
+            .unwrap()
+            .with_workspace_roots([outside.path().to_path_buf()])
+            .unwrap();
+        assert!(authenticate_bearer(
+            Some("Bearer outside-token"),
+            &[outside_credential],
+            "owner",
+            &service_allowlist,
+        )
+        .is_err());
     }
 
     #[test]

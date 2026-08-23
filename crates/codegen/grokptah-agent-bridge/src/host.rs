@@ -25,15 +25,16 @@ use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
     auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
-    call_xai_agent_step_observed, call_xai_chat, cargo_test_failure_coaching,
-    cargo_test_output_failed, cargo_test_output_passed, cargo_test_reverify_coaching,
-    coding_agent_tools, count_cargo_test_failures, emit_message, emit_thought,
-    filter_tools_batch_edit_only, filter_tools_edit_and_shell, filter_tools_edit_only,
-    is_incomplete_stop_message, is_round_limit_stop_message, is_true_noop_tool_step,
-    multi_failure_partial_edit_coaching, normalize_sandbox_profile, offline_plan_steps,
-    parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model, push_assistant,
-    push_thought, push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
-    round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
+    call_xai_agent_step_routed, call_xai_chat, call_xai_chat_routed,
+    capture_provider_route_snapshot, cargo_test_failure_coaching, cargo_test_output_failed,
+    cargo_test_output_passed, cargo_test_reverify_coaching, coding_agent_tools,
+    count_cargo_test_failures, emit_message, emit_thought, filter_tools_batch_edit_only,
+    filter_tools_edit_and_shell, filter_tools_edit_only, is_incomplete_stop_message,
+    is_round_limit_stop_message, is_true_noop_tool_step, multi_failure_partial_edit_coaching,
+    normalize_sandbox_profile, offline_plan_steps, parse_effort_arg,
+    post_cargo_failure_skip_message, propose_plan_with_model, provider_dispatch_outcome,
+    push_assistant, push_thought, push_tool, recovery_round_limit_stop_message,
+    resolve_turn_max_rounds, round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
     should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
     surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
     IdenticalToolCallRun, McpToolIndex,
@@ -46,11 +47,12 @@ use crate::orchestration::{
     AgentContinuationPlan, AgentLaneAssociation, AgentRecord, AgentResumePlan, AgentSpec,
     AgentState, ContinuationCheckpoint, ContinuationMemoryFact, ContinuationMemoryInput,
     ContinuationMemoryScope, ContinuationReason, ContinuationReasonCode, ContinuationRunInput,
-    ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, RoutineConcurrencyPolicy,
-    RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger,
-    RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose, RunRecord, RunState,
-    RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy, WorkTemplate,
-    DEFAULT_AGENT_TOOL_IDS,
+    ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, ProviderRouteSnapshot,
+    ProviderSendCertainty, PublicRun, QuotaClass, QuotaLimits, QuotaReservation,
+    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot,
+    RoutineTrigger, RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose,
+    RunRecord, RunState, RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy,
+    WorkTemplate, DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,
 };
 use crate::permission::{
     evaluate_tool_gate, PendingPermissionView, PermissionDecision, PermissionRequest, ToolGate,
@@ -72,6 +74,22 @@ use crate::types::{
     AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
     SkillInfo, SubagentExecutionMode, SubagentInfo, SubagentIsolationPreference,
 };
+
+fn resolve_run_credentials(
+    provider_route: Option<&ProviderRouteSnapshot>,
+    model: &str,
+) -> Result<Option<crate::auth_store::WireCredentials>> {
+    match provider_route {
+        Some(route) => crate::auth_store::resolve_wire_credentials_for_route(
+            &route.provider_id,
+            route.kind,
+            route.dialect,
+            &route.credential_ref,
+        ),
+        None => crate::auth_store::resolve_wire_credentials_for_model(model),
+    }
+    .map_err(anyhow::Error::msg)
+}
 
 /// UI restore payload: open tabs + active Lane + project.
 ///
@@ -199,6 +217,9 @@ pub(crate) struct Inner {
     turn_generations: HashMap<Uuid, u64>,
     /// Monotonic across all sessions; a generation is never reused.
     next_turn_generation: u64,
+    /// Inspect→admit→commit fence. One token covers session identity,
+    /// cwd/model/spec/mode/reservation until commit consumes it.
+    admission_fences: HashMap<Uuid, AdmissionFence>,
     /// Explicit, short-lived model qualification/proposal calls from the
     /// Computer cockpit. These are independent from Build turns and always
     /// cancelled by local Stop/Take over.
@@ -365,6 +386,7 @@ pub(crate) struct SessionUsage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunTokenStop {
     Reached { consumed: u64, ceiling: u64 },
+    RequestCeiling { consumed: u64, ceiling: u64 },
     UsageUnavailable { ceiling: u64 },
     AccountingOverflow { ceiling: u64 },
 }
@@ -373,6 +395,7 @@ impl RunTokenStop {
     fn code(self) -> &'static str {
         match self {
             Self::Reached { .. } => "max_total_tokens_reached",
+            Self::RequestCeiling { .. } => "provider_request_quota_reached",
             Self::UsageUnavailable { .. } => "max_total_tokens_usage_unavailable",
             Self::AccountingOverflow { .. } => "max_total_tokens_accounting_overflow",
         }
@@ -381,6 +404,7 @@ impl RunTokenStop {
     fn cause(self) -> RunStopCause {
         match self {
             Self::Reached { .. } => RunStopCause::TokenCeiling,
+            Self::RequestCeiling { .. } => RunStopCause::ProviderQuota,
             Self::UsageUnavailable { .. } => RunStopCause::TokenAccountingUnavailable,
             Self::AccountingOverflow { .. } => RunStopCause::TokenAccountingOverflow,
         }
@@ -390,6 +414,9 @@ impl RunTokenStop {
         match self {
             Self::Reached { consumed, ceiling } => format!(
                 "Stopped at the run token boundary: consumed {consumed} total tokens, meeting or exceeding the max_total_tokens ceiling of {ceiling}."
+            ),
+            Self::RequestCeiling { consumed, ceiling } => format!(
+                "Stopped at the provider request boundary: consumed {consumed} requests, meeting the reserved request ceiling of {ceiling}."
             ),
             Self::UsageUnavailable { ceiling } => format!(
                 "Stopped at the run token boundary because the provider did not return usable token metadata for a run bounded by max_total_tokens={ceiling}."
@@ -413,18 +440,30 @@ struct RunUsageTracker {
     run_id: String,
     store: OrchStore,
     max_total_tokens: Option<u64>,
+    max_provider_requests: Option<u64>,
     state: Mutex<RunUsageState>,
     bounded_admission: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct RunUsageAttempt {
     tracker: Arc<RunUsageTracker>,
+    provider_attempt_id: Option<String>,
     _bounded_admission: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl RunUsageAttempt {
-    fn finish(self, usage: Option<&CompletionUsage>) -> Result<Option<String>> {
-        self.tracker.finish_attempt(usage)
+    fn finish(
+        self,
+        certainty: ProviderSendCertainty,
+        http_status: Option<u16>,
+        usage: Option<&CompletionUsage>,
+    ) -> Result<Option<String>> {
+        self.tracker.finish_attempt(
+            self.provider_attempt_id.as_deref(),
+            certainty,
+            http_status,
+            usage,
+        )
     }
 }
 
@@ -434,6 +473,11 @@ impl RunUsageTracker {
             run_id: run.run_id.clone(),
             store,
             max_total_tokens: run.bounds.max_total_tokens,
+            max_provider_requests: run
+                .provider_route
+                .as_ref()
+                .is_some_and(|route| route.quota_reservation_id.is_some())
+                .then(|| QuotaReservation::request_ceiling_for_run(run)),
             state: Mutex::new(RunUsageState {
                 usage: run.aggregates.usage.clone(),
                 complete: run.aggregates.usage_complete,
@@ -493,34 +537,100 @@ impl RunUsageTracker {
         }
         let pending_requests = {
             let mut state = self.state.lock();
+            let admitted_requests = state
+                .usage
+                .requests
+                .checked_add(u64::from(state.pending_requests))
+                .ok_or_else(|| anyhow!("provider request accounting overflowed"))?;
+            if let Some(ceiling) = self.max_provider_requests {
+                if admitted_requests >= ceiling {
+                    let stop = RunTokenStop::RequestCeiling {
+                        consumed: admitted_requests,
+                        ceiling,
+                    };
+                    state.stop = Some(stop);
+                    drop(state);
+                    self.mark_host_stop(stop.cause(), stop.code())?;
+                    bail!(stop.message());
+                }
+            }
             state.pending_requests = state
                 .pending_requests
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("provider attempt counter overflowed"))?;
             state.pending_requests
         };
-        match self.store.update_run(&self.run_id, |run| {
-            run.aggregates.usage_pending_requests = pending_requests;
-            run.updated_at = Utc::now();
-            Ok(())
-        }) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                self.state.lock().pending_requests = pending_requests.saturating_sub(1);
-                bail!("run disappeared while admitting a provider request");
+        let provider_attempt_id = if self.max_provider_requests.is_some() {
+            match self.store.begin_provider_attempt(&self.run_id) {
+                Ok(attempt) => Some(attempt.attempt_id),
+                Err(error) => {
+                    self.state.lock().pending_requests = pending_requests.saturating_sub(1);
+                    return Err(error);
+                }
             }
-            Err(error) => {
-                self.state.lock().pending_requests = pending_requests.saturating_sub(1);
-                return Err(error);
+        } else {
+            match self.store.update_run(&self.run_id, |run| {
+                run.aggregates.usage_pending_requests = pending_requests;
+                run.updated_at = Utc::now();
+                Ok(())
+            }) {
+                Ok(Some(_)) => None,
+                Ok(None) => {
+                    self.state.lock().pending_requests = pending_requests.saturating_sub(1);
+                    bail!("run disappeared while admitting a provider request");
+                }
+                Err(error) => {
+                    self.state.lock().pending_requests = pending_requests.saturating_sub(1);
+                    return Err(error);
+                }
             }
-        }
+        };
         Ok(RunUsageAttempt {
             tracker: self.clone(),
+            provider_attempt_id,
             _bounded_admission: bounded_admission,
         })
     }
 
-    fn finish_attempt(&self, usage: Option<&CompletionUsage>) -> Result<Option<String>> {
+    fn finish_attempt(
+        &self,
+        provider_attempt_id: Option<&str>,
+        certainty: ProviderSendCertainty,
+        http_status: Option<u16>,
+        usage: Option<&CompletionUsage>,
+    ) -> Result<Option<String>> {
+        if let Some(attempt_id) = provider_attempt_id {
+            let run = self.store.finish_provider_attempt(
+                attempt_id,
+                certainty,
+                http_status,
+                usage.cloned(),
+            )?;
+            let mut state = self.state.lock();
+            state.usage = run.aggregates.usage;
+            state.complete = run.aggregates.usage_complete;
+            state.pending_requests = run.aggregates.usage_pending_requests;
+            state.stop = match run.stop_cause {
+                Some(RunStopCause::TokenCeiling) => {
+                    self.max_total_tokens.map(|ceiling| RunTokenStop::Reached {
+                        consumed: state.usage.total_tokens,
+                        ceiling,
+                    })
+                }
+                Some(RunStopCause::TokenAccountingUnavailable) => self
+                    .max_total_tokens
+                    .map(|ceiling| RunTokenStop::UsageUnavailable { ceiling }),
+                Some(RunStopCause::ProviderQuota) => {
+                    self.max_provider_requests
+                        .map(|ceiling| RunTokenStop::RequestCeiling {
+                            consumed: state.usage.requests,
+                            ceiling,
+                        })
+                }
+                _ => None,
+            };
+            return Ok(state.stop.map(RunTokenStop::message));
+        }
         {
             let mut state = self.state.lock();
             state.pending_requests = state.pending_requests.saturating_sub(1);
@@ -558,6 +668,16 @@ impl RunUsageTracker {
                                     consumed: state.usage.total_tokens,
                                     ceiling,
                                 });
+                            }
+                        }
+                        if state.stop.is_none() {
+                            if let Some(ceiling) = self.max_provider_requests {
+                                if state.usage.requests >= ceiling {
+                                    state.stop = Some(RunTokenStop::RequestCeiling {
+                                        consumed: state.usage.requests,
+                                        ceiling,
+                                    });
+                                }
                             }
                         }
                     } else if let Some(ceiling) = self.max_total_tokens {
@@ -754,12 +874,58 @@ pub struct AgentHostHandle {
     /// through `grokptah_home()`. Shared by all host clones.
     runtime_home: crate::discover::RuntimeHome,
     _runtime_home_context: Arc<crate::discover::RuntimeHomeContext>,
+    #[cfg(test)]
+    desktop_admission_cutpoint: Arc<Mutex<Option<DesktopAdmissionCutpoint>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DesktopAdmissionCutpoint {
+    AfterRouteCapture,
+    AfterValidation,
+    BeforePersist,
+    AfterPersistBeforeSessionCommit,
+    LedgerUnavailable,
+    FenceCloseSession,
+    FenceRebindAgent,
+    FenceChangeModel,
+    FenceChangeSpec,
+    FenceStealReservation,
+}
+
+struct SessionAgentBinding {
+    agent: AgentRecord,
+    created_new: bool,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExternalRunContext {
     pub run_id: String,
     pub execution_mode: RunExecutionMode,
+}
+
+struct DesktopTurnSnapshot {
+    fence: AdmissionFence,
+    cwd: PathBuf,
+    model: String,
+    effort: EffortLevel,
+    plan_mode: bool,
+    kind: SessionKind,
+    execution_mode: RunExecutionMode,
+    event_tx: crate::event_bus::EventBus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdmissionFence {
+    token: u64,
+    cwd: PathBuf,
+    model: String,
+    agent_id: Option<String>,
+    spec_revision: Option<u64>,
+    plan_mode: bool,
+    kind: SessionKind,
+    execution_mode: RunExecutionMode,
+    reservation_owner: Option<String>,
 }
 
 pub struct AgentHost;
@@ -905,6 +1071,7 @@ impl AgentHost {
             turn_cancels: HashMap::new(),
             turn_generations: HashMap::new(),
             next_turn_generation: 0,
+            admission_fences: HashMap::new(),
             computer_agent_operations: HashMap::new(),
             computer_agent_qualifications: HashMap::new(),
             turn_reservations: HashMap::new(),
@@ -936,6 +1103,8 @@ impl AgentHost {
             _instance_lock: instance_lock,
             runtime_home,
             _runtime_home_context: runtime_home_context,
+            #[cfg(test)]
+            desktop_admission_cutpoint: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -950,6 +1119,32 @@ impl AgentHostHandle {
         let session = self.provider_observation.as_ref()?;
         let tracker = self.run_usage_trackers.lock().get(&session_id).cloned()?;
         session.context(tracker.run_id(), session_id).ok()
+    }
+
+    fn active_run_provider_route(&self, session_id: Uuid) -> Result<Option<ProviderRouteSnapshot>> {
+        let tracker = self.run_usage_trackers.lock().get(&session_id).cloned();
+        let Some(tracker) = tracker else {
+            if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_none()
+                && self.inner.lock().turn_cancels.contains_key(&session_id)
+            {
+                bail!("active turn has no durable provider route yet");
+            }
+            return Ok(None);
+        };
+        let run = tracker
+            .store
+            .load_run(tracker.run_id())?
+            .ok_or_else(|| anyhow!("active Run disappeared while resolving its provider route"))?;
+        match run.provider_route {
+            Some(route) => {
+                route
+                    .validate()
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                Ok(Some(route))
+            }
+            None if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() => Ok(None),
+            None => bail!("active Build Run has no immutable provider route snapshot"),
+        }
     }
 
     pub fn take_event_receiver(&self) -> Option<crate::event_bus::EventReceiver> {
@@ -1244,6 +1439,33 @@ impl AgentHostHandle {
     /// session owns the binding, while the orchestration store owns lifecycle
     /// state; this keeps transport adapters from inventing identity.
     pub fn ensure_session_agent(&self, session_id: Uuid) -> Result<AgentRecord> {
+        Ok(self.session_agent_binding(session_id, true)?.agent)
+    }
+
+    fn prepare_session_agent(&self, session_id: Uuid) -> Result<(AgentRecord, bool)> {
+        let binding = self.session_agent_binding(session_id, false)?;
+        Ok((binding.agent, binding.created_new))
+    }
+
+    fn bind_session_agent_id(&self, session_id: Uuid, agent_id: &str) -> Result<()> {
+        let session = {
+            let mut g = self.inner.lock();
+            let session = g
+                .sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            session.agent_id = Some(agent_id.to_string());
+            session.clone()
+        };
+        session_store::save_session_meta(&session)
+            .map_err(|error| anyhow!("failed to persist session agent binding: {error:#}"))
+    }
+
+    fn session_agent_binding(
+        &self,
+        session_id: Uuid,
+        persist_new: bool,
+    ) -> Result<SessionAgentBinding> {
         let (cwd, model, kind, existing_id, authority, default_bounds) = {
             let g = self.inner.lock();
             let selected_model = g.model.clone();
@@ -1301,12 +1523,12 @@ impl AgentHostHandle {
             .clone()
             .unwrap_or_else(|| format!("agent-{session_id}"));
         let now = Utc::now();
-        let mut agent = match store.load_agent(&agent_id)? {
+        let (mut agent, created_new) = match store.load_agent(&agent_id)? {
             Some(agent) => {
                 if !agent.known_lane_ids().contains(&session_id) || agent.workspace != workspace {
                     bail!("session is bound to a different persistent agent workspace");
                 }
-                agent
+                (agent, false)
             }
             None => {
                 let mut spec =
@@ -1315,31 +1537,34 @@ impl AgentHostHandle {
                 spec.default_run_bounds = default_bounds;
                 spec.validate()
                     .map_err(|error| anyhow!(error.to_string()))?;
-                AgentRecord {
-                    agent_id: agent_id.clone(),
-                    owner_principal_id: None,
-                    session_id,
-                    lane_ids: vec![session_id],
-                    lane_associations: vec![AgentLaneAssociation {
-                        lane_id: session_id,
-                        source_workspace: workspace.clone(),
-                        attached_at: now,
-                        attached_by: "desktop".into(),
-                        detached_at: None,
-                        detached_by: None,
-                    }],
-                    workspace: workspace.clone(),
-                    model: model.clone(),
-                    spec: Some(spec),
-                    state: AgentState::Waiting,
-                    current_run_id: None,
-                    last_run_id: None,
-                    last_lane_id: Some(session_id),
-                    latest_checkpoint_id: None,
-                    continuation_ordinal: 0,
-                    created_at: now,
-                    updated_at: now,
-                }
+                (
+                    AgentRecord {
+                        agent_id: agent_id.clone(),
+                        owner_principal_id: None,
+                        session_id,
+                        lane_ids: vec![session_id],
+                        lane_associations: vec![AgentLaneAssociation {
+                            lane_id: session_id,
+                            source_workspace: workspace.clone(),
+                            attached_at: now,
+                            attached_by: "desktop".into(),
+                            detached_at: None,
+                            detached_by: None,
+                        }],
+                        workspace: workspace.clone(),
+                        model: model.clone(),
+                        spec: Some(spec),
+                        state: AgentState::Waiting,
+                        current_run_id: None,
+                        last_run_id: None,
+                        last_lane_id: Some(session_id),
+                        latest_checkpoint_id: None,
+                        continuation_ordinal: 0,
+                        created_at: now,
+                        updated_at: now,
+                    },
+                    true,
+                )
             }
         };
         let was_associated = agent.known_lane_ids().contains(&session_id);
@@ -1361,26 +1586,16 @@ impl AgentHostHandle {
         }
         if association_changed {
             agent.updated_at = now;
-            store.save_agent(&agent)?;
         }
-        if store.load_agent(&agent_id)?.is_none() {
-            store.save_agent(&agent)?;
-        }
-        if existing_id.is_none() {
-            let session = {
-                let mut g = self.inner.lock();
-                let session = g
-                    .sessions
-                    .get_mut(&session_id)
-                    .ok_or_else(|| anyhow!("unknown session"))?;
-                session.agent_id = Some(agent_id.clone());
-                session.clone()
-            };
-            if let Err(error) = session_store::save_session_meta(&session) {
-                bail!("failed to persist session agent binding: {error:#}");
+        if persist_new {
+            if association_changed || created_new {
+                store.save_agent(&agent)?;
+            }
+            if existing_id.is_none() {
+                self.bind_session_agent_id(session_id, &agent_id)?;
             }
         }
-        Ok(agent)
+        Ok(SessionAgentBinding { agent, created_new })
     }
 
     /// Attach an existing Build session to a durable Agent identity.
@@ -2204,21 +2419,88 @@ impl AgentHostHandle {
 
     /// Read desktop-visible runs for one session. Session scoping prevents a
     /// local inspector from displaying another workspace's coordinator data.
-    pub fn list_session_runs(&self, session_id: Uuid) -> Result<Vec<RunRecord>> {
+    #[allow(dead_code)] // crate-private raw RunRecord helper; product APIs use PublicRun.
+    pub(crate) fn list_session_runs(&self, session_id: Uuid) -> Result<Vec<RunRecord>> {
         let store = self.ensure_orchestration_store()?;
-        Ok(store
-            .list_runs()?
-            .into_iter()
-            .filter(|run| run.session_id == session_id)
-            .collect())
+        store.list_runs_for_session(session_id, None)
     }
 
     /// Read one run only when it belongs to the requested session.
-    pub fn get_session_run(&self, session_id: Uuid, run_id: &str) -> Result<Option<RunRecord>> {
+    pub(crate) fn get_session_run(
+        &self,
+        session_id: Uuid,
+        run_id: &str,
+    ) -> Result<Option<RunRecord>> {
         let store = self.ensure_orchestration_store()?;
         Ok(store
             .load_run(run_id)?
             .filter(|run| run.session_id == session_id))
+    }
+
+    /// Project one persisted session Run onto the public allowlist.
+    pub(crate) fn project_public_session_run(&self, mut run: RunRecord) -> Result<PublicRun> {
+        let store = self.ensure_orchestration_store()?;
+        run.queue_position = self.orchestration_pending_position(&run.run_id);
+        crate::orchestration::project_public_run(&store, &run)
+            .map_err(|error| anyhow!(error.to_string()))
+    }
+
+    /// Promote through the shared public Run projection.
+    pub fn promote_public_session_run(
+        &self,
+        session_id: Uuid,
+        run_id: &str,
+        approval_id: Option<&str>,
+    ) -> Result<PublicRun> {
+        self.project_public_session_run(self.promote_run_with_approval(
+            session_id,
+            run_id,
+            approval_id,
+        )?)
+    }
+
+    /// Discard through the shared public Run projection.
+    pub fn discard_public_session_run(&self, session_id: Uuid, run_id: &str) -> Result<PublicRun> {
+        self.project_public_session_run(self.discard_run(session_id, run_id)?)
+    }
+
+    /// Desktop-visible Runs for one session, using the shared public projection.
+    pub fn list_public_session_runs(&self, session_id: Uuid) -> Result<Vec<PublicRun>> {
+        Ok(self
+            .list_public_session_runs_page(session_id, None, None)?
+            .runs)
+    }
+
+    pub fn list_public_session_runs_page(
+        &self,
+        session_id: Uuid,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<crate::orchestration::PublicRunPage> {
+        let store = self.ensure_orchestration_store()?;
+        let page = store.list_runs_for_session_page(session_id, None, cursor, limit)?;
+        let runs = page
+            .runs
+            .into_iter()
+            .map(|run| self.project_public_session_run(run))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(crate::orchestration::PublicRunPage {
+            runs,
+            total_count: page.total_count,
+            truncated: page.truncated,
+            next_cursor: page.next_cursor,
+        })
+    }
+
+    /// One desktop-visible Run, using the shared public projection.
+    pub fn get_public_session_run(
+        &self,
+        session_id: Uuid,
+        run_id: &str,
+    ) -> Result<Option<PublicRun>> {
+        self.get_session_run(session_id, run_id)?
+            .map(|run| self.project_public_session_run(run))
+            .transpose()
     }
 
     /// Read the bounded journal range belonging to one durable run.
@@ -2245,12 +2527,30 @@ impl AgentHostHandle {
                 && entry.seq >= start_seq
                 && run.end_seq.map(|end| entry.seq <= end).unwrap_or(true)
         });
+        crate::orchestration::scrub_route_secret_needles(&mut page, run.provider_route.as_ref())
+            .map_err(|error| anyhow!(error.message))?;
         Ok(page)
     }
 
     /// Read the bounded Git diff for an isolated terminal run.
+    ///
+    /// This is the exact reviewed scope used by desktop approval matching.
+    /// Display surfaces that leave the host must use [`Self::review_public_run`].
     pub fn review_run(&self, session_id: Uuid, run_id: &str) -> Result<RunReview> {
         self.review_run_internal(session_id, run_id, true)
+    }
+
+    /// Public review payload: same Git scope as [`Self::review_run`], with this
+    /// Run's provider-route needles redacted from paths and the diff.
+    pub fn review_public_run(&self, session_id: Uuid, run_id: &str) -> Result<RunReview> {
+        let mut review = self.review_run(session_id, run_id)?;
+        let store = self.ensure_orchestration_store()?;
+        let Some(run) = store.load_run(run_id)? else {
+            return Ok(review);
+        };
+        crate::orchestration::scrub_route_secret_needles(&mut review, run.provider_route.as_ref())
+            .map_err(|error| anyhow!(error.message))?;
+        Ok(review)
     }
 
     /// Inspect an isolated run without granting the desktop-only in-memory
@@ -2309,14 +2609,15 @@ impl AgentHostHandle {
     /// Promote an explicitly reviewed isolated run into its original clean
     /// source workspace. Repeated calls are idempotent when the final
     /// fingerprint is already present in the source workspace.
-    pub fn promote_run(&self, session_id: Uuid, run_id: &str) -> Result<RunRecord> {
+    #[allow(dead_code)] // crate-private raw RunRecord helper; product APIs use PublicRun.
+    pub(crate) fn promote_run(&self, session_id: Uuid, run_id: &str) -> Result<RunRecord> {
         self.promote_run_with_approval(session_id, run_id, None)
     }
 
     /// Promote a run using a persisted, exact-scope approval. Unlike the
     /// desktop-only review marker, this survives restart and is revalidated
     /// against the current worktree immediately before Git is changed.
-    pub fn promote_run_with_approval(
+    pub(crate) fn promote_run_with_approval(
         &self,
         session_id: Uuid,
         run_id: &str,
@@ -2423,7 +2724,7 @@ impl AgentHostHandle {
     }
 
     /// Explicitly discard an isolated run's managed worktree.
-    pub fn discard_run(&self, session_id: Uuid, run_id: &str) -> Result<RunRecord> {
+    pub(crate) fn discard_run(&self, session_id: Uuid, run_id: &str) -> Result<RunRecord> {
         self.with_promotion_lock(run_id, || {
             let store = self.ensure_orchestration_store()?;
             let run = store
@@ -2464,34 +2765,362 @@ impl AgentHostHandle {
         result
     }
 
+    fn inspect_turn_slot(
+        &self,
+        session_id: Uuid,
+        reservation_owner: Option<&str>,
+        external_agent_spec: Option<&AgentSpec>,
+        persistent_agent: Option<&AgentRecord>,
+        external_provider_route: Option<&ProviderRouteSnapshot>,
+    ) -> Result<DesktopTurnSnapshot> {
+        let mut g = self.inner.lock();
+        if !g.running {
+            bail!("agent not started");
+        }
+        if g.turn_cancels.contains_key(&session_id) {
+            bail!("session already has an active turn");
+        }
+        match reservation_owner {
+            Some(owner)
+                if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner) => {}
+            Some(_) => bail!("missing or mismatched turn reservation"),
+            None if g.turn_reservations.contains_key(&session_id) => {
+                bail!("session already has an active turn");
+            }
+            None => {}
+        }
+        let model = if let Some(spec) = external_agent_spec {
+            spec.model.selection_key.clone()
+        } else {
+            persistent_agent
+                .map(|agent| {
+                    agent
+                        .current_spec()
+                        .map(|spec| spec.model.selection_key.clone())
+                        .map_err(|error| anyhow!(error.to_string()))
+                })
+                .transpose()?
+                .unwrap_or_else(|| g.model.clone())
+        };
+        let effort = external_provider_route
+            .map(|route| route.effort)
+            .unwrap_or(g.effort);
+        let (cwd, plan_mode, kind, execution_mode) = {
+            let session = g
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?;
+            (
+                session.cwd.clone(),
+                session.plan_mode,
+                session.kind,
+                session.execution_mode,
+            )
+        };
+        g.next_turn_generation += 1;
+        let fence = AdmissionFence {
+            token: g.next_turn_generation,
+            cwd: cwd.clone(),
+            model: model.clone(),
+            agent_id: persistent_agent.map(|agent| agent.agent_id.clone()),
+            spec_revision: persistent_agent
+                .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision)),
+            plan_mode,
+            kind,
+            execution_mode,
+            reservation_owner: reservation_owner.map(str::to_string),
+        };
+        g.admission_fences.insert(session_id, fence.clone());
+        Ok(DesktopTurnSnapshot {
+            fence,
+            cwd,
+            model,
+            effort,
+            plan_mode,
+            kind,
+            execution_mode,
+            event_tx: g.event_tx.clone(),
+        })
+    }
+
+    fn validate_admission_fence(
+        g: &Inner,
+        session_id: Uuid,
+        snapshot: &DesktopTurnSnapshot,
+        reservation_owner: Option<&str>,
+    ) -> Result<()> {
+        let current_fence = g
+            .admission_fences
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("admission fence is missing"))?;
+        if current_fence != &snapshot.fence {
+            bail!("admission fence does not match inspect snapshot");
+        }
+        let session = g
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        if session.cwd != snapshot.fence.cwd
+            || snapshot.model != snapshot.fence.model
+            || session.plan_mode != snapshot.fence.plan_mode
+            || session.kind != snapshot.fence.kind
+            || session.execution_mode != snapshot.fence.execution_mode
+        {
+            bail!("session identity changed after inspect");
+        }
+        if session.agent_id.is_some() && session.agent_id != snapshot.fence.agent_id {
+            bail!("session agent rebinding after inspect");
+        }
+        if snapshot.fence.spec_revision.is_none() && g.model != snapshot.fence.model {
+            bail!("model changed after inspect");
+        }
+        match reservation_owner {
+            Some(owner)
+                if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner)
+                    && snapshot.fence.reservation_owner.as_deref() == Some(owner) => {}
+            Some(_) => bail!("missing or mismatched turn reservation"),
+            None if g.turn_reservations.contains_key(&session_id)
+                || snapshot.fence.reservation_owner.is_some() =>
+            {
+                bail!("session already has an active turn");
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn preflight_admission_fence(
+        &self,
+        session_id: Uuid,
+        reservation_owner: Option<&str>,
+        snapshot: &DesktopTurnSnapshot,
+    ) -> Result<()> {
+        if let (Some(agent_id), Some(expected_revision)) = (
+            snapshot.fence.agent_id.as_deref(),
+            snapshot.fence.spec_revision,
+        ) {
+            if let Some(store) = self.orchestration_store() {
+                if let Some(agent) = store.load_agent(agent_id)? {
+                    let revision = agent
+                        .current_spec()
+                        .map_err(|error| anyhow!(error.to_string()))?
+                        .revision;
+                    if revision != expected_revision {
+                        bail!("agent specification changed after inspect");
+                    }
+                    let selection_key = agent
+                        .current_spec()
+                        .map_err(|error| anyhow!(error.to_string()))?
+                        .model
+                        .selection_key
+                        .clone();
+                    if selection_key != snapshot.fence.model {
+                        bail!("agent model changed after inspect");
+                    }
+                }
+            }
+        }
+        let g = self.inner.lock();
+        Self::validate_admission_fence(&g, session_id, snapshot, reservation_owner)
+    }
+
+    fn commit_admitted_turn(
+        &self,
+        session_id: Uuid,
+        reservation_owner: Option<&str>,
+        snapshot: &DesktopTurnSnapshot,
+        effective_max_rounds: Option<u32>,
+        prompt: &str,
+        defer_resume_transcript: bool,
+    ) -> Result<CancellationToken> {
+        let mut g = self.inner.lock();
+        if !g.running {
+            bail!("agent not started");
+        }
+        if g.turn_cancels.contains_key(&session_id) {
+            bail!("session already has an active turn");
+        }
+        Self::validate_admission_fence(&g, session_id, snapshot, reservation_owner)?;
+        match reservation_owner {
+            Some(owner)
+                if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner)
+                    && snapshot.fence.reservation_owner.as_deref() == Some(owner) =>
+            {
+                g.turn_reservations.remove(&session_id);
+                g.drain_reservations.remove(&session_id);
+            }
+            Some(_) => bail!("missing or mismatched turn reservation"),
+            None if g.turn_reservations.contains_key(&session_id)
+                || snapshot.fence.reservation_owner.is_some() =>
+            {
+                bail!("session already has an active turn");
+            }
+            None => {}
+        }
+        g.admission_fences.remove(&session_id);
+        let cancel = CancellationToken::new();
+        g.turn_cancels.insert(session_id, cancel.clone());
+        g.begin_turn_generation(session_id);
+        if let Some(n) = effective_max_rounds {
+            g.turn_max_rounds.insert(session_id, n.max(1));
+        } else {
+            g.turn_max_rounds.remove(&session_id);
+        }
+        g.active_session = Some(session_id);
+        let session = g
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow!("unknown session"))?;
+        session.model = snapshot.model.clone();
+        session.effort = snapshot.effort;
+        if !defer_resume_transcript {
+            session
+                .transcript
+                .push(TranscriptEntry::user(prompt.to_string()));
+            if session.title == "New session" || session.title == "New chat" {
+                session.title = prompt.chars().take(48).collect();
+            }
+        }
+        session.updated_at = Utc::now();
+        Ok(cancel)
+    }
+
+    fn map_desktop_admission_error(error: anyhow::Error) -> anyhow::Error {
+        if let Some(orch) = error.downcast_ref::<crate::orchestration::OrchError>() {
+            return anyhow!(orch.clone());
+        }
+        error
+    }
+
+    fn require_durable_admission(outcome: crate::orchestration::DurableAdmission) -> Result<()> {
+        match outcome {
+            crate::orchestration::DurableAdmission::Committed => Ok(()),
+            crate::orchestration::DurableAdmission::DefinitelyNotCommitted(error) => Err(error),
+            crate::orchestration::DurableAdmission::Uncertain(error) => {
+                Err(crate::orchestration::UncertainAdmission(error).into())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_admission_cutpoint(
+        &self,
+        expected: DesktopAdmissionCutpoint,
+        message: &str,
+    ) -> Result<()> {
+        if self
+            .desktop_admission_cutpoint
+            .lock()
+            .as_ref()
+            .is_some_and(|cutpoint| *cutpoint == expected)
+        {
+            *self.desktop_admission_cutpoint.lock() = None;
+            bail!(message.to_string());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn inject_fence_race(&self, session_id: Uuid) -> Result<()> {
+        let cut = *self.desktop_admission_cutpoint.lock();
+        let Some(cut) = cut else {
+            return Ok(());
+        };
+        match cut {
+            DesktopAdmissionCutpoint::FenceCloseSession => {
+                *self.desktop_admission_cutpoint.lock() = None;
+                self.inner.lock().sessions.remove(&session_id);
+            }
+            DesktopAdmissionCutpoint::FenceRebindAgent => {
+                *self.desktop_admission_cutpoint.lock() = None;
+                if let Some(session) = self.inner.lock().sessions.get_mut(&session_id) {
+                    session.agent_id = Some("rebound-agent".into());
+                }
+            }
+            DesktopAdmissionCutpoint::FenceChangeModel => {
+                *self.desktop_admission_cutpoint.lock() = None;
+                let mut g = self.inner.lock();
+                g.model = "fence-model-race".into();
+                if let Some(fence) = g.admission_fences.get_mut(&session_id) {
+                    fence.model = "fence-model-race".into();
+                }
+            }
+            DesktopAdmissionCutpoint::FenceChangeSpec => {
+                *self.desktop_admission_cutpoint.lock() = None;
+                let agent_id = self
+                    .inner
+                    .lock()
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|session| session.agent_id.clone());
+                if let Some(agent_id) = agent_id {
+                    let store = self.ensure_orchestration_store()?;
+                    store
+                        .revise_agent_spec(&agent_id, "fence-race", |spec| {
+                            spec.role = "fence-race".into();
+                            Ok(())
+                        })
+                        .map_err(|error| anyhow!(error))?;
+                }
+            }
+            DesktopAdmissionCutpoint::FenceStealReservation => {
+                *self.desktop_admission_cutpoint.lock() = None;
+                self.inner
+                    .lock()
+                    .turn_reservations
+                    .insert(session_id, "thief".into());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)] // Keeps durable run identity inputs explicit.
-    fn begin_desktop_run(
+    fn admit_desktop_build_run(
         &self,
         session_id: Uuid,
         cwd: &Path,
         prompt: &str,
-        bounds: RunBounds,
+        mut bounds: RunBounds,
         start_seq: u64,
         turn_id: Uuid,
-        execution: Option<RunExecution>,
+        provider_route: Option<ProviderRouteSnapshot>,
         agent_id: Option<String>,
         agent_spec_revision: Option<u64>,
         parent_run_id: Option<String>,
         continuation: Option<&AgentContinuationPlan>,
-    ) -> Option<(String, OrchStore)> {
-        let store = match self.ensure_orchestration_store() {
-            Ok(store) => store,
-            Err(error) => {
-                eprintln!("[grokptah] desktop run ledger unavailable: {error:#}");
-                return None;
-            }
-        };
+        pending_agent: Option<&AgentRecord>,
+    ) -> Result<(String, OrchStore)> {
+        #[cfg(test)]
+        self.fail_admission_cutpoint(
+            DesktopAdmissionCutpoint::LedgerUnavailable,
+            "desktop run ledger unavailable",
+        )?;
+        #[cfg(test)]
+        self.fail_admission_cutpoint(
+            DesktopAdmissionCutpoint::BeforePersist,
+            "injected persist fault",
+        )?;
+        let store = self
+            .ensure_orchestration_store()
+            .map_err(|error| anyhow!("desktop run ledger unavailable: {error:#}"))?;
         let run_id = format!("desktop-{turn_id}");
         let now = Utc::now();
         let durable_workspace = dunce::canonicalize(cwd)
             .unwrap_or_else(|_| cwd.to_path_buf())
             .display()
             .to_string();
+        if bounds.max_total_tokens.is_none() {
+            bounds.max_total_tokens = Some(DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS);
+        }
+        let provider_route = match provider_route {
+            Some(route) => Some(
+                route
+                    .bind_quota(QuotaClass::CodingExecution, format!("quota-{run_id}"))
+                    .map_err(|error| Self::map_desktop_admission_error(anyhow!(error)))?,
+            ),
+            None => None,
+        };
         let run = RunRecord {
             run_id: run_id.clone(),
             session_id,
@@ -2500,6 +3129,7 @@ impl AgentHostHandle {
             client_id: Some("desktop".into()),
             state: RunState::Running,
             purpose: RunPurpose::Execution,
+            provider_route,
             agent_id: agent_id.clone(),
             retry_of: None,
             parent_run_id,
@@ -2526,18 +3156,67 @@ impl AgentHostHandle {
             stop_cause: None,
             aggregates: RunAggregates::default(),
             progress: None,
-            execution,
+            execution: None,
             approval: None,
         };
-        let persisted = match agent_id.as_deref() {
-            Some(agent_id) => store.save_run_and_activate_agent(&run, agent_id),
-            None => store.save_run(&run),
+        let reservation = match run.provider_route.as_ref() {
+            Some(_) => Some(
+                QuotaReservation::for_run(
+                    &run,
+                    crate::native_coding_readiness::DESKTOP_OWNER_ID,
+                    QuotaLimits::default(),
+                    now,
+                )
+                .map_err(|error| Self::map_desktop_admission_error(anyhow!(error)))?,
+            ),
+            None => None,
         };
-        if let Err(error) = persisted {
-            eprintln!("[grokptah] desktop run {run_id} start persistence failed: {error:#}");
-            return None;
+        let persisted = match (agent_id.as_deref(), reservation.as_ref()) {
+            (Some(agent_id), Some(reservation)) => store
+                .admit_run_and_activate_agent_with_candidate(
+                    &run,
+                    agent_id,
+                    Some(reservation),
+                    pending_agent,
+                ),
+            (Some(agent_id), None) => store.admit_run_and_activate_agent_with_candidate(
+                &run,
+                agent_id,
+                None,
+                pending_agent,
+            ),
+            (None, Some(reservation)) => store.admit_run_with_quota(&run, reservation),
+            (None, None) => store.admit_run(&run),
+        };
+        match persisted {
+            crate::orchestration::DurableAdmission::Committed => {}
+            crate::orchestration::DurableAdmission::DefinitelyNotCommitted(error) => {
+                return Err(Self::map_desktop_admission_error(error));
+            }
+            crate::orchestration::DurableAdmission::Uncertain(error) => {
+                return Err(Self::map_desktop_admission_error(
+                    crate::orchestration::UncertainAdmission(error).into(),
+                ));
+            }
         }
-        Some((run_id, store))
+        #[cfg(test)]
+        if self
+            .desktop_admission_cutpoint
+            .lock()
+            .as_ref()
+            .is_some_and(|cutpoint| {
+                *cutpoint == DesktopAdmissionCutpoint::AfterPersistBeforeSessionCommit
+            })
+        {
+            *self.desktop_admission_cutpoint.lock() = None;
+            Self::require_durable_admission(store.terminalize_unstarted_admission(
+                &run_id,
+                "admission_aborted",
+                "injected post-persist admission fault",
+            ))?;
+            bail!("injected post-persist admission fault");
+        }
+        Ok((run_id, store))
     }
 
     fn start_desktop_run_aggregator(
@@ -2961,6 +3640,7 @@ impl AgentHostHandle {
         self.invalidate_computer_agent_authority();
         let mut g = self.inner.lock();
         g.turn_generations.clear();
+        g.admission_fences.clear();
         for (_, c) in g.turn_cancels.drain() {
             c.cancel();
         }
@@ -3871,6 +4551,16 @@ impl AgentHostHandle {
 
     /// Async compact: model-backed summary when online, extractive offline.
     pub async fn compact_session_async(&self, id: Uuid) -> Result<SessionSummary> {
+        let provider_route = self.active_run_provider_route(id)?;
+        self.compact_session_async_routed(id, provider_route.as_ref())
+            .await
+    }
+
+    async fn compact_session_async_routed(
+        &self,
+        id: Uuid,
+        provider_route: Option<&ProviderRouteSnapshot>,
+    ) -> Result<SessionSummary> {
         self.ensure_session_accepts_new_work(id)?;
         self.ensure_transcript_loaded(id)?;
         const KEEP_RECENT: usize = 6;
@@ -3897,9 +4587,7 @@ impl AgentHostHandle {
 
         let quality = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
             None
-        } else if let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(&model)
-            .map_err(anyhow::Error::msg)?
-        {
+        } else if let Some(creds) = resolve_run_credentials(provider_route, &model)? {
             let blob = build_compact_summary(&leaving);
             let prompt = format!(
                 "Summarize this coding-agent conversation for future turns. \
@@ -3914,23 +4602,32 @@ impl AgentHostHandle {
             if !call_allowed {
                 None
             } else {
-                match call_xai_chat(
-                    &creds,
-                    &model,
-                    &[("user".into(), prompt)],
-                    None,
-                    &cwd,
-                    SessionKind::Build,
-                )
-                .await
-                {
+                let history = [("user".into(), prompt)];
+                let reply = match provider_route {
+                    Some(route) => {
+                        call_xai_chat_routed(
+                            &creds,
+                            route,
+                            &history,
+                            None,
+                            &cwd,
+                            SessionKind::Build,
+                        )
+                        .await
+                    }
+                    None => {
+                        call_xai_chat(&creds, &model, &history, None, &cwd, SessionKind::Build)
+                            .await
+                    }
+                };
+                match reply {
                     Ok(reply) => {
                         self.finish_provider_attempt(id, usage_attempt, reply.usage.as_ref())?;
                         (!reply.text.trim().is_empty())
                             .then(|| format!("LLM compact summary:\n{}", reply.text))
                     }
-                    Err(_) => {
-                        self.finish_provider_attempt(id, usage_attempt, None)?;
+                    Err(error) => {
+                        self.finish_provider_attempt_after_error(usage_attempt, &error)?;
                         None
                     }
                 }
@@ -4024,6 +4721,28 @@ impl AgentHostHandle {
     ///
     /// `#[doc(hidden)]` — for integration tests (not a product API).
     #[doc(hidden)]
+    #[cfg(test)]
+    pub(crate) fn set_desktop_admission_cutpoint(
+        &self,
+        cutpoint: Option<DesktopAdmissionCutpoint>,
+    ) {
+        *self.desktop_admission_cutpoint.lock() = cutpoint;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn turn_reservation_owner(&self, session_id: Uuid) -> Option<String> {
+        self.inner
+            .lock()
+            .turn_reservations
+            .get(&session_id)
+            .cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn session_has_turn_cancel(&self, session_id: Uuid) -> bool {
+        self.inner.lock().turn_cancels.contains_key(&session_id)
+    }
+
     pub fn test_only_panic_while_turn_busy(&self, session_id: Uuid) {
         let cancel = CancellationToken::new();
         {
@@ -4176,7 +4895,19 @@ impl AgentHostHandle {
             );
         }
         match attempt {
-            Some(attempt) => attempt.finish(usage),
+            Some(attempt) => attempt.finish(ProviderSendCertainty::KnownAccepted, None, usage),
+            None => Ok(None),
+        }
+    }
+
+    fn finish_provider_attempt_after_error(
+        &self,
+        attempt: Option<RunUsageAttempt>,
+        error: &anyhow::Error,
+    ) -> Result<Option<String>> {
+        let outcome = provider_dispatch_outcome(error);
+        match attempt {
+            Some(attempt) => attempt.finish(outcome.certainty, outcome.http_status, None),
             None => Ok(None),
         }
     }
@@ -4271,6 +5002,21 @@ impl AgentHostHandle {
     pub fn set_effort(&self, effort: EffortLevel) {
         self.inner.lock().effort = effort;
         self.persist_chrome();
+    }
+
+    pub(crate) fn current_effort(&self) -> EffortLevel {
+        self.inner.lock().effort
+    }
+
+    pub(crate) fn capture_provider_route(
+        &self,
+        model: &str,
+        effort: EffortLevel,
+    ) -> Result<ProviderRouteSnapshot> {
+        let credentials = crate::auth_store::resolve_wire_credentials_for_model(model)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
+        capture_provider_route_snapshot(&credentials, model, effort)
     }
 
     /// Single source of truth for global tool prompting (#113).
@@ -5507,6 +6253,25 @@ impl AgentHostHandle {
         Ok(found)
     }
 
+    pub fn current_provider_model_selection(&self) -> Option<(String, String)> {
+        let model = self.inner.lock().model.clone();
+        crate::gateway_config::parse_model_selection(&model)
+            .ok()
+            .map(|selection| (selection.provider_id, selection.model_id))
+    }
+
+    pub fn native_coding_readiness(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> crate::native_coding_readiness::NativeCodingReadinessProjection {
+        crate::native_coding_readiness::project_for_owner(
+            crate::native_coding_readiness::DESKTOP_OWNER_ID,
+            provider_id,
+            model_id,
+        )
+    }
+
     pub fn settings_snapshot(&self) -> serde_json::Value {
         // Reconcile legacy dual-control drift so UI never shows conflicting state (#113).
         {
@@ -5813,30 +6578,23 @@ impl AgentHostHandle {
     /// follows those steps (plan → execute pipeline).
     pub async fn accept_plan(&self, session_id: Uuid) -> Result<String> {
         self.ensure_session_accepts_new_work(session_id)?;
-        let (steps, goal) = {
-            let mut g = self.inner.lock();
+        let (steps, goal, prior_mode, prior_status) = {
+            let g = self.inner.lock();
             let s = g
                 .sessions
-                .get_mut(&session_id)
+                .get(&session_id)
                 .ok_or_else(|| anyhow!("unknown session"))?;
             if s.plan_steps.is_empty() {
                 bail!("no plan to accept");
             }
-            s.plan_mode = false;
-            s.plan_status = "accepted".into();
-            let steps = s.plan_steps.clone();
-            let goal = s
-                .plan_goal
-                .clone()
-                .unwrap_or_else(|| "complete the proposed plan".into());
-            let tx = g.event_tx.clone();
-            drop(g);
-            let _ = tx.send(SessionUpdate::Plan {
-                session_id,
-                steps: steps.clone(),
-                status: "accepted".into(),
-            });
-            (steps, goal)
+            (
+                s.plan_steps.clone(),
+                s.plan_goal
+                    .clone()
+                    .unwrap_or_else(|| "complete the proposed plan".into()),
+                s.plan_mode,
+                s.plan_status.clone(),
+            )
         };
 
         let mut numbered = String::new();
@@ -5849,16 +6607,21 @@ impl AgentHostHandle {
              Goal: {goal}\n\nPlan:\n{numbered}"
         );
 
-        {
-            let mut g = self.inner.lock();
-            if let Some(s) = g.sessions.get_mut(&session_id) {
-                s.plan_status = "executing".into();
+        let reply = match self.session_prompt(session_id, exec_prompt).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                let mut g = self.inner.lock();
+                if let Some(session) = g.sessions.get_mut(&session_id) {
+                    session.plan_mode = prior_mode;
+                    session.plan_status = prior_status;
+                }
+                return Err(error);
             }
-        }
-        let reply = self.session_prompt(session_id, exec_prompt).await?;
+        };
         {
             let mut g = self.inner.lock();
             if let Some(s) = g.sessions.get_mut(&session_id) {
+                s.plan_mode = false;
                 s.plan_status = "done".into();
             }
             let tx = g.event_tx.clone();
@@ -6876,12 +7639,19 @@ impl AgentHostHandle {
                 .ok_or_else(|| anyhow!("unknown session"))?
                 .kind;
             if kind == SessionKind::Build {
-                Some(self.ensure_session_agent(session_id)?)
+                let (agent, created_new) = self.prepare_session_agent(session_id)?;
+                Some((agent, created_new))
             } else {
                 None
             }
         };
-        let external_agent_spec = if let Some(external) = external_run.as_ref() {
+        let first_use_unpersisted = persistent_agent
+            .as_ref()
+            .is_some_and(|(_, created_new)| *created_new);
+        let persistent_agent = persistent_agent.map(|(agent, _)| agent);
+        let (external_agent_spec, external_provider_route) = if let Some(external) =
+            external_run.as_ref()
+        {
             let store = self.ensure_orchestration_store()?;
             let run = store
                 .load_run(&external.run_id)?
@@ -6902,13 +7672,25 @@ impl AgentHostHandle {
             if agent.current_spec()?.revision != revision {
                 bail!("persistent Agent specification changed before external turn start");
             }
-            Some(
-                store
-                    .load_agent_spec(&agent.agent_id, revision)?
-                    .ok_or_else(|| anyhow!("external Run Agent specification is missing"))?,
-            )
+            let spec = store
+                .load_agent_spec(&agent.agent_id, revision)?
+                .ok_or_else(|| anyhow!("external Run Agent specification is missing"))?;
+            let route = match run.provider_route.clone() {
+                Some(route) => {
+                    route
+                        .validate()
+                        .map_err(|error| anyhow!(error.to_string()))?;
+                    if route.selection_key != spec.model.selection_key {
+                        bail!("external Run provider route does not match its captured Agent specification");
+                    }
+                    Some(route)
+                }
+                None if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() => None,
+                None => bail!("external Run has no immutable provider route snapshot"),
+            };
+            (Some(spec), route)
         } else {
-            None
+            (None, None)
         };
         let agent_default_bounds = if let Some(spec) = external_agent_spec.as_ref() {
             Some(spec.default_run_bounds.clone())
@@ -6998,92 +7780,23 @@ impl AgentHostHandle {
             .as_ref()
             .map(|plan| plan.context.rendered_context.clone());
         let defer_resume_transcript = resume_context.is_some();
-        let (cwd, model, effort, plan_mode, kind, execution_mode, cancel, event_tx) = {
-            let mut g = self.inner.lock();
-            if !g.running {
-                bail!("agent not started");
-            }
-            // One in-flight turn per session (re-prompt while busy is an error).
-            if g.turn_cancels.contains_key(&session_id) {
-                bail!("session already has an active turn");
-            }
-            match reservation_owner {
-                Some(owner)
-                    if g.turn_reservations.get(&session_id).map(String::as_str) == Some(owner) =>
-                {
-                    g.turn_reservations.remove(&session_id);
-                    g.drain_reservations.remove(&session_id);
-                }
-                Some(_) => bail!("missing or mismatched turn reservation"),
-                None if g.turn_reservations.contains_key(&session_id) => {
-                    bail!("session already has an active turn");
-                }
-                None => {}
-            }
-            // Persistent Agent model selection is revisioned and must not
-            // drift with the currently focused desktop model.
-            let model = if let Some(spec) = external_agent_spec.as_ref() {
-                spec.model.selection_key.clone()
-            } else {
-                persistent_agent
-                    .as_ref()
-                    .map(|agent| {
-                        agent
-                            .current_spec()
-                            .map(|spec| spec.model.selection_key.clone())
-                            .map_err(|error| anyhow!(error.to_string()))
-                    })
-                    .transpose()?
-                    .unwrap_or_else(|| g.model.clone())
-            };
-            let effort = g.effort;
-            let cancel = CancellationToken::new();
-            g.turn_cancels.insert(session_id, cancel.clone());
-            g.begin_turn_generation(session_id);
-            if let Some(n) = effective_max_rounds {
-                g.turn_max_rounds.insert(session_id, n.max(1));
-            } else {
-                g.turn_max_rounds.remove(&session_id);
-            }
-            g.active_session = Some(session_id);
-            let event_tx = g.event_tx.clone();
-            let s = g
-                .sessions
-                .get_mut(&session_id)
-                .ok_or_else(|| anyhow!("unknown session"))?;
-            s.model = model.clone();
-            s.effort = effort;
-            if !defer_resume_transcript {
-                s.transcript.push(TranscriptEntry::user(prompt.clone()));
-                if s.title == "New session" || s.title == "New chat" {
-                    s.title = prompt.chars().take(48).collect();
-                }
-            }
-            s.updated_at = Utc::now();
-            (
-                s.cwd.clone(),
-                model,
-                effort,
-                s.plan_mode,
-                s.kind,
-                s.execution_mode,
-                cancel,
-                event_tx,
-            )
-        };
-        // RAII immediately after insert — before any fallible work — so a panic
-        // in persist_session cannot leave the session permanently busy.
-        let mut busy_guard = TurnBusyGuard {
-            host: self.clone(),
+        let snapshot = self.inspect_turn_slot(
             session_id,
-            armed: true,
-        };
-        // Durably append the user turn before the long model call.
-        self.persist_session(session_id);
-        let start_seq = event_tx.current_seq();
-        let usage_before = self.session_usage_snapshot(session_id);
-        let turn_id = Uuid::new_v4();
-        let agent = persistent_agent;
+            reservation_owner,
+            external_agent_spec.as_ref(),
+            persistent_agent.as_ref(),
+            external_provider_route.as_ref(),
+        )?;
+        #[cfg(test)]
+        self.inject_fence_race(session_id)?;
+        self.preflight_admission_fence(session_id, reservation_owner, &snapshot)?;
+        let cwd = snapshot.cwd.clone();
+        let model = snapshot.model.clone();
+        let effort = snapshot.effort;
+        let plan_mode = snapshot.plan_mode;
+        let kind = snapshot.kind;
+        let execution_mode = snapshot.execution_mode;
+        let event_tx = snapshot.event_tx.clone();
         let requested_execution_mode = external_run
             .as_ref()
             .map(|run| run.execution_mode)
@@ -7094,14 +7807,138 @@ impl AgentHostHandle {
         {
             bail!("isolated external execution is available only for Build sessions");
         }
+
+        // ── desktop Build admission (no session mutation) ──
+        let provider_route = match external_provider_route {
+            Some(route) => Some(route),
+            None if kind == SessionKind::Build
+                && std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_none() =>
+            {
+                let route = self.capture_provider_route(&model, effort)?;
+                #[cfg(test)]
+                self.fail_admission_cutpoint(
+                    DesktopAdmissionCutpoint::AfterRouteCapture,
+                    "injected capture fault",
+                )?;
+                crate::native_coding_readiness::validate_provider_route_for_purpose(
+                    &route,
+                    RunPurpose::Execution,
+                )?;
+                #[cfg(test)]
+                self.fail_admission_cutpoint(
+                    DesktopAdmissionCutpoint::AfterValidation,
+                    "injected validation fault",
+                )?;
+                Some(route)
+            }
+            None => None,
+        };
+        self.preflight_admission_fence(session_id, reservation_owner, &snapshot)?;
+        let turn_id = Uuid::new_v4();
+        let start_seq = event_tx.current_seq();
+        let agent = persistent_agent;
+        let pending_agent = first_use_unpersisted.then_some(agent.as_ref()).flatten();
+        let desktop_run = if external_run.is_none() && kind == SessionKind::Build {
+            let mut bounds = effective_agent_bounds.clone().unwrap_or_default();
+            if let Some(rounds) = effective_max_rounds {
+                bounds.max_rounds = bounds.max_rounds.min(rounds).max(1);
+            }
+            match self.admit_desktop_build_run(
+                session_id,
+                &cwd,
+                &prompt,
+                bounds,
+                start_seq,
+                turn_id,
+                provider_route.clone(),
+                agent.as_ref().map(|agent| agent.agent_id.clone()),
+                agent
+                    .as_ref()
+                    .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision)),
+                resume.as_ref().map(|plan| plan.parent_run_id.clone()),
+                resume.as_ref(),
+                pending_agent,
+            ) {
+                Ok(admitted) => Some(admitted),
+                Err(error) if resume.is_some() => {
+                    return Err(anyhow!(
+                        "persistent continuation could not create and activate its durable Run: {error}"
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        if resume.is_some() && desktop_run.is_none() {
+            bail!("persistent continuation could not create and activate its durable Run");
+        }
+        if first_use_unpersisted {
+            if let Some(agent) = agent.as_ref() {
+                if let Err(error) = self.bind_session_agent_id(session_id, &agent.agent_id) {
+                    if let Some((run_id, store)) = desktop_run.as_ref() {
+                        Self::require_durable_admission(store.terminalize_unstarted_admission(
+                            run_id,
+                            "session_bind_failed",
+                            &error.to_string(),
+                        ))?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        // ── session mutation after durable admission ──
+        let cancel = match self.commit_admitted_turn(
+            session_id,
+            reservation_owner,
+            &snapshot,
+            effective_max_rounds,
+            &prompt,
+            defer_resume_transcript,
+        ) {
+            Ok(cancel) => cancel,
+            Err(error) => {
+                if let Some((run_id, store)) = desktop_run.as_ref() {
+                    Self::require_durable_admission(store.terminalize_unstarted_admission(
+                        run_id,
+                        "session_commit_failed",
+                        &error.to_string(),
+                    ))?;
+                }
+                return Err(error);
+            }
+        };
+        // RAII immediately after insert — before any fallible work — so a panic
+        // in persist_session cannot leave the session permanently busy.
+        let mut busy_guard = TurnBusyGuard {
+            host: self.clone(),
+            session_id,
+            armed: true,
+        };
+        self.persist_session(session_id);
+        let usage_before = self.session_usage_snapshot(session_id);
         let run_execution = if kind == SessionKind::Build
             && requested_execution_mode == RunExecutionMode::IsolatedWorktree
         {
             let run_id = external_run
                 .as_ref()
                 .map(|run| run.run_id.clone())
+                .or_else(|| desktop_run.as_ref().map(|(run_id, _)| run_id.clone()))
                 .unwrap_or_else(|| format!("desktop-{turn_id}"));
-            let prepared = run_promotion::prepare(&cwd, &run_id)?;
+            let prepared = match run_promotion::prepare(&cwd, &run_id) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if let Some((run_id, store)) = desktop_run.as_ref() {
+                        Self::require_durable_admission(store.terminalize_unstarted_admission(
+                            run_id,
+                            "worktree_prepare_failed",
+                            &error.to_string(),
+                        ))?;
+                    }
+                    return Err(error);
+                }
+            };
             let execution = RunExecution {
                 mode: RunExecutionMode::IsolatedWorktree,
                 source_workspace: cwd.display().to_string(),
@@ -7112,16 +7949,22 @@ impl AgentHostHandle {
                 promotion_state: PromotionState::Preparing,
                 promoted_at: None,
             };
-            if let Some(external) = external_run.as_ref() {
-                let store = match self.ensure_orchestration_store() {
-                    Ok(store) => store,
+            let attach_store = if let Some((_, store)) = desktop_run.as_ref() {
+                Some(store.clone())
+            } else if external_run.is_some() {
+                match self.ensure_orchestration_store() {
+                    Ok(store) => Some(store),
                     Err(error) => {
                         let _ =
                             run_promotion::discard(&cwd, Path::new(&execution.execution_workspace));
                         return Err(error);
                     }
-                };
-                let updated = match store.update_run(&external.run_id, |run| {
+                }
+            } else {
+                None
+            };
+            if let Some(store) = attach_store {
+                let updated = match store.update_run(&run_id, |run| {
                     if run.session_id != session_id {
                         bail!("external run session does not match turn session");
                     }
@@ -7138,7 +7981,7 @@ impl AgentHostHandle {
                 };
                 if updated.is_none() {
                     let _ = run_promotion::discard(&cwd, Path::new(&execution.execution_workspace));
-                    bail!("external run disappeared before execution could be attached");
+                    bail!("run disappeared before execution could be attached");
                 }
             }
             Some(execution)
@@ -7149,32 +7992,6 @@ impl AgentHostHandle {
             .as_ref()
             .map(|execution| PathBuf::from(&execution.execution_workspace))
             .unwrap_or_else(|| cwd.clone());
-        let desktop_run = if external_run.is_none() && kind == SessionKind::Build {
-            let mut bounds = effective_agent_bounds.clone().unwrap_or_default();
-            if let Some(rounds) = effective_max_rounds {
-                bounds.max_rounds = bounds.max_rounds.min(rounds).max(1);
-            }
-            self.begin_desktop_run(
-                session_id,
-                &cwd,
-                &prompt,
-                bounds,
-                start_seq,
-                turn_id,
-                run_execution.clone(),
-                agent.as_ref().map(|agent| agent.agent_id.clone()),
-                agent
-                    .as_ref()
-                    .and_then(|agent| agent.current_spec().ok().map(|spec| spec.revision)),
-                resume.as_ref().map(|plan| plan.parent_run_id.clone()),
-                resume.as_ref(),
-            )
-        } else {
-            None
-        };
-        if resume.is_some() && desktop_run.is_none() {
-            bail!("persistent continuation could not create and activate its durable Run");
-        }
         if let Some(context) = resume_context.as_deref() {
             let mut g = self.inner.lock();
             let session = g
@@ -7199,9 +8016,24 @@ impl AgentHostHandle {
                 .ok_or_else(|| anyhow!("external run disappeared before token accounting"))?;
             Some(RunUsageTracker::from_run(store, &run))
         } else if let Some((run_id, store)) = desktop_run.as_ref() {
-            store
-                .load_run(run_id)?
-                .map(|run| RunUsageTracker::from_run(store.clone(), &run))
+            match store.load_run(run_id) {
+                Ok(Some(run)) => Some(RunUsageTracker::from_run(store.clone(), &run)),
+                other => {
+                    let detail = match other {
+                        Ok(None) => {
+                            "admitted Run disappeared before tracker construction".to_string()
+                        }
+                        Err(error) => error.to_string(),
+                        Ok(Some(_)) => unreachable!(),
+                    };
+                    Self::require_durable_admission(store.terminalize_unstarted_admission(
+                        run_id,
+                        "run_reload_failed",
+                        &detail,
+                    ))?;
+                    bail!("{detail}");
+                }
+            }
         } else {
             None
         };
@@ -7223,6 +8055,7 @@ impl AgentHostHandle {
             &execution_cwd,
             &model,
             effort,
+            provider_route.as_ref(),
             plan_mode,
             kind,
             &prompt,
@@ -7532,6 +8365,7 @@ impl AgentHostHandle {
         cwd: &Path,
         model: &str,
         effort: EffortLevel,
+        provider_route: Option<&ProviderRouteSnapshot>,
         plan_mode: bool,
         kind: SessionKind,
         prompt: &str,
@@ -7609,9 +8443,7 @@ impl AgentHostHandle {
             let mut plan_token_stop = None;
             let steps = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
                 offline_plan_steps(&goal)
-            } else if let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(model)
-                .map_err(anyhow::Error::msg)?
-            {
+            } else if let Some(creds) = resolve_run_credentials(provider_route, model)? {
                 let usage_attempt = match self.begin_provider_attempt(session_id).await {
                     Ok(attempt) => attempt,
                     Err(error) => {
@@ -7625,7 +8457,16 @@ impl AgentHostHandle {
                 if plan_token_stop.is_some() {
                     offline_plan_steps(&goal)
                 } else {
-                    match propose_plan_with_model(&creds, model, cwd, &goal, &cancel).await {
+                    match propose_plan_with_model(
+                        &creds,
+                        model,
+                        provider_route,
+                        cwd,
+                        &goal,
+                        &cancel,
+                    )
+                    .await
+                    {
                         Ok((steps, usage)) if !steps.is_empty() => {
                             plan_token_stop = self.finish_provider_attempt(
                                 session_id,
@@ -7644,7 +8485,7 @@ impl AgentHostHandle {
                         }
                         Err(e) => {
                             plan_token_stop =
-                                self.finish_provider_attempt(session_id, usage_attempt, None)?;
+                                self.finish_provider_attempt_after_error(usage_attempt, &e)?;
                             let mut s = offline_plan_steps(&goal);
                             s.insert(0, format!("(model plan fallback: {e})"));
                             s
@@ -7734,7 +8575,9 @@ impl AgentHostHandle {
                             .map(|s| s.transcript.len())
                             .unwrap_or(0)
                     };
-                    let _ = self.compact_session_async(session_id).await?;
+                    let _ = self
+                        .compact_session_async_routed(session_id, provider_route)
+                        .await?;
                     let after = {
                         let g = self.inner.lock();
                         g.sessions
@@ -7932,7 +8775,14 @@ impl AgentHostHandle {
                         args.join(" ")
                     };
                     let summary = self
-                        .run_explore_subagent(session_id, cwd, &query, &cancel, &event_tx)
+                        .run_explore_subagent(
+                            session_id,
+                            cwd,
+                            &query,
+                            &cancel,
+                            &event_tx,
+                            provider_route,
+                        )
                         .await?;
                     emit_message(&event_tx, session_id, &summary);
                     push_assistant(self, session_id, &summary);
@@ -7950,9 +8800,9 @@ impl AgentHostHandle {
         }
 
         // ── Real multi-step coding agent (tool-calling loop) ─────────────
-        let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(model)
-            .map_err(anyhow::Error::msg)?
-        else {
+        let provider_route = provider_route
+            .ok_or_else(|| anyhow!("Build Run has no immutable provider route snapshot"))?;
+        let Some(creds) = resolve_run_credentials(Some(provider_route), model)? else {
             let msg = format!(
                 "{}\n\nYou said: {}\nProject: {}\nModel: {} · effort: {}",
                 crate::auth_store::auth_help_message(),
@@ -7979,9 +8829,8 @@ impl AgentHostHandle {
             .run_coding_agent_loop(
                 session_id,
                 cwd,
-                model,
-                effort,
                 &creds,
+                provider_route,
                 &wire_history,
                 compacted_summary.as_deref(),
                 &cancel,
@@ -8273,6 +9122,7 @@ impl AgentHostHandle {
                     &args.to_string(),
                     cancel,
                     event_tx,
+                    None,
                     &Default::default(),
                 )
                 .await;
@@ -8290,6 +9140,7 @@ impl AgentHostHandle {
                     .to_string(),
                     cancel,
                     event_tx,
+                    None,
                     &Default::default(),
                 )
                 .await;
@@ -8307,6 +9158,7 @@ impl AgentHostHandle {
                     .to_string(),
                     cancel,
                     event_tx,
+                    None,
                     &Default::default(),
                 )
                 .await;
@@ -8320,6 +9172,7 @@ impl AgentHostHandle {
                     &serde_json::json!({ "patch": rest.trim() }).to_string(),
                     cancel,
                     event_tx,
+                    None,
                     &Default::default(),
                 )
                 .await;
@@ -8334,6 +9187,7 @@ impl AgentHostHandle {
                         &serde_json::json!({ "url": url }).to_string(),
                         cancel,
                         event_tx,
+                        None,
                         &Default::default(),
                     )
                     .await;
@@ -8382,9 +9236,8 @@ impl AgentHostHandle {
         &self,
         session_id: Uuid,
         cwd: &Path,
-        model: &str,
-        effort: EffortLevel,
         creds: &crate::auth_store::WireCredentials,
+        provider_route: &ProviderRouteSnapshot,
         history: &[(String, String)],
         compacted_summary: Option<&str>,
         cancel: &CancellationToken,
@@ -8410,7 +9263,9 @@ impl AgentHostHandle {
                     .unwrap_or(false)
             };
             if need {
-                let _ = self.compact_session_async(session_id).await;
+                let _ = self
+                    .compact_session_async_routed(session_id, Some(provider_route))
+                    .await;
             }
         }
 
@@ -8625,10 +9480,9 @@ impl AgentHostHandle {
                 }
             };
             let provider_observation = self.provider_observation_context(session_id);
-            let step = match call_xai_agent_step_observed(
+            let step = match call_xai_agent_step_routed(
                 creds,
-                model,
-                effort,
+                provider_route,
                 &messages,
                 &tools_this_round,
                 !self.run_tokens_bounded(session_id),
@@ -8646,7 +9500,7 @@ impl AgentHostHandle {
                 Ok(s) => s,
                 Err(e) => {
                     if let Some(stop) =
-                        self.finish_provider_attempt(session_id, usage_attempt, None)?
+                        self.finish_provider_attempt_after_error(usage_attempt, &e)?
                     {
                         emit_message(event_tx, session_id, &stop);
                         push_assistant(self, session_id, &stop);
@@ -8850,6 +9704,7 @@ impl AgentHostHandle {
                                 &tc.arguments,
                                 cancel,
                                 event_tx,
+                                Some(provider_route),
                                 &mcp_index,
                             )
                             .await;
@@ -8964,6 +9819,7 @@ impl AgentHostHandle {
                                 &args,
                                 cancel,
                                 event_tx,
+                                Some(provider_route),
                                 &mcp_index,
                             )
                             .await;
@@ -9104,6 +9960,7 @@ impl AgentHostHandle {
         arguments_json: &str,
         cancel: &CancellationToken,
         event_tx: &crate::event_bus::EventBus,
+        provider_route: Option<&ProviderRouteSnapshot>,
         mcp_index: &McpToolIndex,
     ) -> Result<String> {
         let args: serde_json::Value = serde_json::from_str(arguments_json)
@@ -9444,8 +10301,15 @@ impl AgentHostHandle {
                     .and_then(|v| v.as_str())
                     .unwrap_or("explore the codebase")
                     .to_string();
-                self.run_explore_subagent(session_id, cwd, &query, cancel, event_tx)
-                    .await
+                self.run_explore_subagent(
+                    session_id,
+                    cwd,
+                    &query,
+                    cancel,
+                    event_tx,
+                    provider_route,
+                )
+                .await
             }
             "spawn_general_purpose" | "spawn_subagent" => {
                 let prompt = args
@@ -9690,6 +10554,7 @@ impl AgentHostHandle {
         query: &str,
         cancel: &CancellationToken,
         event_tx: &crate::event_bus::EventBus,
+        provider_route: Option<&ProviderRouteSnapshot>,
     ) -> Result<String> {
         let sub_id = Uuid::new_v4().to_string();
         {
@@ -9764,9 +10629,7 @@ impl AgentHostHandle {
         let mut summary = parts.join("\n\n");
         if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_none() {
             let model = self.inner.lock().model.clone();
-            if let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(&model)
-                .map_err(anyhow::Error::msg)?
-            {
+            if let Some(creds) = resolve_run_credentials(provider_route, &model)? {
                 let ask = format!(
                     "You are a read-only explore agent. Summarize findings for the parent agent.\n\
                      Query: {query}\n\nFindings:\n{}",
@@ -9786,16 +10649,25 @@ impl AgentHostHandle {
                 if usage_attempt.is_some()
                     || self.run_token_stop_before_request(session_id).is_none()
                 {
-                    match call_xai_chat(
-                        &creds,
-                        &model,
-                        &[("user".into(), ask)],
-                        None,
-                        cwd,
-                        SessionKind::Build,
-                    )
-                    .await
-                    {
+                    let history = [("user".into(), ask)];
+                    let reply = match provider_route {
+                        Some(route) => {
+                            call_xai_chat_routed(
+                                &creds,
+                                route,
+                                &history,
+                                None,
+                                cwd,
+                                SessionKind::Build,
+                            )
+                            .await
+                        }
+                        None => {
+                            call_xai_chat(&creds, &model, &history, None, cwd, SessionKind::Build)
+                                .await
+                        }
+                    };
+                    match reply {
                         Ok(reply) => {
                             let stop = self.finish_provider_attempt(
                                 session_id,
@@ -9808,9 +10680,9 @@ impl AgentHostHandle {
                                 stop.map(|stop| format!("\n\n{stop}")).unwrap_or_default()
                             );
                         }
-                        Err(_error) => {
+                        Err(error) => {
                             if let Some(stop) =
-                                self.finish_provider_attempt(session_id, usage_attempt, None)?
+                                self.finish_provider_attempt_after_error(usage_attempt, &error)?
                             {
                                 summary = format!("{summary}\n\n### Explorer summary\n{stop}");
                             } else {
@@ -9966,6 +10838,14 @@ impl AgentHostHandle {
         // Snapshot the durable parent Run identity. Looking this up again from
         // the session after the parent finishes could charge a later Run.
         let run_usage_tracker = self.run_usage_trackers.lock().get(&session_id).cloned();
+        let provider_route = run_usage_tracker.as_ref().and_then(|tracker| {
+            tracker
+                .store
+                .load_run(tracker.run_id())
+                .ok()
+                .flatten()
+                .and_then(|run| run.provider_route)
+        });
         let sub_id_task = sub_id.clone();
         tokio::spawn(async move {
             host.run_gp_subagent_body(
@@ -9978,6 +10858,7 @@ impl AgentHostHandle {
                 event_tx,
                 persona_reminder,
                 run_usage_tracker,
+                provider_route,
             )
             .await;
         });
@@ -10010,6 +10891,7 @@ impl AgentHostHandle {
         event_tx: crate::event_bus::EventBus,
         persona_reminder: Option<String>,
         run_usage_tracker: Option<Arc<RunUsageTracker>>,
+        provider_route: Option<ProviderRouteSnapshot>,
     ) {
         if cancel.is_cancelled() {
             self.finish_subagent(sub_id, "cancelled", &event_tx, session_id, None);
@@ -10086,22 +10968,35 @@ impl AgentHostHandle {
         }
 
         // Online: short multi-tool agent loop under child cancel.
-        let creds = match crate::auth_store::resolve_wire_credentials_for_model(
-            &self.inner.lock().model.clone(),
-        ) {
-            Err(error) => {
-                self.finish_subagent(sub_id, "failed", &event_tx, session_id, Some(error));
-                return;
-            }
-            Ok(None) => {
-                let msg = "GP subagent: no credentials";
-                self.finish_subagent(sub_id, "failed", &event_tx, session_id, Some(msg.into()));
-                return;
-            }
-            Ok(Some(c)) => c,
+        let Some(provider_route) = provider_route else {
+            self.finish_subagent(
+                sub_id,
+                "failed",
+                &event_tx,
+                session_id,
+                Some("GP subagent: parent Run has no immutable provider route".into()),
+            );
+            return;
         };
-        let model = self.inner.lock().model.clone();
-        let effort = self.inner.lock().effort;
+        let creds =
+            match resolve_run_credentials(Some(&provider_route), &provider_route.selection_key) {
+                Err(error) => {
+                    self.finish_subagent(
+                        sub_id,
+                        "failed",
+                        &event_tx,
+                        session_id,
+                        Some(error.to_string()),
+                    );
+                    return;
+                }
+                Ok(None) => {
+                    let msg = "GP subagent: no credentials";
+                    self.finish_subagent(sub_id, "failed", &event_tx, session_id, Some(msg.into()));
+                    return;
+                }
+                Ok(Some(c)) => c,
+            };
         let (tools, mcp_index) = coding_agent_tools(&[]);
         let mut sys = format!(
             "You are a {kind} subagent for GrokPtah. Complete the task with tools. \
@@ -10149,10 +11044,9 @@ impl AgentHostHandle {
                     }
                 };
             let provider_observation = self.provider_observation_context(session_id);
-            let step = call_xai_agent_step_observed(
+            let step = call_xai_agent_step_routed(
                 &creds,
-                &model,
-                effort,
+                &provider_route,
                 &messages,
                 &tools,
                 !run_usage_tracker
@@ -10167,7 +11061,7 @@ impl AgentHostHandle {
             let step = match step {
                 Ok(step) => step,
                 Err(error) => {
-                    match self.finish_provider_attempt(session_id, usage_attempt, None) {
+                    match self.finish_provider_attempt_after_error(usage_attempt, &error) {
                         Ok(Some(stop)) => last = stop,
                         Ok(None) => last = format!("GP subagent model call failed: {error:#}"),
                         Err(persist_error) => {
@@ -10252,6 +11146,7 @@ impl AgentHostHandle {
                                 &tc.arguments,
                                 &cancel,
                                 &event_tx,
+                                Some(&provider_route),
                                 &mcp_index,
                             ))
                             .await
@@ -11369,6 +12264,7 @@ mod tests {
             client_id: Some("test".into()),
             state: RunState::Running,
             purpose: RunPurpose::Execution,
+            provider_route: None,
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -11453,6 +12349,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn provider_request_reservation_is_a_hard_run_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = OrchStore::open(temp.path().join("orch")).unwrap();
+        let run = usage_test_run("request-ceiling", Some(10_000));
+        store.save_run(&run).unwrap();
+        let mut tracker = RunUsageTracker::from_run(store.clone(), &run);
+        Arc::get_mut(&mut tracker).unwrap().max_provider_requests = Some(2);
+
+        assert!(tracker
+            .record(Some(&CompletionUsage {
+                total_tokens: 1,
+                requests: 1,
+                ..Default::default()
+            }))
+            .unwrap()
+            .is_none());
+        let stop = tracker
+            .record(Some(&CompletionUsage {
+                total_tokens: 1,
+                requests: 1,
+                ..Default::default()
+            }))
+            .unwrap()
+            .unwrap();
+        assert!(stop.contains("reserved request ceiling of 2"));
+        assert!(tracker.begin_attempt().await.is_err());
+
+        let persisted = store.load_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(
+            persisted.error_code.as_deref(),
+            Some("provider_request_quota_reached")
+        );
+        assert_eq!(persisted.stop_cause, Some(RunStopCause::ProviderQuota));
+        assert_eq!(persisted.aggregates.usage.requests, 2);
+        assert_eq!(persisted.aggregates.usage_pending_requests, 0);
+    }
+
     #[test]
     fn bounded_missing_usage_fails_closed_while_unbounded_run_stays_observable() {
         let temp = tempfile::tempdir().unwrap();
@@ -11519,12 +12453,16 @@ mod tests {
         .is_err());
 
         first
-            .finish(Some(&CompletionUsage {
-                prompt_tokens: 3,
-                completion_tokens: 2,
-                total_tokens: 5,
-                requests: 1,
-            }))
+            .finish(
+                ProviderSendCertainty::KnownAccepted,
+                None,
+                Some(&CompletionUsage {
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    total_tokens: 5,
+                    requests: 1,
+                }),
+            )
             .unwrap();
         let second = tokio::time::timeout(
             std::time::Duration::from_millis(250),
@@ -11534,12 +12472,16 @@ mod tests {
         .unwrap()
         .unwrap();
         second
-            .finish(Some(&CompletionUsage {
-                prompt_tokens: 2,
-                completion_tokens: 1,
-                total_tokens: 3,
-                requests: 1,
-            }))
+            .finish(
+                ProviderSendCertainty::KnownAccepted,
+                None,
+                Some(&CompletionUsage {
+                    prompt_tokens: 2,
+                    completion_tokens: 1,
+                    total_tokens: 3,
+                    requests: 1,
+                }),
+            )
             .unwrap();
 
         let persisted = store.load_run("bounded-admission").unwrap().unwrap();
@@ -11833,6 +12775,7 @@ mod tests {
             client_id: Some("test".into()),
             state: RunState::Completed,
             purpose: RunPurpose::Execution,
+            provider_route: None,
             agent_id: Some(agent.agent_id.clone()),
             retry_of: None,
             parent_run_id: None,
@@ -11947,7 +12890,6 @@ mod tests {
             )
             .await
             .unwrap();
-        drop(offline);
         assert_eq!(replay, response);
         assert_eq!(host.list_session_runs(session_id).unwrap().len(), run_count);
         let receipt = store
@@ -11975,6 +12917,7 @@ mod tests {
             client_id: Some("test".into()),
             state: RunState::Running,
             purpose: RunPurpose::Execution,
+            provider_route: None,
             agent_id: Some(current_agent.agent_id.clone()),
             retry_of: None,
             parent_run_id: None,
@@ -12004,7 +12947,8 @@ mod tests {
             approval: None,
         };
         store
-            .save_run_and_activate_agent(&competing, &current_agent.agent_id)
+            .admit_run_and_activate_agent(&competing, &current_agent.agent_id, None)
+            .into_result()
             .unwrap();
         let transcript_before = host.export_transcript(session_id).unwrap();
         let error = host
@@ -12024,6 +12968,7 @@ mod tests {
             host.export_transcript(session_id).unwrap(),
             transcript_before
         );
+        drop(offline);
     }
 
     #[test]
@@ -12271,6 +13216,7 @@ mod tests {
             client_id: Some("test".into()),
             state: RunState::Running,
             purpose: RunPurpose::Execution,
+            provider_route: None,
             agent_id: Some(agent.agent_id.clone()),
             retry_of: None,
             parent_run_id: None,
@@ -12296,7 +13242,8 @@ mod tests {
             approval: None,
         };
         store
-            .save_run_and_activate_agent(&run, &agent.agent_id)
+            .admit_run_and_activate_agent(&run, &agent.agent_id, None)
+            .into_result()
             .unwrap();
         host.reserve_orchestration_turn(&run.run_id, lane_id)
             .unwrap();
@@ -12364,6 +13311,7 @@ mod tests {
             client_id: Some("native-executor".into()),
             state: RunState::Running,
             purpose: RunPurpose::ManagerProposal,
+            provider_route: None,
             agent_id: Some(agent.agent_id.clone()),
             retry_of: None,
             parent_run_id: None,
@@ -12389,7 +13337,8 @@ mod tests {
             approval: None,
         };
         store
-            .save_run_and_activate_agent(&run, &agent.agent_id)
+            .admit_run_and_activate_agent(&run, &agent.agent_id, None)
+            .into_result()
             .unwrap();
         host.reserve_orchestration_turn(&run.run_id, lane_id)
             .unwrap();
@@ -12431,7 +13380,8 @@ mod tests {
         run.agent_id = Some(agent.agent_id.clone());
         run.agent_spec_revision = Some(agent.current_spec().unwrap().revision);
         store
-            .save_run_and_activate_agent(&run, &agent.agent_id)
+            .admit_run_and_activate_agent(&run, &agent.agent_id, None)
+            .into_result()
             .unwrap();
         let error = host
             .persist_agent_checkpoint(&run, "failed", 1, &host.event_bus(), &store)
@@ -12522,3 +13472,7 @@ mod tests {
         assert_eq!(runs[0].bounds.max_duration_ms, 50);
     }
 }
+
+#[cfg(test)]
+#[path = "host_admission_gate_tests.rs"]
+mod host_admission_gate_tests;

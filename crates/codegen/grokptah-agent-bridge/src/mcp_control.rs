@@ -10,7 +10,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,11 +32,12 @@ use uuid::Uuid;
 
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
-    AuthContext, ChangeRecord, ManagerStepSpec, MessageKind, MissedRunPolicy, OrchError,
-    OrchErrorCode, OrchestrationConfig, OrchestrationService, RoutineConcurrencyPolicy,
-    RoutineLifecycle, RoutineRetryPolicy, RoutineTrigger, RunExecutionMode, WorkArtifactRef,
-    WorkDependency, WorkPolicy, WorkResult, WorkTemplate, WorkerHostKind, WorkspaceAllowlist,
-    CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    required_operation, scrub_route_secret_needles, AuthContext, ChangeRecord, ManagerStepSpec,
+    MessageKind, MissedRunPolicy, OrchError, OrchErrorCode, OrchestrationConfig,
+    OrchestrationService, ProviderRouteSnapshot, RoutineConcurrencyPolicy, RoutineLifecycle,
+    RoutineRetryPolicy, RoutineTrigger, RunExecutionMode, WorkArtifactRef, WorkDependency,
+    WorkPolicy, WorkResult, WorkTemplate, WorkerHostKind, WorkspaceAllowlist, CONTROL_TOOLS,
+    FORBIDDEN_TOOLS, PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS,
 };
 use crate::{EventReceiver, JournalPage, SessionUpdate};
 
@@ -107,6 +108,8 @@ struct SessionState {
     #[allow(dead_code)]
     created_at: Instant,
     last_seen: Instant,
+    credential_id: String,
+    capability_document_hash: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +131,7 @@ struct LiveStreamState {
     run_id: String,
     start_seq: u64,
     end_seq: Option<u64>,
+    provider_route: Option<ProviderRouteSnapshot>,
     receiver: EventReceiver,
     last_seq: u64,
     replay_cursor: Option<u64>,
@@ -151,7 +155,7 @@ impl LiveStreamState {
         }
     }
 
-    fn queue_entry(&mut self, seq: u64, ts: String, update: SessionUpdate) {
+    fn queue_entry(&mut self, seq: u64, ts: String, mut update: SessionUpdate) {
         if seq <= self.last_seq || seq < self.start_seq {
             return;
         }
@@ -159,6 +163,15 @@ impl LiveStreamState {
             if seq > end_seq {
                 self.done = true;
                 return;
+            }
+        }
+        match scrub_route_secret_needles(&mut update, self.provider_route.as_ref()) {
+            Ok(_) => {}
+            Err(_) => {
+                update = SessionUpdate::Error {
+                    session_id: self.session_id,
+                    message: PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS.to_string(),
+                };
             }
         }
         let terminal = matches!(&update, SessionUpdate::TurnComplete { .. });
@@ -555,12 +568,13 @@ struct ReadinessSnapshot {
 }
 
 fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
+    let auth = state
+        .orch
+        .trusted_local_auth("health-probe")
+        .expect("configured service must construct trusted health authority");
     let payload = state
         .orch
-        .get_capacity(&AuthContext {
-            token_id: "health-probe".into(),
-            owner_id: "health-probe".into(),
-        })
+        .get_capacity(&auth)
         .unwrap_or_else(|error| json!({"health": {"serviceError": error.message}}));
     let health = payload.get("health").cloned().unwrap_or_else(|| json!({}));
     let ready = [
@@ -609,20 +623,17 @@ async fn streamable_get_handler(
     Query(query): Query<LiveRunQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let session_id = headers
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if session_id.is_empty() || !state.sessions.lock().contains_key(session_id) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "jsonrpc": "2.0",
-                "error": {"code": -32600, "message": "missing or unknown mcp-session-id"}
-            })),
-        )
-            .into_response();
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let auth = match state.orch.auth_header(auth_header) {
+        Ok(auth) => auth,
+        Err(error) => return json_err(None, StatusCode::UNAUTHORIZED, &error),
+    };
+    if let Err(error) = require_bound_session(&state, &headers, &auth) {
+        return json_err(None, status_for(&error), &error);
     }
+    let session_id = session_id_from_headers(&headers).expect("bound session checked above");
 
     let no_scope =
         query.session_id.is_none() && query.workspace.is_none() && query.run_id.is_none();
@@ -659,13 +670,6 @@ async fn streamable_get_handler(
     let session_scope = query.session_id.expect("checked above");
     let workspace = query.workspace.expect("checked above");
     let run_id = query.run_id.expect("checked above");
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    let auth = match state.orch.auth_header(auth_header) {
-        Ok(auth) => auth,
-        Err(error) => return json_err(None, StatusCode::UNAUTHORIZED, &error),
-    };
     let last_seq = match headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
@@ -721,6 +725,7 @@ async fn streamable_get_handler(
         run_id: scope.run_id,
         start_seq: scope.start_seq,
         end_seq: scope.end_seq,
+        provider_route: scope.provider_route,
         receiver,
         last_seq,
         replay_cursor: None,
@@ -740,21 +745,25 @@ async fn streamable_get_handler(
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
         .header(axum::http::header::CACHE_CONTROL, "no-cache")
-        .header("mcp-session-id", session_id)
+        .header("mcp-session-id", &session_id)
         .header(axum::http::header::CONNECTION, "keep-alive")
         .body(axum::body::Body::from_stream(stream))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn streamable_delete_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let session_id = headers
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if session_id.is_empty() {
-        return StatusCode::BAD_REQUEST.into_response();
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let auth = match state.orch.auth_header(auth_header) {
+        Ok(auth) => auth,
+        Err(error) => return json_err(None, StatusCode::UNAUTHORIZED, &error),
+    };
+    if let Err(error) = require_bound_session(&state, &headers, &auth) {
+        return json_err(None, status_for(&error), &error);
     }
-    state.sessions.lock().remove(session_id);
+    let session_id = session_id_from_headers(&headers).expect("bound session checked above");
+    state.sessions.lock().remove(&session_id);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -778,6 +787,15 @@ struct ToolsCallParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeCodingReadinessArgs {
+    #[serde(default)]
+    provider_id: Option<String>,
+    #[serde(default)]
+    model_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyArgs {}
 
@@ -794,6 +812,17 @@ struct PersistentAgentArgs {
 struct SessionWorkspaceArgs {
     session_id: Uuid,
     workspace: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListRunsArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1543,26 +1572,30 @@ async fn streamable_post_handler(
     // Notifications may omit id.
     let is_notification = req.id.is_none() && method.starts_with("notifications/");
 
+    if method != "initialize" {
+        if let Err(error) = require_bound_session(&state, &headers, &auth) {
+            return json_err(req.id.clone(), status_for(&error), &error);
+        }
+    }
+
     let work_delay = state.inject_work_delay;
     let work = async {
         // Test hook: hold the concurrency permit / trip request timeout without
         // waiting on production 120s or inventing a fake tool.
-        if let Some(delay) = work_delay {
+        if let Some(delay) =
+            work_delay.filter(|_| method != "initialize" && method != "notifications/initialized")
+        {
             tokio::time::sleep(delay).await;
         }
         match method {
-            "initialize" => handle_initialize(&state, &headers, &req),
+            "initialize" => handle_initialize(&state, &headers, &req, &auth),
             "notifications/initialized" => {
-                touch_session(&state, &headers);
+                touch_session(&state, &headers, &auth)?;
                 Ok((json!({}), None::<String>))
             }
             "ping" => Ok((json!({}), session_id_from_headers(&headers))),
-            "tools/list" => {
-                require_session_if_present(&state, &headers)?;
-                Ok((tools_list_result(), session_id_from_headers(&headers)))
-            }
+            "tools/list" => Ok((tools_list_result(&auth), session_id_from_headers(&headers))),
             "tools/call" => {
-                require_session_if_present(&state, &headers)?;
                 let v = tools_call(&state.orch, &auth, &req.params).await?;
                 Ok((v, session_id_from_headers(&headers)))
             }
@@ -1633,27 +1666,48 @@ fn session_id_from_headers(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
-fn touch_session(state: &AppState, headers: &HeaderMap) {
+fn touch_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    auth: &AuthContext,
+) -> Result<(), OrchError> {
+    require_bound_session(state, headers, auth)?;
     if let Some(sid) = session_id_from_headers(headers) {
-        if let Some(s) = state.sessions.lock().get_mut(&sid) {
-            s.last_seen = Instant::now();
-            s.initialized = true;
-        }
+        let mut sessions = state.sessions.lock();
+        let session = sessions.get_mut(&sid).ok_or_else(|| {
+            OrchError::new(OrchErrorCode::InvalidRequest, "unknown mcp-session-id")
+        })?;
+        session.initialized = true;
     }
+    Ok(())
 }
 
-fn require_session_if_present(state: &AppState, headers: &HeaderMap) -> Result<(), OrchError> {
-    // Stateless clients (legacy McpControlClient) may omit session id.
-    let Some(sid) = session_id_from_headers(headers) else {
-        return Ok(());
-    };
+fn require_bound_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    auth: &AuthContext,
+) -> Result<(), OrchError> {
+    let sid = session_id_from_headers(headers).ok_or_else(|| {
+        OrchError::new(
+            OrchErrorCode::UnknownSession,
+            "a bound mcp-session-id is required after initialize",
+        )
+    })?;
     let mut g = state.sessions.lock();
     let Some(s) = g.get_mut(&sid) else {
         return Err(OrchError::new(
-            OrchErrorCode::InvalidRequest,
+            OrchErrorCode::UnknownSession,
             "unknown mcp-session-id",
         ));
     };
+    if s.credential_id != auth.authority_stamp().credential_id
+        || s.capability_document_hash != auth.authority_stamp().capability_document_hash
+    {
+        return Err(OrchError::new(
+            OrchErrorCode::Unauthenticated,
+            "mcp-session-id authority binding does not match the bearer credential",
+        ));
+    }
     s.last_seen = Instant::now();
     Ok(())
 }
@@ -1690,6 +1744,8 @@ mod session_cap_tests {
                     initialized: true,
                     created_at: t0,
                     last_seen: t0 + Duration::from_secs(i),
+                    credential_id: "test".to_string(),
+                    capability_document_hash: "hash".to_string(),
                 },
             );
         }
@@ -1707,6 +1763,7 @@ fn handle_initialize(
     state: &AppState,
     headers: &HeaderMap,
     req: &JsonRpcReq,
+    auth: &AuthContext,
 ) -> Result<(Value, Option<String>), OrchError> {
     let client_version = req
         .params
@@ -1740,6 +1797,8 @@ fn handle_initialize(
                 initialized: false,
                 created_at: Instant::now(),
                 last_seen: Instant::now(),
+                credential_id: auth.authority_stamp().credential_id.clone(),
+                capability_document_hash: auth.authority_stamp().capability_document_hash.clone(),
             },
         );
         // Hard-cap: always keep ≤ MAX_SESSIONS by evicting least-recently-seen.
@@ -1756,7 +1815,10 @@ fn handle_initialize(
                 "name": "grokptah-control",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "Authenticated loopback orchestration control. Build sessions only."
+            "instructions": "Authenticated loopback orchestration control. Build sessions only.",
+            "_meta": {
+                "grokptah/authorityCapabilities": auth.capability_document()
+            }
         }),
         Some(session_id),
     ))
@@ -1766,8 +1828,10 @@ fn status_for(e: &OrchError) -> StatusCode {
     match e.code {
         OrchErrorCode::Unauthenticated => StatusCode::UNAUTHORIZED,
         OrchErrorCode::ForbiddenScope | OrchErrorCode::WorkspaceMismatch => StatusCode::FORBIDDEN,
-        OrchErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
-        OrchErrorCode::StaleVersion | OrchErrorCode::Conflict => StatusCode::CONFLICT,
+        OrchErrorCode::InvalidRequest | OrchErrorCode::UnknownSession => StatusCode::BAD_REQUEST,
+        OrchErrorCode::StaleVersion
+        | OrchErrorCode::Conflict
+        | OrchErrorCode::AdmissionUncertain => StatusCode::CONFLICT,
         OrchErrorCode::Unsupported => StatusCode::METHOD_NOT_ALLOWED,
         OrchErrorCode::CursorExpired => StatusCode::GONE,
         OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted => StatusCode::CONFLICT,
@@ -1799,8 +1863,10 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
         .into_response()
 }
 
-fn tools_list_result() -> Value {
-    let tools: Vec<Value> = CONTROL_TOOLS
+fn tools_list_result(auth: &AuthContext) -> Value {
+    let tools: Vec<Value> = auth
+        .capability_document()
+        .tools
         .iter()
         .map(|name| {
             json!({
@@ -1839,6 +1905,14 @@ fn tool_input_schema(name: &str) -> Value {
             "properties": {},
             "additionalProperties": false
         }),
+        "ptah_get_native_coding_readiness" => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "providerId": {"type": "string", "maxLength": 256},
+                "modelId": {"type": "string", "maxLength": 512}
+            }
+        }),
         "ptah_create_session" => json!({
             "type": "object",
             "required": ["workspace"],
@@ -1854,7 +1928,9 @@ fn tool_input_schema(name: &str) -> Value {
             "additionalProperties": false,
             "properties": {
                 "session_id": session,
-                "workspace": workspace
+                "workspace": workspace,
+                "cursor": {"type": "string", "minLength": 1, "maxLength": 256},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 128}
             }
         }),
         "ptah_get_persistent_agent" => json!({
@@ -2657,7 +2733,7 @@ async fn tools_call(
     let call: ToolsCallParams = match parse_value(params) {
         Ok(call) => call,
         Err(error) => {
-            orch.audit_transport_result("tools/call", Some(&error));
+            orch.audit_transport_result(auth, "tools/call", Some(&error));
             return Err(error);
         }
     };
@@ -2667,11 +2743,30 @@ async fn tools_call(
             OrchErrorCode::ForbiddenScope,
             format!("tool {name} is not available"),
         );
-        orch.audit_transport_result(name, Some(&error));
+        orch.audit_transport_result(auth, name, Some(&error));
         return Err(error);
     }
+    let operation = required_operation(name).ok_or_else(|| {
+        OrchError::new(
+            OrchErrorCode::ForbiddenScope,
+            format!("tool {name} has no authority operation"),
+        )
+    })?;
+    auth.require_operation(operation)?;
+    if let Some(workspace) = call.arguments.get("workspace").and_then(Value::as_str) {
+        auth.require_workspace(operation, Path::new(workspace))?;
+    }
+    if name == "ptah_get_authority_capabilities" {
+        let body = serde_json::to_value(auth.capability_document())
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        return Ok(json!({
+            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&body).unwrap_or_default() }],
+            "structuredContent": body,
+            "isError": false,
+        }));
+    }
     let result = dispatch_tool(orch, auth, name, &call.arguments).await;
-    orch.audit_transport_result(name, result.as_ref().err());
+    orch.audit_transport_result(auth, name, result.as_ref().err());
     let body = result?;
     Ok(json!({
         "content": [{ "type": "text", "text": serde_json::to_string_pretty(&body).unwrap_or_default() }],
@@ -2700,8 +2795,14 @@ async fn dispatch_tool(
             orch.list_persistent_agents(auth)
         }
         "ptah_list_runs" => {
-            let args: SessionWorkspaceArgs = parse_value(args)?;
-            orch.list_runs_scoped(auth, args.session_id, &args.workspace)
+            let args: ListRunsArgs = parse_value(args)?;
+            orch.list_runs_scoped_page(
+                auth,
+                args.session_id,
+                &args.workspace,
+                args.cursor.as_deref(),
+                args.limit,
+            )
         }
         "ptah_get_persistent_agent" => {
             let args: PersistentAgentArgs = parse_value(args)?;
@@ -2711,6 +2812,14 @@ async fn dispatch_tool(
         "ptah_get_capacity" => {
             let _: EmptyArgs = parse_value(args)?;
             orch.get_capacity(auth)
+        }
+        "ptah_get_native_coding_readiness" => {
+            let args: NativeCodingReadinessArgs = parse_value(args)?;
+            orch.get_native_coding_readiness(
+                auth,
+                args.provider_id.as_deref(),
+                args.model_id.as_deref(),
+            )
         }
         "ptah_get_run" => {
             let args: RunArgs = parse_value(args)?;
@@ -3654,12 +3763,44 @@ mod tests {
     use super::*;
     use crate::host::{AgentHost, HostConfig};
     use crate::orchestration::{
-        ContinuationCheckpoint, ContinuationReason, OrchErrorCode, OrchStore, OrchestrationConfig,
-        RunBounds, WorkspaceAllowlist,
+        AuthCredential, ContinuationCheckpoint, ContinuationReason, OrchErrorCode, OrchStore,
+        OrchestrationConfig, RunBounds, WorkPolicy, WorkspaceAllowlist,
     };
     use crate::{home_override_serial, set_grokptah_home_override};
     use chrono::Utc;
     use tempfile::tempdir;
+
+    async fn initialize_test_session(
+        client: &reqwest::Client,
+        url: &str,
+        token: &str,
+        id: u64,
+    ) -> String {
+        let response = client
+            .post(url)
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": DEFAULT_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "bridge-test", "version": "1"}
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response
+            .headers()
+            .get("mcp-session-id")
+            .expect("initialize must return a bound session")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
@@ -3712,10 +3853,12 @@ mod tests {
         );
 
         // valid token
+        let session_id = initialize_test_session(&client, &base, "test-token-196", 2).await;
         let good = client
             .post(&base)
             .header("Authorization", "Bearer test-token-196")
-            .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+            .header("mcp-session-id", session_id)
+            .json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}))
             .send()
             .await
             .unwrap();
@@ -3727,6 +3870,379 @@ mod tests {
         assert!(names.contains(&"ptah_list_persistent_agents"));
         assert!(names.contains(&"ptah_resume_persistent_agent"));
         assert!(!names.contains(&"run_terminal_cmd"));
+
+        srv.stop();
+        set_grokptah_home_override(None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn bearer_capabilities_are_role_filtered_and_session_bound() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let ws = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig::default());
+        host.start().unwrap();
+        host.set_project_cwd(ws.path()).unwrap();
+        let work_session = host.session_new_kind(crate::SessionKind::Build).unwrap();
+        host.session_set_cwd(work_session.id, ws.path()).unwrap();
+        let bus = host.event_bus();
+        let orch = OrchestrationService::new(
+            host.clone(),
+            bus,
+            OrchStore::open(home.path().join("orch")).unwrap(),
+            OrchestrationConfig {
+                bearer_token: "unused-primary".into(),
+                allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+                max_concurrent_runs: 2,
+                bounds: RunBounds::default(),
+            },
+        );
+        orch.set_auth_credentials(vec![
+            AuthCredential::new("primary", "coordinator-secret").unwrap(),
+            AuthCredential::new("secondary", "secondary-secret").unwrap(),
+            AuthCredential::observer("observer", "observer-secret").unwrap(),
+        ])
+        .unwrap();
+
+        // The service repeats high-authority checks so an embedder cannot
+        // bypass MCP discovery/call filtering by invoking the Rust API.
+        let allowlist = WorkspaceAllowlist::new([ws.path().to_path_buf()]);
+        let remote = AuthContext::remote_coordinator("primary", "primary", &allowlist).unwrap();
+        let session_id = Uuid::new_v4();
+        let direct_denials = [
+            orch.list_computer_runs_scoped(&remote, session_id, ws.path())
+                .unwrap_err(),
+            orch.approve_work(
+                &remote,
+                "deny-work",
+                session_id,
+                ws.path(),
+                "work-never-read",
+                None,
+                None,
+            )
+            .await
+            .unwrap_err(),
+            orch.approve_run(
+                &remote,
+                "deny-run",
+                session_id,
+                ws.path(),
+                "run-never-read",
+                "source".into(),
+                "final".into(),
+                Vec::new(),
+                None,
+            )
+            .await
+            .unwrap_err(),
+            orch.promote_run(
+                &remote,
+                "deny-promote",
+                session_id,
+                ws.path(),
+                "run-never-read",
+                "approval-never-read",
+            )
+            .await
+            .unwrap_err(),
+        ];
+        assert!(direct_denials
+            .iter()
+            .all(|error| error.code == OrchErrorCode::ForbiddenScope));
+
+        // Direct Rust callers receive the same fail-closed ordering as MCP:
+        // a denied operation is rejected before Run lookup or prompt-policy
+        // validation can become an existence or policy oracle.
+        let observer = orch.auth_header(Some("Bearer observer-secret")).unwrap();
+        let denied_retry = orch
+            .retry_run(
+                &observer,
+                "observer-retry",
+                session_id,
+                ws.path(),
+                "run-never-read",
+                "inspect this run".into(),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(denied_retry.code, OrchErrorCode::ForbiddenScope);
+        let denied_edit = orch
+            .edit_queue(
+                &observer,
+                "observer-edit",
+                session_id,
+                ws.path(),
+                "entry-never-read",
+                1,
+                "/forbidden-control-prompt".into(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(denied_edit.code, OrchErrorCode::ForbiddenScope);
+
+        // A caller's request id is namespaced by its immutable authority
+        // stamp. Exact retries by the same credential replay the same Work;
+        // another credential using the same public id creates an independent
+        // receipt and can never receive the first principal's response.
+        let secondary =
+            AuthContext::remote_coordinator("secondary", "primary", &allowlist).unwrap();
+        let first = orch
+            .create_work(
+                &remote,
+                "shared-public-request-id",
+                work_session.id,
+                ws.path(),
+                "authority-receipt-test".into(),
+                "prove authority-bound idempotency".into(),
+                0,
+                None,
+                None,
+                Vec::new(),
+                WorkPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let exact_replay = orch
+            .create_work(
+                &remote,
+                "shared-public-request-id",
+                work_session.id,
+                ws.path(),
+                "authority-receipt-test".into(),
+                "prove authority-bound idempotency".into(),
+                0,
+                None,
+                None,
+                Vec::new(),
+                WorkPolicy::default(),
+            )
+            .await
+            .unwrap();
+        let other_principal = orch
+            .create_work(
+                &secondary,
+                "shared-public-request-id",
+                work_session.id,
+                ws.path(),
+                "authority-receipt-test".into(),
+                "prove authority-bound idempotency".into(),
+                0,
+                None,
+                None,
+                Vec::new(),
+                WorkPolicy::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first["work"]["workId"], exact_replay["work"]["workId"]);
+        assert_ne!(first["work"]["workId"], other_principal["work"]["workId"]);
+
+        let srv = start_control_server(orch, 0).await.unwrap();
+        let url = format!("http://{}/mcp", srv.addr);
+        let http = reqwest::Client::new();
+
+        let initialize = |token: &'static str, id: u64| {
+            http.post(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": DEFAULT_PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "clientInfo": {"name": "authority-test", "version": "1"}
+                    }
+                }))
+        };
+        let coordinator_init = initialize("coordinator-secret", 1).send().await.unwrap();
+        assert_eq!(coordinator_init.status(), StatusCode::OK);
+        let coordinator_sid = coordinator_init
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let coordinator_body = coordinator_init.json::<Value>().await.unwrap();
+        let capability = &coordinator_body["result"]["_meta"]["grokptah/authorityCapabilities"];
+        assert_eq!(capability["principal"]["role"], "remote_coordinator");
+        assert!(capability["documentHash"]
+            .as_str()
+            .is_some_and(|hash| !hash.is_empty()));
+        let encoded = serde_json::to_string(capability).unwrap();
+        assert!(!encoded.contains(ws.path().to_string_lossy().as_ref()));
+        assert!(!encoded.contains("coordinator-secret"));
+
+        let listed = http
+            .post(&url)
+            .header("Authorization", "Bearer coordinator-secret")
+            .header("mcp-session-id", &coordinator_sid)
+            .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = listed.json::<Value>().await.unwrap();
+        let names = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"ptah_submit_task"));
+        for denied in [
+            "ptah_approve_work",
+            "ptah_approve_run",
+            "ptah_promote_run",
+            "ptah_set_managed_execution",
+            "ptah_authorize_work_execution",
+            "ptah_list_computer_runs",
+        ] {
+            assert!(!names.contains(&denied), "{denied} leaked into tools/list");
+        }
+
+        let denied = http
+            .post(&url)
+            .header("Authorization", "Bearer coordinator-secret")
+            .header("mcp-session-id", &coordinator_sid)
+            .json(&json!({
+                "jsonrpc":"2.0", "id":3, "method":"tools/call",
+                "params":{"name":"ptah_approve_work","arguments":{}}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let swapped = http
+            .post(&url)
+            .header("Authorization", "Bearer observer-secret")
+            .header("mcp-session-id", &coordinator_sid)
+            .json(&json!({"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(swapped.status(), StatusCode::UNAUTHORIZED);
+
+        let swapped_ping = http
+            .post(&url)
+            .header("Authorization", "Bearer observer-secret")
+            .header("mcp-session-id", &coordinator_sid)
+            .json(&json!({"jsonrpc":"2.0","id":40,"method":"ping","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(swapped_ping.status(), StatusCode::UNAUTHORIZED);
+
+        let swapped_get = http
+            .get(&url)
+            .header("Authorization", "Bearer observer-secret")
+            .header("mcp-session-id", &coordinator_sid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(swapped_get.status(), StatusCode::UNAUTHORIZED);
+
+        let swapped_delete = http
+            .delete(&url)
+            .header("Authorization", "Bearer observer-secret")
+            .header("mcp-session-id", &coordinator_sid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(swapped_delete.status(), StatusCode::UNAUTHORIZED);
+
+        let missing_ping = http
+            .post(&url)
+            .header("Authorization", "Bearer coordinator-secret")
+            .json(&json!({"jsonrpc":"2.0","id":41,"method":"ping","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_ping.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            missing_ping.json::<Value>().await.unwrap()["error"]["data"]["code"],
+            "unknown_session"
+        );
+
+        let missing_get = http
+            .get(&url)
+            .header("Authorization", "Bearer coordinator-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_get.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            missing_get.json::<Value>().await.unwrap()["error"]["data"]["code"],
+            "unknown_session"
+        );
+
+        let missing_delete = http
+            .delete(&url)
+            .header("Authorization", "Bearer coordinator-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_delete.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            missing_delete.json::<Value>().await.unwrap()["error"]["data"]["code"],
+            "unknown_session"
+        );
+
+        let session_survived = http
+            .post(&url)
+            .header("Authorization", "Bearer coordinator-secret")
+            .header("mcp-session-id", &coordinator_sid)
+            .json(&json!({"jsonrpc":"2.0","id":42,"method":"tools/list","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(session_survived.status(), StatusCode::OK);
+
+        let missing_session = http
+            .post(&url)
+            .header("Authorization", "Bearer coordinator-secret")
+            .json(&json!({"jsonrpc":"2.0","id":43,"method":"tools/list","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_session.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            missing_session.json::<Value>().await.unwrap()["error"]["data"]["code"],
+            "unknown_session"
+        );
+
+        let outside_scope = http
+            .post(&url)
+            .header("Authorization", "Bearer coordinator-secret")
+            .header("mcp-session-id", &coordinator_sid)
+            .json(&json!({
+                "jsonrpc":"2.0", "id":5, "method":"tools/call",
+                "params": {
+                    "name":"ptah_create_session",
+                    "arguments":{"workspace":outside.path()}
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(outside_scope.status(), StatusCode::FORBIDDEN);
+
+        let observer_init = initialize("observer-secret", 6).send().await.unwrap();
+        assert_eq!(observer_init.status(), StatusCode::OK);
+        let observer_body = observer_init.json::<Value>().await.unwrap();
+        assert_eq!(
+            observer_body["result"]["_meta"]["grokptah/authorityCapabilities"]["principal"]["role"],
+            "observer"
+        );
 
         srv.stop();
         set_grokptah_home_override(None);
@@ -3763,13 +4279,10 @@ mod tests {
         let client = reqwest::Client::new();
         let cases = [
             json!({
-                "name": "ptah_queue_prompt",
+                "name": "ptah_create_session",
                 "arguments": {
-                    "request_id": "bad-priority",
-                    "session_id": session.id,
                     "workspace": ws.path(),
-                    "prompt": "do not queue",
-                    "priority": "yes"
+                    "title": 42
                 }
             }),
             json!({
@@ -3855,6 +4368,19 @@ mod tests {
         srv: ControlServerHandle,
         url: String,
         client: reqwest::Client,
+        session_id: String,
+    }
+
+    async fn initialized_computer_fixture(srv: ControlServerHandle) -> ComputerFixture {
+        let url = format!("http://{}/mcp", srv.addr);
+        let client = reqwest::Client::new();
+        let session_id = initialize_test_session(&client, &url, "computer-token", 99).await;
+        ComputerFixture {
+            srv,
+            url,
+            client,
+            session_id,
+        }
     }
 
     fn operator_workspace_snapshot(host: &crate::host::AgentHostHandle) -> Value {
@@ -3875,6 +4401,7 @@ mod tests {
             .client
             .post(&fixture.url)
             .header("Authorization", "Bearer computer-token")
+            .header("mcp-session-id", &fixture.session_id)
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -3893,7 +4420,7 @@ mod tests {
         home: &std::path::Path,
         roots: Vec<std::path::PathBuf>,
     ) -> Arc<OrchestrationService> {
-        OrchestrationService::new(
+        let service = OrchestrationService::new(
             host.clone(),
             host.event_bus(),
             OrchStore::open(home.join("orch")).unwrap(),
@@ -3903,7 +4430,18 @@ mod tests {
                 max_concurrent_runs: 2,
                 bounds: RunBounds::default(),
             },
-        )
+        );
+        // These projection tests exercise a trusted loopback desktop adapter.
+        // Production bearer constructors cannot create this credential role;
+        // remote coordinator/observer denial is covered separately.
+        service
+            .set_auth_credentials(vec![AuthCredential::trusted_local_test(
+                "primary",
+                "computer-token",
+            )
+            .unwrap()])
+            .unwrap();
+        service
     }
 
     #[tokio::test]
@@ -3965,11 +4503,7 @@ mod tests {
             vec![ws_a.path().to_path_buf(), ws_b.path().to_path_buf()],
         );
         let srv = start_control_server(orch, 0).await.unwrap();
-        let fixture = ComputerFixture {
-            url: format!("http://{}/mcp", srv.addr),
-            srv,
-            client: reqwest::Client::new(),
-        };
+        let fixture = initialized_computer_fixture(srv).await;
 
         // Coordinator reads inspect a Lane; they must never open it in the
         // local operator cockpit. Keep session_b focused while exercising all
@@ -4037,6 +4571,7 @@ mod tests {
             .client
             .post(&fixture.url)
             .header("Authorization", "Bearer computer-token")
+            .header("mcp-session-id", &fixture.session_id)
             .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
             .send()
             .await
@@ -4300,11 +4835,7 @@ mod tests {
 
         let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
         let srv = start_control_server(orch, 0).await.unwrap();
-        let fixture = ComputerFixture {
-            url: format!("http://{}/mcp", srv.addr),
-            srv,
-            client: reqwest::Client::new(),
-        };
+        let fixture = initialized_computer_fixture(srv).await;
 
         // A cursor below the retained window is a hard 410, mirroring
         // ptah_get_events; the gap is never silently skipped. The retained
@@ -4417,11 +4948,7 @@ mod tests {
 
         let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
         let srv = start_control_server(orch, 0).await.unwrap();
-        let fixture = ComputerFixture {
-            url: format!("http://{}/mcp", srv.addr),
-            srv,
-            client: reqwest::Client::new(),
-        };
+        let fixture = initialized_computer_fixture(srv).await;
 
         let (status, body) = call_tool(
             &fixture,
@@ -4497,11 +5024,7 @@ mod tests {
 
         let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
         let srv = start_control_server(orch, 0).await.unwrap();
-        let fixture = ComputerFixture {
-            url: format!("http://{}/mcp", srv.addr),
-            srv,
-            client: reqwest::Client::new(),
-        };
+        let fixture = initialized_computer_fixture(srv).await;
         let (status, body) = call_tool(
             &fixture,
             1,

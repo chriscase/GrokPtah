@@ -2,6 +2,10 @@
 //!
 //! Starts a real loopback listener against a disposable home and workspace.
 //! Tests talk MCP over HTTP and never require model credentials.
+//! Each integration binary includes this module independently, so helpers
+//! used by only some suites are not dead code in those binaries.
+
+#![allow(dead_code)]
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
@@ -181,6 +185,7 @@ pub fn seed_active_run(
             client_id: Some("mcp".into()),
             state: RunState::Running,
             purpose: Default::default(),
+            provider_route: None,
             agent_id: Some(agent_id.clone()),
             retry_of: None,
             parent_run_id: None,
@@ -237,6 +242,7 @@ pub fn point_agent_at_new_run(
             client_id: Some("mcp".into()),
             state: RunState::Running,
             purpose: Default::default(),
+            provider_route: None,
             agent_id: None,
             retry_of: None,
             parent_run_id: Some(previous_run_id.to_string()),

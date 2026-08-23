@@ -17,7 +17,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use grokptah_agent_bridge::{
     desktop_auto_update_enabled, home_override_serial, model_selection_key,
-    set_grokptah_home_override, AgentHost, HostConfig, PermissionDecision, RunState, SessionUpdate,
+    orchestration::PublicCompletionEvidence, set_grokptah_home_override, AgentHost, HostConfig,
+    PermissionDecision, RunState, SessionUpdate,
 };
 use tokio::time::timeout;
 
@@ -262,13 +263,13 @@ async fn session_lifecycle_prompt_streams_message() {
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].evidence.status, "unverified");
     let turn_id = history[0].turn_id;
-    let runs = host.list_session_runs(session.id).unwrap();
+    let runs = host.list_public_session_runs(session.id).unwrap();
     assert_eq!(runs.len(), 1, "Build turn should create one durable run");
     assert_eq!(runs[0].state, RunState::Completed);
     assert_eq!(runs[0].client_id.as_deref(), Some("desktop"));
     assert_eq!(
         runs[0].aggregates.verification,
-        Some(history[0].evidence.clone())
+        Some(PublicCompletionEvidence::from(&history[0].evidence))
     );
     drop(host);
 
@@ -280,7 +281,7 @@ async fn session_lifecycle_prompt_streams_message() {
     assert_eq!(restored[0].turn_id, turn_id);
     assert_eq!(restored[0].evidence.status, "unverified");
     restored_host.ensure_orchestration_store().unwrap();
-    let restored_runs = restored_host.list_session_runs(session.id).unwrap();
+    let restored_runs = restored_host.list_public_session_runs(session.id).unwrap();
     assert_eq!(restored_runs.len(), 1);
     assert_eq!(restored_runs[0].state, RunState::Completed);
 }

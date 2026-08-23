@@ -28,9 +28,9 @@ Command-line options override their environment equivalents:
 | Option | Environment | Default |
 | --- | --- | --- |
 | `--listen ADDR` | `GROKPTAH_SERVICE_LISTEN` | `127.0.0.1:39200` |
-| `--token TOKEN` | `GROKPTAH_SERVICE_TOKEN` | required |
+| `--token TOKEN` | `GROKPTAH_SERVICE_TOKEN` | required; remote coordinator authority |
 | `--workspace PATH` | `GROKPTAH_SERVICE_WORKSPACES` | required; repeatable |
-| `--client ID=TOKEN` | `GROKPTAH_SERVICE_CLIENTS` | primary token only; additional credentials repeatable |
+| `--client [ROLE:]ID=TOKEN` | `GROKPTAH_SERVICE_CLIENTS` | primary coordinator token only; additional credentials repeatable |
 | — | `GROKPTAH_SERVICE_AGENT_OWNER` | `primary` |
 | `--allow-remote` | `GROKPTAH_SERVICE_ALLOW_REMOTE` | disabled |
 | `--max-concurrent N` | `GROKPTAH_SERVICE_MAX_CONCURRENT` | `4` |
@@ -55,14 +55,68 @@ Remote listeners require both `--allow-remote` and a bearer token at least 24
 characters long. Health and readiness probes are authenticated when the
 listener is non-loopback. The service never binds remotely by accident.
 
-The primary credential remains compatible with `GROKPTAH_SERVICE_TOKEN`. Add
-named device credentials with repeated `--client ID=TOKEN` options or a
-comma-separated `GROKPTAH_SERVICE_CLIENTS` value such as
-`laptop=<token>,phone=<token>`. Every credential maps to the configured
+The primary credential remains compatible with `GROKPTAH_SERVICE_TOKEN` and
+has `coordinator` authority. Add named credentials with repeated
+`--client [ROLE:]ID=TOKEN` options or a comma-separated
+`GROKPTAH_SERVICE_CLIENTS` value such as
+`operator:laptop=<token>,observer:dashboard=<token>`. The role prefix is
+optional and defaults to `coordinator`. Every credential maps to the configured
 `GROKPTAH_SERVICE_AGENT_OWNER` account (default `primary`), so devices can
 share durable Agent identities while Runs and audit entries retain the
 credential ID that initiated them. Credentials are held in process memory and
 are never written into `GROKPTAH_HOME`.
+
+### Authority tiers and capability discovery
+
+Bearer authority is closed and transport-neutral. The shared service checks it
+before request parsing, durable mutation, or idempotency receipt creation; it
+is not inferred from a tool name, token label, desktop process, or host
+filesystem permissions.
+
+| Tier | Intended use | Key limits |
+| --- | --- | --- |
+| `observer` | dashboards and read-only inspection | no submission, queue, Work, Manager, routine, approval, promotion, or Computer Use mutations |
+| `coordinator` | long-running agents and ordinary remote orchestration | may submit/cancel/retry Runs and coordinate Work, Managers, workers, and routines; cannot approve Work or Runs, promote/discard Runs, change managed-execution authority, or access Computer Use |
+| `operator` | explicitly trusted remote administration | adds protected Work/Run approval, promotion/discard, and managed-execution administration; still cannot access Computer Use |
+| local operator | trusted in-process desktop adapter only | never selectable by a bearer credential |
+
+`initialize` returns the bound, secret-free capability document in
+`_meta["grokptah/authorityCapabilities"]`. `tools/list` is derived from that
+same document, and `ptah_get_authority_capabilities` returns it explicitly.
+The document contains opaque workspace IDs, exact operation/tool lists, and
+hard denials—never bearer values or canonical filesystem paths. An MCP session
+is bound to the credential ID and capability-document hash used at initialize;
+credential swaps or authority changes require a new session.
+
+`initialize` is the only stateless MCP method and the only way to create that
+binding. Every later POST method—including `ping`, `tools/list`, `tools/call`,
+notifications, and typed error paths—plus `GET /mcp` and `DELETE /mcp` requires
+the returned `mcp-session-id`. Missing, unknown, stale, or credential-swapped
+session IDs fail closed before tool dispatch or session deletion. There is no
+legacy bearer-only path after initialization; clients must reinitialize after
+an authority change or reconnect.
+
+Run-scoped reads, progress, events/live streams, change and test projections,
+handoffs, isolated review, and cancellation deliberately do not reveal whether
+a well-formed Run ID exists outside the caller's authority. Unknown Runs,
+foreign sessions, foreign workspaces, invalid session/workspace claims, and
+credentials without the required workspace grant return the same typed
+`forbidden_scope` code and message. A refused cancellation reaches this check
+before idempotency is claimed, so it cannot leave a replayable receipt. Only a
+syntactically malformed Run ID remains a distinct `invalid_request`.
+
+Embedders may construct a credential with a narrower set of canonical
+workspace roots. Authentication rejects any credential grant that exceeds the
+service allowlist. The CLI currently applies the service-wide allowlist to its
+named credentials; deployments needing different roots per credential should
+construct `ServiceConfig::client_credentials` explicitly.
+
+Authority-bearing idempotency receipts are namespaced by principal,
+credential, grant revision, and capability-document hash; legacy receipts
+without that binding fail closed. Transport audit rows record the same
+non-secret authority identity. Audit persistence is currently asynchronous and
+best-effort, so it is diagnostic evidence rather than a fail-closed external
+side-effect authorization gate.
 
 ## Probes and MCP
 
@@ -79,9 +133,10 @@ connect to `/mcp` with:
 Authorization: Bearer <token>
 ```
 
-The service exposes the same scoped orchestration tools as the desktop control
-plane, including Build-session discovery/creation, task submission, durable
-run history, checkpoint inspection, and explicit resume. A remote coordinator
+The service exposes the authority-filtered subset of scoped orchestration tools
+granted to each bearer, including Build-session discovery/creation, task
+submission, durable run history, checkpoint inspection, and explicit resume.
+A remote coordinator
 can bootstrap a fresh allowlisted Build session with `ptah_create_session`;
 session creation never accepts an arbitrary path or model policy. The service
 does not resume model execution implicitly after restart. It does reconcile
@@ -156,6 +211,12 @@ The protocol-level conformance and soak suite lives beside the service smoke
 tests. It starts disposable temporary workspaces and a real loopback listener.
 It never requires model credentials or outbound network.
 
+CI (`.github/workflows/hosted-service.yml`) formats the crate, runs clippy with
+warnings denied, and executes the complete hosted-service test suite, including
+standalone conformance, on locked dependencies. Manual `workflow_dispatch` is
+supported. Bridge compilation in the desktop workflow is not a substitute for
+these tests.
+
 ```sh
 # Full service crate: unit, smoke, and protocol conformance.
 cargo test --locked --manifest-path crates/codegen/grokptah-service/Cargo.toml
@@ -210,8 +271,8 @@ Journal expiry is forced by flooding the in-process event bus.
 | MCP reconnect | `DELETE /mcp` plus a new initialize yields a new transport session; durable run reads still work. |
 | Service restart | Reopening the same `GROKPTAH_HOME` exposes the same run records. |
 | Cursor expiry | `ptah_get_events` and the live SSE channel fail closed on a cursor below the retained journal instead of silently skipping history. |
-| Desktop contract | Create/list session shape, typed submit receipt (`runId`, `sessionId`, `state`, `requestId`, `executionMode`, optional `queuedPosition`), and `ptah_list_runs` still includes cancelled history after `current_run_id` moves. |
-| Durable workloads | `ptah_list_work` / `ptah_get_work` expose the same scoped WorkItem and redacted Attempt projections used by the desktop adapter. Human control-plane mutations (`ptah_create_work`, `ptah_assign_work`, `ptah_retry_work`, `ptah_approve_work`, and revision-fenced `ptah_cancel_work`) are idempotent and remain separate from lease-token worker operations; Work remains readable after Lane archival while archived-Lane mutations fail closed, and the shared supervisor reconciles lease expiry or restart. |
+| Desktop contract | Create/list session shape, typed submit receipt (`runId`, `sessionId`, `state`, `requestId`, `executionMode`, optional `queuedPosition`), and `ptah_list_runs` still includes cancelled history after `current_run_id` moves. Public list/get/progress omit the frozen provider route. |
+| Durable workloads | `ptah_list_work` / `ptah_get_work` expose the same scoped WorkItem and redacted Attempt projections used by the desktop adapter. Coordinator mutations (`ptah_create_work`, `ptah_assign_work`, `ptah_retry_work`, and revision-fenced `ptah_cancel_work`) are idempotent and remain separate from lease-token worker operations; `ptah_approve_work` additionally requires operator authority. Work remains readable after Lane archival while archived-Lane mutations fail closed, and the shared supervisor reconciles lease expiry or restart. |
 | Durable routines | `ptah_list_routines` / `ptah_get_routine` / `ptah_list_activations` expose the same Routine and Activation records as the desktop adapter. `ptah_create_routine`, `ptah_fire_routine`, `ptah_pause_routine`, `ptah_enable_routine`, and `ptah_disable_routine` are idempotent. Manual fire creates Work through the existing workload API. The service process is the runtime-home owner that fires due schedules. |
 
 The smoke tests in `tests/service_smoke.rs` remain the smaller lifecycle /
