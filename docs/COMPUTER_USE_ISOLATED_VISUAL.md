@@ -172,7 +172,13 @@ available.
    cleanup campaign. The candidate now defines the closed manifest/security/resource contract and
    a deterministic no-input lifecycle that refuses terminal completion until exact process,
    open-handle, overlay, and frame-cache cleanup evidence matches the bound surface. It contains no
-   host paths or channel secrets. Actual helper/image packaging and the destructive campaign remain.
+   host paths or channel secrets. A subsequent measurement candidate hashes independently opened,
+   read-only regular-file handles under helper/image/configuration size and mode ceilings, preserves
+   their offsets, detects identity changes during streaming, emits no paths/descriptors, and can
+   compare those three content digests with the launch manifest. It does **not** discover bundle
+   resources, reject a symlink at open time, establish the helper's code-signing requirement,
+   package an artifact, launch a VM, or run cleanup. Actual helper/image packaging, signing proof,
+   and the destructive campaign remain.
 4. Add authenticated virtio-socket frame/health transport and render read-only frames. The candidate
    now defines the transport-independent, read-only protocol core: a non-serializable/redacted
    32-byte channel key authenticates the exact protocol version, Run, surface incarnation, message
@@ -193,9 +199,11 @@ available.
 
 The existing simulator remains the only dispatchable isolated proof. The Stage 8 measured
 background candidate is not a substitute. The typed input, read-only host-probe, no-input lifecycle,
-and authenticated read-protocol candidates do not enable `HostNative`, expose isolated actions to a
-model or cockpit approval flow, qualify a provider for visual fallback, package a VM image/helper,
-carry or render frame bytes, or satisfy any #288 acceptance checkbox. The manifest accepts only the
-locked-down profile and bounded resources, but synthetic digests are not packaged identity. A
-present framework, valid contract, authenticated metadata envelope, or entitlement is not a VM,
-guest, carrier, rendered frame, isolation, dispatch, cleanup campaign, or release proof.
+open-handle content-measurement, and authenticated read-protocol candidates do not enable
+`HostNative`, expose isolated actions to a model or cockpit approval flow, qualify a provider for
+visual fallback, package a VM image/helper, establish code-signing identity, carry or render frame
+bytes, or satisfy any #288 acceptance checkbox. The manifest accepts only the locked-down profile
+and bounded resources, but synthetic or caller-opened content digests are not packaged identity. A
+present framework, valid contract, content hash, authenticated metadata envelope, or entitlement is
+not a VM, signed helper, guest, carrier, rendered frame, isolation, dispatch, cleanup campaign, or
+release proof.
