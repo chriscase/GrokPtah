@@ -999,7 +999,7 @@ export interface ComputerIsolatedVisualStatus {
   minimumOsVersion: string;
   operatingSystemSupported: boolean;
   virtualizationFrameworkAvailable: boolean;
-  virtualizationEntitlementPresent: boolean;
+  helperVirtualizationEntitlementVerified: boolean;
   backendPackaged: boolean;
   guestImageMeasured: boolean;
   launchAttempted: boolean;
@@ -1007,8 +1007,8 @@ export interface ComputerIsolatedVisualStatus {
     | "unsupported_platform"
     | "minimum_os"
     | "framework_unavailable"
-    | "entitlement_missing"
     | "backend_not_packaged"
+    | "helper_entitlement_unverified"
     | "guest_image_not_measured"
     | null;
   detail: string;

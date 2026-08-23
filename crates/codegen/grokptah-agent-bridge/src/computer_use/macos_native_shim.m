@@ -26,7 +26,6 @@ typedef struct {
 typedef struct {
     bool operating_system_supported;
     bool framework_available;
-    bool virtualization_entitlement_present;
 } GPTMacVirtualizationProbe;
 
 enum {
@@ -233,20 +232,6 @@ GPTMacVirtualizationProbe gpt_macos_virtualization_probe(void) {
     });
     result.framework_available = framework_available;
 
-    SecTaskRef task = SecTaskCreateFromSelf(kCFAllocatorDefault);
-    if (task != NULL) {
-        CFTypeRef entitlement = SecTaskCopyValueForEntitlement(
-            task,
-            CFSTR("com.apple.security.virtualization"),
-            NULL);
-        if (entitlement != NULL) {
-            result.virtualization_entitlement_present =
-                CFGetTypeID(entitlement) == CFBooleanGetTypeID() &&
-                CFBooleanGetValue((CFBooleanRef)entitlement);
-            CFRelease(entitlement);
-        }
-        CFRelease(task);
-    }
     return result;
 }
 

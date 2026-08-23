@@ -681,6 +681,16 @@ export function SettingsPanel({
                     </div>
                     <div className="computer-permission-row">
                       <div>
+                        <strong>Virtualization authority</strong>
+                        <span>
+                          {isolatedVisualStatus.helperVirtualizationEntitlementVerified
+                            ? "Verified in signed helper"
+                            : "Reserved for signed helper"}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="computer-permission-row">
+                      <div>
                         <strong>Packaged isolated environment</strong>
                         <span>
                           {isolatedVisualStatus.backendPackaged &&

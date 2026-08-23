@@ -46,22 +46,23 @@ pub struct ComputerPlatformStatus {
 }
 
 /// The first fail-closed reason why isolated visual Computer Use is not
-/// available. This is a read-only host/package probe; it is never authority to
-/// construct an isolated capability proof.
+/// available. This is a read-only host/package projection; it is never
+/// authority to construct an isolated capability proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputerIsolatedVisualBlocker {
     UnsupportedPlatform,
     MinimumOs,
     FrameworkUnavailable,
-    EntitlementMissing,
     BackendNotPackaged,
+    HelperEntitlementUnverified,
     GuestImageNotMeasured,
 }
 
 /// Redaction-safe availability facts for the selected disposable-VM
 /// substrate. Reading this value must never request consent, launch a VM,
-/// inspect a guest image, or mint Computer Use authority.
+/// inspect a guest image, or mint Computer Use authority. The main process is
+/// intentionally not required to carry the helper's virtualization authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComputerIsolatedVisualStatus {
@@ -71,7 +72,7 @@ pub struct ComputerIsolatedVisualStatus {
     pub minimum_os_version: String,
     pub operating_system_supported: bool,
     pub virtualization_framework_available: bool,
-    pub virtualization_entitlement_present: bool,
+    pub helper_virtualization_entitlement_verified: bool,
     pub backend_packaged: bool,
     pub guest_image_measured: bool,
     pub launch_attempted: bool,
@@ -84,20 +85,15 @@ impl ComputerIsolatedVisualStatus {
         platform_supported: bool,
         operating_system_supported: bool,
         virtualization_framework_available: bool,
-        virtualization_entitlement_present: bool,
     ) -> Self {
-        let host_capable = platform_supported
-            && operating_system_supported
-            && virtualization_framework_available
-            && virtualization_entitlement_present;
+        let host_capable =
+            platform_supported && operating_system_supported && virtualization_framework_available;
         let blocker = if !platform_supported {
             ComputerIsolatedVisualBlocker::UnsupportedPlatform
         } else if !operating_system_supported {
             ComputerIsolatedVisualBlocker::MinimumOs
         } else if !virtualization_framework_available {
             ComputerIsolatedVisualBlocker::FrameworkUnavailable
-        } else if !virtualization_entitlement_present {
-            ComputerIsolatedVisualBlocker::EntitlementMissing
         } else {
             ComputerIsolatedVisualBlocker::BackendNotPackaged
         };
@@ -111,13 +107,13 @@ impl ComputerIsolatedVisualStatus {
             ComputerIsolatedVisualBlocker::FrameworkUnavailable => {
                 "The required Apple Virtualization framework classes are unavailable".into()
             }
-            ComputerIsolatedVisualBlocker::EntitlementMissing => {
-                "This build does not carry the virtualization entitlement".into()
-            }
             ComputerIsolatedVisualBlocker::BackendNotPackaged => {
-                "Host virtualization is ready; the measured helper and guest are not packaged yet"
+                "Host virtualization is ready; the signed helper and measured guest are not packaged yet"
                     .into()
             }
+            ComputerIsolatedVisualBlocker::HelperEntitlementUnverified => unreachable!(
+                "the read-only host probe never claims that a helper is packaged"
+            ),
             ComputerIsolatedVisualBlocker::GuestImageNotMeasured => unreachable!(
                 "the read-only substrate probe never claims that a backend is packaged"
             ),
@@ -134,7 +130,7 @@ impl ComputerIsolatedVisualStatus {
             minimum_os_version: "14.0".into(),
             operating_system_supported,
             virtualization_framework_available,
-            virtualization_entitlement_present,
+            helper_virtualization_entitlement_verified: false,
             backend_packaged: false,
             guest_image_measured: false,
             launch_attempted: false,
@@ -157,8 +153,7 @@ impl ComputerIsolatedVisualStatus {
         }
         let expected_host_capable = self.platform_id == "macos"
             && self.operating_system_supported
-            && self.virtualization_framework_available
-            && self.virtualization_entitlement_present;
+            && self.virtualization_framework_available;
         let expected_blocker = if self.platform_id == "unavailable" {
             ComputerIsolatedVisualBlocker::UnsupportedPlatform
         } else if self.platform_id != "macos" {
@@ -170,20 +165,17 @@ impl ComputerIsolatedVisualStatus {
             ComputerIsolatedVisualBlocker::MinimumOs
         } else if !self.virtualization_framework_available {
             ComputerIsolatedVisualBlocker::FrameworkUnavailable
-        } else if !self.virtualization_entitlement_present {
-            ComputerIsolatedVisualBlocker::EntitlementMissing
         } else {
             ComputerIsolatedVisualBlocker::BackendNotPackaged
         };
         if self.host_capable != expected_host_capable
             || (self.platform_id == "unavailable"
-                && (self.operating_system_supported
-                    || self.virtualization_framework_available
-                    || self.virtualization_entitlement_present))
+                && (self.operating_system_supported || self.virtualization_framework_available))
             || self.launch_attempted
             || self.available
             || self.backend_packaged
             || self.guest_image_measured
+            || self.helper_virtualization_entitlement_verified
             || self.blocker != Some(expected_blocker)
         {
             return Err(ComputerError::new(
@@ -204,7 +196,7 @@ pub fn computer_isolated_visual_status() -> ComputerIsolatedVisualStatus {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        ComputerIsolatedVisualStatus::read_only_probe(false, false, false, false)
+        ComputerIsolatedVisualStatus::read_only_probe(false, false, false)
     }
 }
 
@@ -359,23 +351,19 @@ mod tests {
     fn isolated_visual_probe_reports_the_first_exact_blocker_without_launching() {
         let cases = [
             (
-                ComputerIsolatedVisualStatus::read_only_probe(false, false, false, false),
+                ComputerIsolatedVisualStatus::read_only_probe(false, false, false),
                 ComputerIsolatedVisualBlocker::UnsupportedPlatform,
             ),
             (
-                ComputerIsolatedVisualStatus::read_only_probe(true, false, false, false),
+                ComputerIsolatedVisualStatus::read_only_probe(true, false, false),
                 ComputerIsolatedVisualBlocker::MinimumOs,
             ),
             (
-                ComputerIsolatedVisualStatus::read_only_probe(true, true, false, false),
+                ComputerIsolatedVisualStatus::read_only_probe(true, true, false),
                 ComputerIsolatedVisualBlocker::FrameworkUnavailable,
             ),
             (
-                ComputerIsolatedVisualStatus::read_only_probe(true, true, true, false),
-                ComputerIsolatedVisualBlocker::EntitlementMissing,
-            ),
-            (
-                ComputerIsolatedVisualStatus::read_only_probe(true, true, true, true),
+                ComputerIsolatedVisualStatus::read_only_probe(true, true, true),
                 ComputerIsolatedVisualBlocker::BackendNotPackaged,
             ),
         ];
@@ -391,7 +379,7 @@ mod tests {
 
     #[test]
     fn isolated_visual_probe_rejects_claim_upgrades() {
-        let mut status = ComputerIsolatedVisualStatus::read_only_probe(true, true, true, true);
+        let mut status = ComputerIsolatedVisualStatus::read_only_probe(true, true, true);
         assert!(status.host_capable);
         status.available = true;
         assert_eq!(
@@ -400,6 +388,12 @@ mod tests {
         );
         status.available = false;
         status.launch_attempted = true;
+        assert_eq!(
+            status.validate().unwrap_err().code,
+            ComputerErrorCode::InvalidRequest
+        );
+        status.launch_attempted = false;
+        status.helper_virtualization_entitlement_verified = true;
         assert_eq!(
             status.validate().unwrap_err().code,
             ComputerErrorCode::InvalidRequest

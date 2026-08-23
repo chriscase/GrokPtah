@@ -42,7 +42,6 @@ struct NativeResult {
 struct NativeVirtualizationProbe {
     operating_system_supported: bool,
     framework_available: bool,
-    virtualization_entitlement_present: bool,
 }
 
 unsafe extern "C" {
@@ -82,7 +81,6 @@ pub(crate) fn isolated_visual_status() -> ComputerIsolatedVisualStatus {
         true,
         probe.operating_system_supported,
         probe.framework_available,
-        probe.virtualization_entitlement_present,
     );
     debug_assert!(status.validate().is_ok());
     status

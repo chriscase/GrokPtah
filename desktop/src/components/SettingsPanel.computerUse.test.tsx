@@ -52,16 +52,17 @@ const granted: ComputerPlatformStatus = {
 const isolatedPending: ComputerIsolatedVisualStatus = {
   platformId: "macos",
   available: false,
-  hostCapable: false,
+  hostCapable: true,
   minimumOsVersion: "14.0",
   operatingSystemSupported: true,
   virtualizationFrameworkAvailable: true,
-  virtualizationEntitlementPresent: false,
+  helperVirtualizationEntitlementVerified: false,
   backendPackaged: false,
   guestImageMeasured: false,
   launchAttempted: false,
-  blocker: "entitlement_missing",
-  detail: "This build does not carry the virtualization entitlement",
+  blocker: "backend_not_packaged",
+  detail:
+    "Host virtualization is ready; the signed helper and measured guest are not packaged yet",
 };
 
 const candidate: ComputerTargetCandidate = {
@@ -138,6 +139,7 @@ describe("Computer Use settings", () => {
     expect(mocks.listTargets).not.toHaveBeenCalled();
     expect(mocks.observeOnce).not.toHaveBeenCalled();
     expect(screen.getByText("Isolated visual workspace")).toBeTruthy();
+    expect(screen.getByText("Reserved for signed helper")).toBeTruthy();
     expect(screen.getByText(/did not launch a virtual machine/)).toBeTruthy();
     expect(
       screen.getByText(/Codex Computer Use and Terminal grants do not grant GrokPtah access/),

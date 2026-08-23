@@ -21,8 +21,9 @@ overlay bound to the exact frame and action state.
 
 The local macOS SDK independently confirms the required platform primitives and boundary:
 
-- `VZVirtualMachineConfiguration` and `VZVirtualMachine` require the
-  `com.apple.security.virtualization` entitlement;
+- `VZVirtualMachineConfiguration` and `VZVirtualMachine` require the owning **helper** to carry the
+  `com.apple.security.virtualization` entitlement; the main GrokPtah process should not receive that
+  authority merely to display status or control the helper;
 - `VZVirtioGraphicsDeviceConfiguration` supplies a display for `VZVirtualMachineView`;
 - `VZVirtioSocketDeviceConfiguration` supplies host/guest socket communication;
 - screen-coordinate pointing devices exist for VM input, but the product path will not forward the
@@ -165,9 +166,10 @@ available.
    The pointer move/button and text-input type/policy slice is implemented in the Stage 9 candidate;
    authenticated transport events and replay evidence remain part of steps 4–5.
 2. Build a read-only Virtualization-framework availability/configuration probe with no VM launch.
-   The Stage 9 probe candidate now checks the minimum OS, required framework classes, and exact
-   virtualization entitlement, then reports the first blocker in Settings. It hard-codes the
-   helper/image as unready and records `launchAttempted: false`; it cannot mint a capability proof.
+   The Stage 9 probe candidate now checks the minimum OS and required framework classes, then
+   reports the first blocker in Settings. It hard-codes the helper entitlement/image as unverified,
+   records `launchAttempted: false`, and does not give the main app the helper's virtualization
+   authority; it cannot mint a capability proof.
 3. Package and measure a minimal helper and immutable guest fixture; run the no-input lifecycle and
    cleanup campaign. The candidate now defines the closed manifest/security/resource contract and
    a deterministic no-input lifecycle that refuses terminal completion until exact process,
