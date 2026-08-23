@@ -4,6 +4,7 @@
 //! and mutates product state through [`grokptah_agent_bridge::McpControlClient`].
 
 pub mod artifact;
+pub mod authority_stage3;
 pub mod capture;
 pub mod cli;
 pub mod local_service;
@@ -30,6 +31,7 @@ pub const REVIEW_FAKE_PROVIDER_SCHEMA: &str = "grokptah.code-review-benchmark-fa
 pub const REVIEW_REPORT_SCHEMA: &str = "grokptah.code-review-benchmark.v1";
 pub const REVIEW_FINGERPRINT_SCHEMA: &str = "grokptah.code-review-benchmark-fingerprint.v1";
 pub const REVIEW_IMPLEMENTATION_SCHEMA: &str = "grokptah.code-review-benchmark-implementation.v1";
+pub const AUTHORITY_STAGE3_REPORT_SCHEMA: &str = authority_stage3::AUTHORITY_STAGE3_REPORT_SCHEMA;
 pub const MEMORY_STAGE5_REPORT_SCHEMA: &str = memory_stage5::MEMORY_STAGE5_REPORT_SCHEMA;
 pub const ALWAYS_ON_GROKBOT_FIXTURE: &[u8] = crate::process_service::FIXTURE_BYTES;
 pub const ALWAYS_ON_GROKBOT_FIXTURE_SCHEMA: &str = crate::process_service::FIXTURE_SCHEMA;

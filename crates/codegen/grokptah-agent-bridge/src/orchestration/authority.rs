@@ -687,6 +687,25 @@ mod tests {
     }
 
     #[test]
+    fn bearer_cannot_mint_local_operator_authority() {
+        let root = tempdir().unwrap();
+        let remote = EffectiveAuthority::remote_default(
+            "forged-local",
+            "owner",
+            &[root.path().to_path_buf()],
+            AuthorityRole::LocalOperator,
+            false,
+        );
+        assert!(remote.is_err());
+
+        let trusted =
+            EffectiveAuthority::trusted_local_operator("owner", &[root.path().to_path_buf()])
+                .unwrap();
+        assert_eq!(trusted.stamp.role, AuthorityRole::LocalOperator);
+        assert_eq!(trusted.stamp.credential_id, "trusted-local-adapter");
+    }
+
+    #[test]
     fn remote_operator_ceiling_is_explicitly_complete_except_computer_read() {
         let expected = CONTROL_TOOLS
             .iter()
@@ -712,11 +731,18 @@ mod tests {
             .tools
             .iter()
             .any(|tool| tool == "ptah_list_runs"));
-        assert!(!authority
-            .capability_document
-            .tools
-            .iter()
-            .any(|tool| tool == "ptah_submit_task"));
+        for denied in [
+            AuthorityOperation::AgentsResume,
+            AuthorityOperation::ManagerControl,
+            AuthorityOperation::QueueControl,
+            AuthorityOperation::RoutinesControl,
+            AuthorityOperation::RunsCancel,
+            AuthorityOperation::RunsSubmit,
+            AuthorityOperation::WorkCreate,
+            AuthorityOperation::WorkersControl,
+        ] {
+            assert!(!authority.operations.contains(&denied));
+        }
         let encoded = serde_json::to_string(&authority.capability_document).unwrap();
         assert!(!encoded.contains(root.path().to_string_lossy().as_ref()));
         assert!(!encoded.to_ascii_lowercase().contains("bearer"));
