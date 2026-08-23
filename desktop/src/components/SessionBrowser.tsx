@@ -85,6 +85,7 @@ export function SessionBrowser({
   const [confirmDelete, setConfirmDelete] = useState<ConfirmDelete | null>(null);
   const [progress, setProgress] = useState<Progress | null>(null);
   const [announce, setAnnounce] = useState("");
+  const [countAnnounce, setCountAnnounce] = useState("");
 
   // A refresh only applies while its generation is current; scope/kind changes,
   // close, and unmount all invalidate in-flight loads.
@@ -158,6 +159,7 @@ export function SessionBrowser({
     setProgress(null);
     setActionError(null);
     setAnnounce("");
+    setCountAnnounce("");
   }, [open]);
   useEffect(
     () => () => {
@@ -196,9 +198,11 @@ export function SessionBrowser({
 
   // After an editor or the confirm dialog closes, hand focus back to the
   // control that opened it ("search" = the always-present filter input).
-  // Deferred while busy so the target is enabled again when focused.
+  // Deferred while busy so the target is enabled again when focused, and
+  // while loading so a row about to leave the scope is never focused just
+  // before the refresh removes it (which would drop focus to body).
   useEffect(() => {
-    if (editor || confirmDelete || busy) return;
+    if (editor || confirmDelete || busy || loading) return;
     const key = pendingFocusRef.current;
     if (!key) return;
     pendingFocusRef.current = null;
@@ -209,9 +213,10 @@ export function SessionBrowser({
     const el = dialogRef.current?.querySelector<HTMLElement>(
       `[data-focus-key="${key}"]`,
     );
-    if (el) el.focus();
+    // A disabled control cannot take focus (it would silently stay on body).
+    if (el && !(el as HTMLButtonElement).disabled) el.focus();
     else searchRef.current?.focus();
-  }, [editor, confirmDelete, busy]);
+  }, [editor, confirmDelete, busy, loading]);
 
   const cancelEditor = useCallback(() => {
     setEditor((current) => {
@@ -228,6 +233,13 @@ export function SessionBrowser({
 
   // Escape resolves innermost-first: dropdown menu, confirm dialog, inline
   // editor, then the browser itself. "/" jumps to the filter input.
+  //
+  // Capture phase is load-bearing: StyledSelect closes its menu from a
+  // document-level listener, and in a real browser React flushes that DOM
+  // removal before a window-level bubble listener runs — so a bubble-phase
+  // menu check here would see no menu and close the whole browser on the
+  // same Escape. Deciding at capture reads the menu state as it was when
+  // the key was pressed.
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -255,8 +267,8 @@ export function SessionBrowser({
       }
       onClose();
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
   }, [open, editor, confirmDelete, onClose, cancelConfirm, cancelEditor]);
 
   // Tab containment; scoped to the confirm dialog while it is up.
@@ -329,6 +341,21 @@ export function SessionBrowser({
   const clientFilterActive =
     query.trim() !== "" || folderFilter !== "" || tagFilter !== "";
   const anyFilterActive = clientFilterActive || kindFilter !== "all";
+
+  const shown = filtered.length;
+  const countText = loading
+    ? "Loading Lanes…"
+    : clientFilterActive
+      ? `${shown} of ${rows.length} Lanes shown`
+      : `${shown} Lane${shown === 1 ? "" : "s"}`;
+
+  // The visible count updates on every keystroke; announcing each update
+  // floods screen readers. Announce only after the count has settled.
+  useEffect(() => {
+    if (!open) return;
+    const timer = window.setTimeout(() => setCountAnnounce(countText), 400);
+    return () => window.clearTimeout(timer);
+  }, [open, countText]);
 
   function toggleSelect(id: string) {
     setSelected((prev) => {
@@ -447,6 +474,10 @@ export function SessionBrowser({
 
   function archiveLanes(ids: string[], archived: boolean, fromBulk: boolean) {
     if (!ids.length) return;
+    // The initiating control may vanish (row leaves the scope) or disable
+    // (selection cleared); the deferred-focus effect falls back to the
+    // filter input so keyboard focus never lands on body.
+    pendingFocusRef.current = fromBulk ? "bulk-archive" : `archive:${ids[0]}`;
     const label = archived ? "Archive" : "Restore";
     void runOp(label, async () => {
       await eachWithProgress(
@@ -496,6 +527,9 @@ export function SessionBrowser({
   function bulkFolder(folder: string | null) {
     const ids = [...selected];
     if (!ids.length) return;
+    // The picker resets to its placeholder after the op; the filter input is
+    // the stable landing spot.
+    pendingFocusRef.current = "search";
     void runOp("Move to folder", async () => {
       await eachWithProgress(ids, "Moving", (id) =>
         api.sessionSetFolder(id, folder),
@@ -506,13 +540,6 @@ export function SessionBrowser({
   }
 
   if (!open) return null;
-
-  const shown = filtered.length;
-  const countText = loading
-    ? "Loading Lanes…"
-    : clientFilterActive
-      ? `${shown} of ${rows.length} Lanes shown`
-      : `${shown} Lane${shown === 1 ? "" : "s"}`;
 
   const renderEditorForm = (
     s: SessionSummary,
@@ -666,8 +693,13 @@ export function SessionBrowser({
       </div>
 
       <div className="sb-summary">
-        <span className="sb-count" role="status">
-          {countText}
+        <span className="sb-count">{countText}</span>
+        <span
+          className="sr-only"
+          role="status"
+          data-testid="sb-count-announce"
+        >
+          {countAnnounce}
         </span>
         {query.trim() && (
           <button
@@ -749,6 +781,7 @@ export function SessionBrowser({
         </button>
         <button
           type="button"
+          data-focus-key="bulk-archive"
           disabled={!selected.size || busy}
           onClick={() => archiveLanes([...selected], scope !== "archive", true)}
         >
@@ -985,6 +1018,7 @@ export function SessionBrowser({
                           </button>
                           <button
                             type="button"
+                            data-focus-key={`archive:${s.id}`}
                             disabled={busy}
                             onClick={() => archiveLanes([s.id], !s.archived, false)}
                           >

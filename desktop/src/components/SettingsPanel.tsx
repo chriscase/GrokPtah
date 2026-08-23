@@ -1070,10 +1070,22 @@ export function SettingsPanel({
                     }}
                   />
 
-                  <div className="modal-actions settings-provider-actions">
+                  {/* The readiness center above carries the single primary
+                      "next safe action"; this row keeps every provider action
+                      discoverable without competing primary emphasis. */}
+                  <span
+                    className="settings-field-label"
+                    id="settings-provider-actions-label"
+                  >
+                    All provider actions
+                  </span>
+                  <div
+                    className="modal-actions settings-provider-actions"
+                    role="group"
+                    aria-labelledby="settings-provider-actions-label"
+                  >
                     <button
                       type="button"
-                      className="primary"
                       data-testid="gateway-save"
                       disabled={providerWriteDisabled}
                       onClick={() => void saveGatewayProfile(false)}

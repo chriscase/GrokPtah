@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 
 import { SettingsPanel } from "./SettingsPanel";
 import { api } from "../lib/api";
@@ -275,5 +282,30 @@ describe("provider profile settings (#278)", () => {
     expect(alert.textContent).not.toContain("sk-secret-credential-value");
     expect(alert.textContent).not.toContain("Saved (leave blank to keep)");
     expect(api.qualifyProviderModel).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps exactly one primary action: the readiness next step, above a labeled full-actions row", async () => {
+    await openGateway();
+
+    // Every provider action stays discoverable under an explicit label…
+    const row = screen.getByRole("group", { name: "All provider actions" });
+    for (const id of ["gateway-save", "gateway-discover", "gateway-qualify"]) {
+      expect(within(row).getByTestId(id)).toBeInTheDocument();
+    }
+    // …but the row never competes for primary emphasis (PR #360 audit:
+    // two primary "Qualify model"/"Save provider" buttons 60px apart).
+    for (const button of within(row).getAllByRole("button")) {
+      expect(button).not.toHaveClass("primary");
+    }
+
+    const next = screen.getByTestId("readiness-next-action");
+    expect(next).toHaveClass("primary");
+    const recommended = (next.textContent ?? "").trim();
+    expect(recommended).not.toBe("");
+    const sameName = screen.getAllByRole("button", { name: recommended });
+    expect(sameName.length).toBeGreaterThan(1);
+    expect(sameName.filter((b) => b.classList.contains("primary"))).toEqual([
+      next,
+    ]);
   });
 });

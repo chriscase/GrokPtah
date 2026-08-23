@@ -87,7 +87,9 @@ export const ToolCallCard = memo(function ToolCallCard({
   const live = kind === "running" || kind === "pending";
   /** null = follow automatic open rules; boolean = user override */
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">(
+    "idle",
+  );
   const copyTimer = useRef<number | null>(null);
   const bodyId = useId();
   const title = item.title?.trim() || "tool";
@@ -125,20 +127,22 @@ export const ToolCallCard = memo(function ToolCallCard({
       ? raw.slice(0, RAW_STATUS_MAX)
       : "";
 
+  const settleCopy = (state: "copied" | "failed") => {
+    setCopyState(state);
+    if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+    copyTimer.current = window.setTimeout(
+      () => setCopyState("idle"),
+      COPY_RESET_MS,
+    );
+  };
+
   const handleCopy = () => {
     const text = item.output ?? "";
     navigator.clipboard.writeText(text).then(
-      () => {
-        setCopied(true);
-        if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
-        copyTimer.current = window.setTimeout(
-          () => setCopied(false),
-          COPY_RESET_MS,
-        );
-      },
-      () => {
-        // Clipboard refused (permissions/webview quirk) — keep the label as-is.
-      },
+      () => settleCopy("copied"),
+      // Clipboard refused (permissions/webview quirk) — a silent no-op reads
+      // as success and ships stale evidence; say it failed.
+      () => settleCopy("failed"),
     );
   };
 
@@ -168,7 +172,7 @@ export const ToolCallCard = memo(function ToolCallCard({
         ) : null}
         {!open && live && !preview ? (
           <span className="tool-card-preview" aria-hidden="true">
-            running…
+            {kind === "pending" ? "waiting…" : "running…"}
           </span>
         ) : null}
         <span className="tool-card-caret" aria-hidden="true">
@@ -189,17 +193,25 @@ export const ToolCallCard = memo(function ToolCallCard({
                   <>
                     <button
                       type="button"
-                      className="tool-card-copy"
+                      className={`tool-card-copy${copyState === "failed" ? " is-failed" : ""}`}
                       onClick={handleCopy}
                     >
-                      {copied ? "Copied" : "Copy output"}
+                      {copyState === "copied"
+                        ? "Copied"
+                        : copyState === "failed"
+                          ? "Copy failed"
+                          : "Copy output"}
                     </button>
                     <span
                       className="sr-only"
                       role="status"
                       data-testid="tool-card-copy-status"
                     >
-                      {copied ? "Output copied" : ""}
+                      {copyState === "copied"
+                        ? "Output copied"
+                        : copyState === "failed"
+                          ? "Copy failed"
+                          : ""}
                     </span>
                   </>
                 ) : null}
@@ -208,7 +220,9 @@ export const ToolCallCard = memo(function ToolCallCard({
             <pre className="tool-card-output">{item.output}</pre>
           </>
         ) : live ? (
-          <div className="tool-card-waiting">Running…</div>
+          <div className="tool-card-waiting">
+            {kind === "pending" ? "Waiting to start…" : "Running…"}
+          </div>
         ) : (
           <div className="tool-card-waiting">
             {oddRawStatus ? `(no output — reported status: ${oddRawStatus})` : "(no output)"}
