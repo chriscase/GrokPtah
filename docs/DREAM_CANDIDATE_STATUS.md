@@ -44,6 +44,24 @@ complete or that the product has reached 100%.
 
 ## Verification recorded
 
+### Overnight deterministic rerun — 2026-08-23
+
+The assembled candidate was rerun in an isolated checkout after the UI and
+enterprise slices were present:
+
+- Enterprise admission: 4 passed, 0 failed.
+- Agent bridge Clippy (`-D warnings`, library target): passed.
+- Certification-lab `cargo check --locked`: passed.
+- Desktop TypeScript typecheck: passed.
+- Desktop Vitest: 46 files, 357 tests passed.
+- Desktop production build: passed (352 modules; one existing large-chunk
+  advisory remains).
+
+Workspace-wide `cargo fmt --check` still reports only two pre-existing
+whitespace-only diffs in `crates/codegen/xai-grok-pager` outside this
+candidate's touched surfaces. No formatting change was made to mask that
+unrelated signal.
+
 - Coordinator store suite: 12 passed, 0 failed.
 - Orchestration library suite: 121 selected tests passed, 0 failed.
 - Computer Use library suite: 130 passed, 0 failed, including the uncertain
