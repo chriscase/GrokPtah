@@ -10,6 +10,9 @@ use parking_lot::Mutex;
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::enterprise_review_plan::{
+    enterprise_review_work_request_id, EnterpriseReviewWorkPlan, ENTERPRISE_REVIEW_WORK_PLAN_SCHEMA,
+};
 use crate::event_bus::{CursorExpiredError, EventBus, EventReceiver, JournalPage};
 use crate::host::AgentHostHandle;
 use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
@@ -3210,6 +3213,60 @@ impl OrchestrationService {
             "durable work item created",
         );
         Ok(response)
+    }
+
+    /// Materialize an admitted enterprise-review work projection through the
+    /// ordinary durable-work mutation path. Each pass uses a plan-bound
+    /// request id, so a host restart or broker retry replays the existing
+    /// WorkItem instead of creating a duplicate. This method does not issue
+    /// credentials or contact a provider; callers must perform admission and
+    /// worker binding before invoking it.
+    pub async fn create_enterprise_review_work_plan(
+        &self,
+        auth: &AuthContext,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        work_plan: EnterpriseReviewWorkPlan,
+    ) -> Result<serde_json::Value, OrchError> {
+        work_plan
+            .validate()
+            .map_err(|error| OrchError::new(OrchErrorCode::InvalidRequest, error.to_string()))?;
+        auth.require_workspace(AuthorityOperation::WorkCreate, workspace)?;
+
+        let mut work_items = Vec::with_capacity(work_plan.work_items.len());
+        for item in &work_plan.work_items {
+            let pass_request_id =
+                enterprise_review_work_request_id(&work_plan.plan_digest, &item.work_key);
+            let objective = format!(
+                "{} review={} plan={} work_key={}",
+                item.template.objective, work_plan.review_id, work_plan.plan_digest, item.work_key
+            );
+            let response = self
+                .create_work(
+                    auth,
+                    &pass_request_id,
+                    session_id,
+                    workspace,
+                    item.template.kind.clone(),
+                    objective,
+                    item.template.priority,
+                    None,
+                    None,
+                    Vec::new(),
+                    item.template.policy.clone(),
+                )
+                .await?;
+            work_items.push(response);
+        }
+        Ok(json!({
+            "schema": ENTERPRISE_REVIEW_WORK_PLAN_SCHEMA,
+            "reviewId": work_plan.review_id,
+            "planDigest": work_plan.plan_digest,
+            "workPlanDigest": work_plan.work_plan_digest,
+            "parentRequestId": request_id,
+            "workItems": work_items,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]

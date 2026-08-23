@@ -60,6 +60,10 @@ complete or that the product has reached 100%.
   deterministic `EnterpriseReviewWorkPlan` now gives each pass a stable,
   restart-safe idempotency key so an authorized host broker can materialize the
   seven independent workers without duplicate work or provider-specific state.
+  The orchestration service now materializes that projection through its
+  ordinary scoped durable-work path, replaying plan-bound request IDs on
+  partial retries; provider attach and live quality evidence remain separate
+  gates.
 - The provider-quota receipt contract now requires a named campaign, credential
   and route binding plus distinct provider-side consumption and HTTP-429
   exhaustion observations. Digests, ordering, schema, and secret-free output

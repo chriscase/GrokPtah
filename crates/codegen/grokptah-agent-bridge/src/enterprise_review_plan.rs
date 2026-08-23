@@ -28,6 +28,13 @@ pub const MAX_ENTERPRISE_REVIEW_PASS_ATTEMPTS: u32 = 3;
 pub const MAX_ENTERPRISE_REVIEW_FINDINGS_PER_PASS: usize = 256;
 pub const MAX_ENTERPRISE_REVIEW_LOCATION_BYTES: usize = 512;
 
+/// Derive the request id a host broker should use when materializing one
+/// projected pass. The plan and work key make retries independent of a
+/// transient UI/request id while remaining bound to one exact plan.
+pub fn enterprise_review_work_request_id(plan_digest: &str, work_key: &str) -> String {
+    format!("enterprise-review:{plan_digest}:{work_key}")
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum EnterpriseReviewPassKind {
@@ -844,6 +851,13 @@ mod tests {
         assert_eq!(
             tampered.work_plan(),
             Err(EnterpriseReviewPlanError::PlanMismatch)
+        );
+        assert_eq!(
+            enterprise_review_work_request_id(&first.plan_digest, &first.work_items[0].work_key),
+            format!(
+                "enterprise-review:{}:{}",
+                first.plan_digest, first.work_items[0].work_key
+            )
         );
     }
 
