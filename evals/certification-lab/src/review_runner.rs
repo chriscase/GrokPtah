@@ -361,7 +361,8 @@ fn run_live_fail_closed(
     // A valid broker lease proves only that admission can be re-established.
     // The runner still emits an indeterminate report until a real provider
     // campaign supplies authoritative usage and paired quality evidence.
-    let enterprise_lease_admitted = enterprise_review_live_evidence().is_ok();
+    let enterprise_evidence = enterprise_review_live_evidence().ok();
+    let enterprise_lease_admitted = enterprise_evidence.is_some();
     let output = SafeOutputRoot::open(
         &options.output_root,
         &options.repository_root,
@@ -383,6 +384,19 @@ fn run_live_fail_closed(
     let placeholder = digest(b"unmaterialized-live-review-workspace-v1");
     let mut report = base_report(bundle, ReviewMode::Live);
     report.implementation_digest = identity_digest.sha256.clone();
+    if let Some(evidence) = &enterprise_evidence {
+        scan_value_for_forbidden_data(&serde_json::to_value(evidence)?)
+            .map_err(|_| anyhow!("enterprise review evidence failed forbidden-data scanning"))?;
+        report.binding.route_fingerprint = digest(evidence.route_binding_digest.as_bytes());
+        report.binding.deployment_fingerprint = digest(evidence.policy_digest.as_bytes());
+        report.binding.credential_fingerprint = digest(evidence.lease_id.as_bytes());
+        report.binding.model_fingerprint = digest(evidence.model_id.as_bytes());
+        report.binding.attestation_present = true;
+        report.binding.attestation_valid = true;
+        report.binding.modest_tier_attested = true;
+        report.binding.premium_fallback_attested_absent = evidence.no_premium_fallback;
+        report.binding.egress_attestation_present = evidence.egress_firewall_attested;
+    }
     report.completeness.artifacts_consumed = true;
     report.completeness.bounds_consumed = true;
     report.live_indeterminate_reasons = [
@@ -1691,7 +1705,7 @@ pub fn stderr_progress(mode: ReviewMode, phase: &str) {
     match mode {
         ReviewMode::Fake => eprintln!("grokptah-cert: {phase} fake_cannot_prove_quality"),
         ReviewMode::Live => {
-            eprintln!("grokptah-cert: {phase} live_enterprise_gateway_unimplemented")
+            eprintln!("grokptah-cert: {phase} live_enterprise_gateway_review_indeterminate")
         }
     }
 }

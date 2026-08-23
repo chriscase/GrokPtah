@@ -90,5 +90,8 @@ cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
 This attachment proves admission only. The runner still returns an
 **indeterminate** live report until the operator-owned broker supplies real
 provider observations, authoritative usage/quota evidence, restart continuity,
-and the paired multi-hour quality result. Ambient API keys, token commands,
-compatible-gateway discovery, and fallback routes remain refused.
+and the paired multi-hour quality result. When a lease is present, the sealed
+report binds its route, deployment-policy, credential, and model fingerprints
+plus the attestation flags without copying the lease or any secret. Ambient API
+keys, token commands, compatible-gateway discovery, and fallback routes remain
+refused.
