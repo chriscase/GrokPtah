@@ -854,12 +854,19 @@ export function ComputerCockpit({
           )}
 
           {approval && (
-            <div className="computer-approval" role="dialog" aria-label="Approve Computer Use action">
+            <div
+              className="computer-approval"
+              role="dialog"
+              aria-label="Approve Computer Use action"
+              aria-modal="true"
+              aria-labelledby="computer-approval-title"
+              aria-describedby="computer-approval-details"
+            >
               <div className="computer-approval-title">
-                <div><span className="computer-section-label">Approval required</span><h2>{approval.actionSummary}</h2></div>
+                <div><span className="computer-section-label">Approval required</span><h2 id="computer-approval-title">{approval.actionSummary}</h2></div>
                 <span className="computer-risk">{approval.risk}</span>
               </div>
-              <dl>
+              <dl id="computer-approval-details">
                 <div><dt>Target</dt><dd>{approval.targetLabel}</dd></div>
                 <div><dt>Will send</dt><dd>{actionText(approval.action)}</dd></div>
                 <div><dt>Bound to</dt><dd>Frame {observation?.sequence ?? "expired"} · one use</dd></div>

@@ -160,6 +160,10 @@ unrelated signal.
   fingerprint and authority stamp before emitting frames. Token rotation or
   scope changes terminate the stale stream with a reconnect/recovery signal;
   the worker rotation integration test covers the invalidation path.
+- The packaged Computer cockpit approval surface now exposes explicit modal,
+  labelled, and described semantics for assistive technology. Its focused
+  component suite (15 tests) and desktop TypeScript typecheck pass; live
+  packaged visual acceptance is still required.
 - Shared black-box fixture: 12 deterministic checks pass; the parity case is
   intentionally blocked here by loopback bind permission and remains open for
   host/CI evidence.

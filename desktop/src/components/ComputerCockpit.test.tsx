@@ -534,7 +534,10 @@ describe("ComputerCockpit", () => {
         "Enter Ada Lovelace in the Name field, then submit the form.",
       ),
     );
-    expect(await screen.findByRole("dialog", { name: "Approve Computer Use action" })).toBeTruthy();
+    const dialog = await screen.findByRole("dialog", { name: "Enter visible text in Name" });
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(dialog.getAttribute("aria-labelledby")).toBe("computer-approval-title");
+    expect(dialog.getAttribute("aria-describedby")).toBe("computer-approval-details");
     expect(screen.getByText("Enter the requested visible name", { exact: false })).toBeTruthy();
   });
 
