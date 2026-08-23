@@ -541,6 +541,7 @@ pub enum OracleCode {
     ResumeRequestReplayStable,
     AlwaysOnPlanSucceeded,
     UncertainAttemptNotResumed,
+    InterruptedRunNotReadmittedWithinWindow,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1200,7 +1201,7 @@ fn validate_always_on_probe(
         OracleCode::NoDuplicateNativeRun,
         OracleCode::RequestReplaySameResource,
         OracleCode::ChangedPayloadConflict,
-        OracleCode::UncertainAttemptNotResumed,
+        OracleCode::InterruptedRunNotReadmittedWithinWindow,
         OracleCode::DurableReadAfterRestart,
         OracleCode::NoImplicitInvocationResume,
         OracleCode::RestartReconnectObserved,
@@ -1227,11 +1228,6 @@ fn validate_always_on_probe(
         ),
         (
             DurableEntity::Run,
-            DurableState::Absent,
-            DurableState::Completed,
-        ),
-        (
-            DurableEntity::Run,
             DurableState::Running,
             DurableState::Interrupted,
         ),
@@ -1239,16 +1235,6 @@ fn validate_always_on_probe(
             DurableEntity::Work,
             DurableState::Running,
             DurableState::Failed,
-        ),
-        (
-            DurableEntity::Service,
-            DurableState::Ready,
-            DurableState::Starting,
-        ),
-        (
-            DurableEntity::Service,
-            DurableState::Starting,
-            DurableState::Ready,
         ),
     ] {
         if !probe.expected_transitions.iter().any(|transition| {

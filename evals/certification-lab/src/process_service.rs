@@ -4,21 +4,23 @@
 //! may be running the in-process lab host; the child is isolated by
 //! `GROKPTAH_HOME` and has ambient provider credentials removed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::orchestration::hash_payload;
-use grokptah_agent_bridge::McpControlClient;
+use grokptah_agent_bridge::{scan_value_for_forbidden_data, McpControlClient};
 use serde_json::{json, Value};
 use tempfile::TempDir;
+
+use crate::report::{LoopbackProviderObservation, LoopbackProviderRecord};
 
 pub const TOKEN: &str = "always-on-grokbot-cert-token-32chars";
 pub const SYNTHETIC_KEY: &str = "test-not-a-secret";
@@ -28,8 +30,12 @@ pub const FIXTURE_BYTES: &[u8] = include_bytes!(
 pub const FIXTURE_SCHEMA: &str = "grokptah.always_on_grokbot_fixture.v1";
 const READY_WAIT: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(20);
-const STDERR_BOUND: usize = 64 * 1024;
 const RECORD_BOUND: usize = 32;
+const STDERR_HEAD: usize = 32 * 1024;
+const STDERR_TAIL: usize = 32 * 1024;
+const MAX_SCAN_DEPTH: u64 = 8;
+const MAX_SCAN_FILES: u64 = 4096;
+const MAX_SCAN_FILE_BYTES: u64 = 1024 * 1024;
 const LIVE_URL_SENTINELS: &[&str] = &["https://api.x.ai", "https://cli-chat-proxy.grok.com"];
 const AMBIENT_CREDENTIAL_ENV: &[&str] = &[
     "XAI_API_KEY",
@@ -52,6 +58,7 @@ pub struct ProviderRecord {
     pub path: String,
     pub auth_present: bool,
     pub auth_scheme: Option<String>,
+    pub auth_accepted: bool,
     pub body_digest: String,
     pub semantic_id: String,
     pub route_ok: bool,
@@ -65,13 +72,16 @@ struct ProviderState {
     release_set: Mutex<HashSet<String>>,
     release_signal: Condvar,
     posts: AtomicU64,
+    rejected_auth: AtomicU64,
+    stop: AtomicBool,
+    workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
-#[derive(Clone)]
 pub struct FakeProvider {
     pub base_url: String,
+    listen: SocketAddr,
     state: Arc<ProviderState>,
-    _join: Arc<thread::JoinHandle<()>>,
+    accept_join: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl FakeProvider {
@@ -86,21 +96,84 @@ impl FakeProvider {
             release_set: Mutex::new(HashSet::new()),
             release_signal: Condvar::new(),
             posts: AtomicU64::new(0),
+            rejected_auth: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+            workers: Mutex::new(Vec::new()),
         });
         let state_task = Arc::clone(&state);
         let join = thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else {
-                    continue;
-                };
-                let state = Arc::clone(&state_task);
-                thread::spawn(move || handle_provider_conn(stream, &state));
+            while !state_task.stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if state_task.stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let worker_state = Arc::clone(&state_task);
+                        let worker = thread::spawn({
+                            let worker_state = Arc::clone(&worker_state);
+                            move || {
+                                handle_provider_conn(stream, &worker_state);
+                            }
+                        });
+                        worker_state
+                            .workers
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(worker);
+                    }
+                    Err(_) if state_task.stop.load(Ordering::SeqCst) => break,
+                    Err(_) => continue,
+                }
             }
         });
         Self {
             base_url: format!("http://{addr}/v1"),
+            listen: addr,
             state,
-            _join: Arc::new(join),
+            accept_join: Mutex::new(Some(join)),
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.state.stop.store(true, Ordering::SeqCst);
+        self.state.release_signal.notify_all();
+        let _ = TcpStream::connect_timeout(&self.listen, Duration::from_millis(200));
+        if let Some(join) = self
+            .accept_join
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = join.join();
+        }
+        let workers = std::mem::take(
+            &mut *self
+                .state
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for worker in workers {
+            let _ = worker.join();
+        }
+    }
+
+    pub fn observation(&self) -> LoopbackProviderObservation {
+        LoopbackProviderObservation {
+            accepted_posts: self.send_count(),
+            rejected_auth: self.state.rejected_auth.load(Ordering::SeqCst),
+            records: self
+                .records()
+                .into_iter()
+                .map(|record| LoopbackProviderRecord {
+                    method: record.method,
+                    path: record.path,
+                    semantic_id: record.semantic_id,
+                    body_digest: record.body_digest,
+                    auth_accepted: record.auth_accepted,
+                    route_ok: record.route_ok,
+                })
+                .collect(),
         }
     }
 
@@ -173,14 +246,22 @@ impl FakeProvider {
             if record.method != "POST" {
                 continue;
             }
-            if !record.auth_present || record.auth_scheme.as_deref() != Some("bearer") {
+            if record.auth_accepted
+                && (!record.auth_present || record.auth_scheme.as_deref() != Some("bearer"))
+            {
                 bail!(
-                    "provider POST {} lacked bearer presence",
+                    "accepted provider POST {} lacked bearer presence",
                     record.semantic_id
                 );
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for FakeProvider {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -200,17 +281,18 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
         return;
     }
     let auth = auth_presence(&headers);
+    let auth_accepted = expected_bearer_accepted(&headers);
     let semantic_id = classify_semantic(&body);
     let record = ProviderRecord {
         method: method.clone(),
         path: path.clone(),
         auth_present: auth.0,
         auth_scheme: auth.1,
+        auth_accepted,
         body_digest: hash_payload(&Value::String(body.clone())),
         semantic_id: semantic_id.clone(),
         route_ok: path == "/v1/chat/completions",
     };
-    state.posts.fetch_add(1, Ordering::SeqCst);
     {
         let mut records = state
             .records
@@ -221,6 +303,14 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
             records.remove(0);
         }
     }
+    if !auth_accepted {
+        state.rejected_auth.fetch_add(1, Ordering::SeqCst);
+        let _ = stream.write_all(
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\nConnection: close\r\n\r\nunauthorized",
+        );
+        return;
+    }
+    state.posts.fetch_add(1, Ordering::SeqCst);
     {
         let mut accepted = state
             .accepted
@@ -242,7 +332,7 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let hold_deadline = Instant::now() + Duration::from_secs(120);
-        while !released.contains(&semantic_id) {
+        while !released.contains(&semantic_id) && !state.stop.load(Ordering::SeqCst) {
             let now = Instant::now();
             if now >= hold_deadline {
                 break;
@@ -288,6 +378,24 @@ fn auth_presence(headers: &str) -> (bool, Option<String>) {
         }
     }
     (false, None)
+}
+
+fn expected_bearer_accepted(headers: &str) -> bool {
+    for line in headers.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        let mut parts = value.split_whitespace();
+        let scheme = parts.next().unwrap_or("");
+        let token = parts.next().unwrap_or("");
+        return scheme.eq_ignore_ascii_case("bearer")
+            && token == SYNTHETIC_KEY
+            && parts.next().is_none();
+    }
+    false
 }
 
 fn classify_semantic(body: &str) -> String {
@@ -569,14 +677,44 @@ fn scripted_completion(body: &str) -> String {
     }
 }
 
+struct StderrCapture {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+}
+
+impl StderrCapture {
+    fn push(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if self.head.len() < STDERR_HEAD {
+                self.head.push(byte);
+            } else {
+                if self.tail.len() >= STDERR_TAIL {
+                    self.tail.pop_front();
+                }
+                self.tail.push_back(byte);
+            }
+        }
+    }
+
+    fn texts(&self) -> (String, String) {
+        let tail: Vec<u8> = self.tail.iter().copied().collect();
+        (
+            String::from_utf8_lossy(&self.head).into_owned(),
+            String::from_utf8_lossy(&tail).into_owned(),
+        )
+    }
+}
+
 pub struct ProcessService {
     pub addr: String,
+    pub previous_addr: Option<String>,
+    pub previous_pid: Option<u32>,
     pub workspace: PathBuf,
     pub provider: FakeProvider,
     child: Child,
     bin: PathBuf,
     home: PathBuf,
-    stderr: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<StderrCapture>>,
     _home: TempDir,
     _workspace: TempDir,
 }
@@ -593,19 +731,13 @@ impl ProcessService {
         let workspace_dir = tempfile::tempdir().context("workspace")?;
         let workspace = dunce::canonicalize(workspace_dir.path())?;
         let home = dunce::canonicalize(home_dir.path())?;
-        let listen = free_listen()?;
-        let stderr = Arc::new(Mutex::new(Vec::new()));
-        let child = spawn_service(
-            &bin,
-            &provider.base_url,
-            &home,
-            &workspace,
-            &listen,
-            &stderr,
-        )?;
-        wait_ready(&listen)?;
+        let stderr = empty_stderr();
+        let mut child = spawn_service(&bin, &provider.base_url, &home, &workspace, &stderr)?;
+        let addr = wait_child_ready(&mut child, &stderr)?;
         Ok(Self {
-            addr: listen,
+            addr,
+            previous_addr: None,
+            previous_pid: None,
             workspace,
             provider,
             child,
@@ -617,41 +749,80 @@ impl ProcessService {
         })
     }
 
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn send_count(&self) -> u64 {
         self.provider.send_count()
     }
 
     pub fn stderr_text(&self) -> String {
-        let bytes = self
+        let (head, tail) = self
             .stderr
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        String::from_utf8_lossy(&bytes).into_owned()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .texts();
+        format!("{head}{tail}")
     }
 
     pub fn kill_sigkill(&mut self) {
+        self.previous_addr = Some(self.addr.clone());
+        self.previous_pid = Some(self.pid());
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 
-    pub fn respawn(&mut self) -> Result<()> {
-        self.kill_sigkill();
-        let listen = free_listen()?;
-        self.child = spawn_service(
-            &self.bin,
-            &self.provider.base_url,
-            &self.home,
-            &self.workspace,
-            &listen,
-            &self.stderr,
-        )?;
-        wait_ready(&listen)?;
-        self.addr = listen;
+    pub fn assert_previous_endpoint_dead(&self) -> Result<()> {
+        let addr = self
+            .previous_addr
+            .as_deref()
+            .context("kill_sigkill must record the previous listen address")?;
+        if !endpoint_dead(addr) {
+            bail!("previous MCP endpoint {addr} is still reachable after SIGKILL");
+        }
         Ok(())
     }
 
+    pub fn respawn(&mut self) -> Result<()> {
+        self.kill_sigkill();
+        self.assert_previous_endpoint_dead()?;
+        let mut last = String::new();
+        for attempt in 1..=5 {
+            self.stderr = empty_stderr();
+            self.child = spawn_service(
+                &self.bin,
+                &self.provider.base_url,
+                &self.home,
+                &self.workspace,
+                &self.stderr,
+            )?;
+            match wait_child_ready_result(&mut self.child, &self.stderr) {
+                Ok(listen) => {
+                    self.addr = listen;
+                    if Some(self.pid()) == self.previous_pid {
+                        bail!("respawned service reused the killed PID");
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    last = format!("{attempt}: {error}");
+                }
+            }
+        }
+        bail!("respawn grokptah-service never became ready: {last}")
+    }
+
     pub fn scan_artifacts(&self) -> Result<()> {
-        scan_cert_text("stderr", &self.stderr_text())?;
+        let (head, tail) = self
+            .stderr
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .texts();
+        scan_cert_text("stderr-head", &head)?;
+        scan_cert_text("stderr-tail", &tail)?;
         scan_home(&self.home)?;
         self.provider.assert_route_and_auth()?;
         Ok(())
@@ -684,8 +855,7 @@ fn spawn_service(
     provider_base: &str,
     home: &Path,
     workspace: &Path,
-    listen: &str,
-    stderr_buf: &Arc<Mutex<Vec<u8>>>,
+    stderr_buf: &Arc<Mutex<StderrCapture>>,
 ) -> Result<Child> {
     let mut command = Command::new(bin);
     for key in AMBIENT_CREDENTIAL_ENV {
@@ -694,7 +864,7 @@ fn spawn_service(
     let mut child = command
         .env("GROKPTAH_HOME", home)
         .env("GROKPTAH_SERVICE_TOKEN", TOKEN)
-        .env("GROKPTAH_SERVICE_LISTEN", listen)
+        .env("GROKPTAH_SERVICE_LISTEN", "127.0.0.1:0")
         .env("GROKPTAH_SERVICE_WORKSPACES", workspace)
         .env("GROKPTAH_SERVICE_MAX_CONCURRENT", "4")
         .env("XAI_API_KEY", SYNTHETIC_KEY)
@@ -714,42 +884,121 @@ fn spawn_service(
                 if n == 0 {
                     break;
                 }
-                let mut held = buf.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                if held.len() >= STDERR_BOUND {
-                    continue;
-                }
-                let take = (STDERR_BOUND - held.len()).min(n);
-                held.extend_from_slice(&tmp[..take]);
+                buf.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(&tmp[..n]);
             }
         });
     }
     Ok(child)
 }
 
-fn free_listen() -> Result<String> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let addr = listener.local_addr()?;
-    drop(listener);
-    Ok(addr.to_string())
+fn endpoint_dead(addr: &str) -> bool {
+    let Ok(socket) = addr.parse::<SocketAddr>() else {
+        return true;
+    };
+    TcpStream::connect_timeout(&socket, Duration::from_millis(200)).is_err()
 }
 
-fn wait_ready(addr: &str) -> Result<()> {
+fn empty_stderr() -> Arc<Mutex<StderrCapture>> {
+    Arc::new(Mutex::new(StderrCapture {
+        head: Vec::new(),
+        tail: VecDeque::new(),
+    }))
+}
+
+fn captured_stderr(stderr: &Arc<Mutex<StderrCapture>>) -> String {
+    let (head, tail) = stderr
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .texts();
+    format!("{head}{tail}")
+}
+
+fn ready_addrs(text: &str) -> Vec<String> {
+    text.match_indices("ready addr=http://")
+        .filter_map(|(index, _)| {
+            let rest = &text[index + "ready addr=http://".len()..];
+            rest.split(|ch: char| ch.is_whitespace() || ch == '/')
+                .next()
+                .map(str::to_string)
+                .filter(|addr| !addr.is_empty())
+        })
+        .collect()
+}
+
+fn wait_child_ready(child: &mut Child, stderr: &Arc<Mutex<StderrCapture>>) -> Result<String> {
+    wait_child_ready_result(child, stderr)
+}
+
+fn wait_child_ready_result(
+    child: &mut Child,
+    stderr: &Arc<Mutex<StderrCapture>>,
+) -> Result<String> {
     let deadline = Instant::now() + READY_WAIT;
-    let request = format!("GET /ready HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    while Instant::now() < deadline {
-        if let Ok(mut stream) = TcpStream::connect(addr) {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-            if stream.write_all(request.as_bytes()).is_ok() {
-                let mut buf = String::new();
-                let _ = stream.read_to_string(&mut buf);
-                if buf.starts_with("HTTP/1.1 200") || buf.starts_with("HTTP/1.0 200") {
-                    return Ok(());
-                }
+    let mut last_http = String::from("no ready line yet");
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            bail!(
+                "grokptah-service exited {status}; stderr={}",
+                captured_stderr(stderr)
+            );
+        }
+        let text = captured_stderr(stderr);
+        if let Some(addr) = ready_addrs(&text).last().cloned() {
+            match probe_ready_http(&addr) {
+                Ok(()) => return Ok(addr),
+                Err(error) => last_http = error,
             }
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "grokptah-service never became HTTP-ready ({last_http}); stderr={}",
+                text
+            );
         }
         thread::sleep(POLL);
     }
-    bail!("grokptah-service /ready was not reachable")
+}
+
+fn probe_ready_http(addr: &str) -> Result<(), String> {
+    let socket: SocketAddr = addr
+        .parse()
+        .map_err(|error| format!("parse listen {addr}: {error}"))?;
+    let mut stream = TcpStream::connect_timeout(&socket, Duration::from_millis(200))
+        .map_err(|error| format!("connect {addr}: {error}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(400)));
+    let request = format!("GET /ready HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("write {addr}: {error}"))?;
+    let mut buf = String::new();
+    let _ = stream.read_to_string(&mut buf);
+    let status = buf.lines().next().unwrap_or("empty-response");
+    if http_control_plane_is_serving(status) {
+        Ok(())
+    } else {
+        Err(format!("GET /ready {addr} -> {status}"))
+    }
+}
+
+fn http_control_plane_is_serving(status: &str) -> bool {
+    status.starts_with("HTTP/1.1 200")
+        || status.starts_with("HTTP/1.0 200")
+        || status.starts_with("HTTP/1.1 503")
+        || status.starts_with("HTTP/1.0 503")
+}
+
+pub fn fixture_zero_growth_window() -> Duration {
+    let value: Value = serde_json::from_slice(FIXTURE_BYTES).expect("always-on fixture");
+    let period = value["supervisorPeriodMs"]
+        .as_u64()
+        .expect("supervisorPeriodMs");
+    let periods = value["zeroGrowthSupervisorPeriods"]
+        .as_u64()
+        .expect("zeroGrowthSupervisorPeriods");
+    Duration::from_millis(period.saturating_mul(periods))
 }
 
 pub fn scan_cert_text(label: &str, text: &str) -> Result<()> {
@@ -772,32 +1021,152 @@ pub fn scan_cert_text(label: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-fn scan_home(path: &Path) -> Result<()> {
-    scan_home_inner(path, 0)
+fn is_path_identity_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "workspace" | "sourceworkspace" | "cwd" | "displayname" | "title" | "promptpreview"
+    ) || normalized.ends_with("id")
+        || normalized.ends_with("ids")
+        || normalized.ends_with("hash")
 }
 
-fn scan_home_inner(path: &Path, depth: usize) -> Result<()> {
-    if depth > 8 {
-        return Ok(());
+fn looks_like_protocol_opaque_token(token: &str) -> bool {
+    if token.len() < 40
+        || token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || (token.len() == 71
+            && token.starts_with("opaque-")
+            && token[7..].bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return false;
     }
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return Ok(());
+    let has_alpha = token.bytes().any(|byte| byte.is_ascii_alphabetic());
+    let digit_count = token.bytes().filter(u8::is_ascii_digit).count();
+    let distinct = token
+        .bytes()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    has_alpha && digit_count >= 6 && distinct >= 12
+}
+
+fn redact_high_entropy_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut current = String::new();
+    let flush = |out: &mut String, current: &mut String| {
+        if looks_like_protocol_opaque_token(current) {
+            out.push_str("<opaque-id>");
+        } else {
+            out.push_str(current);
+        }
+        current.clear();
     };
-    for entry in entries.flatten() {
-        let meta = entry.metadata().ok();
-        if meta.as_ref().is_some_and(|item| item.is_dir()) {
-            scan_home_inner(&entry.path(), depth + 1)?;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            current.push(ch);
+        } else {
+            if !current.is_empty() {
+                flush(&mut out, &mut current);
+            }
+            out.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        flush(&mut out, &mut current);
+    }
+    out
+}
+
+fn redact_protocol_identity_value(value: &Value) -> Value {
+    match value {
+        Value::String(_) => Value::String("<opaque-id>".into()),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(redact_protocol_identity_value).collect())
+        }
+        other => project_public_mcp_for_secret_scan(other),
+    }
+}
+
+pub fn project_public_mcp_for_secret_scan(value: &Value) -> Value {
+    match value {
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .map(|parsed| project_public_mcp_for_secret_scan(&parsed))
+            .unwrap_or_else(|_| Value::String(redact_high_entropy_tokens(text))),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, nested)| {
+                    let projected = if is_path_identity_key(key) {
+                        redact_protocol_identity_value(nested)
+                    } else {
+                        project_public_mcp_for_secret_scan(nested)
+                    };
+                    (key.clone(), projected)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(project_public_mcp_for_secret_scan)
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+pub fn scan_mcp_value(label: &str, value: &Value) -> Result<()> {
+    scan_cert_text(label, &value.to_string())?;
+    scan_value_for_forbidden_data(&project_public_mcp_for_secret_scan(value))
+        .map_err(|error| anyhow::anyhow!("{label} failed forbidden-data scan: {error}"))?;
+    Ok(())
+}
+
+fn scan_home(path: &Path) -> Result<()> {
+    let mut files = 0u64;
+    scan_home_inner(path, 0, &mut files)
+}
+
+fn scan_home_inner(path: &Path, depth: u64, files: &mut u64) -> Result<()> {
+    if depth > MAX_SCAN_DEPTH {
+        bail!("home scan depth {depth} exceeds ceiling {MAX_SCAN_DEPTH}");
+    }
+    let entries =
+        std::fs::read_dir(path).with_context(|| format!("read_dir {}", path.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("dirent {}", path.display()))?;
+        let child = entry.path();
+        let meta = std::fs::symlink_metadata(&child)
+            .with_context(|| format!("metadata {}", child.display()))?;
+        if meta.file_type().is_dir() {
+            scan_home_inner(&child, depth + 1, files)?;
             continue;
         }
-        let Ok(bytes) = std::fs::read(entry.path()) else {
-            continue;
-        };
-        if bytes.len() > 1024 * 1024 {
-            continue;
+        *files = files.saturating_add(1);
+        if *files > MAX_SCAN_FILES {
+            bail!(
+                "home scan file count {} exceeds ceiling {MAX_SCAN_FILES}",
+                *files
+            );
         }
-        if let Ok(text) = std::str::from_utf8(&bytes) {
-            scan_cert_text(&format!("home {}", entry.path().display()), text)?;
+        let bytes = std::fs::read(&child).with_context(|| format!("read {}", child.display()))?;
+        if bytes.len() as u64 > MAX_SCAN_FILE_BYTES {
+            bail!(
+                "home scan {} is {} bytes, ceiling {MAX_SCAN_FILE_BYTES}",
+                child.display(),
+                bytes.len()
+            );
         }
+        let text = std::str::from_utf8(&bytes).map_err(|_| {
+            anyhow::anyhow!(
+                "home scan {} is binary or non-UTF8 ({} bytes)",
+                child.display(),
+                bytes.len()
+            )
+        })?;
+        scan_cert_text(&format!("home {}", child.display()), text)?;
     }
     Ok(())
 }
@@ -810,12 +1179,24 @@ mod tests {
     fn fixture_schema_is_bundled() {
         let value: Value = serde_json::from_slice(FIXTURE_BYTES).unwrap();
         assert_eq!(value["schema"], FIXTURE_SCHEMA);
-        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["schemaVersion"], 2);
         assert_eq!(
             value["proposalOnlyEnforcement"],
             "unverified-pending-pr-352"
         );
-        assert_eq!(value["soak24h"], "not-run");
+        assert_eq!(value["soak24h"], "unverified-no-pinned-head-artifact");
+        assert_eq!(
+            value["provedOracle"],
+            "interrupted_run_not_readmitted_within_window"
+        );
         assert_eq!(value["clock"], "bounded-race-controlled-no-fake-clock-seam");
+        let projected = project_public_mcp_for_secret_scan(&json!({
+            "agentId": "agent-550e8400-e29b-41d4-a716-446655440000",
+            "spec": {"displayName": "agent-550e8400-e29b-41d4-a716-446655440000"},
+            "state": "interrupted"
+        }));
+        assert_eq!(projected["agentId"], "<opaque-id>");
+        assert_eq!(projected["spec"]["displayName"], "<opaque-id>");
+        scan_value_for_forbidden_data(&projected).unwrap();
     }
 }

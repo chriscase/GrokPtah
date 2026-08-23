@@ -311,6 +311,27 @@ pub struct ProbeResult {
     pub trace: Option<ArtifactReference>,
     pub capture_refs: Vec<CaptureReference>,
     pub elapsed_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_observation: Option<LoopbackProviderObservation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LoopbackProviderObservation {
+    pub accepted_posts: u64,
+    pub rejected_auth: u64,
+    pub records: Vec<LoopbackProviderRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LoopbackProviderRecord {
+    pub method: String,
+    pub path: String,
+    pub semantic_id: String,
+    pub body_digest: String,
+    pub auth_accepted: bool,
+    pub route_ok: bool,
 }
 
 impl ProbeResult {
@@ -342,6 +363,7 @@ impl ProbeResult {
             trace: None,
             capture_refs: Vec::new(),
             elapsed_millis: 0,
+            provider_observation: None,
         }
     }
 
@@ -925,6 +947,10 @@ pub struct TraceRecord {
     pub diagnostic: Option<DiagnosticCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opaque_entity_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1196,6 +1222,13 @@ fn validate_probe_against_definition(
             || probe.restart.implicit_execution_observed)
     {
         bail!("passing restart probe lacks recovered state or observed implicit execution");
+    }
+    if definition.id == "always-on-grokbot-lifecycle-v1" && probe.status == ProbeStatus::Passed {
+        match &probe.provider_observation {
+            Some(observation)
+                if !observation.records.is_empty() && observation.accepted_posts > 0 => {}
+            _ => bail!("always-on passing probe omitted observed loopback provider records"),
+        }
     }
     if definition.scope == ProbeScope::ProviderStructural
         && probe.status == ProbeStatus::Passed
@@ -1841,6 +1874,8 @@ mod tests {
                 argument_fields: vec![],
                 diagnostic: Some(DiagnosticCode::Ok),
                 sequence: None,
+                result_digest: None,
+                opaque_entity_id: None,
             }],
             truncated: false,
             dropped_records: 0,
@@ -1902,6 +1937,7 @@ mod tests {
             }),
             capture_refs: Vec::new(),
             elapsed_millis: 1,
+            provider_observation: None,
         }];
         value.recompute_summary().unwrap();
         value.certified = true;
@@ -1968,6 +2004,8 @@ mod tests {
                 argument_fields: vec![],
                 diagnostic: Some(DiagnosticCode::Ok),
                 sequence: None,
+                result_digest: None,
+                opaque_entity_id: None,
             }],
             truncated: false,
             dropped_records: 0,
@@ -2020,6 +2058,18 @@ mod tests {
             sha256: "a".repeat(64),
             bytes: 1,
         });
+        probe.provider_observation = Some(LoopbackProviderObservation {
+            accepted_posts: 1,
+            rejected_auth: 0,
+            records: vec![LoopbackProviderRecord {
+                method: "POST".into(),
+                path: "/v1/chat/completions".into(),
+                semantic_id: "step-a".into(),
+                body_digest: "b".repeat(64),
+                auth_accepted: true,
+                route_ok: true,
+            }],
+        });
         (definition, probe)
     }
 
@@ -2057,5 +2107,8 @@ mod tests {
         let mut not_attempted = probe.clone();
         not_attempted.restart.attempted = false;
         assert!(validate_probe_against_definition(&not_attempted, &definition).is_err());
+        let mut missing_provider = probe.clone();
+        missing_provider.provider_observation = None;
+        assert!(validate_probe_against_definition(&missing_provider, &definition).is_err());
     }
 }

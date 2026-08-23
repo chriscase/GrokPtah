@@ -4,19 +4,19 @@
 //! an explicit POST barrier, and an authenticated MCP client. No production
 //! crate is modified.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use grokptah_agent_bridge::orchestration::hash_payload;
 use grokptah_agent_bridge::{scan_value_for_forbidden_data, McpControlClient};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -26,7 +26,6 @@ pub const FIXTURE_BYTES: &[u8] = include_bytes!("../fixtures/always_on_grokbot.j
 pub const FIXTURE_SCHEMA: &str = "grokptah.always_on_grokbot_fixture.v1";
 const READY_WAIT: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(20);
-const STDERR_BOUND: usize = 64 * 1024;
 const RECORD_BOUND: usize = 32;
 const LIVE_URL_SENTINELS: &[&str] = &["https://api.x.ai", "https://cli-chat-proxy.grok.com"];
 
@@ -39,12 +38,43 @@ const AMBIENT_CREDENTIAL_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailClosedExpect {
+    pub run_state: String,
+    pub error_code: String,
+    pub posts: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResourceCeilings {
+    pub max_rss_bytes: u64,
+    pub max_fd_count: u64,
+    pub max_threads: u64,
+    pub max_disk_bytes: u64,
+    pub max_cycle_latency_ms: u64,
+    pub max_rss_growth_bytes: u64,
+    pub max_fd_growth: u64,
+    pub max_thread_growth: u64,
+    pub max_disk_growth_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactScan {
+    pub max_depth: u64,
+    pub max_files: u64,
+    pub max_file_bytes: u64,
+    pub stderr_head_bytes: usize,
+    pub stderr_tail_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Fixture {
     pub schema: String,
     pub schema_version: u64,
     pub seed: String,
     pub base_sha: String,
+    pub claim: String,
+    pub next_required_campaign: String,
     pub success: String,
     pub fail: String,
     pub ok: String,
@@ -55,82 +85,286 @@ pub struct Fixture {
     pub proposal_only: String,
     pub internal_persistence_cuts: String,
     pub attempt_evidence: String,
+    pub quota_ledger: String,
+    pub provider_attempt_projection: String,
+    pub uncertain_accept_projection: String,
+    pub retry_class_projection: String,
     pub clock: String,
+    pub supervisor_period: Duration,
+    pub zero_growth_periods: u64,
+    pub proved_oracle: String,
+    pub soak10m: String,
     pub soak24h: String,
+    pub ci_mode: String,
     pub required_assertions: Vec<String>,
+    pub decision_work: u64,
+    pub proposal_runs: u64,
+    pub native_work_by_step: BTreeMap<String, u64>,
     pub posts_by_semantic: BTreeMap<String, u64>,
+    pub fail_closed: BTreeMap<String, FailClosedExpect>,
+    pub ceilings: ResourceCeilings,
+    pub artifact_scan: ArtifactScan,
 }
 
 impl Fixture {
     pub fn load() -> Self {
-        let value: Value = serde_json::from_slice(FIXTURE_BYTES).expect("fixture JSON");
-        let schema = value["schema"].as_str().expect("schema").to_string();
-        assert_eq!(schema, FIXTURE_SCHEMA, "always-on fixture schema mismatch");
-        let schema_version = value["schemaVersion"].as_u64().expect("schemaVersion");
-        assert_eq!(
-            schema_version, 1,
-            "always-on fixture schemaVersion mismatch"
-        );
-        let posts = value["happyPath"]["providerPostsBySemanticId"]
-            .as_object()
-            .expect("providerPostsBySemanticId")
-            .iter()
-            .map(|(key, item)| (key.clone(), item.as_u64().expect("post count")))
-            .collect();
-        let required = value["requiredAssertions"]
-            .as_array()
-            .expect("requiredAssertions")
-            .iter()
-            .map(|item| item.as_str().expect("assertion id").to_string())
-            .collect();
-        Self {
-            schema,
-            schema_version,
-            seed: value["seed"].as_str().expect("seed").to_string(),
-            base_sha: value["baseSha"].as_str().expect("baseSha").to_string(),
-            success: value["sentinels"]["success"]
-                .as_str()
-                .expect("success")
-                .to_string(),
-            fail: value["sentinels"]["fail"]
-                .as_str()
-                .expect("fail")
-                .to_string(),
-            ok: value["sentinels"]["ok"].as_str().expect("ok").to_string(),
-            setup: value["sentinels"]["setup"]
-                .as_str()
-                .expect("setup")
-                .to_string(),
-            step_first: value["steps"]["first"].as_str().expect("first").to_string(),
-            step_failing: value["steps"]["failing"]
-                .as_str()
-                .expect("failing")
-                .to_string(),
-            step_replacement: value["steps"]["replacement"]
-                .as_str()
-                .expect("replacement")
-                .to_string(),
-            proposal_only: value["proposalOnlyEnforcement"]
-                .as_str()
-                .expect("proposalOnlyEnforcement")
-                .to_string(),
-            internal_persistence_cuts: value["internalPersistenceCuts"]
-                .as_str()
-                .expect("internalPersistenceCuts")
-                .to_string(),
-            attempt_evidence: value["attemptEvidence"]
-                .as_str()
-                .expect("attemptEvidence")
-                .to_string(),
-            clock: value["clock"].as_str().expect("clock").to_string(),
-            soak24h: value["soak24h"].as_str().expect("soak24h").to_string(),
-            required_assertions: required,
-            posts_by_semantic: posts,
-        }
+        parse_fixture(FIXTURE_BYTES).expect("typed always-on fixture")
     }
 
     pub fn digest(&self) -> String {
         hash_payload(&serde_json::from_slice(FIXTURE_BYTES).expect("fixture value"))
+    }
+
+    pub fn fail_closed_case(&self, name: &str) -> &FailClosedExpect {
+        self.fail_closed
+            .get(name)
+            .unwrap_or_else(|| panic!("fixture missing failClosed.{name}"))
+    }
+}
+
+pub fn parse_fixture(bytes: &[u8]) -> Result<Fixture, String> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|error| format!("fixture JSON: {error}"))?;
+    let mut root = expect_object(value, "fixture")?;
+    let schema = take_string(&mut root, "schema")?;
+    if schema != FIXTURE_SCHEMA {
+        return Err(format!("schema {schema} != {FIXTURE_SCHEMA}"));
+    }
+    let schema_version = take_u64(&mut root, "schemaVersion")?;
+    if schema_version != 2 {
+        return Err(format!("schemaVersion {schema_version} != 2"));
+    }
+    let seed = take_string(&mut root, "seed")?;
+    let base_sha = take_string(&mut root, "baseSha")?;
+    let claim = take_string(&mut root, "claim")?;
+    let next_required_campaign = take_string(&mut root, "nextRequiredCampaign")?;
+    let quota_ledger = take_string(&mut root, "quotaLedger")?;
+    let proposal_only = take_string(&mut root, "proposalOnlyEnforcement")?;
+    let internal_persistence_cuts = take_string(&mut root, "internalPersistenceCuts")?;
+    let attempt_evidence = take_string(&mut root, "attemptEvidence")?;
+    let provider_attempt_projection = take_string(&mut root, "providerAttemptProjection")?;
+    let uncertain_accept_projection = take_string(&mut root, "uncertainAcceptProjection")?;
+    let retry_class_projection = take_string(&mut root, "retryClassProjection")?;
+    let clock = take_string(&mut root, "clock")?;
+    let supervisor_period_ms = take_u64(&mut root, "supervisorPeriodMs")?;
+    let zero_growth_periods = take_u64(&mut root, "zeroGrowthSupervisorPeriods")?;
+    let proved_oracle = take_string(&mut root, "provedOracle")?;
+    let soak10m = take_string(&mut root, "soak10m")?;
+    let soak24h = take_string(&mut root, "soak24h")?;
+    let ci_mode = take_string(&mut root, "ciMode")?;
+    let mut sentinels = take_object(&mut root, "sentinels")?;
+    let success = take_string(&mut sentinels, "success")?;
+    let fail = take_string(&mut sentinels, "fail")?;
+    let ok = take_string(&mut sentinels, "ok")?;
+    let setup = take_string(&mut sentinels, "setup")?;
+    deny_unknown(sentinels, "sentinels")?;
+    let mut steps = take_object(&mut root, "steps")?;
+    let step_first = take_string(&mut steps, "first")?;
+    let step_failing = take_string(&mut steps, "failing")?;
+    let step_replacement = take_string(&mut steps, "replacement")?;
+    deny_unknown(steps, "steps")?;
+    let mut happy = take_object(&mut root, "happyPath")?;
+    let decision_work = take_u64(&mut happy, "decisionWork")?;
+    let proposal_runs = take_u64(&mut happy, "proposalRunsObserved")?;
+    let native_work_by_step = take_u64_map(&mut happy, "nativeWorkByStep")?;
+    let posts_by_semantic = take_u64_map(&mut happy, "providerPostsBySemanticId")?;
+    deny_unknown(happy, "happyPath")?;
+    if native_work_by_step.len() != 3 || posts_by_semantic.len() != 4 {
+        return Err("happyPath maps must be unique and complete".into());
+    }
+    for key in [
+        step_first.as_str(),
+        step_failing.as_str(),
+        step_replacement.as_str(),
+    ] {
+        if !native_work_by_step.contains_key(key) {
+            return Err(format!("happyPath.nativeWorkByStep missing {key}"));
+        }
+        if !posts_by_semantic.contains_key(key) {
+            return Err(format!("happyPath.providerPostsBySemanticId missing {key}"));
+        }
+    }
+    if !posts_by_semantic.contains_key("manager-decision") {
+        return Err("happyPath.providerPostsBySemanticId missing manager-decision".into());
+    }
+    let fail_closed = take_fail_closed(&mut root)?;
+    let ceilings = take_ceilings(&mut root)?;
+    let artifact_scan = take_artifact_scan(&mut root)?;
+    let required_assertions = take_string_array(&mut root, "requiredAssertions")?;
+    if required_assertions.len() != required_assertions.iter().collect::<BTreeSet<_>>().len() {
+        return Err("requiredAssertions must be unique".into());
+    }
+    deny_unknown(root, "fixture")?;
+    Ok(Fixture {
+        schema,
+        schema_version,
+        seed,
+        base_sha,
+        claim,
+        next_required_campaign,
+        success,
+        fail,
+        ok,
+        setup,
+        step_first,
+        step_failing,
+        step_replacement,
+        proposal_only,
+        internal_persistence_cuts,
+        attempt_evidence,
+        quota_ledger,
+        provider_attempt_projection,
+        uncertain_accept_projection,
+        retry_class_projection,
+        clock,
+        supervisor_period: Duration::from_millis(supervisor_period_ms),
+        zero_growth_periods,
+        proved_oracle,
+        soak10m,
+        soak24h,
+        ci_mode,
+        required_assertions,
+        decision_work,
+        proposal_runs,
+        native_work_by_step,
+        posts_by_semantic,
+        fail_closed,
+        ceilings,
+        artifact_scan,
+    })
+}
+
+fn expect_object(value: Value, ctx: &str) -> Result<Map<String, Value>, String> {
+    match value {
+        Value::Object(map) => Ok(map),
+        other => Err(format!("{ctx} must be an object, got {other}")),
+    }
+}
+
+fn take_string(map: &mut Map<String, Value>, key: &str) -> Result<String, String> {
+    match map.remove(key) {
+        Some(Value::String(value)) if !value.is_empty() => Ok(value),
+        Some(other) => Err(format!("{key} must be a non-empty string, got {other}")),
+        None => Err(format!("missing {key}")),
+    }
+}
+
+fn take_u64(map: &mut Map<String, Value>, key: &str) -> Result<u64, String> {
+    match map.remove(key) {
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .ok_or_else(|| format!("{key} must be a u64")),
+        Some(other) => Err(format!("{key} must be a u64, got {other}")),
+        None => Err(format!("missing {key}")),
+    }
+}
+
+fn take_object(map: &mut Map<String, Value>, key: &str) -> Result<Map<String, Value>, String> {
+    expect_object(
+        map.remove(key).ok_or_else(|| format!("missing {key}"))?,
+        key,
+    )
+}
+
+fn take_u64_map(map: &mut Map<String, Value>, key: &str) -> Result<BTreeMap<String, u64>, String> {
+    let object = take_object(map, key)?;
+    let mut out = BTreeMap::new();
+    for (name, value) in object {
+        let count = value
+            .as_u64()
+            .ok_or_else(|| format!("{key}.{name} must be a u64"))?;
+        if out.insert(name.clone(), count).is_some() {
+            return Err(format!("duplicate {key}.{name}"));
+        }
+    }
+    Ok(out)
+}
+
+fn take_string_array(map: &mut Map<String, Value>, key: &str) -> Result<Vec<String>, String> {
+    match map.remove(key) {
+        Some(Value::Array(items)) => items
+            .into_iter()
+            .map(|item| match item {
+                Value::String(value) if !value.is_empty() => Ok(value),
+                other => Err(format!(
+                    "{key} item must be a non-empty string, got {other}"
+                )),
+            })
+            .collect(),
+        Some(other) => Err(format!("{key} must be an array, got {other}")),
+        None => Err(format!("missing {key}")),
+    }
+}
+
+fn take_fail_closed(
+    root: &mut Map<String, Value>,
+) -> Result<BTreeMap<String, FailClosedExpect>, String> {
+    let object = take_object(root, "failClosed")?;
+    let mut out = BTreeMap::new();
+    for (name, value) in object {
+        let mut row = expect_object(value, &format!("failClosed.{name}"))?;
+        let expect = FailClosedExpect {
+            run_state: take_string(&mut row, "runState")?,
+            error_code: take_string(&mut row, "errorCode")?,
+            posts: take_u64(&mut row, "posts")?,
+        };
+        deny_unknown(row, &format!("failClosed.{name}"))?;
+        if expect.posts != 1 {
+            return Err(format!("failClosed.{name}.posts must be exactly 1"));
+        }
+        out.insert(name, expect);
+    }
+    for required in ["cancel", "malformed", "disconnect", "status500", "slow"] {
+        if !out.contains_key(required) {
+            return Err(format!("failClosed missing {required}"));
+        }
+    }
+    if out.len() != 5 {
+        return Err("failClosed must declare exactly the five required cases".into());
+    }
+    Ok(out)
+}
+
+fn take_ceilings(root: &mut Map<String, Value>) -> Result<ResourceCeilings, String> {
+    let mut row = take_object(root, "resourceCeilings")?;
+    let ceilings = ResourceCeilings {
+        max_rss_bytes: take_u64(&mut row, "maxRssBytes")?,
+        max_fd_count: take_u64(&mut row, "maxFdCount")?,
+        max_threads: take_u64(&mut row, "maxThreads")?,
+        max_disk_bytes: take_u64(&mut row, "maxDiskBytes")?,
+        max_cycle_latency_ms: take_u64(&mut row, "maxCycleLatencyMs")?,
+        max_rss_growth_bytes: take_u64(&mut row, "maxRssGrowthBytes")?,
+        max_fd_growth: take_u64(&mut row, "maxFdGrowth")?,
+        max_thread_growth: take_u64(&mut row, "maxThreadGrowth")?,
+        max_disk_growth_bytes: take_u64(&mut row, "maxDiskGrowthBytes")?,
+    };
+    deny_unknown(row, "resourceCeilings")?;
+    Ok(ceilings)
+}
+
+fn take_artifact_scan(root: &mut Map<String, Value>) -> Result<ArtifactScan, String> {
+    let mut row = take_object(root, "artifactScan")?;
+    let scan = ArtifactScan {
+        max_depth: take_u64(&mut row, "maxDepth")?,
+        max_files: take_u64(&mut row, "maxFiles")?,
+        max_file_bytes: take_u64(&mut row, "maxFileBytes")?,
+        stderr_head_bytes: usize::try_from(take_u64(&mut row, "stderrHeadBytes")?)
+            .map_err(|_| "stderrHeadBytes".to_string())?,
+        stderr_tail_bytes: usize::try_from(take_u64(&mut row, "stderrTailBytes")?)
+            .map_err(|_| "stderrTailBytes".to_string())?,
+    };
+    deny_unknown(row, "artifactScan")?;
+    Ok(scan)
+}
+
+fn deny_unknown(map: Map<String, Value>, ctx: &str) -> Result<(), String> {
+    if map.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown fields in {ctx}: {:?}",
+            map.keys().collect::<Vec<_>>()
+        ))
     }
 }
 
@@ -156,6 +390,7 @@ pub struct ProviderRecord {
     pub path: String,
     pub auth_present: bool,
     pub auth_scheme: Option<String>,
+    pub auth_accepted: bool,
     pub body_digest: String,
     pub semantic_id: String,
     pub route_ok: bool,
@@ -171,13 +406,16 @@ struct ProviderState {
     release_set: Mutex<HashSet<String>>,
     release_signal: Condvar,
     posts: AtomicU64,
+    rejected_auth: AtomicU64,
+    stop: AtomicBool,
+    workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
-#[derive(Clone)]
 pub struct FakeProvider {
     pub base_url: String,
+    pub listen: SocketAddr,
     state: Arc<ProviderState>,
-    _join: Arc<thread::JoinHandle<()>>,
+    accept_join: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl FakeProvider {
@@ -197,23 +435,70 @@ impl FakeProvider {
             release_set: Mutex::new(HashSet::new()),
             release_signal: Condvar::new(),
             posts: AtomicU64::new(0),
+            rejected_auth: AtomicU64::new(0),
+            stop: AtomicBool::new(false),
+            workers: Mutex::new(Vec::new()),
         });
         let state_task = Arc::clone(&state);
         let join = thread::spawn(move || {
-            listener.set_nonblocking(false).ok();
-            for stream in listener.incoming() {
-                let Ok(stream) = stream else {
-                    continue;
-                };
-                let state = Arc::clone(&state_task);
-                thread::spawn(move || handle_provider_conn(stream, &state));
+            while !state_task.stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if state_task.stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let worker_state = Arc::clone(&state_task);
+                        let worker = thread::spawn({
+                            let worker_state = Arc::clone(&worker_state);
+                            move || {
+                                handle_provider_conn(stream, &worker_state);
+                            }
+                        });
+                        worker_state
+                            .workers
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(worker);
+                    }
+                    Err(_) if state_task.stop.load(Ordering::SeqCst) => break,
+                    Err(_) => continue,
+                }
             }
         });
         Self {
             base_url: format!("http://{addr}/v1"),
+            listen: addr,
             state,
-            _join: Arc::new(join),
+            accept_join: Mutex::new(Some(join)),
         }
+    }
+
+    pub fn shutdown(&self) {
+        self.state.stop.store(true, Ordering::SeqCst);
+        self.state.release_signal.notify_all();
+        let _ = TcpStream::connect_timeout(&self.listen, Duration::from_millis(200));
+        if let Some(join) = self
+            .accept_join
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = join.join();
+        }
+        let workers = std::mem::take(
+            &mut *self
+                .state
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for worker in workers {
+            let _ = worker.join();
+        }
+    }
+
+    pub fn rejected_auth_count(&self) -> u64 {
+        self.state.rejected_auth.load(Ordering::SeqCst)
     }
 
     pub fn arm(&self, semantic_id: &str, disposition: ProviderDisposition) {
@@ -310,13 +595,58 @@ impl FakeProvider {
             if record.method != "POST" {
                 continue;
             }
-            assert!(
-                record.auth_present,
-                "provider POST {} lacked Authorization presence",
-                record.semantic_id
-            );
-            assert_eq!(record.auth_scheme.as_deref(), Some("bearer"));
+            if record.auth_accepted {
+                assert!(
+                    record.auth_present,
+                    "accepted provider POST {} lacked Authorization presence",
+                    record.semantic_id
+                );
+                assert_eq!(record.auth_scheme.as_deref(), Some("bearer"));
+            } else {
+                assert!(
+                    !record.auth_accepted,
+                    "rejected provider POST must not be marked accepted"
+                );
+            }
         }
+    }
+
+    pub fn post_chat(&self, authorization: Option<&str>, body: &str) -> (u16, String) {
+        let mut stream = TcpStream::connect_timeout(&self.listen, Duration::from_secs(2))
+            .expect("connect fake provider");
+        let mut headers = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            self.listen,
+            body.len()
+        );
+        if let Some(value) = authorization {
+            headers.push_str("Authorization: ");
+            headers.push_str(value);
+            headers.push_str("\r\n");
+        }
+        headers.push_str("\r\n");
+        stream
+            .write_all(headers.as_bytes())
+            .expect("write provider headers");
+        stream
+            .write_all(body.as_bytes())
+            .expect("write provider body");
+        let _ = stream.flush();
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf);
+        let text = String::from_utf8_lossy(&buf);
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|item| item.parse().ok())
+            .unwrap_or(0);
+        (status, text.into_owned())
+    }
+}
+
+impl Drop for FakeProvider {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -337,6 +667,7 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
         return;
     }
     let auth = auth_presence(&headers);
+    let auth_accepted = expected_bearer_accepted(&headers);
     let semantic_id = classify_semantic(&body);
     let focus = objective_focus(&current_user_text(&body));
     let focus_preview: String = focus.chars().take(96).collect();
@@ -345,12 +676,12 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
         path: path.clone(),
         auth_present: auth.0,
         auth_scheme: auth.1,
+        auth_accepted,
         body_digest: hash_payload(&Value::String(body.clone())),
         semantic_id: semantic_id.clone(),
         route_ok: path == "/v1/chat/completions",
         focus_preview,
     };
-    state.posts.fetch_add(1, Ordering::SeqCst);
     {
         let mut records = state
             .records
@@ -361,6 +692,15 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
             records.remove(0);
         }
     }
+    if !auth_accepted {
+        state.rejected_auth.fetch_add(1, Ordering::SeqCst);
+        let _ = stream.write_all(
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\nConnection: close\r\n\r\nunauthorized",
+        );
+        let _ = stream.flush();
+        return;
+    }
+    state.posts.fetch_add(1, Ordering::SeqCst);
     {
         let mut accepted = state
             .accepted
@@ -382,7 +722,7 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let hold_deadline = Instant::now() + Duration::from_secs(120);
-        while !released.contains(&semantic_id) {
+        while !released.contains(&semantic_id) && !state.stop.load(Ordering::SeqCst) {
             let now = Instant::now();
             if now >= hold_deadline {
                 break;
@@ -455,6 +795,24 @@ fn auth_presence(headers: &str) -> (bool, Option<String>) {
     (false, None)
 }
 
+fn expected_bearer_accepted(headers: &str) -> bool {
+    for line in headers.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        let mut parts = value.split_whitespace();
+        let scheme = parts.next().unwrap_or("");
+        let token = parts.next().unwrap_or("");
+        return scheme.eq_ignore_ascii_case("bearer")
+            && token == SYNTHETIC_KEY
+            && parts.next().is_none();
+    }
+    false
+}
+
 pub fn classify_provider_body(body: &str) -> String {
     classify_semantic(body)
 }
@@ -463,6 +821,16 @@ fn classify_semantic(body: &str) -> String {
     let current = current_user_text(body);
     let focus = objective_focus(&current);
     let kind = prompt_kind(&current);
+    if let Some(rest) = current.split("CERT_HOLD ").nth(1) {
+        let token = rest.split_whitespace().next().unwrap_or("");
+        if !token.is_empty()
+            && token
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        {
+            return format!("hold-{token}");
+        }
+    }
     if current.contains("CERT_MALFORMED") {
         return "fail-malformed".into();
     }
@@ -762,7 +1130,7 @@ fn sse_ok(content: &str) -> String {
     )
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResourceSample {
     pub rss_bytes: u64,
     pub fd_count: u64,
@@ -777,34 +1145,101 @@ impl ResourceSample {
         self.threads = self.threads.max(other.threads);
         self.disk_bytes = self.disk_bytes.max(other.disk_bytes);
     }
+
+    pub fn growth_from(&self, baseline: &Self) -> ResourceSample {
+        ResourceSample {
+            rss_bytes: self.rss_bytes.saturating_sub(baseline.rss_bytes),
+            fd_count: self.fd_count.saturating_sub(baseline.fd_count),
+            threads: self.threads.saturating_sub(baseline.threads),
+            disk_bytes: self.disk_bytes.saturating_sub(baseline.disk_bytes),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EntityCardinalities {
+    pub sessions: usize,
+    pub plans: usize,
+    pub work: usize,
+    pub intents: usize,
+    pub runs: usize,
+}
+
+struct StderrCapture {
+    head_cap: usize,
+    tail_cap: usize,
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+}
+
+impl StderrCapture {
+    fn new(head_cap: usize, tail_cap: usize) -> Self {
+        Self {
+            head_cap,
+            tail_cap,
+            head: Vec::new(),
+            tail: VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            if self.head.len() < self.head_cap {
+                self.head.push(byte);
+            } else {
+                if self.tail.len() >= self.tail_cap {
+                    self.tail.pop_front();
+                }
+                self.tail.push_back(byte);
+            }
+        }
+    }
+
+    fn head_text(&self) -> String {
+        String::from_utf8_lossy(&self.head).into_owned()
+    }
+
+    fn tail_text(&self) -> String {
+        let bytes: Vec<u8> = self.tail.iter().copied().collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
 }
 
 pub struct ServiceProcess {
     pub addr: String,
+    pub previous_addr: Option<String>,
+    pub previous_pid: Option<u32>,
     child: Child,
     pub home: PathBuf,
     pub workspace: PathBuf,
-    stderr: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<StderrCapture>>,
+    artifact_scan: ArtifactScan,
     _home_dir: TempDir,
     _workspace_dir: TempDir,
 }
 
 impl ServiceProcess {
     pub fn spawn(provider_base: &str) -> Self {
+        let fixture = Fixture::load();
         let home_dir = tempfile::tempdir().expect("runtime home");
         let workspace_dir = tempfile::tempdir().expect("workspace");
         let home = dunce::canonicalize(home_dir.path()).expect("canon home");
         let workspace = dunce::canonicalize(workspace_dir.path()).expect("canon workspace");
-        let listen = free_listen();
-        let stderr = Arc::new(Mutex::new(Vec::new()));
-        let child = spawn_service(provider_base, &home, &workspace, &listen, &stderr);
-        wait_http_ready(&listen);
+        let stderr = Arc::new(Mutex::new(StderrCapture::new(
+            fixture.artifact_scan.stderr_head_bytes,
+            fixture.artifact_scan.stderr_tail_bytes,
+        )));
+        let mut child = spawn_service(provider_base, &home, &workspace, &stderr);
+        let addr = wait_child_ready(&mut child, &stderr);
         Self {
-            addr: listen,
+            addr,
+            previous_addr: None,
+            previous_pid: None,
             child,
             home,
             workspace,
             stderr,
+            artifact_scan: fixture.artifact_scan,
             _home_dir: home_dir,
             _workspace_dir: workspace_dir,
         }
@@ -814,35 +1249,82 @@ impl ServiceProcess {
         self.child.id()
     }
 
-    pub fn sample(&self) -> ResourceSample {
-        sample_pid(self.pid(), &self.home)
+    pub fn sample_tree(&self) -> ResourceSample {
+        let parent = sample_pid(std::process::id(), Path::new("/"));
+        let child = sample_pid(self.pid(), &self.home);
+        ResourceSample {
+            rss_bytes: parent.rss_bytes.saturating_add(child.rss_bytes),
+            fd_count: parent.fd_count.saturating_add(child.fd_count),
+            threads: parent.threads.saturating_add(child.threads),
+            disk_bytes: dir_size(&self.home).saturating_add(dir_size(&self.workspace)),
+        }
     }
 
-    pub fn stderr_text(&self) -> String {
-        let bytes = self
-            .stderr
+    pub fn stderr_head(&self) -> String {
+        self.stderr
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        String::from_utf8_lossy(&bytes).into_owned()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .head_text()
+    }
+
+    pub fn stderr_tail(&self) -> String {
+        self.stderr
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .tail_text()
     }
 
     pub fn kill_sigkill(&mut self) {
+        self.previous_addr = Some(self.addr.clone());
+        self.previous_pid = Some(self.pid());
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 
+    pub fn assert_previous_endpoint_dead(&self) {
+        let addr = self
+            .previous_addr
+            .as_deref()
+            .expect("kill_sigkill must record the previous listen address");
+        assert!(
+            endpoint_dead(addr),
+            "previous MCP endpoint {addr} is still reachable after SIGKILL"
+        );
+    }
+
     pub fn respawn(&mut self, provider_base: &str) {
         self.kill_sigkill();
-        let listen = free_listen();
-        self.child = spawn_service(
-            provider_base,
-            &self.home,
-            &self.workspace,
-            &listen,
-            &self.stderr,
-        );
-        wait_http_ready(&listen);
-        self.addr = listen;
+        self.assert_previous_endpoint_dead();
+        let mut last = String::new();
+        for attempt in 1..=5 {
+            self.stderr = Arc::new(Mutex::new(StderrCapture::new(
+                self.artifact_scan.stderr_head_bytes,
+                self.artifact_scan.stderr_tail_bytes,
+            )));
+            self.child = spawn_service(provider_base, &self.home, &self.workspace, &self.stderr);
+            match wait_child_ready_result(&mut self.child, &self.stderr) {
+                Ok(listen) => {
+                    self.addr = listen;
+                    assert_ne!(
+                        Some(self.pid()),
+                        self.previous_pid,
+                        "respawned service reused the killed PID"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    last = format!("attempt {attempt}: {error}");
+                }
+            }
+        }
+        panic!("respawn grokptah-service never became ready: {last}");
+    }
+
+    pub fn durable_home_entries(&self) -> Vec<(String, String, u64)> {
+        fingerprint_entries(&self.home, &self.artifact_scan)
+            .unwrap_or_else(|error| panic!("home fingerprint entries: {error}"))
     }
 }
 
@@ -857,8 +1339,7 @@ fn spawn_service(
     provider_base: &str,
     home: &Path,
     workspace: &Path,
-    listen: &str,
-    stderr_buf: &Arc<Mutex<Vec<u8>>>,
+    stderr_buf: &Arc<Mutex<StderrCapture>>,
 ) -> Child {
     let bin = env!("CARGO_BIN_EXE_grokptah-service");
     let mut command = Command::new(bin);
@@ -868,7 +1349,7 @@ fn spawn_service(
     let mut child = command
         .env("GROKPTAH_HOME", home)
         .env("GROKPTAH_SERVICE_TOKEN", TOKEN)
-        .env("GROKPTAH_SERVICE_LISTEN", listen)
+        .env("GROKPTAH_SERVICE_LISTEN", "127.0.0.1:0")
         .env("GROKPTAH_SERVICE_WORKSPACES", workspace)
         .env("GROKPTAH_SERVICE_MAX_CONCURRENT", "4")
         .env("XAI_API_KEY", SYNTHETIC_KEY)
@@ -888,43 +1369,101 @@ fn spawn_service(
                 if n == 0 {
                     break;
                 }
-                let mut held = buf.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                if held.len() >= STDERR_BOUND {
-                    continue;
-                }
-                let take = (STDERR_BOUND - held.len()).min(n);
-                held.extend_from_slice(&tmp[..take]);
+                buf.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(&tmp[..n]);
             }
         });
     }
     child
 }
 
-fn free_listen() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral listen");
-    let addr = listener.local_addr().expect("ephemeral addr");
-    drop(listener);
-    addr.to_string()
+fn endpoint_dead(addr: &str) -> bool {
+    let Ok(socket) = addr.parse::<SocketAddr>() else {
+        return true;
+    };
+    TcpStream::connect_timeout(&socket, Duration::from_millis(200)).is_err()
 }
 
-fn wait_http_ready(addr: &str) {
+fn captured_stderr(stderr: &Arc<Mutex<StderrCapture>>) -> String {
+    let guard = stderr
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    format!("{}{}", guard.head_text(), guard.tail_text())
+}
+
+fn ready_addrs(text: &str) -> Vec<String> {
+    text.match_indices("ready addr=http://")
+        .filter_map(|(index, _)| {
+            let rest = &text[index + "ready addr=http://".len()..];
+            rest.split(|ch: char| ch.is_whitespace() || ch == '/')
+                .next()
+                .map(str::to_string)
+                .filter(|addr| !addr.is_empty())
+        })
+        .collect()
+}
+
+fn wait_child_ready(child: &mut Child, stderr: &Arc<Mutex<StderrCapture>>) -> String {
+    wait_child_ready_result(child, stderr).unwrap_or_else(|error| panic!("{error}"))
+}
+
+fn wait_child_ready_result(
+    child: &mut Child,
+    stderr: &Arc<Mutex<StderrCapture>>,
+) -> Result<String, String> {
     let deadline = Instant::now() + READY_WAIT;
-    let request = format!("GET /ready HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
-    while Instant::now() < deadline {
-        if let Ok(mut stream) = TcpStream::connect(addr) {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-            if stream.write_all(request.as_bytes()).is_ok() {
-                let mut buf = String::new();
-                let _ = stream.read_to_string(&mut buf);
-                if buf.starts_with("HTTP/1.1 200") || buf.starts_with("HTTP/1.0 200") {
-                    return;
-                }
+    let mut last_http = String::from("no ready line yet");
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "grokptah-service exited {status}; stderr={}",
+                captured_stderr(stderr)
+            ));
+        }
+        let text = captured_stderr(stderr);
+        if let Some(addr) = ready_addrs(&text).last().cloned() {
+            match probe_ready_http(&addr) {
+                Ok(()) => return Ok(addr),
+                Err(error) => last_http = error,
             }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "grokptah-service never became HTTP-ready ({last_http}); stderr={text}"
+            ));
         }
         thread::sleep(POLL);
     }
-    panic!("grokptah-service /ready was not reachable at {addr}");
+}
+
+fn probe_ready_http(addr: &str) -> Result<(), String> {
+    let socket: SocketAddr = addr
+        .parse()
+        .map_err(|error| format!("parse listen {addr}: {error}"))?;
+    let mut stream = TcpStream::connect_timeout(&socket, Duration::from_millis(200))
+        .map_err(|error| format!("connect {addr}: {error}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(400)));
+    let request = format!("GET /ready HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| format!("write {addr}: {error}"))?;
+    let mut buf = String::new();
+    let _ = stream.read_to_string(&mut buf);
+    let status = buf.lines().next().unwrap_or("empty-response");
+    if http_control_plane_is_serving(status) {
+        Ok(())
+    } else {
+        Err(format!("GET /ready {addr} -> {status}"))
+    }
+}
+
+fn http_control_plane_is_serving(status: &str) -> bool {
+    status.starts_with("HTTP/1.1 200")
+        || status.starts_with("HTTP/1.0 200")
+        || status.starts_with("HTTP/1.1 503")
+        || status.starts_with("HTTP/1.0 503")
 }
 
 fn sample_pid(pid: u32, home: &Path) -> ResourceSample {
@@ -1104,7 +1643,7 @@ pub fn assert_no_quota_ledger(value: &Value) {
     );
 }
 
-pub fn scan_text(label: &str, text: &str) {
+pub fn scan_text_result(label: &str, text: &str) -> Result<(), String> {
     for sentinel in [
         TOKEN,
         SYNTHETIC_KEY,
@@ -1112,115 +1651,518 @@ pub fn scan_text(label: &str, text: &str) {
         "GROKPTAH_SERVICE_TOKEN=",
         "GROKPTAH_TOKEN_COMMAND=",
     ] {
-        assert!(
-            !text.contains(sentinel),
-            "{label} leaked sentinel {sentinel}"
-        );
+        if text.contains(sentinel) {
+            return Err(format!("{label} leaked sentinel {sentinel}"));
+        }
     }
     for sentinel in LIVE_URL_SENTINELS {
-        assert!(!text.contains(sentinel), "{label} leaked live URL sentinel");
+        if text.contains(sentinel) {
+            return Err(format!("{label} leaked live URL sentinel"));
+        }
     }
+    Ok(())
+}
+
+pub fn scan_text(label: &str, text: &str) {
+    scan_text_result(label, text).unwrap_or_else(|error| panic!("{error}"));
+}
+
+fn is_path_identity_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "workspace" | "sourceworkspace" | "cwd" | "displayname" | "title" | "promptpreview"
+    ) || normalized.ends_with("id")
+        || normalized.ends_with("ids")
+        || normalized.ends_with("hash")
+}
+
+fn looks_like_protocol_opaque_token(token: &str) -> bool {
+    if token.len() < 40
+        || token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || (token.len() == 71
+            && token.starts_with("opaque-")
+            && token[7..].bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return false;
+    }
+    let has_alpha = token.bytes().any(|byte| byte.is_ascii_alphabetic());
+    let digit_count = token.bytes().filter(u8::is_ascii_digit).count();
+    let distinct = token.bytes().collect::<BTreeSet<_>>().len();
+    has_alpha && digit_count >= 6 && distinct >= 12
+}
+
+fn redact_high_entropy_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut current = String::new();
+    let flush = |out: &mut String, current: &mut String| {
+        if looks_like_protocol_opaque_token(current) {
+            out.push_str("<opaque-id>");
+        } else {
+            out.push_str(current);
+        }
+        current.clear();
+    };
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            current.push(ch);
+        } else {
+            if !current.is_empty() {
+                flush(&mut out, &mut current);
+            }
+            out.push(ch);
+        }
+    }
+    if !current.is_empty() {
+        flush(&mut out, &mut current);
+    }
+    out
+}
+
+fn redact_protocol_identity_value(value: &Value) -> Value {
+    match value {
+        Value::String(_) => Value::String("<opaque-id>".into()),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(redact_protocol_identity_value).collect())
+        }
+        other => project_public_mcp_for_secret_scan(other),
+    }
+}
+
+pub fn project_public_mcp_for_secret_scan(value: &Value) -> Value {
+    match value {
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .map(|parsed| project_public_mcp_for_secret_scan(&parsed))
+            .unwrap_or_else(|_| Value::String(redact_high_entropy_tokens(text))),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, nested)| {
+                    let projected = if is_path_identity_key(key) {
+                        redact_protocol_identity_value(nested)
+                    } else {
+                        project_public_mcp_for_secret_scan(nested)
+                    };
+                    (key.clone(), projected)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(project_public_mcp_for_secret_scan)
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn scan_json_for_forbidden_data(label: &str, value: &Value) {
+    scan_value_for_forbidden_data(&project_public_mcp_for_secret_scan(value))
+        .unwrap_or_else(|error| panic!("{label} failed forbidden-data scan: {error}"));
 }
 
 pub fn scan_mcp(tool: &str, structured: &Value, raw: &Value) {
     scan_text(&format!("{tool} structured"), &structured.to_string());
     scan_text(&format!("{tool} raw"), &raw.to_string());
-    let _ = scan_value_for_forbidden_data(structured);
-    let _ = scan_value_for_forbidden_data(raw);
+    scan_json_for_forbidden_data(&format!("{tool} structured"), structured);
+    scan_json_for_forbidden_data(&format!("{tool} raw"), raw);
 }
 
-pub fn scan_home(home: &Path) {
-    scan_home_inner(home, 0);
-}
-
-fn scan_home_inner(path: &Path, depth: usize) {
-    if depth > 8 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let meta = entry.metadata().ok();
-        if meta.as_ref().is_some_and(|item| item.is_dir()) {
-            scan_home_inner(&entry.path(), depth + 1);
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(entry.path()) else {
-            continue;
-        };
-        if bytes.len() > 1024 * 1024 {
-            continue;
-        }
-        if let Ok(text) = std::str::from_utf8(&bytes) {
-            scan_text(&format!("home {}", entry.path().display()), text);
-        }
-    }
+pub fn scan_home(home: &Path, limits: &ArtifactScan) {
+    scan_tree(home, limits).unwrap_or_else(|error| panic!("home scan failed: {error}"));
 }
 
 pub fn scan_service_artifacts(service: &ServiceProcess) {
-    scan_text("stderr", &service.stderr_text());
-    scan_home(&service.home);
+    scan_text("stderr-head", &service.stderr_head());
+    scan_text("stderr-tail", &service.stderr_tail());
+    scan_home(&service.home, &service.artifact_scan);
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TargetSnapshot {
-    pub work_id: Option<String>,
-    pub intent_id: Option<String>,
-    pub attempt_id: Option<String>,
-    pub run_id: Option<String>,
-    pub provider_posts: u64,
-    pub work_state: Option<String>,
-    pub run_state: Option<String>,
-    pub intent_state: Option<String>,
+fn scan_tree(root: &Path, limits: &ArtifactScan) -> Result<(), String> {
+    let mut files = 0u64;
+    scan_tree_inner(root, 0, limits, &mut files)
 }
 
-pub fn snapshot_step(
-    work: &Value,
-    intents: &Value,
-    runs: &Value,
-    step_id: &str,
-    posts: u64,
-) -> TargetSnapshot {
-    let items = work_for_step(work, step_id);
-    let work_item = items.first().copied();
-    let work_id = work_item.and_then(|item| item["workId"].as_str().map(str::to_string));
-    let intent = intents_array(intents).iter().find(|intent| {
-        work_id
-            .as_deref()
-            .is_some_and(|id| intent["workId"].as_str() == Some(id))
-    });
-    let run_id = intent
-        .and_then(|item| item.get("runId").or_else(|| item.get("run_id")))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let attempt_id = intent
-        .and_then(|item| item.get("attemptId").or_else(|| item.get("attempt_id")))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let run = run_id.as_ref().and_then(|id| {
-        runs_array(runs)
-            .iter()
-            .find(|run| run["runId"].as_str() == Some(id.as_str()))
-    });
-    TargetSnapshot {
-        work_id,
-        intent_id: intent.and_then(|item| item["intentId"].as_str().map(str::to_string)),
-        attempt_id,
-        run_id,
-        provider_posts: posts,
-        work_state: work_item.and_then(|item| item["state"].as_str().map(str::to_string)),
-        run_state: run.and_then(|item| item["state"].as_str().map(str::to_string)),
-        intent_state: intent.and_then(|item| item["state"].as_str().map(str::to_string)),
+fn scan_tree_inner(
+    path: &Path,
+    depth: u64,
+    limits: &ArtifactScan,
+    files: &mut u64,
+) -> Result<(), String> {
+    if depth > limits.max_depth {
+        return Err(format!(
+            "artifact depth {depth} exceeds ceiling {}",
+            limits.max_depth
+        ));
     }
+    let entries =
+        std::fs::read_dir(path).map_err(|error| format!("read_dir {}: {error}", path.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("dirent {}: {error}", path.display()))?;
+        let child = entry.path();
+        let meta = std::fs::symlink_metadata(&child)
+            .map_err(|error| format!("metadata {}: {error}", child.display()))?;
+        if meta.file_type().is_dir() {
+            scan_tree_inner(&child, depth + 1, limits, files)?;
+            continue;
+        }
+        *files = files.saturating_add(1);
+        if *files > limits.max_files {
+            return Err(format!(
+                "artifact file count {} exceeds ceiling {}",
+                *files, limits.max_files
+            ));
+        }
+        let bytes =
+            std::fs::read(&child).map_err(|error| format!("read {}: {error}", child.display()))?;
+        if bytes.len() as u64 > limits.max_file_bytes {
+            return Err(format!(
+                "artifact {} is {} bytes, ceiling {}",
+                child.display(),
+                bytes.len(),
+                limits.max_file_bytes
+            ));
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| {
+            format!(
+                "artifact {} is binary or non-UTF8 ({} bytes)",
+                child.display(),
+                bytes.len()
+            )
+        })?;
+        scan_text_result(&format!("home {}", child.display()), text)?;
+    }
+    Ok(())
 }
 
-pub fn assert_no_duplicate_step(work: &Value, step_id: &str) {
+pub fn fingerprint_tree(root: &Path, limits: &ArtifactScan) -> Result<String, String> {
+    let files = fingerprint_entries(root, limits)?;
+    Ok(hash_payload(&json!(files)))
+}
+
+pub fn fingerprint_entries(
+    root: &Path,
+    limits: &ArtifactScan,
+) -> Result<Vec<(String, String, u64)>, String> {
+    let mut files = Vec::new();
+    collect_fingerprint(root, root, 0, limits, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn volatile_home_path(rel: &str) -> bool {
+    let name = Path::new(rel)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(rel);
+    matches!(
+        name,
+        ".instance.lock"
+            | ".store.lock"
+            | "event_journal.jsonl"
+            | "event_journal.seq"
+            | "event_journal.gap.json"
+    ) || name.ends_with("-wal")
+        || name.ends_with("-shm")
+        || rel
+            .split(['/', '\\'])
+            .any(|part| matches!(part, "worker-presence" | "audit" | "computer-use"))
+}
+
+fn collect_fingerprint(
+    root: &Path,
+    path: &Path,
+    depth: u64,
+    limits: &ArtifactScan,
+    files: &mut Vec<(String, String, u64)>,
+) -> Result<(), String> {
+    if depth > limits.max_depth {
+        return Err(format!(
+            "fingerprint depth {depth} exceeds ceiling {}",
+            limits.max_depth
+        ));
+    }
+    let entries =
+        std::fs::read_dir(path).map_err(|error| format!("read_dir {}: {error}", path.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("dirent {}: {error}", path.display()))?;
+        let child = entry.path();
+        let meta = std::fs::symlink_metadata(&child)
+            .map_err(|error| format!("metadata {}: {error}", child.display()))?;
+        let rel = child
+            .strip_prefix(root)
+            .unwrap_or(&child)
+            .to_string_lossy()
+            .into_owned();
+        if volatile_home_path(&rel) {
+            continue;
+        }
+        if meta.file_type().is_dir() {
+            collect_fingerprint(root, &child, depth + 1, limits, files)?;
+            continue;
+        }
+        if files.len() as u64 >= limits.max_files {
+            return Err(format!(
+                "fingerprint file count exceeds ceiling {}",
+                limits.max_files
+            ));
+        }
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(&child)
+                .map_err(|error| format!("read_link {}: {error}", child.display()))?;
+            files.push((
+                rel,
+                hash_payload(&Value::String(target.display().to_string())),
+                0,
+            ));
+            continue;
+        }
+        let bytes =
+            std::fs::read(&child).map_err(|error| format!("read {}: {error}", child.display()))?;
+        if bytes.len() as u64 > limits.max_file_bytes {
+            return Err(format!(
+                "fingerprint {} is {} bytes, ceiling {}",
+                child.display(),
+                bytes.len(),
+                limits.max_file_bytes
+            ));
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| {
+            format!(
+                "fingerprint {} is binary or non-UTF8 ({} bytes)",
+                child.display(),
+                bytes.len()
+            )
+        })?;
+        files.push((
+            rel,
+            hash_payload(&Value::String(text.to_string())),
+            bytes.len() as u64,
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CausalJoin {
+    pub work_id: String,
+    pub work_revision: u64,
+    pub work_state: String,
+    pub attempt_id: String,
+    pub intent_id: String,
+    pub intent_work_revision: u64,
+    pub intent_agent_spec_revision: u64,
+    pub intent_input_hash: String,
+    pub run_id: String,
+    pub run_state: String,
+    pub run_request_id: String,
+    pub run_agent_spec_revision: Option<u64>,
+    pub provider_digest: String,
+    pub provider_posts: u64,
+}
+
+pub fn require_unique_step_work<'a>(work: &'a Value, step_id: &str) -> &'a Value {
+    let items = work_for_step(work, step_id);
     assert_eq!(
-        work_for_step(work, step_id).len(),
+        items.len(),
         1,
         "step {step_id} must have exactly one Work: {work}"
     );
+    items[0]
+}
+
+pub fn require_causal_join(
+    work: &Value,
+    detailed: &Value,
+    intents: &Value,
+    runs: &Value,
+    provider: &FakeProvider,
+    step_id: &str,
+    semantic_id: &str,
+) -> CausalJoin {
+    causal_join(
+        work,
+        detailed,
+        intents,
+        runs,
+        provider,
+        step_id,
+        semantic_id,
+    )
+    .unwrap_or_else(|error| panic!("{error}"))
+}
+
+pub fn causal_join(
+    work: &Value,
+    detailed: &Value,
+    intents: &Value,
+    runs: &Value,
+    provider: &FakeProvider,
+    step_id: &str,
+    semantic_id: &str,
+) -> Result<CausalJoin, String> {
+    let items = work_for_step(work, step_id);
+    if items.len() != 1 {
+        return Err(format!(
+            "step {step_id} must have exactly one Work, found {}: {work}",
+            items.len()
+        ));
+    }
+    let work_item = items[0];
+    let work_id = work_item["workId"]
+        .as_str()
+        .ok_or_else(|| format!("missing workId for {step_id}"))?
+        .to_string();
+    let work_revision = work_item["revision"]
+        .as_u64()
+        .ok_or_else(|| format!("missing work revision for {step_id}"))?;
+    let work_state = work_item["state"]
+        .as_str()
+        .ok_or_else(|| format!("missing work state for {step_id}"))?
+        .to_string();
+    if detailed["work"]["workId"].as_str() != Some(work_id.as_str()) {
+        return Err(format!("get_work target mismatch for {step_id}"));
+    }
+    let attempts = detailed["attempts"]
+        .as_array()
+        .ok_or_else(|| format!("missing public attempts for {step_id}"))?;
+    if attempts.len() != 1 {
+        return Err(format!(
+            "step {step_id} must have exactly one public attempt: {detailed}"
+        ));
+    }
+    let attempt_id = attempts[0]["attemptId"]
+        .as_str()
+        .ok_or_else(|| format!("missing attemptId for {step_id}"))?
+        .to_string();
+    let linked = attempts[0]["linkedRunIds"]
+        .as_array()
+        .ok_or_else(|| format!("missing linkedRunIds for {step_id}"))?;
+    if linked.len() != 1 {
+        return Err(format!(
+            "step {step_id} must have exactly one linked Run: {detailed}"
+        ));
+    }
+    let linked_run = linked[0]
+        .as_str()
+        .ok_or_else(|| format!("linked run id missing for {step_id}"))?
+        .to_string();
+    let matching_intents: Vec<&Value> = intents_array(intents)
+        .iter()
+        .filter(|intent| {
+            intent["workId"].as_str() == Some(work_id.as_str())
+                && intent["attemptId"].as_str() == Some(attempt_id.as_str())
+        })
+        .collect();
+    if matching_intents.len() != 1 {
+        return Err(format!(
+            "step {step_id} must have exactly one intent for work {work_id} attempt {attempt_id}: {intents}"
+        ));
+    }
+    let intent = matching_intents[0];
+    let intent_id = intent["intentId"]
+        .as_str()
+        .ok_or_else(|| format!("missing intentId for {step_id}"))?
+        .to_string();
+    let intent_run = intent["runId"]
+        .as_str()
+        .ok_or_else(|| format!("missing intent.runId for {step_id}"))?
+        .to_string();
+    if intent_run != linked_run {
+        return Err(format!(
+            "intent.runId must equal the unique linkedRunId for {step_id}"
+        ));
+    }
+    let intent_work_revision = intent["workRevision"]
+        .as_u64()
+        .ok_or_else(|| format!("missing intent.workRevision for {step_id}"))?;
+    let intent_agent_spec_revision = intent["agentSpecRevision"]
+        .as_u64()
+        .ok_or_else(|| format!("missing intent.agentSpecRevision for {step_id}"))?;
+    let intent_input_hash = intent["inputHash"]
+        .as_str()
+        .ok_or_else(|| format!("missing intent.inputHash for {step_id}"))?
+        .to_string();
+    if intent_input_hash.is_empty() {
+        return Err(format!("intent.inputHash must be public for {step_id}"));
+    }
+    let matching_runs: Vec<&Value> = runs_array(runs)
+        .iter()
+        .filter(|run| run["runId"].as_str() == Some(intent_run.as_str()))
+        .collect();
+    if matching_runs.len() != 1 {
+        return Err(format!(
+            "step {step_id} must have exactly one Run {intent_run}: {runs}"
+        ));
+    }
+    let run = matching_runs[0];
+    let run_request_id = run["requestId"]
+        .as_str()
+        .ok_or_else(|| format!("missing run.requestId for {step_id}"))?
+        .to_string();
+    if run_request_id != intent_id {
+        return Err(format!(
+            "run.requestId must equal intent.intentId for {step_id}"
+        ));
+    }
+    let run_state = run["state"]
+        .as_str()
+        .ok_or_else(|| format!("missing run.state for {step_id}"))?
+        .to_string();
+    let run_agent_spec_revision = run["agentSpecRevision"].as_u64();
+    let accepted: Vec<ProviderRecord> = provider
+        .records()
+        .into_iter()
+        .filter(|record| record.auth_accepted && record.semantic_id == semantic_id)
+        .collect();
+    if accepted.len() != 1 {
+        return Err(format!(
+            "step {step_id} must have exactly one accepted provider record for {semantic_id}: {:?}",
+            provider.records()
+        ));
+    }
+    let provider_posts = provider.count_for(semantic_id);
+    if provider_posts != 1 {
+        return Err(format!(
+            "semantic POST count for {semantic_id} must be 1, found {provider_posts}"
+        ));
+    }
+    Ok(CausalJoin {
+        work_id,
+        work_revision,
+        work_state,
+        attempt_id,
+        intent_id,
+        intent_work_revision,
+        intent_agent_spec_revision,
+        intent_input_hash,
+        run_id: intent_run,
+        run_state,
+        run_request_id,
+        run_agent_spec_revision,
+        provider_digest: accepted[0].body_digest.clone(),
+        provider_posts,
+    })
+}
+
+pub fn sessions_len(value: &Value) -> usize {
+    value
+        .get("sessions")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+pub fn plans_len(value: &Value) -> usize {
+    value
+        .get("plans")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
 }
 
 pub fn repository_commit() -> String {
@@ -1252,6 +2194,15 @@ pub fn record_assertion(name: &str) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(name.to_string());
+}
+
+pub fn certify(name: &str) {
+    let fixture = Fixture::load();
+    assert!(
+        fixture.required_assertions.iter().any(|item| item == name),
+        "assertion {name} is not declared in the typed fixture"
+    );
+    record_assertion(name);
 }
 
 pub fn recorded_assertions() -> BTreeSet<String> {
@@ -1328,5 +2279,120 @@ mod classification_tests {
             json!({"role":"user","content":"CERT_DROP provider disconnect"}),
         ]);
         assert_eq!(classify_provider_body(&body), "fail-drop");
+    }
+
+    #[test]
+    fn cert_hold_classifies_unique_cycle_token() {
+        let body = chat(vec![
+            json!({"role":"user","content":"CERT_HOLD cycle-7 hold this provider POST"}),
+        ]);
+        assert_eq!(classify_provider_body(&body), "hold-cycle-7");
+    }
+}
+
+#[cfg(test)]
+mod fixture_schema_tests {
+    use super::{parse_fixture, FIXTURE_BYTES};
+    use serde_json::Value;
+
+    #[test]
+    fn typed_fixture_parses_and_rejects_mutants() {
+        parse_fixture(FIXTURE_BYTES).expect("canonical fixture");
+        let mut value: Value = serde_json::from_slice(FIXTURE_BYTES).unwrap();
+        value["unexpectedField"] = serde_json::json!(true);
+        assert!(parse_fixture(&serde_json::to_vec(&value).unwrap()).is_err());
+        let mut missing = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
+        missing.as_object_mut().unwrap().remove("provedOracle");
+        assert!(parse_fixture(&serde_json::to_vec(&missing).unwrap()).is_err());
+        let mut version = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
+        version["schemaVersion"] = serde_json::json!(1);
+        assert!(parse_fixture(&serde_json::to_vec(&version).unwrap()).is_err());
+        let mut duplicate = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
+        let first = duplicate["requiredAssertions"][0].clone();
+        duplicate["requiredAssertions"]
+            .as_array_mut()
+            .unwrap()
+            .push(first);
+        assert!(parse_fixture(&serde_json::to_vec(&duplicate).unwrap()).is_err());
+        let mut empty_claim = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
+        empty_claim["claim"] = serde_json::json!("");
+        assert!(parse_fixture(&serde_json::to_vec(&empty_claim).unwrap()).is_err());
+        let mut extra_fail = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
+        extra_fail["failClosed"]["cancel"]["unexpected"] = serde_json::json!(1);
+        assert!(parse_fixture(&serde_json::to_vec(&extra_fail).unwrap()).is_err());
+        let mut extra_happy = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
+        extra_happy["happyPath"]["bonus"] = serde_json::json!(1);
+        assert!(parse_fixture(&serde_json::to_vec(&extra_happy).unwrap()).is_err());
+        let mut extra_ceil = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
+        extra_ceil["resourceCeilings"]["bonus"] = serde_json::json!(1);
+        assert!(parse_fixture(&serde_json::to_vec(&extra_ceil).unwrap()).is_err());
+        let mut extra_scan = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
+        extra_scan["artifactScan"]["bonus"] = serde_json::json!(1);
+        assert!(parse_fixture(&serde_json::to_vec(&extra_scan).unwrap()).is_err());
+        for key in [
+            "claim",
+            "nextRequiredCampaign",
+            "providerAttemptProjection",
+            "uncertainAcceptProjection",
+            "retryClassProjection",
+            "quotaLedger",
+            "provedOracle",
+            "ciMode",
+            "soak10m",
+            "soak24h",
+            "happyPath",
+            "failClosed",
+            "resourceCeilings",
+            "artifactScan",
+            "requiredAssertions",
+        ] {
+            let mut dropped = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
+            dropped.as_object_mut().unwrap().remove(key);
+            assert!(
+                parse_fixture(&serde_json::to_vec(&dropped).unwrap()).is_err(),
+                "removing {key} must fail closed"
+            );
+        }
+        let mut missing_status = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
+        missing_status["failClosed"]
+            .as_object_mut()
+            .unwrap()
+            .remove("status500");
+        assert!(parse_fixture(&serde_json::to_vec(&missing_status).unwrap()).is_err());
+        let mut zero_posts = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
+        zero_posts["failClosed"]["cancel"]["posts"] = serde_json::json!(0);
+        assert!(parse_fixture(&serde_json::to_vec(&zero_posts).unwrap()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod redaction_scan_tests {
+    use super::{project_public_mcp_for_secret_scan, scan_mcp, TOKEN};
+    use grokptah_agent_bridge::scan_value_for_forbidden_data;
+    use serde_json::json;
+
+    #[test]
+    fn public_agent_ids_are_projected_then_scan_propagates() {
+        let structured = json!({
+            "agentId": "agent-550e8400-e29b-41d4-a716-446655440000",
+            "spec": {"displayName": "agent-550e8400-e29b-41d4-a716-446655440000"},
+            "runId": "550e8400-e29b-41d4-a716-446655440000",
+            "state": "interrupted"
+        });
+        let projected = project_public_mcp_for_secret_scan(&structured);
+        assert_eq!(projected["agentId"], "<opaque-id>");
+        assert_eq!(projected["spec"]["displayName"], "<opaque-id>");
+        scan_value_for_forbidden_data(&projected).unwrap();
+        scan_mcp("ptah_get_run", &structured, &structured);
+    }
+
+    #[test]
+    #[should_panic(expected = "leaked sentinel")]
+    fn forbidden_sentinel_in_non_identity_field_still_fails() {
+        let structured = json!({
+            "agentId": "agent-550e8400-e29b-41d4-a716-446655440000",
+            "detail": TOKEN
+        });
+        scan_mcp("ptah_get_run", &structured, &structured);
     }
 }

@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "crates/codegen/grokptah-service/**"
+      - "crates/codegen/grokptah-agent-bridge/**"
       - "evals/certification-lab/**"
       - "docs/ALWAYS_ON_GROKBOT_CERTIFICATION.md"
       - ".github/workflows/always-on-grokbot-cert.yml"

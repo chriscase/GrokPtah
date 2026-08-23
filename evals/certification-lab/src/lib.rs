@@ -30,6 +30,6 @@ mod tests {
     fn always_on_fixture_schema_is_exported() {
         let value: serde_json::Value = serde_json::from_slice(ALWAYS_ON_GROKBOT_FIXTURE).unwrap();
         assert_eq!(value["schema"], ALWAYS_ON_GROKBOT_FIXTURE_SCHEMA);
-        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["schemaVersion"], 2);
     }
 }
