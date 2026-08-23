@@ -19,6 +19,13 @@ complete or that the product has reached 100%.
   remains secret-free.
 - The certification now covers rollback-safe temporal history and pressure
   compaction without dropping the newly admitted fact.
+- Coordinator/worker store certification covers scoped identity, durable
+  assignment, manager attribution, message acknowledgement, liveness, and
+  restart-safe workload fencing. The workload MCP approval fixture already
+  uses a durable Agent identity and rejects omitted or foreign claimants.
+- Computer Use observation now re-checks the durable conflict-domain poison
+  fence even for an already-granted Agent, so an uncertain sibling dispatch
+  cannot be bypassed by a stale grant.
 - Shared desktop/hosted black-box parity is present as a fail-closed fixture.
   Candidate revisions without an independently captured immutable golden are
   rejected rather than inferred. The local sandbox cannot run its loopback
@@ -26,6 +33,10 @@ complete or that the product has reached 100%.
 
 ## Verification recorded
 
+- Coordinator store suite: 12 passed, 0 failed.
+- Orchestration library suite: 121 selected tests passed, 0 failed.
+- Computer Use uncertain-domain regression: passed; bridge Clippy with
+- `-D warnings`: passed after the observation-fence change.
 - `memory::tests`: 34 passed, 0 failed.
 - Host memory-scope suite: 6 passed, including versioned replay and payload
   conflict rejection.
@@ -41,11 +52,12 @@ complete or that the product has reached 100%.
 
 ## Still required before a 100% claim
 
-1. Wire the memory core through host-owned orchestration and manager attribution
-   surfaces; these operations remain crate-private by design.
-2. Capture the candidate's immutable desktop/hosted parity golden on a host
+1. Capture the candidate's immutable desktop/hosted parity golden on a host
    where the service gateway can bind, then run the full authenticated fixture.
-3. Complete live Grok Build quota/exhaustion evidence, least-privilege worker
-   certification, isolated visual Computer Use hardware proof, packaged UI
-   acceptance plus recurring expert reviews, a 72-hour operational soak, and
-   the enterprise-gateway long-running review lane.
+2. Complete the independent long-running worker outcome: multi-worker crash/
+   restart recovery, no duplicate execution, least-privilege production-shaped
+   credentials, retained evidence, and the operational soak.
+3. Complete live Grok Build quota/exhaustion evidence, isolated visual
+   Computer Use hardware proof, packaged UI acceptance plus recurring expert
+   reviews, a 72-hour operational soak, and the enterprise-gateway
+   long-running review lane.
