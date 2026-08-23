@@ -147,6 +147,10 @@ unrelated signal.
   credential-rotation denial, and unknown fields.
 - Hosted-service security regression: `ServiceConfig` debug output now redacts
   bearer material; the dedicated unit test and service Clippy gate pass.
+- Streamable-MCP security transport regression: scoped live-run GET failures
+  now use the authority-aware HTTP mapping (403 for forbidden scope, 410 for
+  expired cursors, conflict statuses only for actual conflicts/capacity).
+  The mapping regression test passes.
 - Shared black-box fixture: 12 deterministic checks pass; the parity case is
   intentionally blocked here by loopback bind permission and remains open for
   host/CI evidence.

@@ -696,12 +696,10 @@ async fn streamable_get_handler(
         {
             Ok(value) => value,
             Err(error) => {
-                let status = if error.code == OrchErrorCode::CursorExpired {
-                    StatusCode::GONE
-                } else {
-                    StatusCode::CONFLICT
-                };
-                return json_err(None, status, &error);
+                // Preserve the authority distinction on the wire: a scoped
+                // read denied by the credential is forbidden, while stale
+                // cursors are gone and capacity/conflict errors remain 409.
+                return json_err(None, status_for(&error), &error);
             }
         };
     let permit = match state.live_streams.clone().try_acquire_owned() {
@@ -1756,6 +1754,31 @@ mod session_cap_tests {
         assert!(map.contains_key("s2"));
         assert!(map.contains_key("s3"));
         assert!(map.contains_key("s4"));
+    }
+
+    #[test]
+    fn scoped_transport_errors_preserve_authority_statuses() {
+        assert_eq!(
+            status_for(&OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "workspace denied",
+            )),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status_for(&OrchError::new(
+                OrchErrorCode::WorkspaceMismatch,
+                "workspace mismatch",
+            )),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            status_for(&OrchError::new(
+                OrchErrorCode::CursorExpired,
+                "cursor expired",
+            )),
+            StatusCode::GONE
+        );
     }
 }
 
