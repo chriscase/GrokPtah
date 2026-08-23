@@ -112,6 +112,9 @@ The assembled candidate was rerun in an isolated checkout after the UI and
 enterprise slices were present:
 
 - Enterprise admission: 4 passed, 0 failed.
+- Full `grokptah-agent-bridge` library suite: 674 passed, 0 failed;
+  signed-attestation verification and all existing Computer Use, memory, and
+  orchestration regressions are included.
 - Agent bridge Clippy (`-D warnings`, library target): passed.
 - Certification-lab `cargo check --locked`: passed.
 - Desktop TypeScript typecheck: passed.
