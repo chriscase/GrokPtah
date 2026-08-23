@@ -86,13 +86,22 @@ deterministic `manager-decision` Work assigned to the plan's manager Agent.
 The Work uses the existing managed executor and a new finite Run; no manager
 execution queue exists. Its input is a bounded snapshot of the objective,
 plan and Work revisions/outcomes, manager AgentSpec revision, and finite
-bounds. It never includes the Agent's full transcript.
+bounds. It never includes the Agent's full transcript. At occurrence creation,
+the host also captures the exact bounded project-memory context allowed by the
+manager's frozen AgentSpec. The snapshot records a deny-unknown
+`ManagerMemoryAttribution`: source-workspace digest, canonical memory policy,
+exact quoted-context digest and byte count, and one digest over the complete
+attribution. Agent-private and team facts are not injected into manager
+reasoning; the attribution still records their policy state so a later scope
+widening is visible and fenced.
 
 The linked decision record fences the plan revision, manager AgentSpec
 revision, triggering Work/message IDs, input hash, decision Work and Run,
 proposed directive, validation outcome, applied mutation IDs, and timestamps.
-Occurrence and Work IDs are content-derived, so recovery after each durable
-write converges on the same decision.
+It also fences the exact decision Work objective digest. Occurrence and Work
+IDs are content-derived, so recovery after each durable write converges on the
+same decision. Rewriting the objective after capture is refused before a
+provider intent or Run can be created.
 
 Decision Runs are proposal-only at the host permission gate. Every tool call,
 including MCP, Computer Use, approval, promotion, resume, and terminal access,
@@ -100,6 +109,13 @@ is denied by an immutable host-owned capability downgrade installed before
 the provider task is spawned. The durable decision/Work/intent/Run records
 remain the audit trail, but permission enforcement never waits for a later
 ledger link. This is a host boundary, not a prompt instruction.
+
+Proposal-only Runs do not receive ambient memory injection at execution time.
+They reason only over the quoted project context already frozen into the
+durable decision Work. Later memory writes therefore cannot change the model's
+view for that occurrence. A second AgentSpec read fences policy changes during
+capture, and the directive must echo the exact memory-attribution digest before
+the applicator will consider it.
 
 Model output must be exactly one bounded JSON envelope; unknown fields fail.
 The current directive allowlist is deliberately small:
@@ -110,10 +126,11 @@ The current directive allowlist is deliberately small:
 - `no_safe_action`
 
 The envelope must match the occurrence, plan, expected plan revision, manager
-Agent, exact AgentSpec revision, and input snapshot hash. Replacement steps
-then flow through the existing replan validation and CAS operation. Malformed,
-oversized, stale, cross-scope, inactive-identity, and duplicate proposals fail
-closed. Explicitly superseded historical failures no longer prevent a valid
+Agent, exact AgentSpec revision, input snapshot hash, and memory-attribution
+digest. Replacement steps then flow through the existing replan validation
+and CAS operation. Malformed, oversized, stale, cross-scope,
+inactive-identity, memory-drifted, and duplicate proposals fail closed.
+Explicitly superseded historical failures no longer prevent a valid
 replacement graph from reaching `succeeded`.
 
 ## Explicit manager tick

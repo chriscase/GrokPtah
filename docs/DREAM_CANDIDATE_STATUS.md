@@ -234,8 +234,22 @@ unrelated signal.
   scopes, ten logical years, exact quality oracles, storage/reopen bounds, and
   a secret-free evidence digest. The retained deterministic artifact is
   [`docs/evidence/memory-long-horizon-campaign-v1.json`](evidence/memory-long-horizon-campaign-v1.json)
-  at candidate `47d7f71`; it deliberately has `claim_eligible: false` until
-  Manager attribution and the remaining crash/retention gates are proven.
+  at candidate `47d7f71`; it deliberately has `claim_eligible: false`.
+- Code slice `96c28cec36002785a8a03ca5d5d3dca1dbfa78f0` closes the Manager
+  frozen-memory implementation gap. Each decision occurrence now owns a
+  deny-unknown attribution over the exact AgentSpec revision, canonical memory
+  policy, source workspace, bounded quoted project context, and decision Work
+  objective. The directive must echo that attribution digest; later objective,
+  policy, spec, or context drift fails closed. Proposal-only Runs suppress
+  ambient memory injection, so later project facts cannot silently change the
+  reasoning input, and objective drift is rejected before provider admission.
+- Exact-slice qualification: bridge library `680 passed`; manager-store restart
+  suite `5 passed`; focused Manager attribution/admission tests passed; bridge
+  all-target Clippy passed with warnings denied. The socket-backed supervisor
+  and native-provider suites compile, but their current execution is not
+  claimed because this sandbox refused `127.0.0.1:0` listener creation before
+  the test body. The retained logical-years artifact must be recaptured by an
+  integrated host/CI campaign before Stage 5 is called certified.
 - The candidate's 10-minute Always-On soak was attempted and stopped before
   execution because the sandbox denied the fake provider's loopback bind
   (`Operation not permitted`); no soak evidence is claimed.

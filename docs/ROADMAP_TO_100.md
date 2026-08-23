@@ -411,17 +411,33 @@ capabilities, hosted CI, and the black-box fixture above.
 and host parity before treating hosted memory as production-shaped).
 
 **Exists today:** Source-workspace memory with explicit `project` /
-`agent_private` / `team` descriptors, 80-fact / 800-character / 6_000-inject
-bounds ([`MEMORY_SCOPES.md`](MEMORY_SCOPES.md), `memory.rs`,
-`tests/memory_scopes.rs`). Team scope is denied unless host policy approves
-an ID. The candidate now includes a digest-bound `MemoryLongHorizonEvidence`
-schema and one retained deterministic campaign artifact
-([`docs/evidence/memory-long-horizon-campaign-v1.json`](evidence/memory-long-horizon-campaign-v1.json));
-it remains ineligible for the full exit because there is **no** complete
-accelerated logical-years retention proof, no
-revision/supersession/expiry/conflict protocol beyond exact-text
-deduplication, no compaction/retrieval-quality eval, and no Manager frozen
-memory attribution contract.
+`agent_private` / `team` descriptors and fail-closed bounds
+([`MEMORY_SCOPES.md`](MEMORY_SCOPES.md), `memory.rs`,
+`tests/memory_scopes.rs`). Team scope is denied unless host policy approves an
+ID. The dream candidate adds a v2 hot-store protocol with idempotent receipts,
+revisions, compare-and-swap supersession, validity windows, conflict surfacing,
+critical-fact-aware compaction, restart/cutpoint tests, and enforced
+fact/byte/file/scope ceilings. Its deterministic accelerated campaign advances
+ten logical years across all three scopes and measures critical recall, stale
+current facts, conflict recall/false positives, duplicates, lexical retrieval,
+reopen determinism, and storage bounds.
+
+The candidate code slice `96c28cec36002785a8a03ca5d5d3dca1dbfa78f0`
+also freezes Manager memory per occurrence. A deny-unknown attribution binds
+the exact AgentSpec revision, canonical scope policy, source workspace, bounded
+quoted project context, and decision objective; proposal-only execution
+suppresses later ambient memory injection, and objective/spec/digest drift is
+refused before provider admission or plan mutation.
+
+One retained logical-years artifact exists at
+[`docs/evidence/memory-long-horizon-campaign-v1.json`](evidence/memory-long-horizon-campaign-v1.json),
+but it predates the Manager slice and deliberately remains
+`claim_eligible: false`. Stage 5 is therefore **implementation-complete in the
+candidate but not yet certification-complete**: the current integrated head
+still needs one retained exact-head campaign that binds the logical-years,
+crash/restart, scope, and Manager-attribution proofs together. The loopback
+manager/native suites must also be rerun on a host/CI runner because this
+sandbox currently refuses local listener creation.
 
 **Exit (all required):**
 
