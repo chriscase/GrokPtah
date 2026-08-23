@@ -55,6 +55,9 @@ complete or that the product has reached 100%.
 - Host helper schema test: passed; bridge Clippy with `-D warnings`: passed.
 - `memory_long_horizon` integration fixture: 1 passed, 0 failed.
 - `grokptah-agent-bridge` Clippy with `-D warnings`: passed.
+- Native Coding Readiness/provider-attempt suite: 15 passed, including frozen
+  provider routes, quota-backed admission, stale qualification fencing, and
+  restart-safe no-duplicate behavior.
 - Shared black-box fixture: 12 deterministic checks pass; the parity case is
   intentionally blocked here by loopback bind permission and remains open for
   host/CI evidence.
