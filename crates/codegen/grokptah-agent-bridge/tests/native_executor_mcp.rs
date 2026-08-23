@@ -3011,6 +3011,7 @@ async fn failing_provider_live_isolated_promote_and_discard_are_scrubbed() {
             bounds: RunBounds::default(),
         },
     );
+    enable_explicit_operator_bearer(&orch);
     let control = start_control_server(orch.clone(), 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", control.addr), "native-token-308");
     client.initialize().await.unwrap();
