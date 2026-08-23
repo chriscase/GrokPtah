@@ -2,6 +2,7 @@
 //!
 //! Pure policy + durable records live here; the MCP transport is a thin adapter.
 
+mod authority;
 mod authz;
 mod continuation;
 pub(crate) mod managed;
@@ -18,9 +19,13 @@ mod types;
 mod worker;
 mod workload;
 
+pub use authority::{
+    required_operation, role_ceiling, validate_tool_registry, AuthorityCapabilityDocument,
+    AuthorityOperation, AuthorityRole, AuthorityStamp, AUTHORITY_CAPABILITY_SCHEMA,
+    AUTHORITY_SCHEMA_VERSION,
+};
 pub use authz::{
-    authenticate_bearer, canonical_workspace, constant_time_eq, require_bearer, AuthContext,
-    AuthCredential, WorkspaceAllowlist,
+    canonical_workspace, constant_time_eq, AuthContext, AuthCredential, WorkspaceAllowlist,
 };
 pub use continuation::{
     assemble_continuation_context, AgentContinuationPlan, ContinuationAssemblyFailure,

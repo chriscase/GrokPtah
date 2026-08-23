@@ -2,6 +2,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use grokptah_agent_bridge::orchestration::{
     hash_payload, public_provider_route_keys_are_allowlisted, public_run_contains_forbidden_fields,
     IdempotencyClaim, ProviderRouteSnapshot, QuotaClass, QuotaLimits, QuotaReservation,
@@ -9,12 +11,13 @@ use grokptah_agent_bridge::orchestration::{
     PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{
-    model_selection_key, CapabilitySource, EffortLevel, McpRemoteError, ModelCapabilities,
-    ProviderDeadlineClass, ProviderDialect, ProviderKind,
+    model_selection_key, AuthCredential, CapabilitySource, EffortLevel, McpRemoteError,
+    ModelCapabilities, ProviderDeadlineClass, ProviderDialect, ProviderKind,
 };
+use grokptah_service::{start_service, ServiceConfig};
 use serde_json::{json, Value};
 
-use common::{create_build_session, mcp_client, start_isolated, ServiceEnv};
+use common::{create_build_session, mcp_client, start_isolated, ServiceEnv, TOKEN};
 
 const BASE_URL_SENTINEL: &str = "http://127.0.0.1:35201/leak-base-url-sentinel-pr352/v1";
 const CREDENTIAL_REF_SENTINEL: &str = "keychain:provider/leak-cred-ref-sentinel-pr352";
@@ -173,7 +176,19 @@ fn assert_payload_hides_route(payload: &Value, route: &ProviderRouteSnapshot) {
 async fn hosted_list_and_get_omit_frozen_provider_route() {
     let env = ServiceEnv::new();
     let workspace = env.workspace_path();
-    let handle = start_isolated(&env, vec![workspace.clone()], 2).await;
+    let mut config = ServiceConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TOKEN,
+        vec![workspace.clone()],
+        false,
+        2,
+        Duration::from_secs(8),
+    )
+    .unwrap()
+    .with_runtime_home(env._home.path())
+    .unwrap();
+    config.client_credentials = vec![AuthCredential::operator("primary", TOKEN).unwrap()];
+    let handle = start_service(config).await.unwrap();
     let host = handle.host();
     let mut client = mcp_client(handle.addr).await;
     let session_id = create_build_session(&mut client, &workspace, "Public run projection").await;
@@ -307,10 +322,17 @@ async fn hosted_list_and_get_omit_frozen_provider_route() {
             }),
         )
         .await
-        .unwrap();
-    assert!(!promote.is_error, "{:?}", promote.raw);
-    assert_payload_hides_route(&promote.structured, &route);
-    assert_payload_hides_route(&mcp_text_value(&promote.raw), &route);
+        .unwrap_err();
+    assert_eq!(
+        promote
+            .downcast_ref::<McpRemoteError>()
+            .and_then(McpRemoteError::data_code),
+        Some("conflict"),
+        "legacy principal-less receipt must not replay"
+    );
+    let promote_error = promote.to_string();
+    assert!(!promote_error.contains(BASE_URL_SENTINEL));
+    assert!(!promote_error.contains(CREDENTIAL_REF_SENTINEL));
 
     let discard_route = leaky_route_with_quota("quota-leak-discard-sentinel-pr352");
     let mut discarded = run.clone();
@@ -356,10 +378,17 @@ async fn hosted_list_and_get_omit_frozen_provider_route() {
             }),
         )
         .await
-        .unwrap();
-    assert!(!discard.is_error, "{:?}", discard.raw);
-    assert_payload_hides_route(&discard.structured, &discard_route);
-    assert_payload_hides_route(&mcp_text_value(&discard.raw), &discard_route);
+        .unwrap_err();
+    assert_eq!(
+        discard
+            .downcast_ref::<McpRemoteError>()
+            .and_then(McpRemoteError::data_code),
+        Some("conflict"),
+        "legacy principal-less receipt must not replay"
+    );
+    let discard_error = discard.to_string();
+    assert!(!discard_error.contains(&discard_route.base_url));
+    assert!(!discard_error.contains(&discard_route.credential_ref));
 }
 
 #[tokio::test]

@@ -9,8 +9,8 @@ use std::process::Command;
 
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord, RunState,
-    WorkspaceAllowlist,
+    AuthCredential, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord,
+    RunState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     home_override_serial, set_grokptah_home_override, start_control_server, AgentHost, HostConfig,
@@ -107,6 +107,13 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
             bounds: RunBounds::default(),
         },
     );
+    service
+        .set_auth_credentials(vec![AuthCredential::operator(
+            "primary",
+            "coordinator-campaign-token",
+        )
+        .unwrap()])
+        .unwrap();
     let server = start_control_server(service, 0).await.unwrap();
     let harness = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/mcp_sdk_interop/run_coordinator_campaign.mjs");

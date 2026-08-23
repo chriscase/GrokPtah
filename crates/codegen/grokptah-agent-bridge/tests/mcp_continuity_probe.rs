@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord, RunState,
-    WorkspaceAllowlist,
+    AuthCredential, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord,
+    RunState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     home_override_serial, set_grokptah_home_override, start_control_server, AgentHost, HostConfig,
@@ -179,6 +179,13 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
             bounds: RunBounds::default(),
         },
     );
+    service
+        .set_auth_credentials(vec![AuthCredential::operator(
+            "primary",
+            "continuity-probe-token",
+        )
+        .unwrap()])
+        .unwrap();
     let server = start_control_server(service, 0).await.unwrap();
     let ready_file = home.path().join("gap-ready");
     let release_file = home.path().join("gap-release");

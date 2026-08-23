@@ -1058,9 +1058,9 @@ async fn missing_session_workspace_is_not_controllable() {
             bounds: RunBounds::default(),
         },
     );
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
     drop(ws);
 
-    let auth = orch.auth_header(Some("Bearer t")).unwrap();
     let err = orch
         .queue_prompt(&auth, "missing-ws", session.id, &claimed, "x".into(), false)
         .await

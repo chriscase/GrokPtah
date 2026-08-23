@@ -3,8 +3,7 @@
 mod common;
 
 use grokptah_agent_bridge::orchestration::{
-    AuthContext, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
-    WorkspaceAllowlist,
+    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     project_native_coding_readiness, save_gateway_config, scan_value_for_forbidden_data,
@@ -118,12 +117,11 @@ async fn desktop_host_and_loopback_mcp_report_the_same_readiness() {
         .unwrap();
     assert_eq!(from_orch, desktop);
 
+    orch.set_agent_owner_id("owner-b".into()).unwrap();
+    let other_auth = orch.auth_header(Some("Bearer readiness-token")).unwrap();
     let other_owner = orch
         .get_native_coding_readiness(
-            &AuthContext {
-                token_id: "other-token".into(),
-                owner_id: "owner-b".into(),
-            },
+            &other_auth,
             Some("company-gateway"),
             Some("Team/Code:Cheap"),
         )
@@ -132,6 +130,7 @@ async fn desktop_host_and_loopback_mcp_report_the_same_readiness() {
     assert_eq!(other_owner["execution"], desktop["execution"]);
     assert!(!other_owner.to_string().contains("primary"));
     assert_secret_free(&other_owner);
+    orch.set_agent_owner_id("primary".into()).unwrap();
 
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", server.addr), "readiness-token");

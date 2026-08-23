@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord, RunState,
-    WorkspaceAllowlist,
+    AuthCredential, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord,
+    RunState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     canonical_workspace_string, set_grokptah_home_override, start_control_from_env,
@@ -68,7 +68,11 @@ async fn streamable_compat_client_session_and_tools() {
     assert!(init["protocolVersion"].as_str().unwrap().starts_with("202"));
     assert!(client.session_id().is_some());
     let tools = client.list_tools().await.unwrap();
-    assert_eq!(tools.len(), CONTROL_TOOLS.len());
+    let advertised = init["_meta"]["grokptah/authorityCapabilities"]["tools"]
+        .as_array()
+        .expect("initialize must advertise the bound capability document");
+    assert_eq!(tools.len(), advertised.len());
+    assert!(tools.len() < CONTROL_TOOLS.len());
     let cap = client
         .call_tool("ptah_get_capacity", json!({}))
         .await
@@ -444,7 +448,11 @@ async fn independent_node_mcp_sdk_interop() {
     );
     let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(report["ok"], true);
-    assert!(report["toolCount"].as_u64().unwrap() >= CONTROL_TOOLS.len() as u64);
+    let auth = orch.auth_header(Some("Bearer stream-token-200")).unwrap();
+    assert_eq!(
+        report["toolCount"].as_u64().unwrap(),
+        auth.capability_document().tools.len() as u64
+    );
     // Prefer official SDK path success when available.
     if report.get("sdkOk") == Some(&json!(false)) {
         eprintln!(
@@ -1336,6 +1344,12 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
 async fn mcp_isolated_run_review_approval_and_restart_promotion() {
     std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock, host, ws, orch) = setup();
+    orch.set_auth_credentials(vec![AuthCredential::operator(
+        "primary",
+        "stream-token-200",
+    )
+    .unwrap()])
+        .unwrap();
     std::fs::write(ws.path().join("README.md"), "baseline\n").unwrap();
     for args in [
         vec!["init"],
@@ -1516,6 +1530,13 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
             bounds: RunBounds::default(),
         },
     );
+    orch2
+        .set_auth_credentials(vec![AuthCredential::operator(
+            "primary",
+            "stream-token-200",
+        )
+        .unwrap()])
+        .unwrap();
     let srv2 = start_control_server(orch2.clone(), 0).await.unwrap();
     let mut client2 = McpControlClient::new(format!("http://{}", srv2.addr), "stream-token-200");
     client2.initialize().await.unwrap();
@@ -2217,7 +2238,7 @@ fn smoke_grant(run: &ComputerRun) -> ActionGrant {
 /// duplicate replay, stale-cursor recovery, cross-session/workspace
 /// rejection, capacity, auth-before-body, and reconnect replay.
 #[tokio::test]
-async fn live_computer_reads_node_smoke() {
+async fn remote_bearer_computer_reads_fail_closed() {
     let mut env = ProcessEnvGuard::new();
     let home = tempdir().unwrap();
     let ws = tempdir().unwrap();
@@ -2334,37 +2355,42 @@ async fn live_computer_reads_node_smoke() {
         .expect("desktop env bootstrap must start control server");
     assert!(srv.addr.ip().is_loopback());
 
-    let url = format!("http://{}/mcp", srv.addr);
-    let sdk_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mcp_sdk_interop");
-    let output = tokio::process::Command::new("node")
-        .arg(sdk_dir.join("run_computer_reads_smoke.mjs"))
-        .env("GROKPTAH_MCP_URL", &url)
-        .env("GROKPTAH_MCP_TOKEN", &token)
-        .env("GROKPTAH_MCP_SESSION_ID", session.id.to_string())
-        .env("GROKPTAH_MCP_WORKSPACE", ws.path().display().to_string())
-        .env(
-            "GROKPTAH_MCP_OTHER_WORKSPACE",
-            ws_other.path().display().to_string(),
-        )
-        .env("GROKPTAH_MCP_COMPUTER_RUN_A", &run_a.run_id)
-        .env("GROKPTAH_MCP_COMPUTER_RUN_B", &run_b.run_id)
-        .env("GROKPTAH_MCP_COMPUTER_RUN_C", &run_c.run_id)
-        .output()
-        .await
-        .expect("spawn computer reads smoke");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "computer reads smoke failed\nstdout={stdout}\nstderr={stderr}"
+    let mut client = McpControlClient::new(format!("http://{}", srv.addr), &token);
+    let initialized = client.initialize().await.unwrap();
+    assert_eq!(
+        initialized["_meta"]["grokptah/authorityCapabilities"]["hardDenials"],
+        json!(["approval", "promotion", "computer_use"])
     );
-    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(report["ok"], true, "computer reads smoke report={report}");
-    if let Some(failed) = report["failed"].as_array() {
-        assert!(failed.is_empty(), "failed checks: {failed:?}");
+    let tools = client.list_tools().await.unwrap();
+    for name in [
+        "ptah_list_computer_runs",
+        "ptah_get_computer_run",
+        "ptah_get_computer_run_events",
+        "ptah_get_computer_capacity",
+    ] {
+        assert!(
+            tools.iter().all(|tool| tool.name != name),
+            "remote bearer must not discover {name}"
+        );
     }
-    // Durable transcript for verifiers (`--nocapture`).
-    eprintln!("LIVE_COMPUTER_READS_SMOKE_REPORT {report}");
+    let denied = client
+        .call_tool(
+            "ptah_list_computer_runs",
+            json!({
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string()
+            }),
+        )
+        .await
+        .expect_err("undiscoverable remote Computer read must fail closed");
+    let encoded = denied.to_string();
+    assert!(encoded.contains("unknown tool"));
+    for run_id in [&run_a.run_id, &run_b.run_id, &run_c.run_id] {
+        assert!(
+            !encoded.contains(run_id),
+            "denial must not reveal Computer Run identity"
+        );
+    }
 
     srv.stop_and_wait().await;
     set_grokptah_home_override(None);
