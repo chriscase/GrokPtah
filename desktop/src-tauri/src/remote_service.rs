@@ -1695,6 +1695,7 @@ mod tests {
         RuntimeConnectionState, RuntimeTarget, WorkspaceAllowlist,
     };
     use tempfile::tempdir;
+    use uuid::Uuid;
 
     use super::{
         decode_remote_run_page, merge_remote_run_pages, normalize_base_url,
