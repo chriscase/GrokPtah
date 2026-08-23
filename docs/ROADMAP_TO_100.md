@@ -744,9 +744,11 @@ vs discussion-only qualification
 ([`PROVIDER_PROFILES.md`](PROVIDER_PROFILES.md)). Isolated Build worktrees
 and finite Runs exist as separate contracts. The certification lab now has a
 host-only, secret-free lease attachment path for the operator-owned broker;
-that path validates admission but does not execute a provider campaign. **No**
-frozen-route, read-only, multi-hour enterprise review-lane certification
-exists. This row is **not** certified.
+the candidate verifies a detached Ed25519 gateway signature against a separate
+operator-selected public trust record before admitting that lease. That path
+still does not execute a provider campaign. **No** frozen-route, read-only,
+multi-hour enterprise review-lane certification exists. This row is **not**
+certified.
 
 **Exit (all required):**
 
