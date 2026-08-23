@@ -538,6 +538,7 @@ mod tests {
             }],
             elements_truncated: false,
             sensitivity: Sensitivity::None,
+            authority: Default::default(),
         }
     }
 

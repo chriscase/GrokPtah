@@ -2387,6 +2387,62 @@ impl OrchStore {
         self.load_work_attempt_unlocked(attempt_id)
     }
 
+    /// Linearize a Computer Use boundary against Work cancellation,
+    /// expiration, reassignment, and Agent-spec revision. The callback runs
+    /// while the workload ledger lock is held, so a caller may use it to
+    /// commit a second durable fence before any physical side effect.
+    pub(crate) fn with_active_computer_work_attempt<T, E>(
+        &self,
+        work_id: &str,
+        attempt_id: &str,
+        agent: (&str, u64),
+        scope: (Uuid, &str),
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Result<T, E>, OrchError> {
+        let (agent_id, agent_spec_revision) = agent;
+        let (owner_session_id, workspace) = scope;
+        let denied = || {
+            OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "Computer Use WorkAttempt authority is no longer active",
+            )
+        };
+        let _guard = self.inner.lock.lock();
+        let work = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|_| denied())?
+            .ok_or_else(denied)?;
+        let attempt = self
+            .load_work_attempt_unlocked(attempt_id)
+            .map_err(|_| denied())?
+            .ok_or_else(denied)?;
+        let agent = self
+            .load_agent_unlocked(agent_id)
+            .map_err(|_| denied())?
+            .ok_or_else(denied)?;
+        let current_spec = agent.current_spec().map_err(|_| denied())?;
+        let now = Utc::now();
+        if work.work_id != work_id
+            || work.session_id != owner_session_id
+            || work.workspace != workspace
+            || work.assigned_agent_id.as_deref() != Some(agent_id)
+            || !matches!(work.state, WorkState::Leased | WorkState::Running)
+            || attempt.attempt_id != attempt_id
+            || attempt.work_id != work_id
+            || attempt.claimant_id != agent_id
+            || !attempt.state.is_active()
+            || !attempt.lease_active_at(now)
+            || agent.agent_id != agent_id
+            || !agent.state.is_active_identity()
+            || agent.workspace != workspace
+            || current_spec.revision != agent_spec_revision
+            || !current_spec.authority.computer_use_allowed
+        {
+            return Err(denied());
+        }
+        Ok(operation())
+    }
+
     // --- Durable manager plans -------------------------------------------
 
     pub fn save_manager_plan_with_root(

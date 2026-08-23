@@ -5,9 +5,10 @@ use std::collections::BTreeSet;
 use chrono::{Duration, Utc};
 #[cfg(target_os = "macos")]
 use grokptah_agent_bridge::{
-    ActionClass, ActionGrant, ComputerAction, ComputerObservation, ComputerObservationPlatform,
-    ComputerRun, ComputerStore, ComputerUseLimits, ComputerUseService, GrantIssuer,
-    MacOsObservationPlatform, SemanticAction,
+    set_grokptah_home_override, ActionClass, ActionGrant, AgentHost, ComputerAction,
+    ComputerAuthorityToken, ComputerObservation, ComputerObservationPlatform, ComputerRun,
+    ComputerStore, ComputerUseLimits, ComputerUseService, HostConfig, MacOsObservationPlatform,
+    SemanticAction,
 };
 #[cfg(target_os = "macos")]
 use uuid::Uuid;
@@ -38,17 +39,26 @@ async fn main() -> anyhow::Result<()> {
             candidate.target.app_id == DEMO_BUNDLE_ID && candidate.on_screen && !candidate.minimized
         })
         .ok_or_else(|| anyhow::anyhow!("repository Computer Use demo window is not running"))?;
-    let backend = platform.bind_target(&candidate.selection_token).await?;
     let temp = tempfile::tempdir()?;
-    let service = ComputerUseService::new(
-        backend,
-        ComputerStore::open(temp.path().join("computer-use"))?,
-    );
+    set_grokptah_home_override(Some(temp.path().join(".grokptah")));
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start()?;
+    let session = host.session_new()?;
+    let caller = host.computer_operator_token(session.id)?;
+    let service = platform
+        .bind_target_service(
+            &candidate.selection_token,
+            ComputerStore::open(temp.path().join("computer-use"))?,
+        )
+        .await?;
     // Live smoke has no AgentHost session cwd. Fail closed with None rather
     // than inventing a workspace from process cwd or the demo bundle path.
     let run = service.create_run(
         &Uuid::new_v4().to_string(),
-        Uuid::new_v4(),
+        &caller,
         None,
         candidate.target,
         ComputerUseLimits {
@@ -59,10 +69,11 @@ async fn main() -> anyhow::Result<()> {
         },
     )?;
 
-    let (ready, observation) = authorize_and_observe(&service, &run).await?;
+    let (ready, observation) = authorize_and_observe(&service, &run, &caller).await?;
     service
         .act(
             &Uuid::new_v4().to_string(),
+            &caller,
             &ready.run_id,
             ready.version,
             &observation.observation_id,
@@ -71,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let paused = current_run(&service, &ready.run_id)?;
-    let (ready, observation) = authorize_and_observe(&service, &paused).await?;
+    let (ready, observation) = authorize_and_observe(&service, &paused, &caller).await?;
     let field = observation
         .elements
         .iter()
@@ -83,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
     service
         .act(
             &Uuid::new_v4().to_string(),
+            &caller,
             &ready.run_id,
             ready.version,
             &observation.observation_id,
@@ -94,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let paused = current_run(&service, &ready.run_id)?;
-    let (ready, observation) = authorize_and_observe(&service, &paused).await?;
+    let (ready, observation) = authorize_and_observe(&service, &paused, &caller).await?;
     let button = observation
         .elements
         .iter()
@@ -106,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
     service
         .act(
             &Uuid::new_v4().to_string(),
+            &caller,
             &ready.run_id,
             ready.version,
             &observation.observation_id,
@@ -116,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let paused = current_run(&service, &ready.run_id)?;
-    let (_ready, observation) = authorize_and_observe(&service, &paused).await?;
+    let (_ready, observation) = authorize_and_observe(&service, &paused, &caller).await?;
     let submitted = observation.elements.iter().any(|element| {
         element
             .label
@@ -138,27 +151,26 @@ async fn main() -> anyhow::Result<()> {
 async fn authorize_and_observe(
     service: &ComputerUseService,
     run: &ComputerRun,
+    caller: &ComputerAuthorityToken,
 ) -> anyhow::Result<(ComputerRun, ComputerObservation)> {
     let now = Utc::now();
     let authorized = service.authorize(
         &Uuid::new_v4().to_string(),
+        caller,
         &run.run_id,
         run.version,
-        ActionGrant {
-            grant_id: Uuid::new_v4().to_string(),
-            run_id: run.run_id.clone(),
-            target: run.target.clone(),
-            action_classes: BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
-            issued_by: GrantIssuer::LocalUser,
-            issued_at: now,
-            expires_at: now + Duration::seconds(30),
-            uses_remaining: Some(1),
-            revoked_at: None,
-        },
+        ActionGrant::for_run(
+            run,
+            BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
+            now,
+            now + Duration::seconds(30),
+            Some(1),
+        ),
     )?;
     let observation = service
         .observe(
             &Uuid::new_v4().to_string(),
+            caller,
             &authorized.run_id,
             authorized.version,
         )

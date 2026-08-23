@@ -4360,8 +4360,8 @@ mod tests {
     }
 
     use crate::computer_use::{
-        canonical_workspace_string, ActionClass, ActionGrant, ComputerStore, ComputerUseService,
-        GrantIssuer, SimulatorBackend,
+        canonical_workspace_string, ActionClass, ActionGrant, ComputerAuthorityToken,
+        ComputerStore, ComputerUseService, SimulatorBackend,
     };
 
     struct ComputerFixture {
@@ -4469,10 +4469,12 @@ mod tests {
             Arc::new(SimulatorBackend::new()),
             host.ensure_computer_store().unwrap(),
         );
+        let operator_a = ComputerAuthorityToken::local_operator(session_a.id).unwrap();
+        let operator_b = ComputerAuthorityToken::local_operator(session_b.id).unwrap();
         let run_a = computer
             .create_run(
                 "create-a",
-                session_a.id,
+                &operator_a,
                 Some(canon_a.clone()),
                 SimulatorBackend::demo_target(),
                 Default::default(),
@@ -4481,7 +4483,7 @@ mod tests {
         computer
             .create_run(
                 "create-b",
-                session_b.id,
+                &operator_b,
                 Some(canon_b.clone()),
                 SimulatorBackend::demo_target(),
                 Default::default(),
@@ -4490,7 +4492,7 @@ mod tests {
         let unbound = computer
             .create_run(
                 "create-unbound",
-                session_a.id,
+                &operator_a,
                 None,
                 SimulatorBackend::demo_target(),
                 Default::default(),
@@ -4813,10 +4815,11 @@ mod tests {
         let canon = canonical_workspace_string(ws.path()).unwrap();
         let store = host.ensure_computer_store().unwrap();
         let computer = ComputerUseService::new(Arc::new(SimulatorBackend::new()), store.clone());
+        let operator = ComputerAuthorityToken::local_operator(session.id).unwrap();
         let run = computer
             .create_run(
                 "create-ring",
-                session.id,
+                &operator,
                 Some(canon),
                 SimulatorBackend::demo_target(),
                 Default::default(),
@@ -4915,10 +4918,11 @@ mod tests {
             let store =
                 ComputerStore::open(crate::discover::grokptah_home().join("computer-use")).unwrap();
             let computer = ComputerUseService::new(Arc::new(SimulatorBackend::new()), store);
+            let operator = ComputerAuthorityToken::local_operator(session.id).unwrap();
             let run = computer
                 .create_run(
                     "create-restart",
-                    session.id,
+                    &operator,
                     Some(canon.clone()),
                     SimulatorBackend::demo_target(),
                     Default::default(),
@@ -4929,19 +4933,16 @@ mod tests {
             computer
                 .authorize(
                     "grant-restart",
+                    &operator,
                     &run.run_id,
                     run.version,
-                    ActionGrant {
-                        grant_id: "grant-restart".into(),
-                        run_id: run.run_id.clone(),
-                        target: run.target.clone(),
-                        action_classes: std::collections::BTreeSet::from([ActionClass::Semantic]),
-                        issued_by: GrantIssuer::LocalUser,
-                        issued_at: now,
-                        expires_at: now + chrono::Duration::minutes(5),
-                        uses_remaining: None,
-                        revoked_at: None,
-                    },
+                    ActionGrant::for_run(
+                        &run,
+                        std::collections::BTreeSet::from([ActionClass::Semantic]),
+                        now,
+                        now + chrono::Duration::minutes(5),
+                        None,
+                    ),
                 )
                 .unwrap();
         }

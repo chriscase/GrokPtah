@@ -8,10 +8,10 @@ import type {
   ComputerAction,
   ComputerAgentEligibility,
   ComputerCockpitSnapshot,
+  ComputerLocalApproval,
+  ComputerLocalElement,
   ComputerPermissionStatus,
   ComputerPlatformStatus,
-  ComputerRun,
-  ComputerSemanticElement,
   ComputerTargetCandidate,
 } from "../lib/protocol";
 import { LaneScopeLine, type LaneScope } from "./LaneScopeLine";
@@ -39,21 +39,21 @@ function titleCase(value: string) {
   return value.replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
-function isTerminal(run: ComputerRun) {
+function isTerminal(run: ComputerLocalApproval) {
   return ["completed", "failed", "cancelled", "interrupted", "limit_reached"].includes(
     run.state,
   );
 }
 
-function hasOperatorTakeover(run: ComputerRun) {
+function hasOperatorTakeover(run: ComputerLocalApproval) {
   return run.controlDisposition === "operator_takeover";
 }
 
 function elementByAction(
-  run: ComputerRun,
+  run: ComputerLocalApproval,
   action: string,
-): ComputerSemanticElement | undefined {
-  return run.currentObservation?.elements.find((element) =>
+): ComputerLocalElement | undefined {
+  return run.observation?.elements.find((element) =>
     element.actions.includes(action),
   );
 }
@@ -125,7 +125,7 @@ export function ComputerCockpit({
       .then((next) => {
         if (requestEpoch.current !== epoch) return;
         setSnapshot(next);
-        onRunState?.(next.run?.state ?? null);
+        onRunState?.(next.local?.state ?? null);
       })
       .catch((reason) => {
         if (requestEpoch.current !== epoch) return;
@@ -157,7 +157,7 @@ export function ComputerCockpit({
       if (requestEpoch.current !== epoch) return;
       setSnapshot(next);
       setNotice(success ?? null);
-      onRunState?.(next.run?.state ?? null);
+      onRunState?.(next.local?.state ?? null);
     } catch (reason) {
       if (requestEpoch.current === epoch) setError(String(reason));
     } finally {
@@ -165,13 +165,13 @@ export function ComputerCockpit({
     }
   };
 
-  const run = snapshot?.run ?? null;
+  const run = snapshot?.local ?? null;
   // Status rendering reads the authoritative projection, which is the same
-  // payload an external coordinator observes. `run` is kept only for the
-  // local-only observation detail an approval needs.
+  // payload an external coordinator observes. `local` is kept only for the
+  // approval observation detail.
   const projection = snapshot?.projection ?? null;
   const activity = projection ? computerActivityState(projection) : null;
-  const observation = run?.currentObservation ?? null;
+  const observation = run?.observation ?? null;
   const nameElement = run ? elementByAction(run, "set_value") : undefined;
   const submitElement = run ? elementByAction(run, "invoke") : undefined;
   const statusElement = observation?.elements.find((element) =>
@@ -226,7 +226,7 @@ export function ComputerCockpit({
       );
       if (requestEpoch.current !== epoch) return;
       setSnapshot(result.snapshot);
-      onRunState?.(result.snapshot.run?.state ?? null);
+      onRunState?.(result.snapshot.local?.state ?? null);
       setNotice(
         result.completed
           ? `Model marked the run complete: ${result.summary}`
@@ -667,11 +667,9 @@ export function ComputerCockpit({
                 <div><dt>Grant expires</dt><dd>{grantActive && run.grant ? new Date(run.grant.expiresAt).toLocaleTimeString() : "Revoked"}</dd></div>
                 <div><dt>Pointer fallback</dt><dd>Disabled</dd></div>
               </dl>
-              {run.lastOutcome && <div className="computer-outcome">{run.lastOutcome.summary}</div>}
               {run.lastError && (
                 <div className="computer-alert is-error" role="alert">
                   <strong>{titleCase(run.lastError.code)}</strong>
-                  <span>{run.lastError.message}</span>
                 </div>
               )}
             </aside>

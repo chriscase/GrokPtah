@@ -25,7 +25,8 @@ pub use authority::{
     AUTHORITY_SCHEMA_VERSION,
 };
 pub use authz::{
-    canonical_workspace, constant_time_eq, AuthContext, AuthCredential, WorkspaceAllowlist,
+    canonical_workspace, constant_time_eq, AuthContext, AuthCredential, ComputerReadGrant,
+    WorkspaceAllowlist,
 };
 pub use continuation::{
     assemble_continuation_context, AgentContinuationPlan, ContinuationAssemblyFailure,

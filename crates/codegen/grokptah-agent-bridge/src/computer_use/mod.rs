@@ -12,6 +12,7 @@
 //! Which runs each surface may list is a separate gate: the cockpit is
 //! session-scoped; coordinator reads take [`ComputerReadBinding`].
 
+mod coordination;
 mod macos_observation;
 mod platform;
 mod policy;
@@ -29,10 +30,12 @@ pub use platform::{
 };
 pub use policy::ComputerPolicy;
 pub use projection::{
-    project_run_at, ActionGrantSummary, ActionOutcomeSummary, ComputerErrorSummary,
-    ComputerRunCapacity, ComputerRunEventPage, ComputerRunEventRange, ComputerRunProgress,
-    ComputerRunProjection, ComputerScopeCapacity, ComputerTargetSummary, ObservationSummary,
-    DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
+    project_run_at, ActionGrantSummary, ActionOutcomeSummary, ComputerBackendPublicView,
+    ComputerErrorSummary, ComputerLocalApproval, ComputerLocalAuditEntry, ComputerLocalElement,
+    ComputerLocalError, ComputerLocalGrant, ComputerLocalLimits, ComputerLocalObservation,
+    ComputerLocalTarget, ComputerRunCapacity, ComputerRunEventPage, ComputerRunEventRange,
+    ComputerRunProgress, ComputerRunProjection, ComputerScopeCapacity, ComputerTargetSummary,
+    ObservationSummary, DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
 };
 pub use reads::{ComputerReadBinding, ComputerRunReads};
 
@@ -50,10 +53,18 @@ mod macos_native;
 pub use service::ComputerUseService;
 pub use simulator::SimulatorBackend;
 pub use store::ComputerStore;
+pub(crate) use types::ResolvedAgentComputerRunAdmission;
 pub use types::{
-    ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAuditEntry, ComputerBackend,
-    ComputerCapabilities, ComputerControlDisposition, ComputerError, ComputerErrorCode,
-    ComputerObservation, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
-    EvidenceRef, GrantIssuer, ObservationGeometry, PointerButton, SemanticAction, SemanticElement,
-    Sensitivity,
+    macos_native_capability_proof, macos_native_physical_input_domain, ActionClass, ActionGrant,
+    ActionOutcome, AgentComputerRunRequest, ComputerAction, ComputerAuditEntry,
+    ComputerAuthorityToken, ComputerBackend, ComputerCapabilities, ComputerCapabilityProof,
+    ComputerCapabilityTier, ComputerControlDisposition, ComputerError, ComputerErrorCode,
+    ComputerKey, ComputerObservation, ComputerPrincipal, ComputerRun, ComputerRunState,
+    ComputerSurfaceBinding, ComputerTarget, ComputerUseLimits, ComputerWorkAttemptBinding,
+    EvidenceRef, GrantIssuer, IsolationProofOrigin, ObservationAuthority, ObservationGeometry,
+    PhysicalInputDomain, PointerButton, SemanticAction, SemanticElement, Sensitivity,
+    SurfaceFreshnessFence, AGENT_PRINCIPAL_INTEGRATION_BLOCKER, COMPUTER_RECEIPT_SCHEMA_VERSION,
+    COMPUTER_RUN_SCHEMA_VERSION, FOREGROUND_CONFLICT_DOMAIN_CAPACITY, MACOS_INTERRUPTED_BACKEND_ID,
+    MACOS_NATIVE_BACKEND_ID, SIMULATOR_BACKGROUND_BACKEND_ID, SIMULATOR_FOREGROUND_BACKEND_ID,
+    SIMULATOR_ISOLATED_BACKEND_ID,
 };

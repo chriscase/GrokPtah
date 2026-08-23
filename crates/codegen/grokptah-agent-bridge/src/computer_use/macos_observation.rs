@@ -14,11 +14,13 @@ use super::platform::{
     ComputerPlatformStatus, ComputerTargetCandidate,
 };
 use super::types::{
-    ActionOutcome, ComputerAction, ComputerBackend, ComputerCapabilities, ComputerError,
-    ComputerErrorCode, ComputerObservation, ComputerResult, ComputerTarget, ComputerUseLimits,
-    EvidenceRef, ObservationGeometry, SemanticAction, SemanticElement, Sensitivity,
-    MAX_LABEL_BYTES,
+    macos_native_capability_proof, macos_native_physical_input_domain, ActionOutcome,
+    ComputerAction, ComputerBackend, ComputerBackendAttestation, ComputerCapabilities,
+    ComputerCapabilityTier, ComputerError, ComputerErrorCode, ComputerObservation, ComputerResult,
+    ComputerTarget, ComputerUseLimits, EvidenceRef, ObservationGeometry, PhysicalInputDomain,
+    SemanticAction, SemanticElement, Sensitivity, MAX_LABEL_BYTES,
 };
+use super::{ComputerStore, ComputerUseService};
 
 const MAX_TARGET_CANDIDATES: usize = 128;
 const SELECTION_LEASE_TTL: StdDuration = StdDuration::from_secs(120);
@@ -65,6 +67,12 @@ impl MacNativeIdentity {
             ));
         }
         Ok(())
+    }
+
+    /// Window/process/bundle identify the target, not a private input domain.
+    #[allow(clippy::unused_self)]
+    fn physical_input_domain(&self) -> PhysicalInputDomain {
+        macos_native_physical_input_domain()
     }
 }
 
@@ -115,6 +123,7 @@ pub(crate) struct RawMacObservation {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct RawMacActionRequest {
     pub target_frame: ObservationGeometry,
     pub element_index: Option<usize>,
@@ -163,6 +172,7 @@ pub struct MacOsObservationPlatform {
 }
 
 impl MacOsObservationPlatform {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn with_source(source: Arc<dyn MacObservationSource>) -> Self {
         Self {
             source,
@@ -175,6 +185,54 @@ impl MacOsObservationPlatform {
         Ok(Self::with_source(Arc::new(
             super::macos_native::NativeMacObservationSource::new()?,
         )))
+    }
+
+    async fn bind_target_backend(
+        &self,
+        selection_token: &str,
+    ) -> ComputerResult<Arc<dyn ComputerBackend>> {
+        super::types::validate_id("selection_token", selection_token)?;
+        let lease = self.leases.lock().remove(selection_token).ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "unknown or already-consumed computer-use selection",
+            )
+        })?;
+        if lease.issued_at.elapsed() >= SELECTION_LEASE_TTL {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "computer-use selection expired",
+            ));
+        }
+        require_platform_ready(&self.status())?;
+        let current = self
+            .source
+            .revalidate_target(&lease.native.identity)
+            .await?;
+        validate_raw_target(&current)?;
+        if current.identity != lease.native.identity {
+            return Err(ComputerError::new(
+                ComputerErrorCode::TargetChanged,
+                "selected macOS target identity changed",
+            ));
+        }
+        Ok(Arc::new(MacOsObservationBackend {
+            source: self.source.clone(),
+            target: lease.candidate.target,
+            native_identity: lease.native.identity,
+            sequence: Mutex::new(0),
+            observation_gate: tokio::sync::Mutex::new(()),
+            last_capture_started: Mutex::new(None),
+            cancellation_epoch: AtomicU64::new(0),
+            action_gate: tokio::sync::Mutex::new(()),
+            action_snapshot: Mutex::new(None),
+            evidence: EvidenceVault::default(),
+        }))
+    }
+
+    #[cfg(test)]
+    async fn bind_target(&self, selection_token: &str) -> ComputerResult<Arc<dyn ComputerBackend>> {
+        self.bind_target_backend(selection_token).await
     }
 }
 
@@ -232,7 +290,7 @@ impl ComputerObservationPlatform for MacOsObservationPlatform {
                 selection_token: selection_token.clone(),
                 target: ComputerTarget {
                     app_id: raw.identity.bundle_id.clone(),
-                    window_id: format!("macos-window-{}", raw.identity.window_id),
+                    window_id: format!("window-{}", Uuid::new_v4()),
                     generation,
                     display_name: bounded_required(&raw.application_name, MAX_LABEL_BYTES)
                         .unwrap_or_else(|| "Application".into()),
@@ -257,44 +315,18 @@ impl ComputerObservationPlatform for MacOsObservationPlatform {
         Ok(candidates)
     }
 
-    async fn bind_target(&self, selection_token: &str) -> ComputerResult<Arc<dyn ComputerBackend>> {
-        super::types::validate_id("selection_token", selection_token)?;
-        let lease = self.leases.lock().remove(selection_token).ok_or_else(|| {
-            ComputerError::new(
-                ComputerErrorCode::Unauthorized,
-                "unknown or already-consumed computer-use selection",
-            )
-        })?;
-        if lease.issued_at.elapsed() >= SELECTION_LEASE_TTL {
-            return Err(ComputerError::new(
-                ComputerErrorCode::Unauthorized,
-                "computer-use selection expired",
-            ));
-        }
-        require_platform_ready(&self.status())?;
-        let current = self
-            .source
-            .revalidate_target(&lease.native.identity)
-            .await?;
-        validate_raw_target(&current)?;
-        if current.identity != lease.native.identity {
-            return Err(ComputerError::new(
-                ComputerErrorCode::TargetChanged,
-                "selected macOS target identity changed",
-            ));
-        }
-        Ok(Arc::new(MacOsObservationBackend {
-            source: self.source.clone(),
-            target: lease.candidate.target,
-            native_identity: lease.native.identity,
-            sequence: Mutex::new(0),
-            observation_gate: tokio::sync::Mutex::new(()),
-            last_capture_started: Mutex::new(None),
-            cancellation_epoch: AtomicU64::new(0),
-            action_gate: tokio::sync::Mutex::new(()),
-            action_snapshot: Mutex::new(None),
-            evidence: EvidenceVault::default(),
-        }))
+    async fn bind_target_service(
+        &self,
+        selection_token: &str,
+        store: ComputerStore,
+    ) -> ComputerResult<ComputerUseService> {
+        let backend = self.bind_target_backend(selection_token).await?;
+        let attestation = ComputerBackendAttestation::trusted(
+            super::types::MACOS_NATIVE_BACKEND_ID,
+            ComputerCapabilityTier::ForegroundSemantic,
+            macos_native_physical_input_domain(),
+        )?;
+        Ok(ComputerUseService::new_trusted(backend, store, attestation))
     }
 }
 
@@ -304,6 +336,9 @@ struct MacActionSnapshot {
     target_frame: ObservationGeometry,
     nodes: Vec<RawMacSemanticNode>,
     nodes_truncated: bool,
+    identity: MacNativeIdentity,
+    content_digest: String,
+    shape_digest: String,
 }
 
 #[derive(Debug)]
@@ -323,14 +358,12 @@ struct MacOsObservationBackend {
 #[async_trait]
 impl ComputerBackend for MacOsObservationBackend {
     fn capabilities(&self) -> ComputerCapabilities {
-        ComputerCapabilities {
-            backend_id: "macos_accessibility_semantic".into(),
-            observe: true,
-            semantic_actions: true,
-            text_entry: true,
-            key_chords: false,
-            pointer_fallback: false,
-        }
+        ComputerCapabilities::from_proof(macos_native_capability_proof())
+            .expect("macOS native proof is foreground-semantic")
+    }
+
+    fn physical_input_domain(&self) -> PhysicalInputDomain {
+        self.native_identity.physical_input_domain()
     }
 
     async fn observe(
@@ -374,6 +407,9 @@ impl ComputerBackend for MacOsObservationBackend {
             target_frame: raw.frame,
             nodes: raw.nodes.clone(),
             nodes_truncated: raw.nodes_truncated,
+            identity: raw.identity.clone(),
+            content_digest: mac_content_digest(&raw.nodes),
+            shape_digest: mac_shape_digest(&raw.nodes),
         };
         let observation = normalize_observation(
             run_id,
@@ -399,6 +435,15 @@ impl ComputerBackend for MacOsObservationBackend {
     }
 
     async fn act(
+        &self,
+        run_id: &str,
+        observation: &ComputerObservation,
+        action: &ComputerAction,
+    ) -> ComputerResult<ActionOutcome> {
+        self.act_if_current(run_id, observation, action).await
+    }
+
+    async fn act_if_current(
         &self,
         _run_id: &str,
         observation: &ComputerObservation,
@@ -439,6 +484,30 @@ impl ComputerBackend for MacOsObservationBackend {
                 "macOS native semantic walk was truncated; action dispatch is denied",
             ));
         }
+        let live = self
+            .source
+            .observe(&self.native_identity, &ComputerUseLimits::default())
+            .await?;
+        if live.identity != snapshot.identity
+            || live.identity != self.native_identity
+            || live.frame != snapshot.target_frame
+            || mac_shape_digest(&live.nodes) != snapshot.shape_digest
+        {
+            *self.action_snapshot.lock() = None;
+            return Err(ComputerError::new(
+                ComputerErrorCode::TargetChanged,
+                "macOS action target geometry or selected-element shape changed",
+            ));
+        }
+        if mac_content_digest(&live.nodes) != snapshot.content_digest
+            || live.nodes_truncated != snapshot.nodes_truncated
+        {
+            *self.action_snapshot.lock() = None;
+            return Err(ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "macOS action is not attested against the current AX/tree generation",
+            ));
+        }
         let (element_index, expected_element) =
             action_element(snapshot.nodes.as_slice(), observation, action)?;
         let request = RawMacActionRequest {
@@ -453,9 +522,6 @@ impl ComputerBackend for MacOsObservationBackend {
                 "macOS action was cancelled before dispatch",
             ));
         }
-        // Consume the attestation before crossing the native mutation
-        // boundary. A target or postcondition error after dispatch is an
-        // uncertain physical outcome and must never make this frame reusable.
         *self.action_snapshot.lock() = None;
         let outcome = self.source.act(&self.native_identity, &request).await?;
         if self.cancellation_epoch.load(Ordering::SeqCst) != epoch {
@@ -487,6 +553,31 @@ impl ComputerBackend for MacOsObservationBackend {
         self.evidence.remove_run(run_id);
         Ok(())
     }
+}
+
+fn mac_content_digest(nodes: &[RawMacSemanticNode]) -> String {
+    let mut hasher = Sha256::new();
+    for node in nodes {
+        hasher.update(node.label.as_deref().unwrap_or("").as_bytes());
+        hasher.update([0]);
+        hasher.update(node.value.as_deref().unwrap_or("").as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn mac_shape_digest(nodes: &[RawMacSemanticNode]) -> String {
+    let mut hasher = Sha256::new();
+    for node in nodes {
+        hasher.update(node.role.as_bytes());
+        hasher.update([0]);
+        hasher.update(format!("{:?}", node.frame).as_bytes());
+        hasher.update([0]);
+        hasher.update([u8::from(node.enabled), u8::from(node.focused)]);
+        hasher.update(format!("{:?}", node.actions).as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn action_element(
@@ -717,6 +808,7 @@ fn normalize_observation(
         elements,
         elements_truncated,
         sensitivity: raw.sensitivity,
+        authority: Default::default(),
     };
     if let Err(error) = observation.validate(limits) {
         evidence.remove_run(run_id);
@@ -934,6 +1026,7 @@ mod tests {
         action_error: Mutex<Option<ComputerErrorCode>>,
         action_postcondition: Mutex<Option<bool>>,
         action_requests: Mutex<Vec<RawMacActionRequest>>,
+        content_label: Mutex<String>,
     }
 
     impl FixtureSource {
@@ -963,6 +1056,7 @@ mod tests {
                 action_error: Mutex::new(None),
                 action_postcondition: Mutex::new(None),
                 action_requests: Mutex::new(Vec::new()),
+                content_label: Mutex::new("Continue".into()),
             }
         }
     }
@@ -1035,7 +1129,7 @@ mod tests {
                     RawMacSemanticNode {
                         role: "AXButton".into(),
                         subrole: None,
-                        label: Some("Continue".into()),
+                        label: Some(self.content_label.lock().clone()),
                         value: None,
                         frame: Some(ObservationGeometry {
                             x: frame.x + 1.0,
@@ -1171,6 +1265,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_bound_macos_service_is_foreground_semantic_only() {
+        let source = Arc::new(FixtureSource::granted());
+        let platform = MacOsObservationPlatform::with_source(source);
+        let candidate = platform.list_targets().await.unwrap().remove(0);
+        let directory = tempfile::tempdir().unwrap();
+        let service = platform
+            .bind_target_service(
+                &candidate.selection_token,
+                ComputerStore::open(directory.path().join("computer-use")).unwrap(),
+            )
+            .await
+            .unwrap();
+        let capabilities = service.capabilities();
+        assert_eq!(
+            capabilities.backend_id,
+            crate::computer_use::MACOS_NATIVE_BACKEND_ID
+        );
+        assert_eq!(
+            capabilities.tier,
+            ComputerCapabilityTier::ForegroundSemantic
+        );
+        assert!(!capabilities.pointer_fallback);
+        assert!(!capabilities.key_chords);
+        assert!(!capabilities.proof.isolated_input_is_dispatchable());
+    }
+
+    #[tokio::test]
     async fn refreshing_targets_invalidates_prior_selection_snapshot() {
         let source = Arc::new(FixtureSource::granted());
         let platform = MacOsObservationPlatform::with_source(source);
@@ -1216,6 +1337,36 @@ mod tests {
                 "native deny list omits {bundle_id}"
             );
         }
+    }
+
+    #[test]
+    fn native_macos_windows_share_one_host_global_foreground_conflict_domain() {
+        let mail = MacNativeIdentity {
+            window_id: 11,
+            process_id: 101,
+            bundle_id: "com.apple.mail".into(),
+        };
+        let safari = MacNativeIdentity {
+            window_id: 22,
+            process_id: 202,
+            bundle_id: "com.apple.Safari".into(),
+        };
+        assert_eq!(mail.physical_input_domain(), safari.physical_input_domain());
+        assert_eq!(
+            mail.physical_input_domain(),
+            macos_native_physical_input_domain()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            crate::computer_use::ComputerStore::open(dir.path().join("computer-use")).unwrap();
+        let interned_mail = store
+            .intern_physical_domain(&mail.physical_input_domain())
+            .unwrap();
+        let interned_safari = store
+            .intern_physical_domain(&safari.physical_input_domain())
+            .unwrap();
+        assert_eq!(interned_mail.binding, interned_safari.binding);
+        assert_eq!(crate::computer_use::FOREGROUND_CONFLICT_DOMAIN_CAPACITY, 1);
     }
 
     #[tokio::test]
@@ -1545,6 +1696,25 @@ mod tests {
         assert!(backend.capabilities().semantic_actions);
         assert!(backend.capabilities().text_entry);
         assert!(!backend.capabilities().pointer_fallback);
+        assert!(!backend.capabilities().key_chords);
+        assert_eq!(
+            backend.capabilities().tier,
+            crate::computer_use::ComputerCapabilityTier::ForegroundSemantic
+        );
+        assert!(!backend
+            .capabilities()
+            .proof
+            .isolated_input_is_dispatchable());
+        assert_eq!(
+            backend.physical_input_domain(),
+            macos_native_physical_input_domain()
+        );
+        assert!(!candidate.target.window_id.contains("macos-window-"));
+        assert!(!candidate
+            .target
+            .window_id
+            .chars()
+            .all(|ch| ch.is_ascii_digit()));
     }
 
     #[tokio::test]
@@ -1756,6 +1926,37 @@ mod tests {
                 .unwrap_err()
                 .code,
             ComputerErrorCode::TargetChanged
+        );
+        assert!(source.action_requests.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_shape_content_drift_fails_before_native_input() {
+        let source = Arc::new(FixtureSource::granted());
+        let platform = MacOsObservationPlatform::with_source(source.clone());
+        let candidate = platform.list_targets().await.unwrap().remove(0);
+        let backend = platform
+            .bind_target(&candidate.selection_token)
+            .await
+            .unwrap();
+        let observation = backend
+            .observe(
+                "run",
+                "content-drift-observation",
+                &candidate.target,
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let element_id = observation.elements[0].element_id.clone();
+        *source.content_label.lock() = "Submit".into();
+        assert_eq!(
+            backend
+                .act("run", &observation, &ComputerAction::Invoke { element_id },)
+                .await
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::StaleObservation
         );
         assert!(source.action_requests.lock().is_empty());
     }

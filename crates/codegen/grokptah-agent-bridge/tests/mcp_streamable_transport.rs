@@ -15,8 +15,8 @@ use grokptah_agent_bridge::orchestration::{
 use grokptah_agent_bridge::{
     canonical_workspace_string, set_grokptah_home_override, start_control_from_env,
     start_control_server, start_control_server_with, ActionClass, ActionGrant, AgentHost,
-    ComputerRun, ComputerUseService, ControlServerLimits, GrantIssuer, HostConfig,
-    McpControlClient, SessionKind, SimulatorBackend, CONTROL_TOOLS,
+    ComputerRun, ComputerUseService, ControlServerLimits, HostConfig, McpControlClient,
+    SessionKind, SimulatorBackend, CONTROL_TOOLS,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -2236,17 +2236,13 @@ fn desktop_computer_use_shares_the_host_store() {
 
 fn smoke_grant(run: &ComputerRun) -> ActionGrant {
     let now = Utc::now();
-    ActionGrant {
-        grant_id: format!("smoke-grant-{}", run.run_id),
-        run_id: run.run_id.clone(),
-        target: run.target.clone(),
-        action_classes: std::collections::BTreeSet::from([ActionClass::Semantic]),
-        issued_by: GrantIssuer::LocalUser,
-        issued_at: now,
-        expires_at: now + ChronoDuration::minutes(10),
-        uses_remaining: None,
-        revoked_at: None,
-    }
+    ActionGrant::for_run(
+        run,
+        std::collections::BTreeSet::from([ActionClass::Semantic]),
+        now,
+        now + ChronoDuration::minutes(10),
+        None,
+    )
 }
 
 /// Live desktop-equivalent proof for the read-only Computer Run tools: the
@@ -2280,16 +2276,18 @@ async fn remote_bearer_computer_reads_fail_closed() {
 
     let canon = canonical_workspace_string(ws.path()).unwrap();
     let canon_other = canonical_workspace_string(ws_other.path()).unwrap();
-    let computer = ComputerUseService::new(
+    let computer = ComputerUseService::new_simulator(
         std::sync::Arc::new(SimulatorBackend::new()),
         host.ensure_computer_store().unwrap(),
     );
 
     // Run A: bound, authorized, observed — projection metadata plus journal.
+    host.session_load(session.id).unwrap();
+    let caller_a = host.computer_operator_token(session.id).unwrap();
     let run_a = computer
         .create_run(
             "smoke-create-a",
-            session.id,
+            &caller_a,
             Some(canon.clone()),
             SimulatorBackend::demo_target(),
             Default::default(),
@@ -2298,21 +2296,24 @@ async fn remote_bearer_computer_reads_fail_closed() {
     let run_a = computer
         .authorize(
             "smoke-grant-a",
+            &caller_a,
             &run_a.run_id,
             run_a.version,
             smoke_grant(&run_a),
         )
         .unwrap();
     computer
-        .observe("smoke-observe-a", &run_a.run_id, run_a.version)
+        .observe("smoke-observe-a", &caller_a, &run_a.run_id, run_a.version)
         .await
         .unwrap();
 
     // Run B: another session's run in another workspace — the rejection target.
+    host.session_load(other_session.id).unwrap();
+    let caller_b = host.computer_operator_token(other_session.id).unwrap();
     let run_b = computer
         .create_run(
             "smoke-create-b",
-            other_session.id,
+            &caller_b,
             Some(canon_other),
             SimulatorBackend::demo_target(),
             Default::default(),
@@ -2321,10 +2322,12 @@ async fn remote_bearer_computer_reads_fail_closed() {
 
     // Run C: journal driven past the bounded ring so an early cursor is
     // genuinely evicted on the wire, using only public service operations.
+    host.session_load(session.id).unwrap();
+    let caller_a = host.computer_operator_token(session.id).unwrap();
     let run_c = computer
         .create_run(
             "smoke-create-c",
-            session.id,
+            &caller_a,
             Some(canon.clone()),
             SimulatorBackend::demo_target(),
             Default::default(),
@@ -2333,6 +2336,7 @@ async fn remote_bearer_computer_reads_fail_closed() {
     let run_c = computer
         .authorize(
             "smoke-grant-c",
+            &caller_a,
             &run_c.run_id,
             run_c.version,
             smoke_grant(&run_c),
@@ -2342,7 +2346,12 @@ async fn remote_bearer_computer_reads_fail_closed() {
     let mut spins = 0u32;
     loop {
         computer
-            .observe(&format!("smoke-observe-c-{spins}"), &run_c.run_id, version)
+            .observe(
+                &format!("smoke-observe-c-{spins}"),
+                &caller_a,
+                &run_c.run_id,
+                version,
+            )
             .await
             .unwrap();
         let current = computer.get_run(&run_c.run_id).unwrap().unwrap();
@@ -2373,6 +2382,15 @@ async fn remote_bearer_computer_reads_fail_closed() {
         .await
         .expect("desktop env bootstrap must start control server");
     assert!(srv.addr.ip().is_loopback());
+    srv.orchestration_service()
+        .set_auth_credentials(vec![AuthCredential::with_computer_read_grant(
+            "primary",
+            &token,
+            session.id,
+            ws.path(),
+        )
+        .unwrap()])
+        .unwrap();
 
     let mut client = McpControlClient::new(format!("http://{}", srv.addr), &token);
     let initialized = client.initialize().await.unwrap();

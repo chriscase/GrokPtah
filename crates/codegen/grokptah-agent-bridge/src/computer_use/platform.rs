@@ -1,12 +1,11 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::types::{
-    validate_id, ComputerBackend, ComputerError, ComputerErrorCode, ComputerResult, ComputerTarget,
+    validate_id, ComputerError, ComputerErrorCode, ComputerResult, ComputerTarget,
     ObservationGeometry,
 };
+use super::{ComputerStore, ComputerUseService};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,8 +105,15 @@ pub trait ComputerObservationPlatform: Send + Sync + std::fmt::Debug {
     /// Returns bounded local-user choices. It must not capture any target.
     async fn list_targets(&self) -> ComputerResult<Vec<ComputerTargetCandidate>>;
 
-    /// Consumes a picker-issued token so arbitrary native IDs cannot be bound.
-    async fn bind_target(&self, selection_token: &str) -> ComputerResult<Arc<dyn ComputerBackend>>;
+    /// Consumes a picker-issued token and returns a service around the bound
+    /// backend. External platform implementations can construct only an
+    /// Unproven service (or the simulator); trusted native bindings remain
+    /// host-owned inside this crate.
+    async fn bind_target_service(
+        &self,
+        selection_token: &str,
+        store: ComputerStore,
+    ) -> ComputerResult<ComputerUseService>;
 }
 
 #[cfg(test)]

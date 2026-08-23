@@ -1,9 +1,16 @@
 # Computer Use on macOS
 
 The first native Computer Use adapter observes one exact window and performs a deliberately small
-set of semantic Accessibility actions on macOS 14 or later. GrokPtah itself keeps its macOS 11
-minimum: ScreenCaptureKit is loaded from its fixed system-framework path only on a supported OS,
-and every native entry point checks runtime availability before use.
+set of semantic Accessibility actions on macOS 14 or later. That adapter is **foreground-semantic**:
+it operates the real foreground OS application and may activate it. It is not an isolated visual
+input domain, not background-safe, and must never be advertised as isolated from pointer, key,
+clipboard, or focus effects. Distinct window IDs are selection/target identity. Native macOS is one
+host-global-foreground conflict domain (capacity 1); two windows share one physical input domain
+and must not be treated as isolated surfaces. Packaged hardware focus, TCC, and takeover evidence remain explicitly
+unverified. Takeover is durable bookkeeping-safe; it is not physically preemptive once an action is
+already inside the native action gate. GrokPtah itself keeps its macOS 11 minimum: ScreenCaptureKit is loaded
+from its fixed system-framework path only on a supported OS, and every native entry point checks
+runtime availability before use.
 
 ## Consent and selection
 
@@ -53,9 +60,12 @@ application-specific policy can attest their sensitive regions.
 ## Semantic action boundary
 
 The cockpit can stage `activate target`, Accessibility `invoke`, visible `set value`, `select`, and
-semantic `scroll to visible`. The user sees the exact target, action summary, risk, and visible text
-payload before granting one use. Each successful or uncertain mutation consumes its observation;
-continuing requires a new local authorization and observation.
+semantic `scroll to visible`. Activate target is valid only for this foreground-semantic backend
+and is never treated as non-disruptive: `GPTActImpl` still activates with
+`NSApplicationActivateIgnoringOtherApps` when that action is explicitly authorized. Background-safe
+semantic actions cannot silently activate. The user sees the exact target, action summary, risk, and
+visible text payload before granting one use. Each successful or uncertain mutation consumes its
+observation; continuing requires a new local authorization and observation.
 
 Immediately before native dispatch, the shim revalidates the exact ScreenCaptureKit window ID,
 process ID, bundle ID, frame, frontmost application, focused AX window, semantic traversal index,
@@ -64,26 +74,14 @@ after dispatch and verifies values where Accessibility exposes a deterministic p
 Permission revocation, app restart, focus theft, window movement, stale element identity, tree
 truncation, secure controls, or failed postconditions fail closed and consume the frame.
 
-This native adapter has no `CGEvent` keyboard or pointer path, coordinate fallback, cursor
-movement, clipboard access, AppleScript, secret substitution, automatic approval, unattended
-mode, or MCP/model **dispatch** tool. The desktop cockpit may ask a qualified model for one
-typed proposal (`computer_agent.rs`); that proposal never executes until the same local
-one-use approval used for manual actions. Computer Use MCP **mutations** remain unsupported
-([#271](https://github.com/chriscase/GrokPtah/issues/271)). Pause, Stop, and Take over revoke
-authority without depending on the model or network; an action that loses the durable
-completion race cannot commit as successful.
-
-Current semantic Computer Use **deliberately avoids raw global mouse injection**. Foreground
-`activate target` (this shim rechecks the frontmost application and focused AX window) is
-**not equivalent to non-disruptive isolated Computer Use**. Background-safe semantic
-([#287](https://github.com/chriscase/GrokPtah/issues/287)) is Planned.
-**Isolated visual Computer Use ([#288](https://github.com/chriscase/GrokPtah/issues/288))
-is a mandatory product exit**: a genuinely isolated agent-owned app
-surface/cursor; global pointer, keyboard, focus, clipboard, and unrelated apps
-remain unaffected; takeover is out-of-band and preemptive. This foreground
-slice does **not** satisfy that contract. Raw global injection may remain
-Explicitly unsupported. Status:
-[`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md).
+This slice has no `CGEvent` keyboard or pointer path, coordinate fallback, cursor movement,
+clipboard access, AppleScript, secret substitution, automatic approval, unattended mode, model
+Computer tool, or Computer mutation over MCP. Capability booleans stay `pointer_fallback=false`
+and `key_chords=false`; they are a public projection of a foreground-semantic typed proof and
+cannot authorize pointer or key dispatch. Pause, Stop, and Take over revoke authority without
+depending on the model or network; an action that loses the durable completion race cannot commit
+as successful. Takeover still cannot preempt an action already inside the native action gate;
+that remains a later out-of-band stage.
 
 ## Packaging and signing
 

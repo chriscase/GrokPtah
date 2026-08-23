@@ -5591,16 +5591,32 @@ impl OrchestrationService {
         Ok(claimed.display().to_string())
     }
 
+    fn computer_read_binding<'a>(
+        &self,
+        auth: &'a AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<crate::computer_use::ComputerReadBinding<'a>, OrchError> {
+        auth.require_operation(AuthorityOperation::ComputerRead)?;
+        auth.require_workspace(AuthorityOperation::ComputerRead, workspace)?;
+        let grant = auth
+            .computer_read_grant()
+            .ok_or_else(computer_scope_denied)?;
+        let claimed = self.authorize_computer_scope(session_id, workspace)?;
+        if grant.session_id() != session_id || grant.workspace() != claimed.as_str() {
+            return Err(computer_scope_denied());
+        }
+        Ok(crate::computer_use::ComputerReadBinding::from_grant(grant))
+    }
+
     pub fn list_computer_runs_scoped(
         &self,
         auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::ComputerRead, workspace)?;
         let reads = self.computer_reads()?;
-        let claimed = self.authorize_computer_scope(session_id, workspace)?;
-        let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
+        let binding = self.computer_read_binding(auth, session_id, workspace)?;
         let runs = reads
             .list_run_projections(binding, Utc::now())
             .map_err(computer_read_error)?;
@@ -5614,10 +5630,8 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::ComputerRead, workspace)?;
         let reads = self.computer_reads()?;
-        let claimed = self.authorize_computer_scope(session_id, workspace)?;
-        let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
+        let binding = self.computer_read_binding(auth, session_id, workspace)?;
         let projection = reads
             .project_run(binding, run_id, Utc::now())
             .map_err(computer_read_error)?;
@@ -5634,10 +5648,8 @@ impl OrchestrationService {
         after_seq: Option<u64>,
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::ComputerRead, workspace)?;
         let reads = self.computer_reads()?;
-        let claimed = self.authorize_computer_scope(session_id, workspace)?;
-        let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
+        let binding = self.computer_read_binding(auth, session_id, workspace)?;
         let page = reads
             .run_events(binding, run_id, after_seq, limit)
             .map_err(computer_read_error)?;
@@ -5665,10 +5677,8 @@ impl OrchestrationService {
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::ComputerRead, workspace)?;
         let reads = self.computer_reads()?;
-        let claimed = self.authorize_computer_scope(session_id, workspace)?;
-        let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
+        let binding = self.computer_read_binding(auth, session_id, workspace)?;
         let capacity = reads.capacity(binding).map_err(computer_read_error)?;
         serde_json::to_value(capacity)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))

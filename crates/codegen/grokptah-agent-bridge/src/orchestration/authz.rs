@@ -2,11 +2,33 @@
 
 use std::path::{Path, PathBuf};
 
+use uuid::Uuid;
+
 use super::authority::{
     AuthorityCapabilityDocument, AuthorityOperation, AuthorityRole, AuthorityStamp,
     EffectiveAuthority,
 };
 use super::types::{OrchError, OrchErrorCode};
+
+/// Immutable Computer-read capability bound to one credential.
+///
+/// A bearer cannot widen this binding through MCP/UI arguments. Legacy
+/// credentials created with [`AuthCredential::new`] carry no grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputerReadGrant {
+    session_id: Uuid,
+    workspace: String,
+}
+
+impl ComputerReadGrant {
+    pub fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    pub fn workspace(&self) -> &str {
+        &self.workspace
+    }
+}
 
 #[derive(Clone)]
 pub struct AuthContext {
@@ -18,6 +40,7 @@ pub struct AuthContext {
     /// different owner identities without changing the protocol shape.
     pub owner_id: String,
     authority: EffectiveAuthority,
+    computer_read: Option<ComputerReadGrant>,
 }
 
 impl std::fmt::Debug for AuthContext {
@@ -43,6 +66,7 @@ impl AuthContext {
             owner_id,
             allowlist,
             AuthorityRole::RemoteCoordinator,
+            None,
         )
     }
 
@@ -51,6 +75,7 @@ impl AuthContext {
         owner_id: impl Into<String>,
         allowlist: &WorkspaceAllowlist,
         role: AuthorityRole,
+        computer_read: Option<ComputerReadGrant>,
     ) -> Result<Self, OrchError> {
         let token_id = token_id.into();
         let owner_id = owner_id.into();
@@ -60,6 +85,7 @@ impl AuthContext {
             token_id,
             owner_id,
             authority,
+            computer_read,
         })
     }
 
@@ -76,6 +102,7 @@ impl AuthContext {
             token_id,
             owner_id,
             authority,
+            computer_read: None,
         })
     }
 
@@ -89,6 +116,7 @@ impl AuthContext {
             token_id: "trusted-local-adapter".to_string(),
             owner_id,
             authority,
+            computer_read: None,
         })
     }
 
@@ -115,6 +143,10 @@ impl AuthContext {
     pub fn role(&self) -> AuthorityRole {
         self.authority.stamp.role
     }
+
+    pub fn computer_read_grant(&self) -> Option<&ComputerReadGrant> {
+        self.computer_read.as_ref()
+    }
 }
 
 /// One named bearer credential accepted by a service instance.
@@ -128,6 +160,7 @@ pub struct AuthCredential {
     token: String,
     role: AuthorityRole,
     workspace_roots: Option<Vec<PathBuf>>,
+    computer_read: Option<ComputerReadGrant>,
 }
 
 impl std::fmt::Debug for AuthCredential {
@@ -140,6 +173,7 @@ impl std::fmt::Debug for AuthCredential {
                 "workspace_grants",
                 &self.workspace_roots.as_ref().map(Vec::len),
             )
+            .field("computer_read", &self.computer_read)
             .finish()
     }
 }
@@ -170,6 +204,7 @@ impl AuthCredential {
             token,
             role: AuthorityRole::RemoteCoordinator,
             workspace_roots: None,
+            computer_read: None,
         })
     }
 
@@ -206,6 +241,33 @@ impl AuthCredential {
 
     pub fn role(&self) -> AuthorityRole {
         self.role
+    }
+
+    pub fn computer_read_grant(&self) -> Option<&ComputerReadGrant> {
+        self.computer_read.as_ref()
+    }
+
+    /// Issue a credential bound to exactly one host-owned Computer-read
+    /// session and canonical workspace.
+    pub fn with_computer_read_grant(
+        id: impl Into<String>,
+        token: impl Into<String>,
+        session_id: Uuid,
+        workspace: impl AsRef<Path>,
+    ) -> Result<Self, OrchError> {
+        if session_id.is_nil() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "computer-read grant session is missing",
+            ));
+        }
+        let mut credential = Self::new(id, token)?;
+        let workspace = canonical_workspace(workspace.as_ref())?;
+        credential.computer_read = Some(ComputerReadGrant {
+            session_id,
+            workspace: workspace.display().to_string(),
+        });
+        Ok(credential)
     }
 
     pub fn with_workspace_roots(
@@ -358,6 +420,7 @@ pub(crate) fn authenticate_bearer(
         owner_id.trim().to_string(),
         &credential_allowlist,
         credential.role,
+        credential.computer_read.clone(),
     )
 }
 
@@ -443,6 +506,49 @@ mod tests {
             &WorkspaceAllowlist::default(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn legacy_credentials_have_no_computer_read_authority() {
+        let credential = AuthCredential::new("legacy", "token").unwrap();
+        assert!(credential.computer_read_grant().is_none());
+        let auth = authenticate_bearer(
+            Some("Bearer token"),
+            &[credential],
+            "owner",
+            &WorkspaceAllowlist::default(),
+        )
+        .unwrap();
+        assert!(auth.computer_read_grant().is_none());
+    }
+
+    #[test]
+    fn computer_read_grant_is_canonical_and_immutable_on_authentication() {
+        let workspace = tempdir().unwrap();
+        let session_id = uuid::Uuid::new_v4();
+        let credential = AuthCredential::with_computer_read_grant(
+            "scoped",
+            "scoped-token",
+            session_id,
+            workspace.path(),
+        )
+        .unwrap();
+        let auth = authenticate_bearer(
+            Some("Bearer scoped-token"),
+            &[credential],
+            "owner",
+            &WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+        )
+        .unwrap();
+        let grant = auth.computer_read_grant().unwrap();
+        assert_eq!(grant.session_id(), session_id);
+        assert_eq!(
+            grant.workspace(),
+            canonical_workspace(workspace.path())
+                .unwrap()
+                .display()
+                .to_string()
+        );
     }
 
     #[test]
