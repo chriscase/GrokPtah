@@ -60,11 +60,11 @@ pub const COMPUTER_RUN_SCHEMA_VERSION: u32 = 1;
 /// Durable Computer mutation receipt schema. `0` means a legacy unversioned receipt.
 pub const COMPUTER_RECEIPT_SCHEMA_VERSION: u32 = 1;
 
-/// Agent ComputerPrincipal minting is fail-closed in this allowlist. Resolving a
-/// durable Agent ID and the exact current spec revision requires `AgentHost` /
-/// orchestration `AgentRecord` integration owned by the active PR #352 security
-/// repair. Stage 1 must not accept `agent-*` strings as host-issued identity.
-pub const AGENT_PRINCIPAL_INTEGRATION_BLOCKER: &str = "Agent ComputerPrincipal minting requires durable host Agent ID + exact current spec revision from AgentHost/AgentRecord; that integration lives in orchestration files owned by the active PR #352 security repair and is out of this allowlist. Stage-1 fails closed rather than accepting agent-* strings.";
+/// Public Agent-principal minting is intentionally unavailable. The only
+/// issuance path resolves a durable `AgentRecord` and exact current spec
+/// revision inside `AgentHost`; callers cannot authenticate with Agent-shaped
+/// strings or deserialize a usable authority token.
+pub const AGENT_PRINCIPAL_INTEGRATION_BLOCKER: &str = "Agent ComputerPrincipal minting requires a host-resolved durable AgentRecord and exact current spec revision";
 
 /// Closed Computer Use isolation/capability tier.
 ///
@@ -109,7 +109,9 @@ impl ComputerCapabilityTier {
     pub fn allows_background_semantic(self) -> bool {
         matches!(
             self,
-            Self::ForegroundSemantic | Self::MeasuredBackgroundSafeSemantic
+            Self::ForegroundSemantic
+                | Self::MeasuredBackgroundSafeSemantic
+                | Self::IndependentlyIsolatedVisualInputDomain
         )
     }
 
@@ -811,6 +813,30 @@ impl ComputerPrincipal {
         ))
     }
 
+    /// Crate-private issuance seam for the durable AgentHost/AgentRecord
+    /// integration. The public string constructor remains fail-closed: only
+    /// host code that has already resolved the exact durable Agent and spec
+    /// revision can call this function.
+    pub(crate) fn from_host_agent_record(
+        agent_id: impl Into<String>,
+        spec_revision: u64,
+    ) -> ComputerResult<Self> {
+        let agent_id = agent_id.into();
+        validate_id("agent_id", &agent_id)?;
+        if spec_revision == 0 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "agent principal requires a non-zero durable spec revision",
+            ));
+        }
+        Ok(Self {
+            inner: ComputerPrincipalInner::Agent {
+                agent_id,
+                spec_revision,
+            },
+        })
+    }
+
     pub fn session_id(&self) -> Option<Uuid> {
         match &self.inner {
             ComputerPrincipalInner::LocalOperatorSession { session_id } => Some(*session_id),
@@ -843,10 +869,19 @@ impl ComputerPrincipal {
                 }
                 Ok(())
             }
-            ComputerPrincipalInner::Agent { .. } => Err(ComputerError::new(
-                ComputerErrorCode::Unauthorized,
-                AGENT_PRINCIPAL_INTEGRATION_BLOCKER,
-            )),
+            ComputerPrincipalInner::Agent {
+                agent_id,
+                spec_revision,
+            } => {
+                validate_id("agent_id", agent_id)?;
+                if *spec_revision == 0 {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::Unauthorized,
+                        "agent principal is missing its durable spec revision",
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -875,6 +910,16 @@ impl ComputerAuthorityToken {
 
     pub(crate) fn local_operator(session_id: Uuid) -> ComputerResult<Self> {
         Self::from_host_principal(ComputerPrincipal::local_operator(session_id))
+    }
+
+    pub(crate) fn agent_from_host_record(
+        agent_id: impl Into<String>,
+        spec_revision: u64,
+    ) -> ComputerResult<Self> {
+        Self::from_host_principal(ComputerPrincipal::from_host_agent_record(
+            agent_id,
+            spec_revision,
+        )?)
     }
 
     pub fn principal(&self) -> &ComputerPrincipal {
@@ -1654,6 +1699,66 @@ pub struct ActionGrant {
     pub capability_tier: ComputerCapabilityTier,
 }
 
+/// Durable WorkAttempt identity for an Agent-owned Computer Run. The host
+/// freezes this binding at Run admission; the Computer backend and model never
+/// author or widen it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerWorkAttemptBinding {
+    pub work_id: String,
+    pub work_attempt_id: String,
+    pub agent_id: String,
+    pub agent_spec_revision: u64,
+}
+
+impl ComputerWorkAttemptBinding {
+    pub(crate) fn validate(&self) -> ComputerResult<()> {
+        validate_id("work_id", &self.work_id)?;
+        validate_id("work_attempt_id", &self.work_attempt_id)?;
+        validate_id("agent_id", &self.agent_id)?;
+        if self.agent_spec_revision == 0 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "Computer WorkAttempt binding is missing its Agent spec revision",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Request to bind one already-active durable WorkAttempt to a Computer Run.
+/// Session, workspace, Agent identity, and spec revision are deliberately
+/// absent: `AgentHost` resolves those from durable records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentComputerRunRequest {
+    pub request_id: String,
+    pub work_id: String,
+    pub work_attempt_id: String,
+    pub target: ComputerTarget,
+    pub limits: ComputerUseLimits,
+}
+
+impl AgentComputerRunRequest {
+    pub fn validate(&self) -> ComputerResult<()> {
+        validate_id("request_id", &self.request_id)?;
+        validate_id("work_id", &self.work_id)?;
+        validate_id("work_attempt_id", &self.work_attempt_id)?;
+        self.target.validate()?;
+        self.limits.validate().map(|_| ())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedAgentComputerRunAdmission {
+    pub request_id: String,
+    pub owner_session_id: Uuid,
+    pub binding: ComputerWorkAttemptBinding,
+    pub workspace: String,
+    pub target: ComputerTarget,
+    pub limits: ComputerUseLimits,
+}
+
 impl ActionGrant {
     pub fn for_run(
         run: &ComputerRun,
@@ -1763,6 +1868,8 @@ pub struct ComputerRun {
     pub freshness_tick: u64,
     #[serde(default)]
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_attempt: Option<ComputerWorkAttemptBinding>,
 }
 
 impl ComputerRun {
@@ -1805,6 +1912,7 @@ impl ComputerRun {
             capability_proof: ComputerCapabilityProof::Unproven,
             freshness_tick: 0,
             schema_version: COMPUTER_RUN_SCHEMA_VERSION,
+            work_attempt: None,
         })
     }
 
@@ -2369,10 +2477,10 @@ mod tests {
     }
 
     #[test]
-    fn agent_principal_minting_is_fail_closed_without_host_agent_registry() {
+    fn public_agent_principal_minting_is_fail_closed_without_host_agent_registry() {
         let blocked = ComputerPrincipal::agent(format!("agent-{}", Uuid::new_v4()), 1).unwrap_err();
         assert_eq!(blocked.code, ComputerErrorCode::Unauthorized);
-        assert!(blocked.message.contains("PR #352"));
+        assert_eq!(blocked.message, AGENT_PRINCIPAL_INTEGRATION_BLOCKER);
         assert!(ComputerPrincipal::agent("user-supplied", 1).is_err());
         let deserialized: ComputerPrincipal = serde_json::from_value(serde_json::json!({
             "kind": "agent",
@@ -2380,26 +2488,17 @@ mod tests {
             "specRevision": 1
         }))
         .unwrap();
-        assert_eq!(
-            deserialized.validate().unwrap_err().code,
-            ComputerErrorCode::Unauthorized
-        );
-        assert_eq!(
-            ComputerAuthorityToken::from_host_principal(deserialized)
-                .unwrap_err()
-                .code,
-            ComputerErrorCode::Unauthorized
-        );
+        assert!(deserialized.validate().is_ok());
+        // Persisted Agent principals must validate so Runs can reopen. The
+        // authority boundary is the private ComputerAuthorityToken
+        // constructor plus AgentHost's durable Agent/spec lookup.
         let snake_legacy: ComputerPrincipal = serde_json::from_value(serde_json::json!({
             "kind": "agent",
             "agent_id": "agent-legacy",
             "spec_revision": 1
         }))
         .unwrap();
-        assert_eq!(
-            snake_legacy.validate().unwrap_err().code,
-            ComputerErrorCode::Unauthorized
-        );
+        assert!(snake_legacy.validate().is_ok());
         assert!(ComputerPrincipal::local_operator(Uuid::nil())
             .validate()
             .is_err());

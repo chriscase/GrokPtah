@@ -7,6 +7,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::coordination::{ComputerDispatchClaim, ComputerSurfaceLease};
 use super::policy::ComputerPolicy;
 use super::projection::{
     not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
@@ -17,7 +18,7 @@ use super::types::{
     validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerAuthorityToken,
     ComputerBackend, ComputerBackendAttestation, ComputerControlDisposition, ComputerError,
     ComputerErrorCode, ComputerObservation, ComputerResult, ComputerRun, ComputerRunState,
-    ComputerTarget, ComputerUseLimits, ObservationAuthority,
+    ComputerTarget, ComputerUseLimits, ObservationAuthority, ResolvedAgentComputerRunAdmission,
 };
 
 pub struct ComputerUseService {
@@ -25,6 +26,9 @@ pub struct ComputerUseService {
     store: ComputerStore,
     policy: ComputerPolicy,
     backend_attestation: ComputerBackendAttestation,
+    agent_work_store: parking_lot::Mutex<Option<crate::orchestration::OrchStore>>,
+    #[cfg(test)]
+    trust_unbound_agent_work_for_tests: std::sync::atomic::AtomicBool,
 }
 
 impl ComputerUseService {
@@ -55,7 +59,90 @@ impl ComputerUseService {
             store,
             policy: ComputerPolicy,
             backend_attestation,
+            agent_work_store: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            trust_unbound_agent_work_for_tests: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn bind_agent_work_store(
+        &self,
+        store: crate::orchestration::OrchStore,
+    ) -> ComputerResult<()> {
+        let mut current = self.agent_work_store.lock();
+        if let Some(bound) = current.as_ref() {
+            if bound.root() != store.root() {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Conflict,
+                    "Computer Use service is already bound to another Work ledger",
+                ));
+            }
+            return Ok(());
+        }
+        *current = Some(store);
+        Ok(())
+    }
+
+    fn with_active_agent_work<T>(
+        &self,
+        run: &ComputerRun,
+        operation: impl FnOnce() -> ComputerResult<T>,
+    ) -> ComputerResult<T> {
+        let Some(binding) = run.work_attempt.as_ref() else {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "Agent Computer Run is missing its host-frozen WorkAttempt binding",
+            ));
+        };
+        self.with_active_agent_binding(
+            binding,
+            run.owner_session_id,
+            run.workspace.as_deref().unwrap_or_default(),
+            operation,
+        )
+    }
+
+    fn with_active_agent_binding<T>(
+        &self,
+        binding: &super::types::ComputerWorkAttemptBinding,
+        owner_session_id: Uuid,
+        workspace: &str,
+        operation: impl FnOnce() -> ComputerResult<T>,
+    ) -> ComputerResult<T> {
+        binding.validate()?;
+        #[cfg(test)]
+        if self
+            .trust_unbound_agent_work_for_tests
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return operation();
+        }
+        let store = self.agent_work_store.lock().clone().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "Agent Computer Use is not bound to the host Work ledger",
+            )
+        })?;
+        store
+            .with_active_computer_work_attempt(
+                &binding.work_id,
+                &binding.work_attempt_id,
+                (&binding.agent_id, binding.agent_spec_revision),
+                (owner_session_id, workspace),
+                operation,
+            )
+            .map_err(|_| {
+                ComputerError::new(
+                    ComputerErrorCode::PermissionRevoked,
+                    "Agent Computer Use WorkAttempt authority is no longer active",
+                )
+            })?
+    }
+
+    #[cfg(test)]
+    fn trust_unbound_agent_work_for_tests(&self) {
+        self.trust_unbound_agent_work_for_tests
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn capabilities(&self) -> super::types::ComputerCapabilities {
@@ -264,6 +351,81 @@ impl ComputerUseService {
         result
     }
 
+    /// Host-only creation path for a durable Agent. The caller token can only
+    /// be minted after `AgentHost` resolves the exact current AgentRecord/spec
+    /// revision. Work/Attempt binding is added by the surface lease queue.
+    pub(crate) fn create_agent_run(
+        &self,
+        caller: &ComputerAuthorityToken,
+        admission: ResolvedAgentComputerRunAdmission,
+    ) -> ComputerResult<ComputerRun> {
+        admission.target.validate()?;
+        admission.limits.validate()?;
+        admission.binding.validate()?;
+        caller.principal().validate()?;
+        if caller.principal().agent_id().is_none()
+            || caller.principal().agent_spec_revision().is_none()
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "create_agent_run requires a host-issued durable Agent principal",
+            ));
+        }
+        let payload = json!({
+            "ownerSessionId": admission.owner_session_id,
+            "workId": admission.binding.work_id,
+            "workAttemptId": admission.binding.work_attempt_id,
+            "workspace": admission.workspace,
+            "target": admission.target,
+            "limits": admission.limits,
+            "agentId": caller.principal().agent_id(),
+            "agentSpecRevision": caller.principal().agent_spec_revision(),
+        });
+        self.with_active_agent_binding(
+            &admission.binding,
+            admission.owner_session_id,
+            &admission.workspace,
+            || Ok(()),
+        )?;
+        if let Some(replayed) = self.begin_mutation(
+            &admission.request_id,
+            "create_agent_run",
+            &payload,
+            caller,
+            None,
+        )? {
+            return replayed;
+        }
+        let result = (|| {
+            self.store.can_create_run()?;
+            let capabilities = self
+                .backend_attestation
+                .attest_capabilities(self.backend.capabilities())?;
+            let interned = self
+                .store
+                .intern_physical_domain(self.backend_attestation.physical_domain())?;
+            let proof = interned.stamp_proof(capabilities.proof)?;
+            proof.validate()?;
+            let mut run = ComputerRun::new_with_isolation(
+                admission.owner_session_id,
+                Some(admission.workspace.clone()),
+                admission.target.clone(),
+                admission.limits,
+                caller.principal().clone(),
+                interned.binding,
+                proof,
+            )?;
+            run.work_attempt = Some(admission.binding.clone());
+            run.record_audit("create_agent_run", "accepted", None, None, None);
+            self.with_active_agent_work(&run, || {
+                self.store.save_run(&run)?;
+                Ok(run.clone())
+            })
+        })();
+        self.finish_mutation(&admission.request_id, &result)?;
+        result
+    }
+
     pub fn authorize(
         &self,
         request_id: &str,
@@ -285,26 +447,36 @@ impl ComputerUseService {
         {
             return replayed;
         }
-        let result = self
-            .store
-            .update_run(run_id, |run| {
-                ensure_version(run, expected_version)?;
-                if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
-                    return Err(ComputerError::new(
-                        ComputerErrorCode::InvalidState,
-                        "operator takeover is absorbing; create a new computer run",
-                    ));
-                }
-                self.policy
-                    .authorize_grant(run, &grant, Utc::now(), caller.principal())?;
-                run.grant = Some(grant.clone());
-                run.last_error = None;
-                run.transition(ComputerRunState::Ready)?;
-                run.set_control_disposition(ComputerControlDisposition::AgentOwned);
-                run.record_audit("authorize", "granted", None, None, None);
-                Ok(())
-            })
-            .and_then(|run| run.ok_or_else(unknown_run));
+        let authorize = || {
+            self.store
+                .update_run(run_id, |run| {
+                    ensure_version(run, expected_version)?;
+                    if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
+                        return Err(ComputerError::new(
+                            ComputerErrorCode::InvalidState,
+                            "operator takeover is absorbing; create a new computer run",
+                        ));
+                    }
+                    self.policy
+                        .authorize_grant(run, &grant, Utc::now(), caller.principal())?;
+                    run.grant = Some(grant.clone());
+                    run.last_error = None;
+                    run.transition(ComputerRunState::Ready)?;
+                    run.set_control_disposition(ComputerControlDisposition::AgentOwned);
+                    run.record_audit("authorize", "granted", None, None, None);
+                    Ok(())
+                })
+                .and_then(|run| run.ok_or_else(unknown_run))
+        };
+        let result = if current
+            .initiating_principal
+            .as_ref()
+            .is_some_and(|principal| principal.agent_id().is_some())
+        {
+            self.with_active_agent_work(&current, authorize)
+        } else {
+            authorize()
+        };
         if let Err(error) = &result {
             self.record_denial(run_id, "authorize", None, error);
         }
@@ -327,6 +499,26 @@ impl ComputerUseService {
         {
             return replayed;
         }
+
+        let mut observation_lease =
+            match self.preflight_agent_surface_observation(&current, caller, expected_version) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    if error.code != ComputerErrorCode::Pending
+                        && current
+                            .initiating_principal
+                            .as_ref()
+                            .is_some_and(|principal| principal.agent_id().is_some())
+                    {
+                        if let Err(cleanup_error) = self
+                            .revoke_active_observation_lease(run_id, "observation_preflight_failed")
+                        {
+                            return self.finish_and_return(request_id, Err(cleanup_error));
+                        }
+                    }
+                    return self.finish_and_return(request_id, Err(error));
+                }
+            };
 
         let mut budget_error = None;
         let prepared = self
@@ -352,7 +544,16 @@ impl ComputerUseService {
             .and_then(|run| run.ok_or_else(unknown_run));
 
         let result = match (prepared, budget_error) {
-            (Ok(_), Some(error)) => Err(error),
+            (Ok(_), Some(error)) => {
+                if let Some(lease) = observation_lease.take() {
+                    if let Err(cleanup_error) =
+                        self.revoke_observation_lease(&lease, "run_limit_reached")
+                    {
+                        return self.finish_and_return(request_id, Err(cleanup_error));
+                    }
+                }
+                Err(error)
+            }
             (Ok(prepared), None) => {
                 // Observation identities cross the GUI/MCP projection boundary,
                 // so they are minted by the host before capture. A backend may
@@ -389,31 +590,177 @@ impl ComputerUseService {
                         });
                         match validated {
                             Ok(observation) => match self.commit_observation(run_id, observation) {
-                                Ok(observation) => Ok(observation),
+                                Ok(observation) => {
+                                    if let Some(lease) = observation_lease.take() {
+                                        if let Err(error) =
+                                            self.store.bind_surface_lease_observation(
+                                                &lease.lease_id,
+                                                lease.revision,
+                                                run_id,
+                                                observation.authority.frame_epoch,
+                                                observation.authority.freshness.tick,
+                                                Utc::now(),
+                                            )
+                                        {
+                                            self.fail_coordinated_observation(
+                                                run_id,
+                                                &lease,
+                                                &observation,
+                                                &error,
+                                            );
+                                            return self.finish_and_return(request_id, Err(error));
+                                        }
+                                    }
+                                    Ok(observation)
+                                }
                                 Err(error) => {
+                                    if let Some(lease) = observation_lease.take() {
+                                        let _ = self.revoke_observation_lease(
+                                            &lease,
+                                            "observation_commit_failed",
+                                        );
+                                    }
                                     self.fail_inflight(run_id, "observe", &error)?;
                                     Err(error)
                                 }
                             },
                             Err(error) => {
+                                if let Some(lease) = observation_lease.take() {
+                                    let _ = self.revoke_observation_lease(
+                                        &lease,
+                                        "observation_validation_failed",
+                                    );
+                                }
                                 self.fail_inflight(run_id, "observe", &error)?;
                                 Err(error)
                             }
                         }
                     }
                     Err(error) => {
+                        if let Some(lease) = observation_lease.take() {
+                            let _ =
+                                self.revoke_observation_lease(&lease, "observation_backend_failed");
+                        }
                         self.fail_inflight(run_id, "observe", &error)?;
                         Err(error)
                     }
                 }
             }
             (Err(error), _) => {
+                if let Some(lease) = observation_lease.take() {
+                    if let Err(cleanup_error) =
+                        self.revoke_observation_lease(&lease, "observation_denied")
+                    {
+                        return self.finish_and_return(request_id, Err(cleanup_error));
+                    }
+                }
                 self.record_denial(run_id, "observe", None, &error);
                 Err(error)
             }
         };
         self.finish_mutation(request_id, &result)?;
         result
+    }
+
+    fn preflight_agent_surface_observation(
+        &self,
+        current: &ComputerRun,
+        caller: &ComputerAuthorityToken,
+        expected_version: u64,
+    ) -> ComputerResult<Option<ComputerSurfaceLease>> {
+        if current
+            .initiating_principal
+            .as_ref()
+            .is_none_or(|principal| principal.agent_id().is_none())
+        {
+            return Ok(None);
+        }
+        ensure_version(current, expected_version)?;
+        self.policy
+            .authorize_observation(current, Utc::now(), caller.principal())?;
+        self.with_active_agent_work(current, || {
+            self.store
+                .acquire_agent_surface_observation(&current.run_id, Utc::now())
+        })?
+        .map(Some)
+        .ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Pending,
+                "the Computer surface is queued behind another Agent",
+            )
+        })
+    }
+
+    fn revoke_observation_lease(
+        &self,
+        lease: &ComputerSurfaceLease,
+        disposition: &str,
+    ) -> ComputerResult<()> {
+        self.store
+            .revoke_surface_lease_before_dispatch(
+                &lease.lease_id,
+                lease.revision,
+                disposition,
+                Utc::now(),
+            )
+            .map(|_| ())
+    }
+
+    fn revoke_active_observation_lease(
+        &self,
+        run_id: &str,
+        disposition: &str,
+    ) -> ComputerResult<()> {
+        let active = self
+            .store
+            .list_surface_leases()?
+            .into_iter()
+            .filter(|lease| lease.run_id == run_id && !lease.state.is_terminal())
+            .collect::<Vec<_>>();
+        if active.len() > 1 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Internal,
+                "Agent Computer Run owns multiple active surface leases",
+            ));
+        }
+        if let Some(lease) = active.first() {
+            self.revoke_observation_lease(lease, disposition)?;
+        }
+        Ok(())
+    }
+
+    fn fail_coordinated_observation(
+        &self,
+        run_id: &str,
+        lease: &ComputerSurfaceLease,
+        observation: &ComputerObservation,
+        error: &ComputerError,
+    ) {
+        if let Err(cleanup_error) = self.revoke_observation_lease(lease, "frame_bind_failed") {
+            eprintln!(
+                "[grokptah] failed to revoke Computer observation lease {}: {cleanup_error}",
+                lease.lease_id
+            );
+        }
+        if let Err(store_error) = self.store.update_run(run_id, |run| {
+            if run
+                .current_observation
+                .as_ref()
+                .map(|current| &current.observation_id)
+                == Some(&observation.observation_id)
+            {
+                run.last_error = Some(error.clone());
+                run.current_observation = None;
+                run.transition(ComputerRunState::Failed)?;
+                revoke_authority(run);
+                run.record_audit("observe", "frame_bind_failed", None, None, Some(error.code));
+            }
+            Ok(())
+        }) {
+            eprintln!(
+                "[grokptah] failed to terminalize Computer Run {run_id} after observation fence failure: {store_error}"
+            );
+        }
     }
 
     pub async fn act(
@@ -440,6 +787,39 @@ impl ComputerUseService {
         {
             return replayed;
         }
+
+        // Agent actions are coordinated against a host-owned physical input
+        // conflict domain. Perform the complete read-only policy check before
+        // creating a durable lease, then repeat it while transitioning the Run
+        // so a stale frame/grant/takeover race fails before injection.
+        let mut surface_dispatch = match self.preflight_agent_surface_dispatch(
+            &current,
+            caller,
+            expected_version,
+            observation_id,
+            &action,
+            run_id,
+            request_id,
+            &payload,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                if error.code != ComputerErrorCode::Pending
+                    && current
+                        .initiating_principal
+                        .as_ref()
+                        .is_some_and(|principal| principal.agent_id().is_some())
+                {
+                    if let Err(cleanup_error) =
+                        self.revoke_active_observation_lease(run_id, "action_preflight_failed")
+                    {
+                        return self.finish_and_return(request_id, Err(cleanup_error));
+                    }
+                }
+                self.record_denial(run_id, "act", Some(action.class()), &error);
+                return self.finish_and_return(request_id, Err(error));
+            }
+        };
 
         let mut budget_error = None;
         let prepared = self
@@ -502,32 +882,240 @@ impl ComputerUseService {
             .and_then(|run| run.ok_or_else(unknown_run));
 
         let result = match (prepared, budget_error) {
-            (Ok(_), Some(error)) => Err(error),
+            (Ok(_), Some(error)) => {
+                if let Some(lease) = surface_dispatch.take() {
+                    if let Err(cleanup_error) = self.fail_pre_injection_dispatch(&lease, error.code)
+                    {
+                        return self.finish_and_return(request_id, Err(cleanup_error));
+                    }
+                }
+                Err(error)
+            }
             (Ok(prepared), None) => {
                 let observation = prepared
                     .current_observation
                     .clone()
                     .expect("prepared action has an observation");
                 let control_epoch = prepared.control_epoch;
+                let injected_dispatch = match surface_dispatch.take() {
+                    Some(lease) => match self.inject_surface_dispatch(&lease) {
+                        Ok(injected) => Some(injected),
+                        Err(error) => {
+                            self.fail_inflight(run_id, "act", &error)?;
+                            return self.finish_and_return(request_id, Err(error));
+                        }
+                    },
+                    None => None,
+                };
                 let outcome = self
                     .backend
                     .act_if_current(run_id, &observation, &action)
                     .await;
                 match outcome {
                     Ok(outcome) => {
+                        if let Some(lease) = injected_dispatch {
+                            let outcome_value = match serde_json::to_value(&outcome) {
+                                Ok(value) => value,
+                                Err(_) => {
+                                    let error = self.mark_agent_dispatch_uncertain(
+                                        run_id,
+                                        &lease,
+                                        ComputerErrorCode::Internal,
+                                    );
+                                    return self.finish_and_return(request_id, Err(error));
+                                }
+                            };
+                            let outcome_sha256 = crate::orchestration::hash_payload(&outcome_value);
+                            if self
+                                .store
+                                .acknowledge_surface_dispatch(
+                                    &lease.lease_id,
+                                    lease.revision,
+                                    dispatch_id(&lease)?,
+                                    &outcome_sha256,
+                                    Utc::now(),
+                                )
+                                .is_err()
+                            {
+                                let error = self.mark_agent_dispatch_uncertain(
+                                    run_id,
+                                    &lease,
+                                    ComputerErrorCode::Internal,
+                                );
+                                return self.finish_and_return(request_id, Err(error));
+                            }
+                        }
                         self.commit_action(run_id, &action, &observation, control_epoch, outcome)
                     }
                     Err(error) => {
+                        let error = if let Some(lease) = injected_dispatch {
+                            self.mark_agent_dispatch_uncertain(run_id, &lease, error.code)
+                        } else {
+                            error
+                        };
                         self.fail_inflight(run_id, "act", &error)?;
                         Err(error)
                     }
                 }
             }
             (Err(error), _) => {
+                if let Some(lease) = surface_dispatch.take() {
+                    if let Err(cleanup_error) = self.fail_pre_injection_dispatch(&lease, error.code)
+                    {
+                        return self.finish_and_return(request_id, Err(cleanup_error));
+                    }
+                }
                 self.record_denial(run_id, "act", Some(action.class()), &error);
                 Err(error)
             }
         };
+        self.finish_mutation(request_id, &result)?;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn preflight_agent_surface_dispatch(
+        &self,
+        current: &ComputerRun,
+        caller: &ComputerAuthorityToken,
+        expected_version: u64,
+        observation_id: &str,
+        action: &ComputerAction,
+        run_id: &str,
+        request_id: &str,
+        payload: &serde_json::Value,
+    ) -> ComputerResult<Option<ComputerSurfaceLease>> {
+        if current
+            .initiating_principal
+            .as_ref()
+            .is_none_or(|principal| principal.agent_id().is_none())
+        {
+            return Ok(None);
+        }
+        let observation = current.current_observation.as_ref().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "computer run has no current observation",
+            )
+        })?;
+        ensure_version(current, expected_version)?;
+        if observation.observation_id != observation_id {
+            return Err(ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "action observation id is stale",
+            ));
+        }
+        let live_fence = self.store.live_freshness(&current.surface)?;
+        self.policy.authorize_action(
+            current,
+            observation,
+            action,
+            Utc::now(),
+            caller.principal(),
+            &live_fence,
+        )?;
+        if !self.backend.capabilities().allows_action(action) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "the backend does not support this action class",
+            ));
+        }
+        let payload_sha256 = crate::orchestration::hash_payload(payload);
+        match self.with_active_agent_work(current, || {
+            self.store.acquire_agent_surface_dispatch(
+                run_id,
+                request_id,
+                &payload_sha256,
+                Utc::now(),
+            )
+        })? {
+            ComputerDispatchClaim::Perform(lease) => Ok(Some(lease)),
+            ComputerDispatchClaim::Pending => Err(ComputerError::new(
+                ComputerErrorCode::Pending,
+                "the Computer surface is queued behind another Agent",
+            )),
+            ComputerDispatchClaim::Uncertain | ComputerDispatchClaim::Replay(_) => {
+                Err(ComputerError::new(
+                    ComputerErrorCode::UncertainOutcome,
+                    "the physical Computer action already crossed a durable dispatch boundary and will not be replayed",
+                ))
+            }
+        }
+    }
+
+    fn inject_surface_dispatch(
+        &self,
+        lease: &ComputerSurfaceLease,
+    ) -> ComputerResult<ComputerSurfaceLease> {
+        let dispatch_id = dispatch_id(lease)?;
+        let run = self
+            .store
+            .load_run(&lease.run_id)?
+            .ok_or_else(unknown_run)?;
+        match self.with_active_agent_work(&run, || {
+            self.store.mark_surface_dispatch_injected(
+                &lease.lease_id,
+                lease.revision,
+                dispatch_id,
+                Utc::now(),
+            )
+        }) {
+            Ok(injected) => Ok(injected),
+            Err(error) => {
+                let _ = self.store.fail_surface_dispatch(
+                    &lease.lease_id,
+                    dispatch_id,
+                    error.code,
+                    Utc::now(),
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn fail_pre_injection_dispatch(
+        &self,
+        lease: &ComputerSurfaceLease,
+        error_code: ComputerErrorCode,
+    ) -> ComputerResult<()> {
+        self.store
+            .fail_surface_dispatch(&lease.lease_id, dispatch_id(lease)?, error_code, Utc::now())
+            .map(|_| ())
+    }
+
+    fn mark_agent_dispatch_uncertain(
+        &self,
+        run_id: &str,
+        lease: &ComputerSurfaceLease,
+        source_error_code: ComputerErrorCode,
+    ) -> ComputerError {
+        let uncertain = uncertain_dispatch_error();
+        if let Ok(dispatch_id) = dispatch_id(lease) {
+            if let Err(store_error) = self.store.fail_surface_dispatch(
+                &lease.lease_id,
+                dispatch_id,
+                source_error_code,
+                Utc::now(),
+            ) {
+                eprintln!(
+                    "[grokptah] failed to mark injected Computer dispatch uncertain for run {run_id}, lease {}: {store_error}",
+                    lease.lease_id
+                );
+            }
+        }
+        if let Err(store_error) = self.fail_inflight(run_id, "act", &uncertain) {
+            eprintln!(
+                "[grokptah] failed to terminalize Computer Run {run_id} after uncertain physical dispatch: {store_error}"
+            );
+        }
+        uncertain
+    }
+
+    fn finish_and_return<T: Serialize>(
+        &self,
+        request_id: &str,
+        result: ComputerResult<T>,
+    ) -> ComputerResult<T> {
         self.finish_mutation(request_id, &result)?;
         result
     }
@@ -549,7 +1137,7 @@ impl ComputerUseService {
         }
         let paused = self
             .store
-            .update_run(run_id, |run| {
+            .update_run_and_revoke_surface_leases(run_id, "paused", Utc::now(), |run| {
                 ensure_version(run, expected_version)?;
                 self.require_caller(run, caller)?;
                 if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
@@ -597,9 +1185,9 @@ impl ComputerUseService {
         }
         let taken_over = self
             .store
-            .update_run(run_id, |run| {
+            .update_run_and_revoke_surface_leases(run_id, "operator_takeover", Utc::now(), |run| {
                 ensure_version(run, expected_version)?;
-                self.require_caller(run, caller)?;
+                self.require_takeover_caller(run, caller)?;
                 run.transition(ComputerRunState::Paused)?;
                 revoke_authority(run);
                 run.set_control_disposition(ComputerControlDisposition::OperatorTakeover);
@@ -634,7 +1222,7 @@ impl ComputerUseService {
         }
         let cancelled = self
             .store
-            .update_run(run_id, |run| {
+            .update_run_and_revoke_surface_leases(run_id, "cancelled", Utc::now(), |run| {
                 self.require_caller(run, caller)?;
                 if !run.state.is_terminal() {
                     run.transition(ComputerRunState::Cancelled)?;
@@ -895,6 +1483,15 @@ impl ComputerUseService {
         // request id creates no durable receipt or audit-capacity side
         // effect and cannot receive another principal's cached result.
         self.authorize_new_mutation(operation, caller, run)?;
+        // Receipt possession is not continuing authority. Revalidate an
+        // Agent's exact live WorkAttempt before returning either a success or
+        // failure replay, so cancellation, lease expiry, reassignment, or a
+        // spec revision also revokes access to cached observations/outcomes.
+        if caller.principal().agent_id().is_some() {
+            if let Some(run) = run {
+                self.with_active_agent_work(run, || Ok(()))?;
+            }
+        }
         if let Some(replayed) = self
             .store
             .replay_mutation(request_id, operation, &hash, &stamp)?
@@ -950,11 +1547,46 @@ impl ComputerUseService {
                         "create_run requires a host-issued local operator session",
                     )
                 }),
+            "create_agent_run" => caller
+                .principal()
+                .agent_id()
+                .zip(caller.principal().agent_spec_revision())
+                .map(|_| ())
+                .ok_or_else(|| {
+                    ComputerError::new(
+                        ComputerErrorCode::Unauthorized,
+                        "create_agent_run requires a host-issued durable Agent principal",
+                    )
+                }),
+            "take_over" => {
+                let run = run.ok_or_else(unknown_run)?;
+                if caller.principal().session_id() != Some(run.owner_session_id) {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::Unauthorized,
+                        "operator takeover requires the Run's host-resolved owner Lane",
+                    ));
+                }
+                Ok(())
+            }
             _ => {
                 let run = run.ok_or_else(unknown_run)?;
                 self.require_caller(run, caller)
             }
         }
+    }
+
+    fn require_takeover_caller(
+        &self,
+        run: &ComputerRun,
+        caller: &ComputerAuthorityToken,
+    ) -> ComputerResult<()> {
+        if caller.principal().session_id() != Some(run.owner_session_id) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "operator takeover requires the Run's host-resolved owner Lane",
+            ));
+        }
+        Ok(())
     }
 
     fn finish_mutation<T: Serialize>(
@@ -997,6 +1629,26 @@ fn unknown_run() -> ComputerError {
     ComputerError::new(ComputerErrorCode::InvalidRequest, "unknown computer run")
 }
 
+fn dispatch_id(lease: &ComputerSurfaceLease) -> ComputerResult<&str> {
+    lease
+        .dispatch
+        .as_ref()
+        .map(|dispatch| dispatch.dispatch_id.as_str())
+        .ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Internal,
+                "surface lease is missing its physical dispatch record",
+            )
+        })
+}
+
+fn uncertain_dispatch_error() -> ComputerError {
+    ComputerError::new(
+        ComputerErrorCode::UncertainOutcome,
+        "the physical Computer action crossed the injection boundary but its durable outcome is uncertain; it will not be replayed",
+    )
+}
+
 fn run_limit_error() -> ComputerError {
     ComputerError::new(
         ComputerErrorCode::LimitReached,
@@ -1014,6 +1666,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::computer_use::coordination::{ComputerDispatchState, ComputerSurfaceLeaseState};
     use crate::computer_use::{ActionClass, ComputerCapabilities, EvidenceRef, SimulatorBackend};
 
     #[derive(Debug, Default)]
@@ -1253,6 +1906,706 @@ mod tests {
     ) -> crate::computer_use::ComputerAuthorityToken {
         ComputerAuthorityToken::local_operator(run.owner_session_id)
             .expect("owner session is a valid local operator")
+    }
+
+    fn create_authorized_agent_run(
+        service: &ComputerUseService,
+        suffix: &str,
+    ) -> (ComputerRun, ComputerAuthorityToken) {
+        service.trust_unbound_agent_work_for_tests();
+        let agent_id = format!("agent-{suffix}");
+        let token = ComputerAuthorityToken::agent_from_host_record(&agent_id, 1).unwrap();
+        let run = service
+            .create_agent_run(
+                &token,
+                ResolvedAgentComputerRunAdmission {
+                    request_id: format!("create-agent-run-{suffix}"),
+                    owner_session_id: Uuid::new_v4(),
+                    binding: crate::computer_use::ComputerWorkAttemptBinding {
+                        work_id: format!("work-{suffix}"),
+                        work_attempt_id: format!("attempt-{suffix}"),
+                        agent_id,
+                        agent_spec_revision: 1,
+                    },
+                    workspace: format!("/tmp/workspace-{suffix}"),
+                    target: SimulatorBackend::demo_target(),
+                    limits: ComputerUseLimits::default(),
+                },
+            )
+            .unwrap();
+        let run = service
+            .authorize(
+                &format!("authorize-agent-run-{suffix}"),
+                &token,
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
+            .unwrap();
+        (run, token)
+    }
+
+    async fn observe_agent_run(
+        service: &ComputerUseService,
+        run: &ComputerRun,
+        token: &ComputerAuthorityToken,
+        suffix: &str,
+    ) -> ComputerResult<ComputerObservation> {
+        service
+            .observe(
+                &format!("observe-agent-run-{suffix}"),
+                token,
+                &run.run_id,
+                service
+                    .get_run(&run.run_id)?
+                    .ok_or_else(unknown_run)?
+                    .version,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn same_domain_agents_serialize_observation_and_physical_dispatch() {
+        let dir = tempdir().unwrap();
+        let backend = Arc::new(BlockingBackend::default());
+        let service = Arc::new(trusted_fixture_service(
+            backend.clone(),
+            ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+        ));
+        let (run_a, token_a) = create_authorized_agent_run(&service, "serial-a");
+        let (run_b, token_b) = create_authorized_agent_run(&service, "serial-b");
+        let (run_c, token_c) = create_authorized_agent_run(&service, "serial-c");
+
+        let observation_a = observe_agent_run(&service, &run_a, &token_a, "serial-a")
+            .await
+            .unwrap();
+        let current_a = service.get_run(&run_a.run_id).unwrap().unwrap();
+        let action_service = service.clone();
+        let action_run_id = run_a.run_id.clone();
+        let action_observation = observation_a.clone();
+        let action = tokio::spawn(async move {
+            action_service
+                .act(
+                    "act-agent-run-serial-a",
+                    &token_a,
+                    &action_run_id,
+                    current_a.version,
+                    &action_observation.observation_id,
+                    ComputerAction::SetValue {
+                        element_id: format!("{}-name", action_observation.observation_id),
+                        text: "Ada".into(),
+                    },
+                )
+                .await
+        });
+        backend.action_entered.notified().await;
+
+        let pending = observe_agent_run(&service, &run_b, &token_b, "serial-b-pending")
+            .await
+            .unwrap_err();
+        assert_eq!(pending.code, ComputerErrorCode::Pending);
+        let pending = observe_agent_run(&service, &run_c, &token_c, "serial-c-pending")
+            .await
+            .unwrap_err();
+        assert_eq!(pending.code, ComputerErrorCode::Pending);
+        let queued = service
+            .store
+            .list_surface_leases()
+            .unwrap()
+            .into_iter()
+            .filter(|lease| lease.state == ComputerSurfaceLeaseState::Queued)
+            .collect::<Vec<_>>();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].run_id, run_b.run_id);
+        assert_eq!(queued[1].run_id, run_c.run_id);
+        assert!(queued[0].queue_sequence < queued[1].queue_sequence);
+        assert_eq!(backend.action_calls.load(Ordering::SeqCst), 1);
+
+        backend.release_action.notify_one();
+        action.await.unwrap().unwrap();
+
+        let observation_b = observe_agent_run(&service, &run_b, &token_b, "serial-b-granted")
+            .await
+            .unwrap();
+        let current_b = service.get_run(&run_b.run_id).unwrap().unwrap();
+        backend.release_action.notify_one();
+        service
+            .act(
+                "act-agent-run-serial-b",
+                &token_b,
+                &run_b.run_id,
+                current_b.version,
+                &observation_b.observation_id,
+                ComputerAction::SetValue {
+                    element_id: format!("{}-name", observation_b.observation_id),
+                    text: "Grace".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let observation_c = observe_agent_run(&service, &run_c, &token_c, "serial-c-granted")
+            .await
+            .unwrap();
+        let current_c = service.get_run(&run_c.run_id).unwrap().unwrap();
+        backend.release_action.notify_one();
+        service
+            .act(
+                "act-agent-run-serial-c",
+                &token_c,
+                &run_c.run_id,
+                current_c.version,
+                &observation_c.observation_id,
+                ComputerAction::SetValue {
+                    element_id: format!("{}-name", observation_c.observation_id),
+                    text: "Linus".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(backend.action_calls.load(Ordering::SeqCst), 3);
+        let leases = service.store.list_surface_leases().unwrap();
+        assert_eq!(leases.len(), 3);
+        assert!(leases
+            .iter()
+            .all(|lease| lease.state == ComputerSurfaceLeaseState::Released));
+    }
+
+    #[tokio::test]
+    async fn local_surface_advance_stales_agent_frame_before_backend_dispatch() {
+        let dir = tempdir().unwrap();
+        let backend = Arc::new(SimulatorBackend::new());
+        let service = ComputerUseService::new_simulator(
+            backend.clone(),
+            ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+        );
+        let (agent_run, agent_token) = create_authorized_agent_run(&service, "stale-frame");
+        let agent_observation =
+            observe_agent_run(&service, &agent_run, &agent_token, "stale-frame")
+                .await
+                .unwrap();
+
+        let operator = ComputerAuthorityToken::local_operator(agent_run.owner_session_id).unwrap();
+        let local_run = service
+            .create_run(
+                "create-local-frame-advance",
+                &operator,
+                None,
+                SimulatorBackend::demo_target(),
+                ComputerUseLimits::default(),
+            )
+            .unwrap();
+        let local_run = service
+            .authorize(
+                "authorize-local-frame-advance",
+                &operator,
+                &local_run.run_id,
+                local_run.version,
+                grant(&local_run),
+            )
+            .unwrap();
+        service
+            .observe(
+                "observe-local-frame-advance",
+                &operator,
+                &local_run.run_id,
+                local_run.version,
+            )
+            .await
+            .unwrap();
+
+        let current = service.get_run(&agent_run.run_id).unwrap().unwrap();
+        let error = service
+            .act(
+                "act-stale-agent-frame",
+                &agent_token,
+                &agent_run.run_id,
+                current.version,
+                &agent_observation.observation_id,
+                ComputerAction::SetValue {
+                    element_id: format!("{}-name", agent_observation.observation_id),
+                    text: "Ada".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::StaleObservation);
+        assert_eq!(backend.action_attempt_count(), 0);
+        let lease = service.store.list_surface_leases().unwrap().remove(0);
+        assert_eq!(lease.state, ComputerSurfaceLeaseState::Revoked);
+        assert!(lease.dispatch.is_none());
+    }
+
+    #[tokio::test]
+    async fn operator_takeover_and_agent_injection_share_one_linearization_fence() {
+        let dir = tempdir().unwrap();
+        let backend = Arc::new(BlockingBackend::default());
+        let service = Arc::new(trusted_fixture_service(
+            backend.clone(),
+            ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+        ));
+        let (run, token) = create_authorized_agent_run(&service, "takeover-agent");
+        let observation = observe_agent_run(&service, &run, &token, "takeover-agent")
+            .await
+            .unwrap();
+        let current = service.get_run(&run.run_id).unwrap().unwrap();
+        let action_service = service.clone();
+        let action_run_id = run.run_id.clone();
+        let action_observation = observation.clone();
+        let action = tokio::spawn(async move {
+            action_service
+                .act(
+                    "act-takeover-agent",
+                    &token,
+                    &action_run_id,
+                    current.version,
+                    &action_observation.observation_id,
+                    ComputerAction::SetValue {
+                        element_id: format!("{}-name", action_observation.observation_id),
+                        text: "Ada".into(),
+                    },
+                )
+                .await
+        });
+        backend.action_entered.notified().await;
+
+        let acting = service.get_run(&run.run_id).unwrap().unwrap();
+        let operator = ComputerAuthorityToken::local_operator(run.owner_session_id).unwrap();
+        let taken_over = service
+            .take_over(
+                "take-over-agent-run",
+                &operator,
+                &run.run_id,
+                acting.version,
+            )
+            .await
+            .unwrap();
+        assert_eq!(taken_over.state, ComputerRunState::Paused);
+        assert_eq!(
+            taken_over.control_disposition,
+            ComputerControlDisposition::OperatorTakeover
+        );
+        let lease = service.store.list_surface_leases().unwrap().remove(0);
+        assert_eq!(lease.state, ComputerSurfaceLeaseState::Uncertain);
+        assert_eq!(
+            lease.dispatch.as_ref().unwrap().state,
+            ComputerDispatchState::Uncertain
+        );
+
+        backend.release_action.notify_one();
+        let error = action.await.unwrap().unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::UncertainOutcome);
+        assert_eq!(backend.action_calls.load(Ordering::SeqCst), 1);
+        let terminal = service.get_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(
+            terminal.control_disposition,
+            ComputerControlDisposition::OperatorTakeover,
+            "late completion cannot regain Agent control"
+        );
+    }
+
+    #[tokio::test]
+    async fn independently_isolated_agent_domains_can_hold_capacity_together() {
+        let dir = tempdir().unwrap();
+        let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
+        let first_backend = Arc::new(SimulatorBackend::independently_isolated());
+        let second_backend = Arc::new(SimulatorBackend::independently_isolated());
+        let first = ComputerUseService::new_simulator(first_backend, store.clone());
+        let second = ComputerUseService::new_simulator(second_backend, store.clone());
+        let (run_a, token_a) = create_authorized_agent_run(&first, "isolated-a");
+        let (run_b, token_b) = create_authorized_agent_run(&second, "isolated-b");
+
+        let observation_a = observe_agent_run(&first, &run_a, &token_a, "isolated-a")
+            .await
+            .unwrap();
+        let observation_b = observe_agent_run(&second, &run_b, &token_b, "isolated-b")
+            .await
+            .unwrap();
+        let granted = store
+            .list_surface_leases()
+            .unwrap()
+            .into_iter()
+            .filter(|lease| lease.state == ComputerSurfaceLeaseState::Granted)
+            .collect::<Vec<_>>();
+        assert_eq!(granted.len(), 2);
+        assert_ne!(granted[0].conflict_domain_id, granted[1].conflict_domain_id);
+
+        let current_a = first.get_run(&run_a.run_id).unwrap().unwrap();
+        first
+            .act(
+                "act-agent-run-isolated-a",
+                &token_a,
+                &run_a.run_id,
+                current_a.version,
+                &observation_a.observation_id,
+                ComputerAction::SetValue {
+                    element_id: format!("{}-name", observation_a.observation_id),
+                    text: "Ada".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let current_b = second.get_run(&run_b.run_id).unwrap().unwrap();
+        second
+            .act(
+                "act-agent-run-isolated-b",
+                &token_b,
+                &run_b.run_id,
+                current_b.version,
+                &observation_b.observation_id,
+                ComputerAction::SetValue {
+                    element_id: format!("{}-name", observation_b.observation_id),
+                    text: "Grace".into(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn prepared_and_injected_agent_dispatches_recover_fail_closed_twice() {
+        for injected in [false, true] {
+            let dir = tempdir().unwrap();
+            let (lease_id, dispatch_key) = {
+                let backend = Arc::new(SimulatorBackend::new());
+                let service = ComputerUseService::new_simulator(
+                    backend,
+                    ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+                );
+                let (run, token) = create_authorized_agent_run(
+                    &service,
+                    if injected {
+                        "restart-injected"
+                    } else {
+                        "restart-prepared"
+                    },
+                );
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime
+                    .block_on(observe_agent_run(
+                        &service,
+                        &run,
+                        &token,
+                        if injected {
+                            "restart-injected"
+                        } else {
+                            "restart-prepared"
+                        },
+                    ))
+                    .unwrap();
+                let payload_sha256 = crate::orchestration::hash_payload(
+                    &json!({"runId": run.run_id, "action": "fixture"}),
+                );
+                let lease = match service
+                    .store
+                    .acquire_agent_surface_dispatch(
+                        &run.run_id,
+                        if injected {
+                            "dispatch-injected"
+                        } else {
+                            "dispatch-prepared"
+                        },
+                        &payload_sha256,
+                        Utc::now(),
+                    )
+                    .unwrap()
+                {
+                    ComputerDispatchClaim::Perform(lease) => lease,
+                    other => panic!("expected a physical dispatch claim, got {other:?}"),
+                };
+                let dispatch_id = dispatch_id(&lease).unwrap().to_string();
+                let lease = if injected {
+                    service
+                        .store
+                        .mark_surface_dispatch_injected(
+                            &lease.lease_id,
+                            lease.revision,
+                            &dispatch_id,
+                            Utc::now(),
+                        )
+                        .unwrap()
+                } else {
+                    lease
+                };
+                (lease.lease_id, dispatch_id)
+            };
+
+            let first = ComputerStore::open(dir.path().join("computer-use")).unwrap();
+            let recovered = first.load_surface_lease(&lease_id).unwrap().unwrap();
+            let expected_lease_state = if injected {
+                ComputerSurfaceLeaseState::Uncertain
+            } else {
+                ComputerSurfaceLeaseState::Revoked
+            };
+            let expected_dispatch_state = if injected {
+                ComputerDispatchState::Uncertain
+            } else {
+                ComputerDispatchState::KnownNotInjected
+            };
+            assert_eq!(recovered.state, expected_lease_state);
+            assert_eq!(dispatch_id(&recovered).unwrap(), dispatch_key);
+            assert_eq!(
+                recovered.dispatch.as_ref().unwrap().state,
+                expected_dispatch_state
+            );
+            let first_revision = recovered.revision;
+            drop(first);
+
+            let second = ComputerStore::open(dir.path().join("computer-use")).unwrap();
+            let stable = second.load_surface_lease(&lease_id).unwrap().unwrap();
+            assert_eq!(stable.state, expected_lease_state);
+            assert_eq!(stable.revision, first_revision);
+            assert_eq!(
+                stable.dispatch.as_ref().unwrap().state,
+                expected_dispatch_state
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn physical_dispatch_id_deduplicates_every_durable_boundary() {
+        let dir = tempdir().unwrap();
+        let service = ComputerUseService::new_simulator(
+            Arc::new(SimulatorBackend::new()),
+            ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+        );
+        let (run, token) = create_authorized_agent_run(&service, "dispatch-dedup");
+        observe_agent_run(&service, &run, &token, "dispatch-dedup")
+            .await
+            .unwrap();
+        let payload_sha256 = crate::orchestration::hash_payload(&json!({"action": "one"}));
+        let prepared = match service
+            .store
+            .acquire_agent_surface_dispatch(
+                &run.run_id,
+                "dispatch-request-dedup",
+                &payload_sha256,
+                Utc::now(),
+            )
+            .unwrap()
+        {
+            ComputerDispatchClaim::Perform(lease) => lease,
+            other => panic!("expected Perform, got {other:?}"),
+        };
+        let dispatch_key = dispatch_id(&prepared).unwrap().to_string();
+        assert!(matches!(
+            service
+                .store
+                .prepare_surface_dispatch(
+                    &prepared.lease_id,
+                    prepared.revision,
+                    &dispatch_key,
+                    &payload_sha256,
+                    Utc::now(),
+                )
+                .unwrap(),
+            ComputerDispatchClaim::Pending
+        ));
+        assert_eq!(
+            service
+                .store
+                .prepare_surface_dispatch(
+                    &prepared.lease_id,
+                    prepared.revision,
+                    &dispatch_key,
+                    &"b".repeat(64),
+                    Utc::now(),
+                )
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Conflict
+        );
+
+        let injected = service
+            .store
+            .mark_surface_dispatch_injected(
+                &prepared.lease_id,
+                prepared.revision,
+                &dispatch_key,
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(matches!(
+            service
+                .store
+                .prepare_surface_dispatch(
+                    &injected.lease_id,
+                    injected.revision,
+                    &dispatch_key,
+                    &payload_sha256,
+                    Utc::now(),
+                )
+                .unwrap(),
+            ComputerDispatchClaim::Uncertain
+        ));
+        let acknowledged = service
+            .store
+            .acknowledge_surface_dispatch(
+                &injected.lease_id,
+                injected.revision,
+                &dispatch_key,
+                &"c".repeat(64),
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(matches!(
+            service
+                .store
+                .prepare_surface_dispatch(
+                    &acknowledged.lease_id,
+                    acknowledged.revision,
+                    &dispatch_key,
+                    &payload_sha256,
+                    Utc::now(),
+                )
+                .unwrap(),
+            ComputerDispatchClaim::Replay(_)
+        ));
+        assert_eq!(service.store.list_surface_leases().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lease_expiry_fences_known_not_injected_and_uncertain_dispatches() {
+        let root = tempdir().unwrap();
+
+        let before_service = ComputerUseService::new_simulator(
+            Arc::new(SimulatorBackend::new()),
+            ComputerStore::open(root.path().join("before-injection")).unwrap(),
+        );
+        let (before_run, before_token) =
+            create_authorized_agent_run(&before_service, "expiry-before");
+        observe_agent_run(&before_service, &before_run, &before_token, "expiry-before")
+            .await
+            .unwrap();
+        let before_lease = before_service
+            .store
+            .list_surface_leases()
+            .unwrap()
+            .remove(0);
+        let before_error = before_service
+            .store
+            .prepare_surface_dispatch(
+                &before_lease.lease_id,
+                before_lease.revision,
+                "expiry-before-dispatch",
+                &"a".repeat(64),
+                before_lease.expires_at + Duration::milliseconds(1),
+            )
+            .unwrap_err();
+        assert_eq!(before_error.code, ComputerErrorCode::PermissionRevoked);
+        let before_recovered = before_service
+            .store
+            .load_surface_lease(&before_lease.lease_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before_recovered.state, ComputerSurfaceLeaseState::Revoked);
+        assert!(before_recovered.dispatch.is_none());
+
+        let after_service = ComputerUseService::new_simulator(
+            Arc::new(SimulatorBackend::new()),
+            ComputerStore::open(root.path().join("after-injection")).unwrap(),
+        );
+        let (after_run, after_token) = create_authorized_agent_run(&after_service, "expiry-after");
+        observe_agent_run(&after_service, &after_run, &after_token, "expiry-after")
+            .await
+            .unwrap();
+        let after_lease = after_service.store.list_surface_leases().unwrap().remove(0);
+        let after_payload = "b".repeat(64);
+        let after_prepared = match after_service
+            .store
+            .prepare_surface_dispatch(
+                &after_lease.lease_id,
+                after_lease.revision,
+                "expiry-after-dispatch",
+                &after_payload,
+                after_lease.updated_at,
+            )
+            .unwrap()
+        {
+            ComputerDispatchClaim::Perform(lease) => lease,
+            other => panic!("expected Perform, got {other:?}"),
+        };
+        let after_injected = after_service
+            .store
+            .mark_surface_dispatch_injected(
+                &after_prepared.lease_id,
+                after_prepared.revision,
+                "expiry-after-dispatch",
+                after_prepared.updated_at,
+            )
+            .unwrap();
+        assert_eq!(
+            after_injected.dispatch.as_ref().unwrap().state,
+            ComputerDispatchState::Injected
+        );
+        assert!(after_service
+            .store
+            .grant_next_surface_lease(
+                &after_run.surface,
+                after_injected.expires_at + Duration::milliseconds(1),
+            )
+            .unwrap()
+            .is_none());
+        let after_recovered = after_service
+            .store
+            .load_surface_lease(&after_lease.lease_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_recovered.state, ComputerSurfaceLeaseState::Uncertain);
+        assert_eq!(
+            after_recovered.dispatch.as_ref().unwrap().state,
+            ComputerDispatchState::Uncertain
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupted_surface_lease_fails_closed_without_rewriting_records() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("computer-use");
+        let (lease_path, run_path) = {
+            let service = ComputerUseService::new_simulator(
+                Arc::new(SimulatorBackend::new()),
+                ComputerStore::open(&root).unwrap(),
+            );
+            let (run, token) = create_authorized_agent_run(&service, "corrupt-lease");
+            observe_agent_run(&service, &run, &token, "corrupt-lease")
+                .await
+                .unwrap();
+            let _lease = service.store.list_surface_leases().unwrap().remove(0);
+            (
+                std::fs::read_dir(root.join("surface-leases"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+                std::fs::read_dir(root.join("runs"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+        };
+        let run_before = std::fs::read(&run_path).unwrap();
+        let mut lease_value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&lease_path).unwrap()).unwrap();
+        lease_value
+            .as_object_mut()
+            .unwrap()
+            .insert("futureAuthority".into(), json!(true));
+        std::fs::write(
+            &lease_path,
+            serde_json::to_vec_pretty(&lease_value).unwrap(),
+        )
+        .unwrap();
+        let corrupt_before = std::fs::read(&lease_path).unwrap();
+
+        assert!(ComputerStore::open(&root).is_err());
+        assert_eq!(std::fs::read(&lease_path).unwrap(), corrupt_before);
+        assert_eq!(std::fs::read(&run_path).unwrap(), run_before);
     }
 
     #[tokio::test]

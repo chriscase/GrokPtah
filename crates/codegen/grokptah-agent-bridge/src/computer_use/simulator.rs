@@ -121,6 +121,7 @@ impl SimulatorBackend {
     /// Explicit simulator-only isolated fixture. This proof cannot attest a
     /// native backend as isolated.
     pub fn independently_isolated() -> Self {
+        let isolated_domain = format!("{SIMULATOR_ISOLATED_BACKEND_ID}:{}", uuid::Uuid::new_v4());
         Self::with_proof(
             ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain {
                 backend_id: SIMULATOR_ISOLATED_BACKEND_ID.into(),
@@ -134,7 +135,7 @@ impl SimulatorBackend {
                 key_chords: true,
                 pointer_fallback: true,
             },
-            PhysicalInputDomain::attested("simulator", SIMULATOR_ISOLATED_BACKEND_ID)
+            PhysicalInputDomain::attested("simulator", &isolated_domain)
                 .expect("simulator isolated domain is attested"),
         )
     }
