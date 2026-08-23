@@ -100,6 +100,32 @@ fn claim_release_and_complete_are_durable_and_token_scoped() {
 }
 
 #[test]
+fn bound_worker_attempt_check_rejects_foreign_claimants() {
+    let home = tempdir().unwrap();
+    let (store, item) = new_work(home.path(), "fence foreign worker");
+    store.save_work_item(&item).unwrap();
+    let claim = store.claim_work(&item.work_id, "worker-a", None).unwrap();
+
+    store
+        .require_work_attempt_claimant(&item.work_id, &claim.attempt.attempt_id, "worker-a")
+        .unwrap();
+    let error = store
+        .require_work_attempt_claimant(&item.work_id, &claim.attempt.attempt_id, "worker-b")
+        .unwrap_err();
+    assert_eq!(
+        error.code,
+        grokptah_agent_bridge::orchestration::OrchErrorCode::ForbiddenScope
+    );
+    let other = store
+        .require_work_attempt_claimant("work-not-owned", &claim.attempt.attempt_id, "worker-a")
+        .unwrap_err();
+    assert_eq!(
+        other.code,
+        grokptah_agent_bridge::orchestration::OrchErrorCode::ForbiddenScope
+    );
+}
+
+#[test]
 fn expired_lease_requeues_without_duplicate_live_attempt() {
     let home = tempdir().unwrap();
     let (store, item) = new_work(home.path(), "expire me");
