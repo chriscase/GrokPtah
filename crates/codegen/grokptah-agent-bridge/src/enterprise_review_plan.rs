@@ -168,6 +168,7 @@ pub struct EnterpriseReviewWorkPlan {
     pub schema: String,
     pub review_id: String,
     pub plan_digest: String,
+    pub admission: EnterpriseReviewEvidence,
     pub repository_fingerprint: String,
     pub scope_fingerprint: String,
     pub work_items: Vec<EnterpriseReviewWorkItemTemplate>,
@@ -391,6 +392,7 @@ impl EnterpriseReviewPlan {
             schema: ENTERPRISE_REVIEW_WORK_PLAN_SCHEMA.to_owned(),
             review_id: self.review_id.clone(),
             plan_digest: self.plan_digest.clone(),
+            admission: self.admission.clone(),
             repository_fingerprint: self.repository_fingerprint.clone(),
             scope_fingerprint: self.scope_fingerprint.clone(),
             work_items,
@@ -415,6 +417,9 @@ impl EnterpriseReviewPlan {
         {
             return Err(EnterpriseReviewPlanError::PlanMismatch);
         }
+        self.admission
+            .validate()
+            .map_err(|_| EnterpriseReviewPlanError::InvalidField("admission"))?;
         let mut ids = BTreeSet::new();
         let mut requests = 0u32;
         let mut tokens = 0u64;
@@ -622,6 +627,9 @@ impl EnterpriseReviewWorkPlan {
         {
             return Err(EnterpriseReviewPlanError::PlanMismatch);
         }
+        self.admission
+            .validate()
+            .map_err(|_| EnterpriseReviewPlanError::InvalidField("admission"))?;
         let mut keys = BTreeSet::new();
         let mut pass_ids = BTreeSet::new();
         for item in &self.work_items {
@@ -822,6 +830,7 @@ mod tests {
         let second = plan().work_plan().unwrap();
         first.validate().unwrap();
         second.validate().unwrap();
+        first.admission.validate().unwrap();
         assert_eq!(first.work_plan_digest, second.work_plan_digest);
         assert_eq!(first.work_items.len(), MAX_ENTERPRISE_REVIEW_PASSES);
         assert!(first
@@ -835,7 +844,7 @@ mod tests {
                 && item.template.objective.contains(&item.objective_digest)
         }));
         let encoded = serde_json::to_string(&first).unwrap();
-        assert!(!encoded.contains("company-gateway"));
+        assert!(encoded.contains("company-gateway"));
         assert!(!encoded.contains("credential-plan"));
         assert!(!encoded.contains("https://"));
 
@@ -844,6 +853,14 @@ mod tests {
         assert_eq!(
             invalid_work_plan.validate(),
             Err(EnterpriseReviewPlanError::PlanMismatch)
+        );
+
+        let mut invalid_admission = first.clone();
+        invalid_admission.admission.read_only = false;
+        invalid_admission.work_plan_digest = work_plan_digest(&invalid_admission);
+        assert_eq!(
+            invalid_admission.validate(),
+            Err(EnterpriseReviewPlanError::InvalidField("admission"))
         );
 
         let mut tampered = plan();

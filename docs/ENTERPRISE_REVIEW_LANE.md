@@ -44,6 +44,9 @@ The same plan can be projected into a secret-free
 the passes in parallel and safely re-materialize them after a restart. The
 projection is side-effect free; only an authorized host broker may issue the
 worker credential, bind the workspace, and persist the resulting WorkItems.
+The plan retains and validates the secret-free admission evidence, including
+the exact route/model/policy binding, so a recovered plan cannot silently
+broaden its permissions or fallback policy.
 The orchestration service now has a host-authorized materialization helper that
 uses the plan-bound keys as per-pass idempotency request IDs, so a partial
 broker retry replays completed WorkItems instead of duplicating them.

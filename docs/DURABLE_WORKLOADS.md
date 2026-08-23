@@ -32,7 +32,9 @@ plan-bound work key and a bounded `WorkTemplate`. The host-authorized
 the projection through the ordinary durable-work path, using those keys as
 per-pass idempotency request IDs. If a broker or host restarts after only some
 passes were stored, retrying the same plan replays the completed WorkItems and
-creates only the remainder. This is the execution foundation for the
+creates only the remainder. The projection also retains validated,
+secret-free admission evidence for the exact route/model/policy binding. This
+is the execution foundation for the
 enterprise review lane, not live provider or quality certification; admission,
 worker credential binding, gateway attestation, and the paired campaign remain
 separate gates.

@@ -104,6 +104,44 @@ pub struct EnterpriseReviewEvidence {
     pub secret_free: bool,
 }
 
+impl EnterpriseReviewEvidence {
+    /// Validate evidence after it has crossed a durable or transport boundary.
+    /// This checks the safe admission projection, not the original lease
+    /// validity window; a host must still re-admit a fresh lease before a new
+    /// review is started.
+    pub fn validate(&self) -> Result<(), EnterpriseReviewAdmissionError> {
+        if self.schema != ENTERPRISE_REVIEW_EVIDENCE_SCHEMA {
+            return Err(EnterpriseReviewAdmissionError::UnsupportedSchema);
+        }
+        for (value, name) in [
+            (&self.lease_id, "lease_id"),
+            (&self.route_id, "route_id"),
+            (&self.model_id, "model_id"),
+        ] {
+            if !valid_opaque_id(value) {
+                return Err(EnterpriseReviewAdmissionError::InvalidField(name));
+            }
+        }
+        if !valid_fingerprint(&self.route_binding_digest) || !valid_fingerprint(&self.policy_digest)
+        {
+            return Err(EnterpriseReviewAdmissionError::InvalidField("fingerprint"));
+        }
+        if !self.read_only {
+            return Err(EnterpriseReviewAdmissionError::ReviewMustBeReadOnly);
+        }
+        if !self.no_premium_fallback {
+            return Err(EnterpriseReviewAdmissionError::FallbackPermitted);
+        }
+        if !self.egress_firewall_attested {
+            return Err(EnterpriseReviewAdmissionError::EgressFirewallMissing);
+        }
+        if !self.secret_free {
+            return Err(EnterpriseReviewAdmissionError::InvalidField("secret_free"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnterpriseReviewAdmissionError {
     InvalidField(&'static str),
@@ -347,9 +385,29 @@ mod tests {
         let policy = EnterpriseReviewPolicy::default();
         let evidence = admit_enterprise_review(&lease, &policy, now).unwrap();
         assert!(evidence.secret_free);
+        evidence.validate().unwrap();
         let encoded = serde_json::to_string(&evidence).unwrap();
         assert!(!encoded.contains("credential-opaque"));
         assert!(!encoded.contains("https://"));
+    }
+
+    #[test]
+    fn evidence_projection_rejects_broadened_policy_or_secrets() {
+        let now = Utc::now();
+        let lease = lease(now);
+        let policy = EnterpriseReviewPolicy::default();
+        let mut evidence = admit_enterprise_review(&lease, &policy, now).unwrap();
+        evidence.read_only = false;
+        assert_eq!(
+            evidence.validate(),
+            Err(EnterpriseReviewAdmissionError::ReviewMustBeReadOnly)
+        );
+        evidence.read_only = true;
+        evidence.secret_free = false;
+        assert_eq!(
+            evidence.validate(),
+            Err(EnterpriseReviewAdmissionError::InvalidField("secret_free"))
+        );
     }
 
     #[test]
