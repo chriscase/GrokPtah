@@ -848,6 +848,11 @@ mod tests {
         assert!(!encoded.contains("credential-plan"));
         assert!(!encoded.contains("https://"));
 
+        let mut unknown_nested = serde_json::to_value(&first).unwrap();
+        unknown_nested["work_items"][0]["template"]["unexpectedPolicyField"] =
+            serde_json::json!(true);
+        assert!(serde_json::from_value::<EnterpriseReviewWorkPlan>(unknown_nested).is_err());
+
         let mut invalid_work_plan = first.clone();
         invalid_work_plan.work_items[0].work_key = "0".repeat(64);
         assert_eq!(

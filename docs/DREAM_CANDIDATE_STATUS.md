@@ -76,6 +76,9 @@ complete or that the product has reached 100%.
   exhaustion observations. Digests, ordering, schema, and secret-free output
   fail closed; this remains a contract for future live evidence, not a live
   quota receipt.
+- Enterprise durable work-plan deserialization now denies unknown nested
+  `WorkTemplate` fields, with a regression covering a tampered policy member;
+  the broker cannot silently discard an unrecognized field before validation.
 - The operations drill contract now requires all 14 Stage 11 categories,
   combined packaged-desktop/hosted-service evidence, measured RTO/RPO, backup
   confidentiality, and explicit active-target deletion refusal. It remains a

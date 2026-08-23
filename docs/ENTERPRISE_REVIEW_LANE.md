@@ -47,6 +47,9 @@ worker credential, bind the workspace, and persist the resulting WorkItems.
 The plan retains and validates the secret-free admission evidence, including
 the exact route/model/policy binding, so a recovered plan cannot silently
 broaden its permissions or fallback policy.
+Its nested durable work template is also deny-unknown, so a transport or
+broker cannot add an unrecognized policy field that deserialization would
+otherwise discard.
 The orchestration service now has a host-authorized materialization helper that
 uses the plan-bound keys as per-pass idempotency request IDs, so a partial
 broker retry replays completed WorkItems instead of duplicating them.
