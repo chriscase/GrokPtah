@@ -439,6 +439,12 @@ impl McpControlClient {
         if with_auth {
             req = req.header("Authorization", format!("Bearer {}", self.token));
         }
+        // Negative tests still exercise an already-established session (e.g.
+        // a swapped-credential probe after initialize) — omitting the header
+        // here would silently degrade them into missing-session cases.
+        if let Some(sid) = &self.session_id {
+            req = req.header("mcp-session-id", sid);
+        }
         bounded_non_streaming(self.operation_timeout, async move {
             let resp = req.send().await.map_err(|_| McpTransportError)?;
             let status = resp.status();
@@ -785,7 +791,8 @@ mod tests {
     use crate::host::{AgentHost, HostConfig};
     use crate::mcp_control::start_control_server;
     use crate::orchestration::{
-        OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+        AuthCredential, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
+        WorkspaceAllowlist,
     };
     use crate::{home_override_serial, set_grokptah_home_override};
     use axum::body::Body;
@@ -869,6 +876,72 @@ mod tests {
             .unwrap();
         assert!(st.is_client_error() || body.get("error").is_some());
         assert!(body.get("result").and_then(|r| r.get("tools")).is_none());
+
+        srv.stop();
+        set_grokptah_home_override(None);
+    }
+
+    /// `rpc_raw` is the low-level path used by negative tests (custom
+    /// jsonrpc / auth). It must still attach an already-established
+    /// `mcp-session-id`, the same as `rpc`/`notify` do — otherwise a
+    /// negative test that swaps only the credential would silently degrade
+    /// into a missing-session case instead of exercising the credential
+    /// swap it intends to probe. Prove attachment happened by swapping the
+    /// client's token onto an already-initialized session: the server can
+    /// only tell "wrong credential for this session" (401) from "no session
+    /// id was sent" (400) if the header actually arrived.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rpc_raw_attaches_established_session_id() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let ws = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        });
+        let orch = OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            OrchStore::open(home.path().join("orch")).unwrap(),
+            OrchestrationConfig {
+                bearer_token: "unused-primary".into(),
+                allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+                max_concurrent_runs: 2,
+                bounds: RunBounds::default(),
+            },
+        );
+        orch.set_auth_credentials(vec![
+            AuthCredential::new("primary", "rpc-raw-a").unwrap(),
+            AuthCredential::new("secondary", "rpc-raw-b").unwrap(),
+        ])
+        .unwrap();
+        let srv = start_control_server(orch, 0).await.unwrap();
+        let mut client = McpControlClient::new(format!("http://{}", srv.addr), "rpc-raw-a");
+        client.initialize().await.unwrap();
+        let sid = client.session_id().unwrap().to_string();
+
+        // Same credential, established session: rpc_raw must succeed, which
+        // it can only do if it attached the session id.
+        let (status, _) = client
+            .rpc_raw("2.0", "ping", json!({}), true)
+            .await
+            .unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK);
+
+        // Swap the credential without touching session_id, then use rpc_raw
+        // for the same already-established session. A 401 (credential
+        // mismatch) rather than a 400 (missing session) proves the header
+        // was sent.
+        client.token = "rpc-raw-b".into();
+        assert_eq!(client.session_id(), Some(sid.as_str()));
+        let (status, body) = client
+            .rpc_raw("2.0", "ping", json!({}), true)
+            .await
+            .unwrap();
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["data"]["code"], "unauthenticated");
 
         srv.stop();
         set_grokptah_home_override(None);

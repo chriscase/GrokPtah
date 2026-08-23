@@ -84,9 +84,22 @@ filesystem permissions.
 `_meta["grokptah/authorityCapabilities"]`. `tools/list` is derived from that
 same document, and `ptah_get_authority_capabilities` returns it explicitly.
 The document contains opaque workspace IDs, exact operation/tool lists, and
-hard denials—never bearer values or canonical filesystem paths. An MCP session
-is bound to the credential ID and capability-document hash used at initialize;
-credential swaps or authority changes require a new session.
+hard denials—never bearer values or canonical filesystem paths.
+
+**Session-binding contract.** `initialize` is the sole session-creation path;
+it stamps the returned `mcp-session-id` with the calling credential's ID and
+capability-document hash. Every other request the transport accepts —
+`ping`, `tools/list`, `tools/call`, the SSE `GET`, `DELETE`, and the error
+path for a missing or unsupported method — must present an `mcp-session-id`
+that still resolves to that same credential ID and capability-document hash.
+There is no stateless or legacy fallback: a request with no session id, an
+unknown session id, or a session id whose bound credential/capability hash no
+longer matches the caller (a credential swap, or a capability grant that
+changed since initialize) fails closed with a typed `unauthenticated` or
+`unknown_session` error rather than being served. A rejected attempt never
+disturbs the session it targeted — the legitimate credential can keep using
+it. Credential swaps or authority changes always require a fresh
+`initialize`.
 
 Embedders may construct a credential with a narrower set of canonical
 workspace roots. Authentication rejects any credential grant that exceeds the
@@ -247,9 +260,11 @@ Journal expiry is forced by flooding the in-process event bus.
 | Idempotent conflict | The same `request_id` with a different payload fails closed. |
 | Wrong bearer | Initialize / MCP calls with a bad token are unauthorized. |
 | Unknown session | Reads against a random session id fail closed. |
+| Transport session binding | Every non-`initialize` POST (`ping`, `tools/list`, `tools/call`, and the error path for a missing/unsupported method), `GET`, and `DELETE` require an `mcp-session-id` bound to the calling credential and capability-document hash; a missing, unknown, or credential-swapped session id fails closed and never disturbs the legitimate session. There is no stateless legacy path — `initialize` is the only way to obtain a session. |
 | Mismatched workspace | An allowlisted workspace that is not the session cwd cannot be used as an oracle. |
 | Non-allowlisted workspace | `ptah_create_session` cannot mint a session on an arbitrary path. |
 | Cross-session reads / mutations | `ptah_get_run`, `ptah_get_events`, and `ptah_cancel` refuse another session's `run_id`. |
+| Run existence oracle | An unknown `run_id` and a `run_id` that exists but belongs to a foreign session, a foreign workspace, or a credential without scope for the claimed workspace all return the identical typed `forbidden_scope` code and message from `ptah_get_run`/`ptah_get_progress`/`ptah_get_changes`/`ptah_get_test_results`/`ptah_get_handoff`/`ptah_review_run` and `ptah_cancel`. A caller cannot use error shape to learn whether a run exists. A refused `ptah_cancel` attempt never claims an idempotency receipt for its `request_id`; only a malformed `run_id` stays a distinct `invalid_request`. |
 | Disconnect during request | A full-body drop still commits at most once; replay returns the receipt. A truncated body does not consume the request id. |
 | MCP reconnect | `DELETE /mcp` plus a new initialize yields a new transport session; durable run reads still work. |
 | Service restart | Reopening the same `GROKPTAH_HOME` exposes the same run records. |

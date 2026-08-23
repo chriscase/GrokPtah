@@ -12,8 +12,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    hash_payload, AgentModelSpec, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
-    RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist,
+    hash_payload, AgentModelSpec, AuthCredential, OrchStore, OrchestrationConfig,
+    OrchestrationService, RunBounds, RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     discovered_tool_names, model_selection_key, set_grokptah_home_override, start_control_server,
@@ -1394,10 +1394,36 @@ async fn e2e_mcp_client_valid_and_invalid_token() {
         .unwrap();
     assert_eq!(unauth.status(), 401);
 
+    // initialize is the sole session-creation path; every later call binds
+    // to the returned mcp-session-id.
+    let init = client
+        .post(&url)
+        .header("Authorization", "Bearer secret-196")
+        .json(&json!({
+            "jsonrpc":"2.0","id":2,"method":"initialize",
+            "params":{
+                "protocolVersion":"2025-03-26",
+                "capabilities":{},
+                "clientInfo":{"name":"e2e","version":"0"}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(init.status(), 200);
+    let sid = init
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
     let list = client
         .post(&url)
         .header("Authorization", "Bearer secret-196")
-        .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ptah_list_sessions","arguments":{}}}))
+        .header("mcp-session-id", &sid)
+        .json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ptah_list_sessions","arguments":{}}}))
         .send()
         .await
         .unwrap();
@@ -1407,8 +1433,9 @@ async fn e2e_mcp_client_valid_and_invalid_token() {
     let q = client
         .post(&url)
         .header("Authorization", "Bearer secret-196")
+        .header("mcp-session-id", &sid)
         .json(&json!({
-            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "jsonrpc":"2.0","id":4,"method":"tools/call",
             "params":{"name":"ptah_queue_prompt","arguments":{
                 "request_id":"e2e-q1",
                 "session_id": session.id.to_string(),
@@ -1431,8 +1458,9 @@ async fn e2e_mcp_client_valid_and_invalid_token() {
     let bad_ws = client
         .post(&url)
         .header("Authorization", "Bearer secret-196")
+        .header("mcp-session-id", &sid)
         .json(&json!({
-            "jsonrpc":"2.0","id":4,"method":"tools/call",
+            "jsonrpc":"2.0","id":5,"method":"tools/call",
             "params":{"name":"ptah_queue_prompt","arguments":{
                 "request_id":"e2e-q2",
                 "session_id": session.id.to_string(),
@@ -1445,6 +1473,19 @@ async fn e2e_mcp_client_valid_and_invalid_token() {
         .unwrap();
     assert!(bad_ws.status().is_client_error() || bad_ws.status().is_server_error());
     assert_eq!(host.session_queue_list(session.id).unwrap().len(), before);
+
+    // missing mcp-session-id fails closed instead of falling back to a
+    // stateless legacy path.
+    let no_session = client
+        .post(&url)
+        .header("Authorization", "Bearer secret-196")
+        .json(&json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"ptah_list_sessions","arguments":{}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_session.status(), 400);
+    let no_session_body: serde_json::Value = no_session.json().await.unwrap();
+    assert_eq!(no_session_body["error"]["data"]["code"], "unknown_session");
 
     srv.stop();
     set_grokptah_home_override(None);
@@ -1769,6 +1810,241 @@ async fn cancel_isolates_sessions() {
     let run_b = rb["runId"].as_str().unwrap().to_string();
     let state_b = wait_run_terminal(&orch, &auth, &run_b, Duration::from_secs(10)).await;
     assert_eq!(state_b, RunState::Completed);
+    set_grokptah_home_override(None);
+}
+
+/// Unknown, foreign-session, foreign-workspace, and credential-out-of-scope
+/// Run IDs must be indistinguishable to the caller: same typed
+/// `ForbiddenScope` code, same message, for both a public Run read
+/// (`get_run_scoped`) and `cancel`. Only a malformed id stays a distinct
+/// `InvalidRequest`, since it never carries information about a real run.
+/// `cancel` additionally must never claim an idempotency receipt on a
+/// refused attempt — proven by replaying the same `request_id` from the
+/// legitimate owner afterward and observing a fresh, successful cancel
+/// rather than a replayed/conflicting denial.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn run_scope_denial_is_indistinguishable_and_claims_no_receipt() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let owner = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(owner.id, ws.path()).unwrap();
+    let foreign_session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(foreign_session.id, ws.path()).unwrap();
+
+    let store = OrchStore::open(home.path().join("orch")).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store.clone(),
+        OrchestrationConfig {
+            bearer_token: "unused-primary".into(),
+            allowlist: WorkspaceAllowlist::new([
+                ws.path().to_path_buf(),
+                outside.path().to_path_buf(),
+            ]),
+            max_concurrent_runs: 4,
+            bounds: RunBounds::default(),
+        },
+    );
+    orch.set_auth_credentials(vec![
+        AuthCredential::new("primary", "owner-token").unwrap(),
+        AuthCredential::new("narrow", "narrow-token")
+            .unwrap()
+            .with_workspace_roots([outside.path().to_path_buf()])
+            .unwrap(),
+    ])
+    .unwrap();
+    let auth = orch.auth_header(Some("Bearer owner-token")).unwrap();
+    let narrow_auth = orch.auth_header(Some("Bearer narrow-token")).unwrap();
+
+    // A real, owned run.
+    let submitted = orch
+        .submit_task(
+            &auth,
+            "scope-real",
+            owner.id,
+            ws.path(),
+            "list files".into(),
+            Some(json!({"maxPromptBytes": 10000, "maxRounds": 2, "maxDurationMs": 30000})),
+        )
+        .await
+        .unwrap();
+    let run_id = submitted["runId"].as_str().unwrap().to_string();
+    let _ = wait_run_terminal(&orch, &auth, &run_id, Duration::from_secs(10)).await;
+
+    // A hand-crafted run whose stored workspace disagrees with the
+    // workspace its owning session actually claims, exercising the
+    // "run's own recorded workspace disagrees with the claim" branch
+    // directly (distinct from a foreign-session claim).
+    let mismatched_run_id = "scope-foreign-workspace-run";
+    let now = Utc::now();
+    store
+        .save_run(&RunRecord {
+            run_id: mismatched_run_id.into(),
+            session_id: owner.id,
+            workspace: outside.path().display().to_string(),
+            request_id: "scope-foreign-workspace-req".into(),
+            client_id: Some("mcp".into()),
+            state: RunState::Completed,
+            purpose: Default::default(),
+            provider_route: None,
+            agent_id: None,
+            retry_of: None,
+            parent_run_id: None,
+            agent_spec_revision: None,
+            checkpoint_id: None,
+            continuation_context_id: None,
+            continuation_context_hash: None,
+            continuation_fidelity: None,
+            queue_position: None,
+            bounds: RunBounds::default(),
+            prompt_preview: "mismatched".into(),
+            start_seq: Some(1),
+            end_seq: Some(2),
+            created_at: now,
+            updated_at: now,
+            terminal_result: None,
+            final_response: None,
+            error_code: None,
+            stop_cause: None,
+            aggregates: Default::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        })
+        .unwrap();
+
+    let unknown = orch
+        .get_run_scoped(&auth, owner.id, ws.path(), "totally-unknown-run-id")
+        .unwrap_err();
+    let foreign_session_err = orch
+        .get_run_scoped(&auth, foreign_session.id, ws.path(), &run_id)
+        .unwrap_err();
+    let foreign_workspace_err = orch
+        .get_run_scoped(&auth, owner.id, ws.path(), mismatched_run_id)
+        .unwrap_err();
+    let credential_out_of_scope_err = orch
+        .get_run_scoped(&narrow_auth, owner.id, ws.path(), &run_id)
+        .unwrap_err();
+
+    for (label, err) in [
+        ("unknown", &unknown),
+        ("foreign_session", &foreign_session_err),
+        ("foreign_workspace", &foreign_workspace_err),
+        ("credential_out_of_scope", &credential_out_of_scope_err),
+    ] {
+        assert_eq!(err.code.as_str(), "forbidden_scope", "{label}");
+        assert_eq!(err.message, unknown.message, "{label} message must match");
+    }
+
+    // Malformed ids stay distinctly typed, never folded into the scope
+    // denial — they carry no information about a real run.
+    let malformed = orch
+        .get_run_scoped(&auth, owner.id, ws.path(), "../etc/passwd")
+        .unwrap_err();
+    assert_eq!(malformed.code.as_str(), "invalid_request");
+    assert_ne!(malformed.message, unknown.message);
+
+    // Same indistinguishability for cancel.
+    let cancel_unknown = orch
+        .cancel(
+            &auth,
+            "cancel-unknown",
+            owner.id,
+            ws.path(),
+            Some("totally-unknown-run-id"),
+        )
+        .await
+        .unwrap_err();
+    let cancel_foreign = orch
+        .cancel(
+            &auth,
+            "cancel-foreign",
+            foreign_session.id,
+            ws.path(),
+            Some(&run_id),
+        )
+        .await
+        .unwrap_err();
+    let cancel_out_of_scope = orch
+        .cancel(
+            &narrow_auth,
+            "cancel-out-of-scope",
+            owner.id,
+            ws.path(),
+            Some(&run_id),
+        )
+        .await
+        .unwrap_err();
+    for (label, err) in [
+        ("cancel_unknown", &cancel_unknown),
+        ("cancel_foreign", &cancel_foreign),
+        ("cancel_out_of_scope", &cancel_out_of_scope),
+    ] {
+        assert_eq!(err.code.as_str(), "forbidden_scope", "{label}");
+        assert_eq!(
+            err.message, cancel_unknown.message,
+            "{label} message must match"
+        );
+    }
+
+    // No idempotency receipt was claimed by either refusal above: replaying
+    // the same request_id from the legitimate owner against a real,
+    // cancellable run must still perform a fresh cancel, not replay (or
+    // conflict with) a stale claim.
+    let dup_request_id = "cancel-receipt-check";
+    let denied_unknown = orch
+        .cancel(
+            &auth,
+            dup_request_id,
+            owner.id,
+            ws.path(),
+            Some("totally-unknown-run-id"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(denied_unknown.code.as_str(), "forbidden_scope");
+    let denied_foreign = orch
+        .cancel(
+            &auth,
+            dup_request_id,
+            foreign_session.id,
+            ws.path(),
+            Some(&run_id),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(denied_foreign.code.as_str(), "forbidden_scope");
+
+    let cancellable = orch
+        .submit_task(
+            &auth,
+            "scope-cancellable",
+            owner.id,
+            ws.path(),
+            "run sleep 5".into(),
+            Some(json!({"maxPromptBytes": 10000, "maxRounds": 8, "maxDurationMs": 60000})),
+        )
+        .await
+        .unwrap();
+    let cancellable_run_id = cancellable["runId"].as_str().unwrap().to_string();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let fresh_cancel = orch
+        .cancel(
+            &auth,
+            dup_request_id,
+            owner.id,
+            ws.path(),
+            Some(&cancellable_run_id),
+        )
+        .await
+        .expect("refused attempts must not have claimed a receipt for this request_id");
+    assert_eq!(fresh_cancel["runId"], cancellable_run_id);
+
     set_grokptah_home_override(None);
 }
 

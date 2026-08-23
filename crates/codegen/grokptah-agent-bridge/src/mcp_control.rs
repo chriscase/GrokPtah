@@ -623,24 +623,17 @@ async fn streamable_get_handler(
     Query(query): Query<LiveRunQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let session_id = headers
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if session_id.is_empty() || !state.sessions.lock().contains_key(session_id) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32600,
-                    "message": "missing or unknown mcp-session-id",
-                    "data": {"code": "unknown_session"}
-                }
-            })),
-        )
-            .into_response();
-    }
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let auth = match state.orch.auth_header(auth_header) {
+        Ok(auth) => auth,
+        Err(error) => return json_err(None, StatusCode::UNAUTHORIZED, &error),
+    };
+    let session_id = match require_session(&state, &headers, &auth) {
+        Ok(sid) => sid,
+        Err(error) => return json_err(None, status_for(&error), &error),
+    };
 
     let no_scope =
         query.session_id.is_none() && query.workspace.is_none() && query.run_id.is_none();
@@ -659,7 +652,7 @@ async fn streamable_get_handler(
             .status(StatusCode::OK)
             .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
             .header(axum::http::header::CACHE_CONTROL, "no-cache")
-            .header("mcp-session-id", session_id)
+            .header("mcp-session-id", &session_id)
             .body(axum::body::Body::from(body))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
@@ -677,13 +670,6 @@ async fn streamable_get_handler(
     let session_scope = query.session_id.expect("checked above");
     let workspace = query.workspace.expect("checked above");
     let run_id = query.run_id.expect("checked above");
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    let auth = match state.orch.auth_header(auth_header) {
-        Ok(auth) => auth,
-        Err(error) => return json_err(None, StatusCode::UNAUTHORIZED, &error),
-    };
     let last_seq = match headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
@@ -766,14 +752,18 @@ async fn streamable_get_handler(
 }
 
 async fn streamable_delete_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let session_id = headers
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if session_id.is_empty() {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    state.sessions.lock().remove(session_id);
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let auth = match state.orch.auth_header(auth_header) {
+        Ok(auth) => auth,
+        Err(error) => return json_err(None, StatusCode::UNAUTHORIZED, &error),
+    };
+    let session_id = match require_session(&state, &headers, &auth) {
+        Ok(sid) => sid,
+        Err(error) => return json_err(None, status_for(&error), &error),
+    };
+    state.sessions.lock().remove(&session_id);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -1595,24 +1585,33 @@ async fn streamable_post_handler(
                 touch_session(&state, &headers, &auth)?;
                 Ok((json!({}), None::<String>))
             }
-            "ping" => Ok((json!({}), session_id_from_headers(&headers))),
+            "ping" => {
+                require_session(&state, &headers, &auth)?;
+                Ok((json!({}), session_id_from_headers(&headers)))
+            }
             "tools/list" => {
-                require_session_if_present(&state, &headers, &auth)?;
+                require_session(&state, &headers, &auth)?;
                 Ok((tools_list_result(&auth), session_id_from_headers(&headers)))
             }
             "tools/call" => {
-                require_session_if_present(&state, &headers, &auth)?;
+                require_session(&state, &headers, &auth)?;
                 let v = tools_call(&state.orch, &auth, &req.params).await?;
                 Ok((v, session_id_from_headers(&headers)))
             }
-            "" => Err(OrchError::new(
-                OrchErrorCode::InvalidRequest,
-                "missing method",
-            )),
-            other => Err(OrchError::new(
-                OrchErrorCode::Unsupported,
-                format!("unsupported method {other}"),
-            )),
+            "" => {
+                require_session(&state, &headers, &auth)?;
+                Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "missing method",
+                ))
+            }
+            other => {
+                require_session(&state, &headers, &auth)?;
+                Err(OrchError::new(
+                    OrchErrorCode::Unsupported,
+                    format!("unsupported method {other}"),
+                ))
+            }
         }
     };
 
@@ -1677,25 +1676,32 @@ fn touch_session(
     headers: &HeaderMap,
     auth: &AuthContext,
 ) -> Result<(), OrchError> {
-    require_session_if_present(state, headers, auth)?;
-    if let Some(sid) = session_id_from_headers(headers) {
-        let mut sessions = state.sessions.lock();
-        let session = sessions.get_mut(&sid).ok_or_else(|| {
-            OrchError::new(OrchErrorCode::InvalidRequest, "unknown mcp-session-id")
-        })?;
-        session.initialized = true;
-    }
+    let sid = require_session(state, headers, auth)?;
+    let mut sessions = state.sessions.lock();
+    let session = sessions
+        .get_mut(&sid)
+        .ok_or_else(|| OrchError::new(OrchErrorCode::UnknownSession, "unknown mcp-session-id"))?;
+    session.initialized = true;
     Ok(())
 }
 
-fn require_session_if_present(
+/// Require a live `mcp-session-id` bound to this request's credential and
+/// current capability-document hash. `initialize` is the sole session
+/// creation path; every other non-initialize POST (including `ping` and the
+/// error paths for unsupported/missing methods), GET, and DELETE must carry
+/// a session id that resolves here, or fail closed. There is no stateless
+/// fallback — a missing, unknown, or swapped-credential session id is
+/// always an error, never a silently-permitted legacy request.
+fn require_session(
     state: &AppState,
     headers: &HeaderMap,
     auth: &AuthContext,
-) -> Result<(), OrchError> {
-    // Stateless clients (legacy McpControlClient) may omit session id.
+) -> Result<String, OrchError> {
     let Some(sid) = session_id_from_headers(headers) else {
-        return Ok(());
+        return Err(OrchError::new(
+            OrchErrorCode::UnknownSession,
+            "missing mcp-session-id",
+        ));
     };
     let mut g = state.sessions.lock();
     let Some(s) = g.get_mut(&sid) else {
@@ -1713,7 +1719,7 @@ fn require_session_if_present(
         ));
     }
     s.last_seen = Instant::now();
-    Ok(())
+    Ok(sid)
 }
 
 /// Evict least-recently-seen sessions until `map.len() <= max`.
@@ -3824,11 +3830,36 @@ mod tests {
             "authentication must run before body extraction"
         );
 
-        // valid token
+        // valid token: initialize is the sole session-creation path.
+        let init = client
+            .post(&base)
+            .header("Authorization", "Bearer test-token-196")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": DEFAULT_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "e2e-loopback", "version": "1"}
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(init.status(), 200);
+        let sid = init
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         let good = client
             .post(&base)
             .header("Authorization", "Bearer test-token-196")
-            .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+            .header("mcp-session-id", &sid)
+            .json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}))
             .send()
             .await
             .unwrap();
@@ -4130,6 +4161,192 @@ mod tests {
         set_grokptah_home_override(None);
     }
 
+    /// `initialize` is the sole session-creation path. Every other
+    /// non-initialize verb the transport exposes — `ping`, `tools/list`
+    /// (POST), the SSE `GET`, and the session-ending `DELETE` — must bind to
+    /// an existing `mcp-session-id` whose credential and capability-document
+    /// hash still match the caller, fail closed on a swapped credential or a
+    /// missing session id, and never let a rejected attempt disturb the
+    /// legitimate session.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn session_binding_covers_ping_get_delete_and_survives_rejected_swaps() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let ws = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig::default());
+        host.start().unwrap();
+        host.set_project_cwd(ws.path()).unwrap();
+        let orch = OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            OrchStore::open(home.path().join("orch")).unwrap(),
+            OrchestrationConfig {
+                bearer_token: "unused-primary".into(),
+                allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+                max_concurrent_runs: 2,
+                bounds: RunBounds::default(),
+            },
+        );
+        orch.set_auth_credentials(vec![
+            AuthCredential::new("primary", "session-a-secret").unwrap(),
+            AuthCredential::new("secondary", "session-b-secret").unwrap(),
+        ])
+        .unwrap();
+        let srv = start_control_server(orch, 0).await.unwrap();
+        let url = format!("http://{}/mcp", srv.addr);
+        let http = reqwest::Client::new();
+
+        let init = http
+            .post(&url)
+            .header("Authorization", "Bearer session-a-secret")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": DEFAULT_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "swap-test", "version": "1"}
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(init.status(), StatusCode::OK);
+        let sid = init
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // A different credential presenting the same mcp-session-id must be
+        // rejected on every verb the session gates, not just tools/call.
+        let swapped_list = http
+            .post(&url)
+            .header("Authorization", "Bearer session-b-secret")
+            .header("mcp-session-id", &sid)
+            .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(swapped_list.status(), StatusCode::UNAUTHORIZED);
+
+        let swapped_ping = http
+            .post(&url)
+            .header("Authorization", "Bearer session-b-secret")
+            .header("mcp-session-id", &sid)
+            .json(&json!({"jsonrpc":"2.0","id":3,"method":"ping","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(swapped_ping.status(), StatusCode::UNAUTHORIZED);
+
+        let swapped_get = http
+            .get(&url)
+            .header("Authorization", "Bearer session-b-secret")
+            .header("mcp-session-id", &sid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(swapped_get.status(), StatusCode::UNAUTHORIZED);
+
+        let swapped_delete = http
+            .delete(&url)
+            .header("Authorization", "Bearer session-b-secret")
+            .header("mcp-session-id", &sid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(swapped_delete.status(), StatusCode::UNAUTHORIZED);
+
+        // A post-initialize request carrying no session id at all fails
+        // closed too — there is no stateless legacy fallback.
+        let missing_list = http
+            .post(&url)
+            .header("Authorization", "Bearer session-a-secret")
+            .json(&json!({"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_list.status(), StatusCode::BAD_REQUEST);
+        let missing_body: Value = missing_list.json().await.unwrap();
+        assert_eq!(missing_body["error"]["data"]["code"], "unknown_session");
+
+        let missing_ping = http
+            .post(&url)
+            .header("Authorization", "Bearer session-a-secret")
+            .json(&json!({"jsonrpc":"2.0","id":5,"method":"ping","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_ping.status(), StatusCode::BAD_REQUEST);
+
+        let missing_get = http
+            .get(&url)
+            .header("Authorization", "Bearer session-a-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_get.status(), StatusCode::BAD_REQUEST);
+
+        let missing_delete = http
+            .delete(&url)
+            .header("Authorization", "Bearer session-a-secret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_delete.status(), StatusCode::BAD_REQUEST);
+
+        // None of the rejected swap or missing-session attempts evicted or
+        // corrupted the legitimate session: the original credential still
+        // controls it afterward, on every verb.
+        let survives_list = http
+            .post(&url)
+            .header("Authorization", "Bearer session-a-secret")
+            .header("mcp-session-id", &sid)
+            .json(&json!({"jsonrpc":"2.0","id":6,"method":"tools/list","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(survives_list.status(), StatusCode::OK);
+
+        let survives_ping = http
+            .post(&url)
+            .header("Authorization", "Bearer session-a-secret")
+            .header("mcp-session-id", &sid)
+            .json(&json!({"jsonrpc":"2.0","id":7,"method":"ping","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(survives_ping.status(), StatusCode::OK);
+
+        let survives_get = http
+            .get(&url)
+            .header("Authorization", "Bearer session-a-secret")
+            .header("mcp-session-id", &sid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(survives_get.status(), StatusCode::OK);
+
+        // Correct-credential DELETE ends the session cleanly last.
+        let close = http
+            .delete(&url)
+            .header("Authorization", "Bearer session-a-secret")
+            .header("mcp-session-id", &sid)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(close.status(), StatusCode::NO_CONTENT);
+
+        srv.stop();
+        set_grokptah_home_override(None);
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn malformed_tool_arguments_fail_closed_without_mutation() {
@@ -4250,6 +4467,45 @@ mod tests {
         srv: ControlServerHandle,
         url: String,
         client: reqwest::Client,
+        session_id: String,
+    }
+
+    /// Builds a `ComputerFixture` bound to a fresh MCP session: `initialize`
+    /// is the sole session-creation path, so every fixture used by
+    /// `call_tool` below must run it before any tools/call.
+    async fn computer_fixture(srv: ControlServerHandle) -> ComputerFixture {
+        let url = format!("http://{}/mcp", srv.addr);
+        let client = reqwest::Client::new();
+        let init = client
+            .post(&url)
+            .header("Authorization", "Bearer computer-token")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": DEFAULT_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "computer-fixture", "version": "1"}
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(init.status(), StatusCode::OK);
+        let session_id = init
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        ComputerFixture {
+            url,
+            srv,
+            client,
+            session_id,
+        }
     }
 
     fn operator_workspace_snapshot(host: &crate::host::AgentHostHandle) -> Value {
@@ -4270,6 +4526,7 @@ mod tests {
             .client
             .post(&fixture.url)
             .header("Authorization", "Bearer computer-token")
+            .header("mcp-session-id", &fixture.session_id)
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -4371,11 +4628,7 @@ mod tests {
             vec![ws_a.path().to_path_buf(), ws_b.path().to_path_buf()],
         );
         let srv = start_control_server(orch, 0).await.unwrap();
-        let fixture = ComputerFixture {
-            url: format!("http://{}/mcp", srv.addr),
-            srv,
-            client: reqwest::Client::new(),
-        };
+        let fixture = computer_fixture(srv).await;
 
         // Coordinator reads inspect a Lane; they must never open it in the
         // local operator cockpit. Keep session_b focused while exercising all
@@ -4443,6 +4696,7 @@ mod tests {
             .client
             .post(&fixture.url)
             .header("Authorization", "Bearer computer-token")
+            .header("mcp-session-id", &fixture.session_id)
             .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
             .send()
             .await
@@ -4706,11 +4960,7 @@ mod tests {
 
         let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
         let srv = start_control_server(orch, 0).await.unwrap();
-        let fixture = ComputerFixture {
-            url: format!("http://{}/mcp", srv.addr),
-            srv,
-            client: reqwest::Client::new(),
-        };
+        let fixture = computer_fixture(srv).await;
 
         // A cursor below the retained window is a hard 410, mirroring
         // ptah_get_events; the gap is never silently skipped. The retained
@@ -4823,11 +5073,7 @@ mod tests {
 
         let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
         let srv = start_control_server(orch, 0).await.unwrap();
-        let fixture = ComputerFixture {
-            url: format!("http://{}/mcp", srv.addr),
-            srv,
-            client: reqwest::Client::new(),
-        };
+        let fixture = computer_fixture(srv).await;
 
         let (status, body) = call_tool(
             &fixture,
@@ -4903,11 +5149,7 @@ mod tests {
 
         let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
         let srv = start_control_server(orch, 0).await.unwrap();
-        let fixture = ComputerFixture {
-            url: format!("http://{}/mcp", srv.addr),
-            srv,
-            client: reqwest::Client::new(),
-        };
+        let fixture = computer_fixture(srv).await;
         let (status, body) = call_tool(
             &fixture,
             1,

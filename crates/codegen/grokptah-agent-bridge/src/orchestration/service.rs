@@ -5339,7 +5339,8 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::RunsRead, workspace)?;
+        auth.require_workspace(AuthorityOperation::RunsRead, workspace)
+            .map_err(|_| run_scope_denied())?;
         self.run_value(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5366,7 +5367,8 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::RunsRead, workspace)?;
+        auth.require_workspace(AuthorityOperation::RunsRead, workspace)
+            .map_err(|_| run_scope_denied())?;
         self.progress_value(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5736,7 +5738,8 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::RunsRead, workspace)?;
+        auth.require_workspace(AuthorityOperation::RunsRead, workspace)
+            .map_err(|_| run_scope_denied())?;
         self.changes_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5782,7 +5785,8 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::RunsRead, workspace)?;
+        auth.require_workspace(AuthorityOperation::RunsRead, workspace)
+            .map_err(|_| run_scope_denied())?;
         self.test_results_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5885,7 +5889,8 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::RunsRead, workspace)?;
+        auth.require_workspace(AuthorityOperation::RunsRead, workspace)
+            .map_err(|_| run_scope_denied())?;
         self.handoff_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5942,30 +5947,51 @@ impl OrchestrationService {
         Ok(session)
     }
 
+    /// Resolve `run_id` for a session+workspace-scoped Run request.
+    ///
+    /// An unknown run_id, a run owned by a different session, a run whose
+    /// workspace does not match the caller's claim, or a session/workspace
+    /// claim that itself does not resolve are all authorization failures of
+    /// the same shape from a caller's point of view. Every one of those
+    /// branches is folded into `run_scope_denied()` — same code, same
+    /// message — so a caller cannot tell "this run does not exist" apart
+    /// from "this run is not yours" by diffing error output. Only a
+    /// malformed id (never a real run) stays distinguishable.
     fn authorize_run_request(
         &self,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<RunRecord, OrchError> {
-        let run = self.load_authorized_run(run_id)?;
-        if run.session_id != session_id {
+        if safe_id_filename(run_id).is_err() {
             return Err(OrchError::new(
-                OrchErrorCode::ForbiddenScope,
-                "run does not belong to the requested session",
+                OrchErrorCode::InvalidRequest,
+                "malformed run_id",
             ));
         }
-        let session = self.require_build_session(session_id)?;
-        let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
+        let session = self.require_build_session(session_id).ok();
         let allowlist = self.config.lock().allowlist.clone();
-        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
-        if !super::workspaces_match(&run.workspace, &claimed.display().to_string()) {
-            return Err(OrchError::new(
-                OrchErrorCode::WorkspaceMismatch,
-                "run workspace does not match the requested workspace",
-            ));
+        let cwd = session
+            .as_ref()
+            .filter(|s| !s.cwd.is_empty())
+            .map(|s| PathBuf::from(&s.cwd));
+        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace).ok();
+        let run = self
+            .store
+            .load_run(run_id)
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        let authorized = session.is_some()
+            && run.as_ref().is_some_and(|r| {
+                r.session_id == session_id
+                    && allowlist.contains(Path::new(&r.workspace))
+                    && claimed.as_ref().is_some_and(|c| {
+                        super::workspaces_match(&r.workspace, &c.display().to_string())
+                    })
+            });
+        match (authorized, run) {
+            (true, Some(run)) => Ok(run),
+            _ => Err(run_scope_denied()),
         }
-        Ok(run)
     }
 
     fn authorize_persistent_agent_request(
@@ -6678,7 +6704,8 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        auth.require_workspace(AuthorityOperation::RunsReview, workspace)?;
+        auth.require_workspace(AuthorityOperation::RunsReview, workspace)
+            .map_err(|_| run_scope_denied())?;
         let (run, mut review) = self.isolated_review(session_id, workspace, run_id)?;
         let projected = super::project_public_run(&self.store, &run)?;
         let redacted = super::scrub_route_secret_needles(&mut review, run.provider_route.as_ref())?;
@@ -8096,7 +8123,6 @@ impl OrchestrationService {
         run_id: Option<&str>,
     ) -> Result<serde_json::Value, OrchError> {
         let tool = "ptah_cancel";
-        auth.require_workspace(AuthorityOperation::RunsCancel, workspace)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -8126,15 +8152,33 @@ impl OrchestrationService {
                 ));
             }
         };
+        if safe_id_filename(rid).is_err() {
+            return Err(fail(
+                self,
+                OrchError::new(OrchErrorCode::InvalidRequest, "malformed run_id"),
+            ));
+        }
 
+        // Every claim below — the credential's workspace/operation grant,
+        // the caller's session ownership, and the run's own recorded
+        // session and workspace — is resolved before any of it is
+        // disclosed, and any failure among them collapses into the same
+        // ForbiddenScope code and message (`run_scope_denied`), matching
+        // the public Run-read authorization above. Refusal happens here,
+        // before any idempotency receipt is claimed below, so an
+        // unauthorized cancel attempt never creates a replayable receipt.
+        let credential_ok = auth
+            .require_workspace(AuthorityOperation::RunsCancel, workspace)
+            .is_ok();
+        let session = self.host.session_inspect(session_id).ok();
+        let allowlist = self.config.lock().allowlist.clone();
+        let cwd = session
+            .as_ref()
+            .filter(|s| !s.cwd.is_empty())
+            .map(|s| PathBuf::from(&s.cwd));
+        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace).ok();
         let run = match self.store.load_run(rid) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                return Err(fail(
-                    self,
-                    OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"),
-                ));
-            }
+            Ok(run) => run,
             Err(e) => {
                 return Err(fail(
                     self,
@@ -8142,47 +8186,18 @@ impl OrchestrationService {
                 ));
             }
         };
-
-        if run.session_id != session_id {
-            return Err(fail(
-                self,
-                OrchError::new(
-                    OrchErrorCode::ForbiddenScope,
-                    "run_id does not belong to session",
-                ),
-            ));
-        }
-        let session = match self.host.session_inspect(session_id) {
-            Ok(s) => s,
-            Err(_) => {
-                return Err(fail(
-                    self,
-                    OrchError::new(OrchErrorCode::InvalidRequest, "unknown session"),
-                ));
-            }
+        let authorized_run = run.filter(|r| {
+            credential_ok
+                && r.session_id == session_id
+                && claimed.as_ref().is_some_and(|c| {
+                    c.display().to_string() == r.workspace
+                        || canonical_cmp(c, Path::new(&r.workspace)).is_ok()
+                })
+        });
+        let (run, claimed) = match (authorized_run, claimed) {
+            (Some(run), Some(claimed)) => (run, claimed),
+            _ => return Err(fail(self, run_scope_denied())),
         };
-        let cwd = if session.cwd.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(&session.cwd))
-        };
-        let allowlist = self.config.lock().allowlist.clone();
-        let claimed = match require_workspace_match(&allowlist, cwd.as_deref(), workspace) {
-            Ok(c) => c,
-            Err(e) => return Err(fail(self, e)),
-        };
-        // Workspace must match the run record as well.
-        if claimed.display().to_string() != run.workspace
-            && canonical_cmp(&claimed, Path::new(&run.workspace)).is_err()
-        {
-            return Err(fail(
-                self,
-                OrchError::new(
-                    OrchErrorCode::WorkspaceMismatch,
-                    "workspace does not match run",
-                ),
-            ));
-        }
 
         let mut lease = match self
             .begin_idempotency(auth, tool, request_id, &phash, session_id, &claimed)
@@ -8297,6 +8312,19 @@ impl OrchestrationService {
         }
         Ok(response)
     }
+}
+
+/// Uniform denial for a public Run read or cancel that fails authorization.
+/// Unknown run_id, foreign-session, foreign-workspace, and a credential
+/// without scope for the claimed workspace/operation all collapse into this
+/// one ForbiddenScope code and message, mirroring `computer_scope_denied`
+/// below — otherwise a caller could tell those cases apart by diffing error
+/// shape and enumerate Run IDs or probe workspace/credential boundaries.
+fn run_scope_denied() -> OrchError {
+    OrchError::new(
+        OrchErrorCode::ForbiddenScope,
+        "run is not available to this session and workspace",
+    )
 }
 
 /// Map a Computer Run read failure into the control plane's error vocabulary.
