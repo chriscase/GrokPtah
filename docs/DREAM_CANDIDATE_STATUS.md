@@ -56,6 +56,9 @@ enterprise slices were present:
 - Desktop Vitest: 46 files, 357 tests passed.
 - Desktop production build: passed (352 modules; one existing large-chunk
   advisory remains).
+- Certification-lab manifest validation: 33 probes, valid.
+- Hermetic provider-behavior replay: 10/10 cases passed with fixture and
+  oracle hashes recorded by the lab.
 
 Workspace-wide `cargo fmt --check` still reports only two pre-existing
 whitespace-only diffs in `crates/codegen/xai-grok-pager` outside this
