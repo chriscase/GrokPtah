@@ -1507,6 +1507,18 @@ async fn streamable_post_handler(
     };
     let _permit = permit;
 
+    // Authenticate before parsing attacker-controlled JSON. This keeps
+    // malformed or oversized unauthenticated requests from reaching the
+    // session/protocol parser and makes the transport trust boundary
+    // explicit.
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    let auth = match state.orch.auth_header(auth_header) {
+        Ok(a) => a,
+        Err(e) => return json_err(None, StatusCode::UNAUTHORIZED, &e),
+    };
+
     if body.len() > 256 * 1024 {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1557,14 +1569,6 @@ async fn streamable_post_handler(
             );
         }
     }
-
-    let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    let auth = match state.orch.auth_header(auth_header) {
-        Ok(a) => a,
-        Err(e) => return json_err(req.id.clone(), StatusCode::UNAUTHORIZED, &e),
-    };
 
     let method = req.method.as_deref().unwrap_or("");
     // Notifications may omit id.

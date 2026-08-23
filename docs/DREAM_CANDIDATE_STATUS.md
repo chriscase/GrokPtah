@@ -151,6 +151,11 @@ unrelated signal.
   now use the authority-aware HTTP mapping (403 for forbidden scope, 410 for
   expired cursors, conflict statuses only for actual conflicts/capacity).
   The mapping regression test passes.
+- Streamable-MCP now authenticates before parsing request JSON, so malformed or
+  oversized unauthenticated input cannot reach the session/protocol parser.
+  The unauthenticated-malformed regression is in the host-only loopback suite;
+  this sandbox still denies loopback bind, so no live transport result is
+  claimed here.
 - Shared black-box fixture: 12 deterministic checks pass; the parity case is
   intentionally blocked here by loopback bind permission and remains open for
   host/CI evidence.

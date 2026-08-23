@@ -251,6 +251,17 @@ async fn unauthenticated_and_oversized_fail_closed() {
         .unwrap();
     assert_eq!(unauth.status(), 401);
 
+    // Authentication must precede JSON parsing, so malformed unauthenticated
+    // input cannot probe the parser or session boundary.
+    let unauth_malformed = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body("{not-json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth_malformed.status(), 401);
+
     // Oversized body (auth present) — body limit 256KiB
     let big = "x".repeat(300_000);
     let over = client
