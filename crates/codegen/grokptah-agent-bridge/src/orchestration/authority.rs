@@ -428,11 +428,52 @@ pub fn role_ceiling(role: AuthorityRole) -> BTreeSet<AuthorityOperation> {
             .iter()
             .filter_map(|tool| required_operation(tool))
             .collect(),
-        AuthorityRole::RemoteOperator => CONTROL_TOOLS
-            .iter()
-            .filter_map(|tool| required_operation(tool))
-            .filter(|operation| *operation != ComputerRead)
-            .collect(),
+        AuthorityRole::RemoteOperator => [
+            CapabilitiesRead,
+            SessionsRead,
+            SessionsCreate,
+            AgentsRead,
+            AgentsResume,
+            CapacityRead,
+            ReadinessRead,
+            RunsRead,
+            RunsEvents,
+            RunsSubmit,
+            RunsSteer,
+            RunsCancel,
+            RunsReview,
+            RunsRetry,
+            RunsApprove,
+            RunsPromote,
+            RunsDiscard,
+            QueueControl,
+            WorkRead,
+            WorkCreate,
+            WorkAssign,
+            WorkClaim,
+            WorkLease,
+            WorkProgress,
+            WorkComplete,
+            WorkCancel,
+            WorkRetry,
+            WorkApprove,
+            WorkAdmin,
+            WorkMessages,
+            ManagerRead,
+            ManagerCreate,
+            ManagerControl,
+            RoutinesRead,
+            RoutinesCreate,
+            RoutinesControl,
+            RoutinesFire,
+            WorkersRead,
+            WorkersControl,
+            ManagedRead,
+            ManagedConfigure,
+            ManagedAuthorize,
+        ]
+        .into_iter()
+        .collect(),
         AuthorityRole::RemoteCoordinator => [
             CapabilitiesRead,
             SessionsRead,
@@ -643,6 +684,16 @@ mod tests {
             .iter()
             .any(|tool| tool == "ptah_submit_task"));
         assert_eq!(authority.capability_document.hard_denials.len(), 3);
+    }
+
+    #[test]
+    fn remote_operator_ceiling_is_explicitly_complete_except_computer_read() {
+        let expected = CONTROL_TOOLS
+            .iter()
+            .filter_map(|tool| required_operation(tool))
+            .filter(|operation| *operation != AuthorityOperation::ComputerRead)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(role_ceiling(AuthorityRole::RemoteOperator), expected);
     }
 
     #[test]
