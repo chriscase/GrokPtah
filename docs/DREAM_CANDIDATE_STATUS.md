@@ -56,7 +56,10 @@ complete or that the product has reached 100%.
   `quality_claim_eligible=false` until the live paired campaign is run.
 - Each specialist also projects into the provider-neutral durable `WorkTemplate`
   contract with bounded rounds/tokens/time and retry policy; the template carries
-  only opaque objective evidence, never a route or raw source prompt.
+  only opaque objective evidence, never a route or raw source prompt. A
+  deterministic `EnterpriseReviewWorkPlan` now gives each pass a stable,
+  restart-safe idempotency key so an authorized host broker can materialize the
+  seven independent workers without duplicate work or provider-specific state.
 - The provider-quota receipt contract now requires a named campaign, credential
   and route binding plus distinct provider-side consumption and HTTP-429
   exhaustion observations. Digests, ordering, schema, and secret-free output

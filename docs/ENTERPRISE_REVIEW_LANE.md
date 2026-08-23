@@ -38,6 +38,12 @@ safe to include in a public campaign report.
 After admission, `enterprise_review_plan.rs` freezes seven bounded specialist
 passes (correctness, security, concurrency, performance, tests, API, and UX).
 Each pass has a deterministic objective digest and request/token/time budget.
+The same plan can be projected into a secret-free
+`EnterpriseReviewWorkPlan`: seven stable idempotency keys and validated
+`WorkTemplate` records, intentionally independent so a host scheduler may run
+the passes in parallel and safely re-materialize them after a restart. The
+projection is side-effect free; only an authorized host broker may issue the
+worker credential, bind the workspace, and persist the resulting WorkItems.
 The run accepts only safe location references, deduplicates findings across
 passes, and can resume only from a checkpoint bound to the exact plan digest.
 The resulting outcome is execution evidence, not a quality claim.

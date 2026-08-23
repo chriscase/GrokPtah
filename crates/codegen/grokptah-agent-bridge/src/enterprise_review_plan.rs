@@ -22,6 +22,7 @@ use super::enterprise_review::{
 pub const ENTERPRISE_REVIEW_PLAN_SCHEMA: &str = "grokptah.enterprise-review-plan.v1";
 pub const ENTERPRISE_REVIEW_CHECKPOINT_SCHEMA: &str = "grokptah.enterprise-review-checkpoint.v1";
 pub const ENTERPRISE_REVIEW_OUTCOME_SCHEMA: &str = "grokptah.enterprise-review-outcome.v1";
+pub const ENTERPRISE_REVIEW_WORK_PLAN_SCHEMA: &str = "grokptah.enterprise-review-work-plan.v1";
 pub const MAX_ENTERPRISE_REVIEW_PASSES: usize = 7;
 pub const MAX_ENTERPRISE_REVIEW_PASS_ATTEMPTS: u32 = 3;
 pub const MAX_ENTERPRISE_REVIEW_FINDINGS_PER_PASS: usize = 256;
@@ -132,6 +133,38 @@ impl EnterpriseReviewPass {
             },
         }
     }
+}
+
+/// A deterministic, provider-neutral durable-work projection for one
+/// specialist pass. `work_key` is stable across retries and process restarts;
+/// it is not the randomly assigned WorkItem UUID and contains no credential,
+/// endpoint, prompt, or source contents.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnterpriseReviewWorkItemTemplate {
+    pub schema: String,
+    pub work_key: String,
+    pub review_id: String,
+    pub pass_id: String,
+    pub kind: EnterpriseReviewPassKind,
+    pub objective_digest: String,
+    pub template: crate::orchestration::WorkTemplate,
+}
+
+/// The immutable work graph a host broker may materialize into durable
+/// WorkItems. Passes are intentionally independent and may run in parallel;
+/// final aggregation remains bound to the review checkpoint and exact plan
+/// digest rather than to provider-specific worker state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnterpriseReviewWorkPlan {
+    pub schema: String,
+    pub review_id: String,
+    pub plan_digest: String,
+    pub repository_fingerprint: String,
+    pub scope_fingerprint: String,
+    pub work_items: Vec<EnterpriseReviewWorkItemTemplate>,
+    pub work_plan_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -319,6 +352,48 @@ pub fn build_enterprise_review_plan(
 }
 
 impl EnterpriseReviewPlan {
+    /// Project this admitted plan into stable durable-worker intents. The
+    /// projection is deliberately side-effect free: a host must still issue
+    /// the worker credential, bind the workspace scope, and persist each
+    /// resulting WorkItem through its authorized orchestration service.
+    pub fn work_plan(&self) -> Result<EnterpriseReviewWorkPlan, EnterpriseReviewPlanError> {
+        self.validate()?;
+        let work_items = self
+            .passes
+            .iter()
+            .map(|pass| {
+                let template = pass.work_template();
+                template
+                    .validate()
+                    .map_err(|_| EnterpriseReviewPlanError::InvalidField("work_template"))?;
+                Ok(EnterpriseReviewWorkItemTemplate {
+                    schema: ENTERPRISE_REVIEW_WORK_PLAN_SCHEMA.to_owned(),
+                    work_key: digest(&format!(
+                        "{}|{}|{}",
+                        self.plan_digest, pass.pass_id, pass.objective_digest
+                    )),
+                    review_id: self.review_id.clone(),
+                    pass_id: pass.pass_id.clone(),
+                    kind: pass.kind,
+                    objective_digest: pass.objective_digest.clone(),
+                    template,
+                })
+            })
+            .collect::<Result<Vec<_>, EnterpriseReviewPlanError>>()?;
+        let mut work_plan = EnterpriseReviewWorkPlan {
+            schema: ENTERPRISE_REVIEW_WORK_PLAN_SCHEMA.to_owned(),
+            review_id: self.review_id.clone(),
+            plan_digest: self.plan_digest.clone(),
+            repository_fingerprint: self.repository_fingerprint.clone(),
+            scope_fingerprint: self.scope_fingerprint.clone(),
+            work_items,
+            work_plan_digest: String::new(),
+        };
+        work_plan.work_plan_digest = work_plan_digest(&work_plan);
+        work_plan.validate()?;
+        Ok(work_plan)
+    }
+
     fn pass(&self, pass_id: &str) -> Result<&EnterpriseReviewPass, EnterpriseReviewPlanError> {
         self.passes
             .iter()
@@ -524,6 +599,45 @@ impl EnterpriseReviewRun {
     }
 }
 
+impl EnterpriseReviewWorkPlan {
+    /// Validate a work projection after transport or durable-store recovery.
+    /// This keeps a broker from materializing a stale, duplicated, or
+    /// broadened pass even when the source `EnterpriseReviewPlan` is no longer
+    /// in memory.
+    pub fn validate(&self) -> Result<(), EnterpriseReviewPlanError> {
+        if self.schema != ENTERPRISE_REVIEW_WORK_PLAN_SCHEMA
+            || self.work_items.len() != MAX_ENTERPRISE_REVIEW_PASSES
+            || self.work_plan_digest != work_plan_digest(self)
+            || !valid_opaque_id(&self.review_id)
+            || !valid_fingerprint(&self.plan_digest)
+            || !valid_fingerprint(&self.repository_fingerprint)
+            || !valid_fingerprint(&self.scope_fingerprint)
+        {
+            return Err(EnterpriseReviewPlanError::PlanMismatch);
+        }
+        let mut keys = BTreeSet::new();
+        let mut pass_ids = BTreeSet::new();
+        for item in &self.work_items {
+            if item.schema != ENTERPRISE_REVIEW_WORK_PLAN_SCHEMA
+                || item.review_id != self.review_id
+                || item.pass_id != format!("{}:{}", self.review_id, item.kind.id())
+                || !valid_fingerprint(&item.work_key)
+                || !valid_fingerprint(&item.objective_digest)
+                || item.template.kind != format!("enterprise_review:{}", item.kind.id())
+            {
+                return Err(EnterpriseReviewPlanError::InvalidField("work_item"));
+            }
+            item.template
+                .validate()
+                .map_err(|_| EnterpriseReviewPlanError::InvalidField("work_template"))?;
+            if !keys.insert(&item.work_key) || !pass_ids.insert(&item.pass_id) {
+                return Err(EnterpriseReviewPlanError::DuplicatePass);
+            }
+        }
+        Ok(())
+    }
+}
+
 fn validate_findings(
     findings: &[EnterpriseReviewFindingRef],
 ) -> Result<(), EnterpriseReviewPlanError> {
@@ -580,6 +694,12 @@ fn plan_digest(plan: &EnterpriseReviewPlan) -> String {
     let mut unsigned = plan.clone();
     unsigned.plan_digest.clear();
     digest(&serde_json::to_string(&unsigned).expect("plan serialization is infallible"))
+}
+
+fn work_plan_digest(work_plan: &EnterpriseReviewWorkPlan) -> String {
+    let mut unsigned = work_plan.clone();
+    unsigned.work_plan_digest.clear();
+    digest(&serde_json::to_string(&unsigned).expect("work plan serialization is infallible"))
 }
 
 #[cfg(test)]
@@ -687,6 +807,44 @@ mod tests {
             assert!(template.objective.contains(&pass.objective_digest));
             assert!(!template.objective.contains("https://"));
         }
+    }
+
+    #[test]
+    fn work_plan_is_stable_parallel_and_secret_free() {
+        let first = plan().work_plan().unwrap();
+        let second = plan().work_plan().unwrap();
+        first.validate().unwrap();
+        second.validate().unwrap();
+        assert_eq!(first.work_plan_digest, second.work_plan_digest);
+        assert_eq!(first.work_items.len(), MAX_ENTERPRISE_REVIEW_PASSES);
+        assert!(first
+            .work_items
+            .windows(2)
+            .all(|items| items[0].work_key != items[1].work_key));
+        assert!(first.work_items.iter().all(|item| {
+            item.schema == ENTERPRISE_REVIEW_WORK_PLAN_SCHEMA
+                && item.review_id == first.review_id
+                && item.template.validate().is_ok()
+                && item.template.objective.contains(&item.objective_digest)
+        }));
+        let encoded = serde_json::to_string(&first).unwrap();
+        assert!(!encoded.contains("company-gateway"));
+        assert!(!encoded.contains("credential-plan"));
+        assert!(!encoded.contains("https://"));
+
+        let mut invalid_work_plan = first.clone();
+        invalid_work_plan.work_items[0].work_key = "0".repeat(64);
+        assert_eq!(
+            invalid_work_plan.validate(),
+            Err(EnterpriseReviewPlanError::PlanMismatch)
+        );
+
+        let mut tampered = plan();
+        tampered.plan_digest = "f".repeat(64);
+        assert_eq!(
+            tampered.work_plan(),
+            Err(EnterpriseReviewPlanError::PlanMismatch)
+        );
     }
 
     #[test]
