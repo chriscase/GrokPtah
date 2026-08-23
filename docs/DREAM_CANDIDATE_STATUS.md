@@ -46,7 +46,8 @@ complete or that the product has reached 100%.
   campaign. Its deny-unknown report binds the four-role
   contract, explicit RemoteCoordinator/Observer denials, authority-bound
   idempotency, Agent-bound worker identity, immutable scoped Computer reads,
-  and the public capability document to seven ordered gate families / 21 tests
+  the public capability document, and hash-bound host profiles to seven ordered
+  gate families / 22 tests
   on one clean SHA. The added behavioral MCP gate proves authorized reads and
   indistinguishable cross-session/cross-workspace/unknown-run denial. Failed
   gates retain only a bounded digest checkpoint and cannot seal. The product

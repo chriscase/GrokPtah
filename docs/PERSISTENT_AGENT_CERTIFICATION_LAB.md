@@ -90,7 +90,9 @@ credential/workspace/worker narrowing, the read-only Computer Use MCP surface,
 behavioral Computer-read session/workspace isolation, public MCP role filtering
 and authority-bound idempotency, bound-worker impersonation denial, and
 standalone-service token/session/workspace authorization. Together they
-require 21 exact green tests. The behavioral Computer-read, public MCP, worker,
+require 22 exact green tests. The authority family also proves that host
+capability profiles are stable, role-separated, and hash-bound. The behavioral
+Computer-read, public MCP, worker,
 and service gates require a host that permits loopback listeners.
 
 Run it serially with the mandatory shared compiler cache and external target:

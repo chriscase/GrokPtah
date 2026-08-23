@@ -363,8 +363,8 @@ credentials are Agent-bound and rotatable; Computer-read grants are immutable
 session/workspace capabilities; and the public capability document is derived
 from the enforced operation set. The current dream candidate adds the
 clean-exact-head `authority` campaign and independently sealed verifier. It
-fixes seven ordered gate families at 21 tests and now explicitly tests that a
-bearer cannot mint
+fixes seven ordered gate families at 22 tests and now explicitly tests that
+host profiles are stable, role-separated, and hash-bound; a bearer cannot mint
 local authority, Observer lacks the complete named mutation set, and Computer
 reads deny cross-session/cross-workspace access indistinguishably.
 

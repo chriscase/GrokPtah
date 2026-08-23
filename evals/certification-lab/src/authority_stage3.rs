@@ -141,7 +141,7 @@ const GATES: &[GateSpec] = &[
             "--",
             "--test-threads=1",
         ],
-        expected_passed_tests: 6,
+        expected_passed_tests: 7,
     },
     GateSpec {
         id: "authority-credential-scope-v1",
