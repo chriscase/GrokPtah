@@ -1065,7 +1065,10 @@ mod tests {
         let run = leaky_run(route.clone());
         let reservation =
             QuotaReservation::for_run(&run, "owner-a", QuotaLimits::default(), Utc::now()).unwrap();
-        store.save_run_with_quota(&run, &reservation).unwrap();
+        store
+            .admit_run_with_quota(&run, &reservation)
+            .into_result()
+            .unwrap();
         let projected =
             project_public_run(&store, &store.load_run(&run.run_id).unwrap().unwrap()).unwrap();
         let get_payload = public_run_to_value(&projected).unwrap();
@@ -1241,7 +1244,10 @@ mod tests {
         let run = leaky_run(leaky_route());
         let reservation =
             QuotaReservation::for_run(&run, "owner-a", QuotaLimits::default(), Utc::now()).unwrap();
-        store.save_run_with_quota(&run, &reservation).unwrap();
+        store
+            .admit_run_with_quota(&run, &reservation)
+            .into_result()
+            .unwrap();
         let projected =
             project_public_run(&store, &store.load_run(&run.run_id).unwrap().unwrap()).unwrap();
         let encoded = public_run_to_value(&projected).unwrap();
@@ -1296,7 +1302,10 @@ mod tests {
             });
         let reservation =
             QuotaReservation::for_run(&run, "owner-a", QuotaLimits::default(), Utc::now()).unwrap();
-        store.save_run_with_quota(&run, &reservation).unwrap();
+        store
+            .admit_run_with_quota(&run, &reservation)
+            .into_result()
+            .unwrap();
         let loaded = store.load_run(&run.run_id).unwrap().unwrap();
         let projected = project_public_run(&store, &loaded).unwrap();
         let get_payload = public_run_to_value(&projected).unwrap();

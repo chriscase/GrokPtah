@@ -12932,7 +12932,8 @@ mod tests {
             approval: None,
         };
         store
-            .save_run_and_activate_agent(&competing, &current_agent.agent_id)
+            .admit_run_and_activate_agent(&competing, &current_agent.agent_id, None)
+            .into_result()
             .unwrap();
         let transcript_before = host.export_transcript(session_id).unwrap();
         let error = host
@@ -13226,7 +13227,8 @@ mod tests {
             approval: None,
         };
         store
-            .save_run_and_activate_agent(&run, &agent.agent_id)
+            .admit_run_and_activate_agent(&run, &agent.agent_id, None)
+            .into_result()
             .unwrap();
         host.reserve_orchestration_turn(&run.run_id, lane_id)
             .unwrap();
@@ -13320,7 +13322,8 @@ mod tests {
             approval: None,
         };
         store
-            .save_run_and_activate_agent(&run, &agent.agent_id)
+            .admit_run_and_activate_agent(&run, &agent.agent_id, None)
+            .into_result()
             .unwrap();
         host.reserve_orchestration_turn(&run.run_id, lane_id)
             .unwrap();
@@ -13362,7 +13365,8 @@ mod tests {
         run.agent_id = Some(agent.agent_id.clone());
         run.agent_spec_revision = Some(agent.current_spec().unwrap().revision);
         store
-            .save_run_and_activate_agent(&run, &agent.agent_id)
+            .admit_run_and_activate_agent(&run, &agent.agent_id, None)
+            .into_result()
             .unwrap();
         let error = host
             .persist_agent_checkpoint(&run, "failed", 1, &host.event_bus(), &store)

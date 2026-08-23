@@ -1037,7 +1037,10 @@ mod tests {
         let store = OrchStore::open(&store_root).unwrap();
         let (run, reservation) = running_quota_backed_run("Team/Code:Cheap");
         let frozen = run.provider_route.clone().unwrap();
-        store.save_run_with_quota(&run, &reservation).unwrap();
+        store
+            .admit_run_with_quota(&run, &reservation)
+            .into_result()
+            .unwrap();
         let attempt = store.begin_provider_attempt(&run.run_id).unwrap();
         assert_eq!(attempt.state, ProviderAttemptState::Admitted);
 

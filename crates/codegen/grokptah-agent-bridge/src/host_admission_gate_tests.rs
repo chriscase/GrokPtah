@@ -493,7 +493,8 @@ fn manager_proposal_tool_autodeny_is_unchanged() {
         approval: None,
     };
     store
-        .save_run_and_activate_agent(&run, &agent.agent_id)
+        .admit_run_and_activate_agent(&run, &agent.agent_id, None)
+        .into_result()
         .unwrap();
     host.reserve_orchestration_turn(&run.run_id, lane.id)
         .unwrap();
@@ -747,7 +748,10 @@ async fn quota_exhausted_refuses_desktop_build_without_session_effects() {
         };
         let reservation =
             QuotaReservation::for_run(&run, DESKTOP_OWNER_ID, QuotaLimits::default(), now).unwrap();
-        store.save_run_with_quota(&run, &reservation).unwrap();
+        store
+            .admit_run_with_quota(&run, &reservation)
+            .into_result()
+            .unwrap();
     }
     let before_title = host.session_inspect(lane_id).unwrap().title;
     let before_transcript = host.session_transcript(lane_id).unwrap();
@@ -843,7 +847,8 @@ async fn already_service_admitted_frozen_route_does_not_double_reserve() {
     let reservation =
         QuotaReservation::for_run(&run, DESKTOP_OWNER_ID, QuotaLimits::default(), now).unwrap();
     store
-        .save_run_and_activate_agent_with_quota(&run, &agent.agent_id, &reservation)
+        .admit_run_and_activate_agent(&run, &agent.agent_id, Some(&reservation))
+        .into_result()
         .unwrap();
     host.reserve_orchestration_turn(&run.run_id, lane_id)
         .unwrap();

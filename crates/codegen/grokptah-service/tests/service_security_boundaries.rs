@@ -218,7 +218,10 @@ async fn hosted_list_and_get_omit_frozen_provider_route() {
     let store = host.ensure_orchestration_store().unwrap();
     let reservation =
         QuotaReservation::for_run(&run, "primary", QuotaLimits::default(), now).unwrap();
-    store.save_run_with_quota(&run, &reservation).unwrap();
+    store
+        .admit_run_with_quota(&run, &reservation)
+        .into_result()
+        .unwrap();
 
     let get_run = client
         .call_tool(
@@ -318,7 +321,8 @@ async fn hosted_list_and_get_omit_frozen_provider_route() {
     let discard_reservation =
         QuotaReservation::for_run(&discarded, "primary", QuotaLimits::default(), now).unwrap();
     store
-        .save_run_with_quota(&discarded, &discard_reservation)
+        .admit_run_with_quota(&discarded, &discard_reservation)
+        .into_result()
         .unwrap();
     let discard_request = "hosted-discard-replay";
     let discard_hash = hash_payload(&json!({

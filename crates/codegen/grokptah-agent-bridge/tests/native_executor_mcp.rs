@@ -2542,7 +2542,10 @@ async fn failing_provider_mcp_surfaces_scrub_get_list_progress_promote_discard_a
     };
     let reservation =
         QuotaReservation::for_run(&run, "primary", QuotaLimits::default(), now).unwrap();
-    store.save_run_with_quota(&run, &reservation).unwrap();
+    store
+        .admit_run_with_quota(&run, &reservation)
+        .into_result()
+        .unwrap();
 
     let control = start_control_server(orch.clone(), 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", control.addr), "native-token-308");
@@ -2655,7 +2658,8 @@ async fn failing_provider_mcp_surfaces_scrub_get_list_progress_promote_discard_a
     let discard_reservation =
         QuotaReservation::for_run(&run, "primary", QuotaLimits::default(), now).unwrap();
     store
-        .save_run_with_quota(&run, &discard_reservation)
+        .admit_run_with_quota(&run, &discard_reservation)
+        .into_result()
         .unwrap();
     let discard_request = "native-discard-replay";
     let discard_hash = hash_payload(&json!({

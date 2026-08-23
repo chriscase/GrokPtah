@@ -101,6 +101,11 @@ impl DurableAdmission {
         matches!(self, Self::Committed)
     }
 
+    /// Convert a typed admission outcome into `Result`.
+    ///
+    /// Uncertain stays [`UncertainAdmission`], not a zero-effect error. Production
+    /// persist paths must match [`DurableAdmission`] directly; this conversion is
+    /// for tests that still want a `Result`.
     pub fn into_result(self) -> anyhow::Result<()> {
         match self {
             Self::Committed => Ok(()),
@@ -1436,14 +1441,6 @@ impl OrchStore {
 
     /// Atomically install a queued Run and its provider-quota reservation.
     /// The intent is the recovery anchor for every crash cut point.
-    pub fn save_run_with_quota(
-        &self,
-        run: &RunRecord,
-        reservation: &QuotaReservation,
-    ) -> anyhow::Result<()> {
-        self.admit_run_with_quota(run, reservation).into_result()
-    }
-
     pub fn admit_run_with_quota(
         &self,
         run: &RunRecord,
@@ -1610,27 +1607,6 @@ impl OrchStore {
 
     /// Serialize Agent activation with durable Run creation so two Lanes
     /// cannot both pass the active-Run check and execute under one identity.
-    pub fn save_run_and_activate_agent(
-        &self,
-        run: &RunRecord,
-        agent_id: &str,
-    ) -> anyhow::Result<()> {
-        self.admit_run_and_activate_agent(run, agent_id, None)
-            .into_result()
-    }
-
-    /// Atomically reserve provider quota, create the Run, and activate its
-    /// persistent Agent before provider execution may begin.
-    pub fn save_run_and_activate_agent_with_quota(
-        &self,
-        run: &RunRecord,
-        agent_id: &str,
-        reservation: &QuotaReservation,
-    ) -> anyhow::Result<()> {
-        self.admit_run_and_activate_agent(run, agent_id, Some(reservation))
-            .into_result()
-    }
-
     pub fn admit_run_and_activate_agent(
         &self,
         run: &RunRecord,
@@ -8221,7 +8197,8 @@ mod tests {
         first.end_seq = None;
         first.provider_route = Some(provider_route_snapshot("wrong-model"));
         let error = store
-            .save_run_and_activate_agent(&first, "agent-activation-race")
+            .admit_run_and_activate_agent(&first, "agent-activation-race", None)
+            .into_result()
             .unwrap_err()
             .to_string();
         assert!(
@@ -8236,10 +8213,12 @@ mod tests {
         second.session_id = second_lane;
 
         store
-            .save_run_and_activate_agent(&first, "agent-activation-race")
+            .admit_run_and_activate_agent(&first, "agent-activation-race", None)
+            .into_result()
             .unwrap();
         let error = store
-            .save_run_and_activate_agent(&second, "agent-activation-race")
+            .admit_run_and_activate_agent(&second, "agent-activation-race", None)
+            .into_result()
             .unwrap_err()
             .to_string();
         assert!(error.contains("active Run"), "unexpected error: {error}");
@@ -8368,7 +8347,8 @@ mod tests {
         let (first_run, first_reservation) =
             quota_backed_run("quota-run-1", RunState::Queued, now, limits);
         store
-            .save_run_with_quota(&first_run, &first_reservation)
+            .admit_run_with_quota(&first_run, &first_reservation)
+            .into_result()
             .unwrap();
         assert_eq!(
             store.load_run(&first_run.run_id).unwrap().unwrap().run_id,
@@ -8385,7 +8365,8 @@ mod tests {
         let (second_run, second_reservation) =
             quota_backed_run("quota-run-2", RunState::Queued, now, limits);
         let error = store
-            .save_run_with_quota(&second_run, &second_reservation)
+            .admit_run_with_quota(&second_run, &second_reservation)
+            .into_result()
             .unwrap_err();
         assert_eq!(
             error.downcast_ref::<OrchError>().map(|error| &error.code),
@@ -8417,7 +8398,7 @@ mod tests {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                store.save_run_with_quota(&run, &reservation)
+                store.admit_run_with_quota(&run, &reservation).into_result()
             })
         });
         barrier.wait();
@@ -8496,7 +8477,10 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
         let limits = super::super::quota::QuotaLimits::default();
         let (run, reservation) = quota_backed_run("quota-consume", RunState::Queued, now, limits);
-        store.save_run_with_quota(&run, &reservation).unwrap();
+        store
+            .admit_run_with_quota(&run, &reservation)
+            .into_result()
+            .unwrap();
         for _ in 0..2 {
             store
                 .update_run(&run.run_id, |current| {
@@ -8540,7 +8524,8 @@ mod tests {
         let (uncertain_run, uncertain_reservation) =
             quota_backed_run("quota-uncertain", RunState::Queued, now, limits);
         store
-            .save_run_with_quota(&uncertain_run, &uncertain_reservation)
+            .admit_run_with_quota(&uncertain_run, &uncertain_reservation)
+            .into_result()
             .unwrap();
         store
             .update_run(&uncertain_run.run_id, |current| {
@@ -8604,7 +8589,10 @@ mod tests {
         );
         {
             let store = OrchStore::open(root.path()).unwrap();
-            store.save_run_with_quota(&run, &reservation).unwrap();
+            store
+                .admit_run_with_quota(&run, &reservation)
+                .into_result()
+                .unwrap();
             run.state = RunState::Completed;
             run.aggregates.usage.total_tokens = 333;
             run.aggregates.usage.requests = 2;
@@ -8637,7 +8625,10 @@ mod tests {
             now,
             super::super::quota::QuotaLimits::default(),
         );
-        store.save_run_with_quota(&run, &reservation).unwrap();
+        store
+            .admit_run_with_quota(&run, &reservation)
+            .into_result()
+            .unwrap();
 
         let first = store.begin_provider_attempt(&run.run_id).unwrap();
         assert_eq!(first.ordinal, 1);
@@ -8689,7 +8680,10 @@ mod tests {
         );
         let attempt_id = {
             let store = OrchStore::open(root.path()).unwrap();
-            store.save_run_with_quota(&run, &reservation).unwrap();
+            store
+                .admit_run_with_quota(&run, &reservation)
+                .into_result()
+                .unwrap();
             store
                 .begin_provider_attempt(&run.run_id)
                 .unwrap()
@@ -8737,7 +8731,10 @@ mod tests {
         );
         let attempt_id = {
             let store = OrchStore::open(root.path()).unwrap();
-            store.save_run_with_quota(&run, &reservation).unwrap();
+            store
+                .admit_run_with_quota(&run, &reservation)
+                .into_result()
+                .unwrap();
             let mut attempt = store.begin_provider_attempt(&run.run_id).unwrap();
             attempt
                 .finish(
@@ -8956,7 +8953,8 @@ mod tests {
                 let store = OrchStore::open(root.path()).unwrap();
                 store.save_agent(&agent).unwrap();
                 store
-                    .save_run_and_activate_agent_with_quota(&run, &agent.agent_id, &reservation)
+                    .admit_run_and_activate_agent(&run, &agent.agent_id, Some(&reservation))
+                    .into_result()
                     .unwrap();
                 store.set_persist_cut(Some(cut));
                 assert_eq!(
@@ -9072,9 +9070,13 @@ mod tests {
             super::super::quota::QuotaLimits::default(),
         );
         let store = OrchStore::open(root.path()).unwrap();
-        store.save_run_with_quota(&own, &own_reservation).unwrap();
         store
-            .save_run_with_quota(&foreign, &foreign_reservation)
+            .admit_run_with_quota(&own, &own_reservation)
+            .into_result()
+            .unwrap();
+        store
+            .admit_run_with_quota(&foreign, &foreign_reservation)
+            .into_result()
             .unwrap();
         for ordinal in 1..=200 {
             let attempt = super::super::provider_attempt::ProviderAttemptRecord::admitted(
@@ -9118,7 +9120,7 @@ mod tests {
     }
 
     #[test]
-    fn save_run_with_quota_uncertain_is_typed_and_not_zero_effect() {
+    fn admit_run_with_quota_uncertain_into_result_is_typed_and_not_zero_effect() {
         let root = tempdir().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
         let (run, reservation) = quota_backed_run(
@@ -9129,7 +9131,10 @@ mod tests {
         );
         let store = OrchStore::open(root.path()).unwrap();
         store.set_persist_cut(Some(AdmissionPersistCut::AfterQuota));
-        let error = store.save_run_with_quota(&run, &reservation).unwrap_err();
+        let error = store
+            .admit_run_with_quota(&run, &reservation)
+            .into_result()
+            .unwrap_err();
         assert!(
             UncertainAdmission::is(&error),
             "Uncertain must not collapse to an ordinary zero-effect error: {error}"
@@ -9170,7 +9175,10 @@ mod tests {
             let reservation =
                 super::super::quota::QuotaReservation::for_run(&run, "owner-1", limits, created)
                     .unwrap();
-            store.save_run_with_quota(&run, &reservation).unwrap();
+            store
+                .admit_run_with_quota(&run, &reservation)
+                .into_result()
+                .unwrap();
         }
         for index in 0..400 {
             let created = now + Duration::milliseconds(index as i64);
@@ -9187,7 +9195,10 @@ mod tests {
             let reservation =
                 super::super::quota::QuotaReservation::for_run(&run, "owner-1", limits, created)
                     .unwrap();
-            store.save_run_with_quota(&run, &reservation).unwrap();
+            store
+                .admit_run_with_quota(&run, &reservation)
+                .into_result()
+                .unwrap();
         }
         store.reset_session_run_index_files_read();
         let page = store
@@ -9238,7 +9249,8 @@ mod tests {
                     run.agent_spec_revision = Some(agent.current_spec().unwrap().revision);
                     store.save_agent(&agent).unwrap();
                     store
-                        .save_run_and_activate_agent_with_quota(&run, &agent.agent_id, &reservation)
+                        .admit_run_and_activate_agent(&run, &agent.agent_id, Some(&reservation))
+                        .into_result()
                         .unwrap();
                     store.set_persist_cut(Some(AdmissionPersistCut::AfterAbortJournal));
                     let _ = store.terminalize_unstarted_admission(
