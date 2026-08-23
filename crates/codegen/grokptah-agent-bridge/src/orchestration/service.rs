@@ -7138,10 +7138,7 @@ impl OrchestrationService {
                 run.agent_id.as_deref().expect("Run Agent"),
                 Some(reservation),
             ),
-            (true, None) => match self.store.save_run(&run) {
-                Ok(()) => crate::orchestration::DurableAdmission::Committed,
-                Err(error) => crate::orchestration::DurableAdmission::DefinitelyNotCommitted(error),
-            },
+            (true, None) => self.store.admit_run(&run),
             (false, None) => self.store.admit_run_and_activate_agent(
                 &run,
                 run.agent_id.as_deref().expect("Run Agent"),

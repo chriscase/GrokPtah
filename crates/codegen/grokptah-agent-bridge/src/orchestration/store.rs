@@ -1571,6 +1571,55 @@ impl OrchStore {
         false
     }
 
+    /// Persist a new Run that is not quota-backed. Callers must match
+    /// [`DurableAdmission`]. A written Run file with a later index failure is
+    /// [`Self::Uncertain`], not a zero-effect rejection.
+    pub fn admit_run(&self, run: &RunRecord) -> DurableAdmission {
+        let _guard = self.inner.lock.lock();
+        if run
+            .provider_route
+            .as_ref()
+            .is_some_and(|route| route.quota_reservation_id.is_some())
+        {
+            return DurableAdmission::DefinitelyNotCommitted(anyhow::anyhow!(
+                "quota-backed Run must be created atomically with its reservation"
+            ));
+        }
+        if let Some(route) = &run.provider_route {
+            if let Err(error) = route.validate() {
+                return DurableAdmission::DefinitelyNotCommitted(
+                    anyhow::anyhow!(error.to_string()),
+                );
+            }
+        }
+        if let Err(error) = self.preflight_quota_for_run_unlocked(run) {
+            return DurableAdmission::DefinitelyNotCommitted(error);
+        }
+        let run_path = match self.run_path(&run.run_id) {
+            Ok(path) => path,
+            Err(error) => {
+                return DurableAdmission::DefinitelyNotCommitted(anyhow::anyhow!(error));
+            }
+        };
+        if run_path.is_file() {
+            return DurableAdmission::DefinitelyNotCommitted(anyhow::anyhow!(
+                "Run ID already exists"
+            ));
+        }
+        if let Err(error) = self.write_run_record_at_unlocked(&run_path, run) {
+            return DurableAdmission::from_partial_write(
+                error.context("persist Run"),
+                run_path.is_file(),
+            );
+        }
+        if let Some(outcome) =
+            self.injected_persist_cut(AdmissionPersistCut::AfterRun, run_path.is_file())
+        {
+            return outcome;
+        }
+        DurableAdmission::Committed
+    }
+
     pub fn save_run(&self, run: &RunRecord) -> anyhow::Result<()> {
         let _g = self.inner.lock.lock();
         if let Some(route) = &run.provider_route {
@@ -9147,6 +9196,49 @@ mod tests {
             .quota_admission_intent_path(&run.run_id)
             .unwrap()
             .is_file());
+    }
+
+    #[test]
+    fn admit_run_after_run_cut_is_uncertain_and_retains_run() {
+        let root = tempdir().unwrap();
+        let store = OrchStore::open(root.path()).unwrap();
+        let mut run = terminal_run("offline-admit");
+        run.state = RunState::Queued;
+        run.terminal_result = None;
+        store.set_persist_cut(Some(AdmissionPersistCut::AfterRun));
+        let error = store.admit_run(&run).into_result().unwrap_err();
+        assert!(
+            UncertainAdmission::is(&error),
+            "no-quota persist Uncertain must not collapse to a zero-effect error: {error}"
+        );
+        assert!(store.load_run(&run.run_id).unwrap().is_some());
+        drop(store);
+        let first = OrchStore::open(root.path()).unwrap();
+        assert_eq!(
+            first.load_run(&run.run_id).unwrap().unwrap().run_id,
+            run.run_id
+        );
+        drop(first);
+        let second = OrchStore::open(root.path()).unwrap();
+        assert_eq!(
+            second.load_run(&run.run_id).unwrap().unwrap().run_id,
+            run.run_id
+        );
+    }
+
+    #[test]
+    fn admit_run_rejects_quota_backed_runs() {
+        let root = tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 12, 0, 0).unwrap();
+        let (run, _reservation) = quota_backed_run(
+            "must-use-quota-admit",
+            RunState::Queued,
+            now,
+            super::super::quota::QuotaLimits::default(),
+        );
+        let store = OrchStore::open(root.path()).unwrap();
+        assert_eq!(admission_kind(store.admit_run(&run)), "not_committed");
+        assert!(store.load_run(&run.run_id).unwrap().is_none());
     }
 
     #[test]

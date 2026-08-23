@@ -3168,10 +3168,7 @@ impl AgentHostHandle {
                 pending_agent,
             ),
             (None, Some(reservation)) => store.admit_run_with_quota(&run, reservation),
-            (None, None) => match store.save_run(&run) {
-                Ok(()) => crate::orchestration::DurableAdmission::Committed,
-                Err(error) => crate::orchestration::DurableAdmission::DefinitelyNotCommitted(error),
-            },
+            (None, None) => store.admit_run(&run),
         };
         match persisted {
             crate::orchestration::DurableAdmission::Committed => {}

@@ -1746,6 +1746,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remote_run_decode_rejects_unknown_nested_usage_keys() {
+        let mut leaked = serde_json::to_value(sample_public_run(
+            "public-run-usage-leak",
+            "2026-01-01T00:00:00Z",
+        ))
+        .unwrap();
+        leaked["aggregates"]["usage"]["credentialRef"] =
+            serde_json::json!("keychain:provider/leak-cred-ref-sentinel-pr352");
+        let decoded = serde_json::from_value::<PublicRun>(leaked);
+        assert!(
+            decoded.is_err(),
+            "unknown nested aggregates.usage keys must fail remote decode: {decoded:?}"
+        );
+    }
+
     fn sample_public_run(run_id: &str, updated_at: &str) -> PublicRun {
         serde_json::from_value(serde_json::json!({
             "runId": run_id,

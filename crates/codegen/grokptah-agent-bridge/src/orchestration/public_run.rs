@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::completion::CompletionUsage;
+use crate::completion::{
+    CompletionClaims, CompletionEvidence, CompletionObservations, CompletionUsage,
+};
 use crate::gateway_config::{
     CapabilitySource, ProviderDeadlineClass, ProviderDialect, ProviderKind,
 };
@@ -75,6 +77,101 @@ pub const PUBLIC_PROVIDER_ROUTE_KEYS: &[&str] = &[
 /// Version stamp for promote/discard idempotency receipts.
 pub const PUBLIC_RUN_RECEIPT_SCHEMA: &str = "grokptah.public-run-receipt.v1";
 
+/// Public usage counters. Nested unknown keys must fail trusted decode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicCompletionUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub requests: u64,
+}
+
+impl From<&CompletionUsage> for PublicCompletionUsage {
+    fn from(usage: &CompletionUsage) -> Self {
+        Self {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            requests: usage.requests,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicCompletionClaims {
+    pub present: bool,
+    pub mentions_changes: bool,
+    pub mentions_tests: bool,
+    pub mentions_verification: bool,
+}
+
+impl From<&CompletionClaims> for PublicCompletionClaims {
+    fn from(claims: &CompletionClaims) -> Self {
+        Self {
+            present: claims.present,
+            mentions_changes: claims.mentions_changes,
+            mentions_tests: claims.mentions_tests,
+            mentions_verification: claims.mentions_verification,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicCompletionObservations {
+    pub changed_files: u32,
+    pub tests_observed: u32,
+    pub tests_passed: u32,
+    pub tests_failed: u32,
+    pub tests_incomplete: u32,
+    pub permissions_requested: u32,
+    pub permissions_granted: u32,
+    pub permissions_denied: u32,
+    pub permissions_unresolved: u32,
+}
+
+impl From<&CompletionObservations> for PublicCompletionObservations {
+    fn from(observations: &CompletionObservations) -> Self {
+        Self {
+            changed_files: observations.changed_files,
+            tests_observed: observations.tests_observed,
+            tests_passed: observations.tests_passed,
+            tests_failed: observations.tests_failed,
+            tests_incomplete: observations.tests_incomplete,
+            permissions_requested: observations.permissions_requested,
+            permissions_granted: observations.permissions_granted,
+            permissions_denied: observations.permissions_denied,
+            permissions_unresolved: observations.permissions_unresolved,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicCompletionEvidence {
+    pub status: String,
+    pub stop_reason: String,
+    pub interrupted: bool,
+    pub claims: PublicCompletionClaims,
+    pub observations: PublicCompletionObservations,
+    pub usage: PublicCompletionUsage,
+}
+
+impl From<&CompletionEvidence> for PublicCompletionEvidence {
+    fn from(evidence: &CompletionEvidence) -> Self {
+        Self {
+            status: evidence.status.clone(),
+            stop_reason: evidence.stop_reason.clone(),
+            interrupted: evidence.interrupted,
+            claims: PublicCompletionClaims::from(&evidence.claims),
+            observations: PublicCompletionObservations::from(&evidence.observations),
+            usage: PublicCompletionUsage::from(&evidence.usage),
+        }
+    }
+}
+
 /// Secret-free route identity that operators and coordinators may observe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -128,7 +225,7 @@ pub struct PublicProviderAttempt {
     pub send_certainty: Option<ProviderSendCertainty>,
     pub retry_class: Option<ProviderRetryClass>,
     pub http_status: Option<u16>,
-    pub usage: Option<CompletionUsage>,
+    pub usage: Option<PublicCompletionUsage>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -186,13 +283,13 @@ pub struct PublicRunAggregates {
     #[serde(default)]
     pub permissions_denied: u32,
     #[serde(default)]
-    pub usage: CompletionUsage,
+    pub usage: PublicCompletionUsage,
     #[serde(default)]
     pub usage_complete: bool,
     #[serde(default)]
     pub usage_pending_requests: u32,
     #[serde(default)]
-    pub verification: Option<crate::completion::CompletionEvidence>,
+    pub verification: Option<PublicCompletionEvidence>,
 }
 
 impl Default for PublicRunAggregates {
@@ -203,7 +300,7 @@ impl Default for PublicRunAggregates {
             permissions_requested: 0,
             permissions_granted: 0,
             permissions_denied: 0,
-            usage: CompletionUsage::default(),
+            usage: PublicCompletionUsage::default(),
             usage_complete: true,
             usage_pending_requests: 0,
             verification: None,
@@ -705,7 +802,7 @@ fn project_attempt(attempt: ProviderAttemptRecord) -> PublicProviderAttempt {
         send_certainty: attempt.send_certainty,
         retry_class: attempt.retry_class,
         http_status: attempt.http_status,
-        usage: attempt.usage,
+        usage: attempt.usage.as_ref().map(PublicCompletionUsage::from),
         created_at: attempt.created_at,
         updated_at: attempt.updated_at,
         finished_at: attempt.finished_at,
@@ -745,10 +842,13 @@ fn project_aggregates(aggregates: &RunAggregates) -> PublicRunAggregates {
         permissions_requested: aggregates.permissions_requested,
         permissions_granted: aggregates.permissions_granted,
         permissions_denied: aggregates.permissions_denied,
-        usage: aggregates.usage.clone(),
+        usage: PublicCompletionUsage::from(&aggregates.usage),
         usage_complete: aggregates.usage_complete,
         usage_pending_requests: aggregates.usage_pending_requests,
-        verification: aggregates.verification.clone(),
+        verification: aggregates
+            .verification
+            .as_ref()
+            .map(PublicCompletionEvidence::from),
     }
 }
 
@@ -1275,6 +1375,69 @@ mod tests {
         assert!(
             serde_json::from_value::<PublicRun>(with_unknown_aggregates).is_err(),
             "unknown nested aggregates keys must fail"
+        );
+        let mut with_unknown_usage = encoded.clone();
+        with_unknown_usage["aggregates"]["usage"]["selectionKey"] = json!("ptah.model.v1:leaked");
+        assert!(
+            serde_json::from_value::<PublicRun>(with_unknown_usage).is_err(),
+            "unknown nested aggregates.usage keys must fail"
+        );
+        let mut with_unknown_verification = encoded.clone();
+        with_unknown_verification["aggregates"]["verification"] = json!({
+            "status": "unverified",
+            "stopReason": "completed",
+            "interrupted": false,
+            "claims": {
+                "present": false,
+                "mentionsChanges": false,
+                "mentionsTests": false,
+                "mentionsVerification": false,
+                "credentialRef": CREDENTIAL_REF_SENTINEL
+            },
+            "observations": {
+                "changedFiles": 0,
+                "testsObserved": 0,
+                "testsPassed": 0,
+                "testsFailed": 0,
+                "testsIncomplete": 0,
+                "permissionsRequested": 0,
+                "permissionsGranted": 0,
+                "permissionsDenied": 0,
+                "permissionsUnresolved": 0
+            },
+            "usage": {
+                "promptTokens": 0,
+                "completionTokens": 0,
+                "totalTokens": 0,
+                "requests": 0
+            }
+        });
+        assert!(
+            serde_json::from_value::<PublicRun>(with_unknown_verification).is_err(),
+            "unknown nested verification.claims keys must fail"
+        );
+        let mut with_unknown_attempt_usage = encoded.clone();
+        with_unknown_attempt_usage["providerExecution"]["attempts"] = json!([{
+            "attemptId": "attempt-1",
+            "ordinal": 1,
+            "state": "admitted",
+            "sendCertainty": null,
+            "retryClass": null,
+            "httpStatus": null,
+            "usage": {
+                "promptTokens": 0,
+                "completionTokens": 0,
+                "totalTokens": 0,
+                "requests": 0,
+                "baseUrl": BASE_URL_SENTINEL
+            },
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "finishedAt": null
+        }]);
+        assert!(
+            serde_json::from_value::<PublicRun>(with_unknown_attempt_usage).is_err(),
+            "unknown nested providerExecution.attempts.usage keys must fail"
         );
     }
 
