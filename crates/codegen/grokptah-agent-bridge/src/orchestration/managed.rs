@@ -265,6 +265,11 @@ pub enum ManagedFinalizationOutcome {
     AwaitingApproval,
     Failed,
     RetryQueued,
+    /// Work is non-claimable until an operator starts a new logical Run.
+    /// Used when an Interrupted managed Run has a provider attempt that is
+    /// `UncertainAccept` or `ExplicitNewRunOnly`: auto-retry would duplicate
+    /// an in-flight provider request.
+    Parked,
     Cancelled,
 }
 

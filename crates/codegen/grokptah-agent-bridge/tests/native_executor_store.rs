@@ -899,6 +899,8 @@ fn interrupted_run_with_retry_forbidden_is_terminal() {
 
 #[test]
 fn interrupted_run_with_retry_allowed_requeues_without_resuming() {
+    // No provider attempt is linked, so UncertainAccept / ExplicitNewRunOnly
+    // does not override retryEligible. Work is requeued for a new admission.
     let home = tempdir().unwrap();
     let store = OrchStore::open(home.path()).unwrap();
     let session = Uuid::new_v4();

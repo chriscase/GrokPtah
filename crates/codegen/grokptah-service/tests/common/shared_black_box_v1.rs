@@ -1,0 +1,3888 @@
+//! Versioned public-boundary desktop/hosted black-box parity fixture v1.
+//!
+//! After launch, the scenario may interact only through `McpControlClient`
+//! initialize/list_tools/call_tool/close_session. Launch handles are retained
+//! only for stop/restart. Fake transport (MockGateway) is inspected for
+//! request cardinalities without exposing secrets.
+//!
+//! Timing (do not claim Utc timestamps are fake-controlled):
+//! - Both adapters are in-process on this test's Tokio runtime. Hosted
+//!   `start_service` is not a child process, so paused Tokio time can drive
+//!   in-process timers. There is no standalone child whose clocks we control.
+//! - `#[tokio::test(start_paused = true)]` drives in-process timers via
+//!   bounded `tokio::time::advance` plus yield loops. No wall-clock sleeps
+//!   in the fixture body. Bound: `maxLogicalTicks` × (`advanceNativeMs` or
+//!   `advanceSupervisorMs`) plus `maxYieldsPerWait` yields per wait.
+//! - `MockGateway::start_routed` records a complete HTTP request, then the
+//!   restart-cut route returns `Step::stall`, which is
+//!   `std::future::pending()` before any response bytes. Paused time cannot
+//!   complete a stall. The fixture stops immediately after that recorded
+//!   accept and does not wait for a provider response.
+//! - Durable supervisor OS threads still use wall-clock time; manager
+//!   progress is driven through public `ptah_tick_manager_plan`.
+//! - `chrono::Utc` timestamps are real and are stripped as transport-volatile.
+//!
+//! Main golden production (never by the PR-head run, never by rewriting
+//! expected-main from a PR result):
+//! 1. Detach a worktree at exact `67e29bd34dc64049432c715c93c2cef2185c63ea`.
+//! 2. Overlay only the allowlisted fixture files. Overlay
+//!    `tests/shared_black_box_v1.rs` which loads this driver via `#[path]`.
+//!    Do not add this driver to main's `tests/common/mod.rs` — that compiles
+//!    it into unrelated integration targets.
+//! 3. Overlay this crate's `Cargo.toml` dev-deps (`grokptah-test-gateway`,
+//!    tokio `test-util`). Let the worktree refresh its own lockfile.
+//! 4. `CARGO_TARGET_DIR=/tmp/sbb-main-target cargo test --manifest-path
+//!    crates/codegen/grokptah-service/Cargo.toml --test shared_black_box_v1
+//!    -- --test-threads=1 --nocapture`
+//! 5. Check in `/tmp/sbb-v1-desktop-normalized.json` as
+//!    `expected-main-67e29bd3.json` after desktop and hosted hashes match.
+
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, MutexGuard};
+use std::time::Duration;
+
+use grokptah_agent_bridge::{
+    home_override_serial, set_grokptah_home_override, start_control_server, AgentHost,
+    AgentHostHandle, ControlServerHandle, HostConfig, McpControlClient, McpRemoteError,
+    OrchestrationConfig, OrchestrationService, RuntimeHome, WorkspaceAllowlist,
+};
+use grokptah_service::{start_service, ServiceConfig, ServiceHandle};
+use grokptah_test_gateway::{MockGateway, RecordedRequest, Response, Step};
+use serde_json::{json, Map, Value};
+use tempfile::TempDir;
+
+const FIXTURE_SCHEMA: &str = "grokptah.shared-black-box-fixture.v1";
+const RESULT_SCHEMA: &str = "grokptah.shared-black-box-result.v1";
+const SCENARIO_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/shared-black-box/v1/scenario.json"
+);
+const GOLDEN_DIR: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/shared-black-box/v1"
+);
+
+/// Compile-time map from audited host revision to the one immutable golden.
+/// Never infer the golden from advertised tools or feature downgrade.
+const AUDITED_GOLDENS: &[(&str, &str)] = &[
+    (
+        "4bd2081b2945e8ce881895f976bb7c8d88b929f2",
+        "expected-pr352-4bd2081b.json",
+    ),
+    (
+        "67e29bd34dc64049432c715c93c2cef2185c63ea",
+        "expected-main-67e29bd3.json",
+    ),
+    (
+        "57c0f4f70f53a726188ff7ec8278c1c5d0be6604",
+        "expected-57c0f4f70f53a7.json",
+    ),
+];
+
+const FIXTURE_ALLOWLIST: &[&str] = &[
+    "crates/codegen/grokptah-service/Cargo.toml",
+    "crates/codegen/grokptah-service/Cargo.lock",
+    "crates/codegen/grokptah-service/tests/shared_black_box_v1.rs",
+    "crates/codegen/grokptah-service/tests/common/mod.rs",
+    "crates/codegen/grokptah-service/tests/common/shared_black_box_v1.rs",
+    "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/scenario.json",
+    "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-main-67e29bd3.json",
+    "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-pr352-4bd2081b.json",
+    "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-57c0f4f70f53a7.json",
+    ".github/workflows/hosted-service.yml",
+];
+
+const GOLDEN_UPDATE_ENV_VARS: &[&str] = &[
+    "UPDATE_SHARED_BLACK_BOX_GOLDEN",
+    "GROKPTAH_UPDATE_GOLDENS",
+    "UPDATE_GOLDENS",
+    "UPDATE_SNAPSHOTS",
+];
+
+/// Serializes process-global environment mutations for this test binary.
+pub struct ProcessEnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    previous: Vec<(OsString, Option<OsString>)>,
+}
+
+impl ProcessEnvGuard {
+    pub fn new() -> Self {
+        Self {
+            _lock: home_override_serial(),
+            previous: Vec::new(),
+        }
+    }
+
+    pub fn set(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) {
+        let key = key.as_ref();
+        self.remember(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    pub fn remove(&mut self, key: impl AsRef<OsStr>) {
+        let key = key.as_ref();
+        self.remember(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+
+    fn remember(&mut self, key: &OsStr) {
+        self.previous
+            .push((key.to_os_string(), std::env::var_os(key)));
+    }
+}
+
+impl Drop for ProcessEnvGuard {
+    fn drop(&mut self) {
+        set_grokptah_home_override(None);
+        for (key, previous) in self.previous.drain(..).rev() {
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EndpointKind {
+    Desktop,
+    Hosted,
+}
+
+impl EndpointKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Desktop => "desktop",
+            Self::Hosted => "hosted",
+        }
+    }
+}
+
+enum EndpointInner {
+    Desktop {
+        server: ControlServerHandle,
+        host: AgentHostHandle,
+    },
+    Hosted {
+        handle: ServiceHandle,
+    },
+}
+
+struct Launched {
+    mcp: McpControlClient,
+    inner: EndpointInner,
+    addr: String,
+}
+
+struct Scenario {
+    raw: Value,
+}
+
+impl Scenario {
+    fn load() -> Self {
+        let text = std::fs::read_to_string(SCENARIO_PATH).expect("read scenario.json");
+        let raw: Value = serde_json::from_str(&text).expect("parse scenario.json");
+        assert_eq!(
+            raw["schema"].as_str(),
+            Some(FIXTURE_SCHEMA),
+            "scenario schema"
+        );
+        Self { raw }
+    }
+
+    fn str(&self, path: &[&str]) -> String {
+        let mut cur = &self.raw;
+        for key in path {
+            cur = &cur[*key];
+        }
+        cur.as_str()
+            .unwrap_or_else(|| panic!("scenario string {}", path.join(".")))
+            .to_string()
+    }
+
+    fn u64(&self, path: &[&str]) -> u64 {
+        let mut cur = &self.raw;
+        for key in path {
+            cur = &cur[*key];
+        }
+        cur.as_u64()
+            .unwrap_or_else(|| panic!("scenario u64 {}", path.join(".")))
+    }
+
+    fn bool(&self, path: &[&str]) -> bool {
+        let mut cur = &self.raw;
+        for key in path {
+            cur = &cur[*key];
+        }
+        cur.as_bool()
+            .unwrap_or_else(|| panic!("scenario bool {}", path.join(".")))
+    }
+
+    fn request_id(&self, name: &str) -> String {
+        self.str(&["requestIds", name])
+    }
+
+    fn max_ticks(&self) -> u64 {
+        self.u64(&["bounds", "maxLogicalTicks"])
+    }
+
+    fn yields(&self) -> u64 {
+        self.u64(&["bounds", "maxYieldsPerWait"])
+    }
+
+    fn native_ms(&self) -> u64 {
+        self.u64(&["bounds", "advanceNativeMs"])
+    }
+
+    fn supervisor_ms(&self) -> u64 {
+        self.u64(&["bounds", "advanceSupervisorMs"])
+    }
+
+    fn golden_selector(&self) -> BTreeMap<String, String> {
+        let Some(map) = self.raw["goldenSelector"].as_object() else {
+            panic!("scenario.json missing goldenSelector");
+        };
+        map.iter()
+            .map(|(key, value)| {
+                (
+                    key.clone(),
+                    value
+                        .as_str()
+                        .unwrap_or_else(|| panic!("goldenSelector.{key} must be a string"))
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+}
+
+struct RedactionHit {
+    path: String,
+    reason: String,
+}
+
+struct ScanCtx<'a> {
+    bearer: &'a str,
+    api_key: &'a str,
+    gateway: &'a str,
+    gateway_authority: &'a str,
+    marker: &'a str,
+    hits: Vec<RedactionHit>,
+}
+
+struct IdCanon {
+    map: BTreeMap<String, String>,
+}
+
+struct GatewayScript {
+    proposal_turns: Arc<AtomicUsize>,
+    restart_objective: String,
+    proposal_path: String,
+}
+
+#[derive(Debug)]
+struct ToolFail {
+    tool: String,
+    mcp_code: Option<String>,
+    detail: String,
+}
+
+fn blocked_overlay_result(
+    fail: ToolFail,
+    observations: Value,
+    advertised: Vec<String>,
+    readiness_supported: bool,
+) -> Value {
+    json!({
+        "schema": RESULT_SCHEMA,
+        "version": "v1",
+        "advertisedTools": advertised,
+        "features": {
+            "nativeCodingReadiness": if readiness_supported {
+                json!({ "support": "present" })
+            } else {
+                json!({ "support": "absent" })
+            }
+        },
+        "overlay": {
+            "completed": false,
+            "blockedTool": fail.tool,
+            "mcpError": match fail.mcp_code {
+                Some(code) => json!({ "code": code }),
+                None => json!({ "support": "absent" }),
+            },
+            "detail": fail.detail,
+        },
+        "observations": observations,
+        "assertions": {
+            "ordinaryNative": { "support": "absent" },
+            "manager": { "support": "absent" },
+            "restart": { "support": "absent" }
+        },
+        "transport": { "support": "absent" }
+    })
+}
+
+pub async fn run_fixture() {
+    let scenario = Scenario::load();
+    reject_golden_mutation_env();
+    let source = detect_audited_source_revision();
+    let golden_name = select_golden_file(&source, &scenario);
+    let golden_path = PathBuf::from(GOLDEN_DIR).join(golden_name);
+    let golden_before = snapshot_path(&golden_path);
+    // Fail closed before either backend launches. There is no recording
+    // hatch, pending calibration, or env-gated golden rewrite.
+    let expected = load_immutable_golden(&golden_path, &source);
+
+    let mut env = ProcessEnvGuard::new();
+    env.remove("GROKPTAH_AGENT_OFFLINE");
+    env.remove("XAI_API_KEY");
+    env.remove("OPENAI_API_KEY");
+    env.remove("OPENAI_BASE_URL");
+    env.remove("OPENAI_API_BASE");
+
+    let desktop = run_v1(EndpointKind::Desktop, &scenario, &mut env).await;
+    let hosted = run_v1(EndpointKind::Hosted, &scenario, &mut env).await;
+
+    let mut desktop_result = desktop.result.clone();
+    let mut hosted_result = hosted.result.clone();
+    stamp_source_revision(&mut desktop_result, &source);
+    stamp_source_revision(&mut hosted_result, &source);
+
+    let desktop_json = canonical_json(&desktop_result);
+    let hosted_json = canonical_json(&hosted_result);
+    let desktop_hash = sha256_hex(desktop_json.as_bytes());
+    let hosted_hash = sha256_hex(hosted_json.as_bytes());
+    eprintln!("shared-black-box-v1 audited source revision={source}");
+    eprintln!("shared-black-box-v1 selected golden={golden_name}");
+    eprintln!("shared-black-box-v1 desktop normalized sha256={desktop_hash}");
+    eprintln!("shared-black-box-v1 hosted normalized sha256={hosted_hash}");
+    eprintln!(
+        "shared-black-box-v1 desktop transport {:?}",
+        desktop_result["transport"]
+    );
+    eprintln!(
+        "shared-black-box-v1 hosted transport {:?}",
+        hosted_result["transport"]
+    );
+    dump_normalized_temp("desktop", &desktop_result);
+    dump_normalized_temp("hosted", &hosted_result);
+
+    let mut report = Vec::new();
+    if golden_before != snapshot_path(&golden_path) {
+        report.push(format!(
+            "immutable golden was rewritten during the run: {}",
+            golden_path.display()
+        ));
+    }
+    if desktop_json != hosted_json {
+        report.push(format!(
+            "desktop and hosted normalized JSON are not byte-equal\ndesktop={desktop_hash}\nhosted={hosted_hash}"
+        ));
+    }
+    match compare_normalized(&desktop_result, &expected) {
+        Ok(()) => {}
+        Err(errors) => report.push(format!(
+            "selected golden mismatch ({golden_name}):\n{}",
+            errors.join("\n")
+        )),
+    }
+    for (label, endpoint) in [("desktop", &desktop), ("hosted", &hosted)] {
+        if !endpoint.defects.is_empty() {
+            report.push(format!(
+                "{label} mutation-resistant assertions failed:\n{}",
+                endpoint.defects.join("\n")
+            ));
+        }
+        let (failing_hits, documented_leaks) = partition_redaction_hits(&endpoint.redaction_hits);
+        if !documented_leaks.is_empty() {
+            eprintln!(
+                "shared-black-box-v1 {label} documented public get_run/list_runs leak paths (non-process limitation; scan kept, not a hard fail):\n{}",
+                documented_leaks.join("\n")
+            );
+        }
+        if !failing_hits.is_empty() {
+            report.push(format!(
+                "{label} redaction scan failed; paths only (values omitted):\n{}",
+                failing_hits.join("\n")
+            ));
+        }
+    }
+    if report.is_empty() {
+        return;
+    }
+    panic!("{}", report.join("\n\n"));
+}
+
+struct EndpointOutcome {
+    result: Value,
+    defects: Vec<String>,
+    redaction_hits: Vec<String>,
+}
+
+fn collapse_redaction_path(hit: &str) -> String {
+    hit.chars()
+        .fold((String::new(), false), |(mut acc, in_index), ch| {
+            if ch == '[' {
+                acc.push_str("[]");
+                (acc, true)
+            } else if ch == ']' {
+                (acc, false)
+            } else if in_index {
+                (acc, true)
+            } else {
+                acc.push(ch);
+                (acc, false)
+            }
+        })
+        .0
+}
+
+fn collapse_redaction_hits(hits: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = hits
+        .iter()
+        .map(|hit| collapse_redaction_path(hit))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Public `ptah_get_run` / `ptah_list_runs` still advertise `providerRoute`
+/// `baseUrl` / `credentialRef` / `credentialFingerprint`. The scan must still
+/// report those paths; they are a remaining non-process product leak and must
+/// not by themselves fail this fixture after restart cardinality is 1.
+fn is_documented_public_run_leak(hit: &str) -> bool {
+    let (path, reason) = hit.split_once(": ").unwrap_or((hit, ""));
+    let mcp_run_payload_text = (path.contains("ptah_get_run") || path.contains("ptah_list_runs"))
+        && path.contains(".text")
+        && reason.contains("private gateway sentinel");
+    if mcp_run_payload_text {
+        return true;
+    }
+    if !path.contains("providerRoute") {
+        return false;
+    }
+    let forbidden_key = reason.contains("forbidden key")
+        && (path.ends_with(".baseUrl")
+            || path.ends_with(".credentialRef")
+            || path.ends_with(".credentialFingerprint"));
+    let gateway_in_base_url =
+        reason.contains("private gateway sentinel") && path.contains(".baseUrl");
+    forbidden_key || gateway_in_base_url
+}
+
+fn partition_redaction_hits(hits: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut failing = Vec::new();
+    let mut documented = Vec::new();
+    for hit in collapse_redaction_hits(hits) {
+        if is_documented_public_run_leak(&hit) {
+            documented.push(hit);
+        } else {
+            failing.push(hit);
+        }
+    }
+    (failing, documented)
+}
+
+async fn run_v1(
+    kind: EndpointKind,
+    scenario: &Scenario,
+    env: &mut ProcessEnvGuard,
+) -> EndpointOutcome {
+    let home_dir = TempDir::new().expect("temp home");
+    let workspace_dir = TempDir::new().expect("temp workspace");
+    let home = dunce::canonicalize(home_dir.path()).expect("canonicalize home");
+    let workspace = dunce::canonicalize(workspace_dir.path()).expect("canonicalize workspace");
+    env.set("HOME", &home);
+    env.set("GROK_HOME", home.join(".grok"));
+    std::fs::create_dir_all(home.join(".grok")).expect("grok home");
+    // Pin the catalog default so both adapters resolve the fixture modelId
+    // instead of grok-4.5 from the builtin preference list.
+    std::fs::write(
+        home.join(".grok").join("config.toml"),
+        format!(
+            "[models]\ndefault = \"{}\"\n",
+            scenario.str(&["identities", "modelId"])
+        ),
+    )
+    .expect("write grok config.toml");
+    set_grokptah_home_override(Some(home.clone()));
+
+    let token = scenario.str(&["secrets", "mcpBearer"]);
+    let api_key = scenario.str(&["secrets", "apiKey"]);
+    let marker = scenario.str(&["secrets", "privateGatewayMarker"]);
+    let restart_objective = scenario.str(&["objectives", "restartCut"]);
+    let proposal_path = scenario.str(&["proposal", "targetRelativePath"]);
+
+    let script = GatewayScript {
+        proposal_turns: Arc::new(AtomicUsize::new(0)),
+        restart_objective: restart_objective.clone(),
+        proposal_path: proposal_path.clone(),
+    };
+    let gateway = start_scripted_gateway(script).await;
+    let gateway_base = gateway.base_url().to_string();
+    let gateway_authority = gateway_base
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string();
+    env.set("GROKPTAH_API_BASE", format!("{gateway_base}/v1"));
+    env.set("GROKPTAH_API_KEY", &api_key);
+
+    let mut hits = Vec::new();
+    let mut launched = start_endpoint(kind, &home, &workspace, &token).await;
+    let gateway_http_before_auth = gateway.requests().len();
+    let workspace_files_before_auth = workspace_entry_count(&workspace);
+    assert_mcp_auth_zero_side_effects(&launched.addr, &token).await;
+    assert_eq!(
+        gateway.requests().len(),
+        gateway_http_before_auth,
+        "{} missing/wrong MCP auth must not send provider HTTP",
+        kind.as_str()
+    );
+    assert_eq!(
+        workspace_entry_count(&workspace),
+        workspace_files_before_auth,
+        "{} missing/wrong MCP auth must not write workspace files",
+        kind.as_str()
+    );
+    initialize_mcp(&mut launched).await;
+    let (result, mut launched, defects) = {
+        let mut scan = |value: &Value, origin: &str| {
+            scan_raw(
+                value,
+                origin,
+                &token,
+                &api_key,
+                &gateway_base,
+                &gateway_authority,
+                &marker,
+                &mut hits,
+            );
+        };
+        drive_six_phases(
+            kind,
+            scenario,
+            launched,
+            &home,
+            &workspace,
+            &token,
+            &gateway,
+            &proposal_path,
+            &mut scan,
+        )
+        .await
+    };
+
+    let _ = launched.mcp.close_session().await;
+    stop_endpoint(launched).await;
+    drop(gateway);
+    drop(home_dir);
+    drop(workspace_dir);
+
+    let redaction_hits: Vec<String> = hits
+        .iter()
+        .map(|hit| format!("{}: {}", hit.path, hit.reason))
+        .collect();
+
+    let mut normalized =
+        normalize_result(result, &workspace, &home, &gateway_base, &gateway_authority);
+    normalized["schema"] = json!(RESULT_SCHEMA);
+    normalized["version"] = json!("v1");
+    let mut normalized_hits = Vec::new();
+    scan_normalized_secrets(
+        &normalized,
+        &token,
+        &api_key,
+        &gateway_base,
+        &gateway_authority,
+        &marker,
+        &mut normalized_hits,
+    );
+    let mut all_hits = redaction_hits;
+    all_hits.extend(normalized_hits);
+    EndpointOutcome {
+        result: normalized,
+        defects,
+        redaction_hits: all_hits,
+    }
+}
+
+async fn start_scripted_gateway(script: GatewayScript) -> MockGateway {
+    let proposal_turns = script.proposal_turns.clone();
+    let restart_objective = script.restart_objective.clone();
+    let proposal_path = script.proposal_path.clone();
+    MockGateway::start_routed(move |request: &RecordedRequest| {
+        if request.path.starts_with("/v1/models") {
+            return Step::respond(Response::json_ok(&json!({
+                "object": "list",
+                "data": [{
+                    "id": "grok-build",
+                    "object": "model",
+                    "created": 1,
+                    "owned_by": "xai"
+                }]
+            })));
+        }
+        let body = request.body_str();
+        if body.contains(&restart_objective) {
+            return Step::stall();
+        }
+        if body.contains("Return exactly this JSON envelope") {
+            let turn = proposal_turns.fetch_add(1, Ordering::SeqCst);
+            if turn == 0 {
+                let arguments = json!({
+                    "path": proposal_path,
+                    "content": "must never be written\n"
+                })
+                .to_string();
+                return Step::respond(Response::json_ok(&json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "proposal-write",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": arguments
+                                }
+                            }]
+                        }
+                    }],
+                    "usage": {
+                        "prompt_tokens": 6,
+                        "completion_tokens": 4,
+                        "total_tokens": 10
+                    }
+                })));
+            }
+            let denied = body.contains("DENIED by deny rule")
+                && body.contains("write_file")
+                && body.contains("proposal-write");
+            if !denied {
+                return Step::respond(Response::json(
+                    500,
+                    &json!({"error": {"type": "fixture", "message": "proposal second turn without host denial"}}),
+                ));
+            }
+            let Some(envelope) = extract_json_object_after(&body, "Envelope: ") else {
+                return Step::respond(Response::json(
+                    500,
+                    &json!({"error": {"type": "fixture", "message": "missing exact envelope substring"}}),
+                ));
+            };
+            return Step::respond(Response::json_ok(&json!({
+                "choices": [{
+                    "message": { "content": envelope }
+                }],
+                "usage": {
+                    "prompt_tokens": 6,
+                    "completion_tokens": 4,
+                    "total_tokens": 10
+                }
+            })));
+        }
+        Step::respond(Response::json_ok(&json!({
+            "choices": [{
+                "message": { "content": "native route snapshot verified" }
+            }],
+            "usage": {
+                "prompt_tokens": 6,
+                "completion_tokens": 4,
+                "total_tokens": 10
+            }
+        })))
+    })
+    .await
+}
+
+async fn start_endpoint(
+    kind: EndpointKind,
+    home: &Path,
+    workspace: &Path,
+    token: &str,
+) -> Launched {
+    match kind {
+        EndpointKind::Desktop => {
+            let runtime_home = RuntimeHome::from_path(home).expect("desktop runtime home");
+            let host = AgentHost::create_with_runtime_home(HostConfig::default(), runtime_home);
+            host.start().expect("start desktop agent host");
+            let store = host
+                .ensure_orchestration_store()
+                .expect("desktop orchestration store");
+            let orch = OrchestrationService::new(
+                host.clone(),
+                host.event_bus(),
+                store,
+                OrchestrationConfig {
+                    bearer_token: token.to_string(),
+                    allowlist: WorkspaceAllowlist::new([workspace.to_path_buf()]),
+                    max_concurrent_runs: 4,
+                    bounds: Default::default(),
+                },
+            );
+            let server = start_control_server(orch, 0)
+                .await
+                .expect("desktop control server");
+            let addr = format!("http://{}", server.addr);
+            let mcp = McpControlClient::new(&addr, token);
+            Launched {
+                mcp,
+                inner: EndpointInner::Desktop { server, host },
+                addr,
+            }
+        }
+        EndpointKind::Hosted => {
+            let config = ServiceConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                token,
+                vec![workspace.to_path_buf()],
+                false,
+                4,
+                Duration::from_secs(120),
+            )
+            .expect("hosted service config")
+            .with_runtime_home(home)
+            .expect("hosted runtime home");
+            let handle = start_service(config).await.expect("start hosted service");
+            let addr = format!("http://{}", handle.addr);
+            let mcp = McpControlClient::new(&addr, token);
+            Launched {
+                mcp,
+                inner: EndpointInner::Hosted { handle },
+                addr,
+            }
+        }
+    }
+}
+
+async fn stop_endpoint(launched: Launched) {
+    match launched.inner {
+        EndpointInner::Desktop { server, host } => {
+            server.stop_and_wait().await;
+            let _ = host.stop();
+        }
+        EndpointInner::Hosted { handle } => {
+            handle.stop_and_wait().await;
+        }
+    }
+}
+
+async fn restart_endpoint(
+    kind: EndpointKind,
+    launched: Launched,
+    home: &Path,
+    workspace: &Path,
+    token: &str,
+) -> Launched {
+    let _ = launched.mcp;
+    stop_endpoint(launched).await;
+    yield_budget(16).await;
+    let mut next = start_endpoint(kind, home, workspace, token).await;
+    initialize_mcp(&mut next).await;
+    next
+}
+
+async fn settle_native(scenario: &Scenario) {
+    for _ in 0..8 {
+        tokio::time::advance(Duration::from_millis(scenario.native_ms())).await;
+        yield_budget(scenario.yields() as usize).await;
+    }
+}
+
+async fn assert_mcp_auth_zero_side_effects(addr: &str, valid_token: &str) {
+    let missing = probe_mcp_initialize(addr, None).await;
+    assert_auth_rejected(&missing, "missing bearer");
+    let wrong = probe_mcp_initialize(addr, Some("sbb-v1-wrong-bearer-not-the-secret")).await;
+    assert_auth_rejected(&wrong, "wrong bearer");
+    let valid_len = valid_token.len();
+    assert!(valid_len > 16, "fixture bearer must be a real secret");
+}
+
+struct AuthProbe {
+    status: u16,
+    body: Option<Value>,
+}
+
+fn assert_auth_rejected(probe: &AuthProbe, label: &str) {
+    let code = probe
+        .body
+        .as_ref()
+        .and_then(|body| body.pointer("/error/data/code"))
+        .and_then(Value::as_str);
+    let unauthenticated = probe.status == 401
+        || code == Some("unauthenticated")
+        || probe
+            .body
+            .as_ref()
+            .and_then(|body| body.pointer("/error/message"))
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.to_ascii_lowercase().contains("unauthenticated"));
+    assert!(
+        unauthenticated,
+        "{label} must fail closed without a session: status={} body={:?}",
+        probe.status, probe.body
+    );
+}
+
+async fn probe_mcp_initialize(base: &str, bearer: Option<&str>) -> AuthProbe {
+    let mut req = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("auth probe client")
+        .post(format!("{}/mcp", base.trim_end_matches('/')))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2025-03-26")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": { "name": "sbb-v1-auth-probe", "version": "0" }
+            }
+        }));
+    if let Some(token) = bearer {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let resp = req.send().await.expect("auth probe request");
+    let status = resp.status().as_u16();
+    let body = resp.json::<Value>().await.ok();
+    AuthProbe { status, body }
+}
+
+fn workspace_entry_count(workspace: &Path) -> usize {
+    fn walk(path: &Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| {
+                let child = entry.path();
+                if child.is_dir() {
+                    walk(&child)
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+    walk(workspace)
+}
+
+async fn initialize_mcp(launched: &mut Launched) {
+    yield_budget(16).await;
+    launched
+        .mcp
+        .initialize()
+        .await
+        .unwrap_or_else(|error| panic!("initialize {}: {error}", launched.addr));
+}
+
+type ScanFn<'a> = dyn FnMut(&Value, &str) + 'a;
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_six_phases(
+    kind: EndpointKind,
+    scenario: &Scenario,
+    mut launched: Launched,
+    home: &Path,
+    workspace: &Path,
+    token: &str,
+    gateway: &MockGateway,
+    proposal_file: &str,
+    scan: &mut ScanFn<'_>,
+) -> (Value, Launched, Vec<String>) {
+    let workspace_text = workspace.display().to_string();
+    let mut advertised: Vec<String> = Vec::new();
+    let mut readiness_supported = false;
+    let mut observations = json!({});
+    macro_rules! require {
+        ($expr:expr) => {
+            match $expr {
+                Ok(value) => value,
+                Err(fail) => {
+                    return (
+                        blocked_overlay_result(
+                            fail,
+                            observations,
+                            advertised.clone(),
+                            readiness_supported,
+                        ),
+                        launched,
+                        Vec::new(),
+                    );
+                }
+            }
+        };
+    }
+
+    // Phase 1: discovery / readiness through tools/list and optional readiness.
+    let tools = require!(launched.mcp.list_tools().await.map_err(|error| ToolFail {
+        tool: "tools/list".into(),
+        mcp_code: None,
+        detail: error.to_string(),
+    }));
+    advertised = {
+        let mut names = tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let tools_value = json!(advertised
+        .iter()
+        .map(|name| json!(name))
+        .collect::<Vec<_>>());
+    scan(&tools_value, "tools/list");
+
+    let capacity0 =
+        require!(call_ok(&mut launched.mcp, "ptah_get_capacity", json!({}), scan).await);
+    readiness_supported = advertised
+        .iter()
+        .any(|name| name == "ptah_get_native_coding_readiness");
+    let readiness = if readiness_supported {
+        require!(
+            call_ok(
+                &mut launched.mcp,
+                "ptah_get_native_coding_readiness",
+                json!({}),
+                scan,
+            )
+            .await
+        )
+    } else {
+        json!({ "support": "absent" })
+    };
+    observations["discovery"] = json!({
+        "capacity": capacity0,
+        "readiness": readiness
+    });
+
+    // Phase 2: native admission / quota.
+    let session = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_create_session",
+            json!({
+                "workspace": workspace_text,
+                "title": scenario.str(&["identities", "sessionTitle"])
+            }),
+            scan,
+        )
+        .await
+    );
+    let session_id = session["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_string();
+
+    let bootstrap = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_submit_task",
+            json!({
+                "request_id": scenario.request_id("bootstrapSubmit"),
+                "session_id": session_id,
+                "workspace": workspace_text,
+                "prompt": scenario.str(&["objectives", "bootstrap"])
+            }),
+            scan,
+        )
+        .await
+    );
+    let bootstrap_run = bootstrap["runId"]
+        .as_str()
+        .expect("bootstrap runId")
+        .to_string();
+    require!(
+        wait_run_terminal(
+            &mut launched,
+            scenario,
+            &session_id,
+            &workspace_text,
+            &bootstrap_run,
+            scan,
+        )
+        .await
+    );
+
+    let agents = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_list_persistent_agents",
+            json!({}),
+            scan,
+        )
+        .await
+    );
+    let agent_id = agents["agents"]
+        .as_array()
+        .expect("agents")
+        .iter()
+        .find_map(|agent| agent["agentId"].as_str())
+        .expect("bootstrap agent")
+        .to_string();
+
+    let managed_policy = json!({
+        "enabled": scenario.bool(&["policies", "managed", "enabled"]),
+        "maxConcurrentRuns": scenario.u64(&["policies", "managed", "maxConcurrentRuns"]),
+        "retryEligible": scenario.bool(&["policies", "managed", "retryEligible"]),
+        "requiresApprovalBeforeExecution": scenario.bool(&["policies", "managed", "requiresApprovalBeforeExecution"]),
+        "allowedWorkKinds": scenario.raw["policies"]["managed"]["allowedWorkKinds"].clone(),
+        "bounds": {
+            "maxPromptBytes": 65536,
+            "maxRounds": 8,
+            "maxDurationMs": 300000,
+            "maxTotalTokens": scenario.u64(&["policies", "managed", "maxTotalTokens"])
+        }
+    });
+    require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_set_managed_execution",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace_text,
+                "agent_id": agent_id,
+                "policy": managed_policy
+            }),
+            scan,
+        )
+        .await
+    );
+    let managed = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_get_managed_execution",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace_text,
+                "agent_id": agent_id
+            }),
+            scan,
+        )
+        .await
+    );
+
+    let native_objective = scenario.str(&["objectives", "ordinaryNative"]);
+    let native_work = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_create_work",
+            json!({
+                "request_id": scenario.request_id("createNativeWork"),
+                "session_id": session_id,
+                "workspace": workspace_text,
+                "kind": "native",
+                "objective": native_objective,
+                "policy": work_policy(&scenario.raw["policies"]["ordinaryNativeWork"])
+            }),
+            scan,
+        )
+        .await
+    );
+    let native_work_id = native_work["work"]["workId"]
+        .as_str()
+        .expect("native workId")
+        .to_string();
+    require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_assign_work",
+            json!({
+                "request_id": scenario.request_id("assignNativeWork"),
+                "session_id": session_id,
+                "workspace": workspace_text,
+                "work_id": native_work_id,
+                "assigned_agent_id": agent_id
+            }),
+            scan,
+        )
+        .await
+    );
+    observations["native"] = json!({
+        "session": session,
+        "managed": managed,
+        "createWork": native_work
+    });
+
+    require!(
+        wait_work_state(
+            &mut launched,
+            scenario,
+            &session_id,
+            &workspace_text,
+            &native_work_id,
+            &["succeeded"],
+            Duration::from_millis(scenario.native_ms()),
+            scan,
+        )
+        .await
+    );
+
+    let native_get = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_get_work",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace_text,
+                "work_id": native_work_id
+            }),
+            scan,
+        )
+        .await
+    );
+    let listed_work = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_list_work",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace_text
+            }),
+            scan,
+        )
+        .await
+    );
+    let intents = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_list_execution_intents",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace_text
+            }),
+            scan,
+        )
+        .await
+    );
+    let runs = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_list_runs",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace_text
+            }),
+            scan,
+        )
+        .await
+    );
+    let native_run_id = require!(run_id_for_work(&runs, &intents, &native_work_id));
+    let native_get_run = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_get_run",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace_text,
+                "run_id": native_run_id
+            }),
+            scan,
+        )
+        .await
+    );
+    let capacity_native =
+        require!(call_ok(&mut launched.mcp, "ptah_get_capacity", json!({}), scan).await);
+    let native_http = chat_requests_containing(gateway, &native_objective);
+    observations["native"] = json!({
+        "session": session,
+        "managed": managed,
+        "createWork": native_work,
+        "work": native_get,
+        "listWork": listed_work,
+        "intents": intents,
+        "runs": runs,
+        "getRun": native_get_run,
+        "capacity": capacity_native
+    });
+
+    // Phase 3: autonomous manager plan.
+    let plan = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_create_manager_plan",
+            json!({
+                "request_id": scenario.request_id("createManagerPlan"),
+                "session_id": session_id,
+                "workspace": workspace_text,
+                "manager_agent_id": agent_id,
+                "objective": scenario.str(&["objectives", "managerGoal"]),
+                "steps": [{
+                    "stepId": "inspect",
+                    "kind": "native",
+                    "objective": "shared-black-box-v1-manager-child"
+                }],
+                "max_in_flight": scenario.u64(&["policies", "managerPlan", "maxInFlight"]),
+                "autonomous": scenario.bool(&["policies", "managerPlan", "autonomous"])
+            }),
+            scan,
+        )
+        .await
+    );
+    let plan_id = plan["plan"]["planId"].as_str().expect("planId").to_string();
+    yield_budget(scenario.yields() as usize).await;
+    let child_id = require!(
+        wait_child_work(
+            &mut launched,
+            scenario,
+            &session_id,
+            &workspace_text,
+            &plan_id,
+            scan,
+        )
+        .await
+    );
+    require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_cancel_work",
+            json!({
+                "request_id": scenario.request_id("cancelChildWork"),
+                "session_id": session_id,
+                "workspace": workspace_text,
+                "work_id": child_id,
+                "reason": "drive needs_replan for proposal-only decision"
+            }),
+            scan,
+        )
+        .await
+    );
+
+    let decision_work_id = require!(
+        wait_decision_work(
+            &mut launched,
+            scenario,
+            &session_id,
+            &workspace_text,
+            &plan_id,
+            scan,
+        )
+        .await
+    );
+    require!(
+        wait_work_state(
+            &mut launched,
+            scenario,
+            &session_id,
+            &workspace_text,
+            &decision_work_id,
+            &["succeeded", "failed", "cancelled"],
+            Duration::from_millis(scenario.native_ms()),
+            scan,
+        )
+        .await
+    );
+
+    let plans = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_list_manager_plans",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace_text
+            }),
+            scan,
+        )
+        .await
+    );
+    let got_plan = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_get_manager_plan",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace_text,
+                "plan_id": plan_id
+            }),
+            scan,
+        )
+        .await
+    );
+    let decision_get = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_get_work",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace_text,
+                "work_id": decision_work_id
+            }),
+            scan,
+        )
+        .await
+    );
+    let intents_manager = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_list_execution_intents",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace_text
+            }),
+            scan,
+        )
+        .await
+    );
+    let runs_manager = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_list_runs",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace_text
+            }),
+            scan,
+        )
+        .await
+    );
+    let decision_run_id = require!(run_id_for_work(
+        &runs_manager,
+        &intents_manager,
+        &decision_work_id
+    ));
+    let decision_run = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_get_run",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace_text,
+                "run_id": decision_run_id
+            }),
+            scan,
+        )
+        .await
+    );
+
+    // Phase 4: proposal-only malicious write_file.
+    let proposal_abs = workspace.join(proposal_file);
+    let file_exists = proposal_abs.exists();
+    let proposal_http = chat_requests_containing(gateway, "Return exactly this JSON envelope");
+    let denial_http = gateway
+        .requests()
+        .iter()
+        .filter(|request| {
+            let body = request.body_str();
+            body.contains("Return exactly this JSON envelope")
+                && body.contains("DENIED by deny rule")
+        })
+        .count();
+    let permission_requests = decision_run
+        .pointer("/aggregates/permissionsRequested")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let permission_grants = decision_run
+        .pointer("/aggregates/permissionsGranted")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+
+    // Phase 5: restart cut.
+    let restart_objective = scenario.str(&["objectives", "restartCut"]);
+    let restart_work = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_create_work",
+            json!({
+                "request_id": scenario.request_id("createRestartWork"),
+                "session_id": session_id,
+                "workspace": workspace_text,
+                "kind": "native",
+                "objective": restart_objective,
+                "policy": work_policy(&scenario.raw["policies"]["restartWork"])
+            }),
+            scan,
+        )
+        .await
+    );
+    let restart_work_id = restart_work["work"]["workId"]
+        .as_str()
+        .expect("restart workId")
+        .to_string();
+    require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_assign_work",
+            json!({
+                "request_id": scenario.request_id("assignRestartWork"),
+                "session_id": session_id,
+                "workspace": workspace_text,
+                "work_id": restart_work_id,
+                "assigned_agent_id": agent_id
+            }),
+            scan,
+        )
+        .await
+    );
+    // Wait until MockGateway has accepted+recorded the restart request. The
+    // routed stall returns Step::stall after recording, so the connection is
+    // held before any response bytes. Do not wait for a provider response.
+    let saw_restart_send = wait_until(
+        scenario,
+        Duration::from_millis(scenario.native_ms()),
+        || async { chat_requests_containing(gateway, &restart_objective) >= 1 },
+    )
+    .await;
+    if !saw_restart_send {
+        require!(Err::<(), ToolFail>(ToolFail {
+            tool: "fake-provider".into(),
+            mcp_code: None,
+            detail: format!(
+                "{} restart-cut did not reach the fake provider before stop",
+                kind.as_str()
+            ),
+        }));
+    }
+    let restart_http_before = chat_requests_containing(gateway, &restart_objective);
+    // Recorded request means MockGateway finished read_request, then the
+    // restart-cut route returned Step::stall (pending, no response bytes).
+    // Stop now; do not wait for a provider body. Paused Tokio time cannot
+    // complete that pending future.
+    if restart_http_before != 1 {
+        require!(Err::<(), ToolFail>(ToolFail {
+            tool: "fake-provider".into(),
+            mcp_code: None,
+            detail: format!(
+                "{} restart-cut must send exactly one provider request before stop, saw {restart_http_before}",
+                kind.as_str()
+            ),
+        }));
+    }
+    let stall_held_after_accept = restart_http_before == 1;
+
+    launched = restart_endpoint(kind, launched, home, workspace, token).await;
+    settle_native(scenario).await;
+    launched = restart_endpoint(kind, launched, home, workspace, token).await;
+    settle_native(scenario).await;
+
+    let post1 = require!(
+        restart_observation(
+            &mut launched,
+            &session_id,
+            &workspace_text,
+            &restart_work_id,
+            gateway,
+            &restart_objective,
+            scan,
+        )
+        .await
+    );
+    let post2 = require!(
+        restart_observation(
+            &mut launched,
+            &session_id,
+            &workspace_text,
+            &restart_work_id,
+            gateway,
+            &restart_objective,
+            scan,
+        )
+        .await
+    );
+    let gateway_base = gateway.base_url().to_string();
+    let gateway_authority = gateway_base
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string();
+    let post1_norm = normalize_result(
+        post1.clone(),
+        workspace,
+        home,
+        &gateway_base,
+        &gateway_authority,
+    );
+    let post2_norm = normalize_result(
+        post2.clone(),
+        workspace,
+        home,
+        &gateway_base,
+        &gateway_authority,
+    );
+    let mut defects: Vec<String> = Vec::new();
+    if serde_json::to_string(&post1_norm).unwrap() != serde_json::to_string(&post2_norm).unwrap() {
+        defects.push(format!(
+            "{} post-restart observations did not converge after stripping declared transport-volatile fields",
+            kind.as_str()
+        ));
+    }
+
+    let restart_http_after = chat_requests_containing(gateway, &restart_objective);
+    let listed_after = require!(
+        call_ok(
+            &mut launched.mcp,
+            "ptah_list_work",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace_text
+            }),
+            scan,
+        )
+        .await
+    );
+
+    let native_intent_count = count_matching(&intents["intents"], "workId", &native_work_id);
+    let native_run_count = count_runs_for_work(&runs, &intents, &native_work_id);
+    let native_attempts = native_get["attempts"].as_array().map(Vec::len).unwrap_or(0);
+    let native_provider_attempts =
+        u64_or_absent(native_get_run.pointer("/providerExecution/attemptCount"));
+    let native_quota_state =
+        str_or_absent(native_get_run.pointer("/providerExecution/quota/state"));
+    let native_tokens = u64_or_absent(
+        native_get_run
+            .pointer("/providerExecution/attempts/0/usage/total_tokens")
+            .or_else(|| native_get_run.pointer("/providerExecution/attempts/0/usage/totalTokens"))
+            .or_else(|| native_get_run.pointer("/aggregates/usage/totalTokens")),
+    );
+    let native_requests = u64_or_absent(
+        native_get_run
+            .pointer("/providerExecution/attempts/0/usage/requests")
+            .or_else(|| native_get_run.pointer("/aggregates/usage/requests")),
+    );
+
+    let decision_intent_count =
+        count_matching(&intents_manager["intents"], "workId", &decision_work_id);
+    let restart_work_row = find_work(&listed_after, &restart_work_id);
+    let restart_attempt_count = post1["work"]["attempts"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0);
+    let restart_intent_count =
+        count_matching(&post1["intents"]["intents"], "workId", &restart_work_id);
+    let restart_run_count =
+        count_runs_for_work(&post1["runs"], &post1["intents"], &restart_work_id);
+    let restart_send =
+        str_or_absent(post1["getRun"].pointer("/providerExecution/attempts/0/sendCertainty"));
+    let restart_retry =
+        str_or_absent(post1["getRun"].pointer("/providerExecution/attempts/0/retryClass"));
+    let restart_quota = str_or_absent(post1["getRun"].pointer("/providerExecution/quota/state"));
+    let restart_queued = restart_work_row.get("state").and_then(Value::as_str) == Some("queued");
+    let restart_provider_attempts =
+        u64_or_absent(post1["getRun"].pointer("/providerExecution/attemptCount"));
+    let restart_tuple = restart_tuple_links(&post1, &restart_work_id);
+
+    let ordinary = json!({
+        "work": 1,
+        "intent": native_intent_count,
+        "run": native_run_count,
+        "providerAttempt": native_provider_attempts,
+        "workAttempts": native_attempts,
+        "http": native_http,
+        "quotaState": native_quota_state,
+        "requests": native_requests,
+        "tokens": native_tokens
+    });
+    let manager_obs = json!({
+        "decisionWork": 1,
+        "decisionIntent": decision_intent_count,
+        "decisionRun": if decision_run_id.is_empty() { 0 } else { 1 },
+        "proposalHttp": proposal_http,
+        "hostDenials": denial_http,
+        "permissionRequests": permission_requests,
+        "permissionGrants": permission_grants,
+        "filesystemWrites": if file_exists { 1 } else { 0 },
+        "purpose": decision_run["purpose"]
+    });
+    let restart_obs = json!({
+        "work": 1,
+        "workAttempt": restart_attempt_count,
+        "intent": restart_intent_count,
+        "run": restart_run_count,
+        "providerAttempt": restart_provider_attempts,
+        "sendCertainty": restart_send,
+        "retryClass": restart_retry,
+        "quotaState": restart_quota,
+        "http": restart_http_after,
+        "queued": restart_queued,
+        "stallHeldAfterAccept": stall_held_after_accept,
+        "httpBeforeStop": restart_http_before,
+        "tuple": restart_tuple["tuple"].clone()
+    });
+
+    push_mismatch(
+        &mut defects,
+        "ordinary.intent",
+        &ordinary["intent"],
+        json!(1),
+    );
+    push_mismatch(&mut defects, "ordinary.run", &ordinary["run"], json!(1));
+    push_mismatch(
+        &mut defects,
+        "ordinary.providerAttempt",
+        &ordinary["providerAttempt"],
+        json!(1),
+    );
+    push_mismatch(&mut defects, "ordinary.http", &ordinary["http"], json!(1));
+    push_mismatch(
+        &mut defects,
+        "ordinary.tokens",
+        &ordinary["tokens"],
+        json!(10),
+    );
+    push_mismatch(
+        &mut defects,
+        "ordinary.requests",
+        &ordinary["requests"],
+        json!(1),
+    );
+    push_mismatch(
+        &mut defects,
+        "ordinary.quotaState",
+        &ordinary["quotaState"],
+        json!("consumed"),
+    );
+    push_mismatch(
+        &mut defects,
+        "manager.proposalHttp",
+        &manager_obs["proposalHttp"],
+        json!(2),
+    );
+    push_mismatch(
+        &mut defects,
+        "manager.hostDenials",
+        &manager_obs["hostDenials"],
+        json!(1),
+    );
+    push_mismatch(
+        &mut defects,
+        "manager.permissionRequests",
+        &manager_obs["permissionRequests"],
+        json!(0),
+    );
+    push_mismatch(
+        &mut defects,
+        "manager.permissionGrants",
+        &manager_obs["permissionGrants"],
+        json!(0),
+    );
+    push_mismatch(
+        &mut defects,
+        "manager.filesystemWrites",
+        &manager_obs["filesystemWrites"],
+        json!(0),
+    );
+    push_mismatch(
+        &mut defects,
+        "manager.purpose",
+        &manager_obs["purpose"],
+        json!("manager_proposal"),
+    );
+    push_mismatch(
+        &mut defects,
+        "restart.workAttempt",
+        &restart_obs["workAttempt"],
+        json!(1),
+    );
+    push_mismatch(
+        &mut defects,
+        "restart.intent",
+        &restart_obs["intent"],
+        json!(1),
+    );
+    push_mismatch(&mut defects, "restart.run", &restart_obs["run"], json!(1));
+    push_mismatch(
+        &mut defects,
+        "restart.providerAttempt",
+        &restart_obs["providerAttempt"],
+        json!(1),
+    );
+    push_mismatch(&mut defects, "restart.http", &restart_obs["http"], json!(1));
+    push_mismatch(
+        &mut defects,
+        "restart.stallHeldAfterAccept",
+        &restart_obs["stallHeldAfterAccept"],
+        json!(true),
+    );
+    push_mismatch(
+        &mut defects,
+        "restart.queued",
+        &restart_obs["queued"],
+        json!(false),
+    );
+    if restart_obs["sendCertainty"] != "uncertain_accept"
+        && restart_obs["sendCertainty"] != "UncertainAccept"
+    {
+        defects.push(format!(
+            "restart.sendCertainty: actual={} expected=uncertain_accept",
+            restart_obs["sendCertainty"]
+        ));
+    }
+    if restart_obs["retryClass"] != "explicit_new_run_only"
+        && restart_obs["retryClass"] != "ExplicitNewRunOnly"
+    {
+        defects.push(format!(
+            "restart.retryClass: actual={} expected=explicit_new_run_only",
+            restart_obs["retryClass"]
+        ));
+    }
+    push_mismatch(
+        &mut defects,
+        "restart.quotaState",
+        &restart_obs["quotaState"],
+        json!("reserved"),
+    );
+    if let Some(link_errors) = restart_tuple["errors"].as_array() {
+        for error in link_errors {
+            if let Some(text) = error.as_str() {
+                defects.push(text.to_string());
+            }
+        }
+    }
+    let leak_paths = leak_paths(&post1["getRun"]);
+    if !leak_paths.is_empty() {
+        eprintln!(
+            "shared-black-box-v1 documented public get_run leak paths (non-process limitation): {}",
+            leak_paths.join(", ")
+        );
+    }
+
+    let result = json!({
+        "schema": RESULT_SCHEMA,
+        "version": "v1",
+        "advertisedTools": advertised,
+        "features": {
+            "nativeCodingReadiness": if readiness_supported {
+                json!({ "support": "present" })
+            } else {
+                json!({ "support": "absent" })
+            }
+        },
+        "observations": {
+            "discovery": {
+                "capacity": capacity0,
+                "readiness": readiness
+            },
+            "native": {
+                "session": session,
+                "managed": managed,
+                "work": native_get,
+                "listWork": listed_work,
+                "intents": intents,
+                "runs": runs,
+                "getRun": native_get_run,
+                "capacity": capacity_native
+            },
+            "manager": {
+                "create": plan,
+                "list": plans,
+                "get": got_plan,
+                "childWorkId": child_id,
+                "decisionWork": decision_get,
+                "decisionRun": decision_run
+            },
+            "proposal": {
+                "targetRelativePath": proposal_file,
+                "fileExists": file_exists,
+                "hostDenials": denial_http
+            },
+            "restart": {
+                "httpBeforeStop": restart_http_before,
+                "stallHeldAfterAccept": stall_held_after_accept,
+                "postRestart": [post1, post2]
+            }
+        },
+        "assertions": {
+            "ordinaryNative": ordinary,
+            "manager": manager_obs,
+            "restart": restart_obs
+        },
+        "transport": {
+            "ordinaryNativeHttp": native_http,
+            "proposalHttp": proposal_http,
+            "restartHttp": restart_http_after,
+            "headerCardinalities": header_cardinalities(gateway)
+        }
+    });
+    (result, launched, defects)
+}
+
+async fn restart_observation(
+    launched: &mut Launched,
+    session_id: &str,
+    workspace: &str,
+    restart_work_id: &str,
+    gateway: &MockGateway,
+    restart_objective: &str,
+    scan: &mut ScanFn<'_>,
+) -> Result<Value, ToolFail> {
+    let work = call_ok(
+        &mut launched.mcp,
+        "ptah_get_work",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace,
+            "work_id": restart_work_id
+        }),
+        scan,
+    )
+    .await?;
+    let intents = call_ok(
+        &mut launched.mcp,
+        "ptah_list_execution_intents",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace
+        }),
+        scan,
+    )
+    .await?;
+    let runs = call_ok(
+        &mut launched.mcp,
+        "ptah_list_runs",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace
+        }),
+        scan,
+    )
+    .await?;
+    let run_id = run_id_for_work(&runs, &intents, restart_work_id)?;
+    let get_run = call_ok(
+        &mut launched.mcp,
+        "ptah_get_run",
+        json!({
+            "session_id": session_id,
+            "workspace": workspace,
+            "run_id": run_id
+        }),
+        scan,
+    )
+    .await?;
+    let capacity = call_ok(&mut launched.mcp, "ptah_get_capacity", json!({}), scan).await?;
+    Ok(json!({
+        "work": work,
+        "intents": intents,
+        "runs": runs,
+        "getRun": get_run,
+        "capacity": capacity,
+        "http": chat_requests_containing(gateway, restart_objective)
+    }))
+}
+
+fn count_matching(arr: &Value, field: &str, expected: &str) -> usize {
+    arr.as_array()
+        .map(|items| items.iter().filter(|item| item[field] == expected).count())
+        .unwrap_or(0)
+}
+
+fn count_runs_for_work(runs: &Value, intents: &Value, work_id: &str) -> usize {
+    let ids: Vec<String> = intents["intents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|intent| intent["workId"] == work_id)
+        .filter_map(|intent| intent["runId"].as_str().map(str::to_string))
+        .collect();
+    if ids.is_empty() {
+        return 0;
+    }
+    runs["runs"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|run| {
+                    run["runId"]
+                        .as_str()
+                        .is_some_and(|id| ids.iter().any(|want| want == id))
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn find_work(listed: &Value, work_id: &str) -> Value {
+    listed["work"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["workId"] == work_id))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn work_policy(node: &Value) -> Value {
+    json!({
+        "bounds": node["bounds"],
+        "retry": node["retry"],
+        "requiresApproval": false,
+        "maxConcurrentAttempts": 1
+    })
+}
+
+fn chat_requests_containing(gateway: &MockGateway, needle: &str) -> usize {
+    gateway
+        .requests()
+        .iter()
+        .filter(|request| {
+            request.path.contains("chat/completions") && request.body_str().contains(needle)
+        })
+        .count()
+}
+
+fn header_cardinalities(gateway: &MockGateway) -> Value {
+    let mut rows = Vec::new();
+    for request in gateway.requests() {
+        if !request.path.contains("chat/completions") {
+            continue;
+        }
+        let mut names: BTreeMap<String, usize> = BTreeMap::new();
+        let mut authorization_present = false;
+        for (name, _) in &request.headers {
+            let key = name.to_ascii_lowercase();
+            if key == "authorization" {
+                authorization_present = true;
+            }
+            *names.entry(key).or_insert(0) += 1;
+        }
+        rows.push(json!({
+            "path": "/v1/chat/completions",
+            "method": request.method,
+            "headerNames": names,
+            "authorizationPresent": authorization_present,
+            "bodyLen": request.body.len()
+        }));
+    }
+    json!(rows)
+}
+
+async fn call_ok(
+    mcp: &mut McpControlClient,
+    name: &str,
+    arguments: Value,
+    scan: &mut ScanFn<'_>,
+) -> Result<Value, ToolFail> {
+    match mcp.call_tool(name, arguments.clone()).await {
+        Ok(result) => {
+            scan(&result.raw, name);
+            scan(&result.structured, name);
+            if result.is_error {
+                return Err(ToolFail {
+                    tool: name.to_string(),
+                    mcp_code: Some("is_error".into()),
+                    detail: result.raw.to_string(),
+                });
+            }
+            Ok(result.structured)
+        }
+        Err(error) => {
+            if let Some(remote) = error.downcast_ref::<McpRemoteError>() {
+                let code = remote.data_code().unwrap_or("unknown");
+                let wrapped = json!({ "mcpError": { "code": code } });
+                scan(&wrapped, name);
+                return Err(ToolFail {
+                    tool: name.to_string(),
+                    mcp_code: Some(code.to_string()),
+                    detail: error.to_string(),
+                });
+            }
+            Err(ToolFail {
+                tool: name.to_string(),
+                mcp_code: None,
+                detail: error.to_string(),
+            })
+        }
+    }
+}
+
+async fn call_scanned(
+    mcp: &mut McpControlClient,
+    name: &str,
+    arguments: Value,
+    scan: &mut ScanFn<'_>,
+) -> Result<Value, String> {
+    match mcp.call_tool(name, arguments).await {
+        Ok(result) => {
+            scan(&result.raw, name);
+            scan(&result.structured, name);
+            if result.is_error {
+                return Err(format!("{name} isError"));
+            }
+            Ok(result.structured)
+        }
+        Err(error) => {
+            if let Some(remote) = error.downcast_ref::<McpRemoteError>() {
+                let code = remote.data_code().unwrap_or("unknown");
+                scan(&json!({ "mcpError": { "code": code } }), name);
+                return Err(code.to_string());
+            }
+            Err(error.to_string())
+        }
+    }
+}
+
+async fn yield_budget(n: usize) {
+    for _ in 0..n {
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_until<F, Fut>(scenario: &Scenario, advance: Duration, mut pred: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..scenario.max_ticks() {
+        yield_budget(scenario.yields() as usize).await;
+        if pred().await {
+            return true;
+        }
+        tokio::time::advance(advance).await;
+    }
+    yield_budget(scenario.yields() as usize).await;
+    pred().await
+}
+
+async fn wait_run_terminal(
+    launched: &mut Launched,
+    scenario: &Scenario,
+    session_id: &str,
+    workspace: &str,
+    run_id: &str,
+    scan: &mut ScanFn<'_>,
+) -> Result<(), ToolFail> {
+    let advance = Duration::from_millis(scenario.native_ms());
+    for _ in 0..scenario.max_ticks() {
+        yield_budget(scenario.yields() as usize).await;
+        let run = call_ok(
+            &mut launched.mcp,
+            "ptah_get_run",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace,
+                "run_id": run_id
+            }),
+            scan,
+        )
+        .await?;
+        if matches!(
+            run["state"].as_str(),
+            Some("completed" | "failed" | "cancelled" | "interrupted" | "limit_reached")
+        ) {
+            return Ok(());
+        }
+        tokio::time::advance(advance).await;
+    }
+    Err(ToolFail {
+        tool: "ptah_get_run".into(),
+        mcp_code: None,
+        detail: format!("bootstrap/run {run_id} did not become terminal"),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_work_state(
+    launched: &mut Launched,
+    scenario: &Scenario,
+    session_id: &str,
+    workspace: &str,
+    work_id: &str,
+    states: &[&str],
+    advance: Duration,
+    scan: &mut ScanFn<'_>,
+) -> Result<(), ToolFail> {
+    for _ in 0..scenario.max_ticks() {
+        yield_budget(scenario.yields() as usize).await;
+        let snap = call_ok(
+            &mut launched.mcp,
+            "ptah_get_work",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace,
+                "work_id": work_id
+            }),
+            scan,
+        )
+        .await?;
+        if snap["work"]["state"]
+            .as_str()
+            .is_some_and(|state| states.contains(&state))
+        {
+            return Ok(());
+        }
+        tokio::time::advance(advance).await;
+    }
+    Err(ToolFail {
+        tool: "ptah_get_work".into(),
+        mcp_code: None,
+        detail: format!("work {work_id} did not reach {states:?}"),
+    })
+}
+
+async fn wait_child_work(
+    launched: &mut Launched,
+    scenario: &Scenario,
+    session_id: &str,
+    workspace: &str,
+    plan_id: &str,
+    scan: &mut ScanFn<'_>,
+) -> Result<String, ToolFail> {
+    let advance = Duration::from_millis(scenario.supervisor_ms());
+    let mut tick_seq = 0u64;
+    for _ in 0..scenario.max_ticks() {
+        yield_budget(scenario.yields() as usize).await;
+        wake_manager_plan(
+            launched,
+            scenario,
+            session_id,
+            workspace,
+            plan_id,
+            &mut tick_seq,
+            scan,
+        )
+        .await;
+        let listed = call_ok(
+            &mut launched.mcp,
+            "ptah_list_work",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace
+            }),
+            scan,
+        )
+        .await?;
+        if let Some(id) = listed["work"].as_array().and_then(|items| {
+            items.iter().find_map(|item| {
+                if item["kind"] == "native"
+                    && item["sourceManagerPlanId"] == plan_id
+                    && item["sourceManagerStepId"] != "__manager_decision__"
+                {
+                    item["workId"].as_str().map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        }) {
+            return Ok(id);
+        }
+        tokio::time::advance(advance).await;
+    }
+    Err(ToolFail {
+        tool: "ptah_list_work".into(),
+        mcp_code: None,
+        detail: "manager child Work was not created".into(),
+    })
+}
+
+async fn wait_decision_work(
+    launched: &mut Launched,
+    scenario: &Scenario,
+    session_id: &str,
+    workspace: &str,
+    plan_id: &str,
+    scan: &mut ScanFn<'_>,
+) -> Result<String, ToolFail> {
+    let advance = Duration::from_millis(scenario.supervisor_ms());
+    let mut tick_seq = 1_000u64;
+    for _ in 0..scenario.max_ticks() {
+        yield_budget(scenario.yields() as usize).await;
+        wake_manager_plan(
+            launched,
+            scenario,
+            session_id,
+            workspace,
+            plan_id,
+            &mut tick_seq,
+            scan,
+        )
+        .await;
+        let listed = call_ok(
+            &mut launched.mcp,
+            "ptah_list_work",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace
+            }),
+            scan,
+        )
+        .await?;
+        if let Some(id) = listed["work"].as_array().and_then(|items| {
+            items.iter().find_map(|item| {
+                if item["kind"] == "manager-decision"
+                    || item["sourceManagerStepId"] == "__manager_decision__"
+                {
+                    item["workId"].as_str().map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        }) {
+            return Ok(id);
+        }
+        tokio::time::advance(advance).await;
+    }
+    Err(ToolFail {
+        tool: "ptah_list_work".into(),
+        mcp_code: None,
+        detail: "manager-decision Work was not created".into(),
+    })
+}
+
+/// Public-boundary supervisor wake. Errors are scanned and ignored so a stale
+/// concurrent supervisor pass cannot abort the fixture.
+async fn wake_manager_plan(
+    launched: &mut Launched,
+    scenario: &Scenario,
+    session_id: &str,
+    workspace: &str,
+    plan_id: &str,
+    tick_seq: &mut u64,
+    scan: &mut ScanFn<'_>,
+) {
+    *tick_seq += 1;
+    let request_id = format!("{}-{}", scenario.request_id("tickManagerPlan"), tick_seq);
+    let _ = call_scanned(
+        &mut launched.mcp,
+        "ptah_tick_manager_plan",
+        json!({
+            "request_id": request_id,
+            "session_id": session_id,
+            "workspace": workspace,
+            "plan_id": plan_id
+        }),
+        scan,
+    )
+    .await;
+}
+
+fn run_id_for_work(_runs: &Value, intents: &Value, work_id: &str) -> Result<String, ToolFail> {
+    intents["intents"]
+        .as_array()
+        .and_then(|items| {
+            items.iter().find_map(|intent| {
+                if intent["workId"] == work_id {
+                    intent["runId"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        })
+        .ok_or_else(|| ToolFail {
+            tool: "ptah_list_execution_intents".into(),
+            mcp_code: None,
+            detail: format!("run id for work {work_id} was not advertised on its intent"),
+        })
+}
+
+fn restart_tuple_links(post: &Value, restart_work_id: &str) -> Value {
+    let mut errors: Vec<String> = Vec::new();
+    let work_id = post["work"]["work"]["workId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let attempts = post["work"]["attempts"].as_array();
+    let attempt = attempts.and_then(|items| items.first());
+    let attempt_id = attempt
+        .and_then(|row| row["attemptId"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let linked_run_ids = attempt
+        .and_then(|row| row["linkedRunIds"].as_array())
+        .cloned()
+        .unwrap_or_default();
+    let matching_intents: Vec<&Value> = post["intents"]["intents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|intent| intent["workId"] == restart_work_id)
+        .collect();
+    let intent = matching_intents.first().copied();
+    let intent_id = intent
+        .and_then(|row| row["intentId"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let intent_attempt_id = intent
+        .and_then(|row| row["attemptId"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let intent_run_id = intent
+        .and_then(|row| row["runId"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let run_id = post["getRun"]["runId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let provider_attempt_id = post["getRun"]
+        .pointer("/providerExecution/attempts/0/attemptId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let reservation_id = post["getRun"]
+        .pointer("/providerExecution/quota/reservationId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if work_id != restart_work_id {
+        errors.push(format!(
+            "restart.tuple.workId: actual={work_id} expected={restart_work_id}"
+        ));
+    }
+    if matching_intents.len() != 1 {
+        errors.push(format!(
+            "restart.tuple.intent: expected exactly one intent, saw {}",
+            matching_intents.len()
+        ));
+    }
+    if attempt_id.is_empty() || intent_attempt_id != attempt_id {
+        errors.push(format!(
+            "restart.tuple.attemptId: work={attempt_id} intent={intent_attempt_id}"
+        ));
+    }
+    if intent_run_id.is_empty() || intent_run_id != run_id {
+        errors.push(format!(
+            "restart.tuple.runId: intent={intent_run_id} getRun={run_id}"
+        ));
+    }
+    let linked = linked_run_ids
+        .iter()
+        .any(|id| id.as_str() == Some(run_id.as_str()));
+    if !linked {
+        errors.push(format!("restart.tuple.linkedRunIds missing run {run_id}"));
+    }
+    if provider_attempt_id.is_empty() {
+        errors.push("restart.tuple.providerAttemptId missing".into());
+    }
+    if reservation_id.is_empty() {
+        errors.push("restart.tuple.reservationId missing".into());
+    }
+    json!({
+        "tuple": {
+            "workId": work_id,
+            "attemptId": attempt_id,
+            "intentId": intent_id,
+            "runId": run_id,
+            "providerAttemptId": provider_attempt_id,
+            "reservationId": reservation_id
+        },
+        "errors": errors
+    })
+}
+
+fn extract_json_object_after<'a>(haystack: &'a str, marker: &str) -> Option<&'a str> {
+    let start = haystack.find(marker)? + marker.len();
+    let rest = haystack[start..].trim_start();
+    let bytes = rest.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (index, ch) in rest.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&rest[..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+const FORBIDDEN_KEYS: &[&str] = &[
+    "credentialref",
+    "credentialfingerprint",
+    "baseurl",
+    "apikey",
+    "api_key",
+    "bearertoken",
+];
+
+fn push_mismatch(defects: &mut Vec<String>, name: &str, actual: &Value, expected: Value) {
+    if actual != &expected {
+        defects.push(format!("{name}: actual={actual} expected={expected}"));
+    }
+}
+
+fn leak_paths(value: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    collect_leak_paths(value, "getRun", &mut paths);
+    paths
+}
+
+fn collect_leak_paths(value: &Value, path: &str, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let lowered = key.to_ascii_lowercase();
+                if FORBIDDEN_KEYS.contains(&lowered.as_str()) {
+                    out.push(format!("{path}.{key}"));
+                }
+                collect_leak_paths(child, &format!("{path}.{key}"), out);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_leak_paths(child, &format!("{path}[{index}]"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_raw(
+    value: &Value,
+    origin: &str,
+    bearer: &str,
+    api_key: &str,
+    gateway: &str,
+    gateway_authority: &str,
+    marker: &str,
+    hits: &mut Vec<RedactionHit>,
+) {
+    let mut ctx = ScanCtx {
+        bearer,
+        api_key,
+        gateway,
+        gateway_authority,
+        marker,
+        hits: Vec::new(),
+    };
+    walk_scan(value, origin, &mut ctx);
+    ctx.hits
+        .sort_by(|a, b| a.path.cmp(&b.path).then(a.reason.cmp(&b.reason)));
+    ctx.hits
+        .dedup_by(|a, b| a.path == b.path && a.reason == b.reason);
+    hits.append(&mut ctx.hits);
+}
+
+#[allow(clippy::only_used_in_recursion)]
+fn walk_scan(value: &Value, path: &str, ctx: &mut ScanCtx<'_>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let lowered = key.to_ascii_lowercase();
+                if lowered == "headernames" {
+                    continue;
+                }
+                if FORBIDDEN_KEYS.contains(&lowered.as_str()) {
+                    ctx.hits.push(RedactionHit {
+                        path: format!("{path}.{key}"),
+                        reason: format!("forbidden key {key}"),
+                    });
+                }
+                walk_scan(child, &format!("{path}.{key}"), ctx);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                walk_scan(child, &format!("{path}[{index}]"), ctx);
+            }
+        }
+        Value::String(text) => {
+            scan_text(path, text, ctx);
+            if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                if parsed.is_object() || parsed.is_array() {
+                    walk_scan(&parsed, &format!("{path}.json"), ctx);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scan_text(path: &str, text: &str, ctx: &mut ScanCtx<'_>) {
+    if text.contains(ctx.bearer) {
+        ctx.hits.push(RedactionHit {
+            path: path.to_string(),
+            reason: "mcp bearer sentinel".into(),
+        });
+    }
+    if text.contains(ctx.api_key) {
+        ctx.hits.push(RedactionHit {
+            path: path.to_string(),
+            reason: "api-key sentinel".into(),
+        });
+    }
+    if text.contains(ctx.gateway) || text.contains(ctx.gateway_authority) {
+        ctx.hits.push(RedactionHit {
+            path: path.to_string(),
+            reason: "private gateway sentinel".into(),
+        });
+    }
+    if text.contains(ctx.marker) {
+        ctx.hits.push(RedactionHit {
+            path: path.to_string(),
+            reason: "private gateway marker".into(),
+        });
+    }
+}
+
+fn scan_normalized_secrets(
+    value: &Value,
+    bearer: &str,
+    api_key: &str,
+    gateway: &str,
+    gateway_authority: &str,
+    marker: &str,
+    out: &mut Vec<String>,
+) {
+    let mut hits = Vec::new();
+    scan_raw(
+        value,
+        "normalized",
+        bearer,
+        api_key,
+        gateway,
+        gateway_authority,
+        marker,
+        &mut hits,
+    );
+    out.extend(
+        hits.into_iter()
+            .map(|hit| format!("normalized {}: {}", hit.path, hit.reason)),
+    );
+}
+
+fn normalize_result(
+    mut value: Value,
+    workspace: &Path,
+    home: &Path,
+    gateway: &str,
+    gateway_authority: &str,
+) -> Value {
+    replace_authorities(&mut value, workspace, home, gateway, gateway_authority);
+    strip_ephemerals(&mut value, None);
+    let mut canon = IdCanon {
+        map: BTreeMap::new(),
+    };
+    collect_ids(&value, None, &mut canon);
+    apply_ids(&mut value, &canon);
+    sort_value(&mut value, None);
+    value
+}
+
+fn replace_authorities(
+    value: &mut Value,
+    workspace: &Path,
+    home: &Path,
+    gateway: &str,
+    gateway_authority: &str,
+) {
+    let workspace_s = workspace.display().to_string();
+    let home_s = home.display().to_string();
+    visit_strings(value, &mut |text| {
+        let mut out = text.replace(&workspace_s, "$WORKSPACE");
+        out = out.replace(&home_s, "$HOME");
+        out = out.replace(gateway, "$GATEWAY");
+        out = out.replace(gateway_authority, "$GATEWAY");
+        out
+    });
+}
+
+fn visit_strings(value: &mut Value, edit: &mut dyn FnMut(&str) -> String) {
+    match value {
+        Value::Object(map) => {
+            for child in map.values_mut() {
+                visit_strings(child, edit);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                visit_strings(child, edit);
+            }
+        }
+        Value::String(text) => *text = edit(text),
+        _ => {}
+    }
+}
+
+fn strip_ephemerals(value: &mut Value, _key: Option<&str>) {
+    match value {
+        Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for k in keys {
+                if is_ephemeral_key(&k) {
+                    map.remove(&k);
+                    continue;
+                }
+                if let Some(child) = map.get_mut(&k) {
+                    strip_ephemerals(child, Some(&k));
+                }
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                strip_ephemerals(child, _key);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_ephemeral_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    if is_timestamp_key(&lower) {
+        return true;
+    }
+    matches!(
+        lower.as_str(),
+        "transportsessionid"
+            | "mcp-session-id"
+            | "sessionidheader"
+            | "port"
+            | "listenport"
+            | "backend"
+            | "backendlabel"
+            | "skippedmanual"
+            | "skippedineligible"
+            | "skippedprovidercapacity"
+            | "skippedunroutable"
+            | "laggedliveevents"
+    )
+}
+
+fn is_timestamp_key(lower: &str) -> bool {
+    if lower == "format" || lower.len() <= 3 {
+        return false;
+    }
+    lower.ends_with("at")
+}
+
+fn collect_ids(value: &Value, key: Option<&str>, canon: &mut IdCanon) {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for k in keys {
+                collect_ids(&map[k], Some(k), canon);
+            }
+        }
+        Value::Array(items) => {
+            let mut items = items.clone();
+            if key.is_some_and(is_set_array_key) {
+                items.sort_by_key(canonical_sort_key);
+            }
+            for child in &items {
+                collect_ids(child, key, canon);
+            }
+        }
+        Value::String(text) => {
+            if should_canonicalize(key, text) && !canon.map.contains_key(text) {
+                let next = format!("$ID_{}", canon.map.len() + 1);
+                canon.map.insert(text.clone(), next);
+            }
+            for captured in find_generated_ids(text) {
+                if !canon.map.contains_key(&captured) {
+                    let next = format!("$ID_{}", canon.map.len() + 1);
+                    canon.map.insert(captured, next);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_ids(value: &mut Value, canon: &IdCanon) {
+    let mut pairs: Vec<(String, String)> = canon
+        .map
+        .iter()
+        .map(|(from, to)| (from.clone(), to.clone()))
+        .collect();
+    pairs.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+    let mut prefixes: Vec<(String, String)> = Vec::new();
+    for (from, to) in &pairs {
+        if looks_like_uuid(from) && from.len() >= 14 {
+            let prefix = from[..14].to_string();
+            let unique = pairs
+                .iter()
+                .filter(|(other, _)| looks_like_uuid(other) && other.starts_with(&prefix))
+                .count()
+                == 1;
+            if unique {
+                prefixes.push((prefix, to.clone()));
+            }
+        }
+    }
+    prefixes.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+    visit_strings(value, &mut |text| {
+        let mut out = text.to_string();
+        for (from, to) in &pairs {
+            out = out.replace(from, to);
+        }
+        for (from, to) in &prefixes {
+            out = out.replace(from, to);
+        }
+        out
+    });
+}
+
+fn should_canonicalize(key: Option<&str>, text: &str) -> bool {
+    if text.starts_with("sbb-v1-")
+        || text.starts_with("$")
+        || text == "__manager_decision__"
+        || text == "inspect"
+        || text == "env-grokptah"
+        || text == "grok-build"
+        || text.contains("shared-black-box-v1")
+    {
+        return false;
+    }
+    if looks_like_uuid(text) || looks_like_hash(text) {
+        return true;
+    }
+    let Some(lower) = key.map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    if lower == "stepid" || lower == "kind" || lower == "purpose" || lower == "type" {
+        return false;
+    }
+    (lower.ends_with("id") || lower.ends_with("hash") || lower.ends_with("fingerprint"))
+        && !text.is_empty()
+        && text != "__manager_decision__"
+}
+
+fn looks_like_uuid(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[18] == b'-'
+        && bytes[23] == b'-'
+        && text.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-')
+}
+
+fn looks_like_hash(text: &str) -> bool {
+    let len = text.len();
+    (len == 32 || len == 64) && text.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn find_generated_ids(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 36 <= bytes.len() {
+        let slice = &text[i..i + 36];
+        if looks_like_uuid(slice) {
+            out.push(slice.to_string());
+            i += 36;
+            continue;
+        }
+        i += 1;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_hexdigit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+            i += 1;
+        }
+        let len = i - start;
+        if len == 32 || len == 64 {
+            let bounded_left = start == 0 || !bytes[start - 1].is_ascii_hexdigit();
+            let bounded_right = i == bytes.len() || !bytes[i].is_ascii_hexdigit();
+            if bounded_left && bounded_right {
+                out.push(text[start..i].to_string());
+            }
+        }
+    }
+    out
+}
+
+fn is_set_array_key(key: &str) -> bool {
+    matches!(
+        key,
+        "work"
+            | "runs"
+            | "intents"
+            | "plans"
+            | "tools"
+            | "providers"
+            | "agents"
+            | "sessions"
+            | "advertisedTools"
+            | "triggeringWorkIds"
+            | "triggeringMessageIds"
+            | "allowedWorkKinds"
+            | "headerNames"
+    )
+}
+
+fn canonical_sort_key(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            for key in [
+                "objective",
+                "kind",
+                "purpose",
+                "promptPreview",
+                "name",
+                "workId",
+                "runId",
+                "planId",
+                "agentId",
+            ] {
+                if let Some(Value::String(text)) = map.get(key) {
+                    return format!("{key}:{text}");
+                }
+            }
+            serde_json::to_string(value).unwrap_or_default()
+        }
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn sort_value(value: &mut Value, key: Option<&str>) {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<String> = map.keys().cloned().collect();
+            keys.sort();
+            let mut ordered = Map::new();
+            for k in keys {
+                if let Some(mut child) = map.remove(&k) {
+                    sort_value(&mut child, Some(&k));
+                    ordered.insert(k, child);
+                }
+            }
+            *map = ordered;
+        }
+        Value::Array(items) => {
+            for child in items.iter_mut() {
+                sort_value(child, key);
+            }
+            if key.is_some_and(is_set_array_key) {
+                items.sort_by_key(canonical_sort_key);
+            } else if key == Some("attempts") {
+                items.sort_by_key(|item| item["ordinal"].as_u64().unwrap_or(0));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn u64_or_absent(value: Option<&Value>) -> Value {
+    match value.and_then(Value::as_u64) {
+        Some(number) => json!(number),
+        None => json!({ "support": "absent" }),
+    }
+}
+
+fn str_or_absent(value: Option<&Value>) -> Value {
+    match value.and_then(Value::as_str) {
+        Some(text) => json!(text),
+        None => json!({ "support": "absent" }),
+    }
+}
+
+fn canonical_json(value: &Value) -> String {
+    serde_json::to_string(value).expect("canonical json")
+}
+
+fn snapshot_path(path: &Path) -> Option<Vec<u8>> {
+    std::fs::read(path).ok()
+}
+
+fn dump_normalized_temp(label: &str, value: &Value) {
+    let source = value
+        .get("sourceRevision")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let document = write_golden_document(value, source);
+    let path = std::env::temp_dir().join(format!("sbb-v1-{label}-normalized.json"));
+    let root = repo_root();
+    assert!(
+        !path.starts_with(&root) && !path.starts_with(env!("CARGO_MANIFEST_DIR")),
+        "diagnostic dump must not write into the source tree: {}",
+        path.display()
+    );
+    let pretty = serde_json::to_string_pretty(&document).expect("pretty dump");
+    let _ = std::fs::write(&path, format!("{pretty}\n"));
+    eprintln!(
+        "shared-black-box-v1 dumped {} evidenceHash={} to {}",
+        label,
+        document
+            .get("evidenceHash")
+            .and_then(Value::as_str)
+            .unwrap_or("missing"),
+        path.display()
+    );
+}
+
+fn stamp_source_revision(value: &mut Value, source: &str) {
+    if let Some(map) = value.as_object_mut() {
+        map.insert("sourceRevision".into(), json!(source));
+    }
+    sort_value(value, None);
+}
+
+fn reject_golden_mutation_env() {
+    for var in GOLDEN_UPDATE_ENV_VARS {
+        if std::env::var_os(var).is_some() {
+            panic!("{var} cannot rewrite or bypass the immutable golden");
+        }
+    }
+}
+
+fn select_golden_file(source: &str, scenario: &Scenario) -> &'static str {
+    let from_const = AUDITED_GOLDENS
+        .iter()
+        .find(|(sha, _)| *sha == source)
+        .map(|(_, file)| *file);
+    let selector = scenario.golden_selector();
+    let from_scenario = selector.get(source).map(String::as_str);
+    match (from_const, from_scenario) {
+        (Some(const_file), Some(scenario_file)) if const_file == scenario_file => const_file,
+        (Some(const_file), Some(scenario_file)) => panic!(
+            "golden selector mismatch for {source}: compile-time={const_file} scenario={scenario_file}"
+        ),
+        (None, _) | (_, None) => panic!(
+            "unexpected source revision {source}; fail closed (no golden inference by feature downgrade)"
+        ),
+    }
+}
+
+fn load_immutable_golden(path: &Path, expected_source: &str) -> Value {
+    if !path.exists() {
+        panic!("missing immutable golden {}", path.display());
+    }
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("read golden {}: {error}", path.display()));
+    let mut value: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("malformed golden {}: {error}", path.display()));
+    if value.get("calibration") == Some(&json!("pending")) {
+        panic!(
+            "pending golden is not an immutable oracle: {}",
+            path.display()
+        );
+    }
+    if value["schema"] != RESULT_SCHEMA {
+        panic!(
+            "malformed golden {}: schema={:?} expected={RESULT_SCHEMA}",
+            path.display(),
+            value.get("schema")
+        );
+    }
+    if value.get("version") != Some(&json!("v1")) {
+        panic!("malformed golden {}: missing version v1", path.display());
+    }
+    sort_value(&mut value, None);
+    let stored_hash = value
+        .get("evidenceHash")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut body = value.clone();
+    if let Some(map) = body.as_object_mut() {
+        map.remove("evidenceHash");
+    }
+    sort_value(&mut body, None);
+    let computed = format!("sha256:{}", sha256_hex(canonical_json(&body).as_bytes()));
+    match stored_hash {
+        Some(stored) if stored == computed => {}
+        Some(stored) => panic!(
+            "golden evidenceHash mismatch for {}: stored={stored} computed={computed}",
+            path.display()
+        ),
+        None => panic!("malformed golden {}: missing evidenceHash", path.display()),
+    }
+    if value.get("sourceRevision").and_then(Value::as_str) != Some(expected_source) {
+        panic!(
+            "golden sourceRevision {:?} does not match audited {}",
+            value.get("sourceRevision"),
+            expected_source
+        );
+    }
+    if let Some(map) = value.as_object_mut() {
+        map.remove("evidenceHash");
+    }
+    sort_value(&mut value, None);
+    value
+}
+
+fn compare_normalized(actual: &Value, expected: &Value) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    collect_semantic_key_diffs(actual, expected, "", &mut errors);
+    if canonical_json(actual) != canonical_json(expected) && errors.is_empty() {
+        errors.push(format!(
+            "canonical JSON differs (actual sha256={} expected sha256={})",
+            sha256_hex(canonical_json(actual).as_bytes()),
+            sha256_hex(canonical_json(expected).as_bytes())
+        ));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn collect_semantic_key_diffs(
+    actual: &Value,
+    expected: &Value,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    match (actual, expected) {
+        (Value::Object(actual_map), Value::Object(expected_map)) => {
+            for key in expected_map.keys() {
+                if !actual_map.contains_key(key) {
+                    errors.push(format!(
+                        "{}: missing semantic key {key}",
+                        display_path(path)
+                    ));
+                }
+            }
+            for key in actual_map.keys() {
+                if !expected_map.contains_key(key) {
+                    errors.push(format!("{}: extra semantic key {key}", display_path(path)));
+                }
+            }
+            for (key, expected_child) in expected_map {
+                if let Some(actual_child) = actual_map.get(key) {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    collect_semantic_key_diffs(actual_child, expected_child, &child_path, errors);
+                }
+            }
+        }
+        (Value::Array(actual_items), Value::Array(expected_items)) => {
+            if actual_items.len() != expected_items.len() {
+                errors.push(format!(
+                    "{}: array cardinality actual={} expected={}",
+                    display_path(path),
+                    actual_items.len(),
+                    expected_items.len()
+                ));
+            }
+            for (index, (actual_child, expected_child)) in
+                actual_items.iter().zip(expected_items.iter()).enumerate()
+            {
+                collect_semantic_key_diffs(
+                    actual_child,
+                    expected_child,
+                    &format!("{path}[{index}]"),
+                    errors,
+                );
+            }
+        }
+        (actual, expected) if actual != expected => {
+            errors.push(format!(
+                "{}: value actual={actual} expected={expected}",
+                display_path(path)
+            ));
+        }
+        _ => {}
+    }
+}
+
+fn display_path(path: &str) -> String {
+    if path.is_empty() {
+        "$".into()
+    } else {
+        path.to_string()
+    }
+}
+
+fn repo_root() -> PathBuf {
+    dunce::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.."))
+        .expect("canonicalize repo root")
+}
+
+fn git_stdout(args: &[&str]) -> Result<String, String> {
+    let root = repo_root();
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(args)
+        .output()
+        .map_err(|error| format!("git {}: {error}", args.join(" ")))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
+}
+
+fn porcelain_paths(status: &str) -> Vec<String> {
+    status
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let rest = if line.len() >= 3 && line.as_bytes().get(2) == Some(&b' ') {
+                &line[3..]
+            } else {
+                line.trim()
+            };
+            rest.split(" -> ").last().unwrap_or(rest).trim().to_string()
+        })
+        .collect()
+}
+
+fn allowlisted(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    if FIXTURE_ALLOWLIST.contains(&path) {
+        return true;
+    }
+    FIXTURE_ALLOWLIST.iter().any(|allowed| {
+        allowed.starts_with(&format!("{path}/")) || path.starts_with(&format!("{allowed}/"))
+    })
+}
+
+fn commit_changed_files(sha: &str) -> Result<Vec<String>, String> {
+    let parent = git_stdout(&["rev-parse", &format!("{sha}^")]);
+    let diff = if parent.is_ok() {
+        git_stdout(&["diff", "--name-only", &format!("{sha}^"), sha])?
+    } else {
+        git_stdout(&[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "--root",
+            "-r",
+            sha,
+        ])?
+    };
+    Ok(diff
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn commit_parents(sha: &str) -> Result<Vec<String>, String> {
+    let line = git_stdout(&["rev-list", "--parents", "-n", "1", sha])?;
+    let mut parts = line.split_whitespace();
+    let Some(self_sha) = parts.next() else {
+        return Err(format!("git rev-list --parents returned empty for {sha}"));
+    };
+    if self_sha != sha {
+        return Err(format!(
+            "git rev-list --parents started with {self_sha}, expected {sha}"
+        ));
+    }
+    Ok(parts.map(str::to_string).collect())
+}
+
+/// GitHub `pull_request` jobs check out a merge of the PR into the base.
+/// That synthetic commit is not an audited host revision; the second parent
+/// is the PR head we actually authored.
+fn audit_walk_start(head: &str, parents: &[String]) -> String {
+    if parents.len() >= 2 {
+        parents[1].clone()
+    } else {
+        head.to_string()
+    }
+}
+
+fn detect_audited_source_revision() -> String {
+    let status = git_stdout(&["status", "--porcelain"]).expect("git status");
+    for path in porcelain_paths(&status) {
+        if !allowlisted(&path) {
+            panic!("unexpected dirty path outside fixture allowlist: {path}");
+        }
+    }
+    let head = git_stdout(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    let parents = commit_parents(&head).expect("HEAD parents");
+    let mut sha = audit_walk_start(&head, &parents);
+    loop {
+        let files = commit_changed_files(&sha).expect("commit files");
+        if files.iter().any(|path| !allowlisted(path)) {
+            return sha;
+        }
+        match git_stdout(&["rev-parse", &format!("{sha}^")]) {
+            Ok(parent) => sha = parent,
+            Err(_) => panic!("could not identify audited host revision (fail closed)"),
+        }
+    }
+}
+
+fn write_golden_document(result: &Value, source: &str) -> Value {
+    let mut document = result.clone();
+    stamp_source_revision(&mut document, source);
+    let mut body = document.clone();
+    if let Some(map) = body.as_object_mut() {
+        map.remove("evidenceHash");
+    }
+    sort_value(&mut body, None);
+    let hash = format!("sha256:{}", sha256_hex(canonical_json(&body).as_bytes()));
+    if let Some(map) = document.as_object_mut() {
+        map.insert("evidenceHash".into(), json!(hash));
+    }
+    sort_value(&mut document, None);
+    document
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    sha256(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    // FIPS 180-4 SHA-256, fixture reporting only.
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut msg = bytes.to_vec();
+    let bit_len = (bytes.len() as u64) * 8;
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+    let mut h = [
+        0x6a09e667u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    for chunk in msg.chunks(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut hh = h[7];
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+    let mut out = [0u8; 32];
+    for (i, part) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&part.to_be_bytes());
+    }
+    out
+}
+
+fn sample_oracle_result() -> Value {
+    json!({
+        "schema": RESULT_SCHEMA,
+        "version": "v1",
+        "sourceRevision": "4bd2081b2945e8ce881895f976bb7c8d88b929f2",
+        "advertisedTools": ["ptah_get_capacity"],
+        "features": { "nativeCodingReadiness": { "support": "present" } },
+        "observations": {
+            "discovery": { "capacity": { "ok": true }, "readiness": { "support": "present" } },
+            "native": { "getRun": { "purpose": "native", "state": "completed" } },
+            "manager": { "purpose": "manager_proposal" },
+            "proposal": { "fileExists": false },
+            "restart": {
+                "httpBeforeStop": 1,
+                "stallHeldAfterAccept": true
+            }
+        },
+        "assertions": {
+            "ordinaryNative": {
+                "work": 1,
+                "intent": 1,
+                "run": 1,
+                "providerAttempt": 1,
+                "http": 1,
+                "quotaState": "consumed",
+                "requests": 1,
+                "tokens": 10
+            },
+            "manager": {
+                "proposalHttp": 2,
+                "permissionRequests": 0,
+                "permissionGrants": 0
+            },
+            "restart": {
+                "work": 1,
+                "workAttempt": 1,
+                "intent": 1,
+                "run": 1,
+                "providerAttempt": 1,
+                "sendCertainty": "uncertain_accept",
+                "retryClass": "explicit_new_run_only",
+                "quotaState": "reserved",
+                "http": 1,
+                "queued": false
+            }
+        },
+        "transport": { "ordinaryNativeHttp": 1, "proposalHttp": 2, "restartHttp": 1 }
+    })
+}
+
+fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_string())
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn pending_golden_fails_before_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pending.json");
+    std::fs::write(
+        &path,
+        r#"{"schema":"grokptah.shared-black-box-result.v1","calibration":"pending"}"#,
+    )
+    .unwrap();
+    let message = catch_unwind(AssertUnwindSafe(|| {
+        load_immutable_golden(&path, "4bd2081b2945e8ce881895f976bb7c8d88b929f2")
+    }))
+    .expect_err("pending golden must fail");
+    let text = panic_text(message);
+    assert!(text.contains("pending golden"), "unexpected panic: {text}");
+}
+
+#[test]
+fn missing_golden_fails_before_launch() {
+    let path = PathBuf::from("/tmp/sbb-v1-missing-golden-does-not-exist.json");
+    let message = catch_unwind(AssertUnwindSafe(|| {
+        load_immutable_golden(&path, "4bd2081b2945e8ce881895f976bb7c8d88b929f2")
+    }))
+    .expect_err("missing golden must fail");
+    let text = panic_text(message);
+    assert!(text.contains("missing immutable golden"), "{text}");
+}
+
+#[test]
+fn malformed_golden_fails_before_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("malformed.json");
+    std::fs::write(&path, "{not-json").unwrap();
+    let message = catch_unwind(AssertUnwindSafe(|| {
+        load_immutable_golden(&path, "4bd2081b2945e8ce881895f976bb7c8d88b929f2")
+    }))
+    .expect_err("malformed golden must fail");
+    let text = panic_text(message);
+    assert!(text.contains("malformed golden"), "{text}");
+}
+
+#[test]
+fn unknown_source_revision_fails_closed() {
+    let scenario = Scenario::load();
+    let message = catch_unwind(AssertUnwindSafe(|| {
+        select_golden_file("ffffffffffffffffffffffffffffffffffffffff", &scenario)
+    }))
+    .expect_err("unknown revision must fail closed");
+    let text = panic_text(message);
+    assert!(text.contains("unexpected source revision"), "{text}");
+}
+
+#[test]
+fn github_pr_merge_commit_starts_audit_at_the_pr_head() {
+    assert_eq!(
+        audit_walk_start(
+            "ef0a479b57e14d48209a1561e12551405569f0f3",
+            &[
+                "4bd2081b2945e8ce881895f976bb7c8d88b929f2".into(),
+                "e9f7934dbecaba50b840d337b7073c86687242b2".into()
+            ]
+        ),
+        "e9f7934dbecaba50b840d337b7073c86687242b2"
+    );
+    assert_eq!(
+        audit_walk_start(
+            "e9f7934dbecaba50b840d337b7073c86687242b2",
+            &["57c0f4f70f53a726188ff7ec8278c1c5d0be6604".into()]
+        ),
+        "e9f7934dbecaba50b840d337b7073c86687242b2"
+    );
+}
+
+#[test]
+fn extra_and_missing_semantic_keys_fail() {
+    let expected = sample_oracle_result();
+    let mut extra = expected.clone();
+    extra
+        .as_object_mut()
+        .unwrap()
+        .insert("unexpectedLeaf".into(), json!(1));
+    extra["observations"]
+        .as_object_mut()
+        .unwrap()
+        .insert("unknownPhase".into(), json!({ "x": 1 }));
+    let extra_errors = compare_normalized(&extra, &expected).expect_err("extra key");
+    let extra_joined = extra_errors.join("\n");
+    assert!(
+        extra_joined.contains("extra semantic key unexpectedLeaf"),
+        "{extra_errors:?}"
+    );
+    assert!(
+        extra_joined.contains("extra semantic key unknownPhase"),
+        "{extra_errors:?}"
+    );
+    let mut missing = expected.clone();
+    missing.as_object_mut().unwrap().remove("assertions");
+    missing["observations"]["native"]
+        .as_object_mut()
+        .unwrap()
+        .remove("getRun");
+    let missing_errors = compare_normalized(&missing, &expected).expect_err("missing key");
+    let missing_joined = missing_errors.join("\n");
+    assert!(
+        missing_joined.contains("missing semantic key assertions"),
+        "{missing_errors:?}"
+    );
+    assert!(
+        missing_joined.contains("missing semantic key getRun"),
+        "{missing_errors:?}"
+    );
+}
+
+#[test]
+fn altered_cardinality_state_purpose_quota_attempt_retry_redaction_fail() {
+    let expected = sample_oracle_result();
+    let mut actual = expected.clone();
+    actual["assertions"]["ordinaryNative"]["work"] = json!(2);
+    actual["assertions"]["ordinaryNative"]["quotaState"] = json!("reserved");
+    actual["observations"]["native"]["getRun"]["state"] = json!("failed");
+    actual["observations"]["native"]["getRun"]["purpose"] = json!("other");
+    actual["assertions"]["restart"]["providerAttempt"] = json!(2);
+    actual["assertions"]["restart"]["retryClass"] = json!("auto");
+    actual["observations"]["proposal"]["fileExists"] = json!(true);
+    let errors = compare_normalized(&actual, &expected).expect_err("altered semantics");
+    let joined = errors.join("\n");
+    for needle in [
+        "ordinaryNative.work",
+        "quotaState",
+        "state",
+        "purpose",
+        "providerAttempt",
+        "retryClass",
+        "fileExists",
+    ] {
+        assert!(joined.contains(needle), "missing {needle} in {joined}");
+    }
+}
+
+#[test]
+fn backend_result_divergence_fails() {
+    let desktop = sample_oracle_result();
+    let mut hosted = desktop.clone();
+    hosted["transport"]["restartHttp"] = json!(2);
+    let errors = compare_normalized(&desktop, &hosted).expect_err("divergence");
+    assert!(
+        errors.iter().any(|row| row.contains("restartHttp")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn redaction_scan_fails_on_forbidden_secrets() {
+    let mut hits = Vec::new();
+    scan_raw(
+        &json!({
+            "providerRoute": {
+                "baseUrl": "http://127.0.0.1:9",
+                "credentialRef": "ref",
+                "credentialFingerprint": "fp"
+            },
+            "text": "sbb-v1-api-key-1a2b3c4d5e6f708192a3b4c5d6e7f809"
+        }),
+        "probe",
+        "sbb-v1-mcp-bearer-7f3c9e1a4b8d2e6f0c5a9d3b7e1f4a8c",
+        "sbb-v1-api-key-1a2b3c4d5e6f708192a3b4c5d6e7f809",
+        "http://127.0.0.1:9",
+        "127.0.0.1:9",
+        "sbb-v1-private-gateway-sentinel",
+        &mut hits,
+    );
+    let reasons: Vec<_> = hits.iter().map(|hit| hit.reason.as_str()).collect();
+    assert!(reasons
+        .iter()
+        .any(|reason| reason.contains("forbidden key")));
+    assert!(reasons
+        .iter()
+        .any(|reason| reason.contains("api-key sentinel")));
+}
+
+#[test]
+fn documented_public_run_leaks_are_partitioned_from_hard_fails() {
+    let hits = vec![
+        "ptah_get_run.providerRoute.baseUrl: forbidden key baseUrl".into(),
+        "ptah_list_runs.runs[0].providerRoute.credentialRef: forbidden key credentialRef".into(),
+        "ptah_get_run.providerRoute.credentialFingerprint: forbidden key credentialFingerprint"
+            .into(),
+        "ptah_get_run.providerRoute.baseUrl: private gateway sentinel".into(),
+        "ptah_get_run.content[].text: private gateway sentinel".into(),
+        "ptah_list_runs.content[].text: private gateway sentinel".into(),
+        "ptah_get_work.summary: api-key sentinel".into(),
+        "normalized observations.native.getRun.providerRoute.baseUrl: forbidden key baseUrl".into(),
+    ];
+    let (failing, documented) = partition_redaction_hits(&hits);
+    assert!(
+        documented
+            .iter()
+            .any(|hit| hit.contains("providerRoute.baseUrl")),
+        "{documented:?}"
+    );
+    assert!(
+        documented.iter().any(|hit| hit.contains("credentialRef")),
+        "{documented:?}"
+    );
+    assert_eq!(failing, vec!["ptah_get_work.summary: api-key sentinel"]);
+}
+
+#[test]
+fn update_env_cannot_rewrite_or_bypass() {
+    let _lock = home_override_serial();
+    let golden = PathBuf::from(GOLDEN_DIR).join("expected-pr352-4bd2081b.json");
+    let before = std::fs::read(&golden).expect("read pr golden");
+    for var in GOLDEN_UPDATE_ENV_VARS {
+        std::env::set_var(var, "1");
+        let panicked = catch_unwind(reject_golden_mutation_env);
+        std::env::remove_var(var);
+        assert!(panicked.is_err(), "{var} must fail closed");
+    }
+    let after = std::fs::read(&golden).expect("re-read pr golden");
+    assert_eq!(before, after, "golden bytes must be unchanged");
+}
+
+#[test]
+fn write_golden_document_roundtrip_does_not_touch_repo_goldens() {
+    let result = sample_oracle_result();
+    let document = write_golden_document(&result, "4bd2081b2945e8ce881895f976bb7c8d88b929f2");
+    assert!(document.get("evidenceHash").is_some());
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oracle.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&document).unwrap()).unwrap();
+    let loaded = load_immutable_golden(&path, "4bd2081b2945e8ce881895f976bb7c8d88b929f2");
+    assert!(loaded.get("evidenceHash").is_none());
+    assert_eq!(
+        loaded["sourceRevision"],
+        json!("4bd2081b2945e8ce881895f976bb7c8d88b929f2")
+    );
+}
+
+#[test]
+fn golden_selector_is_compile_time_and_scenario_locked() {
+    let scenario = Scenario::load();
+    assert_eq!(
+        select_golden_file("4bd2081b2945e8ce881895f976bb7c8d88b929f2", &scenario),
+        "expected-pr352-4bd2081b.json"
+    );
+    assert_eq!(
+        select_golden_file("67e29bd34dc64049432c715c93c2cef2185c63ea", &scenario),
+        "expected-main-67e29bd3.json"
+    );
+    assert_eq!(
+        select_golden_file("57c0f4f70f53a726188ff7ec8278c1c5d0be6604", &scenario),
+        "expected-57c0f4f70f53a7.json"
+    );
+}
+
+#[test]
+fn dump_normalized_temp_never_writes_repo_goldens() {
+    let root = repo_root();
+    let dump = std::env::temp_dir().join("sbb-v1-desktop-normalized.json");
+    assert!(!dump.starts_with(&root));
+    let pr = PathBuf::from(GOLDEN_DIR).join("expected-pr352-4bd2081b.json");
+    let before = std::fs::read(&pr).expect("pr golden");
+    dump_normalized_temp("desktop", &sample_oracle_result());
+    let after = std::fs::read(&pr).expect("pr golden after dump");
+    assert_eq!(before, after);
+}
+
+#[test]
+fn canonicalization_strips_only_declared_volatile_fields() {
+    let mut value = json!({
+        "state": "completed",
+        "purpose": "native",
+        "createdAt": "2026-01-01T00:00:00Z",
+        "updatedAt": "2026-01-01T00:00:01Z",
+        "quota": { "state": "reserved" },
+        "sendCertainty": "uncertain_accept",
+        "retryClass": "explicit_new_run_only",
+        "mcpError": { "code": "invalid_request" },
+        "providerId": "env-grokptah",
+        "modelId": "grok-build",
+        "attempts": [{ "ordinal": 1, "state": "running" }],
+        "bounds": { "maxRounds": 4 },
+        "port": 9,
+        "transportSessionId": "abc",
+        "skippedManual": 3,
+        "support": "present"
+    });
+    strip_ephemerals(&mut value, None);
+    assert_eq!(value["state"], json!("completed"));
+    assert_eq!(value["purpose"], json!("native"));
+    assert_eq!(value["quota"]["state"], json!("reserved"));
+    assert_eq!(value["sendCertainty"], json!("uncertain_accept"));
+    assert_eq!(value["retryClass"], json!("explicit_new_run_only"));
+    assert_eq!(value["mcpError"]["code"], json!("invalid_request"));
+    assert_eq!(value["providerId"], json!("env-grokptah"));
+    assert_eq!(value["modelId"], json!("grok-build"));
+    assert_eq!(value["attempts"][0]["ordinal"], json!(1));
+    assert_eq!(value["bounds"]["maxRounds"], json!(4));
+    assert_eq!(value["support"], json!("present"));
+    assert!(value.get("createdAt").is_none());
+    assert!(value.get("updatedAt").is_none());
+    assert!(value.get("port").is_none());
+    assert!(value.get("transportSessionId").is_none());
+    assert!(value.get("skippedManual").is_none());
+}
+
+#[test]
+fn expected_pr352_golden_is_immutable_for_audited_revision() {
+    let path = PathBuf::from(GOLDEN_DIR).join("expected-pr352-4bd2081b.json");
+    let loaded = load_immutable_golden(&path, "4bd2081b2945e8ce881895f976bb7c8d88b929f2");
+    assert!(loaded.get("overlay").is_none());
+    assert_eq!(loaded["schema"], json!(RESULT_SCHEMA));
+    assert!(loaded.get("observations").is_some());
+    assert!(loaded.get("assertions").is_some());
+}
+
+#[test]
+fn expected_57c0f4f_golden_is_immutable_for_audited_revision() {
+    let path = PathBuf::from(GOLDEN_DIR).join("expected-57c0f4f70f53a7.json");
+    let loaded = load_immutable_golden(&path, "57c0f4f70f53a726188ff7ec8278c1c5d0be6604");
+    assert!(loaded.get("overlay").is_none());
+    assert_eq!(loaded["schema"], json!(RESULT_SCHEMA));
+    assert_eq!(
+        loaded["sourceRevision"],
+        json!("57c0f4f70f53a726188ff7ec8278c1c5d0be6604")
+    );
+    assert!(loaded.get("observations").is_some());
+    assert!(loaded.get("assertions").is_some());
+}
+
+#[test]
+fn expected_main_golden_is_immutable_for_audited_revision() {
+    let path = PathBuf::from(GOLDEN_DIR).join("expected-main-67e29bd3.json");
+    let loaded = load_immutable_golden(&path, "67e29bd34dc64049432c715c93c2cef2185c63ea");
+    assert_eq!(loaded["schema"], json!(RESULT_SCHEMA));
+    assert_eq!(
+        loaded["sourceRevision"],
+        json!("67e29bd34dc64049432c715c93c2cef2185c63ea")
+    );
+    assert!(loaded.get("calibration").is_none());
+    assert!(
+        loaded.get("overlay").is_none(),
+        "main golden is a complete overlay run, not a handwritten blocker"
+    );
+    assert!(loaded.get("observations").is_some());
+    assert!(loaded.get("assertions").is_some());
+    assert!(
+        loaded
+            .get("assertions")
+            .and_then(Value::as_object)
+            .is_some(),
+        "main expectations are the source-typed overlay result, not an absent-metadata stub"
+    );
+}
+
+#[test]
+fn run_id_for_work_does_not_guess_the_newest_run() {
+    let runs = json!({
+        "runs": [{ "runId": "older-run" }, { "runId": "newest-run" }]
+    });
+    let intents = json!({
+        "intents": [{ "workId": "other-work", "runId": "newest-run" }]
+    });
+    let error = run_id_for_work(&runs, &intents, "wanted-work").expect_err("must not guess");
+    assert!(
+        error.detail.contains("not advertised"),
+        "unexpected detail: {}",
+        error.detail
+    );
+    let linked = json!({
+        "intents": [
+            { "workId": "wanted-work", "runId": "linked-run" },
+            { "workId": "other-work", "runId": "newest-run" }
+        ]
+    });
+    assert_eq!(
+        run_id_for_work(&runs, &linked, "wanted-work").expect("intent link"),
+        "linked-run"
+    );
+}
+
+#[tokio::test(start_paused = true, flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn missing_and_wrong_mcp_auth_have_zero_side_effects() {
+    let scenario = Scenario::load();
+    let mut env = ProcessEnvGuard::new();
+    for kind in [EndpointKind::Desktop, EndpointKind::Hosted] {
+        run_auth_zero_side_effect(kind, &scenario, &mut env).await;
+    }
+}
+
+async fn run_auth_zero_side_effect(
+    kind: EndpointKind,
+    scenario: &Scenario,
+    env: &mut ProcessEnvGuard,
+) {
+    let home_dir = TempDir::new().expect("temp home");
+    let workspace_dir = TempDir::new().expect("temp workspace");
+    let home = dunce::canonicalize(home_dir.path()).expect("canonicalize home");
+    let workspace = dunce::canonicalize(workspace_dir.path()).expect("canonicalize workspace");
+    env.set("HOME", &home);
+    env.set("GROK_HOME", home.join(".grok"));
+    std::fs::create_dir_all(home.join(".grok")).expect("grok home");
+    std::fs::write(
+        home.join(".grok").join("config.toml"),
+        format!(
+            "[models]\ndefault = \"{}\"\n",
+            scenario.str(&["identities", "modelId"])
+        ),
+    )
+    .expect("write grok config.toml");
+    set_grokptah_home_override(Some(home.clone()));
+    let token = scenario.str(&["secrets", "mcpBearer"]);
+    let api_key = scenario.str(&["secrets", "apiKey"]);
+    let script = GatewayScript {
+        proposal_turns: Arc::new(AtomicUsize::new(0)),
+        restart_objective: scenario.str(&["objectives", "restartCut"]),
+        proposal_path: scenario.str(&["proposal", "targetRelativePath"]),
+    };
+    let gateway = start_scripted_gateway(script).await;
+    env.set("GROKPTAH_API_BASE", format!("{}/v1", gateway.base_url()));
+    env.set("GROKPTAH_API_KEY", &api_key);
+    let launched = start_endpoint(kind, &home, &workspace, &token).await;
+    let http_before = gateway.requests().len();
+    let files_before = workspace_entry_count(&workspace);
+    assert_mcp_auth_zero_side_effects(&launched.addr, &token).await;
+    assert_eq!(
+        gateway.requests().len(),
+        http_before,
+        "{} missing/wrong MCP auth must not send provider HTTP",
+        kind.as_str()
+    );
+    assert_eq!(
+        workspace_entry_count(&workspace),
+        files_before,
+        "{} missing/wrong MCP auth must not write workspace files",
+        kind.as_str()
+    );
+    let mut launched = launched;
+    initialize_mcp(&mut launched).await;
+    let sessions = launched
+        .mcp
+        .call_tool("ptah_list_sessions", json!({}))
+        .await
+        .unwrap_or_else(|error| panic!("list sessions after failed auth: {error}"));
+    let session_count = sessions.structured["sessions"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(usize::MAX);
+    assert_eq!(
+        session_count,
+        0,
+        "{} auth probes created sessions: {}",
+        kind.as_str(),
+        sessions.structured
+    );
+    let agents = launched
+        .mcp
+        .call_tool("ptah_list_persistent_agents", json!({}))
+        .await
+        .unwrap_or_else(|error| panic!("list agents after failed auth: {error}"));
+    let agent_count = agents.structured["agents"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(usize::MAX);
+    assert_eq!(
+        agent_count,
+        0,
+        "{} auth probes created agents: {}",
+        kind.as_str(),
+        agents.structured
+    );
+    assert_eq!(
+        gateway.requests().len(),
+        http_before,
+        "{} initialize after failed auth must not send provider HTTP",
+        kind.as_str()
+    );
+    let _ = launched.mcp.close_session().await;
+    stop_endpoint(launched).await;
+    drop(gateway);
+    drop(home_dir);
+    drop(workspace_dir);
+}
