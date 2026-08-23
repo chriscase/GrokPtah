@@ -5750,7 +5750,7 @@ impl OrchestrationService {
         let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
         let allowlist = self.config.lock().allowlist.clone();
         let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
-        if claimed.display().to_string() != run.workspace {
+        if !super::workspaces_match(&run.workspace, &claimed.display().to_string()) {
             return Err(OrchError::new(
                 OrchErrorCode::WorkspaceMismatch,
                 "run workspace does not match the requested workspace",
