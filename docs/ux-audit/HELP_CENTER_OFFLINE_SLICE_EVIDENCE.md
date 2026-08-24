@@ -45,7 +45,7 @@ The evidence-note commit is part of this same clean candidate branch; record
 Candidate evidence reports the following from the exact worktree:
 
 - `npm run typecheck` — pass.
-- `npm test -- --reporter=dot` — 46 files, 240 tests passed.
+- `npm test -- --reporter=dot` — 46 files, 244 tests passed.
 - `npm run build` — pass; Vite production bundle emitted.
 - `npm audit --audit-level=high` — zero vulnerabilities.
 - `git diff --check` — pass.

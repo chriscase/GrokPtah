@@ -11,7 +11,7 @@ Candidate implementation: `c17e3644129d70d281979f66c75c6618ab22a31a`
 This note records local candidate evidence only. It is not packaged desktop
 acceptance, live-provider certification, measured recall/precision, recurring
 expert sign-off, or a 100% claim. The independent review did not drive a
-browser or re-run the candidate's 46-file / 240-test baseline.
+browser or re-run the candidate's 46-file / 244-test baseline.
 
 ## Candidate checks recorded
 
