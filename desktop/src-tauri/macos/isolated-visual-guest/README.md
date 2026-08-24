@@ -13,9 +13,11 @@ input backend, or `HostNative` dispatch proof.
 - `guest-init.c` is a freestanding Linux arm64 PID 1. It uses raw syscalls only, connects to the
   host over VSOCK port `17001`, authenticates the fixed READY frame with the host challenge, accepts
   zero or more authenticated binding commands, emits a binding acknowledgement for each accepted
-  identity, then accepts the fixed STOP byte, emits the authenticated shutdown acknowledgement,
-  and powers off. The zero-binding path preserves the current lifecycle smoke contract until a
-  host supervisor supplies the per-run packet.
+  identity, opens the guest framebuffer, renders a bounded deterministic fixture surface, emits
+  authenticated frame chunks, and applies only validated fixture pointer/button/scroll state. It
+  then accepts the fixed STOP byte, emits the authenticated shutdown acknowledgement, and powers
+  off. The zero-binding path preserves the current lifecycle smoke contract until a host supervisor
+  supplies the per-run packet.
 - `protocol.h` is shared by the guest and macOS helper. It contains the fixed bootstrap frame
   format, the freestanding HMAC-SHA-256 implementation, and the fixed session-binding header.
   The binding hashes Run, surface, incarnation, and isolated input-domain identities with
@@ -50,6 +52,7 @@ Local validation proves shell syntax, lock-file shape, protocol/self-test vector
 cross-language binding digest and challenge-derived confirmation), arm64 guest syntax, the closed
 kernel fragment, Objective-C helper syntax/linking, and the helper's invalid-start event path. It
 does not prove Linux CI execution, kernel boot, VSOCK operation on a real VM, framebuffer capture,
-guest application input, cleanup under crashes, signing, notarization, hardware support, or the
-#288 acceptance campaign. A CI image comparison must not be promoted to a reviewed release guest
-without those additional gates.
+  guest application input, cleanup under crashes, signing, notarization, hardware support, or the
+  #288 acceptance campaign. The fixture is a deterministic qualification surface, not arbitrary
+  GUI application support. A CI image comparison must not be promoted to a reviewed release guest
+  without those additional gates.

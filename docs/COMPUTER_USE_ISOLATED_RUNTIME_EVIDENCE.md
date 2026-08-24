@@ -6,12 +6,12 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `203de561e7189b8e19f17bc515b094450aa6387b`
-- Bundle: `/private/tmp/grokptah-cu-stage17-guest-frame-capture-v1.bundle`
-- Bundle SHA-256: `c7c8e1f45b70743e7dfbec19cde73dfec156e851238d29e1df43b5d4b19ac0a8`
+- Head: `bf1e1b7f0c27598ce155e2d734a23a6f095010ea`
+- Bundle: `/private/tmp/grokptah-cu-stage18-guest-fixture-v1.bundle`
+- Bundle SHA-256: `15d033f19c615c53e663ef9257c29e1ee4574ea137decdfe23a6ee80d111c401`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current sealed implementation head: `203de561e7189b8e19f17bc515b094450aa6387b`.
+Current sealed implementation head: `bf1e1b7f0c27598ce155e2d734a23a6f095010ea`.
 
 The later guest-input validation extension is sealed at:
 
@@ -42,6 +42,12 @@ The guest framebuffer-capture extension is sealed at:
 - Commit: `203de561e7189b8e19f17bc515b094450aa6387b`
 - Bundle: `/private/tmp/grokptah-cu-stage17-guest-frame-capture-v1.bundle`
 - Bundle SHA-256: `c7c8e1f45b70743e7dfbec19cde73dfec156e851238d29e1df43b5d4b19ac0a8`
+
+The deterministic guest-fixture rendering extension is sealed at:
+
+- Commit: `bf1e1b7f0c27598ce155e2d734a23a6f095010ea`
+- Bundle: `/private/tmp/grokptah-cu-stage18-guest-fixture-v1.bundle`
+- Bundle SHA-256: `15d033f19c615c53e663ef9257c29e1ee4574ea137decdfe23a6ee80d111c401`
 
 ## What this candidate proves
 
@@ -76,6 +82,10 @@ The guest framebuffer-capture extension is sealed at:
   chunks with fresh UUIDv4 nonces, and advances the frame freshness fence. This
   is source-level capture plumbing only; no reviewed guest image, GUI surface,
   or packaged rendered frame has been qualified.
+- The guest fixture renderer now writes a bounded deterministic surface through
+  the guest framebuffer before capture. Validated pointer, button, and scroll
+  packets update only that fixture's cursor/state; this is a qualification
+  surface, not arbitrary guest GUI support or a packaged render proof.
 - The freestanding guest source validates the authenticated input packet,
   sequence fence, identity-bound HMAC, coordinate/key/text bounds, and closed
   message kind set after binding. Input remains fail-closed until a reviewed

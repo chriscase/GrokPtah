@@ -45,7 +45,7 @@ typedef unsigned long gpt_size;
     (GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES + \
      4U * GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES)
 
-/* Authenticated guest-to-host frame chunks. Input is intentionally absent. */
+/* Authenticated guest-to-host frame chunks. Input is a separate host-to-guest ABI below. */
 #define GPT_ISOLATED_VISUAL_FRAME_MAGIC 0x47505446U
 #define GPT_ISOLATED_VISUAL_FRAME_VERSION 1U
 #define GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES 100U
