@@ -142,7 +142,8 @@ The bounded packaged-supervisor source extension is sealed at:
 The changed Rust files were rustfmt-clean. The guest verifier reported its
 protocol self-test and closed-source checks passing. The helper verifier linked
 an arm64 Mach-O against `Virtualization.framework` and passed its
-entitlement/configuration/source checks, including the native-spawn symbols.
+entitlement/configuration/source checks, including a native-shim object link and
+the exported spawn/free symbols.
 The repository-wide formatter still reports pre-existing unrelated whitespace
 in the xai-grok-pager crate; that code was not modified by this candidate.
 
