@@ -19,6 +19,11 @@ Candidate: `f2644f23` (`codex/help-center-integration-v1`), based directly on
   verified `document.documentElement.scrollWidth == window.innerWidth` (720px),
   with the dialog and source card still present.
 - Reset the temporary viewport override and closed the preview tab/server.
+- Ran the locked dependency audit. The only advisory is high-severity
+  `nanoid <3.3.18` through the Vite/PostCSS development toolchain; the
+  production-only audit reports zero vulnerabilities. This remains a
+  development-toolchain maintenance item, not a runtime Help Center
+  dependency.
 
 This is local browser evidence for the isolated integration candidate. It is
 not packaged desktop acceptance, live-provider certification, or expert UI
