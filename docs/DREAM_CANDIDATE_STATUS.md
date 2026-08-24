@@ -182,6 +182,9 @@ supervisor: start, frame reads, input, and stop require the exact Agent lease;
 failure revokes it; cleanup refuses to proceed while ownership remains. This
 is a source-level denial boundary only and is not a packaged-runtime or
 hardware qualification.
+The exact external compile/test procedure is recorded in
+[`COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md);
+no result for that follow-up has been returned yet.
 
 Grok Build ran the focused `isolated_guest` library proof (8 passed) plus the
 committed-stop cleanup regression (1 passed) on the isolated PR head with the

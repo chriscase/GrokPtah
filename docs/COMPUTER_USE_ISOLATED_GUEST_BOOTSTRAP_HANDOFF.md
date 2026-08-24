@@ -51,3 +51,6 @@ are not replaced or relaxed.
 The packaged-runtime lease follow-up is candidate commit `HEAD` after the
 PR integration; it is not part of PR #374’s GitHub allowlist and does not
 change the source-only qualification status above.
+
+The reproducible external compile/test procedure for that follow-up is
+[`COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md).

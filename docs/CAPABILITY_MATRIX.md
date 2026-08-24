@@ -48,7 +48,10 @@ tests remain external PR-head evidence rather than combined-head qualification.
 The candidate follow-up additionally applies the exact Agent lease to the
 macOS packaged-runtime supervisor’s start/read/input/stop methods and refuses
 cleanup while the lease is live. This remains source-only and unexposed until
-the signed package, real guest, and lifecycle campaign qualify it.
+the signed package, real guest, and lifecycle campaign qualify it. The
+reproducible external compile/test procedure is
+[`COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md);
+no result is recorded yet.
 
 Candidate-only UI update (2026-08-24): the Provider Readiness Center now
 surfaces provider-route configuration, the fact that provider/Grok Build
