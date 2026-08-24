@@ -141,7 +141,7 @@ complete or that the product has reached 100%.
 
 ### Latest desktop safety continuation — 2026-08-24
 
-Candidate `913baf8d49eb78f382ce9aeddca1aabf08cc0066` extends the shared,
+Candidate `95a3a20b40c59dbb3f1d88b3ad3f7df6b36ea7d9` extends the shared,
 bounded backend-error display boundary across the desktop surfaces. Credential-
 shaped values, local paths, and UI-only secret placeholders are redacted before
 errors reach search, session, run, routine, worker, settings, terminal, remote
@@ -155,8 +155,9 @@ review also found unlabeled glyph-only operator controls; Work refresh, new-tab,
 shell-dismiss, and Live-rail-hide controls now expose explicit accessible names
 with regression coverage. Search and modal Settings now keep Tab traversal
 inside the true modal surface, with a shared focus-trap helper and component
-regression coverage. The full desktop suite now passes 51 files / 385 tests.
-This remains source/UI evidence, not packaged review.
+regression coverage, and closing either surface returns focus to its opener.
+The full desktop suite now passes 51 files / 386 tests. This remains source/UI
+evidence, not packaged review.
 
 ## Verification recorded
 
