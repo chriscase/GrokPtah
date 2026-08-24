@@ -141,7 +141,7 @@ complete or that the product has reached 100%.
 
 ### Latest desktop safety continuation — 2026-08-24
 
-Candidate `8d26e10c1a9c7b8c60607286ad29a158789e4164` extends the shared,
+Candidate `af609a4278f71998a58e9f352fdc3b2795281d94` extends the shared,
 bounded backend-error display boundary across the desktop surfaces. Credential-
 shaped values, local paths, and UI-only secret placeholders are redacted before
 errors reach search, session, run, routine, worker, settings, terminal, remote
@@ -163,6 +163,8 @@ has a regression for path/credential leakage. The global React error boundary
 now uses that same sanitizer before showing render diagnostics, with a regression
 for path/credential leakage there as well. Durable Run timeline error and rate-
 limit events now use the same bounded display path, with a timeline regression.
+The shared sanitizer also covers ordinary `/tmp`, `/private/var`, and mounted
+volume paths that can appear in native/runtime failures.
 This remains source/UI evidence, not packaged review.
 
 ## Verification recorded
