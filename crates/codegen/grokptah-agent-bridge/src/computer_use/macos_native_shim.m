@@ -706,6 +706,11 @@ static BOOL GPTSetCloseOnExec(int descriptor) {
     return flags >= 0 && fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) == 0;
 }
 
+static BOOL GPTIsCloseOnExec(int descriptor) {
+    int flags = fcntl(descriptor, F_GETFD);
+    return flags >= 0 && (flags & FD_CLOEXEC) != 0;
+}
+
 static int GPTCreateCloseOnExecPipe(int pair[2]) {
     pair[0] = -1;
     pair[1] = -1;
@@ -753,10 +758,13 @@ GPTMacIsolatedRuntimeSpawnResult gpt_macos_isolated_runtime_spawn(
             !S_ISREG(helperIdentity.st_mode) ||
             !S_ISREG(guestImageIdentity.st_mode) ||
             !S_ISREG(configurationIdentity.st_mode) ||
+            !GPTIsCloseOnExec(helper_fd) ||
+            !GPTIsCloseOnExec(guest_image_fd) ||
+            !GPTIsCloseOnExec(configuration_fd) ||
             !GPTPathStillNamesArtifact(helperPath, &helperIdentity)) {
             return GPTIsolatedRuntimeSpawnError(
-                GPT_MAC_TARGET_CHANGED,
-                @"Measured isolated artifacts changed before isolated launch");
+                GPT_MAC_FORBIDDEN_ACTION,
+                @"Measured isolated artifact descriptors are not close-on-exec");
         }
 
         int control[2] = {-1, -1};

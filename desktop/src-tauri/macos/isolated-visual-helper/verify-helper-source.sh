@@ -80,6 +80,7 @@ for required in \
   'int32_t guest_image_fd' \
   'int32_t configuration_fd' \
   'fstat(guest_image_fd' \
+  'GPTIsCloseOnExec' \
   'GPTMacIsolatedRuntimeSpawnResult' \
   'POSIX_SPAWN_CLOEXEC_DEFAULT' \
   'posix_spawn_file_actions_adddup2' \

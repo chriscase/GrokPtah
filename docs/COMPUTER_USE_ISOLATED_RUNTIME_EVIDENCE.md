@@ -116,8 +116,8 @@ The measured-descriptor spawn hardening is sealed at:
   launch and package qualification explicitly unclaimed.
 - The native macOS shim now consumes the exact helper, guest-image, and
   configuration descriptors returned by the Rust measurement/receipt verifier,
-  rechecks helper identity immediately before `posix_spawn`, creates only the
-  five private parent/child channels, and maps the fixed descriptor contract under
+  rejects descriptors without close-on-exec, rechecks helper identity immediately
+  before `posix_spawn`, creates only the five private parent/child channels, and maps the fixed descriptor contract under
   `POSIX_SPAWN_CLOEXEC_DEFAULT`, and routes child stdio to `/dev/null`. The
   macOS Rust supervisor owns the returned PID and descriptors, consumes FD9,
   drives the bounded Prepared → Running → Bound lifecycle, applies bounded
