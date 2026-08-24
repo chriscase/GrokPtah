@@ -44,14 +44,21 @@ checked-in record contains only the secret-free projection defined by
 
 1. Freeze the assembled SHA and package identity; record the exact window
    surfaces and workflow list.
-2. Run the complete state and accessibility matrix in the packaged build.
-3. Record each finding once, assigning P0–P3 severity and a disposition.
-4. Fix P0/P1 findings before the next integration/release gate, or stop with
+2. Before any navigation or input, perform a read-only surface synchronization:
+   capture the full accessibility tree and a screenshot, and verify that the
+   visible application, task title, repository, ref/SHA, environment, and
+   model/effort match the frozen review record. If the surfaces disagree, or
+   the visible pane contains another task’s draft or controls, take no click,
+   typing, send, stop, retry, or navigation action; release the desktop focus
+   and record the review as blocked.
+3. Run the complete state and accessibility matrix in the packaged build.
+4. Record each finding once, assigning P0–P3 severity and a disposition.
+5. Fix P0/P1 findings before the next integration/release gate, or stop with
    an explicit failed review. P2/P3 findings require a tracking reference or
    an evidence-backed accepted tradeoff.
-5. Run the evidence validator and retain the secret-free record plus external
+6. Run the evidence validator and retain the secret-free record plus external
    evidence digests. Never set `claim_eligible` by hand.
-6. Link the record from the integration PR/release record and schedule the
+7. Link the record from the integration PR/release record and schedule the
    next cadence review immediately.
 
 ## Ownership and retention
