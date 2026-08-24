@@ -218,6 +218,11 @@ available.
    socket loop, guest application capture, and renderer are not wired yet, so this is not runtime
    transport or isolation proof.
 5. Add guest pointer state and one-action local approval; then key/text/scroll/drag independently.
+   The source candidate now includes a non-dispatchable host-side input gate that binds every
+   pointer/button/scroll/key/text edge to the latest frame, requires strictly increasing input
+   sequence, enforces the measured display/text/event ceilings, and refuses terminal state while a
+   key or button remains held. It does not authenticate or send a socket message yet; the packaged
+   guest agent and one-action approval path remain required before any input claim.
 6. Integrate app-owned cursor, focus/drag preview, timeline, persistent emergency controls, and
    accessibility states in the cockpit.
 7. Run adversarial, crash/restart, resource, packaged hardware, and recurring expert UI reviews.
