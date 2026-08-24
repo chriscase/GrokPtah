@@ -19,6 +19,8 @@ Candidate: `f2644f23` (`codex/help-center-integration-v1`), based directly on
 - At a 720px × 800px viewport, expanded the Lanes rail, reopened Help, and
   verified `document.documentElement.scrollWidth == window.innerWidth` (720px),
   with the dialog and source card still present.
+- The desktop preview also confirmed twelve rendered article buttons and the
+  visible `Grok Build, Grok Bot, and external tools` article title.
 - Reset the temporary viewport override and closed the preview tab/server.
 - Refreshed the lockfile so the Vite/PostCSS development toolchain resolves
   `nanoid@3.3.18` and reran the locked dependency audit. Production and full
