@@ -555,8 +555,9 @@ checks only** from exact candidate
 The currently pinned external procedure still uses immutable bundle
 `/private/tmp/grokptah-packaged-lease-b250b70-v2.bundle`
 (SHA-256 `4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`).
-Because the returned report names a different input-bundle digest, identity
-reconciliation remains required. No packaged VM, guest boot, rendered-frame,
+The returned report names a different transport-bundle digest, but the
+repository-owned lease-fence verifier confirms the pinned bundle is complete
+and contains the exact candidate. No packaged VM, guest boot, rendered-frame,
 host-input, signing, or soak claim may be inferred; the later v15 hardware
 campaign remains the next Stage 9/#288 gate.
 The subsequent source-only stop-failure correction is frozen separately at

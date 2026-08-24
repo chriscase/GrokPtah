@@ -57,8 +57,10 @@ the active external run is pinned to immutable bundle
 source-level PASS has now been returned for exact candidate
 `b250b7096c6131721864b39f4cc5fdce5e3ada15`; see the secret-free
 [`COMPUTER_USE_PACKAGED_LEASE_B250B70_SOURCE_REPORT.md`](evidence/COMPUTER_USE_PACKAGED_LEASE_B250B70_SOURCE_REPORT.md).
-The report names a different input-bundle digest than the pinned handoff, so
-bundle identity reconciliation and the packaged campaign remain open.
+The report names a different transport-bundle digest; the repository-owned
+lease-fence verifier confirms the pinned bundle is complete and contains the
+exact candidate. This source PASS still does not advance the packaged VM
+campaign.
 
 Candidate follow-up `40730e4` additionally revokes packaged-guest ownership
 after any terminal stop/reap result, including bounded reap failure, and

@@ -21,9 +21,12 @@ boundary, not a packaged Computer Use or VM certification.
 
 The report names input bundle SHA-256
 `2888bd904e3175e475d105e63e2b9aed449fcf8b25a0081464d8a67df1d74edd`.
-That digest is not the currently pinned external-handoff bundle
-`4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`; the
-bundle identity therefore remains a separate reconciliation gate.
+That is a different transport bundle from the currently pinned external-
+handoff bundle
+`4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`, but
+the repository-owned lease-fence verifier independently confirms the pinned
+bundle is complete and contains this exact candidate. The alternate digest is
+retained for provenance; it is not evidence for the later VM campaign.
 
 ## Checks returned
 
@@ -55,4 +58,3 @@ Virtualization.framework launch, real guest boot, rendered frames, host input,
 live-VM cleanup, multi-agent desktop acceptance, or a long soak. Stage 9 /
 issue #288 therefore remains open, and the later v15 full campaign remains the
 next packaged/hardware gate.
-

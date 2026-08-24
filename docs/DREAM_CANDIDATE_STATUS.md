@@ -195,10 +195,11 @@ the external run is using immutable bundle
 source-level PASS has now been returned for exact candidate
 `b250b7096c6131721864b39f4cc5fdce5e3ada15`; the secret-free report is
 [`COMPUTER_USE_PACKAGED_LEASE_B250B70_SOURCE_REPORT.md`](evidence/COMPUTER_USE_PACKAGED_LEASE_B250B70_SOURCE_REPORT.md).
-The report names a different input-bundle digest, so bundle identity
-reconciliation remains open. No packaged VM, guest boot, rendered-frame,
-host-input, signing, or soak claim may be inferred; the later v15 hardware
-campaign remains queued.
+The report names a different transport-bundle digest; the repository-owned
+lease-fence verifier confirms the pinned bundle is complete and contains the
+exact candidate. No packaged VM, guest boot, rendered-frame, host-input,
+signing, or soak claim may be inferred; the later v15 hardware campaign
+remains queued.
 
 The next source-only correction (`40730e4`) makes terminal stop failure
 fail-closed for ownership as well: the lease is revoked even when bounded
