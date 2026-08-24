@@ -529,6 +529,16 @@ unsupported. Certification-lab smoke checks that managed execution is
 **disabled by default**. No 72-hour soak report exists. The v51 public-run
 campaign is **NOT QUALIFIED**; the exact v52 repair/certification handoff is
 [`ALWAYS_ON_GROKBOT_V52_HANDOFF.md`](ALWAYS_ON_GROKBOT_V52_HANDOFF.md). The
+v51 also yielded a separate one-file route-identity repair candidate at
+`6e9ee187a846f26c3210ac2e417ed16115813cad` (parent
+`bb9e7ed30f19018d6c3244885a6ce83818662c1b`) in immutable bundle
+`/private/tmp/grokptah-dream-stage4-v52-public-run-correction.bundle` (SHA-256
+`56dad64886b77195ad5dac3fe48d4c9cec12dd7c96014bc7d23ee21888f44a0b`). Its
+static checks pass, but no external service-process result is recorded; the
+dedicated procedure is
+[`ALWAYS_ON_GROKBOT_V52_ROUTE_IDENTITY_HANDOFF.md`](ALWAYS_ON_GROKBOT_V52_ROUTE_IDENTITY_HANDOFF.md).
+It must not be treated as a second certification or conflated with the
+packaged Computer Use campaign. The
 dream candidate now accepts externally managed, Agent-bound worker credentials,
 scopes them to
 the final service workspace allowlist, rejects token reuse, and has a real

@@ -198,6 +198,21 @@ runner; it does not change the active `b250b70` campaign.
 The frozen follow-up procedure is
 [`COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md).
 
+### Always-On v52 route-identity repair — 2026-08-24
+
+The v51 campaign reached the real `grokptah-service` process but failed closed
+when `ptah_get_run` encountered the allowlisted `grok-build` route identity in
+the public redaction scan. Grok Build produced a separate immutable one-file
+repair candidate at `6e9ee187a846f26c3210ac2e417ed16115813cad`, parent
+`bb9e7ed30f19018d6c3244885a6ce83818662c1b`, in bundle
+`/private/tmp/grokptah-dream-stage4-v52-public-run-correction.bundle` (SHA-256
+`56dad64886b77195ad5dac3fe48d4c9cec12dd7c96014bc7d23ee21888f44a0b`). The
+overlay changes only `orchestration/public_run.rs`; local rustfmt, metadata,
+and diff checks pass. It remains source-only until the real service-process
+campaign, lab probe, and retained soak agree on this exact head. The dedicated
+external handoff is
+[`ALWAYS_ON_GROKBOT_V52_ROUTE_IDENTITY_HANDOFF.md`](ALWAYS_ON_GROKBOT_V52_ROUTE_IDENTITY_HANDOFF.md).
+
 Grok Build ran the focused `isolated_guest` library proof (8 passed) plus the
 committed-stop cleanup regression (1 passed) on the isolated PR head with the
 required sccache/target policy. Those are external PR-head results, not a Rust

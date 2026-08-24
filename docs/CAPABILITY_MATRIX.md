@@ -72,6 +72,13 @@ evidence and a live campaign certificate. This improves operator honesty for
 company-gateway workflows; it does not create a quota receipt, live provider
 certification, or a shipped-on-main claim.
 
+Candidate-only Always-On update (2026-08-24): the v51 public-run failure has
+an exact one-file route-identity repair candidate at `6e9ee187` on the v51
+failure head. Its immutable bundle and source-only procedure are recorded in
+[`ALWAYS_ON_GROKBOT_V52_ROUTE_IDENTITY_HANDOFF.md`](ALWAYS_ON_GROKBOT_V52_ROUTE_IDENTITY_HANDOFF.md).
+No external service-process, lab, or soak result has been recorded for that
+candidate; the Always-On row remains Planned and uncertified.
+
 The recurring expert review process is documented in
 [`UI_REVIEW_CADENCE.md`](UI_REVIEW_CADENCE.md); no dated packaged review is
 claimed by that process document.
