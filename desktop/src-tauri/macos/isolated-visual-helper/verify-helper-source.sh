@@ -21,6 +21,11 @@ sh -n "$script_dir/build-helper.sh"
 sh -n "$script_dir/package-signed-app.sh"
 xcrun clang -fobjc-arc -fblocks -fsyntax-only -mmacosx-version-min=11.0 \
   -Wall -Wextra -Werror "$native_shim"
+native_object="$work/macos_native_shim.o"
+xcrun clang -fobjc-arc -fblocks -c -mmacosx-version-min=11.0 \
+  -Wall -Wextra -Werror "$native_shim" -o "$native_object"
+nm -gU "$native_object" | grep -F '_gpt_macos_isolated_runtime_spawn' >/dev/null
+nm -gU "$native_object" | grep -F '_gpt_macos_isolated_runtime_spawn_result_free' >/dev/null
 plutil -lint \
   "$script_dir/isolated-visual-helper.entitlements.plist" \
   "$script_dir/grokptah-main.entitlements.plist"
