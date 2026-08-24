@@ -20,6 +20,8 @@ This is a fail-closed evidence campaign, not an implementation task.
 Global rules for both lanes:
 - Preserve /Users/chriscase/Documents/GitHub/GrokPtah, all Git branches,
   GitHub, existing app sessions, and every other campaign.
+- Before launching either lane, run `sh docs/verify-qualification-doc-state.sh`
+  and stop if the documentation-state guard fails.
 - Never merge, push, rebase, undraft, create a PR, patch a disposable checkout,
   or silently substitute another source/ref.
 - Before every Rust command, report disk headroom and active cargo/rustc
