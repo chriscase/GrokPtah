@@ -211,7 +211,8 @@ The monotonic VM-deadline hardening extension is sealed at:
 - Guest VSOCK reads and writes now pass through one poll-budgeted I/O helper;
   the retry budget covers each whole protocol operation, so a stalled or
   trickling host channel cannot leave freestanding guest PID 1 in an
-  unbounded blocking syscall.
+  unbounded blocking syscall. Terminal poll errors, hangups, and invalid
+  descriptors fail immediately instead of consuming the temporary-stall budget.
 - The stop boundary now rejects held keyboard/button state, waits for the
   helper to exit, and leaves the lifecycle in `CleanupPending` until explicit
   per-surface process, handle, overlay, and frame-cache evidence completes it.
