@@ -54,6 +54,12 @@ if [ ! -d "$input_app" ] || [ ! -f "$guest_image" ] ||
   echo "expected an app directory, regular guest image, and reviewed configuration" >&2
   exit 66
 fi
+input_bundle_identifier=$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - \
+  "$input_app/Contents/Info.plist" 2>/dev/null || true)
+if [ "$input_bundle_identifier" != "com.chriscase.grokptah" ]; then
+  echo "input app has an unexpected bundle identifier" >&2
+  exit 65
+fi
 case "$expected_guest_sha" in
   *[!0-9a-f]*|'') echo "expected guest digest must be lowercase hexadecimal" >&2; exit 64 ;;
 esac
@@ -169,6 +175,26 @@ chmod 0444 "$manifest"
   --sign "$signing_identity" \
   "$output_app"
 /usr/bin/codesign --verify --deep --strict --all-architectures "$output_app"
+
+output_bundle_identifier=$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - \
+  "$output_app/Contents/Info.plist" 2>/dev/null || true)
+if [ "$output_bundle_identifier" != "com.chriscase.grokptah" ]; then
+  echo "signed app has an unexpected bundle identifier" >&2
+  exit 65
+fi
+
+signed_team_identifier() {
+  /usr/bin/codesign -dv --verbose=4 "$1" 2>&1 |
+    sed -n 's/^TeamIdentifier=//p'
+}
+
+helper_team_identifier=$(signed_team_identifier "$packaged_helper")
+output_team_identifier=$(signed_team_identifier "$output_app")
+if [ -z "$helper_team_identifier" ] ||
+   [ "$helper_team_identifier" != "$output_team_identifier" ]; then
+  echo "signed helper and outer app do not share one team identity" >&2
+  exit 65
+fi
 
 assert_entitlement_present() {
   artifact=$1

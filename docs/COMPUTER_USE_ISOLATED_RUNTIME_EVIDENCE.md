@@ -195,6 +195,9 @@ The monotonic VM-deadline hardening extension is sealed at:
   helper and outer-app signing: only the helper must carry App Sandbox plus
   Virtualization, while helper and outer app reject VM networking and
   `get-task-allow`.
+- Package assembly also requires the exact GrokPtah bundle identifier and
+  matching signed team identity for the helper and outer app; a misidentified
+  or cross-team artifact fails before it can be used as a runtime candidate.
 - The stop boundary now rejects held keyboard/button state, waits for the
   helper to exit, and leaves the lifecycle in `CleanupPending` until explicit
   per-surface process, handle, overlay, and frame-cache evidence completes it.

@@ -20,6 +20,10 @@ trap cleanup EXIT HUP INT TERM
 sh -n "$script_dir/build-helper.sh"
 sh -n "$script_dir/package-signed-app.sh"
 for required in \
+  'CFBundleIdentifier' \
+  'com.chriscase.grokptah' \
+  'signed_team_identifier' \
+  'TeamIdentifier=' \
   'assert_entitlement_present' \
   'assert_entitlement_absent' \
   'com.apple.security.app-sandbox' \
