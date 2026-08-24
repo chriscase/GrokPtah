@@ -122,6 +122,9 @@ event_capture="$work/events.bin"
 input_fifo="$work/input"
 frame_fifo="$work/frames"
 challenge_fifo="$work/challenge"
+guest_fixture="$work/guest.img"
+printf '\001' >"$guest_fixture"
+chmod 0444 "$guest_fixture"
 mkfifo -m 0600 "$control_fifo" "$event_fifo" "$input_fifo" "$frame_fifo" "$challenge_fifo"
 dd if="$event_fifo" of="$event_capture" status=none &
 event_reader=$!
@@ -135,7 +138,7 @@ printf '\003' >"$control_fifo" &
 control_writer=$!
 set +e
 "$helper" \
-  3<"$configuration" \
+  3<"$guest_fixture" \
   4<"$configuration" \
   5<"$control_fifo" \
   6>"$event_fifo" \
