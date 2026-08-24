@@ -21,8 +21,8 @@ recorded cutoff. The candidate branch continued afterward and must not be
 described as covered by that bundle:
 
 - Latest implementation commit covered by this continuation:
-  `afe68ebdb6c9b212c840e5b86eceeaa26ed1284e`
-  (`fix(desktop): make computer errors recoverable and safe`).
+  `70c080890b3835fdbe4f7a2926822189c1dcc902`
+  (`fix(desktop): sanitize backend error surfaces`).
 - Post-bundle changes include the approval-dialog keyboard/focus safety fixes
   (`6a00ea3` and `295a4ff`), post-stop cleanup coverage (`6c6d1e7`),
   and the enterprise/v52 handoff documentation (`7aef495` and `c7423a0`).
@@ -31,6 +31,10 @@ described as covered by that bundle:
   a recoverable message, and exposes an accessible retry action. Typecheck,
   the focused cockpit suite (26 tests), and the full desktop suite (380 tests)
   pass at this candidate head.
+- The shared error boundary now applies the same bounded redaction to search,
+  sessions, runs, routines, workers, settings, terminal, remote-agent, and
+  provider-readiness surfaces. Its focused redaction tests pass; the full
+  desktop suite now passes 382 tests.
 - No new signed package, guest image, VM launch, rendered-frame/input run, or
   qualification bundle exists for those later commits.
 - Reviewers must either use the exact bundle cutoff above for source-only
