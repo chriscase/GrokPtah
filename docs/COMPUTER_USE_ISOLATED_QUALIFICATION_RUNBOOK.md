@@ -35,6 +35,29 @@ export SCCACHE_DIR=/Users/chriscase/Library/Caches/grokptah/sccache
 export CARGO_TARGET_DIR=/Users/chriscase/Library/Caches/grokptah/targets/rust-1.92.0-stage5-memory-default
 ```
 
+Run this read-only preflight before any Rust command; it refuses a missing wrapper or a target
+inside the disposable checkout and prints the ownership record that must accompany the campaign:
+
+```sh
+set -eu
+test "${RUSTC_WRAPPER:-}" = /opt/homebrew/bin/sccache
+test "${SCCACHE_DIR:-}" = /Users/chriscase/Library/Caches/grokptah/sccache
+test "${CARGO_TARGET_DIR:-}" = /Users/chriscase/Library/Caches/grokptah/targets/rust-1.92.0-stage5-memory-default
+test -x "$RUSTC_WRAPPER"
+checkout=$(pwd -P)
+case "$CARGO_TARGET_DIR" in
+  "$checkout"|"$checkout"/*)
+    echo "refusing a checkout-local Cargo target" >&2
+    exit 65
+    ;;
+esac
+printf 'qualification_owner=%s\n' "$(id -u):$(id -g)"
+printf 'qualification_checkout=%s\n' "$checkout"
+printf 'qualification_target=%s\n' "$CARGO_TARGET_DIR"
+df -h "$checkout"
+ps axo pid,ppid,etime,command | grep -E '[c]argo|[r]ustc|[s]ccache' || true
+```
+
 The campaign must report `df`/process ownership before building and target size/cleanup status
 afterward. Do not create an in-checkout or per-agent Cargo target.
 
