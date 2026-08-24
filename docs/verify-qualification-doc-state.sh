@@ -13,6 +13,28 @@ require_text() {
   fi
 }
 
+verify_bundle() {
+  bundle=$1
+  expected_sha=$2
+  if [ ! -f "$bundle" ] || [ -L "$bundle" ]; then
+    echo "qualification bundle is not a regular file: $bundle" >&2
+    exit 66
+  fi
+  observed_sha=$(shasum -a 256 "$bundle" | awk '{print $1}')
+  if [ "$observed_sha" != "$expected_sha" ]; then
+    echo "qualification bundle SHA-256 mismatch: $bundle" >&2
+    exit 67
+  fi
+  git -C "$repo_root" bundle verify "$bundle" >/dev/null
+}
+
+verify_bundle \
+  /private/tmp/grokptah-dream-stage4-v52-public-run-correction.bundle \
+  56dad64886b77195ad5dac3fe48d4c9cec12dd7c96014bc7d23ee21888f44a0b
+verify_bundle \
+  /private/tmp/grokptah-cu-isolated-visual-v15.bundle \
+  34ecdcdacf6c07b07d425e56c0f908ba8f6a5932d75f0dd2abb88c5c30bb8012
+
 # The current visual lane must be the only actionable visual handoff.
 require_text 'Status: **SUPERSEDED historical procedure; do not launch.**' \
   docs/COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V13.md
