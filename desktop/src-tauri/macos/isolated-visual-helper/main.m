@@ -72,22 +72,11 @@ static void GPTSignalHandler(int signalNumber) {
     GPTStopRequested = 1;
 }
 
-static BOOL GPTWriteExact(int descriptor, const void *bytes, size_t length) {
-    const uint8_t *cursor = bytes;
-    size_t remaining = length;
-    while (remaining > 0) {
-        ssize_t written = write(descriptor, cursor, remaining);
-        if (written < 0 && errno == EINTR) {
-            continue;
-        }
-        if (written <= 0) {
-            return NO;
-        }
-        cursor += written;
-        remaining -= (size_t)written;
-    }
-    return YES;
-}
+static BOOL GPTWriteDescriptorExact(
+    int descriptor,
+    const void *bytes,
+    size_t length,
+    int timeoutMilliseconds);
 
 static BOOL GPTWriteEvent(GPTIsolatedHelperEventCode code, uint32_t detail) {
     gpt_isolated_helper_event event = {
@@ -97,7 +86,11 @@ static BOOL GPTWriteEvent(GPTIsolatedHelperEventCode code, uint32_t detail) {
         .detail = CFSwapInt32HostToBig(detail),
         .reserved = 0,
     };
-    return GPTWriteExact(GPT_EVENT_FD, &event, sizeof(event));
+    return GPTWriteDescriptorExact(
+        GPT_EVENT_FD,
+        &event,
+        sizeof(event),
+        GPT_GUEST_HANDSHAKE_TIMEOUT_MS);
 }
 
 static BOOL GPTDescriptorHasAccess(int descriptor, int accessMode) {

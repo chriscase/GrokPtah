@@ -66,6 +66,7 @@ for required in \
   'setSocketListener:guestSocketListener' \
   'GPTGuestWaitForReady' \
   'GPTGuestRequestShutdown' \
+  'GPTWriteDescriptorExact' \
   'GPTMonotonicMilliseconds' \
   'GPTDeadlineAfter' \
   'durationMilliseconds' \
