@@ -9,11 +9,11 @@ cleanup result.
 
 ## Exact candidate
 
-- Source bundle: `/private/tmp/grokptah-cu-isolated-visual-v10.bundle`
-- Bundle SHA-256: `d3ffa525093ced9500f2fd43ee4100e35b6cb19e5ab9ac33a017ffe82f1d4ad6`
-- Source cutoff: `813516fd97ecd756427cdd4465f3bf4872beb5a0`
+- Source bundle: `/private/tmp/grokptah-cu-isolated-visual-v11.bundle`
+- Bundle SHA-256: `1445fa1fd8ebc301c3257ab33cbaaa2efcac85884146cd623cefd2a06968e939`
+- Source cutoff: `43c3e08e8b057f4116fa2e842f3afbebcaf4e178`
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Docs-only handoff checkpoint (contains the evidence verifier): `e5769a9925b4152eae3d83e63dbe15444192ae81`
+- Handoff checkpoint (contains the evidence verifier): `43c3e08e8b057f4116fa2e842f3afbebcaf4e178`
 - Main checkout must remain untouched at `6409645cb7d0fe6d75585f0610366340f808b8ec`.
 
 ## Paste this to the external build owner
@@ -26,9 +26,9 @@ Use only the exact source bundle and SHA below. Create a disposable checkout; do
 developer checkout, existing app sessions, Git branches, or GitHub. Do not infer a VM capability
 from source tests, a Linux image comparison, package signing, or launchAttempted=false.
 
-Bundle: /private/tmp/grokptah-cu-isolated-visual-v10.bundle
-Bundle SHA-256: d3ffa525093ced9500f2fd43ee4100e35b6cb19e5ab9ac33a017ffe82f1d4ad6
-Source cutoff: 813516fd97ecd756427cdd4465f3bf4872beb5a0
+Bundle: /private/tmp/grokptah-cu-isolated-visual-v11.bundle
+Bundle SHA-256: 1445fa1fd8ebc301c3257ab33cbaaa2efcac85884146cd623cefd2a06968e939
+Source cutoff: 43c3e08e8b057f4116fa2e842f3afbebcaf4e178
 
 Before any build, report macOS version/build, Virtualization.framework availability, signing
 identity fingerprint (never private material), free disk, active cargo/rustc processes, intended
@@ -79,8 +79,9 @@ It must explicitly state whether `launchAttempted` occurred. A report that stops
 launch remains **NOT QUALIFIED**.
 
 After the campaign, run `docs/verify-isolated-runtime-evidence.sh` from the docs-only handoff
-checkpoint (`e5769a99…`) or another checkout that contains that exact script. The immutable source
-bundle is the current candidate at `813516fd…`; the verifier is a source-level evidence aid and
+checkpoint (the docs-only checkpoint from this refresh) or another checkout that contains that
+exact script. The immutable source bundle is the current candidate at `43c3e08e…`; the verifier is
+a source-level evidence aid and
 must not be treated as a VM qualification result. Then update `ROADMAP_TO_100.md`, `CAPABILITY_MATRIX.md`, and
 `COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md` together. Do not change an unsupported or planned
 status based on this handoff alone.
