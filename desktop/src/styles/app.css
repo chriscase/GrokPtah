@@ -56,11 +56,11 @@
   --border-soft: #e2e5ec;
   --text: #1a1d24;
   --muted: #5c6573;
-  --accent: #b8860b;
-  --accent-dim: #8a6508;
-  --accent-bg: rgba(184, 134, 11, 0.12);
+  --accent: #8a6508;
+  --accent-dim: #6b4e06;
+  --accent-bg: rgba(138, 101, 8, 0.12);
   --danger: #c23b44;
-  --ok: #2f8f57;
+  --ok: #1e7041;
   --thought: #5a6575;
   --tool: #6b4db8;
   --user-bg: #e8ebf2;
@@ -6794,20 +6794,38 @@ html[data-type-scale="lg"] body,
 html[data-type-scale="lg"] #root {
   font-size: 15px;
 }
-html[data-accent="amber"] {
+/* Accent palettes are theme-scoped. Unscoped html[data-accent] used to paint
+   dark-only hex onto the light canvas (~2:1). Dark (default) values stay on
+   :not(light); light gets AA-safe text accents. */
+html:not([data-theme="light"])[data-accent="amber"] {
   --accent: #f0b429;
   --accent-dim: #a67c1a;
   --accent-bg: rgba(240, 180, 41, 0.12);
 }
-html[data-accent="teal"] {
+html[data-theme="light"][data-accent="amber"] {
+  --accent: #8a6508;
+  --accent-dim: #6b4e06;
+  --accent-bg: rgba(138, 101, 8, 0.12);
+}
+html:not([data-theme="light"])[data-accent="teal"] {
   --accent: #2dd4a8;
   --accent-dim: #1a9e7a;
   --accent-bg: rgba(45, 212, 168, 0.12);
 }
-html[data-accent="violet"] {
+html[data-theme="light"][data-accent="teal"] {
+  --accent: #0f6b54;
+  --accent-dim: #0b5744;
+  --accent-bg: rgba(15, 107, 84, 0.12);
+}
+html:not([data-theme="light"])[data-accent="violet"] {
   --accent: #c084fc;
   --accent-dim: #8b5cf6;
   --accent-bg: rgba(192, 132, 252, 0.14);
+}
+html[data-theme="light"][data-accent="violet"] {
+  --accent: #6d28d9;
+  --accent-dim: #5b21b6;
+  --accent-bg: rgba(109, 40, 217, 0.12);
 }
 .appearance-preview {
   margin-top: 0.75rem;

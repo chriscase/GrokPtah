@@ -67,6 +67,7 @@ import {
   enqueuePermission,
   headPermission,
 } from "./lib/permissionQueue";
+import { isChromeLocked, inertProps } from "./lib/overlayA11y";
 import {
   clampDocks,
   SPLIT_MIN_WIDTH,
@@ -2901,13 +2902,22 @@ export default function App() {
   // A missing status is rendered as an offline/no-project state elsewhere;
   // it must not leave the launch splash blocking every control forever.
   const splashReady = workspaceRestored;
+  const chromeLocked = isChromeLocked({
+    settingsOpen,
+    sessionBrowserOpen,
+    permissionOpen: Boolean(permission),
+    searchOpen,
+    aboutOpen,
+    mcpTrustOpen: Boolean(mcpTrustPrompt),
+  });
+  const lockChrome = inertProps(chromeLocked);
 
   return (
     <div
       className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${rightbarCollapsed ? "rightbar-collapsed" : ""}`}
     >
       <LaunchSplash ready={splashReady} />
-      <header className="titlebar">
+      <header className="titlebar" {...lockChrome}>
         <div className="brand">
           <BrandMark size={20} className="brand-mark-img" />
           <span className="brand-name">
@@ -3037,6 +3047,7 @@ export default function App() {
       </header>
 
       <aside
+        {...lockChrome}
         className={`sidebar ${sidebarCollapsed ? "is-collapsed" : ""}`}
         aria-expanded={!sidebarCollapsed}
       >
@@ -3232,6 +3243,7 @@ export default function App() {
       </aside>
 
       <main
+        {...lockChrome}
         className={`main density-${layoutDensity} ${computerCockpitVisible ? "computer-open" : ""} ${
           docks.length > 1 ? "is-split" : ""
         }`}
@@ -4000,6 +4012,7 @@ export default function App() {
       </main>
 
       <aside
+        {...lockChrome}
         className={`rightbar ${rightbarCollapsed ? "is-collapsed" : ""}`}
         aria-expanded={!rightbarCollapsed}
       >
@@ -4743,7 +4756,7 @@ export default function App() {
         </div>
       </aside>
 
-      <footer className="status-bar">
+      <footer className="status-bar" {...lockChrome}>
         <span className={busy || anyBusy ? "status-live" : "status-idle"}>
           {busy
             ? `● Live · ${activity.label}${activity.detail ? ` — ${activity.detail}` : ""}`
