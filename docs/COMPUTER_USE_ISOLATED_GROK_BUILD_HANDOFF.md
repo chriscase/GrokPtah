@@ -1,4 +1,8 @@
-# Isolated visual Computer Use — external Grok Build handoff
+# Isolated visual Computer Use — superseded external Grok Build handoff
+
+> **Superseded.** Do not launch this v12 procedure. The current queued
+> campaign is [COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V14.md](COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V14.md),
+> backed by the immutable v14 bundle and the pre-`Stopping` stop-failure fix.
 
 Status: **qualification procedure only; no VM capability is claimed by this document.**
 

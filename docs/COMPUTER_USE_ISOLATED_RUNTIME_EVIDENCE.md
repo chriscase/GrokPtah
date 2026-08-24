@@ -3,6 +3,12 @@
 Status: source-level progress only; this record does not qualify a packaged
 Computer Use backend or satisfy the #288 release gate.
 
+This record is the historical v12 source cutoff. For any new Stage 9 campaign,
+use the current queued
+[`COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V14.md`](COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V14.md)
+and its v14 bundle; do not infer current packaged evidence from this v12
+record.
+
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
