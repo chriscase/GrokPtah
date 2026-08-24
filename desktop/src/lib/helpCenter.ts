@@ -402,6 +402,43 @@ export function buildHelpSemanticRequest(
   };
 }
 
+export type HelpLaneChrome = {
+  tabIds: string[];
+  activeId: string | null;
+};
+
+export type HelpLaneHost = {
+  snapshot: () => HelpLaneChrome;
+  restore: (chrome: HelpLaneChrome) => Promise<void>;
+  createEphemeralChat: () => Promise<{ id: string }>;
+  prompt: (sessionId: string, text: string) => Promise<string>;
+  deleteSession: (sessionId: string) => Promise<void>;
+};
+
+/**
+ * Run a confirmation-gated Help provider turn without leaving the helper
+ * chat as the user's active Lane or on the open-tab strip.
+ *
+ * `session_new_kind("chat")` and `session_prompt` both mutate host
+ * `active_session`; restore the snapshot after create and again after delete.
+ */
+export async function runHelpProviderTurn<T>(
+  host: HelpLaneHost,
+  prompt: string,
+  parse: (reply: string) => T,
+): Promise<T> {
+  const chrome = host.snapshot();
+  const session = await host.createEphemeralChat();
+  try {
+    await host.restore(chrome);
+    const reply = await host.prompt(session.id, prompt);
+    return parse(reply);
+  } finally {
+    await host.deleteSession(session.id).catch(() => undefined);
+    await host.restore(chrome);
+  }
+}
+
 /** Reject answers that cannot be tied back to the selected source bundle. */
 export function validateHelpAssistantAnswer(
   answer: HelpAssistantAnswer,

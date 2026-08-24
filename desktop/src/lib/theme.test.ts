@@ -116,6 +116,9 @@ describe("Help overlay and small-label contract", () => {
 
     expect(css).toMatch(/\.help-eyebrow[\s\S]{0,180}color:\s*var\(--accent-label\)/);
     expect(css).toMatch(/\.help-list-topic,\s*\n\.help-article-topic \{\n  color:\s*var\(--accent-label\)/);
+    expect(css).toMatch(/\.help-assistant-answer strong \{\n  color:\s*var\(--accent-label\)/);
+    expect(css).toMatch(/\.sidebar-help-opener\s*\{[\s\S]*?min-width:\s*44px/);
+    expect(css).toMatch(/\.sidebar-help-opener\s*\{[\s\S]*?min-height:\s*44px/);
   });
 
   it("defines a global overlay contract where consent stacks above Help", () => {

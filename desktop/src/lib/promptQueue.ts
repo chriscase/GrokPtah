@@ -267,3 +267,34 @@ export function drainPromptQueuePrefix(
     remaining: entries.slice(count),
   };
 }
+
+export type HelpCommandIntercept = {
+  handled: boolean;
+  openHelp: boolean;
+  /**
+   * Queued /help already left the queue when the drain reserved the turn.
+   * Release that reservation with an empty restore so the slot is free and
+   * /help is not sent or put back on the queue.
+   */
+  releaseReservationWithoutRestore: boolean;
+};
+
+/** Local /help handling that must not reach sessionPrompt or re-queue. */
+export function interceptHelpCommand(input: {
+  prompt: string;
+  fromQueue?: boolean;
+  reservation?: string | null;
+}): HelpCommandIntercept {
+  if (input.prompt !== "/help") {
+    return {
+      handled: false,
+      openHelp: false,
+      releaseReservationWithoutRestore: false,
+    };
+  }
+  return {
+    handled: true,
+    openHelp: true,
+    releaseReservationWithoutRestore: Boolean(input.fromQueue || input.reservation),
+  };
+}

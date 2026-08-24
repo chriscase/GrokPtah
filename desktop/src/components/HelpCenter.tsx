@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   buildHelpAssistantRequest,
   buildHelpSemanticRequest,
@@ -57,6 +57,10 @@ function focusableIn(root: HTMLElement | null): HTMLElement[] {
   );
 }
 
+function consentLayerPresent(): boolean {
+  return Boolean(document.querySelector('[data-modal-layer="consent"]'));
+}
+
 export function HelpCenter({
   open,
   onClose,
@@ -70,10 +74,12 @@ export function HelpCenter({
   const [assistant, setAssistant] = useState<AssistantState>({ status: "idle" });
   const [semantic, setSemantic] = useState<SemanticState>({ status: "idle" });
   const [confirmStack, setConfirmStack] = useState<ConfirmKind[]>([]);
+  const [consentPresent, setConsentPresent] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
   const surfaceRef = useRef<HTMLDivElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
   const confirmDialogRef = useRef<HTMLDivElement>(null);
+  const articleButtonRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const onCloseRef = useRef(onClose);
   const topConfirmRef = useRef<ConfirmKind | null>(null);
   const prevTopConfirmRef = useRef<ConfirmKind | null>(null);
@@ -136,8 +142,11 @@ export function HelpCenter({
     prevTopConfirmRef.current = null;
     layerReturnFocusRef.current = {};
     const focusTarget = dialogRef.current?.querySelector<HTMLElement>("#help-search-input");
-    focusTarget?.focus();
+    if (!consentLayerPresent()) {
+      focusTarget?.focus();
+    }
     const onKey = (event: KeyboardEvent) => {
+      if (consentLayerPresent()) return;
       if (event.key === "Escape") {
         event.preventDefault();
         const top = topConfirmRef.current;
@@ -180,6 +189,7 @@ export function HelpCenter({
       prevTopConfirmRef.current = null;
       return;
     }
+    if (consentLayerPresent()) return;
     const previous = prevTopConfirmRef.current;
     prevTopConfirmRef.current = topConfirm;
     if (topConfirm) {
@@ -192,7 +202,31 @@ export function HelpCenter({
     if (previous) {
       layerReturnFocusRef.current[previous]?.focus();
     }
-  }, [open, topConfirm]);
+  }, [open, topConfirm, consentPresent]);
+
+  const helpFocusBeforeConsentRef = useRef<HTMLElement | null>(null);
+  const prevConsentPresentRef = useRef(false);
+  useLayoutEffect(() => {
+    if (!open) {
+      helpFocusBeforeConsentRef.current = null;
+      prevConsentPresentRef.current = false;
+      return;
+    }
+    if (consentPresent) {
+      prevConsentPresentRef.current = true;
+      if (
+        dialogRef.current?.contains(document.activeElement) &&
+        document.activeElement instanceof HTMLElement
+      ) {
+        helpFocusBeforeConsentRef.current = document.activeElement;
+      }
+      return;
+    }
+    if (!prevConsentPresentRef.current) return;
+    prevConsentPresentRef.current = false;
+    helpFocusBeforeConsentRef.current?.focus();
+    helpFocusBeforeConsentRef.current = null;
+  }, [open, consentPresent]);
 
   useEffect(() => {
     if (!open || !dialogRef.current) return;
@@ -221,6 +255,23 @@ export function HelpCenter({
         else element.setAttribute("aria-hidden", ariaHidden);
       });
     };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) {
+      setConsentPresent(false);
+      return;
+    }
+    const read = () => setConsentPresent(consentLayerPresent());
+    read();
+    const observer = new MutationObserver(read);
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["data-modal-layer"],
+    });
+    return () => observer.disconnect();
   }, [open]);
 
   useEffect(() => {
@@ -323,6 +374,24 @@ export function HelpCenter({
     }
   };
 
+  const moveArticleSelection = (
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    index: number,
+  ) => {
+    if (results.length === 0) return;
+    let nextIndex: number | null = null;
+    if (event.key === "ArrowDown") nextIndex = (index + 1) % results.length;
+    if (event.key === "ArrowUp") nextIndex = (index - 1 + results.length) % results.length;
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = results.length - 1;
+    if (nextIndex === null) return;
+
+    event.preventDefault();
+    const nextId = results[nextIndex].article.id;
+    setSelectedId(nextId);
+    articleButtonRefs.current[nextId]?.focus();
+  };
+
   if (!open) return null;
 
   return (
@@ -331,9 +400,11 @@ export function HelpCenter({
       className="help-center"
       data-modal-layer="help"
       role="dialog"
-      aria-modal="true"
+      aria-modal={consentPresent ? false : true}
+      aria-hidden={consentPresent ? true : undefined}
       aria-labelledby="help-center-title"
       aria-describedby="help-center-subtitle"
+      {...(consentPresent ? { inert: "" } : {})}
     >
       <div
         className="help-surface"
@@ -386,7 +457,7 @@ export function HelpCenter({
             ))}
           </select>
 
-          <p className="help-result-count" aria-live="polite">
+          <p className="help-result-count">
             {results.length} {results.length === 1 ? "article" : "articles"}
           </p>
           <p className="help-retrieval-mode" aria-label="Help retrieval mode">
@@ -407,14 +478,20 @@ export function HelpCenter({
           {semantic.status === "loading" && <p className="help-retrieval-status" role="status">Ranking help by meaning…</p>}
           {semantic.status === "error" && <p className="help-retrieval-status" role="alert">{semantic.message}</p>}
           <ul className="help-list" role="listbox" aria-label="Help article results">
-            {results.map(({ article, matchedTerms, confidence }) => (
+            {results.map(({ article, matchedTerms, confidence }, index) => (
               <li key={article.id}>
                 <button
                   type="button"
                   role="option"
+                  id={`help-article-option-${article.id}`}
+                  ref={(element) => {
+                    articleButtonRefs.current[article.id] = element;
+                  }}
+                  tabIndex={article.id === selected?.id ? 0 : -1}
                   className={`help-list-item ${article.id === selected?.id ? "is-selected" : ""}`}
                   aria-selected={article.id === selected?.id}
                   onClick={() => setSelectedId(article.id)}
+                  onKeyDown={(event) => moveArticleSelection(event, index)}
                 >
                   <span className="help-list-topic">{article.topic.replace("-", " ")}</span>
                   <strong>{article.title}</strong>
@@ -521,6 +598,17 @@ export function HelpCenter({
             <p id="help-semantic-confirm-copy">
               Send this query and article metadata to {assistantProviderLabel ?? "the selected provider"} for meaning-based ranking? No article body or workspace data will be sent.
             </p>
+            <details className="help-confirm-details" open>
+              <summary>Review exact metadata</summary>
+              <p>Query: <code>{semantic.request.query}</code></p>
+              <ul aria-label="Meaning search metadata">
+                {semantic.request.candidates.map((candidate) => (
+                  <li key={candidate.articleId}>
+                    <code>{candidate.articleId}</code> · {candidate.sources.map((source) => `${source.id} · ${source.path}`).join(", ")}
+                  </li>
+                ))}
+              </ul>
+            </details>
             <button type="button" className="primary" onClick={() => void confirmSemanticRequest()}>
               Search by meaning
             </button>
@@ -546,6 +634,16 @@ export function HelpCenter({
             <p id="help-assistant-confirm-copy">
               Ready to send the cited article bundle ({assistant.request.sources.length} source{assistant.request.sources.length === 1 ? "" : "s"}) via {assistantProviderLabel ?? "the selected provider"}?
             </p>
+            <details className="help-confirm-details" open>
+              <summary>Review exact cited sources</summary>
+              <ul aria-label="Assistant request sources">
+                {assistant.request.sources.map((source) => (
+                  <li key={source.id}>
+                    <code>{source.id}</code> · {source.path} · {source.heading}
+                  </li>
+                ))}
+              </ul>
+            </details>
             <button type="button" className="primary" onClick={() => void confirmAssistantRequest()}>
               Send cited context
             </button>
