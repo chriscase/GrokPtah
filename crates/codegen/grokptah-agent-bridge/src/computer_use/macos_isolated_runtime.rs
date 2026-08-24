@@ -9,7 +9,7 @@ use super::isolated_visual::{
 use super::isolated_visual_driver::IsolatedVisualRuntimeDriver;
 use super::isolated_visual_frames::IsolatedVisualFrame;
 use super::isolated_visual_helper_control::{
-    read_isolated_visual_challenge, IsolatedVisualHelperControl,
+    read_isolated_visual_challenge_with_timeout, IsolatedVisualHelperControl,
 };
 use super::isolated_visual_input::IsolatedVisualInputMessage;
 use super::isolated_visual_runtime::IsolatedVisualRuntimeSession;
@@ -26,6 +26,7 @@ const NATIVE_BACKEND_UNAVAILABLE: i32 = 12;
 const NATIVE_UNAUTHORIZED: i32 = 13;
 const MAX_NATIVE_ERROR_BYTES: usize = 512;
 const PREPARED_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNNING_EVENT_TIMEOUT: Duration = Duration::from_secs(60);
 const BOUND_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
 const STOPPING_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -170,7 +171,10 @@ impl IsolatedVisualPackagedRuntime {
         let pid = native.pid;
         let mut challenge_reader =
             unsafe { BufReader::new(File::from_raw_fd(native.challenge_fd)) };
-        let challenge = match read_isolated_visual_challenge(&mut challenge_reader) {
+        let challenge = match read_isolated_visual_challenge_with_timeout(
+            &mut challenge_reader,
+            CHALLENGE_TIMEOUT,
+        ) {
             Ok(challenge) => challenge,
             Err(error) => {
                 drop(challenge_reader);

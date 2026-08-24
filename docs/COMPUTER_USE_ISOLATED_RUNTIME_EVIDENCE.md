@@ -126,9 +126,10 @@ The close-on-exec artifact gate is sealed at:
   before `posix_spawn`, creates only the five private parent/child channels, and maps the fixed descriptor contract under
   `POSIX_SPAWN_CLOEXEC_DEFAULT`, and routes child stdio to `/dev/null`. The
   macOS Rust supervisor owns the returned PID and descriptors, consumes FD9,
-  drives the bounded Prepared → Running → Bound lifecycle, applies bounded
-  event waits, force-cleans an unresponsive helper, and creates every runtime
-  pipe with close-on-exec set in the parent. This is a packaged-
+  drives the bounded Prepared → Running → Bound lifecycle, bounds the FD9
+  challenge read as well as each helper-event wait, force-cleans an
+  unresponsive helper, and creates every runtime pipe with close-on-exec set in
+  the parent. This is a packaged-
   supervisor **source candidate**; no signed app has launched it and no VM
   boot/render/input/cleanup result is claimed.
 - The packaged supervisor exposes read-only runtime inspection while keeping

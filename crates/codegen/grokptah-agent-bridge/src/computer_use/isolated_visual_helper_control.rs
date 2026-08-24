@@ -1,6 +1,6 @@
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::isolated_visual::IsolatedVisualTerminalDisposition;
 use super::isolated_visual_helper::{
@@ -141,6 +141,61 @@ fn stream_error(error: io::Error) -> ComputerError {
 pub fn read_isolated_visual_challenge<R: Read>(reader: &mut R) -> ComputerResult<[u8; 32]> {
     let mut challenge = [0_u8; ISOLATED_VISUAL_CHALLENGE_BYTES];
     read_exact(reader, &mut challenge)?;
+    if challenge.iter().all(|byte| *byte == 0) {
+        return Err(ComputerError::new(
+            ComputerErrorCode::BackendFailure,
+            "isolated helper returned an empty guest challenge",
+        ));
+    }
+    Ok(challenge)
+}
+
+/// Reads the helper-generated challenge without allowing a stalled helper to
+/// hold launch forever. The pipe normally delivers the small challenge in one
+/// write, but the loop also bounds a partial read so the supervisor retains a
+/// finite startup deadline under abnormal helper behavior.
+pub fn read_isolated_visual_challenge_with_timeout<R: Read + AsRawFd>(
+    reader: &mut R,
+    timeout: Duration,
+) -> ComputerResult<[u8; 32]> {
+    let deadline = Instant::now() + timeout;
+    let mut challenge = [0_u8; ISOLATED_VISUAL_CHALLENGE_BYTES];
+    let mut offset = 0;
+    while offset < challenge.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout_millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: the descriptor is borrowed from the supervisor-owned
+        // reader and remains valid for the duration of this call.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_millis) };
+        if ready == 0 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::BackendFailure,
+                "isolated helper challenge timed out",
+            ));
+        }
+        if ready < 0 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::BackendFailure,
+                "isolated helper challenge poll failed",
+            ));
+        }
+        match reader.read(&mut challenge[offset..]) {
+            Ok(0) => {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::TargetClosed,
+                    "isolated helper challenge pipe closed mid-challenge",
+                ));
+            }
+            Ok(read) => offset += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(stream_error(error)),
+        }
+    }
     if challenge.iter().all(|byte| *byte == 0) {
         return Err(ComputerError::new(
             ComputerErrorCode::BackendFailure,
