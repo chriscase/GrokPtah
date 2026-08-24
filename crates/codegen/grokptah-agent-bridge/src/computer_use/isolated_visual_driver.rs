@@ -5,6 +5,7 @@ use super::isolated_visual_input::IsolatedVisualInputMessage;
 use super::isolated_visual_runtime::IsolatedVisualRuntimeSession;
 use super::isolated_visual_stream::IsolatedVisualStream;
 use super::types::ComputerResult;
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
@@ -38,43 +39,62 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
         &self.runtime
     }
 
-    pub fn start(&mut self) -> ComputerResult<()> {
+    pub fn start(&mut self) -> ComputerResult<()>
+    where
+        ER: Read,
+        CW: Write,
+    {
         self.helper.send_start(&mut self.runtime)
     }
 
     pub fn start_with_timeout(&mut self, timeout: Duration) -> ComputerResult<()>
     where
-        CW: AsRawFd,
+        ER: Read,
+        CW: Write + AsRawFd,
     {
         self.helper
             .send_start_with_timeout(&mut self.runtime, timeout)
     }
 
-    pub fn receive_helper_event(&mut self) -> ComputerResult<()> {
+    pub fn receive_helper_event(&mut self) -> ComputerResult<()>
+    where
+        ER: Read,
+        CW: Write,
+    {
         self.helper.receive_event(&mut self.runtime)
     }
 
     pub fn receive_helper_event_with_timeout(&mut self, timeout: Duration) -> ComputerResult<()>
     where
-        ER: AsRawFd,
+        ER: Read + AsRawFd,
+        CW: Write,
     {
         self.helper
             .receive_event_with_timeout(&mut self.runtime, timeout)
     }
 
-    pub fn bind(&mut self) -> ComputerResult<()> {
+    pub fn bind(&mut self) -> ComputerResult<()>
+    where
+        ER: Read,
+        CW: Write,
+    {
         self.helper.send_binding(&mut self.runtime)
     }
 
     pub fn bind_with_timeout(&mut self, timeout: Duration) -> ComputerResult<()>
     where
-        CW: AsRawFd,
+        ER: Read,
+        CW: Write + AsRawFd,
     {
         self.helper
             .send_binding_with_timeout(&mut self.runtime, timeout)
     }
 
-    pub fn read_frame(&mut self) -> ComputerResult<Option<IsolatedVisualFrame>> {
+    pub fn read_frame(&mut self) -> ComputerResult<Option<IsolatedVisualFrame>>
+    where
+        FR: Read,
+        IW: Write,
+    {
         self.stream.read_frame_chunk(&mut self.runtime)
     }
 
@@ -83,7 +103,8 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
         timeout: Duration,
     ) -> ComputerResult<Option<IsolatedVisualFrame>>
     where
-        FR: AsRawFd,
+        FR: Read + AsRawFd,
+        IW: Write,
     {
         self.stream
             .read_frame_chunk_with_timeout(&mut self.runtime, timeout)
@@ -94,7 +115,11 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
         input_sequence: u64,
         request_nonce: &str,
         message: IsolatedVisualInputMessage,
-    ) -> ComputerResult<()> {
+    ) -> ComputerResult<()>
+    where
+        FR: Read,
+        IW: Write,
+    {
         self.stream
             .write_input(&mut self.runtime, input_sequence, request_nonce, message)
     }
@@ -107,7 +132,8 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
         timeout: Duration,
     ) -> ComputerResult<()>
     where
-        IW: AsRawFd,
+        FR: Read,
+        IW: Write + AsRawFd,
     {
         self.stream.write_input_with_timeout(
             &mut self.runtime,
@@ -118,7 +144,11 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
         )
     }
 
-    pub fn stop(&mut self, disposition: IsolatedVisualTerminalDisposition) -> ComputerResult<()> {
+    pub fn stop(&mut self, disposition: IsolatedVisualTerminalDisposition) -> ComputerResult<()>
+    where
+        ER: Read,
+        CW: Write,
+    {
         self.helper.send_stop(&mut self.runtime, disposition)
     }
 
@@ -128,7 +158,8 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
         timeout: Duration,
     ) -> ComputerResult<()>
     where
-        CW: AsRawFd,
+        ER: Read,
+        CW: Write + AsRawFd,
     {
         self.helper
             .send_stop_with_timeout(&mut self.runtime, disposition, timeout)

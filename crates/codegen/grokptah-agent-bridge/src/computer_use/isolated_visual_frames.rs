@@ -232,7 +232,7 @@ impl IsolatedVisualFrameCarrier {
                 || receiving.width != chunk.width
                 || receiving.height != chunk.height
                 || receiving.content_sha256 != chunk.content_sha256
-                || receiving.chunk_index != chunk.chunk_index
+                || receiving.next_chunk_index != chunk.chunk_index
                 || receiving.next_offset != chunk.offset
             {
                 return Err(ComputerError::new(

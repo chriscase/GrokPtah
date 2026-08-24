@@ -239,8 +239,8 @@ impl IsolatedVisualChannelBinding {
     }
 }
 
-fn put_u16(output: &mut Vec<u8>, value: usize) {
-    output.extend_from_slice(&(value as u16).to_be_bytes());
+fn put_u16(output: &mut Vec<u8>, value: u16) {
+    output.extend_from_slice(&value.to_be_bytes());
 }
 
 fn put_u32(output: &mut Vec<u8>, value: u32) {

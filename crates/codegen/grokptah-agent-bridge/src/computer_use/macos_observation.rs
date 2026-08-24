@@ -1770,28 +1770,32 @@ mod tests {
             if let Some(code) = *self.action_error.lock() {
                 return Err(ComputerError::new(code, "fixture action failed"));
             }
-            let targets = self.targets.lock();
-            let target = targets
-                .iter()
-                .find(|target| &target.identity == identity)
-                .ok_or_else(|| {
-                    ComputerError::new(ComputerErrorCode::TargetChanged, "fixture target changed")
-                })?;
-            let focus_invalid = match request.execution_mode {
-                MacSemanticExecutionMode::ForegroundRequired => {
-                    !matches!(&request.action, ComputerAction::ActivateTarget) && !target.active
+            {
+                let targets = self.targets.lock();
+                let target = targets
+                    .iter()
+                    .find(|target| &target.identity == identity)
+                    .ok_or_else(|| {
+                        ComputerError::new(
+                            ComputerErrorCode::TargetChanged,
+                            "fixture target changed",
+                        )
+                    })?;
+                let focus_invalid = match request.execution_mode {
+                    MacSemanticExecutionMode::ForegroundRequired => {
+                        !matches!(&request.action, ComputerAction::ActivateTarget) && !target.active
+                    }
+                    MacSemanticExecutionMode::MeasuredBackground => {
+                        target.active || !matches!(&request.action, ComputerAction::SetValue { .. })
+                    }
+                };
+                if target.frame != request.target_frame || focus_invalid {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::TargetChanged,
+                        "fixture target geometry or focus changed",
+                    ));
                 }
-                MacSemanticExecutionMode::MeasuredBackground => {
-                    target.active || !matches!(&request.action, ComputerAction::SetValue { .. })
-                }
-            };
-            if target.frame != request.target_frame || focus_invalid {
-                return Err(ComputerError::new(
-                    ComputerErrorCode::TargetChanged,
-                    "fixture target geometry or focus changed",
-                ));
             }
-            drop(targets);
             if self.block_action_before_dispatch.load(Ordering::SeqCst) {
                 self.action_entered.notify_one();
                 self.release_action.notified().await;
@@ -2204,7 +2208,8 @@ mod tests {
                     ComputerStore::open(directory.path().join("second-use")).unwrap(),
                 )
                 .await
-                .unwrap_err()
+                .err()
+                .expect("second measured background use is denied")
                 .code,
             ComputerErrorCode::Unauthorized
         );

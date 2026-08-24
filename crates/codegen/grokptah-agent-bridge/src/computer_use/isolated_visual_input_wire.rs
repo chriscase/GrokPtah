@@ -162,7 +162,7 @@ impl IsolatedVisualInputWire {
         put_u16(&mut packet, ISOLATED_VISUAL_GUEST_PROTOCOL_VERSION as u16);
         put_u64(&mut packet, frame_sequence);
         put_u64(&mut packet, input_sequence);
-        packet.extend_from_slice(&nonce);
+        packet.extend_from_slice(nonce.as_bytes());
         packet.push(fields.kind);
         packet.push(fields.state);
         put_u16(&mut packet, fields.code);

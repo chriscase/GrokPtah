@@ -13,6 +13,7 @@
 //! session-scoped; coordinator reads take [`ComputerReadBinding`].
 
 mod coordination;
+mod isolated_guest;
 mod isolated_visual;
 mod isolated_visual_artifacts;
 mod isolated_visual_channel;
@@ -39,6 +40,10 @@ mod simulator;
 mod store;
 mod types;
 
+pub use isolated_guest::{
+    project_captured_artifact, redact_isolated_capture, IsolatedCapturedArtifact,
+    IsolatedGuestLease, IsolatedGuestPhase, IsolatedGuestSession,
+};
 pub use isolated_visual::{
     IsolatedVisualCleanupEvidence, IsolatedVisualLaunchContract, IsolatedVisualLifecycle,
     IsolatedVisualLifecycleState, IsolatedVisualManifest, IsolatedVisualResourceLimits,
