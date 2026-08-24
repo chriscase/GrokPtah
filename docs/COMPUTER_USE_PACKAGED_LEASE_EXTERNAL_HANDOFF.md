@@ -68,8 +68,10 @@ Rust compilation:
 bash docs/verify-packaged-lease-fence.sh
 ```
 
-It only proves that the intended lease markers and candidate identity are
-present. It is not a substitute for the external compile/test commands below.
+When the optional immutable bundle is mounted, it also verifies the bundle
+SHA-256 and Git bundle integrity. It only proves that the intended lease
+markers and candidate identity are present; it is not a substitute for the
+external compile/test commands below.
 
 ## Interpretation
 
