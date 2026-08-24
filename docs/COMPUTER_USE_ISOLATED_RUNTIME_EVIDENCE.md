@@ -6,9 +6,9 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `ad7901a5eab5078e9a64adc7b00524622322d63c`
-- Bundle: `/private/tmp/grokptah-cu-stage39-bounded-control-write-v1.bundle`
-- Bundle SHA-256: `61fc261f44405d95a2f5d8ce3f230fe0e0b71283ddf6f804cb70b90c024ffc5c`
+- Head: `ab922776f8ff0f47c426e2dc423b7224ba38f032`
+- Bundle: `/private/tmp/grokptah-cu-stage40-bounded-forced-reap-v1.bundle`
+- Bundle SHA-256: `f789c57ef73ceeae576f372f9b947d8fc8a09b584bf07f8bfff27f0b083519bb`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
 Current sealed implementation head: `eb9892e1ba5606c73b66abe60067fea5ae7eafb6`.
@@ -102,6 +102,12 @@ The bounded helper-control write hardening is sealed at:
 - Commit: `ad7901a5eab5078e9a64adc7b00524622322d63c`
 - Bundle: `/private/tmp/grokptah-cu-stage39-bounded-control-write-v1.bundle`
 - Bundle SHA-256: `61fc261f44405d95a2f5d8ce3f230fe0e0b71283ddf6f804cb70b90c024ffc5c`
+
+The bounded forced-reap hardening is sealed at:
+
+- Commit: `ab922776f8ff0f47c426e2dc423b7224ba38f032`
+- Bundle: `/private/tmp/grokptah-cu-stage40-bounded-forced-reap-v1.bundle`
+- Bundle SHA-256: `f789c57ef73ceeae576f372f9b947d8fc8a09b584bf07f8bfff27f0b083519bb`
 
 ## What this candidate proves
 
