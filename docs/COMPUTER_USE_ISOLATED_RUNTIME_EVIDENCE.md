@@ -254,6 +254,9 @@ The atomic guest-artifact publication extension is sealed at:
   publishing both only after manifest generation and output-path rechecks;
   failed qualification builds do not leave partial output artifacts behind,
   including a rollback if the two final renames do not both succeed.
+- Pinned kernel-source fetching now rejects non-HTTPS redirects, bounds connect
+  and transfer time, verifies the locked digest before publication, and moves
+  the verified tarball atomically into its final path.
 - Package assembly also requires the exact GrokPtah bundle identifier and
   matching signed team identity for the helper and outer app; a misidentified
   or cross-team artifact fails before it can be used as a runtime candidate.

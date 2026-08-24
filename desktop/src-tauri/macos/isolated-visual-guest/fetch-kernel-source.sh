@@ -37,13 +37,19 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 curl --fail --location --proto '=https' --tlsv1.2 --silent --show-error \
+  --proto-redir '=https' \
+  --connect-timeout 15 --max-time 900 \
   --output "$temporary" "$url"
 observed=$(sha256sum "$temporary" | awk '{print $1}')
 if [ "$observed" != "$expected" ]; then
   echo "Linux $version source digest mismatch" >&2
   exit 65
 fi
-install -m 0444 "$temporary" "$output"
+chmod 0444 "$temporary"
+if [ -e "$output" ] || [ -L "$output" ]; then
+  echo "output appeared during source fetch" >&2
+  exit 73
+fi
+mv "$temporary" "$output"
 trap - EXIT HUP INT TERM
-rm -f -- "$temporary"
 printf 'kernel_version=%s\nsource_sha256=%s\noutput=%s\n' "$version" "$observed" "$output"

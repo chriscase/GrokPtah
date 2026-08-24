@@ -19,6 +19,10 @@ trap cleanup EXIT HUP INT TERM
 
 sh -n "$script_dir/fetch-kernel-source.sh"
 sh -n "$script_dir/build-guest-image.sh"
+for required in '--proto-redir' '--connect-timeout 15' '--max-time 900' \
+  'output appeared during source fetch' 'mv "$temporary" "$output"'; do
+  grep -F -- "$required" "$script_dir/fetch-kernel-source.sh" >/dev/null
+done
 for required in staged_output_image staged_output_manifest \
   published_image published_manifest \
   'trap - EXIT HUP INT TERM' \
