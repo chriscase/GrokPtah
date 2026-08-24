@@ -204,6 +204,7 @@ impl IsolatedVisualRuntimeSession {
         &mut self,
         disposition: IsolatedVisualTerminalDisposition,
     ) -> ComputerResult<u8> {
+        self.input_gate.terminal_check()?;
         let control = self.helper.stop()?;
         self.lifecycle.begin_stop(disposition)?;
         Ok(control)

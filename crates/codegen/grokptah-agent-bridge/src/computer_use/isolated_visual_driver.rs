@@ -1,4 +1,4 @@
-use super::isolated_visual::IsolatedVisualTerminalDisposition;
+use super::isolated_visual::{IsolatedVisualCleanupEvidence, IsolatedVisualTerminalDisposition};
 use super::isolated_visual_frames::IsolatedVisualFrame;
 use super::isolated_visual_helper_control::IsolatedVisualHelperControl;
 use super::isolated_visual_input::IsolatedVisualInputMessage;
@@ -74,6 +74,13 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
 
     pub fn stop(&mut self, disposition: IsolatedVisualTerminalDisposition) -> ComputerResult<()> {
         self.helper.send_stop(&mut self.runtime, disposition)
+    }
+
+    pub(crate) fn complete_cleanup(
+        &mut self,
+        evidence: &IsolatedVisualCleanupEvidence,
+    ) -> ComputerResult<()> {
+        self.runtime.complete_cleanup(evidence)
     }
 
     pub fn into_parts(

@@ -3,7 +3,9 @@ use std::io::{BufReader, BufWriter};
 use std::os::fd::FromRawFd;
 use std::time::Duration;
 
-use super::isolated_visual::{IsolatedVisualLaunchContract, IsolatedVisualTerminalDisposition};
+use super::isolated_visual::{
+    IsolatedVisualCleanupEvidence, IsolatedVisualLaunchContract, IsolatedVisualTerminalDisposition,
+};
 use super::isolated_visual_driver::IsolatedVisualRuntimeDriver;
 use super::isolated_visual_frames::IsolatedVisualFrame;
 use super::isolated_visual_helper_control::{
@@ -234,6 +236,16 @@ impl IsolatedVisualPackagedRuntime {
         self.driver
             .receive_helper_event_with_timeout(STOPPING_EVENT_TIMEOUT)?;
         self.wait_for_exit()
+    }
+
+    /// Completes the terminal transition only after the caller has verified
+    /// exact helper/process absence, open-handle closure, overlay removal, and
+    /// frame-cache removal for this surface incarnation.
+    pub fn complete_cleanup(
+        &mut self,
+        evidence: &IsolatedVisualCleanupEvidence,
+    ) -> ComputerResult<()> {
+        self.driver.complete_cleanup(evidence)
     }
 
     pub fn runtime(&self) -> &IsolatedVisualRuntimeSession {
