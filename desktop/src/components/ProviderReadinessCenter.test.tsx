@@ -657,6 +657,14 @@ describe("ProviderReadinessCenter", () => {
       "No native tool call",
     );
     expect(screen.getByTestId("readiness-computer-tier")).toHaveTextContent("None");
+    const operations = screen.getByTestId("readiness-operations");
+    expect(operations).toHaveTextContent("Provider route");
+    expect(operations).toHaveTextContent("Configured");
+    expect(operations).toHaveTextContent("Provider quota");
+    expect(operations).toHaveTextContent("Not synchronized");
+    expect(operations).toHaveTextContent("Live certification");
+    expect(operations).toHaveTextContent("Model evidence only");
+    expect(operations).toHaveTextContent("not a live campaign certificate");
     expect(screen.getByTestId("readiness-verdict")).not.toHaveTextContent("codingReady");
     expect(screen.getByTestId("readiness-details")).not.toHaveAttribute("open");
 

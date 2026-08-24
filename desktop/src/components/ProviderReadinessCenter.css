@@ -233,6 +233,40 @@
   overflow-wrap: anywhere;
 }
 
+.provider-readiness-operations {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.55rem;
+  min-width: 0;
+}
+
+.provider-readiness-operations > div {
+  min-width: 0;
+  padding: 0.5rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+}
+
+.provider-readiness-operation-value {
+  min-width: 0;
+  margin: 0.2rem 0 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.provider-readiness-operation-copy {
+  min-width: 0;
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
 .provider-readiness-env {
   min-width: 0;
   margin: 0;
@@ -327,7 +361,8 @@
   .provider-readiness-reason,
   .provider-readiness-check,
   .provider-readiness-dl,
-  .provider-readiness-axes {
+  .provider-readiness-axes,
+  .provider-readiness-operations {
     grid-template-columns: minmax(0, 1fr);
   }
 }

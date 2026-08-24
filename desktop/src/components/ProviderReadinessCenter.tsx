@@ -93,6 +93,8 @@ export type ProviderReadinessView = {
   providerId: string;
   providerLabel: string;
   modelId: string;
+  routeConfigured: boolean;
+  certificationBoundary: string;
   managedByEnv: boolean;
   hasSavedProfile: boolean;
   credentialSet: boolean;
@@ -323,6 +325,7 @@ export function deriveProviderReadiness(
     admission?.credentialPresent ?? profile?.credentialSet,
   );
   const hasSavedProfile = profile !== null;
+  const routeConfigured = hasSavedProfile && configurationComplete(input);
   const error = input.error ? sanitizeReadinessText(input.error) : null;
   const verdict = admission
     ? verdictFromEligibility(admission.execution.eligibility)
@@ -577,6 +580,15 @@ export function deriveProviderReadiness(
         : `Streaming: ${streaming.summary}`
       : null;
 
+  const certificationBoundary =
+    qualificationEvidence === "measured"
+      ? "Measured model evidence is present; this panel is not a live campaign certificate."
+      : qualificationEvidence === "declared"
+        ? "This route is declared, not measured; no live campaign certificate is present."
+        : qualificationEvidence === "stale"
+          ? "Prior evidence is stale for this route; no live campaign certificate is present."
+          : "No model qualification evidence or live campaign certificate is present.";
+
   const tone =
     verdict === "ready"
       ? "ok"
@@ -609,6 +621,8 @@ export function deriveProviderReadiness(
     providerId: input.providerId,
     providerLabel: input.providerLabel,
     modelId: input.modelId,
+    routeConfigured,
+    certificationBoundary,
     managedByEnv,
     hasSavedProfile,
     credentialSet,
@@ -771,6 +785,40 @@ export function ProviderReadinessCenter(props: ProviderReadinessCenterProps) {
           {view.streamingNote}
         </p>
       )}
+
+      <div
+        className="provider-readiness-operations"
+        data-testid="readiness-operations"
+        aria-label="Provider route, quota, and certification boundaries"
+      >
+        <div>
+          <p className="provider-readiness-reasons-label">Provider route</p>
+          <p className="provider-readiness-operation-value">
+            {view.routeConfigured ? "Configured" : "Incomplete"}
+          </p>
+          <p className="provider-readiness-operation-copy">
+            {view.routeConfigured
+              ? "Requests use the selected provider and exact model route."
+              : "Save a provider, base URL, and exact model before using this route."}
+          </p>
+        </div>
+        <div>
+          <p className="provider-readiness-reasons-label">Provider quota</p>
+          <p className="provider-readiness-operation-value">Not synchronized</p>
+          <p className="provider-readiness-operation-copy">
+            GrokPtah does not read or sync a provider or Grok Build account balance.
+          </p>
+        </div>
+        <div>
+          <p className="provider-readiness-reasons-label">Live certification</p>
+          <p className="provider-readiness-operation-value">
+            {view.hasLiveReport ? "Model evidence only" : "Not present"}
+          </p>
+          <p className="provider-readiness-operation-copy">
+            {view.certificationBoundary}
+          </p>
+        </div>
+      </div>
 
       <div
         className="provider-readiness-computer"

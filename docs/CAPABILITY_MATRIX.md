@@ -45,6 +45,13 @@ guest phases, one-Agent lease fencing, mandatory cleanup, and a frame-free
 capture projection. It is not shipped on `origin/main`, and its focused Rust
 tests remain external PR-head evidence rather than combined-head qualification.
 
+Candidate-only UI update (2026-08-24): the Provider Readiness Center now
+surfaces provider-route configuration, the fact that provider/Grok Build
+account quota is not synchronized, and the boundary between measured model
+evidence and a live campaign certificate. This improves operator honesty for
+company-gateway workflows; it does not create a quota receipt, live provider
+certification, or a shipped-on-main claim.
+
 ## Status vocabulary
 
 Exactly one of the four status columns is the *shipped-on-main* claim for the

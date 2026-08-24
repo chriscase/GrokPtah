@@ -336,6 +336,19 @@ unrelated signal.
   execution because the sandbox denied the fake provider's loopback bind
   (`Operation not permitted`); no soak evidence is claimed.
 
+### Provider route / quota / certification boundary — 2026-08-24
+
+The candidate Provider Readiness Center now exposes three operator-visible
+boundaries in one compact, accessible status strip: whether the selected
+provider/model route is configured, whether provider quota is observable, and
+whether the panel is showing model evidence versus a live campaign certificate.
+The panel explicitly says that GrokPtah does not read or synchronize a provider
+or Grok Build account balance. A measured model report is labelled “Model
+evidence only”; it is never presented as a live provider campaign receipt.
+The desktop suite remains source/UI evidence only: the full Vitest suite (52
+files, 389 tests) and TypeScript typecheck pass. This does not close the named
+provider-quota receipt or Stage 12 enterprise-gateway campaign.
+
 ## Still required before a 100% claim
 
 1. Capture the candidate's immutable desktop/hosted parity golden on a host
