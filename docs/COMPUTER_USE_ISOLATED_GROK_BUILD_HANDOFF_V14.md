@@ -1,12 +1,12 @@
 # Isolated visual Computer Use — v14 packaged qualification handoff
 
-Status: **queued procedure only; no VM, package, or Computer Use capability is
-qualified by this document.** This v14 bundle supersedes v13 because it also
-contains the fail-closed stop-control repair: a stop failure before `Stopping`
-now aborts the helper, revokes the lease, and requires exact cleanup.
+Status: **SUPERSEDED historical procedure; do not launch.** v15 is the current
+isolated visual handoff. This v14 bundle superseded v13 because it contained
+the fail-closed stop-control repair, but it provides no VM, package, or
+Computer Use qualification evidence.
 
-Do not substitute this bundle into the currently running `b250b70` source
-campaign or launch it concurrently.
+Do not substitute this bundle for the recorded `b250b70` source result or the
+current v15 packaged/hardware campaign.
 
 ## Frozen input
 
@@ -35,7 +35,7 @@ Source cutoff: 0137969dcfbb7453dd716d1ed1894e4cfc7334b9
 
 Create a disposable checkout, verify bundle SHA/complete history/exact HEAD,
 and keep the developer checkout, existing sessions, Git branches, GitHub, and
-the running b250b70 campaign untouched. Do not infer VM capability from source
+the recorded b250b70 source result untouched. Do not infer VM capability from source
 tests, Linux image reproducibility, package signing, or launchAttempted=false.
 
 For every Rust command set exactly:

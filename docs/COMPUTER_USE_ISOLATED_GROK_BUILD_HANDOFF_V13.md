@@ -1,9 +1,9 @@
 # Isolated visual Computer Use — v13 packaged qualification handoff
 
-Status: **queued procedure only; no VM, package, or Computer Use capability is
-qualified by this document.** The active packaged lease-fence campaign is a
-separate source gate at `b250b70`; do not substitute this bundle into that
-running campaign or launch both campaigns concurrently.
+Status: **SUPERSEDED historical procedure; do not launch.** v15 is the current
+isolated visual handoff. This document provides no VM, package, or Computer Use
+qualification evidence; the recorded `b250b70` source gate and current v15
+campaign are separate and must not be conflated.
 
 ## Frozen input
 
@@ -32,7 +32,7 @@ Source cutoff: 890bb080104c24dcfb0da787e7d0b20eb875f7c3
 
 Create a disposable checkout from that bundle and verify its SHA, complete
 history, exact HEAD, and clean worktree. Do not modify the developer checkout,
-existing app sessions, branches, GitHub, or the currently running b250b70
+existing app sessions, branches, GitHub, or the recorded b250b70 source result
 packaged lease campaign. Do not infer a VM capability from source tests,
 Linux image reproducibility, package signing, or launchAttempted=false.
 
