@@ -201,10 +201,11 @@ to a VM capability result without the complete signed-runtime campaign.
    bounded graceful-then-forced stop.
    The helper's fixed event/control ABI is shared with the freestanding protocol header, and a
    host-supervisor codec/state machine rejects reordered, unknown, and post-terminal events. The
-   candidate now also contains a macOS packaged-supervisor seam: it revalidates the signed artifact
-   handles immediately before `posix_spawn`, maps only the fixed guest/configuration and five
-   private channel descriptors under `POSIX_SPAWN_CLOEXEC_DEFAULT`, consumes the private per-launch
-   challenge, and owns bounded helper lifecycle/cleanup. This remains source-level wiring only:
+   candidate now also contains a macOS packaged-supervisor seam: it consumes the already-measured
+   helper/guest/configuration descriptors, rechecks the helper path/signature immediately before
+   `posix_spawn`, maps only the fixed guest/configuration and five private channel descriptors under
+   `POSIX_SPAWN_CLOEXEC_DEFAULT`, consumes the private per-launch challenge, and owns bounded helper
+   lifecycle/cleanup. This remains source-level wiring only:
    no signed package has launched it and no VM boot/render/input/cleanup evidence exists.
    The assembler signs the helper before the outer unprivileged app and derives the content and
    designated-requirement manifest. CI links only the unsigned helper source. The repository now

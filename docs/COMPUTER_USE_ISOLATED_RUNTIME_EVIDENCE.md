@@ -108,9 +108,10 @@ The helper/guest contract-documentation synchronization is sealed at:
   channel, and the Rust host adapter reads a complete nonzero challenge without
   serializing it. This closes the host-binding input seam while leaving process
   launch and package qualification explicitly unclaimed.
-- The native macOS shim now performs the reviewed package-open step, rechecks
-  helper identity immediately before `posix_spawn`, creates only the five
-  private parent/child channels, maps the fixed descriptor contract under
+- The native macOS shim now consumes the exact helper, guest-image, and
+  configuration descriptors returned by the Rust measurement/receipt verifier,
+  rechecks helper identity immediately before `posix_spawn`, creates only the
+  five private parent/child channels, and maps the fixed descriptor contract under
   `POSIX_SPAWN_CLOEXEC_DEFAULT`, and routes child stdio to `/dev/null`. The
   macOS Rust supervisor owns the returned PID and descriptors, consumes FD9,
   drives the bounded Prepared → Running → Bound lifecycle, applies bounded
@@ -136,9 +137,10 @@ The helper/guest contract-documentation synchronization is sealed at:
 - Before native spawn, the Rust launch seam now opens the exact package through
   the existing read-only measurement/receipt verifier and binds the caller's
   manifest to helper, guest-image, configuration, and designated-requirement
-  digests. A structurally valid but mismatched manifest therefore cannot reach
-  the child process; the native shim repeats path/signature checks immediately
-  before spawn.
+  digests. It passes those still-open measured descriptors to the native shim
+  instead of allowing a second path-based artifact open; a structurally valid
+  but mismatched manifest therefore cannot reach the child process, and the
+  native shim repeats the helper path/signature check immediately before spawn.
 - The freestanding guest source validates the authenticated input packet,
   sequence fence, identity-bound HMAC, coordinate/key/text bounds, and closed
   message kind set after binding. Input remains fail-closed until a reviewed

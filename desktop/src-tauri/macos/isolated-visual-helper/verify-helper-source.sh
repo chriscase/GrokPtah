@@ -76,6 +76,10 @@ for required in \
 done
 for required in \
   'gpt_macos_isolated_runtime_spawn' \
+  'int32_t helper_fd' \
+  'int32_t guest_image_fd' \
+  'int32_t configuration_fd' \
+  'fstat(guest_image_fd' \
   'GPTMacIsolatedRuntimeSpawnResult' \
   'POSIX_SPAWN_CLOEXEC_DEFAULT' \
   'posix_spawn_file_actions_adddup2' \

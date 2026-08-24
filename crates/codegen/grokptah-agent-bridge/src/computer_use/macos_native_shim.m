@@ -719,26 +719,20 @@ static int GPTCreateCloseOnExecPipe(int pair[2]) {
     return 0;
 }
 
-GPTMacIsolatedRuntimeSpawnResult gpt_macos_isolated_runtime_spawn(void) {
+GPTMacIsolatedRuntimeSpawnResult gpt_macos_isolated_runtime_spawn(
+    int32_t helper_fd,
+    int32_t guest_image_fd,
+    int32_t configuration_fd) {
     @autoreleasepool {
 #ifndef POSIX_SPAWN_CLOEXEC_DEFAULT
         return GPTIsolatedRuntimeSpawnError(
             GPT_MAC_BACKEND_UNAVAILABLE,
             @"The macOS SDK does not provide close-on-exec spawn isolation");
 #else
-        GPTMacIsolatedArtifactsResult artifacts = gpt_macos_isolated_artifacts_open();
-        if (artifacts.status != GPT_MAC_OK) {
-            NSString *message = artifacts.error == NULL
-                ? @"Packaged isolated artifacts could not be verified"
-                : [[NSString alloc]
-                      initWithBytes:artifacts.error
-                             length:artifacts.error_len
-                           encoding:NSUTF8StringEncoding];
-            GPTMacIsolatedRuntimeSpawnResult result = GPTIsolatedRuntimeSpawnError(
-                artifacts.status,
-                message ?: @"Packaged isolated artifacts could not be verified");
-            gpt_macos_isolated_artifacts_result_free(&artifacts);
-            return result;
+        if (helper_fd < 0 || guest_image_fd < 0 || configuration_fd < 0) {
+            return GPTIsolatedRuntimeSpawnError(
+                GPT_MAC_INVALID_REQUEST,
+                @"The measured isolated artifact descriptors are incomplete");
         }
 
         NSBundle *bundle = NSBundle.mainBundle;
@@ -746,21 +740,23 @@ GPTMacIsolatedRuntimeSpawnResult gpt_macos_isolated_runtime_spawn(void) {
         char bundleRoot[PATH_MAX] = {0};
         char helperPath[PATH_MAX] = {0};
         struct stat helperIdentity = {0};
+        struct stat guestImageIdentity = {0};
+        struct stat configurationIdentity = {0};
         if (bundlePath == NULL || realpath(bundlePath, bundleRoot) == NULL ||
             !GPTAppendBundlePath(
                 bundleRoot,
                 "Contents/MacOS/grokptah-isolated-visual-helper",
                 helperPath) ||
-            fstat(artifacts.helper_fd, &helperIdentity) != 0 ||
+            fstat(helper_fd, &helperIdentity) != 0 ||
+            fstat(guest_image_fd, &guestImageIdentity) != 0 ||
+            fstat(configuration_fd, &configurationIdentity) != 0 ||
+            !S_ISREG(helperIdentity.st_mode) ||
+            !S_ISREG(guestImageIdentity.st_mode) ||
+            !S_ISREG(configurationIdentity.st_mode) ||
             !GPTPathStillNamesArtifact(helperPath, &helperIdentity)) {
-            GPTCloseArtifactDescriptors(
-                artifacts.helper_fd,
-                artifacts.guest_image_fd,
-                artifacts.configuration_fd);
-            gpt_macos_isolated_artifacts_result_free(&artifacts);
             return GPTIsolatedRuntimeSpawnError(
                 GPT_MAC_TARGET_CHANGED,
-                @"The packaged helper changed before isolated launch");
+                @"Measured isolated artifacts changed before isolated launch");
         }
 
         int control[2] = {-1, -1};
@@ -786,11 +782,6 @@ GPTMacIsolatedRuntimeSpawnResult gpt_macos_isolated_runtime_spawn(void) {
             close(challenge[0]);
             close(challenge[1]);
             close(null_fd);
-            GPTCloseArtifactDescriptors(
-                artifacts.helper_fd,
-                artifacts.guest_image_fd,
-                artifacts.configuration_fd);
-            gpt_macos_isolated_artifacts_result_free(&artifacts);
             return GPTIsolatedRuntimeSpawnError(
                 GPT_MAC_BACKEND_FAILURE,
                 @"Could not allocate isolated helper pipes");
@@ -810,9 +801,9 @@ GPTMacIsolatedRuntimeSpawnResult gpt_macos_isolated_runtime_spawn(void) {
             action_status = posix_spawnattr_setflags(&attributes, flags);
         }
         int sources[] = {
-            artifacts.helper_fd,
-            artifacts.guest_image_fd,
-            artifacts.configuration_fd,
+            helper_fd,
+            guest_image_fd,
+            configuration_fd,
             control[0],
             control[1],
             events[0],
@@ -830,13 +821,13 @@ GPTMacIsolatedRuntimeSpawnResult gpt_macos_isolated_runtime_spawn(void) {
         if (action_status == 0) {
             action_status = posix_spawn_file_actions_adddup2(
                 &actions,
-                artifacts.guest_image_fd,
+                guest_image_fd,
                 3);
         }
         if (action_status == 0) {
             action_status = posix_spawn_file_actions_adddup2(
                 &actions,
-                artifacts.configuration_fd,
+                configuration_fd,
                 4);
         }
         if (action_status == 0) {
@@ -898,11 +889,6 @@ GPTMacIsolatedRuntimeSpawnResult gpt_macos_isolated_runtime_spawn(void) {
             posix_spawn_file_actions_destroy(&actions);
         }
         close(null_fd);
-        GPTCloseArtifactDescriptors(
-            artifacts.helper_fd,
-            artifacts.guest_image_fd,
-            artifacts.configuration_fd);
-        gpt_macos_isolated_artifacts_result_free(&artifacts);
         close(control[0]);
         close(events[1]);
         close(input[0]);

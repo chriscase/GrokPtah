@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::time::Duration;
 
 use super::isolated_visual::{
@@ -44,7 +44,11 @@ struct NativeIsolatedRuntimeSpawnResult {
 }
 
 unsafe extern "C" {
-    fn gpt_macos_isolated_runtime_spawn() -> NativeIsolatedRuntimeSpawnResult;
+    fn gpt_macos_isolated_runtime_spawn(
+        helper_fd: i32,
+        guest_image_fd: i32,
+        configuration_fd: i32,
+    ) -> NativeIsolatedRuntimeSpawnResult;
     fn gpt_macos_isolated_runtime_spawn_result_free(result: *mut NativeIsolatedRuntimeSpawnResult);
 }
 
@@ -129,12 +133,18 @@ impl IsolatedVisualPackagedRuntime {
         // and the helper's designated requirement before any child process is
         // created; native launch then repeats its path/signature identity
         // checks immediately before spawn.
-        let _verified_artifacts =
+        let verified_artifacts =
             super::macos_isolated_artifacts::open_packaged_runtime_artifacts(&contract.manifest)?;
         // SAFETY: the native shim returns either an error buffer or ownership
         // of five distinct descriptors and one child PID. The paired free
         // function releases only the error buffer.
-        let mut native = unsafe { gpt_macos_isolated_runtime_spawn() };
+        let mut native = unsafe {
+            gpt_macos_isolated_runtime_spawn(
+                verified_artifacts.helper.as_raw_fd(),
+                verified_artifacts.guest_image.as_raw_fd(),
+                verified_artifacts.configuration.as_raw_fd(),
+            )
+        };
         if native.status != NATIVE_OK {
             let error = ComputerError::new(native_error_code(native.status), native_error(&native));
             unsafe { gpt_macos_isolated_runtime_spawn_result_free(&mut native) };
