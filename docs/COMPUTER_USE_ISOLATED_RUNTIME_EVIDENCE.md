@@ -6,9 +6,9 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `dc0aea97d49278055fa007f073a00f1bd39b0e48`
-- Bundle: `/private/tmp/grokptah-cu-stage36-bounded-challenge-read-v1.bundle`
-- Bundle SHA-256: `a49c13cb97f7ceea4c5993ecf56622d96b108fc4ab66833ac2d00f355cdcbd36`
+- Head: `f24a6a42da7e1eaa64e6f37330c55aa486843970`
+- Bundle: `/private/tmp/grokptah-cu-stage37-bounded-frame-read-v1.bundle`
+- Bundle SHA-256: `f1b81f9b10ff81628da526d38d547416a6f9738ab6f37eb6b93e84a448bb75f0`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
 Current sealed implementation head: `eb9892e1ba5606c73b66abe60067fea5ae7eafb6`.
@@ -84,6 +84,12 @@ The bounded FD9 challenge-read hardening is sealed at:
 - Commit: `dc0aea97d49278055fa007f073a00f1bd39b0e48`
 - Bundle: `/private/tmp/grokptah-cu-stage36-bounded-challenge-read-v1.bundle`
 - Bundle SHA-256: `a49c13cb97f7ceea4c5993ecf56622d96b108fc4ab66833ac2d00f355cdcbd36`
+
+The bounded guest-frame read hardening is sealed at:
+
+- Commit: `f24a6a42da7e1eaa64e6f37330c55aa486843970`
+- Bundle: `/private/tmp/grokptah-cu-stage37-bounded-frame-read-v1.bundle`
+- Bundle SHA-256: `f1b81f9b10ff81628da526d38d547416a6f9738ab6f37eb6b93e84a448bb75f0`
 
 ## What this candidate proves
 
