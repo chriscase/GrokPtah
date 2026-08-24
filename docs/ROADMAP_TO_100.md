@@ -689,7 +689,7 @@ and a credentialed nested-signing assembler. The helper's closed inherited-descr
    configure a one-display/virtio-socket VM with no network/share/audio/storage/host-input devices,
    challenge/response guest bootstrap, authenticated shutdown acknowledgement, and bounded
    graceful/forced stop, but there is no reviewed guest image, signing identity, assembled app,
-   host supervisor, launch, or cleanup run. The protocol does not implement a carrier, transfer frame
+   signed-package launch, or cleanup run. The protocol does not implement a carrier, transfer frame
    bytes, render a frame, or launch a guest application. The repository now also carries a pinned Linux arm64
    guest-source lock, closed kernel fragment, freestanding guest PID 1, protocol self-test, and a
    Linux-only deterministic image-builder candidate. A dedicated Linux workflow builds that source
