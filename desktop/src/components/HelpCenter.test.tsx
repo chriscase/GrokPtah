@@ -82,6 +82,29 @@ describe("HelpCenter", () => {
     opener.remove();
   });
 
+  it("makes the application background inert while Help is open", () => {
+    const onClose = vi.fn();
+    const { rerender } = render(
+      <div className="app-shell">
+        <main data-testid="app-background">Active coding lane</main>
+        <HelpCenter open onClose={onClose} />
+      </div>,
+    );
+
+    const background = screen.getByTestId("app-background");
+    expect(background).toHaveAttribute("inert");
+    expect(background).toHaveAttribute("aria-hidden", "true");
+
+    rerender(
+      <div className="app-shell">
+        <main data-testid="app-background">Active coding lane</main>
+        <HelpCenter open={false} onClose={onClose} />
+      </div>,
+    );
+    expect(background).not.toHaveAttribute("inert");
+    expect(background).not.toHaveAttribute("aria-hidden");
+  });
+
   it("renders an honest empty state for an unknown query", () => {
     render(<HelpCenter open onClose={vi.fn()} />);
     fireEvent.change(screen.getByRole("textbox", { name: "Search help" }), {
