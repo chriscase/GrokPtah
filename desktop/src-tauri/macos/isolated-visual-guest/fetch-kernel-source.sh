@@ -38,7 +38,7 @@ trap cleanup EXIT HUP INT TERM
 
 curl --fail --location --proto '=https' --tlsv1.2 --silent --show-error \
   --proto-redir '=https' \
-  --connect-timeout 15 --max-time 900 \
+  --connect-timeout 15 --max-time 900 --max-filesize 2147483648 \
   --output "$temporary" "$url"
 observed=$(sha256sum "$temporary" | awk '{print $1}')
 if [ "$observed" != "$expected" ]; then
