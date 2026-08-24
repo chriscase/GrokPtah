@@ -3,6 +3,11 @@
 Status: **qualification procedure only; no packaged VM or hardware claim is
 made by this document.**
 
+The source-only run at this exact candidate returned **PASS**. The secret-free
+record is [`evidence/COMPUTER_USE_PACKAGED_LEASE_B250B70_SOURCE_REPORT.md`](evidence/COMPUTER_USE_PACKAGED_LEASE_B250B70_SOURCE_REPORT.md).
+This handoff remains the reproducible source-check procedure; it is not a
+packaged-runtime qualification.
+
 The candidate follow-up at `b250b70` threads the exact one-Agent lease into
 the macOS packaged-runtime supervisor. The supervisor must now reject start,
 frame reads, guest input, and stop without a matching agent/revision lease;
@@ -20,7 +25,7 @@ failure revokes ownership; cleanup is refused while ownership remains.
 - Bundle SHA-256: `4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`
 
 The later source-only stop-failure correction is intentionally not part of
-this active campaign. Its separate future handoff is
+this recorded b250 source result. Its separate handoff is
 [`COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md).
 
 Use a disposable checkout at this exact head. Do not merge, push, rebase,
@@ -88,8 +93,8 @@ campaign.
 
 ## Local report check
 
-After saving the external transcript, run the fail-closed evidence checker from
-the candidate checkout:
+After saving a transcript that claims the frozen handoff bundle, run the
+fail-closed evidence checker from the candidate checkout:
 
 ```sh
 bash docs/verify-packaged-lease-report.sh /path/to/grok-build-report.txt
@@ -98,4 +103,6 @@ bash docs/verify-packaged-lease-report.sh /path/to/grok-build-report.txt
 It requires the frozen candidate/parent/PR/bundle identities, the mandated
 sccache and target paths, the exact source checks, resource-ownership evidence,
 an explicit source-only boundary, and a final `PASS`. A report that contains a
-labeled failure or omits any of those fields is rejected.
+labeled failure or omits any of those fields is rejected. A source report that
+uses a different transport bundle is retained as provenance, but cannot be
+treated as the frozen-bundle report by this checker.

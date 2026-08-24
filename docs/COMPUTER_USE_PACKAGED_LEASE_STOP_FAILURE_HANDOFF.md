@@ -1,7 +1,7 @@
 # Packaged lease stop-failure follow-up handoff
 
 Status: **future external source qualification only**. This follow-up is
-separate from the active `b250b70` campaign and makes no packaged VM or
+separate from the recorded `b250b70` source result and makes no packaged VM or
 hardware claim.
 
 ## Frozen candidate

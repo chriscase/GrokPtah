@@ -206,7 +206,7 @@ fail-closed for ownership as well: the lease is revoked even when bounded
 helper reaping reports an error, and stopping/cleanup/terminated runtimes
 cannot admit a replacement agent. Exact cleanup evidence remains mandatory.
 Its focused regressions are formatted but still require the same external
-runner; it does not change the active `b250b70` campaign.
+runner; it does not change the recorded `b250b70` source result.
 The frozen follow-up procedure is
 [`COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md).
 
@@ -219,8 +219,8 @@ in `/private/tmp/grokptah-cu-isolated-visual-v15.bundle` (SHA-256
 `34ecdcdacf6c07b07d425e56c0f908ba8f6a5932d75f0dd2abb88c5c30bb8012`, cutoff
 `2142287f67fe532a631d72f280c91bb8eae38b22`) with the queued procedure in
 [`COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V15.md`](COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V15.md).
-It remains source-only and must not be conflated with the active `b250b70`
-campaign.
+It remains source-only and must not be conflated with the recorded `b250b70`
+source result.
 
 ### Always-On v52 route-identity repair — 2026-08-24
 

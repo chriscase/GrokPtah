@@ -562,7 +562,7 @@ host-input, signing, or soak claim may be inferred; the later v15 hardware
 campaign remains the next Stage 9/#288 gate.
 The subsequent source-only stop-failure correction is frozen separately at
 `40730e4` with its own bundle and handoff; it must not be conflated with the
-active `b250b70` result.
+recorded `b250b70` source result.
 
 **Exit (all required):**
 
@@ -757,7 +757,7 @@ signed/built helper, reviewed guest image, packaged entitlement proof, rendered 
 cleanup, or host-native dispatch evidence exists yet, so these source slices satisfy no #288
 acceptance checkbox. The credentialed execution and evidence handoff is defined in
 [`COMPUTER_USE_ISOLATED_QUALIFICATION_RUNBOOK.md`](COMPUTER_USE_ISOLATED_QUALIFICATION_RUNBOOK.md).
-For the next campaign after the active lease-fence source gate, the current
+For the next campaign after the completed lease-fence source gate, the current
 candidate is pinned separately in
 [`COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V15.md`](COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V15.md)
 as immutable bundle `/private/tmp/grokptah-cu-isolated-visual-v15.bundle`

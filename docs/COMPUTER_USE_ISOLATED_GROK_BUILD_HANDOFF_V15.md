@@ -5,7 +5,8 @@ qualified by this document.** v15 supersedes v14 by including the regression
 that proves a poisoned input gate cannot leave the lifecycle live after a stop
 failure; the supervisor aborts and requires cleanup.
 
-Do not run this concurrently with the active `b250b70` source campaign.
+The earlier `b250b70` source campaign is complete; do not substitute its
+source-only report or bundle for this packaged/hardware campaign.
 
 ## Frozen input
 
@@ -33,7 +34,7 @@ Source cutoff: 2142287f67fe532a631d72f280c91bb8eae38b22
 
 Create a disposable checkout and verify bundle SHA, complete history, exact
 HEAD, and clean worktree. Keep the developer checkout, existing app sessions,
-Git branches, GitHub, and the active b250b70 campaign untouched. Do not infer
+Git branches, GitHub, and the recorded b250b70 source result untouched. Do not infer
 VM capability from source tests, Linux image reproducibility, package signing,
 or launchAttempted=false.
 

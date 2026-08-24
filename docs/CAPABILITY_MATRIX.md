@@ -66,8 +66,8 @@ Candidate follow-up `40730e4` additionally revokes packaged-guest ownership
 after any terminal stop/reap result, including bounded reap failure, and
 denies reacquisition after stopping/cleanup/termination, so a failed stop
 cannot be resumed by the same or a replacement agent. Exact cleanup evidence
-remains independent; this correction is source-only and is not part of the
-active `b250b70` external campaign.
+remains independent; this correction is source-only and was not part of the
+recorded `b250b70` source result.
 Its future external procedure is
 [`COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md).
 
@@ -78,7 +78,7 @@ cutoff `2142287f67fe532a631d72f280c91bb8eae38b22`) with its copyable
 procedure in
 [`COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V15.md`](COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V15.md).
 It supersedes v14 with the poisoned-input stop regression, is queued rather
-than running, and does not alter the active `b250b70` campaign or create any
+than running, and does not alter the recorded `b250b70` source result or create any
 packaged/hardware claim.
 
 Candidate-only UI update (2026-08-24): the Provider Readiness Center now
