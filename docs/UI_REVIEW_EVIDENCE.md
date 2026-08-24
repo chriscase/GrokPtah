@@ -4,6 +4,9 @@
 recurring expert review cadence in roadmap stage 10. It is a release contract,
 not a claim that a review has already happened.
 
+The operational trigger, reviewer-independence, and retention procedure is in
+[`UI_REVIEW_CADENCE.md`](UI_REVIEW_CADENCE.md).
+
 ## What a review must bind
 
 Every record names:

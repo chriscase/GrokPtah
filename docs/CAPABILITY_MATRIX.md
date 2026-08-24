@@ -72,6 +72,10 @@ evidence and a live campaign certificate. This improves operator honesty for
 company-gateway workflows; it does not create a quota receipt, live provider
 certification, or a shipped-on-main claim.
 
+The recurring expert review process is documented in
+[`UI_REVIEW_CADENCE.md`](UI_REVIEW_CADENCE.md); no dated packaged review is
+claimed by that process document.
+
 ## Status vocabulary
 
 Exactly one of the four status columns is the *shipped-on-main* claim for the
