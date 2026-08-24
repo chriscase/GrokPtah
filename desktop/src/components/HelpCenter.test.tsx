@@ -12,6 +12,7 @@ describe("HelpCenter", () => {
     expect(screen.getByRole("textbox", { name: "Search help" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Sessions, builds, and chats" })).toBeInTheDocument();
     expect(screen.getByText(/Product corpus v1/)).toBeInTheDocument();
+    expect(screen.getByText(/^\d+ articles$/)).not.toHaveAttribute("aria-live");
   });
 
   it("filters articles deterministically and exposes the selected article", () => {

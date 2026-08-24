@@ -405,7 +405,7 @@ export function HelpCenter({
             ))}
           </select>
 
-          <p className="help-result-count" aria-live="polite">
+          <p className="help-result-count">
             {results.length} {results.length === 1 ? "article" : "articles"}
           </p>
           <p className="help-retrieval-mode" aria-label="Help retrieval mode">
