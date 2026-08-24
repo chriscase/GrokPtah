@@ -67,8 +67,10 @@ for required in \
   'GPTGuestWaitForReady' \
   'GPTGuestRequestShutdown' \
   'GPTMonotonicMilliseconds' \
+  'GPTDeadlineAfter' \
   'durationMilliseconds' \
   'deadline - now' \
+  'now == 0' \
   'GPTIsolatedHelperFailureGuestProtocol' \
   'GPT_INPUT_FD' \
   'GPT_FRAME_FD' \

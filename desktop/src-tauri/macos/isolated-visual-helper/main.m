@@ -424,6 +424,7 @@ static VZVirtualMachineConfiguration *GPTVirtualMachineConfiguration(
 @end
 
 static uint64_t GPTMonotonicMilliseconds(void);
+static BOOL GPTDeadlineAfter(int timeoutMilliseconds, uint64_t *deadline);
 
 static int GPTReadControlByte(uint8_t *command, int timeoutMilliseconds) {
     struct pollfd descriptor = {
@@ -452,9 +453,15 @@ static int GPTReadDescriptorExact(
     int timeoutMilliseconds) {
     uint8_t *cursor = bytes;
     size_t remaining = length;
-    uint64_t deadline = GPTMonotonicMilliseconds() + (uint64_t)timeoutMilliseconds;
+    uint64_t deadline = 0;
+    if (!GPTDeadlineAfter(timeoutMilliseconds, &deadline)) {
+        return -1;
+    }
     while (remaining > 0 && !GPTStopRequested) {
         uint64_t now = GPTMonotonicMilliseconds();
+        if (now == 0) {
+            return -1;
+        }
         int waitMilliseconds = now >= deadline ? 0 : (int)(deadline - now);
         struct pollfd descriptorState = {
             .fd = descriptor,
@@ -495,9 +502,15 @@ static BOOL GPTWriteDescriptorExact(
     int timeoutMilliseconds) {
     const uint8_t *cursor = bytes;
     size_t remaining = length;
-    uint64_t deadline = GPTMonotonicMilliseconds() + (uint64_t)timeoutMilliseconds;
+    uint64_t deadline = 0;
+    if (!GPTDeadlineAfter(timeoutMilliseconds, &deadline)) {
+        return NO;
+    }
     while (remaining > 0 && !GPTStopRequested) {
         uint64_t now = GPTMonotonicMilliseconds();
+        if (now == 0) {
+            return NO;
+        }
         int waitMilliseconds = now >= deadline ? 0 : (int)(deadline - now);
         struct pollfd descriptorState = {
             .fd = descriptor,
@@ -534,6 +547,19 @@ static uint64_t GPTMonotonicMilliseconds(void) {
     return (uint64_t)now.tv_sec * 1000ULL + (uint64_t)now.tv_nsec / 1000000ULL;
 }
 
+static BOOL GPTDeadlineAfter(int timeoutMilliseconds, uint64_t *deadline) {
+    if (timeoutMilliseconds < 0 || deadline == NULL) {
+        return NO;
+    }
+    uint64_t now = GPTMonotonicMilliseconds();
+    uint64_t duration = (uint64_t)timeoutMilliseconds;
+    if (now == 0 || duration > UINT64_MAX - now) {
+        return NO;
+    }
+    *deadline = now + duration;
+    return YES;
+}
+
 static BOOL GPTWriteSocketExact(
     VZVirtioSocketConnection *connection,
     const void *bytes,
@@ -541,9 +567,15 @@ static BOOL GPTWriteSocketExact(
     int timeoutMilliseconds) {
     const uint8_t *cursor = bytes;
     size_t remaining = length;
-    uint64_t deadline = GPTMonotonicMilliseconds() + (uint64_t)timeoutMilliseconds;
+    uint64_t deadline = 0;
+    if (!GPTDeadlineAfter(timeoutMilliseconds, &deadline)) {
+        return NO;
+    }
     while (remaining > 0 && connection.fileDescriptor >= 0) {
         uint64_t now = GPTMonotonicMilliseconds();
+        if (now == 0) {
+            return NO;
+        }
         int waitMilliseconds = now >= deadline ? 0 : (int)(deadline - now);
         struct pollfd descriptor = {
             .fd = connection.fileDescriptor,
@@ -580,9 +612,15 @@ static BOOL GPTReadSocketExact(
     int timeoutMilliseconds) {
     uint8_t *cursor = bytes;
     size_t remaining = length;
-    uint64_t deadline = GPTMonotonicMilliseconds() + (uint64_t)timeoutMilliseconds;
+    uint64_t deadline = 0;
+    if (!GPTDeadlineAfter(timeoutMilliseconds, &deadline)) {
+        return NO;
+    }
     while (remaining > 0 && connection.fileDescriptor >= 0) {
         uint64_t now = GPTMonotonicMilliseconds();
+        if (now == 0) {
+            return NO;
+        }
         int waitMilliseconds = now >= deadline ? 0 : (int)(deadline - now);
         struct pollfd descriptor = {
             .fd = connection.fileDescriptor,

@@ -185,6 +185,9 @@ The monotonic VM-deadline hardening extension is sealed at:
   continuously readable guest frame channel therefore cannot consume the
   configured duration early, and a failed or overflowing clock calculation
   fails closed before the VM lifecycle proceeds.
+- The same checked deadline constructor is used by every helper descriptor and
+  VSOCK read/write wrapper; a later clock failure cannot turn a bounded wait
+  into an unbounded one.
 - The stop boundary now rejects held keyboard/button state, waits for the
   helper to exit, and leaves the lifecycle in `CleanupPending` until explicit
   per-surface process, handle, overlay, and frame-cache evidence completes it.
