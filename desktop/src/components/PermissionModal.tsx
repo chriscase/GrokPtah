@@ -67,9 +67,9 @@ export function PermissionModal({
 
   useEffect(() => {
     const root = dialogRef.current;
-    const focusTarget = root?.querySelector<HTMLElement>(
-      "button.primary, button:not([disabled])",
-    );
+    const focusTarget =
+      root?.querySelector<HTMLElement>("button.primary") ??
+      focusableIn(root)[0];
     focusTarget?.focus();
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {

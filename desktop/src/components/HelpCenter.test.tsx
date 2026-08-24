@@ -333,9 +333,9 @@ describe("HelpCenter", () => {
     );
 
     const help = await waitFor(() => {
-      const dialog = screen.getByRole("dialog", { name: "Help Center", hidden: true });
+      const dialog = document.querySelector<HTMLElement>('[data-modal-layer="help"]');
       expect(dialog).toHaveAttribute("inert");
-      return dialog;
+      return dialog!;
     });
     expect(help).toHaveAttribute("aria-hidden", "true");
     expect(help).toHaveAttribute("aria-modal", "false");
@@ -364,7 +364,7 @@ describe("HelpCenter", () => {
       </div>,
     );
     await waitFor(() => {
-      expect(screen.getByRole("dialog", { name: "Help Center" })).not.toHaveAttribute("inert");
+      expect(document.querySelector('[data-modal-layer="help"]')).not.toHaveAttribute("inert");
     });
     expect(onClose).not.toHaveBeenCalled();
   });

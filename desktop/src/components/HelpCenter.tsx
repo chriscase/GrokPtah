@@ -205,12 +205,15 @@ export function HelpCenter({
   }, [open, topConfirm, consentPresent]);
 
   const helpFocusBeforeConsentRef = useRef<HTMLElement | null>(null);
+  const prevConsentPresentRef = useRef(false);
   useLayoutEffect(() => {
     if (!open) {
       helpFocusBeforeConsentRef.current = null;
+      prevConsentPresentRef.current = false;
       return;
     }
     if (consentPresent) {
+      prevConsentPresentRef.current = true;
       if (
         dialogRef.current?.contains(document.activeElement) &&
         document.activeElement instanceof HTMLElement
@@ -219,11 +222,10 @@ export function HelpCenter({
       }
       return;
     }
-    const restore =
-      helpFocusBeforeConsentRef.current ??
-      dialogRef.current?.querySelector<HTMLElement>("#help-search-input");
+    if (!prevConsentPresentRef.current) return;
+    prevConsentPresentRef.current = false;
+    helpFocusBeforeConsentRef.current?.focus();
     helpFocusBeforeConsentRef.current = null;
-    restore?.focus();
   }, [open, consentPresent]);
 
   useEffect(() => {
