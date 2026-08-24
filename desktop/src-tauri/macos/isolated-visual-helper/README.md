@@ -62,7 +62,8 @@ incomplete state. The source candidate also defines a separate authenticated 64-
 header with a closed key/button code set; it is not wired to a socket and no input capability is
 enabled. Rust and freestanding guest C also share a length-prefixed session-binding digest,
 challenge-derived channel key, and confirmation-tag contract; the packet is not consumed by the
-helper/guest socket loop.
+helper/guest socket loop. The Rust host-supervisor state machine now requires this binding step
+before it will send the terminal stop command; this is an ABI/source guard, not a packaged runtime.
 
 ## Build and package boundaries
 

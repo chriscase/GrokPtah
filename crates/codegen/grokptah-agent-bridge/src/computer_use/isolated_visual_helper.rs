@@ -1,3 +1,4 @@
+use super::isolated_visual_channel::IsolatedVisualChannelBinding;
 use super::types::{ComputerError, ComputerErrorCode, ComputerResult};
 
 /// The helper event ABI is deliberately smaller than the model-facing
@@ -104,6 +105,7 @@ pub enum IsolatedVisualHelperSupervisorState {
     Prepared,
     StartSent,
     Running,
+    Bound,
     StopSent,
     Stopped,
     Failed(IsolatedVisualHelperFailure),
@@ -146,14 +148,33 @@ impl IsolatedVisualHelperSupervisor {
     }
 
     pub fn stop(&mut self) -> ComputerResult<u8> {
-        if self.state != IsolatedVisualHelperSupervisorState::Running {
+        if self.state != IsolatedVisualHelperSupervisorState::Bound {
             return Err(ComputerError::new(
                 ComputerErrorCode::Conflict,
-                "isolated helper stop is not allowed in the current state",
+                "isolated helper stop requires an authenticated guest binding",
             ));
         }
         self.state = IsolatedVisualHelperSupervisorState::StopSent;
         Ok(ISOLATED_VISUAL_HELPER_CONTROL_STOP)
+    }
+
+    /// Seals the per-run binding packet only after the helper has reported a
+    /// live guest. The supervisor refuses shutdown until this packet has been
+    /// accepted by the guest side of the channel.
+    pub fn bind(
+        &mut self,
+        binding: &IsolatedVisualChannelBinding,
+        challenge: &[u8; 32],
+    ) -> ComputerResult<Vec<u8>> {
+        if self.state != IsolatedVisualHelperSupervisorState::Running {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "isolated guest binding is not allowed in the current state",
+            ));
+        }
+        let packet = binding.encode_header_and_payload(challenge)?;
+        self.state = IsolatedVisualHelperSupervisorState::Bound;
+        Ok(packet)
     }
 
     pub fn accept_event(&mut self, event: IsolatedVisualHelperEvent) -> ComputerResult<()> {
@@ -263,6 +284,17 @@ mod tests {
         supervisor
             .accept_event(IsolatedVisualHelperEvent::decode(&event(2, 0)).unwrap())
             .unwrap();
+        assert_eq!(
+            supervisor.stop().unwrap_err().code,
+            ComputerErrorCode::Conflict
+        );
+        let binding = IsolatedVisualChannelBinding {
+            run_id: "run-supervisor-test".into(),
+            surface_id: "surface-supervisor-test".into(),
+            incarnation: "incarnation-supervisor-test".into(),
+            input_domain_id: "input-supervisor-test".into(),
+        };
+        assert!(supervisor.bind(&binding, &[9; 32]).is_ok());
         assert_eq!(
             supervisor.stop().unwrap(),
             ISOLATED_VISUAL_HELPER_CONTROL_STOP

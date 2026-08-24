@@ -229,7 +229,9 @@ available.
    challenge-bound channel key, and carries a confirmation tag before frame/input traffic. Rust and
    freestanding guest C share the digest and vectors; the Rust frame/input carriers can derive
    interoperable keys from the same challenge, but the helper/guest socket loop still does not
-   consume the binding packet.
+   consume the binding packet. The host-supervisor source state machine now refuses terminal stop
+   until it has sealed the binding packet, preserving the intended lifecycle ordering without
+   claiming that a packaged process performs the exchange.
 6. Integrate app-owned cursor, focus/drag preview, timeline, persistent emergency controls, and
    accessibility states in the cockpit.
 7. Run adversarial, crash/restart, resource, packaged hardware, and recurring expert UI reviews.
