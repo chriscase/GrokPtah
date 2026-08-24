@@ -3366,10 +3366,10 @@ impl OrchestrationService {
     /// Materialize an admitted enterprise-review work projection through the
     /// ordinary durable-work mutation path. Each pass uses a plan-bound
     /// request id, so a host restart or broker retry replays the existing
-    /// WorkItem instead of creating a duplicate. This method does not issue
-    /// credentials or contact a provider; callers must perform admission and
-    /// worker binding before invoking it.
-    pub async fn create_enterprise_review_work_plan(
+    /// WorkItem instead of creating a duplicate. This crate-private seam is
+    /// reached only after the MCP handler verifies the signed gateway lease;
+    /// it does not issue credentials or contact a provider.
+    pub(crate) async fn create_enterprise_review_work_plan(
         &self,
         auth: &AuthContext,
         request_id: &str,
