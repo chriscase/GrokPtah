@@ -2476,6 +2476,8 @@ button:disabled {
 .help-confirm-details {
   border: 1px solid var(--border-soft);
   border-radius: 6px;
+  max-height: 11rem;
+  overflow: auto;
   padding: 0.45rem 0.6rem;
   color: var(--muted);
   font-size: 11px;
