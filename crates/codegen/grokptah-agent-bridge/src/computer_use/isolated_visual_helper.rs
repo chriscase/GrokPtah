@@ -9,6 +9,7 @@ pub const ISOLATED_VISUAL_HELPER_EVENT_VERSION: u16 = 1;
 pub const ISOLATED_VISUAL_HELPER_EVENT_BYTES: usize = 16;
 pub const ISOLATED_VISUAL_HELPER_CONTROL_START: u8 = 1;
 pub const ISOLATED_VISUAL_HELPER_CONTROL_STOP: u8 = 2;
+pub const ISOLATED_VISUAL_HELPER_CONTROL_BIND: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -17,6 +18,7 @@ pub enum IsolatedVisualHelperEventCode {
     Running = 2,
     Stopped = 3,
     Failure = 4,
+    Bound = 5,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +83,7 @@ impl IsolatedVisualHelperEvent {
             2 => IsolatedVisualHelperEventCode::Running,
             3 => IsolatedVisualHelperEventCode::Stopped,
             4 => IsolatedVisualHelperEventCode::Failure,
+            5 => IsolatedVisualHelperEventCode::Bound,
             _ => return Err(invalid_event("helper event code is unknown")),
         };
         let failure = match code {
@@ -105,6 +108,7 @@ pub enum IsolatedVisualHelperSupervisorState {
     Prepared,
     StartSent,
     Running,
+    BindingSent,
     Bound,
     StopSent,
     Stopped,
@@ -159,8 +163,9 @@ impl IsolatedVisualHelperSupervisor {
     }
 
     /// Seals the per-run binding packet only after the helper has reported a
-    /// live guest. The supervisor refuses shutdown until this packet has been
-    /// accepted by the guest side of the channel.
+    /// live guest. The returned control frame is sent to the helper; the
+    /// supervisor refuses shutdown until the helper reports that the guest
+    /// acknowledged it.
     pub fn bind(
         &mut self,
         binding: &IsolatedVisualChannelBinding,
@@ -173,8 +178,18 @@ impl IsolatedVisualHelperSupervisor {
             ));
         }
         let packet = binding.encode_header_and_payload(challenge)?;
-        self.state = IsolatedVisualHelperSupervisorState::Bound;
-        Ok(packet)
+        let packet_len = u32::try_from(packet.len()).map_err(|_| {
+            ComputerError::new(
+                ComputerErrorCode::LimitReached,
+                "isolated helper binding packet exceeds its bound",
+            )
+        })?;
+        let mut control = Vec::with_capacity(1 + 4 + packet.len());
+        control.push(ISOLATED_VISUAL_HELPER_CONTROL_BIND);
+        control.extend_from_slice(&packet_len.to_be_bytes());
+        control.extend_from_slice(&packet);
+        self.state = IsolatedVisualHelperSupervisorState::BindingSent;
+        Ok(control)
     }
 
     pub fn accept_event(&mut self, event: IsolatedVisualHelperEvent) -> ComputerResult<()> {
@@ -201,6 +216,11 @@ impl IsolatedVisualHelperSupervisor {
                 if self.state == IsolatedVisualHelperSupervisorState::StartSent =>
             {
                 self.state = IsolatedVisualHelperSupervisorState::Running;
+            }
+            IsolatedVisualHelperEventCode::Bound
+                if self.state == IsolatedVisualHelperSupervisorState::BindingSent =>
+            {
+                self.state = IsolatedVisualHelperSupervisorState::Bound;
             }
             IsolatedVisualHelperEventCode::Stopped
                 if self.state == IsolatedVisualHelperSupervisorState::StopSent =>
@@ -257,6 +277,7 @@ mod tests {
         assert!(IsolatedVisualHelperEvent::decode(&[0; 15]).is_err());
         assert!(IsolatedVisualHelperEvent::decode(&event(99, 0)).is_err());
         assert!(IsolatedVisualHelperEvent::decode(&event(1, 1)).is_err());
+        assert!(IsolatedVisualHelperEvent::decode(&event(5, 1)).is_err());
         assert!(IsolatedVisualHelperEvent::decode(&event(4, 99)).is_err());
     }
 
@@ -294,7 +315,19 @@ mod tests {
             incarnation: "incarnation-supervisor-test".into(),
             input_domain_id: "input-supervisor-test".into(),
         };
-        assert!(supervisor.bind(&binding, &[9; 32]).is_ok());
+        let control = supervisor.bind(&binding, &[9; 32]).unwrap();
+        assert_eq!(control[0], ISOLATED_VISUAL_HELPER_CONTROL_BIND);
+        assert_eq!(
+            supervisor.state(),
+            IsolatedVisualHelperSupervisorState::BindingSent
+        );
+        supervisor
+            .accept_event(IsolatedVisualHelperEvent::decode(&event(5, 0)).unwrap())
+            .unwrap();
+        assert_eq!(
+            supervisor.state(),
+            IsolatedVisualHelperSupervisorState::Bound
+        );
         assert_eq!(
             supervisor.stop().unwrap(),
             ISOLATED_VISUAL_HELPER_CONTROL_STOP

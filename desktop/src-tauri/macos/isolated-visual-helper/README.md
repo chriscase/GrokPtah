@@ -63,7 +63,10 @@ header with a closed key/button code set; it is not wired to a socket and no inp
 enabled. Rust and freestanding guest C also share a length-prefixed session-binding digest,
 challenge-derived channel key, and confirmation-tag contract; the packet is not consumed by the
 helper/guest socket loop. The Rust host-supervisor state machine now requires this binding step
-before it will send the terminal stop command; this is an ABI/source guard, not a packaged runtime.
+before it will send the terminal stop command. The helper now accepts a private control-channel bind
+packet, validates it against the guest challenge, relays it over VSOCK, and requires the guest's
+authenticated binding acknowledgement. The legacy zero-binding stop path remains only for the
+bootstrap smoke; this is still source/ABI evidence, not a packaged runtime claim.
 
 ## Build and package boundaries
 

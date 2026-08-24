@@ -32,6 +32,7 @@ typedef NS_ENUM(uint16_t, GPTIsolatedHelperEventCode) {
     GPTIsolatedHelperEventRunning = GPT_ISOLATED_HELPER_EVENT_RUNNING,
     GPTIsolatedHelperEventStopped = GPT_ISOLATED_HELPER_EVENT_STOPPED,
     GPTIsolatedHelperEventFailure = GPT_ISOLATED_HELPER_EVENT_FAILURE,
+    GPTIsolatedHelperEventBound = GPT_ISOLATED_HELPER_EVENT_BOUND,
 };
 
 typedef NS_ENUM(uint32_t, GPTIsolatedHelperFailure) {
@@ -402,6 +403,8 @@ static VZVirtualMachineConfiguration *GPTVirtualMachineConfiguration(
 }
 @end
 
+static uint64_t GPTMonotonicMilliseconds(void);
+
 static int GPTReadControlByte(uint8_t *command, int timeoutMilliseconds) {
     struct pollfd descriptor = {
         .fd = GPT_CONTROL_FD,
@@ -420,6 +423,41 @@ static int GPTReadControlByte(uint8_t *command, int timeoutMilliseconds) {
         count = read(GPT_CONTROL_FD, command, 1);
     } while (count < 0 && errno == EINTR && !GPTStopRequested);
     return count == 1 ? 1 : -1;
+}
+
+static int GPTReadControlExact(void *bytes, size_t length, int timeoutMilliseconds) {
+    uint8_t *cursor = bytes;
+    size_t remaining = length;
+    uint64_t deadline = GPTMonotonicMilliseconds() + (uint64_t)timeoutMilliseconds;
+    while (remaining > 0 && !GPTStopRequested) {
+        uint64_t now = GPTMonotonicMilliseconds();
+        int waitMilliseconds = now >= deadline ? 0 : (int)(deadline - now);
+        struct pollfd descriptor = {
+            .fd = GPT_CONTROL_FD,
+            .events = POLLIN | POLLERR | POLLHUP,
+            .revents = 0,
+        };
+        int polled;
+        do {
+            polled = poll(&descriptor, 1, waitMilliseconds);
+        } while (polled < 0 && errno == EINTR && !GPTStopRequested);
+        if (polled <= 0 ||
+            (descriptor.revents & POLLERR) != 0 ||
+            ((descriptor.revents & POLLHUP) != 0 &&
+             (descriptor.revents & POLLIN) == 0)) {
+            return polled == 0 ? 0 : -1;
+        }
+        ssize_t count = read(GPT_CONTROL_FD, cursor, remaining);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            return -1;
+        }
+        cursor += count;
+        remaining -= (size_t)count;
+    }
+    return remaining == 0 ? 1 : -1;
 }
 
 static uint64_t GPTMonotonicMilliseconds(void) {
@@ -541,6 +579,81 @@ static BOOL GPTGuestWaitForReady(
                challenge,
                GPT_GUEST_BOOTSTRAP_EVENT_READY,
                frame);
+}
+
+static BOOL GPTGuestAcceptBindingControl(
+    GPTGuestSocketDelegate *socketDelegate,
+    const gpt_u8 challenge[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES]) {
+    uint8_t lengthBytes[GPT_ISOLATED_HELPER_BINDING_LENGTH_BYTES] = {0};
+    if (GPTReadControlExact(
+            lengthBytes,
+            sizeof(lengthBytes),
+            GPT_GUEST_HANDSHAKE_TIMEOUT_MS) != 1) {
+        return NO;
+    }
+    uint32_t packetBytes = gpt_load_be32(lengthBytes);
+    if (packetBytes < GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES ||
+        packetBytes > GPT_ISOLATED_HELPER_BINDING_MAX_PACKET_BYTES) {
+        return NO;
+    }
+    gpt_u8 *packet = malloc(packetBytes);
+    if (packet == NULL) {
+        return NO;
+    }
+    BOOL valid = NO;
+    if (GPTReadControlExact(packet, packetBytes, GPT_GUEST_HANDSHAKE_TIMEOUT_MS) == 1) {
+        gpt_u16 lengths[4] = {
+            gpt_load_be16(packet + 8U),
+            gpt_load_be16(packet + 10U),
+            gpt_load_be16(packet + 12U),
+            gpt_load_be16(packet + 14U),
+        };
+        size_t payloadBytes = 0;
+        for (size_t index = 0; index < 4U; ++index) {
+            if (lengths[index] == 0 ||
+                lengths[index] > GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES) {
+                free(packet);
+                return NO;
+            }
+            payloadBytes += lengths[index];
+        }
+        valid = payloadBytes <= 4U * GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES &&
+                packetBytes == GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES + payloadBytes &&
+                gpt_isolated_visual_binding_valid(
+                    challenge,
+                    packet,
+                    packet + GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES,
+                    payloadBytes);
+    }
+    if (!valid) {
+        free(packet);
+        return NO;
+    }
+    VZVirtioSocketConnection *connection = socketDelegate.connection;
+    const gpt_u8 command = GPT_GUEST_BOOTSTRAP_BIND;
+    gpt_u8 acknowledgement[GPT_GUEST_BOOTSTRAP_FRAME_BYTES] = {0};
+    BOOL exchanged = connection != nil &&
+                    GPTWriteSocketExact(
+                        connection,
+                        &command,
+                        sizeof(command),
+                        GPT_GUEST_HANDSHAKE_TIMEOUT_MS) &&
+                    GPTWriteSocketExact(
+                        connection,
+                        packet,
+                        packetBytes,
+                        GPT_GUEST_HANDSHAKE_TIMEOUT_MS) &&
+                    GPTReadSocketExact(
+                        connection,
+                        acknowledgement,
+                        sizeof(acknowledgement),
+                        GPT_GUEST_HANDSHAKE_TIMEOUT_MS) &&
+                    gpt_guest_bootstrap_frame_valid(
+                        challenge,
+                        GPT_GUEST_BOOTSTRAP_EVENT_BINDING_ACK,
+                        acknowledgement);
+    free(packet);
+    return exchanged;
 }
 
 static BOOL GPTGuestRequestShutdown(
@@ -728,6 +841,7 @@ int main(int argc, const char *argv[]) {
             NSUInteger elapsedSeconds = 0;
             BOOL controlLost = NO;
             BOOL guestStopped = NO;
+            BOOL guestBound = NO;
             BOOL expectedGuestStop = NO;
             BOOL guestShutdownAcknowledged = NO;
             while (!GPTStopRequested && elapsedSeconds < configuration.durationSeconds) {
@@ -739,6 +853,18 @@ int main(int argc, const char *argv[]) {
                 int result = GPTReadControlByte(&command, 1000);
                 if (result == 1 && command == GPT_ISOLATED_HELPER_CONTROL_STOP) {
                     break;
+                }
+                if (result == 1 && command == GPT_ISOLATED_HELPER_CONTROL_BIND) {
+                    if (guestBound || !GPTGuestAcceptBindingControl(guestSocketDelegate, challenge)) {
+                        controlLost = YES;
+                        break;
+                    }
+                    guestBound = YES;
+                    if (!GPTWriteEvent(GPTIsolatedHelperEventBound, 0)) {
+                        controlLost = YES;
+                        break;
+                    }
+                    continue;
                 }
                 if (result < 0 ||
                     (result == 1 && command != GPT_ISOLATED_HELPER_CONTROL_STOP)) {

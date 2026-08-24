@@ -64,14 +64,18 @@ done
 for required in \
   'GPT_ISOLATED_HELPER_EVENT_MAGIC' \
   'GPT_ISOLATED_HELPER_EVENT_BYTES' \
+  'GPT_ISOLATED_HELPER_EVENT_BOUND' \
   'GPT_ISOLATED_HELPER_CONTROL_START' \
   'GPT_ISOLATED_HELPER_CONTROL_STOP' \
+  'GPT_ISOLATED_HELPER_CONTROL_BIND' \
   'gpt_isolated_helper_event' \
   'GPT_ISOLATED_VISUAL_BINDING_MAGIC' \
   'GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES' \
   'gpt_isolated_visual_binding_header'; do
   grep -F "$required" "$shared_protocol" >/dev/null
 done
+grep -F 'GPTGuestAcceptBindingControl' "$helper_source" >/dev/null
+grep -F 'GPTIsolatedHelperEventBound' "$helper_source" >/dev/null
 for forbidden in \
   VZNATNetworkDeviceAttachment \
   VZVirtioFileSystemDeviceConfiguration \

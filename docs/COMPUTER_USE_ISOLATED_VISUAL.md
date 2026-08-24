@@ -233,7 +233,9 @@ available.
    until it has sealed the binding packet, preserving the intended lifecycle ordering without
    claiming that a packaged process performs the exchange. The freestanding guest now accepts the
    binding command and returns an authenticated binding acknowledgement; the existing zero-binding
-   STOP path remains available for the current bootstrap smoke until the supervisor is wired.
+   STOP path remains available for the current bootstrap smoke until the supervisor is wired. The
+   helper source now defines the corresponding private control-channel relay and validates the
+   guest acknowledgement, but no packaged supervisor invokes it yet.
 6. Integrate app-owned cursor, focus/drag preview, timeline, persistent emergency controls, and
    accessibility states in the cockpit.
 7. Run adversarial, crash/restart, resource, packaged hardware, and recurring expert UI reviews.
