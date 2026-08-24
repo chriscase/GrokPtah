@@ -66,6 +66,9 @@ for required in \
   'setSocketListener:guestSocketListener' \
   'GPTGuestWaitForReady' \
   'GPTGuestRequestShutdown' \
+  'GPTMonotonicMilliseconds' \
+  'durationMilliseconds' \
+  'deadline - now' \
   'GPTIsolatedHelperFailureGuestProtocol' \
   'GPT_INPUT_FD' \
   'GPT_FRAME_FD' \

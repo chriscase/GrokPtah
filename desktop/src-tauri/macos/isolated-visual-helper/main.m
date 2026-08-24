@@ -1004,13 +1004,31 @@ int main(int argc, const char *argv[]) {
                 GPTStopRequested = 1;
             }
 
-            NSUInteger elapsedSeconds = 0;
+            uint64_t startedAt = GPTMonotonicMilliseconds();
+            uint64_t durationMilliseconds =
+                (uint64_t)configuration.durationSeconds * 1000ULL;
+            if (startedAt == 0 || durationMilliseconds > UINT64_MAX - startedAt) {
+                GPTStopVirtualMachine(virtualMachine, delegate, queue);
+                GPTWriteEvent(
+                    GPTIsolatedHelperEventFailure,
+                    GPTIsolatedHelperFailureControlLost);
+                return GPTIsolatedHelperFailureControlLost;
+            }
+            uint64_t deadline = startedAt + durationMilliseconds;
             BOOL controlLost = NO;
             BOOL guestStopped = NO;
             BOOL guestBound = NO;
             BOOL expectedGuestStop = NO;
             BOOL guestShutdownAcknowledged = NO;
-            while (!GPTStopRequested && elapsedSeconds < configuration.durationSeconds) {
+            while (!GPTStopRequested) {
+                uint64_t now = GPTMonotonicMilliseconds();
+                if (now == 0) {
+                    controlLost = YES;
+                    break;
+                }
+                if (now >= deadline) {
+                    break;
+                }
                 if (delegate.didStop) {
                     guestStopped = YES;
                     break;
@@ -1037,16 +1055,19 @@ int main(int argc, const char *argv[]) {
                         .revents = 0,
                     },
                 };
+                uint64_t remainingMilliseconds = deadline - now;
+                int pollTimeout = remainingMilliseconds > 1000ULL
+                                       ? 1000
+                                       : (int)remainingMilliseconds;
                 int polled;
                 do {
-                    polled = poll(descriptors, 3, 1000);
+                    polled = poll(descriptors, 3, pollTimeout);
                 } while (polled < 0 && errno == EINTR && !GPTStopRequested);
                 if (polled < 0) {
                     controlLost = YES;
                     break;
                 }
                 if (polled == 0) {
-                    elapsedSeconds += 1;
                     continue;
                 }
                 if ((descriptors[0].revents & (POLLERR | POLLHUP)) != 0 &&
@@ -1098,7 +1119,6 @@ int main(int argc, const char *argv[]) {
                     controlLost = YES;
                     break;
                 }
-                elapsedSeconds += 1;
             }
             if (!delegate.didStop) {
                 guestShutdownAcknowledged =

@@ -174,6 +174,11 @@ The raw-reader channel alignment is sealed at:
 - The packaged supervisor exposes read-only runtime inspection while keeping
   lifecycle-state mutation behind its driver; callers cannot obtain a public
   mutable session reference and bypass the ordered helper protocol.
+- The helper's VM lifetime is governed by a checked monotonic deadline and a
+  bounded poll timeout rather than by the number of I/O loop iterations. A
+  continuously readable guest frame channel therefore cannot consume the
+  configured duration early, and a failed or overflowing clock calculation
+  fails closed before the VM lifecycle proceeds.
 - The stop boundary now rejects held keyboard/button state, waits for the
   helper to exit, and leaves the lifecycle in `CleanupPending` until explicit
   per-surface process, handle, overlay, and frame-cache evidence completes it.
