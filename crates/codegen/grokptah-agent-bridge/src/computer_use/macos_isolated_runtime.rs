@@ -96,6 +96,22 @@ fn descriptors_are_distinct(descriptors: &[i32]) -> bool {
     })
 }
 
+fn waitpid_without_interrupt(pid: libc::pid_t) -> Option<libc::pid_t> {
+    for _ in 0..8 {
+        // SAFETY: the PID was returned by the native launch shim and this
+        // supervisor is the only code allowed to reap it.
+        let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        if result < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                std::thread::yield_now();
+                continue;
+            }
+        }
+        return Some(result);
+    }
+    None
+}
+
 fn close_spawn_descriptors(result: &NativeIsolatedRuntimeSpawnResult) {
     let descriptors = [
         result.control_fd,
@@ -118,7 +134,9 @@ fn terminate_process(pid: libc::pid_t) -> bool {
     // Reap/check ownership before sending a signal. If the child already
     // exited, or another owner reaped it, the numeric PID must never be
     // treated as a live process that can be killed after PID reuse.
-    let initial = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+    let Some(initial) = waitpid_without_interrupt(pid) else {
+        return false;
+    };
     if initial == pid {
         return true;
     }
@@ -127,11 +145,9 @@ fn terminate_process(pid: libc::pid_t) -> bool {
         if error.raw_os_error() == Some(libc::ECHILD) {
             return true;
         }
-        if error.raw_os_error() != Some(libc::EINTR) {
-            return false;
-        }
-        // EINTR leaves ownership unresolved but does not reap the child. Keep
-        // the supervisor-owned PID and continue to the bounded kill/reap path.
+        // `waitpid_without_interrupt` already retries EINTR, so any remaining
+        // error means ownership could not be established safely.
+        return false;
     }
     // SAFETY: the PID was returned by our launch shim. A failed kill is
     // intentionally followed by bounded reap polling; the normal stop path
