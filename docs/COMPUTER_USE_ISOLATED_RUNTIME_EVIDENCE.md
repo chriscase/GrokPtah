@@ -224,6 +224,11 @@ The monotonic VM-deadline hardening extension is sealed at:
 - `cargo metadata --locked --offline --no-deps --format-version=1`
 - `desktop/src-tauri/macos/isolated-visual-guest/verify-guest-source.sh`
 - `desktop/src-tauri/macos/isolated-visual-helper/verify-helper-source.sh`
+- `npm exec -- vitest run src/components/ComputerCockpit.test.tsx
+  src/components/SettingsPanel.computerUse.test.tsx` from the isolated desktop
+  checkout: 2 files / 27 tests passed. The checkout temporarily referenced
+  the main checkout's read-only `desktop/node_modules` tree for this command;
+  that link was removed immediately afterward.
 - `git diff --check`
 
 The changed Rust files were rustfmt-clean. The guest verifier reported its
