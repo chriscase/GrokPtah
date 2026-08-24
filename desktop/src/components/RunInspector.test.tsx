@@ -237,6 +237,35 @@ describe("RunInspector", () => {
     await waitFor(() => expect(onCancel).toHaveBeenCalledWith("remote-run"));
   });
 
+  it("redacts sensitive error events in the live timeline", async () => {
+    render(
+      <RunInspector
+        runs={[run({ state: "running" })]}
+        liveEvents={{
+          "desktop-run-1": [
+            {
+              seq: 9,
+              ts: "2026-08-17T12:01:09Z",
+              update: {
+                type: "error",
+                session_id: "session-1",
+                message: "failed at /Users/alice/project (api_key=sk-live-secret)",
+              },
+            },
+          ],
+        }}
+        onRefresh={vi.fn()}
+        {...actions}
+      />
+    );
+
+    const timeline = await screen.findByText(/Error ·/);
+    expect(timeline).toHaveTextContent("[local path redacted]");
+    expect(timeline).toHaveTextContent("[redacted]");
+    expect(timeline).not.toHaveTextContent("/Users/alice/project");
+    expect(timeline).not.toHaveTextContent("sk-live-secret");
+  });
+
   it("labels coordinator-owned runs", () => {
     render(
       <RunInspector

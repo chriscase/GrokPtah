@@ -119,7 +119,7 @@ function eventLabel(update: SessionUpdate): string {
     case "completion_evidence":
       return `Verification · ${update.evidence.status}`;
     case "error":
-      return `Error · ${compactEventText(update.message)}`;
+      return `Error · ${safeErrorMessage(update.message)}`;
     case "subagent_spawned":
       return `Subagent started · ${compactEventText(update.title, 140)}`;
     case "subagent_update":
@@ -139,7 +139,7 @@ function eventLabel(update: SessionUpdate): string {
     case "agent_progress":
       return `Round ${update.round}/${update.max_rounds} · ${compactEventText(update.last_tool || "model step", 100)} · ${compactEventText(update.detail, 120)}`;
     case "rate_limited":
-      return `Rate limited · ${compactEventText(update.message)}`;
+      return `Rate limited · ${safeErrorMessage(update.message)}`;
     case "steering_injected":
       return `Steering delivered · ${compactEventText(update.text)}`;
     case "prompt_queue_changed":
