@@ -85,3 +85,17 @@ Virtualization.framework launch, real guest boot, rendered frames, host input,
 cleanup on a live VM, or a long soak. Those remain mandatory Stage 9/#288
 hardware and packaged-runtime gates and require a separate credentialed host
 campaign.
+
+## Local report check
+
+After saving the external transcript, run the fail-closed evidence checker from
+the candidate checkout:
+
+```sh
+bash docs/verify-packaged-lease-report.sh /path/to/grok-build-report.txt
+```
+
+It requires the frozen candidate/parent/PR/bundle identities, the mandated
+sccache and target paths, the exact source checks, resource-ownership evidence,
+an explicit source-only boundary, and a final `PASS`. A report that contains a
+labeled failure or omits any of those fields is rejected.
