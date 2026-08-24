@@ -4921,7 +4921,8 @@ impl OrchStore {
             .run_id
             .as_deref()
             .map(|run_id| self.provider_retry_safe_for_run_unlocked(run_id))
-            .transpose()?
+            .transpose()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
             .unwrap_or(false);
         let retry = provider_retry_safe
             && policy.allows_auto_retry(&item, attempt_number.saturating_add(1), cause);

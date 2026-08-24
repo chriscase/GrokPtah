@@ -225,6 +225,12 @@ impl IsolatedVisualRuntimeSession {
     ) -> ComputerResult<()> {
         self.lifecycle.complete_cleanup(evidence)
     }
+
+    /// Records helper/runtime failure without skipping cleanup evidence.
+    pub(crate) fn fail(&mut self) -> ComputerResult<()> {
+        self.input_gate.poison();
+        self.lifecycle.fail()
+    }
 }
 
 fn runtime_order_error(message: &'static str) -> ComputerError {
