@@ -235,7 +235,10 @@ available.
    binding command and returns an authenticated binding acknowledgement; the existing zero-binding
    STOP path remains available for the current bootstrap smoke until the supervisor is wired. The
    helper source now defines the corresponding private control-channel relay and validates the
-   guest acknowledgement, but no packaged supervisor invokes it yet.
+   guest acknowledgement, but no packaged supervisor invokes it yet. A source-only
+   `IsolatedVisualRuntimeSession` now couples that helper event order to lifecycle cleanup, frame
+   freshness, and challenge-bound input admission; it still does not spawn or dispatch a packaged
+   runtime.
 6. Integrate app-owned cursor, focus/drag preview, timeline, persistent emergency controls, and
    accessibility states in the cockpit.
 7. Run adversarial, crash/restart, resource, packaged hardware, and recurring expert UI reviews.

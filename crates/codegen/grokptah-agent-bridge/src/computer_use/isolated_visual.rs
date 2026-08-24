@@ -290,6 +290,14 @@ impl IsolatedVisualLifecycle {
         })
     }
 
+    pub fn state(&self) -> IsolatedVisualLifecycleState {
+        self.state
+    }
+
+    pub fn contract(&self) -> &IsolatedVisualLaunchContract {
+        &self.contract
+    }
+
     pub fn begin_start(&mut self) -> ComputerResult<()> {
         self.transition(
             IsolatedVisualLifecycleState::Prepared,
@@ -319,6 +327,26 @@ impl IsolatedVisualLifecycle {
         self.terminal_disposition = Some(disposition);
         self.bump_revision();
         Ok(())
+    }
+
+    /// Records a helper/runtime failure and requires the same exact cleanup
+    /// evidence as an operator stop. A failure never resumes the lifecycle or
+    /// skips the cleanup proof.
+    pub fn fail(&mut self) -> ComputerResult<()> {
+        if matches!(
+            self.state,
+            IsolatedVisualLifecycleState::Prepared
+                | IsolatedVisualLifecycleState::Starting
+                | IsolatedVisualLifecycleState::ReadOnlyReady
+                | IsolatedVisualLifecycleState::Stopping
+        ) && self.terminal_disposition.is_none()
+        {
+            self.state = IsolatedVisualLifecycleState::CleanupPending;
+            self.terminal_disposition = Some(IsolatedVisualTerminalDisposition::Failed);
+            self.bump_revision();
+            return Ok(());
+        }
+        Err(invalid_transition())
     }
 
     /// The out-of-band stop/kill grace period has ended. This transition does

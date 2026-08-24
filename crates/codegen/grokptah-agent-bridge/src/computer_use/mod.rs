@@ -21,6 +21,7 @@ mod isolated_visual_helper;
 mod isolated_visual_input;
 mod isolated_visual_input_wire;
 mod isolated_visual_protocol;
+mod isolated_visual_runtime;
 #[cfg(target_os = "macos")]
 mod macos_isolated_artifacts;
 mod macos_observation;
@@ -62,9 +63,9 @@ pub use isolated_visual_frames::{
 pub use isolated_visual_helper::{
     IsolatedVisualHelperEvent, IsolatedVisualHelperEventCode, IsolatedVisualHelperFailure,
     IsolatedVisualHelperSupervisor, IsolatedVisualHelperSupervisorState,
-    ISOLATED_VISUAL_HELPER_CONTROL_START, ISOLATED_VISUAL_HELPER_CONTROL_STOP,
-    ISOLATED_VISUAL_HELPER_EVENT_BYTES, ISOLATED_VISUAL_HELPER_EVENT_MAGIC,
-    ISOLATED_VISUAL_HELPER_EVENT_VERSION,
+    ISOLATED_VISUAL_HELPER_CONTROL_BIND, ISOLATED_VISUAL_HELPER_CONTROL_START,
+    ISOLATED_VISUAL_HELPER_CONTROL_STOP, ISOLATED_VISUAL_HELPER_EVENT_BYTES,
+    ISOLATED_VISUAL_HELPER_EVENT_MAGIC, ISOLATED_VISUAL_HELPER_EVENT_VERSION,
 };
 pub use isolated_visual_input::{
     IsolatedVisualInputGate, IsolatedVisualInputKeyState, IsolatedVisualInputMessage,
@@ -81,6 +82,7 @@ pub use isolated_visual_protocol::{
     IsolatedVisualProtocolSession, IsolatedVisualProtocolSurfaceBinding,
     ISOLATED_VISUAL_CHANNEL_SECRET_BYTES, ISOLATED_VISUAL_MAX_SIGNED_ENVELOPE_BYTES,
 };
+pub use isolated_visual_runtime::IsolatedVisualRuntimeSession;
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
     computer_isolated_visual_status, ComputerBackgroundSafetyReceipt,

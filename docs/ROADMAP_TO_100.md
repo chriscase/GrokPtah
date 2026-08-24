@@ -700,7 +700,10 @@ and a credentialed nested-signing assembler. The helper's closed inherited-descr
    challenge, and the helper/guest source loop now consumes the binding packet and returns an
    authenticated acknowledgement. The helper source defines a private control-channel relay and
    validates the guest acknowledgement, but no packaged supervisor invokes that relay yet. These are contracts
-   and unshipped source/pipeline primitives, not packaged evidence. See
+   and unshipped source/pipeline primitives, not packaged evidence. A source-only
+   `IsolatedVisualRuntimeSession` now couples helper event order to lifecycle cleanup, frame
+   freshness, and challenge-bound input admission; it does not spawn or dispatch a packaged
+   runtime. See
 [`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,
 signed/built helper, guest image, packaged entitlement proof, or host-native dispatch exists yet, so these
 source slices satisfy no #288 acceptance checkbox.
