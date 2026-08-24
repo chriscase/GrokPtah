@@ -73,10 +73,11 @@ pub use certification::{
     MAX_RAW_ARTIFACT_BYTES, PERSISTENT_AGENT_CAPTURE_SCHEMA,
 };
 pub use enterprise_review::{
-    admit_enterprise_review_with_trust, attestation_signing_bytes, expected_route_binding_digest,
-    verify_enterprise_gateway_attestation, EnterpriseGatewayAttestation, EnterpriseGatewayTrust,
-    EnterpriseModelTier, EnterpriseReviewAdmissionError, EnterpriseReviewEvidence,
-    EnterpriseReviewLease, EnterpriseReviewPolicy, ENTERPRISE_REVIEW_ATTESTATION_SCHEMA,
+    admit_enterprise_review_with_trust, attestation_signing_bytes, expected_lease_binding_digest,
+    expected_route_binding_digest, verify_enterprise_gateway_attestation,
+    EnterpriseGatewayAttestation, EnterpriseGatewayTrust, EnterpriseModelTier,
+    EnterpriseReviewAdmissionError, EnterpriseReviewEvidence, EnterpriseReviewLease,
+    EnterpriseReviewPolicy, ENTERPRISE_REVIEW_ATTESTATION_SCHEMA,
     ENTERPRISE_REVIEW_EVIDENCE_SCHEMA, ENTERPRISE_REVIEW_LEASE_SCHEMA,
     ENTERPRISE_REVIEW_TRUST_SCHEMA, MAX_ENTERPRISE_REVIEW_DURATION_MS,
     MAX_ENTERPRISE_REVIEW_REQUESTS, MAX_ENTERPRISE_REVIEW_TOKENS,

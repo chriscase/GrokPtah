@@ -12,8 +12,8 @@ use ring::signature::{UnparsedPublicKey, ED25519};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const ENTERPRISE_REVIEW_LEASE_SCHEMA: &str = "grokptah.enterprise-review-lease.v1";
-pub const ENTERPRISE_REVIEW_ATTESTATION_SCHEMA: &str = "grokptah.enterprise-gateway-attestation.v1";
+pub const ENTERPRISE_REVIEW_LEASE_SCHEMA: &str = "grokptah.enterprise-review-lease.v2";
+pub const ENTERPRISE_REVIEW_ATTESTATION_SCHEMA: &str = "grokptah.enterprise-gateway-attestation.v2";
 pub const ENTERPRISE_REVIEW_EVIDENCE_SCHEMA: &str = "grokptah.enterprise-review-evidence.v1";
 pub const ENTERPRISE_REVIEW_TRUST_SCHEMA: &str = "grokptah.enterprise-review-trust.v1";
 pub const MAX_ENTERPRISE_REVIEW_REQUESTS: u32 = 400;
@@ -43,6 +43,11 @@ pub struct EnterpriseGatewayAttestation {
     pub expires_at: DateTime<Utc>,
     pub no_premium_fallback: bool,
     pub egress_firewall_attested: bool,
+    /// Digest of every secret-free lease field that the attestation authorizes
+    /// (identity, validity, policy, and bounds). This keeps a transport from
+    /// broadening an otherwise valid detached attestation by editing the
+    /// unsigned lease envelope.
+    pub lease_binding_digest: String,
     /// Optional detached signature over the canonical attestation payload.
     /// The legacy admission helper accepts unsigned metadata for deterministic
     /// contract tests; production callers must use
@@ -189,6 +194,7 @@ pub enum EnterpriseReviewAdmissionError {
     PublicationNotAllowed,
     BoundExceeded(&'static str),
     RouteBindingMismatch,
+    LeaseBindingMismatch,
     AttestationSignatureMissing,
     AttestationSignatureInvalid,
     AttestationTrustInvalid,
@@ -212,6 +218,7 @@ impl std::fmt::Display for EnterpriseReviewAdmissionError {
             Self::PublicationNotAllowed => write!(f, "publication is not allowed for review"),
             Self::BoundExceeded(name) => write!(f, "enterprise review bound exceeded: {name}"),
             Self::RouteBindingMismatch => write!(f, "enterprise route binding digest mismatch"),
+            Self::LeaseBindingMismatch => write!(f, "enterprise lease binding digest mismatch"),
             Self::AttestationSignatureMissing => {
                 write!(f, "enterprise gateway attestation signature is missing")
             }
@@ -340,6 +347,9 @@ pub(crate) fn admit_enterprise_review(
     if expected_route_binding_digest(lease) != lease.route_binding_digest {
         return Err(EnterpriseReviewAdmissionError::RouteBindingMismatch);
     }
+    if expected_lease_binding_digest(lease) != lease.attestation.lease_binding_digest {
+        return Err(EnterpriseReviewAdmissionError::LeaseBindingMismatch);
+    }
     Ok(EnterpriseReviewEvidence {
         schema: ENTERPRISE_REVIEW_EVIDENCE_SCHEMA.to_owned(),
         lease_id: lease.lease_id.clone(),
@@ -428,6 +438,7 @@ pub fn attestation_signing_bytes(attestation: &EnterpriseGatewayAttestation) -> 
         expires_at: DateTime<Utc>,
         no_premium_fallback: bool,
         egress_firewall_attested: bool,
+        lease_binding_digest: &'a str,
         signing_key_id: &'a Option<String>,
     }
     serde_json::to_vec(&Payload {
@@ -442,6 +453,7 @@ pub fn attestation_signing_bytes(attestation: &EnterpriseGatewayAttestation) -> 
         expires_at: attestation.expires_at,
         no_premium_fallback: attestation.no_premium_fallback,
         egress_firewall_attested: attestation.egress_firewall_attested,
+        lease_binding_digest: &attestation.lease_binding_digest,
         signing_key_id: &attestation.signing_key_id,
     })
     .expect("attestation signing payload serialization is infallible")
@@ -459,6 +471,56 @@ pub fn expected_route_binding_digest(lease: &EnterpriseReviewLease) -> String {
     hasher.update([0]);
     hasher.update(lease.credential_id.as_bytes());
     hex_digest(hasher.finalize())
+}
+
+/// Digest every lease field that affects authority or resource consumption.
+/// The detached attestation signs this digest; the attestation's own signature
+/// fields are intentionally excluded to avoid recursive signing.
+pub fn expected_lease_binding_digest(lease: &EnterpriseReviewLease) -> String {
+    #[derive(Serialize)]
+    struct LeaseBinding<'a> {
+        schema: &'a str,
+        lease_id: &'a str,
+        credential_id: &'a str,
+        route_id: &'a str,
+        endpoint_fingerprint: &'a str,
+        credential_fingerprint: &'a str,
+        model_id: &'a str,
+        model_tier: EnterpriseModelTier,
+        issued_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        route_binding_digest: &'a str,
+        read_only: bool,
+        allow_network: bool,
+        allow_workspace_writes: bool,
+        allow_publication: bool,
+        max_requests: u32,
+        max_tokens: u64,
+        max_duration_ms: u64,
+    }
+    let binding = LeaseBinding {
+        schema: &lease.schema,
+        lease_id: &lease.lease_id,
+        credential_id: &lease.credential_id,
+        route_id: &lease.route_id,
+        endpoint_fingerprint: &lease.endpoint_fingerprint,
+        credential_fingerprint: &lease.credential_fingerprint,
+        model_id: &lease.model_id,
+        model_tier: lease.model_tier,
+        issued_at: lease.issued_at,
+        expires_at: lease.expires_at,
+        route_binding_digest: &lease.route_binding_digest,
+        read_only: lease.read_only,
+        allow_network: lease.allow_network,
+        allow_workspace_writes: lease.allow_workspace_writes,
+        allow_publication: lease.allow_publication,
+        max_requests: lease.max_requests,
+        max_tokens: lease.max_tokens,
+        max_duration_ms: lease.max_duration_ms,
+    };
+    hex_digest(Sha256::digest(
+        serde_json::to_vec(&binding).expect("lease binding serialization is infallible"),
+    ))
 }
 
 fn policy_digest(policy: &EnterpriseReviewPolicy) -> String {
@@ -546,11 +608,13 @@ mod tests {
                 expires_at: now + chrono::Duration::hours(1),
                 no_premium_fallback: true,
                 egress_firewall_attested: true,
+                lease_binding_digest: String::new(),
                 signing_key_id: None,
                 signature: None,
             },
         };
         lease.route_binding_digest = expected_route_binding_digest(&lease);
+        lease.attestation.lease_binding_digest = expected_lease_binding_digest(&lease);
         lease
     }
 
@@ -592,6 +656,20 @@ mod tests {
         let (lease, trust) = trusted_signed_lease(now);
         admit_enterprise_review_with_trust(&lease, &EnterpriseReviewPolicy::default(), now, &trust)
             .unwrap();
+
+        let mut broadened = lease.clone();
+        broadened.max_requests = MAX_ENTERPRISE_REVIEW_REQUESTS;
+        broadened.max_tokens = MAX_ENTERPRISE_REVIEW_TOKENS;
+        broadened.expires_at += chrono::Duration::hours(1);
+        assert_eq!(
+            admit_enterprise_review_with_trust(
+                &broadened,
+                &EnterpriseReviewPolicy::default(),
+                now,
+                &trust,
+            ),
+            Err(EnterpriseReviewAdmissionError::LeaseBindingMismatch)
+        );
 
         let mut missing = lease.clone();
         missing.attestation.signature = None;

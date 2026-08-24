@@ -1958,11 +1958,11 @@ fn tool_input_schema(name: &str) -> Value {
             "schema", "route_id", "endpoint_fingerprint", "credential_fingerprint",
             "model_id", "model_tier",
             "deployment_revision", "issued_at", "expires_at", "no_premium_fallback",
-            "egress_firewall_attested"
+            "egress_firewall_attested", "lease_binding_digest"
         ],
         "additionalProperties": false,
         "properties": {
-            "schema": {"type": "string", "const": "grokptah.enterprise-gateway-attestation.v1"},
+            "schema": {"type": "string", "const": "grokptah.enterprise-gateway-attestation.v2"},
             "route_id": {"type": "string", "minLength": 1, "maxLength": 256},
             "endpoint_fingerprint": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
             "credential_fingerprint": {"type": "string", "pattern": "^v1-sha256:[0-9a-f]{64}$"},
@@ -1973,6 +1973,7 @@ fn tool_input_schema(name: &str) -> Value {
             "expires_at": {"type": "string", "format": "date-time"},
             "no_premium_fallback": {"type": "boolean"},
             "egress_firewall_attested": {"type": "boolean"},
+            "lease_binding_digest": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
             "signing_key_id": {"type": ["string", "null"], "maxLength": 256},
             "signature": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{128}$"}
         }
@@ -1987,7 +1988,7 @@ fn tool_input_schema(name: &str) -> Value {
         ],
         "additionalProperties": false,
         "properties": {
-            "schema": {"type": "string", "const": "grokptah.enterprise-review-lease.v1"},
+            "schema": {"type": "string", "const": "grokptah.enterprise-review-lease.v2"},
             "lease_id": {"type": "string", "minLength": 1, "maxLength": 256},
             "credential_id": {"type": "string", "minLength": 1, "maxLength": 256},
             "route_id": {"type": "string", "minLength": 1, "maxLength": 256},

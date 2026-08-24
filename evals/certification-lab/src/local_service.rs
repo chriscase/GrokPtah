@@ -730,11 +730,11 @@ pub(crate) fn loopback_test_available() -> bool {
 mod tests {
     use chrono::{Duration, Utc};
     use grokptah_agent_bridge::{
-        attestation_signing_bytes, expected_route_binding_digest, EnterpriseGatewayAttestation,
-        EnterpriseGatewayTrust, EnterpriseModelTier, ENTERPRISE_REVIEW_ATTESTATION_SCHEMA,
-        ENTERPRISE_REVIEW_LEASE_SCHEMA, ENTERPRISE_REVIEW_TRUST_SCHEMA,
-        MAX_ENTERPRISE_REVIEW_DURATION_MS, MAX_ENTERPRISE_REVIEW_REQUESTS,
-        MAX_ENTERPRISE_REVIEW_TOKENS,
+        attestation_signing_bytes, expected_lease_binding_digest, expected_route_binding_digest,
+        EnterpriseGatewayAttestation, EnterpriseGatewayTrust, EnterpriseModelTier,
+        ENTERPRISE_REVIEW_ATTESTATION_SCHEMA, ENTERPRISE_REVIEW_LEASE_SCHEMA,
+        ENTERPRISE_REVIEW_TRUST_SCHEMA, MAX_ENTERPRISE_REVIEW_DURATION_MS,
+        MAX_ENTERPRISE_REVIEW_REQUESTS, MAX_ENTERPRISE_REVIEW_TOKENS,
     };
     use serde_json::json;
     use tempfile::tempdir;
@@ -857,11 +857,13 @@ mod tests {
                 expires_at: now + Duration::hours(1),
                 no_premium_fallback: true,
                 egress_firewall_attested: true,
+                lease_binding_digest: String::new(),
                 signing_key_id: None,
                 signature: None,
             },
         };
         lease.route_binding_digest = expected_route_binding_digest(&lease);
+        lease.attestation.lease_binding_digest = expected_lease_binding_digest(&lease);
         lease
     }
 

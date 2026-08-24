@@ -15,8 +15,11 @@ The shared bridge contract is
 `EnterpriseReviewLease` is the only object the future gateway broker should
 hand to the review runtime. It contains opaque identifiers and fingerprints,
 never a bearer, URL, API key, or provider response. Its gateway attestation is
-detached-signed with an operator-selected Ed25519 key; the runtime verifies it
-against a separate public trust record before treating the route as admitted.
+detached-signed with an operator-selected Ed25519 key; the signature includes
+an exact digest of every authority-bearing lease field (identity, validity,
+policy flags, and budgets). The runtime verifies it against a separate public
+trust record before treating the route as admitted. Editing the unsigned lease
+envelope therefore fails closed instead of extending or broadening a review.
 
 ## Admission contract
 

@@ -814,12 +814,15 @@ mod tests {
                 expires_at: now + Duration::hours(2),
                 no_premium_fallback: true,
                 egress_firewall_attested: true,
+                lease_binding_digest: String::new(),
                 signing_key_id: None,
                 signature: None,
             },
         };
         lease.route_binding_digest =
             super::super::enterprise_review::expected_route_binding_digest(&lease);
+        lease.attestation.lease_binding_digest =
+            super::super::enterprise_review::expected_lease_binding_digest(&lease);
         lease
     }
 
