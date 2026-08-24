@@ -131,14 +131,14 @@ fn terminate_process(pid: libc::pid_t) -> bool {
 /// private channels. It is deliberately not wired into capability admission:
 /// callers must still provide a reviewed package manifest and independently
 /// prove boot, rendering, input, and cleanup before exposing this backend.
-pub struct IsolatedVisualPackagedRuntime {
+pub(crate) struct IsolatedVisualPackagedRuntime {
     pid: libc::pid_t,
     exited: bool,
     driver: IsolatedVisualRuntimeDriver<File, File, File, File>,
 }
 
 impl IsolatedVisualPackagedRuntime {
-    pub fn launch(contract: IsolatedVisualLaunchContract) -> ComputerResult<Self> {
+    pub(crate) fn launch(contract: IsolatedVisualLaunchContract) -> ComputerResult<Self> {
         contract.validate()?;
         // Hold the exact read-only package handles through the native launch
         // call. This binds the caller's manifest to measured artifact bytes
@@ -230,7 +230,7 @@ impl IsolatedVisualPackagedRuntime {
     }
 
     /// Drives the fixed Prepared → start → Running → bind → Bound sequence.
-    pub fn start(&mut self) -> ComputerResult<()> {
+    pub(crate) fn start(&mut self) -> ComputerResult<()> {
         if let Err(error) = self
             .driver
             .receive_helper_event_with_timeout(PREPARED_EVENT_TIMEOUT)
@@ -258,14 +258,14 @@ impl IsolatedVisualPackagedRuntime {
         Ok(())
     }
 
-    pub fn read_frame(&mut self) -> ComputerResult<Option<IsolatedVisualFrame>> {
+    pub(crate) fn read_frame(&mut self) -> ComputerResult<Option<IsolatedVisualFrame>> {
         match self.driver.read_frame_with_timeout(FRAME_READ_TIMEOUT) {
             Ok(frame) => Ok(frame),
             Err(error) => self.abort_with_error(error),
         }
     }
 
-    pub fn write_input(
+    pub(crate) fn write_input(
         &mut self,
         input_sequence: u64,
         request_nonce: &str,
@@ -282,7 +282,10 @@ impl IsolatedVisualPackagedRuntime {
         }
     }
 
-    pub fn stop(&mut self, disposition: IsolatedVisualTerminalDisposition) -> ComputerResult<()> {
+    pub(crate) fn stop(
+        &mut self,
+        disposition: IsolatedVisualTerminalDisposition,
+    ) -> ComputerResult<()> {
         if let Err(error) = self
             .driver
             .stop_with_timeout(disposition, CONTROL_WRITE_TIMEOUT)
@@ -306,7 +309,7 @@ impl IsolatedVisualPackagedRuntime {
     /// Completes the terminal transition only after the caller has verified
     /// exact helper/process absence, open-handle closure, overlay removal, and
     /// frame-cache removal for this surface incarnation.
-    pub fn complete_cleanup(
+    pub(crate) fn complete_cleanup(
         &mut self,
         evidence: &IsolatedVisualCleanupEvidence,
     ) -> ComputerResult<()> {
@@ -321,7 +324,7 @@ impl IsolatedVisualPackagedRuntime {
         Err(error)
     }
 
-    pub fn runtime(&self) -> &IsolatedVisualRuntimeSession {
+    pub(crate) fn runtime(&self) -> &IsolatedVisualRuntimeSession {
         self.driver.runtime()
     }
 

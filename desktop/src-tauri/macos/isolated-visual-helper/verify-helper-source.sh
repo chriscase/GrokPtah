@@ -10,6 +10,9 @@ script_dir=$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd -P)
 helper_source="$script_dir/main.m"
 shared_protocol="$script_dir/../isolated-visual-guest/protocol.h"
 native_shim="$script_dir/../../../../crates/codegen/grokptah-agent-bridge/src/computer_use/macos_native_shim.m"
+bridge_root="$script_dir/../../../../crates/codegen/grokptah-agent-bridge/src"
+runtime_source="$bridge_root/computer_use/macos_isolated_runtime.rs"
+bridge_lib="$bridge_root/lib.rs"
 configuration="$script_dir/grokptah-isolated-config-v1.json"
 work=$(mktemp -d /private/tmp/grokptah-helper-source-proof.XXXXXX)
 cleanup() {
@@ -19,6 +22,12 @@ trap cleanup EXIT HUP INT TERM
 
 sh -n "$script_dir/build-helper.sh"
 sh -n "$script_dir/package-signed-app.sh"
+grep -F 'pub(crate) struct IsolatedVisualPackagedRuntime' "$runtime_source" >/dev/null
+if grep -F 'pub struct IsolatedVisualPackagedRuntime' "$runtime_source" >/dev/null ||
+   grep -F 'pub use computer_use::IsolatedVisualPackagedRuntime' "$bridge_lib" >/dev/null; then
+  echo "packaged isolated runtime must remain crate-private before qualification" >&2
+  exit 1
+fi
 for required in \
   'CFBundleIdentifier' \
   'com.chriscase.grokptah' \

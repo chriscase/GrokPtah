@@ -198,6 +198,9 @@ The monotonic VM-deadline hardening extension is sealed at:
 - Package assembly also requires the exact GrokPtah bundle identifier and
   matching signed team identity for the helper and outer app; a misidentified
   or cross-team artifact fails before it can be used as a runtime candidate.
+- The packaged runtime launcher is crate-private until qualification completes;
+  it is no longer re-exported as a public provider/plugin API, so an unproven
+  helper cannot be started by an external caller or model-facing surface.
 - The stop boundary now rejects held keyboard/button state, waits for the
   helper to exit, and leaves the lifecycle in `CleanupPending` until explicit
   per-surface process, handle, overlay, and frame-cache evidence completes it.

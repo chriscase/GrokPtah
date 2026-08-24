@@ -98,7 +98,7 @@ pub use isolated_visual_stream::{
     ISOLATED_VISUAL_STREAM_MAX_FRAME_PACKET_BYTES,
 };
 #[cfg(target_os = "macos")]
-pub use macos_isolated_runtime::IsolatedVisualPackagedRuntime;
+pub(crate) use macos_isolated_runtime::IsolatedVisualPackagedRuntime;
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
     computer_isolated_visual_status, ComputerBackgroundSafetyReceipt,
