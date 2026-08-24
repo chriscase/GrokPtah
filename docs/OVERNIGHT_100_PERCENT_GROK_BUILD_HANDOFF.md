@@ -74,8 +74,8 @@ targets and credentialed runtime hosts are single-owner resources.
 
 - Qualify the packaged semantic macOS fixture and packaged identity/hardware matrix.
 - Run the isolated visual VM handoff in the current
-  `COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V14.md` (the older v12 handoff is
-  explicitly superseded); a signed VM must boot, render, accept bounded
+  `COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V15.md` (the older v12–v14 handoffs
+  are explicitly superseded); a signed VM must boot, render, accept bounded
   guest-only pointer/key/text input, stop/crash/restart safely, and prove exact cleanup while the
   host pointer, foreground app, window, clipboard digest, and unrelated windows remain unchanged.
 - Keep raw global injection, clipboard, shell, host input, and unattended grants unsupported.

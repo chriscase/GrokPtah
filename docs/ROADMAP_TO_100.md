@@ -753,12 +753,12 @@ acceptance checkbox. The credentialed execution and evidence handoff is defined 
 [`COMPUTER_USE_ISOLATED_QUALIFICATION_RUNBOOK.md`](COMPUTER_USE_ISOLATED_QUALIFICATION_RUNBOOK.md).
 For the next campaign after the active lease-fence source gate, the current
 candidate is pinned separately in
-[`COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V14.md`](COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V14.md)
-as immutable bundle `/private/tmp/grokptah-cu-isolated-visual-v14.bundle`
-(SHA-256 `c9f4d2aa4692789c9f02ff71f7126089e9ceebb856de7d9cef9a7f6458b72a66`,
-cutoff `0137969dcfbb7453dd716d1ed1894e4cfc7334b9`). It includes the
-fail-closed stop-control repair and is queued procedure only; it adds no
-packaged, VM, or #288 qualification evidence.
+[`COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V15.md`](COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V15.md)
+as immutable bundle `/private/tmp/grokptah-cu-isolated-visual-v15.bundle`
+(SHA-256 `34ecdcdacf6c07b07d425e56c0f908ba8f6a5932d75f0dd2abb88c5c30bb8012`,
+cutoff `2142287f67fe532a631d72f280c91bb8eae38b22`). It includes the
+fail-closed stop-control repair and its poisoned-input regression, and is
+queued procedure only; it adds no packaged, VM, or #288 qualification evidence.
 The ordinary `grokptah.computer-qualification.v1` record remains semantic-only; visual fallback
 authority additionally requires a **measured** record with the separate
 `grokptah.isolated-visual-computer-qualification.v1` schema, which cannot be written before the

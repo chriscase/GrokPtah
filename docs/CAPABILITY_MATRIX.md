@@ -66,13 +66,13 @@ Its future external procedure is
 [`COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md).
 
 A fresh immutable bundle for the later full Stage 9 campaign is also sealed at
-`/private/tmp/grokptah-cu-isolated-visual-v14.bundle` (SHA-256
-`c9f4d2aa4692789c9f02ff71f7126089e9ceebb856de7d9cef9a7f6458b72a66`, source
-cutoff `0137969dcfbb7453dd716d1ed1894e4cfc7334b9`) with its copyable
+`/private/tmp/grokptah-cu-isolated-visual-v15.bundle` (SHA-256
+`34ecdcdacf6c07b07d425e56c0f908ba8f6a5932d75f0dd2abb88c5c30bb8012`, source
+cutoff `2142287f67fe532a631d72f280c91bb8eae38b22`) with its copyable
 procedure in
-[`COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V14.md`](COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V14.md).
-It supersedes v13 with a fail-closed stop-control repair, is queued rather than
-running, and does not alter the active `b250b70` campaign or create any
+[`COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V15.md`](COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V15.md).
+It supersedes v14 with the poisoned-input stop regression, is queued rather
+than running, and does not alter the active `b250b70` campaign or create any
 packaged/hardware claim.
 
 Candidate-only UI update (2026-08-24): the Provider Readiness Center now

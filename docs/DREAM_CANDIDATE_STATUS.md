@@ -208,10 +208,10 @@ failure path: a poisoned input gate or failed control write now aborts the
 helper, revokes the lease, and requires exact cleanup rather than leaving a
 live child eligible for retry. Static formatting, offline metadata, and the
 source verifiers pass. The corrected full Stage 9 campaign is sealed separately
-in `/private/tmp/grokptah-cu-isolated-visual-v14.bundle` (SHA-256
-`c9f4d2aa4692789c9f02ff71f7126089e9ceebb856de7d9cef9a7f6458b72a66`, cutoff
-`0137969dcfbb7453dd716d1ed1894e4cfc7334b9`) with the queued procedure in
-[`COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V14.md`](COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V14.md).
+in `/private/tmp/grokptah-cu-isolated-visual-v15.bundle` (SHA-256
+`34ecdcdacf6c07b07d425e56c0f908ba8f6a5932d75f0dd2abb88c5c30bb8012`, cutoff
+`2142287f67fe532a631d72f280c91bb8eae38b22`) with the queued procedure in
+[`COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V15.md`](COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V15.md).
 It remains source-only and must not be conflated with the active `b250b70`
 campaign.
 
