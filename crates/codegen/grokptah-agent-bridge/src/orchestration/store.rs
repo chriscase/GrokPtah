@@ -6279,6 +6279,9 @@ mod tests {
         store
             .deactivate_agent_run("agent-activation-race", &first.run_id, false)
             .unwrap();
+        store
+            .deactivate_agent_run("agent-activation-race", &first.run_id, false)
+            .unwrap();
         second.state = RunState::Queued;
         second.start_seq = None;
         store.save_run(&second).unwrap();
@@ -6288,6 +6291,20 @@ mod tests {
             .unwrap();
         assert_eq!(promoted.state, RunState::Running);
         assert_eq!(promoted.start_seq, Some(42));
+        assert_eq!(
+            store
+                .load_agent("agent-activation-race")
+                .unwrap()
+                .unwrap()
+                .current_run_id
+                .as_deref(),
+            Some(second.run_id.as_str())
+        );
+        let stolen = store.deactivate_agent_run("agent-activation-race", &first.run_id, false);
+        assert!(
+            stolen.is_err(),
+            "deactivating a prior Run must not steal a successor Agent pointer"
+        );
         assert_eq!(
             store
                 .load_agent("agent-activation-race")

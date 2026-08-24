@@ -2668,6 +2668,9 @@ impl AgentHostHandle {
         store.save_checkpoint(&checkpoint)?;
         store
             .update_agent(agent_id, |current| {
+                if current.current_run_id.as_deref() != Some(run.run_id.as_str()) {
+                    return Ok(());
+                }
                 current.current_run_id = None;
                 current.last_run_id = Some(run.run_id.clone());
                 current.last_lane_id = Some(run.session_id);

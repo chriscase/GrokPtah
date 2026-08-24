@@ -1792,6 +1792,17 @@ async fn cancel_busy_turn_then_same_session_isolated_submit_is_admitted() {
     assert_eq!(replay, cancelled);
     assert_eq!(host.orchestration_active_count(), 0);
     assert!(!host.session_busy(session.id));
+    let agent = host.ensure_session_agent(session.id).unwrap();
+    let stored = orch
+        .store()
+        .load_agent(&agent.agent_id)
+        .unwrap()
+        .expect("session Agent");
+    assert_ne!(
+        stored.current_run_id.as_deref(),
+        Some(busy_id.as_str()),
+        "cancel must release the persistent Agent pointer"
+    );
 
     let isolated = orch
         .submit_task_with_execution_mode_and_queue(
@@ -1813,6 +1824,12 @@ async fn cancel_busy_turn_then_same_session_isolated_submit_is_admitted() {
     assert_eq!(isolated["executionMode"], "isolated_worktree");
     assert_eq!(isolated["state"], "running");
     assert_eq!(host.orchestration_active_count(), 1);
+    let stored = orch
+        .store()
+        .load_agent(&agent.agent_id)
+        .unwrap()
+        .expect("session Agent");
+    assert_eq!(stored.current_run_id.as_deref(), Some(isolated_id.as_str()));
 
     let durable = orch.get_run(&auth, &isolated_id).unwrap();
     assert_eq!(durable["runId"], isolated_id);

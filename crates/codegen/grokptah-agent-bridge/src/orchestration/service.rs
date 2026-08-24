@@ -7689,6 +7689,14 @@ impl OrchestrationService {
         // HashMap::remove is idempotent, so a later drop cannot free a
         // successor run's slot or underflow capacity.
         self.host.release_orchestration_turn(rid);
+        // The persistent Agent pointer is a second same-session lease. Spawned
+        // checkpointing may still be in flight; deactivation is keyed by
+        // run_id so a successor activation cannot be stolen or double-freed.
+        if let Some(agent_id) = run.agent_id.as_deref() {
+            if let Err(error) = self.store.deactivate_agent_run(agent_id, rid, false) {
+                eprintln!("[grokptah] cancel {rid} agent deactivation failed: {error}");
+            }
+        }
 
         // A completed teardown should have reconciled every provider marker.
         // If it did not—or teardown itself timed out—persist incomplete usage
