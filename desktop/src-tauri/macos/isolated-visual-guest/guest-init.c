@@ -99,36 +99,31 @@ static long gpt_write(int descriptor, const void *bytes, gpt_size length) {
 }
 
 static int gpt_wait_for_io(int descriptor, gpt_u16 events) {
-    unsigned int attempt;
-    for (attempt = 0; attempt < GPT_GUEST_IO_ATTEMPTS; ++attempt) {
-        gpt_pollfd descriptor_state = {
-            .descriptor = descriptor,
-            .events = events,
-            .revents = 0,
-        };
-        long polled = gpt_syscall3(
-            GPT_SYS_POLL,
-            (long)&descriptor_state,
-            1,
-            GPT_GUEST_IO_WAIT_MILLISECONDS);
-        if (polled == -GPT_EINTR) {
-            continue;
-        }
-        if (polled <= 0 ||
-            (descriptor_state.revents & (GPT_POLLERR | GPT_POLLHUP | GPT_POLLNVAL)) != 0 ||
-            (descriptor_state.revents & events) == 0) {
-            continue;
-        }
-        return 1;
+    gpt_pollfd descriptor_state = {
+        .descriptor = descriptor,
+        .events = events,
+        .revents = 0,
+    };
+    long polled = gpt_syscall3(
+        GPT_SYS_POLL,
+        (long)&descriptor_state,
+        1,
+        GPT_GUEST_IO_WAIT_MILLISECONDS);
+    if (polled <= 0 ||
+        (descriptor_state.revents & (GPT_POLLERR | GPT_POLLHUP | GPT_POLLNVAL)) != 0 ||
+        (descriptor_state.revents & events) == 0) {
+        return 0;
     }
-    return 0;
+    return 1;
 }
 
 static int gpt_read_exact(int descriptor, gpt_u8 *bytes, gpt_size length) {
     gpt_size offset = 0;
-    while (offset < length) {
+    unsigned int attempts = 0;
+    while (offset < length && attempts < GPT_GUEST_IO_ATTEMPTS) {
+        attempts += 1U;
         if (!gpt_wait_for_io(descriptor, GPT_POLLIN)) {
-            return 0;
+            continue;
         }
         long count = gpt_read(descriptor, bytes + offset, length - offset);
         if (count == -GPT_EINTR) {
@@ -139,14 +134,16 @@ static int gpt_read_exact(int descriptor, gpt_u8 *bytes, gpt_size length) {
         }
         offset += (gpt_size)count;
     }
-    return 1;
+    return offset == length;
 }
 
 static int gpt_write_exact(int descriptor, const gpt_u8 *bytes, gpt_size length) {
     gpt_size offset = 0;
-    while (offset < length) {
+    unsigned int attempts = 0;
+    while (offset < length && attempts < GPT_GUEST_IO_ATTEMPTS) {
+        attempts += 1U;
         if (!gpt_wait_for_io(descriptor, GPT_POLLOUT)) {
-            return 0;
+            continue;
         }
         long count = gpt_write(descriptor, bytes + offset, length - offset);
         if (count == -GPT_EINTR) {
@@ -157,7 +154,7 @@ static int gpt_write_exact(int descriptor, const gpt_u8 *bytes, gpt_size length)
         }
         offset += (gpt_size)count;
     }
-    return 1;
+    return offset == length;
 }
 
 static void gpt_sleep_retry(void) {
