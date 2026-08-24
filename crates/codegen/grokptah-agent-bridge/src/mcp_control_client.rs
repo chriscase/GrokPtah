@@ -87,11 +87,6 @@ pub struct PtahRecoveryNotification {
 pub enum LiveNotification {
     Event(PtahEventNotification),
     Recovery(PtahRecoveryNotification),
-    /// Preserve unknown notifications for forward-compatible coordinators.
-    Unknown {
-        method: String,
-        params: Value,
-    },
 }
 
 /// One decoded SSE message, including its resumable durable ID when present.
@@ -259,10 +254,7 @@ fn decode_sse_frame(frame: &[u8], scope: &RunScope) -> anyhow::Result<Option<Liv
             )?;
             LiveNotification::Recovery(recovery)
         }
-        _ => LiveNotification::Unknown {
-            method: method.to_string(),
-            params,
-        },
+        _ => anyhow::bail!("unsupported MCP live notification method {method}"),
     };
     Ok(Some(LiveEventFrame {
         sse_id,
@@ -348,6 +340,13 @@ impl McpControlClient {
         let resp = req.send().await?;
         if let Some(sid) = resp.headers().get("mcp-session-id") {
             if let Ok(s) = sid.to_str() {
+                if self
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|previous| previous != s)
+                {
+                    anyhow::bail!("MCP response changed the transport session");
+                }
                 self.session_id = Some(s.to_string());
             }
         }
@@ -359,10 +358,11 @@ impl McpControlClient {
         if let Some(err) = v.get("error") {
             anyhow::bail!("MCP error: {err}");
         }
-        if let Some(ver) = v.get("jsonrpc").and_then(|x| x.as_str()) {
-            if ver != "2.0" {
-                anyhow::bail!("server jsonrpc version {ver:?}");
-            }
+        if v.get("jsonrpc").and_then(|x| x.as_str()) != Some("2.0") {
+            anyhow::bail!("server response is not JSON-RPC 2.0");
+        }
+        if v.get("id") != Some(&Value::from(id)) {
+            anyhow::bail!("MCP response id does not match request");
         }
         Ok(v.get("result").cloned().unwrap_or(Value::Null))
     }
@@ -398,7 +398,10 @@ impl McpControlClient {
 
     /// MCP initialize handshake (Streamable HTTP session established).
     pub async fn initialize(&mut self) -> anyhow::Result<Value> {
-        let result = self
+        self.initialized = false;
+        self.protocol_version = None;
+        self.capability_set = None;
+        let result = match self
             .rpc(
                 "initialize",
                 json!({
@@ -410,20 +413,60 @@ impl McpControlClient {
                     }
                 }),
             )
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.reset_state();
+                return Err(error);
+            }
+        };
         self.protocol_version = result
             .get("protocolVersion")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        self.capability_set = result
+        let Some(protocol_version) = self.protocol_version.as_ref() else {
+            self.reset_state();
+            anyhow::bail!("initialize response has no protocolVersion");
+        };
+        if protocol_version.is_empty() {
+            self.reset_state();
+            anyhow::bail!("initialize response has an empty protocolVersion");
+        }
+        let parsed_capabilities = result
             .get("serverInfo")
             .and_then(|server_info| server_info.get("capabilityContract"))
             .map(|contract| serde_json::from_value(contract.clone()))
-            .transpose()?;
+            .transpose();
+        self.capability_set = match parsed_capabilities {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                self.reset_state();
+                return Err(error.into());
+            }
+        };
+        if self
+            .capability_set
+            .as_ref()
+            .is_none_or(|set| !set.is_current())
+        {
+            self.reset_state();
+            anyhow::bail!("initialize response has no valid capability contract");
+        }
         // Notification may return 202 with empty body — tolerate either shape.
-        let _ = self.notify("notifications/initialized", json!({})).await;
+        if let Err(error) = self.notify("notifications/initialized", json!({})).await {
+            self.reset_state();
+            return Err(error);
+        }
         self.initialized = true;
         Ok(result)
+    }
+
+    fn reset_state(&mut self) {
+        self.initialized = false;
+        self.protocol_version = None;
+        self.session_id = None;
+        self.capability_set = None;
     }
 
     /// Fire-and-forget JSON-RPC notification (no id).
@@ -575,6 +618,16 @@ impl McpControlClient {
         if !self.initialized {
             anyhow::bail!("MCP client not initialized; call initialize() first");
         }
+        if let Some(capability_id) = capability_for_tool(name) {
+            let capabilities = self
+                .capability_set
+                .as_ref()
+                .filter(|set| set.is_current())
+                .ok_or_else(|| anyhow::anyhow!("capability contract is missing or invalid"))?;
+            if capabilities.get(capability_id).is_none() {
+                anyhow::bail!("tool {name} is not advertised by the negotiated capability set");
+            }
+        }
         let tools = self.list_tools().await?;
         let tool = tools
             .iter()
@@ -604,6 +657,35 @@ impl McpControlClient {
             raw,
         })
     }
+}
+
+fn capability_for_tool(tool: &str) -> Option<&'static str> {
+    Some(match tool {
+        "ptah_list_sessions" | "ptah_get_capacity" => "session.observe",
+        "ptah_submit_task" | "ptah_retry_run" | "ptah_cancel" => "run.execute",
+        "ptah_get_queue" | "ptah_queue_prompt" | "ptah_edit_queue" | "ptah_remove_queue"
+        | "ptah_reorder_queue" | "ptah_clear_queue" | "ptah_run_next" | "ptah_steer_queued"
+        | "ptah_steer" => "run.queue",
+        "ptah_get_run"
+        | "ptah_get_progress"
+        | "ptah_get_changes"
+        | "ptah_get_test_results"
+        | "ptah_get_handoff"
+        | "ptah_get_events"
+        | "ptah_review_run" => "run.review",
+        "ptah_approve_run" | "ptah_promote_run" | "ptah_discard_run" => "run.promote",
+        "ptah_list_persistent_agents" | "ptah_get_persistent_agent" => "agent.continuity",
+        "ptah_resume_persistent_agent" => "agent.resume",
+        "ptah_list_computer_runs"
+        | "ptah_get_computer_run"
+        | "ptah_get_computer_run_events"
+        | "ptah_get_computer_capacity" => "computer.observe",
+        "ptah_authorize_computer_run"
+        | "ptah_pause_computer_run"
+        | "ptah_take_over_computer_run"
+        | "ptah_cancel_computer_run" => "computer.control",
+        _ => return None,
+    })
 }
 
 /// Client-side required-field check against MCP inputSchema.
