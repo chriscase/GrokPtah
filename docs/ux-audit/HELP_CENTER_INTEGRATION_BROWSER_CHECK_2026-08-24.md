@@ -30,6 +30,9 @@ Candidate: `f2644f23` (`codex/help-center-integration-v1`), based directly on
 - The security suite includes a prompt-injection-shaped article fixture and
   verifies that the text remains cited data; the full frontend suite is now
   46 files / 240 tests.
+- A live browser search for `Grok Bot vs Grok Build` rendered the boundary
+  article first (two matching results, 92% explainable heuristic score) and
+  kept the Help dialog accessible and visible.
 - Reset the temporary viewport override and closed the preview tab/server.
 - Refreshed the lockfile so the Vite/PostCSS development toolchain resolves
   `nanoid@3.3.18` and reran the locked dependency audit. Production and full
