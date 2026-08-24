@@ -90,6 +90,26 @@ static long gpt_syscall3(long number, long argument0, long argument1, long argum
     return gpt_syscall6(number, argument0, argument1, argument2, 0, 0, 0);
 }
 
+#if defined(__clang__)
+#define GPT_GUEST_FILL_ATTR __attribute__((noinline, optnone))
+#elif defined(__GNUC__)
+#define GPT_GUEST_FILL_ATTR \
+    __attribute__((noinline, optimize("no-tree-loop-distribute-patterns")))
+#else
+#error "the v1 isolated visual guest requires clang or gcc"
+#endif
+
+/* Explicit bounded fill. Do not name this memset/memcpy: -O2 must not emit a
+ * libc helper from freestanding PID 1. Attributes keep the loop from being
+ * rewritten into an implicit builtin. */
+GPT_GUEST_FILL_ATTR
+static void gpt_fill_bytes(gpt_u8 *bytes, gpt_u8 value, gpt_size length) {
+    gpt_size index;
+    for (index = 0; index < length; ++index) {
+        bytes[index] = value;
+    }
+}
+
 static long gpt_read(int descriptor, void *bytes, gpt_size length) {
     return gpt_syscall3(GPT_SYS_READ, descriptor, (long)bytes, (long)length);
 }
@@ -466,9 +486,12 @@ __attribute__((noreturn)) void _start(void) {
 
     gpt_u8 command = 0;
     gpt_u8 bound = 0;
-    gpt_u8 channel_secret[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES] = {0};
-    gpt_u8 binding_payload[4U * GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES] = {0};
-    gpt_u16 binding_lengths[4] = {0, 0, 0, 0};
+    gpt_u8 channel_secret[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES];
+    gpt_u8 binding_payload[4U * GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES];
+    gpt_u16 binding_lengths[4];
+    gpt_fill_bytes(channel_secret, 0, sizeof(channel_secret));
+    gpt_fill_bytes(binding_payload, 0, sizeof(binding_payload));
+    gpt_fill_bytes((gpt_u8 *)binding_lengths, 0, sizeof(binding_lengths));
     gpt_u64 last_frame_sequence = 0;
     gpt_u64 last_input_sequence = 0;
     gpt_u32 held_keys_mask = 0;
