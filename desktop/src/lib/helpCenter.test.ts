@@ -15,7 +15,7 @@ import { HELP_RETRIEVAL_FIXTURES } from "./helpCenter.fixtures";
 
 describe("offline Help Center corpus", () => {
   it("keeps a stable, non-empty article inventory", () => {
-    expect(HELP_ARTICLES.length).toBeGreaterThanOrEqual(5);
+    expect(HELP_ARTICLES).toHaveLength(12);
     expect(new Set(HELP_ARTICLES.map((article) => article.id)).size).toBe(
       HELP_ARTICLES.length,
     );
@@ -182,6 +182,30 @@ describe("offline Help Center corpus", () => {
       },
       HELP_ARTICLES.map((article) => article.id),
     ).reason).toBe("duplicate-article");
+    expect(validateHelpSemanticAnswer(
+      { results: [{ articleId: "providers.gateway", score: 1.1, rationale: "too high" }], uncertainty: "bounded" },
+      HELP_ARTICLES.map((article) => article.id),
+    ).reason).toBe("invalid-score");
+    expect(validateHelpSemanticAnswer(
+      { results: [{ articleId: "providers.gateway", score: 0.8, rationale: "  " }], uncertainty: "bounded" },
+      HELP_ARTICLES.map((article) => article.id),
+    ).reason).toBe("missing-rationale");
+    expect(validateHelpSemanticAnswer(
+      { results: [{ articleId: "providers.gateway", score: 0.8, rationale: "bounded" }], uncertainty: "  " },
+      HELP_ARTICLES.map((article) => article.id),
+    ).reason).toBe("missing-uncertainty");
     expect(parseHelpSemanticAnswer("not JSON").results).toEqual([]);
+  });
+
+  it("keeps semantic candidates inside the selected topic", () => {
+    const request = buildHelpSemanticRequest(
+      "what is safe computer control?",
+      HELP_ARTICLES.filter((article) => article.topic === "computer-use"),
+    );
+    expect(request.candidates.length).toBeGreaterThan(0);
+    expect(request.candidates.every((candidate) => candidate.topic === "computer-use")).toBe(true);
+    expect(request.candidates).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ articleId: "providers.gateway" })]),
+    );
   });
 });

@@ -11,6 +11,11 @@ export type HelpRetrievalFixture = {
  */
 export const HELP_RETRIEVAL_FIXTURES: HelpRetrievalFixture[] = [
   {
+    query: "sessions builds chats",
+    expectedId: "getting-started.sessions",
+    rationale: "exact",
+  },
+  {
     query: "semantic search",
     expectedId: "getting-started.search",
     rationale: "exact",
@@ -58,6 +63,11 @@ export const HELP_RETRIEVAL_FIXTURES: HelpRetrievalFixture[] = [
   {
     query: "72 hour persistent workers",
     expectedId: "operations.always-on-soak",
+    rationale: "paraphrase",
+  },
+  {
+    query: "what does passing evidence prove",
+    expectedId: "operations.evidence",
     rationale: "paraphrase",
   },
   {

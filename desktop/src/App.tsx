@@ -1170,13 +1170,19 @@ export default function App() {
       "You are the optional GrokPtah product-help assistant.",
       request.instruction,
       `Selected provider/model: ${assistantProviderLabel}`,
+      `Retrieval mode: ${request.retrievalMode}`,
+      `Corpus version: ${request.corpusVersion}`,
       "Do not switch provider, tenant, model, or retrieval scope.",
       "Return JSON only with exactly these keys: text (string), citations (array of exact source IDs), uncertainty (string).",
       `Question: ${request.query}`,
       `Cited context:\n${request.citedContext}`,
     ].join("\n\n");
-    const reply = await api.sessionPrompt(session.id, prompt);
-    return parseHelpAssistantAnswer(reply);
+    try {
+      const reply = await api.sessionPrompt(session.id, prompt);
+      return parseHelpAssistantAnswer(reply);
+    } finally {
+      await api.sessionDelete(session.id).catch(() => undefined);
+    }
   }, [assistantProviderLabel]);
   const searchHelpSemantically = useCallback(async (request: HelpSemanticRequest) => {
     const session = await api.sessionNewKind("chat");
@@ -1184,13 +1190,19 @@ export default function App() {
       "You are the optional GrokPtah Help Center semantic retriever.",
       request.instruction,
       `Selected provider/model: ${assistantProviderLabel}`,
+      `Retrieval mode: ${request.retrievalMode}`,
+      `Corpus version: ${request.corpusVersion}`,
       "Do not switch provider, tenant, model, or retrieval scope.",
       "Return JSON only with exactly these keys: results (array of objects with articleId, score, rationale), uncertainty (string).",
       `Query: ${request.query}`,
       `Candidate article metadata:\n${JSON.stringify(request.candidates)}`,
     ].join("\n\n");
-    const reply = await api.sessionPrompt(session.id, prompt);
-    return parseHelpSemanticAnswer(reply);
+    try {
+      const reply = await api.sessionPrompt(session.id, prompt);
+      return parseHelpSemanticAnswer(reply);
+    } finally {
+      await api.sessionDelete(session.id).catch(() => undefined);
+    }
   }, [assistantProviderLabel]);
   const activeTabKind = kindForTab(activeTab, sessions, workspaceMode);
   const activeIsBuild = activeTabKind === "build";

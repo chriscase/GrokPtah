@@ -35,6 +35,23 @@ describe("HelpCenter", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
+  it("cancels a nested confirmation before closing the Help Center", () => {
+    const onClose = vi.fn();
+    const onAskAssistant = vi.fn().mockResolvedValue({
+      text: "A bounded answer.",
+      citations: ["product.readme"],
+      uncertainty: "The selected article is the authority.",
+    });
+    render(<HelpCenter open onClose={onClose} onAskAssistant={onAskAssistant} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Prepare cited question" }));
+    expect(screen.getByRole("alertdialog", { name: "Confirm assistant request" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alertdialog", { name: "Confirm assistant request" })).not.toBeInTheDocument();
+  });
+
   it("keeps keyboard focus inside the modal and restores the opener", () => {
     const onClose = vi.fn();
     const opener = document.createElement("button");
@@ -129,5 +146,27 @@ describe("HelpCenter", () => {
     expect(screen.getByRole("heading", { name: "Provider routes and gateway policy" })).toBeInTheDocument();
     expect(screen.getByText(/Provider semantic ranking/)).toBeInTheDocument();
     expect(screen.getByText(/Provider ranking score: 88%/)).toBeInTheDocument();
+  });
+
+  it("keeps lexical guidance when semantic ranking is rejected", async () => {
+    const onSearchSemantic = vi.fn().mockResolvedValue({
+      results: [{ articleId: "providers.gateway", score: 2, rationale: "out of bounds" }],
+      uncertainty: "bounded",
+    });
+    render(
+      <HelpCenter
+        open
+        onClose={vi.fn()}
+        onSearchSemantic={onSearchSemantic}
+        assistantProviderLabel="Company gateway · review-model"
+      />,
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "Search help" }), {
+      target: { value: "why is the company gateway model weak?" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Prepare meaning search" }));
+    fireEvent.click(screen.getByRole("button", { name: "Search by meaning" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/ranking rejected/));
+    expect(screen.getByRole("heading", { name: "Review code through a restricted company gateway" })).toBeInTheDocument();
   });
 });

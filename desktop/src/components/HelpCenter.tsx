@@ -59,6 +59,7 @@ export function HelpCenter({
   const [semantic, setSemantic] = useState<SemanticState>({ status: "idle" });
   const dialogRef = useRef<HTMLDivElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
+  const confirmDialogRef = useRef<HTMLDivElement>(null);
 
   const lexicalResults = useMemo(() => {
     if (!query.trim()) {
@@ -94,7 +95,17 @@ export function HelpCenter({
     const focusTarget = dialogRef.current?.querySelector<HTMLElement>("#help-search-input");
     focusTarget?.focus();
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") {
+        event.preventDefault();
+        if (semantic.status === "confirm") {
+          setSemantic({ status: "idle" });
+        } else if (assistant.status === "confirm") {
+          setAssistant({ status: "idle" });
+        } else {
+          onClose();
+        }
+        return;
+      }
       if (event.key !== "Tab") return;
 
       const focusable = Array.from(
@@ -119,7 +130,41 @@ export function HelpCenter({
       returnFocusRef.current?.focus();
       returnFocusRef.current = null;
     };
-  }, [open, onClose]);
+  }, [assistant.status, onClose, open, semantic.status]);
+
+  useEffect(() => {
+    if (!open || (assistant.status !== "confirm" && semantic.status !== "confirm")) return;
+    const focusTarget = confirmDialogRef.current?.querySelector<HTMLElement>(
+      "button.primary, button:not([disabled])",
+    );
+    focusTarget?.focus();
+  }, [assistant.status, open, semantic.status]);
+
+  useEffect(() => {
+    if (!open || !dialogRef.current) return;
+    const shell = dialogRef.current.parentElement;
+    if (!shell) return;
+    const siblings = Array.from(shell.children).filter(
+      (child): child is HTMLElement => child !== dialogRef.current && child instanceof HTMLElement,
+    );
+    const previous = siblings.map((element) => ({
+      element,
+      ariaHidden: element.getAttribute("aria-hidden"),
+      inert: element.hasAttribute("inert"),
+    }));
+    siblings.forEach((element) => {
+      element.setAttribute("inert", "");
+      element.setAttribute("aria-hidden", "true");
+    });
+    return () => {
+      previous.forEach(({ element, ariaHidden, inert }) => {
+        if (inert) element.setAttribute("inert", "");
+        else element.removeAttribute("inert");
+        if (ariaHidden === null) element.removeAttribute("aria-hidden");
+        else element.setAttribute("aria-hidden", ariaHidden);
+      });
+    };
+  }, [open]);
 
   useEffect(() => {
     if (selected && !results.some((result) => result.article.id === selectedId)) {
@@ -167,7 +212,10 @@ export function HelpCenter({
     if (!trimmed || !onSearchSemantic) return;
     setSemantic({
       status: "confirm",
-      request: buildHelpSemanticRequest(trimmed),
+      request: buildHelpSemanticRequest(
+        trimmed,
+        HELP_ARTICLES.filter((article) => topic === "all" || article.topic === topic),
+      ),
     });
   };
 
@@ -281,8 +329,18 @@ export function HelpCenter({
             </button>
           )}
           {onSearchSemantic && semantic.status === "confirm" && (
-            <div className="help-semantic-confirm" role="alertdialog" aria-label="Confirm meaning search">
+            <div
+              ref={confirmDialogRef}
+              className="help-semantic-confirm"
+              role="alertdialog"
+              aria-modal="true"
+              aria-labelledby="help-semantic-confirm-title"
+              aria-describedby="help-semantic-confirm-copy"
+            >
               <p>
+                <strong id="help-semantic-confirm-title">Confirm meaning search</strong>
+              </p>
+              <p id="help-semantic-confirm-copy">
                 Send this query and article metadata to {assistantProviderLabel ?? "the selected provider"} for meaning-based ranking? No article body or workspace data will be sent.
               </p>
               <button type="button" className="primary" onClick={() => void confirmSemanticRequest()}>
@@ -295,13 +353,14 @@ export function HelpCenter({
           )}
           {semantic.status === "loading" && <p className="help-retrieval-status" role="status">Ranking help by meaning…</p>}
           {semantic.status === "error" && <p className="help-retrieval-status" role="alert">{semantic.message}</p>}
-          <ul className="help-list">
+          <ul className="help-list" role="listbox" aria-label="Help article results">
             {results.map(({ article, matchedTerms, confidence }) => (
               <li key={article.id}>
                 <button
                   type="button"
+                  role="option"
                   className={`help-list-item ${article.id === selected?.id ? "is-selected" : ""}`}
-                  aria-current={article.id === selected?.id ? "page" : undefined}
+                  aria-selected={article.id === selected?.id}
                   onClick={() => setSelectedId(article.id)}
                 >
                   <span className="help-list-topic">{article.topic.replace("-", " ")}</span>
@@ -318,7 +377,10 @@ export function HelpCenter({
           </ul>
         </aside>
 
-        <article className="help-article" aria-live="polite">
+        <p className="sr-only" role="status" aria-live="polite">
+          {selected ? `Selected article: ${selected.title}` : "No matching guidance"}
+        </p>
+        <article className="help-article">
           {selected ? (
             <>
               <span className="help-article-topic">{selected.topic.replace("-", " ")}</span>
@@ -368,8 +430,18 @@ export function HelpCenter({
                     </button>
                   )}
                   {assistant.status === "confirm" && (
-                    <div className="help-assistant-confirm" role="alertdialog" aria-label="Confirm assistant request">
+                    <div
+                      ref={confirmDialogRef}
+                      className="help-assistant-confirm"
+                      role="alertdialog"
+                      aria-modal="true"
+                      aria-labelledby="help-assistant-confirm-title"
+                      aria-describedby="help-assistant-confirm-copy"
+                    >
                       <p>
+                        <strong id="help-assistant-confirm-title">Confirm assistant request</strong>
+                      </p>
+                      <p id="help-assistant-confirm-copy">
                         Ready to send the cited article bundle ({assistant.request.sources.length} source{assistant.request.sources.length === 1 ? "" : "s"}) via {assistantProviderLabel ?? "the selected provider"}?
                       </p>
                       <button type="button" className="primary" onClick={() => void confirmAssistantRequest()}>

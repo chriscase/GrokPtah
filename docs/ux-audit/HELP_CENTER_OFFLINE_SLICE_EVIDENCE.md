@@ -5,68 +5,63 @@ acceptance, and not a 100% claim.
 
 ## Candidate identity
 
-- Candidate worktree: `/private/tmp/grokptah-ui-contrast-fix`
-- Candidate revision: the exact commit containing this evidence note; record
-  `git rev-parse HEAD` when assembling the packaged review packet.
+- Candidate worktree: `/private/tmp/grokptah-help-integration-v1`
+- Candidate branch: `codex/help-center-integration-v1`
+- Candidate revision: `db88467a05d9559aff8cf89f2d6ad6eed1e1f23e`
+- Base: `origin/main` `67e29bd34dc64049432c715c93c2cef2185c63ea`
 - Working tree: clean after the candidate commit
 - Date: 2026-08-24
 
 ## Surface delivered
 
 - Visible Help entry in the sidebar and `/help` command routing.
-- Full-screen accessible dialog with labelled search, topic filter, Escape
-  close, focus-visible styling, responsive narrow layout, and reduced-motion
+- Full-screen dialog with labelled search, topic filter, Escape close, focus
+  return, responsive narrow layout, forced-colors styling, and reduced-motion
   handling.
-- Eleven stable offline article IDs covering sessions, search, provider
-  routes, restricted-company reviews, live gateway evidence, Computer Use
-  boundaries, isolated guests, multi-agent coordination, general evidence,
-  the always-on soak, and the grounded Help assistant.
+- Twelve stable offline article IDs:
+  `getting-started.sessions`, `getting-started.search`, `providers.gateway`,
+  `providers.live-gateway-evidence`, `providers.grok-build-boundary`,
+  `providers.restricted-gateway-review`, `computer-use.boundaries`,
+  `computer-use.isolated-guest`, `computer-use.multi-agent-coordination`,
+  `operations.evidence`, `operations.always-on-soak`, and
+  `operations.help-assistant`.
 - Deterministic field-weighted retrieval with explicit aliases for power-user
   paraphrases, transparent plural/diacritic normalization, and exact terms
   outranking prose matches.
 - Versioned retrieval fixtures cover exact identifiers, paraphrases, topic
   filters, unsupported questions, and natural-language stop-word handling.
-- Every article carries one or more explicit source IDs, repository paths, and
-  headings rendered in the source card.
-- Retrieval is built from a stable `HELP_INDEX` contract, and the candidate
-  now includes an optional provider-semantic ranking path that preserves the
-  same article IDs and validates every returned score against that corpus.
-- Offline results carry `offline-lexical`; provider-ranked results carry
-  `provider-semantic`. The UI never silently represents one mode as the other.
-- The candidate now exposes a source-only grounded-assistant request contract
-  with corpus version, retrieval mode, explicit confirmation, and citation
-  validation, plus a confirmation-gated provider callback through a fresh chat
-  session. Search results also expose an explainable heuristic confidence
-  signal; it is explicitly not a model-confidence or certification claim.
-  Live provider routing and qualification remain unverified.
-- Honest no-result state and source/evidence note on every displayed article.
+- Every article carries source IDs, repository paths, and headings that exist
+  at this candidate revision. The isolated-guest article explicitly says that
+  source-level proof does not qualify a packaged VM or usable guest surface.
+- Optional provider-semantic ranking and grounded-assistant requests are
+  confirmation-gated, metadata/context bounded, corpus-versioned, and
+  validated. Helper chat sessions are deleted after each completed request.
 
 ## Verification
 
-From `/private/tmp/grokptah-ui-contrast-fix/desktop`:
+Candidate evidence reports the following from the exact worktree:
 
 - `npm run typecheck` — pass.
-- `npm test -- --reporter=dot` — 48 files, 376 tests passed.
+- `npm test -- --reporter=dot` — 46 files, 240 tests passed.
 - `npm run build` — pass; Vite production bundle emitted.
+- `npm audit --audit-level=high` — zero vulnerabilities.
 - `git diff --check` — pass.
+
+The independent review did not re-run this full baseline; it remains evidence
+to repeat at promotion time.
 
 ## Browser visual pass
 
-- Local Vite preview checked at the default viewport and explicit 720×800
-  narrow viewport.
-- The natural-language query `why is the company gateway model weak?` ranks
-  the provider-route article first after stop-word filtering; no horizontal
-  overflow was observed at 720px (`scrollWidth == innerWidth`).
-- The meaning-search control is disabled until a query exists, then exposes a
-  clear confirmation dialog naming the configured provider and stating that
-  only static article metadata will leave the app. No provider request was
-  sent during this browser pass.
-- The final expanded-corpus pass exposed eleven article buttons, kept the
-  restricted-company review article first for the natural-language gateway
-  query, and preserved the same confirmation/no-overflow behavior at 720px.
+Prior local browser evidence covered the real Help dialog, twelve article
+buttons, topic/search behavior, source cards, and a 720px narrow viewport. That
+evidence predates the final boundary/accessibility correction and must be
+re-run for packaged promotion. It is not packaged desktop acceptance.
 
 ## Remaining gates
 
-This slice still needs live provider qualification of the semantic route,
-packaged desktop acceptance, and the recurring expert review cadence before it
-can be promoted.
+1. Live provider qualification of the confirmation-gated semantic route and
+   grounded assistant, with receipts and no silent fallback.
+2. Measured recall/precision against a larger corpus than the deterministic
+   fixtures.
+3. Packaged desktop acceptance, including keyboard and forced-colors checks.
+4. Recurring expert review cadence for accessibility and product copy.

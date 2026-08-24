@@ -2160,6 +2160,7 @@ button:disabled {
 
 .help-header > button {
   flex: 0 0 auto;
+  min-height: 44px;
 }
 
 .help-layout {
@@ -2191,6 +2192,7 @@ button:disabled {
 .help-search input,
 .help-topic {
   width: 100%;
+  min-height: 44px;
   border: 1px solid var(--border);
   border-radius: 7px;
   background: var(--bg-input);
@@ -2229,6 +2231,7 @@ button:disabled {
 .help-semantic-search {
   justify-self: start;
   margin: 0 0 0.7rem;
+  min-height: 44px;
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 0.4rem 0.55rem;
@@ -2273,6 +2276,7 @@ button:disabled {
 
 .help-semantic-confirm button {
   justify-self: start;
+  min-height: 44px;
 }
 
 .help-confidence-note {
@@ -2290,6 +2294,7 @@ button:disabled {
 .help-list-item {
   display: grid;
   width: 100%;
+  min-height: 44px;
   gap: 0.22rem;
   border: 1px solid transparent;
   border-radius: 8px;
@@ -2382,6 +2387,7 @@ button:disabled {
 .help-source-card code {
   color: var(--text);
   font-family: var(--font);
+  overflow-wrap: anywhere;
 }
 
 .help-index-note {
@@ -2420,6 +2426,7 @@ button:disabled {
 
 .help-assistant-card button {
   justify-self: start;
+  min-height: 44px;
 }
 
 .help-assistant-confirm,
@@ -2428,6 +2435,10 @@ button:disabled {
   gap: 0.5rem;
   border-top: 1px solid var(--border-soft);
   padding-top: 0.65rem;
+}
+
+.help-assistant-confirm button {
+  min-height: 44px;
 }
 
 .help-assistant-answer strong {
@@ -2466,8 +2477,40 @@ button:disabled {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .help-list-item {
+  .help-center,
+  .help-center * {
+    animation: none !important;
     transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .help-center,
+  .help-header,
+  .help-nav,
+  .help-source-card,
+  .help-assistant-card,
+  .help-semantic-confirm,
+  .help-assistant-confirm {
+    border-color: CanvasText;
+  }
+
+  .help-list-item.is-selected,
+  .help-list-item:hover {
+    border-color: Highlight;
+    background: Canvas;
+    color: CanvasText;
+  }
+
+  .help-search input:focus-visible,
+  .help-topic:focus-visible,
+  .help-list-item:focus-visible,
+  .help-semantic-search:focus-visible,
+  .help-semantic-confirm button:focus-visible,
+  .help-assistant-card button:focus-visible,
+  .help-assistant-confirm button:focus-visible,
+  .help-header > button:focus-visible {
+    outline-color: Highlight;
   }
 }
 

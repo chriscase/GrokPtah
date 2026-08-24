@@ -37,7 +37,7 @@ export const HELP_ARTICLES: HelpArticle[] = [
       "Builds are the tool-enabled workspace for repository work. Chats are separate conversations for planning or discussion. Use the Builds and Chats tabs to switch modes, and keep multiple lanes open when you need parallel work.",
     aliases: ["coding lane", "conversation", "parallel agents", "new build", "new chat"],
     keywords: ["session", "build", "chat", "lane", "workspace"],
-    sources: [{ id: "product.readme", path: "README.md", heading: "Getting started" }],
+    sources: [{ id: "product.readme", path: "README.md", heading: "Quick start" }],
   },
   {
     id: "getting-started.search",
@@ -48,7 +48,7 @@ export const HELP_ARTICLES: HelpArticle[] = [
       "Open Search from the Lanes sidebar. Hybrid search combines exact text with meaning-based ranking when the semantic index is available; Keyword mode is authoritative for commands and identifiers. Archived sessions can be included explicitly.",
     aliases: ["search history", "find conversation", "look up a build", "semantic search", "search old work"],
     keywords: ["search", "archive", "hybrid", "keyword", "semantic", "session"],
-    sources: [{ id: "product.readme", path: "README.md", heading: "Search and commands" }],
+    sources: [{ id: "product.readme", path: "README.md", heading: "Features (desktop)" }],
   },
   {
     id: "providers.gateway",
@@ -71,8 +71,8 @@ export const HELP_ARTICLES: HelpArticle[] = [
     aliases: ["real gateway", "live provider", "grok build quota", "quota receipt", "company review lane"],
     keywords: ["live", "gateway", "quota", "receipt", "tenant", "authorization", "latency"],
     sources: [
-      { id: "provider.profiles", path: "docs/PROVIDER_PROFILES.md", heading: "Gateway routing" },
-      { id: "verification.guide", path: "docs/VERIFICATION.md", heading: "Evidence and certification" },
+      { id: "provider.profiles", path: "docs/PROVIDER_PROFILES.md", heading: "Qualify a model" },
+      { id: "verification.guide", path: "docs/VERIFICATION.md", heading: "Verification paths" },
     ],
   },
   {
@@ -86,7 +86,7 @@ export const HELP_ARTICLES: HelpArticle[] = [
     keywords: ["grok", "bot", "boundary", "cursor", "claude", "external"],
     sources: [
       { id: "provider.boundaries", path: "docs/PROVIDER_PRODUCT_BOUNDARIES.md", heading: "Grok Build route" },
-      { id: "provider.profiles", path: "docs/PROVIDER_PROFILES.md", heading: "Grok Build OIDC" },
+      { id: "provider.profiles", path: "docs/PROVIDER_PROFILES.md", heading: "Provider profiles" },
     ],
   },
   {
@@ -98,7 +98,7 @@ export const HELP_ARTICLES: HelpArticle[] = [
       "A company gateway can still run a bounded, read-only code review when the route, tenant, model, and authority policy are fixed. GrokPtah should preserve useful partial findings on throttles or timeouts, never silently fall back, and show whether the evidence is a configured route, a live receipt, or only a local test.",
     aliases: ["weak gateway code review", "restricted AI policy", "long running company agent", "use the model we have", "enterprise review"],
     keywords: ["company", "restricted", "review", "read-only", "fallback", "tenant", "authority"],
-    sources: [{ id: "provider.profiles", path: "docs/PROVIDER_PROFILES.md", heading: "Restricted gateways" }],
+    sources: [{ id: "provider.profiles", path: "docs/PROVIDER_PROFILES.md", heading: "Provider profiles" }],
   },
   {
     id: "computer-use.boundaries",
@@ -110,20 +110,20 @@ export const HELP_ARTICLES: HelpArticle[] = [
     aliases: ["computer control", "clicking", "screen access", "safe automation", "mouse and keyboard"],
     keywords: ["computer", "consent", "observation", "approval", "stop", "takeover", "secure", "unsupported"],
     sources: [
-      { id: "computer-use.overview", path: "docs/COMPUTER_USE.md", heading: "Consent and boundaries" },
-      { id: "computer-use.threat-model", path: "docs/COMPUTER_USE_THREAT_MODEL.md", heading: "Threat model" },
+      { id: "computer-use.overview", path: "docs/COMPUTER_USE.md", heading: "Safety boundary" },
+      { id: "computer-use.threat-model", path: "docs/COMPUTER_USE_THREAT_MODEL.md", heading: "Trust boundaries" },
     ],
   },
   {
     id: "computer-use.isolated-guest",
     title: "Isolated guest Computer Use",
     topic: "computer-use",
-    summary: "Use a reviewed guest boundary when foreground desktop control would be disruptive or unsafe.",
+    summary: "Understand the isolated guest boundary without treating source proof as a usable VM.",
     body:
-      "An isolated guest can provide a separate visual surface for bounded Computer Use. The helper and guest image must be reviewed and signed, one agent lease controls a guest at a time, frames are redacted, and host clipboard, shares, raw global input, and guest networking remain denied unless a separately qualified policy says otherwise.",
+      "An isolated guest is a planned separate visual surface for bounded Computer Use, but it is not qualified for use in this release. The helper and guest image still need review and signing, one agent lease must control a guest at a time, frames must be redacted, and host clipboard, shares, raw global input, and guest networking remain denied. Source-level lease and projection tests do not prove a packaged VM, guest boot, rendered frames, or host input.",
     aliases: ["VM computer use", "virtual machine screen", "sandboxed desktop", "isolated visual", "guest computer", "non disruptive computer use"],
     keywords: ["guest", "VM", "isolated", "helper", "lease", "frame", "redaction", "sandbox"],
-    sources: [{ id: "computer-use.isolated-guest", path: "docs/COMPUTER_USE_ISOLATED_GUEST_BOOTSTRAP_HANDOFF.md", heading: "Guest lifecycle and lease fence" }],
+    sources: [{ id: "computer-use.isolated-guest", path: "docs/COMPUTER_USE_THREAT_MODEL.md", heading: "Release blockers still open" }],
   },
   {
     id: "computer-use.multi-agent-coordination",
@@ -134,7 +134,7 @@ export const HELP_ARTICLES: HelpArticle[] = [
       "Computer Use coordination is lease-based: an agent must hold the exact guest/session authority and revision before it can act. A second agent, stale observation, wrong session, Stop, or Take over must be denied without mutation. Separate guests or explicitly disjoint scopes are required for parallel work.",
     aliases: ["two agents one screen", "multiple agents", "agent contention", "share a computer", "coordinate computer agents", "stale visual state"],
     keywords: ["multi-agent", "coordination", "lease", "revision", "stale", "scope", "contention"],
-    sources: [{ id: "computer-use.threat-model", path: "docs/COMPUTER_USE_THREAT_MODEL.md", heading: "Concurrency and authority" }],
+    sources: [{ id: "computer-use.threat-model", path: "docs/COMPUTER_USE_THREAT_MODEL.md", heading: "Evidence matrix" }],
   },
   {
     id: "operations.evidence",
@@ -145,7 +145,7 @@ export const HELP_ARTICLES: HelpArticle[] = [
       "A passing unit test proves an in-tree behavior on a named revision. It does not prove a live provider campaign, a packaged macOS identity, a multi-day operational soak, or a VM guest. Always read the exact revision, evidence kind, remaining gate, and whether the result is candidate-only.",
     aliases: ["is this certified", "what does pass mean", "qualification", "proof", "release gate"],
     keywords: ["evidence", "test", "hardware", "live", "soak", "certified", "qualification", "release"],
-    sources: [{ id: "verification.guide", path: "docs/VERIFICATION.md", heading: "Verification discipline" }],
+    sources: [{ id: "verification.guide", path: "docs/VERIFICATION.md", heading: "Verification paths" }],
   },
   {
     id: "operations.always-on-soak",
@@ -156,7 +156,7 @@ export const HELP_ARTICLES: HelpArticle[] = [
       "The always-on soak runs the real local service process for a measured duration against a controlled loopback provider. It checks leases, restarts, reconnects, duplicate prevention, credential rotation, resource ceilings, cleanup, and secret-free evidence. A separate live-gateway campaign is required for external provider behavior.",
     aliases: ["72 hour test", "multi-day soak", "persistent workers", "durable agents", "endurance run"],
     keywords: ["soak", "always-on", "worker", "restart", "reconnect", "lease", "duplicate", "cleanup"],
-    sources: [{ id: "verification.guide", path: "docs/VERIFICATION.md", heading: "Operational evidence" }],
+    sources: [{ id: "verification.guide", path: "docs/VERIFICATION.md", heading: "Verification paths" }],
   },
   {
     id: "operations.help-assistant",
@@ -167,7 +167,7 @@ export const HELP_ARTICLES: HelpArticle[] = [
       "Help search is offline-first. Meaning-based ranking and the optional assistant are separate, explicit actions: the app shows the selected provider, sends only the selected article metadata or cited context, validates article IDs and citations, and labels generated text as a draft rather than product truth. Workspace paths, transcripts, credentials, clipboard data, and actions stay out of the request.",
     aliases: ["AI help", "ask product questions", "grounded assistant", "help chatbot", "cited answer", "safe help model"],
     keywords: ["assistant", "help", "citation", "confirmation", "privacy", "offline", "draft"],
-    sources: [{ id: "help-center.spec", path: "docs/ux-audit/HELP_CENTER_OFFLINE_SLICE_EVIDENCE.md", heading: "Grounded assistant boundary" }],
+    sources: [{ id: "verification.guide", path: "docs/VERIFICATION.md", heading: "Verification paths" }],
   },
 ];
 
