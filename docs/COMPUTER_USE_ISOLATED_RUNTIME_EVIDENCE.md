@@ -6,9 +6,9 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `c95524032269abfabc95ba57f04152aba64fc061`
-- Bundle: `/private/tmp/grokptah-cu-stage38-bounded-input-write-v1.bundle`
-- Bundle SHA-256: `7f00f8fd38cff1c4390253557657012b0e7131d5b81fcce4b27a5c808ee44ebd`
+- Head: `ad7901a5eab5078e9a64adc7b00524622322d63c`
+- Bundle: `/private/tmp/grokptah-cu-stage39-bounded-control-write-v1.bundle`
+- Bundle SHA-256: `61fc261f44405d95a2f5d8ce3f230fe0e0b71283ddf6f804cb70b90c024ffc5c`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
 Current sealed implementation head: `eb9892e1ba5606c73b66abe60067fea5ae7eafb6`.
@@ -96,6 +96,12 @@ The bounded guest-input write hardening is sealed at:
 - Commit: `c95524032269abfabc95ba57f04152aba64fc061`
 - Bundle: `/private/tmp/grokptah-cu-stage38-bounded-input-write-v1.bundle`
 - Bundle SHA-256: `7f00f8fd38cff1c4390253557657012b0e7131d5b81fcce4b27a5c808ee44ebd`
+
+The bounded helper-control write hardening is sealed at:
+
+- Commit: `ad7901a5eab5078e9a64adc7b00524622322d63c`
+- Bundle: `/private/tmp/grokptah-cu-stage39-bounded-control-write-v1.bundle`
+- Bundle SHA-256: `61fc261f44405d95a2f5d8ce3f230fe0e0b71283ddf6f804cb70b90c024ffc5c`
 
 ## What this candidate proves
 
