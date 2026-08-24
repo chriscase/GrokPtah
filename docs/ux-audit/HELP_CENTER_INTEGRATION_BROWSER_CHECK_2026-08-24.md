@@ -27,6 +27,9 @@ Candidate: `f2644f23` (`codex/help-center-integration-v1`), based directly on
 - A source audit found Grok Bot mentions only in the boundary article, its
   retrieval fixture/tests, and evidence/docs; no executable provider adapter,
   route, or quota manager references Grok Bot.
+- The security suite includes a prompt-injection-shaped article fixture and
+  verifies that the text remains cited data; the full frontend suite is now
+  46 files / 240 tests.
 - Reset the temporary viewport override and closed the preview tab/server.
 - Refreshed the lockfile so the Vite/PostCSS development toolchain resolves
   `nanoid@3.3.18` and reran the locked dependency audit. Production and full
