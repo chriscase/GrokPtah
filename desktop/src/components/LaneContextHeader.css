@@ -64,6 +64,12 @@
   color: var(--ok);
 }
 
+/* Light --ok (#2f8f57) only reaches ~3.6:1 as pill text; mix toward --text
+ * for ~6:1. Dark keeps its measured 10:1 --ok. */
+[data-theme="light"] .lane-context-header .lane-context-state.is-running {
+  color: color-mix(in srgb, var(--ok) 60%, var(--text));
+}
+
 .lane-context-header .lane-context-state.is-reconnecting {
   color: var(--state-attention);
 }
@@ -110,7 +116,7 @@
   border: 1px solid var(--border);
   border-radius: 999px;
   color: var(--muted);
-  font-size: 8px;
+  font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;

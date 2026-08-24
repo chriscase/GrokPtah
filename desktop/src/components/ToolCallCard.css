@@ -65,9 +65,12 @@
   border-color: var(--muted);
 }
 
+/* --state-attention, not --accent: identical in dark, but the light-theme
+ * accent (#b8860b) only reaches ~2.9:1 as text while the state token holds
+ * 4.5:1+ in both themes. */
 .tool-card.status-running .tool-card-status,
 .tool-card.status-pending .tool-card-status {
-  color: var(--accent);
+  color: var(--state-attention);
 }
 
 .tool-card.status-unknown .tool-card-glyph {
@@ -137,6 +140,12 @@
 .tool-card .tool-card-copy:hover {
   color: var(--text);
   background: var(--overlay-faint);
+}
+
+/* Clipboard refusal must be visible, not just announced. */
+.tool-card .tool-card-copy.is-failed {
+  color: var(--danger);
+  border-color: var(--danger);
 }
 
 /* Meta row present → the output's own border-top would double up. */

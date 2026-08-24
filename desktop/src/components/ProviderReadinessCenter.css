@@ -1,5 +1,9 @@
 /* Component-local Native Coding Readiness Center. Uses Settings tokens only. */
 
+/* The card lives in containers of very different widths (docked Settings
+ * pane ≈260px, modal ≈560px) at the same viewport, so every layout switch
+ * below is a container query on the card itself — a viewport media query
+ * cannot see the pane. */
 .provider-readiness {
   display: flex;
   flex-direction: column;
@@ -11,6 +15,7 @@
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--overlay-faint);
+  container-type: inline-size;
 }
 
 .provider-readiness-header {
@@ -87,8 +92,15 @@
   color: var(--ok);
 }
 
+/* Light --ok (#2f8f57) only reaches ~3.6:1 as text; mixing toward --text
+ * lands ~6:1 while staying green. Dark keeps its measured 10:1 --ok. */
+[data-theme="light"] .provider-readiness-banner.is-ok .provider-readiness-verdict {
+  color: color-mix(in srgb, var(--ok) 60%, var(--text));
+}
+
+/* --state-attention, not --accent: identical in dark, 4.5:1+ in light. */
 .provider-readiness-banner.is-attention .provider-readiness-verdict {
-  color: var(--accent);
+  color: var(--state-attention);
 }
 
 .provider-readiness-banner.is-danger .provider-readiness-verdict {
@@ -140,10 +152,13 @@
   color: var(--muted);
 }
 
+/* Single column is the safe default (also the fallback where container
+ * queries are unsupported); the label column appears only when the card
+ * itself is wide enough to afford it. */
 .provider-readiness-reason,
 .provider-readiness-check {
   display: grid;
-  grid-template-columns: minmax(0, 9.5rem) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 0.25rem 0.65rem;
   min-width: 0;
   padding: 0.35rem 0.45rem;
@@ -266,7 +281,7 @@
 
 .provider-readiness-dl {
   display: grid;
-  grid-template-columns: minmax(0, 9.5rem) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 0.25rem 0.65rem;
   min-width: 0;
   margin: 0;
@@ -293,14 +308,18 @@
   font-size: 11px;
 }
 
-@media (max-width: 640px) {
-  .provider-readiness {
-    padding: 0.65rem 0.6rem 0.75rem;
-  }
-
+@container (min-width: 30rem) {
   .provider-readiness-reason,
   .provider-readiness-check,
   .provider-readiness-dl {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 9.5rem) minmax(0, 1fr);
+  }
+}
+
+/* Viewport query kept only for the card's own padding — a container cannot
+ * restyle itself from its own query. */
+@media (max-width: 640px) {
+  .provider-readiness {
+    padding: 0.65rem 0.6rem 0.75rem;
   }
 }

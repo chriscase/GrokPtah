@@ -1,3 +1,6 @@
+import { readFileSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 import {
   act,
   cleanup,
@@ -132,7 +135,7 @@ describe("SessionBrowser data lifecycle", () => {
     });
     await screen.findByText("Alpha");
     expect(screen.getByText("Beta")).toBeInTheDocument();
-    expect(screen.getByText("2 Lanes")).toBeInTheDocument();
+    expect(screen.getByText("2 Lanes", { selector: ".sb-count" })).toBeInTheDocument();
     expect(screen.queryByText("Loading Lanes")).toBeNull();
   });
 
@@ -140,7 +143,7 @@ describe("SessionBrowser data lifecycle", () => {
     mockLists([]);
     renderBrowser();
     await screen.findByText("No Lanes match this view");
-    expect(screen.getByText("0 Lanes")).toBeInTheDocument();
+    expect(screen.getByText("0 Lanes", { selector: ".sb-count" })).toBeInTheDocument();
   });
 
   it("surfaces load errors with a working retry", async () => {
@@ -305,6 +308,45 @@ describe("SessionBrowser modal accessibility", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("decides Escape from the menu state at keydown, surviving the real-browser close ordering", async () => {
+    mockLists([], { folders: ["Ops"] });
+    const { onClose } = renderBrowser();
+    await screen.findByText("No Lanes match this view");
+
+    const trigger = screen.getByRole("button", { name: "Filter by folder" });
+    fireEvent.click(trigger);
+    const listbox = await screen.findByRole("listbox");
+
+    // Reproduce the audited real-browser failure (PR #360 expert review):
+    // on mouse-open, focus stays on the trigger (the option-focus attempt
+    // hits a still-hidden menu), so nothing preventDefaults Escape; then
+    // StyledSelect's document-level listener closes the menu and React
+    // flushes the removal before any window-level bubble listener runs.
+    // Emulate both conditions: focus on the trigger, and the menu becoming
+    // invisible to selectors from a document-capture listener — which fires
+    // after window-capture but before window-bubble. The browser must decide
+    // at capture, from the menu state as it was when the key went down.
+    trigger.focus();
+    const stripMenuClass = (e: KeyboardEvent) => {
+      if (e.key === "Escape") listbox.classList.remove("styled-select-menu");
+    };
+    document.addEventListener("keydown", stripMenuClass, true);
+    try {
+      fireEvent.keyDown(trigger, { key: "Escape" });
+    } finally {
+      document.removeEventListener("keydown", stripMenuClass, true);
+    }
+
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Lanes" })).toBeInTheDocument();
+
+    await waitFor(() => expect(screen.queryByRole("listbox")).toBeNull());
+    fireEvent.keyDown(document.activeElement ?? document.body, {
+      key: "Escape",
+    });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it("focuses the filter input on the / shortcut", async () => {
     mockLists([]);
     renderBrowser();
@@ -324,10 +366,10 @@ describe("SessionBrowser filters and counts", () => {
     mockLists([alpha, beta]);
     renderBrowser();
     await screen.findByText("Alpha");
-    expect(screen.getByText("2 Lanes")).toBeInTheDocument();
+    expect(screen.getByText("2 Lanes", { selector: ".sb-count" })).toBeInTheDocument();
 
     fireEvent.change(filterInput(), { target: { value: "alp" } });
-    expect(screen.getByText("1 of 2 Lanes shown")).toBeInTheDocument();
+    expect(screen.getByText("1 of 2 Lanes shown", { selector: ".sb-count" })).toBeInTheDocument();
     expect(screen.queryByText("Beta")).toBeNull();
     expect(
       screen.getByRole("button", { name: /Clear text filter/ }),
@@ -335,7 +377,7 @@ describe("SessionBrowser filters and counts", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Reset filters" }));
     expect(screen.getByText("Beta")).toBeInTheDocument();
-    expect(screen.getByText("2 Lanes")).toBeInTheDocument();
+    expect(screen.getByText("2 Lanes", { selector: ".sb-count" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Reset filters" })).toBeNull();
   });
 
@@ -347,7 +389,7 @@ describe("SessionBrowser filters and counts", () => {
     await screen.findByText("Tagged");
 
     fireEvent.click(screen.getByRole("button", { name: "Filter by tag ops" }));
-    expect(screen.getByText("1 of 2 Lanes shown")).toBeInTheDocument();
+    expect(screen.getByText("1 of 2 Lanes shown", { selector: ".sb-count" })).toBeInTheDocument();
     expect(screen.queryByText("Plain")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Clear tag filter" }));
@@ -389,6 +431,102 @@ describe("SessionBrowser filters and counts", () => {
       within(emptyCard).getByRole("button", { name: "Reset filters" }),
     );
     expect(screen.getByText("Solo")).toBeInTheDocument();
+  });
+
+  it("announces the result count only after it settles, never per keystroke", async () => {
+    const alpha = lane({ title: "Alpha" });
+    const beta = lane({ title: "Beta" });
+    mockLists([alpha, beta]);
+    renderBrowser();
+    await screen.findByText("Alpha");
+
+    // The visible count is not itself a live region (that is what flooded
+    // screen readers); announcements come from a debounced sr-only mirror.
+    const visible = screen.getByText("2 Lanes", { selector: ".sb-count" });
+    expect(visible).not.toHaveAttribute("role");
+    const region = screen.getByTestId("sb-count-announce");
+    expect(region).toHaveAttribute("role", "status");
+    await waitFor(() => expect(region).toHaveTextContent("2 Lanes"));
+
+    // Three quick keystrokes: the visible count tracks each one, the
+    // announcement region does not move until the input settles.
+    fireEvent.change(filterInput(), { target: { value: "a" } });
+    fireEvent.change(filterInput(), { target: { value: "al" } });
+    fireEvent.change(filterInput(), { target: { value: "alp" } });
+    expect(
+      screen.getByText("1 of 2 Lanes shown", { selector: ".sb-count" }),
+    ).toBeInTheDocument();
+    expect(region).toHaveTextContent("2 Lanes");
+    expect(region).not.toHaveTextContent("1 of 2 Lanes shown");
+
+    await waitFor(() =>
+      expect(region).toHaveTextContent("1 of 2 Lanes shown"),
+    );
+  });
+});
+
+describe("SessionBrowser focus continuity", () => {
+  it("moves focus to the filter input when the archived row leaves the scope", async () => {
+    const alpha = lane({ title: "Alpha" });
+    mockLists([alpha]);
+    renderBrowser();
+    await screen.findByText("Alpha");
+
+    const archive = within(rowFor("Alpha")).getByRole("button", {
+      name: "Archive",
+    });
+    archive.focus();
+    // The post-op refresh sees the Lane archived, so the row leaves the
+    // Active scope and the initiating control disappears with it.
+    apiMocks.sessionListAll.mockResolvedValue([{ ...alpha, archived: true }]);
+    fireEvent.click(archive);
+
+    await waitFor(() => expect(screen.queryByText("Alpha")).toBeNull());
+    // Focus must never land on body — the modal's Tab containment would
+    // stop seeing keystrokes. The filter input is the documented fallback.
+    expect(filterInput()).toHaveFocus();
+  });
+
+  it("returns focus to the initiating Archive control when the operation fails", async () => {
+    const alpha = lane({ title: "Alpha" });
+    mockLists([alpha]);
+    apiMocks.sessionArchive.mockRejectedValue(new Error("boom"));
+    renderBrowser();
+    await screen.findByText("Alpha");
+
+    const archive = within(rowFor("Alpha")).getByRole("button", {
+      name: "Archive",
+    });
+    archive.focus();
+    fireEvent.click(archive);
+
+    await screen.findByText("Archive failed");
+    // The row survived the failure, so the exact control gets focus back
+    // for an immediate retry.
+    await waitFor(() => expect(archive).toHaveFocus());
+  });
+
+  it("keeps focus inside the dialog after a bulk archive clears the selection", async () => {
+    const alpha = lane({ title: "Alpha" });
+    const beta = lane({ title: "Beta" });
+    mockLists([alpha, beta]);
+    renderBrowser();
+    await screen.findByText("Alpha");
+
+    fireEvent.click(screen.getByRole("button", { name: /Select visible/ }));
+    const bulk = screen.getByRole("button", { name: "Archive selected" });
+    bulk.focus();
+    apiMocks.sessionListAll.mockResolvedValue([
+      { ...alpha, archived: true },
+      { ...beta, archived: true },
+    ]);
+    fireEvent.click(bulk);
+
+    await waitFor(() => expect(screen.queryByText("Alpha")).toBeNull());
+    // The bulk control disabled itself (selection cleared), so focus falls
+    // back to the filter input rather than dropping to body.
+    expect(document.activeElement).not.toBe(document.body);
+    expect(filterInput()).toHaveFocus();
   });
 });
 
@@ -730,5 +868,25 @@ describe("SessionBrowser archived Lane boundary", () => {
       expect(apiMocks.sessionArchive).toHaveBeenCalledWith(archived.id, false);
     });
     expect(onChanged).toHaveBeenCalled();
+  });
+});
+
+describe("SessionBrowser CSS contrast contract (PR #360 audit)", () => {
+  it("gives light-theme chip, progress, and archive-pill text passing tokens", () => {
+    const root = dirname(fileURLToPath(import.meta.url));
+    const css = readFileSync(join(root, "SessionBrowser.css"), "utf8");
+    // Light --accent (#b8860b) only reaches ~3:1 as text; the light theme
+    // must swap chip and progress text to --accent-dim (4.5:1+).
+    expect(css).toMatch(
+      /\[data-theme="light"\][^{]*\.sb-chip\s*{[^}]*var\(--accent-dim\)/s,
+    );
+    expect(css).toMatch(
+      /\[data-theme="light"\][^{]*\.sb-progress\s*{[^}]*var\(--accent-dim\)/s,
+    );
+    // The archive pill overrides the shared accent text with the state
+    // token (identical in dark, passing in light).
+    expect(css).toMatch(
+      /\.sb-pill\.archive\s*{[^}]*var\(--state-attention\)/s,
+    );
   });
 });
