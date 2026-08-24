@@ -81,6 +81,8 @@ authority unless its exact **measured** capability record carries
 `grokptah.isolated-visual-computer-qualification.v1`, which may be written only after the
 credentialed packaged-runtime campaign and independent review pass. Until then, a declared or
 manually supplied visual tier does not expose isolated visual authority.
+The separate schema is preserved only in the route-bound, host-managed qualification store;
+user-editable compatible-provider profiles are normalized back to no measured visual authority.
 
 The guest starts from a read-only measured base plus an empty per-Run overlay. Stop, cancel,
 takeover, timeout, disconnect, helper failure, guest crash, app crash, or host restart performs the

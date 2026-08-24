@@ -591,6 +591,18 @@ fn is_valid_stored_profile(profile: &ProviderProfile) -> bool {
         && profile.dialect == ProviderDialect::OpenAiChatCompletions
 }
 
+/// Managed xAI qualifications may carry the ordinary semantic probe or the
+/// separate packaged-runtime visual proof. Stored compatible-provider config
+/// deliberately accepts only the ordinary schema above; a user-editable
+/// profile must never be able to self-assert isolated visual authority.
+fn is_valid_managed_computer_qualification_schema(schema: Option<&str>) -> bool {
+    matches!(
+        schema,
+        Some(COMPUTER_CAPABILITY_QUALIFICATION_SCHEMA)
+            | Some(ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA)
+    )
+}
+
 fn validate_stored_profile(profile: &ProviderProfile) -> Result<(), String> {
     if !is_valid_stored_profile(profile) {
         return Err(
@@ -725,8 +737,9 @@ fn synthesized_xai_profile(
         capabilities = measured.capabilities.clone();
         capabilities.effort_options = effort_options;
         if capabilities.computer_capability_source == CapabilitySource::Measured
-            && capabilities.computer_qualification_schema.as_deref()
-                != Some(COMPUTER_CAPABILITY_QUALIFICATION_SCHEMA)
+            && !is_valid_managed_computer_qualification_schema(
+                capabilities.computer_qualification_schema.as_deref(),
+            )
         {
             capabilities.computer_use_tier = ComputerUseTier::None;
             capabilities.computer_capability_source = CapabilitySource::Unknown;
@@ -1501,6 +1514,59 @@ mod tests {
             }
         }
 
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn managed_isolated_visual_schema_survives_host_projection() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".grokptah");
+        set_grokptah_home_override(Some(home));
+        let previous_base = std::env::var_os("XAI_API_BASE");
+
+        let (profile, mut model) = measured_managed_profile(
+            "grok-visual",
+            "https://api.x.ai/v1",
+            "managed:xai:api-key",
+            true,
+            true,
+        );
+        model.capabilities.image_input = true;
+        model.capabilities.image_media_types = vec!["image/png".into()];
+        model.capabilities.max_image_bytes = Some(1024);
+        model.capabilities.computer_use_tier = ComputerUseTier::VisualFallbackAct;
+        model.capabilities.computer_qualification_schema =
+            Some(ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA.into());
+        save_managed_profile_capabilities(&profile, &model, TEST_CREDENTIAL_FINGERPRINT).unwrap();
+
+        unsafe { std::env::set_var("XAI_API_BASE", "https://api.x.ai/v1") };
+        let projected = resolve_profile_for_selection(
+            &ModelSelection {
+                provider_id: XAI_PROVIDER_ID.into(),
+                model_id: "grok-visual".into(),
+            },
+            false,
+            Some(TEST_CREDENTIAL_FINGERPRINT),
+        )
+        .unwrap();
+        let capabilities = &projected.models[0].capabilities;
+        assert_eq!(
+            capabilities.computer_qualification_schema.as_deref(),
+            Some(ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA)
+        );
+        assert_eq!(
+            capabilities.effective_computer_use_tier(),
+            ComputerUseTier::VisualFallbackAct
+        );
+
+        unsafe {
+            if let Some(value) = previous_base {
+                std::env::set_var("XAI_API_BASE", value);
+            } else {
+                std::env::remove_var("XAI_API_BASE");
+            }
+        }
         set_grokptah_home_override(None);
     }
 
