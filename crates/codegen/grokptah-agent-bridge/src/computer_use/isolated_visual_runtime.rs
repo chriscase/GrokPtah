@@ -262,7 +262,8 @@ mod tests {
 
     #[test]
     fn runtime_requires_binding_before_channels_and_stop() {
-        let mut runtime = IsolatedVisualRuntimeSession::new(contract(), [7; 32]).unwrap();
+        let contract = contract();
+        let mut runtime = IsolatedVisualRuntimeSession::new(contract.clone(), [7; 32]).unwrap();
         assert!(runtime.start_control().is_err());
         runtime
             .accept_helper_event(IsolatedVisualHelperEvent::decode(&event(1, 0)).unwrap())
@@ -275,6 +276,50 @@ mod tests {
             .stop_control(IsolatedVisualTerminalDisposition::Cancelled)
             .is_err());
         runtime.bind_control().unwrap();
+        runtime
+            .accept_helper_event(IsolatedVisualHelperEvent::decode(&event(5, 0)).unwrap())
+            .unwrap();
+        let mut guest =
+            IsolatedVisualFrameCarrier::new_guest_with_challenge(&contract, &[7; 32]).unwrap();
+        let chunks = guest
+            .seal_frame(1, "00112233445566778899aabbccddeeff", 2, 2, &[1, 2, 3, 4])
+            .unwrap();
+        assert_eq!(
+            runtime.open_frame_chunk(&chunks[0]).unwrap().unwrap().bytes,
+            vec![1, 2, 3, 4]
+        );
+        let packet = runtime
+            .seal_input(
+                1,
+                "00112233445566778899aabbccddeeff",
+                IsolatedVisualInputMessage::PointerMove { x: 1, y: 1 },
+            )
+            .unwrap();
+        assert!(!packet.is_empty());
+        runtime
+            .stop_control(IsolatedVisualTerminalDisposition::Cancelled)
+            .unwrap();
+        runtime
+            .accept_helper_event(IsolatedVisualHelperEvent::decode(&event(3, 0)).unwrap())
+            .unwrap();
+        assert_eq!(
+            runtime.lifecycle_state(),
+            IsolatedVisualLifecycleState::CleanupPending
+        );
+        runtime.terminal_check().unwrap();
+    }
+
+    #[test]
+    fn runtime_rejects_input_before_binding() {
+        let contract = contract();
+        let mut runtime = IsolatedVisualRuntimeSession::new(contract, [7; 32]).unwrap();
+        runtime
+            .accept_helper_event(IsolatedVisualHelperEvent::decode(&event(1, 0)).unwrap())
+            .unwrap();
+        runtime.start_control().unwrap();
+        runtime
+            .accept_helper_event(IsolatedVisualHelperEvent::decode(&event(2, 0)).unwrap())
+            .unwrap();
         assert!(runtime
             .seal_input(
                 1,
