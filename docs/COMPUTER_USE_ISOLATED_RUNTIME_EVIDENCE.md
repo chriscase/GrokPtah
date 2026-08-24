@@ -6,9 +6,9 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `5a51d69a57a66ad72139402fc2a2e3fd9080b9e1`
-- Bundle: `/private/tmp/grokptah-cu-stage33-contract-docs-v1.bundle`
-- Bundle SHA-256: `3611489a7263f4901e681befed1c49d86fed40a98bd83f30fd1c63b88194f29d`
+- Head: `e733c5016f9131f01a8167afcbad5eb37973a06d`
+- Bundle: `/private/tmp/grokptah-cu-stage34-measured-descriptor-spawn-v1.bundle`
+- Bundle SHA-256: `02c99b875f45839b7fde168e9ced3079ab2670e04a0710bc2df3bbeb85727b9b`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
 Current sealed implementation head: `eb9892e1ba5606c73b66abe60067fea5ae7eafb6`.
@@ -66,6 +66,12 @@ The helper/guest contract-documentation synchronization is sealed at:
 - Commit: `5a51d69a57a66ad72139402fc2a2e3fd9080b9e1`
 - Bundle: `/private/tmp/grokptah-cu-stage33-contract-docs-v1.bundle`
 - Bundle SHA-256: `3611489a7263f4901e681befed1c49d86fed40a98bd83f30fd1c63b88194f29d`
+
+The measured-descriptor spawn hardening is sealed at:
+
+- Commit: `e733c5016f9131f01a8167afcbad5eb37973a06d`
+- Bundle: `/private/tmp/grokptah-cu-stage34-measured-descriptor-spawn-v1.bundle`
+- Bundle SHA-256: `02c99b875f45839b7fde168e9ced3079ab2670e04a0710bc2df3bbeb85727b9b`
 
 ## What this candidate proves
 
