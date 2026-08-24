@@ -141,13 +141,13 @@ complete or that the product has reached 100%.
 
 ### Latest desktop safety continuation — 2026-08-24
 
-Candidate `11c43be58c55eb6954c212b564c67c9cb986a6b7` extends the shared,
+Candidate `8d26e10c1a9c7b8c60607286ad29a158789e4164` extends the shared,
 bounded backend-error display boundary across the desktop surfaces. Credential-
 shaped values, local paths, and UI-only secret placeholders are redacted before
 errors reach search, session, run, routine, worker, settings, terminal, remote
 agent, provider-readiness, or Computer Run UI. Computer Run storage contention
 also has a clear retry path. The focused redaction tests and full desktop suite
-(52 files, 388 tests) pass; this is source/UI safety evidence only and is not a
+(52 files, 389 tests) pass; this is source/UI safety evidence only and is not a
 packaged-desktop acceptance or expert UX cadence record. Parent-provided load
 diagnostics now pass through the same boundary before technical details render,
 closing the path visible in the earlier persistent-agent capture. The visual
@@ -156,13 +156,14 @@ shell-dismiss, and Live-rail-hide controls now expose explicit accessible names
 with regression coverage. Search and modal Settings now keep Tab traversal
 inside the true modal surface, with a shared focus-trap helper and component
 regression coverage, and closing either surface returns focus to its opener.
-The full desktop suite now passes 52 files / 388 tests. The App-owned activity,
+The full desktop suite now passes 52 files / 389 tests. The App-owned activity,
 transcript, durable-work, lane-scope, remote-connection, and rate-limit error
 paths now use the same bounded sanitizer, and the selected-lane blocked alert
 has a regression for path/credential leakage. The global React error boundary
 now uses that same sanitizer before showing render diagnostics, with a regression
-for path/credential leakage there as well. This remains source/UI evidence, not
-packaged review.
+for path/credential leakage there as well. Durable Run timeline error and rate-
+limit events now use the same bounded display path, with a timeline regression.
+This remains source/UI evidence, not packaged review.
 
 ## Verification recorded
 
