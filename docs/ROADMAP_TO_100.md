@@ -548,12 +548,17 @@ and emits the v2 secret-free evidence record only after a clean-head 72-hour
 run. That harness is formatted but uncompiled and unexecuted; it is not a
 retained campaign. Unbound remote bearers remain coordinator-scoped.
 
-The packaged lease-fence follow-up is now running as an external, fail-closed
-source qualification from immutable bundle
+The packaged lease-fence follow-up returned a **PASS for source lease-fence
+checks only** from exact candidate
+`b250b7096c6131721864b39f4cc5fdce5e3ada15`; the secret-free report is
+[`COMPUTER_USE_PACKAGED_LEASE_B250B70_SOURCE_REPORT.md`](evidence/COMPUTER_USE_PACKAGED_LEASE_B250B70_SOURCE_REPORT.md).
+The currently pinned external procedure still uses immutable bundle
 `/private/tmp/grokptah-packaged-lease-b250b70-v2.bundle`
 (SHA-256 `4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`).
-No packaged VM, guest boot, rendered-frame, host-input, signing, or soak claim
-may be inferred until that report and the later hardware campaign return.
+Because the returned report names a different input-bundle digest, identity
+reconciliation remains required. No packaged VM, guest boot, rendered-frame,
+host-input, signing, or soak claim may be inferred; the later v15 hardware
+campaign remains the next Stage 9/#288 gate.
 The subsequent source-only stop-failure correction is frozen separately at
 `40730e4` with its own bundle and handoff; it must not be conflated with the
 active `b250b70` result.
@@ -958,7 +963,7 @@ live frozen-route, read-only, multi-hour enterprise
 review-lane certification exists. This row is **not** certified.
 
 The executable external procedure is
-[`ENTERPRISE_REVIEW_V1_HANDOFF.md`](ENTERPRISE_REVIEW_V1_HANDOFF.md). It pins
+[`ENTERPRISE_REVIEW_V2_HANDOFF.md`](ENTERPRISE_REVIEW_V2_HANDOFF.md). It pins
 the candidate source, cache/target ownership, broker lease boundary, held-out
 24-case paired campaign, denial matrix, quality thresholds, secret-free
 evidence, cleanup, and independent-review requirements. It is deliberately a

@@ -191,8 +191,14 @@ The exact external compile/test procedure is recorded in
 [`COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md);
 the external run is using immutable bundle
 `/private/tmp/grokptah-packaged-lease-b250b70-v2.bundle` (SHA-256
-`4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`). No
-result for that follow-up has been returned yet.
+`4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`). A
+source-level PASS has now been returned for exact candidate
+`b250b7096c6131721864b39f4cc5fdce5e3ada15`; the secret-free report is
+[`COMPUTER_USE_PACKAGED_LEASE_B250B70_SOURCE_REPORT.md`](evidence/COMPUTER_USE_PACKAGED_LEASE_B250B70_SOURCE_REPORT.md).
+The report names a different input-bundle digest, so bundle identity
+reconciliation remains open. No packaged VM, guest boot, rendered-frame,
+host-input, signing, or soak claim may be inferred; the later v15 hardware
+campaign remains queued.
 
 The next source-only correction (`40730e4`) makes terminal stop failure
 fail-closed for ownership as well: the lease is revoked even when bounded

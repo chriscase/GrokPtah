@@ -53,8 +53,12 @@ reproducible external compile/test procedure is
 [`COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md);
 the active external run is pinned to immutable bundle
 `/private/tmp/grokptah-packaged-lease-b250b70-v2.bundle` (SHA-256
-`4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`). No
-result is recorded yet.
+`4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`). A
+source-level PASS has now been returned for exact candidate
+`b250b7096c6131721864b39f4cc5fdce5e3ada15`; see the secret-free
+[`COMPUTER_USE_PACKAGED_LEASE_B250B70_SOURCE_REPORT.md`](evidence/COMPUTER_USE_PACKAGED_LEASE_B250B70_SOURCE_REPORT.md).
+The report names a different input-bundle digest than the pinned handoff, so
+bundle identity reconciliation and the packaged campaign remain open.
 
 Candidate follow-up `40730e4` additionally revokes packaged-guest ownership
 after any terminal stop/reap result, including bounded reap failure, and
@@ -89,7 +93,9 @@ failure head. Its immutable bundle and source-only procedure are recorded in
 No external service-process, lab, or soak result has been recorded for that
 candidate; the Always-On row remains Planned and uncertified.
 
-The recurring expert review process is documented in
+The current enterprise review campaign is pinned in
+[`ENTERPRISE_REVIEW_V2_HANDOFF.md`](ENTERPRISE_REVIEW_V2_HANDOFF.md); it is
+queued and not live-certified. The recurring expert review process is documented in
 [`UI_REVIEW_CADENCE.md`](UI_REVIEW_CADENCE.md); no dated packaged review is
 claimed by that process document.
 

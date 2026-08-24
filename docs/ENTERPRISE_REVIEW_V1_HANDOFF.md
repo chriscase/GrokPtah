@@ -1,4 +1,8 @@
-# Enterprise gateway review lane — external certification handoff
+# Enterprise gateway review lane — superseded external certification handoff
+
+> **Superseded.** Do not launch this older source cutoff. Use
+> [ENTERPRISE_REVIEW_V2_HANDOFF.md](ENTERPRISE_REVIEW_V2_HANDOFF.md), which
+> pins the current candidate and bundle.
 
 Status: **certification procedure only; this document makes no live quality or
 enterprise-lane claim.** A report that omits a required gate is a failed or
