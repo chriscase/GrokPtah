@@ -6,12 +6,12 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `6a21788c6baf17abc0c76dc67165e7b4b8a14bdf`
-- Bundle: `/private/tmp/grokptah-cu-stage24-packaged-supervisor-v1.bundle`
-- Bundle SHA-256: `f81f08c9e74e98f131c65d1fcdb38d43f9c38cf241ed2325405d0405f1aad7c6`
+- Head: `63363b4603c3b971424716820ba568610f7e5f4a`
+- Bundle: `/private/tmp/grokptah-cu-stage25-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `a199ba07fe1211a7d7a4f4ea14c987416250c4dd18d0ff7faf31ae58c9e64ad6`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current sealed implementation head: `6a21788c6baf17abc0c76dc67165e7b4b8a14bdf`.
+Current sealed implementation head: `63363b4603c3b971424716820ba568610f7e5f4a`.
 
 The later guest-input validation extension is sealed at:
 
@@ -57,9 +57,9 @@ The private guest-challenge channel extension is sealed at:
 
 The bounded packaged-supervisor source extension is sealed at:
 
-- Commit: `6a21788c6baf17abc0c76dc67165e7b4b8a14bdf`
-- Bundle: `/private/tmp/grokptah-cu-stage24-packaged-supervisor-v1.bundle`
-- Bundle SHA-256: `f81f08c9e74e98f131c65d1fcdb38d43f9c38cf241ed2325405d0405f1aad7c6`
+- Commit: `63363b4603c3b971424716820ba568610f7e5f4a`
+- Bundle: `/private/tmp/grokptah-cu-stage25-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `a199ba07fe1211a7d7a4f4ea14c987416250c4dd18d0ff7faf31ae58c9e64ad6`
 
 ## What this candidate proves
 
@@ -144,7 +144,8 @@ The changed Rust files were rustfmt-clean. The guest verifier reported its
 protocol self-test and closed-source checks passing. The helper verifier linked
 an arm64 Mach-O against `Virtualization.framework` and passed its
 entitlement/configuration/source checks, including a native-shim object link and
-the exported spawn/free symbols.
+the exported spawn/free symbols. Its invalid-start smoke now supplies a separate
+bounded regular guest descriptor rather than reusing the configuration file.
 The repository-wide formatter still reports pre-existing unrelated whitespace
 in the xai-grok-pager crate; that code was not modified by this candidate.
 
