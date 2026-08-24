@@ -203,4 +203,23 @@ describe("PermissionModal (#141)", () => {
       screen.getByTestId("permission-deny-history-item").textContent,
     ).toMatch(/run_terminal_cmd/);
   });
+
+  it("traps Tab inside the consent dialog and focuses the primary action", () => {
+    render(
+      <PermissionModal
+        request={makeReq("r-focus", "sess-1")}
+        onRespond={vi.fn()}
+      />,
+    );
+    const allow = screen.getByTestId("permission-allow");
+    const deny = screen.getByTestId("permission-deny");
+    expect(document.activeElement).toBe(allow);
+
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(document.activeElement).toBe(deny);
+    deny.focus();
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(allow);
+    expect(screen.getByTestId("permission-modal").contains(document.activeElement)).toBe(true);
+  });
 });

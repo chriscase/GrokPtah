@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import type { PermissionRequest } from "../lib/protocol";
 import {
   sessionIdForPermission,
@@ -5,6 +6,16 @@ import {
 } from "../lib/permissionQueue";
 import type { DenyHistoryEntry } from "../lib/denyHistory";
 import { LaneScopeLine, type LaneScope } from "./LaneScopeLine";
+
+const FOCUSABLE_SELECTOR =
+  'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
+
+function focusableIn(root: HTMLElement | null): HTMLElement[] {
+  if (!root) return [];
+  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+    (element) => !element.closest("[inert]"),
+  );
+}
 
 export type PermissionModalProps = {
   request: PermissionRequest;
@@ -39,6 +50,7 @@ export function PermissionModal({
   denyHistory = [],
   scope,
 }: PermissionModalProps) {
+  const dialogRef = useRef<HTMLDivElement>(null);
   const sessionId = sessionIdForPermission(request, fallbackSessionId);
   const detail =
     typeof request.detail === "object" && request.detail !== null
@@ -53,6 +65,38 @@ export function PermissionModal({
     await onRespond(request.id, decision, sessionId);
   }
 
+  useEffect(() => {
+    const root = dialogRef.current;
+    const focusTarget = root?.querySelector<HTMLElement>(
+      "button.primary, button:not([disabled])",
+    );
+    focusTarget?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        focusTarget?.focus();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = focusableIn(root);
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        event.stopPropagation();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        event.stopPropagation();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [request.id]);
+
   return (
     <div
       className="modal-backdrop"
@@ -60,6 +104,7 @@ export function PermissionModal({
       data-testid="permission-modal-backdrop"
     >
       <div
+        ref={dialogRef}
         className="modal permission-modal"
         role="dialog"
         aria-modal="true"

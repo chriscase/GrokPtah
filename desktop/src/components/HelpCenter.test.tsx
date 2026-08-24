@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HelpCenter } from "./HelpCenter";
+import { PermissionModal } from "./PermissionModal";
 
 afterEach(cleanup);
 
@@ -312,5 +313,59 @@ describe("HelpCenter", () => {
     expect(screen.getByTestId("app-background")).toHaveAttribute("inert");
     expect(screen.getByTestId("consent-layer")).not.toHaveAttribute("inert");
     expect(screen.getByTestId("consent-layer")).not.toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("yields Tab, Escape, and AT to a mounted permission consent layer", async () => {
+    const onClose = vi.fn();
+    const request = {
+      id: "req-consent",
+      session_id: "session-background-aaaa",
+      tool_name: "run_terminal_cmd",
+      summary: "Allow this tool?",
+      detail: { session_id: "session-background-aaaa" },
+    };
+    const { rerender } = render(
+      <div className="app-shell">
+        <main data-testid="app-background">Active coding lane</main>
+        <PermissionModal request={request} onRespond={vi.fn()} />
+        <HelpCenter open onClose={onClose} onAskAssistant={vi.fn()} />
+      </div>,
+    );
+
+    const help = await waitFor(() => {
+      const dialog = screen.getByRole("dialog", { name: "Help Center", hidden: true });
+      expect(dialog).toHaveAttribute("inert");
+      return dialog;
+    });
+    expect(help).toHaveAttribute("aria-hidden", "true");
+    expect(help).toHaveAttribute("aria-modal", "false");
+    expect(screen.getByTestId("app-background")).toHaveAttribute("inert");
+
+    const allow = screen.getByTestId("permission-allow");
+    const deny = screen.getByTestId("permission-deny");
+    expect(document.activeElement).toBe(allow);
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByTestId("permission-modal")).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(document.activeElement).toBe(deny);
+    expect(help.contains(document.activeElement)).toBe(false);
+
+    deny.focus();
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(allow);
+
+    rerender(
+      <div className="app-shell">
+        <main data-testid="app-background">Active coding lane</main>
+        <HelpCenter open onClose={onClose} onAskAssistant={vi.fn()} />
+      </div>,
+    );
+    await waitFor(() => {
+      expect(screen.getByRole("dialog", { name: "Help Center" })).not.toHaveAttribute("inert");
+    });
+    expect(onClose).not.toHaveBeenCalled();
   });
 });

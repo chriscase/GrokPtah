@@ -6,6 +6,7 @@ import {
   createPromptQueueEntry,
   drainPromptQueuePrefix,
   emptyPromptQueueState,
+  interceptHelpCommand,
   promptQueueReducer,
   queueEntriesFor,
   type PromptQueueState,
@@ -276,6 +277,71 @@ describe("prompt queue drain", () => {
 
   it("returns null for an empty queue", () => {
     expect(drainPromptQueuePrefix([])).toBeNull();
+  });
+});
+
+describe("queued /help intercept", () => {
+  it("releases drain capacity without re-queuing or duplicating the help action", () => {
+    expect(interceptHelpCommand({ prompt: "/compact", fromQueue: true })).toEqual({
+      handled: false,
+      openHelp: false,
+      releaseReservationWithoutRestore: false,
+    });
+    expect(interceptHelpCommand({ prompt: "/help" })).toEqual({
+      handled: true,
+      openHelp: true,
+      releaseReservationWithoutRestore: false,
+    });
+
+    const intercept = interceptHelpCommand({
+      prompt: "/help",
+      fromQueue: true,
+      reservation: "queue-drain:1",
+    });
+    expect(intercept).toEqual({
+      handled: true,
+      openHelp: true,
+      releaseReservationWithoutRestore: true,
+    });
+
+    const queue: {
+      entries: string[];
+      reservation: string | null;
+      prompts: string[];
+      helpOpens: number;
+    } = {
+      entries: [],
+      reservation: "queue-drain:1",
+      prompts: [],
+      helpOpens: 0,
+    };
+    const apply = (prompt: string, fromQueue: boolean, reservation: string | null) => {
+      const plan = interceptHelpCommand({ prompt, fromQueue, reservation });
+      if (!plan.handled) {
+        queue.prompts.push(prompt);
+        queue.reservation = null;
+        return;
+      }
+      queue.helpOpens += 1;
+      if (plan.releaseReservationWithoutRestore) {
+        queue.reservation = null;
+      }
+    };
+
+    apply("/help", true, "queue-drain:1");
+    expect(queue.entries).toEqual([]);
+    expect(queue.reservation).toBeNull();
+    expect(queue.prompts).toEqual([]);
+    expect(queue.helpOpens).toBe(1);
+
+    queue.entries = ["do the work"];
+    const next = queue.entries.shift()!;
+    queue.reservation = "queue-drain:2";
+    apply(next, true, queue.reservation);
+    expect(queue.entries).toEqual([]);
+    expect(queue.prompts).toEqual(["do the work"]);
+    expect(queue.helpOpens).toBe(1);
+    expect(queue.reservation).toBeNull();
   });
 });
 

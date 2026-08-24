@@ -7,9 +7,11 @@ import {
   HELP_INDEX,
   parseHelpAssistantAnswer,
   parseHelpSemanticAnswer,
+  runHelpProviderTurn,
   searchHelp,
   validateHelpAssistantAnswer,
   validateHelpSemanticAnswer,
+  type HelpLaneChrome,
 } from "./helpCenter";
 import { HELP_RETRIEVAL_FIXTURES } from "./helpCenter.fixtures";
 
@@ -207,5 +209,45 @@ describe("offline Help Center corpus", () => {
     expect(request.candidates).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ articleId: "providers.gateway" })]),
     );
+  });
+
+  it("restores the active Lane and open tabs after a helper chat turn", async () => {
+    const original: HelpLaneChrome = { tabIds: ["lane-a", "lane-b"], activeId: "lane-a" };
+    let chrome: HelpLaneChrome = {
+      tabIds: [...original.tabIds],
+      activeId: original.activeId,
+    };
+    const prompted: string[] = [];
+    const host = {
+      snapshot: () => ({ tabIds: [...chrome.tabIds], activeId: chrome.activeId }),
+      restore: async (next: HelpLaneChrome) => {
+        chrome = { tabIds: [...next.tabIds], activeId: next.activeId };
+      },
+      createEphemeralChat: async () => {
+        chrome = { tabIds: [...chrome.tabIds, "helper"], activeId: "helper" };
+        return { id: "helper" };
+      },
+      prompt: async (sessionId: string, text: string) => {
+        chrome = { ...chrome, activeId: sessionId };
+        prompted.push(text);
+        return JSON.stringify({
+          text: "Use the cited article.",
+          citations: ["product.readme"],
+          uncertainty: "Not certification.",
+        });
+      },
+      deleteSession: async (sessionId: string) => {
+        chrome = {
+          tabIds: chrome.tabIds.filter((id) => id !== sessionId),
+          activeId: chrome.activeId === sessionId ? null : chrome.activeId,
+        };
+      },
+    };
+
+    const answer = await runHelpProviderTurn(host, "bounded help prompt", parseHelpAssistantAnswer);
+    expect(answer.citations).toEqual(["product.readme"]);
+    expect(prompted).toEqual(["bounded help prompt"]);
+    expect(chrome).toEqual(original);
+    expect(chrome.tabIds).not.toContain("helper");
   });
 });

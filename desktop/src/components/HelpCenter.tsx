@@ -57,6 +57,10 @@ function focusableIn(root: HTMLElement | null): HTMLElement[] {
   );
 }
 
+function consentLayerPresent(): boolean {
+  return Boolean(document.querySelector('[data-modal-layer="consent"]'));
+}
+
 export function HelpCenter({
   open,
   onClose,
@@ -70,6 +74,7 @@ export function HelpCenter({
   const [assistant, setAssistant] = useState<AssistantState>({ status: "idle" });
   const [semantic, setSemantic] = useState<SemanticState>({ status: "idle" });
   const [confirmStack, setConfirmStack] = useState<ConfirmKind[]>([]);
+  const [consentPresent, setConsentPresent] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
   const surfaceRef = useRef<HTMLDivElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
@@ -137,8 +142,11 @@ export function HelpCenter({
     prevTopConfirmRef.current = null;
     layerReturnFocusRef.current = {};
     const focusTarget = dialogRef.current?.querySelector<HTMLElement>("#help-search-input");
-    focusTarget?.focus();
+    if (!consentLayerPresent()) {
+      focusTarget?.focus();
+    }
     const onKey = (event: KeyboardEvent) => {
+      if (consentLayerPresent()) return;
       if (event.key === "Escape") {
         event.preventDefault();
         const top = topConfirmRef.current;
@@ -181,6 +189,7 @@ export function HelpCenter({
       prevTopConfirmRef.current = null;
       return;
     }
+    if (consentLayerPresent()) return;
     const previous = prevTopConfirmRef.current;
     prevTopConfirmRef.current = topConfirm;
     if (topConfirm) {
@@ -193,7 +202,29 @@ export function HelpCenter({
     if (previous) {
       layerReturnFocusRef.current[previous]?.focus();
     }
-  }, [open, topConfirm]);
+  }, [open, topConfirm, consentPresent]);
+
+  const helpFocusBeforeConsentRef = useRef<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (!open) {
+      helpFocusBeforeConsentRef.current = null;
+      return;
+    }
+    if (consentPresent) {
+      if (
+        dialogRef.current?.contains(document.activeElement) &&
+        document.activeElement instanceof HTMLElement
+      ) {
+        helpFocusBeforeConsentRef.current = document.activeElement;
+      }
+      return;
+    }
+    const restore =
+      helpFocusBeforeConsentRef.current ??
+      dialogRef.current?.querySelector<HTMLElement>("#help-search-input");
+    helpFocusBeforeConsentRef.current = null;
+    restore?.focus();
+  }, [open, consentPresent]);
 
   useEffect(() => {
     if (!open || !dialogRef.current) return;
@@ -222,6 +253,23 @@ export function HelpCenter({
         else element.setAttribute("aria-hidden", ariaHidden);
       });
     };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) {
+      setConsentPresent(false);
+      return;
+    }
+    const read = () => setConsentPresent(consentLayerPresent());
+    read();
+    const observer = new MutationObserver(read);
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["data-modal-layer"],
+    });
+    return () => observer.disconnect();
   }, [open]);
 
   useEffect(() => {
@@ -350,9 +398,11 @@ export function HelpCenter({
       className="help-center"
       data-modal-layer="help"
       role="dialog"
-      aria-modal="true"
+      aria-modal={consentPresent ? false : true}
+      aria-hidden={consentPresent ? true : undefined}
       aria-labelledby="help-center-title"
       aria-describedby="help-center-subtitle"
+      {...(consentPresent ? { inert: "" } : {})}
     >
       <div
         className="help-surface"

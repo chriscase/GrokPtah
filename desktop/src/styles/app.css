@@ -2510,7 +2510,7 @@ button:disabled {
 }
 
 .help-assistant-answer strong {
-  color: var(--accent);
+  color: var(--accent-label);
 }
 
 .help-empty {
@@ -6388,6 +6388,11 @@ button:disabled {
 .sidebar-action-ghost:hover {
   color: var(--text);
   border-color: var(--border);
+}
+
+.sidebar-help-opener {
+  min-width: 44px;
+  min-height: 44px;
 }
 
 /* ── Multi-zone docks (Phase 14.1) ── */

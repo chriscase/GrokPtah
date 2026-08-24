@@ -25,15 +25,20 @@ describe("slash commands (#148)", () => {
 
   it("opens Help locally for exact /help, including queued sends", () => {
     const app = readFileSync(join(root, "..", "App.tsx"), "utf8");
-    expect(app).toMatch(/if \(prompt === ["']\/help["']\) \{/);
     expect(app).not.toMatch(/!opts\?\.fromQueue && prompt === ["']\/help["']/);
-    const helpIdx = app.search(/if \(prompt === ["']\/help["']\) \{/);
+    const sendPromptIdx = app.search(/async function sendPrompt\(/);
+    const helpIdx = app.search(/const helpIntercept = interceptHelpCommand/);
     const queueIdx = app.search(/tabBusy && !opts\?\.fromQueue/);
     const promptIdx = app.search(/api\.sessionPrompt\(id, prompt/);
-    expect(helpIdx).toBeGreaterThan(-1);
+    expect(helpIdx).toBeGreaterThan(sendPromptIdx);
     expect(helpIdx).toBeLessThan(queueIdx);
     expect(helpIdx).toBeLessThan(promptIdx);
-    expect(app).toMatch(/setHelpOpen\(true\)/);
+    const interceptBlock = app.slice(helpIdx, queueIdx);
+    expect(interceptBlock).toMatch(/setHelpOpen\(true\)/);
+    expect(interceptBlock).toMatch(/releaseReservationWithoutRestore/);
+    expect(interceptBlock).toMatch(/sessionQueueRestoreDrain\(/);
+    expect(interceptBlock).toMatch(/\[\s*\]/);
+    expect(interceptBlock).not.toMatch(/api\.sessionPrompt/);
   });
 });
 

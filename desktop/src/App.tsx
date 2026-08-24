@@ -36,7 +36,9 @@ import { HelpCenter } from "./components/HelpCenter";
 import {
   parseHelpAssistantAnswer,
   parseHelpSemanticAnswer,
+  runHelpProviderTurn,
   type HelpAssistantRequest,
+  type HelpLaneChrome,
   type HelpSemanticRequest,
 } from "./lib/helpCenter";
 import { SessionBrowser } from "./components/SessionBrowser";
@@ -110,9 +112,10 @@ import {
   queuedActivity,
   type ActivityState,
 } from "./lib/activity";
-import type {
-  PromptQueueEntry,
-  PromptQueueSnapshot,
+import {
+  interceptHelpCommand,
+  type PromptQueueEntry,
+  type PromptQueueSnapshot,
 } from "./lib/promptQueue";
 import { useComposerQueue } from "./lib/useComposerQueue";
 import { findTabOfKind, kindForTab } from "./lib/sessionTab";
@@ -409,6 +412,7 @@ export default function App() {
   const [sessionBrowserOpen, setSessionBrowserOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const helpLaneChromeRef = useRef<HelpLaneChrome>({ tabIds: [], activeId: null });
   /**
    * Ordered dock slots (session ids visible as columns). Phase 14.1 multi-zone.
    * Empty or single-element = classic single-pane; up to maxDocks columns.
@@ -1164,8 +1168,16 @@ export default function App() {
     .filter((value): value is string => Boolean(value))
     .filter((value, index, values) => values.indexOf(value) === index)
     .join(" · ") || "selected provider";
+  helpLaneChromeRef.current = {
+    tabIds: tabs.map((tab) => tab.id),
+    activeId: activeSessionId,
+  };
+  const restoreHelpLaneChrome = useCallback(async (chrome: HelpLaneChrome) => {
+    await api.setOpenTabs(chrome.tabIds, chrome.activeId);
+    if (!chrome.activeId) return;
+    await api.sessionLoad(chrome.activeId).catch(() => undefined);
+  }, []);
   const askHelpAssistant = useCallback(async (request: HelpAssistantRequest) => {
-    const session = await api.sessionNewKind("chat");
     const prompt = [
       "You are the optional GrokPtah product-help assistant.",
       request.instruction,
@@ -1177,15 +1189,22 @@ export default function App() {
       `Question: ${request.query}`,
       `Cited context:\n${request.citedContext}`,
     ].join("\n\n");
-    try {
-      const reply = await api.sessionPrompt(session.id, prompt);
-      return parseHelpAssistantAnswer(reply);
-    } finally {
-      await api.sessionDelete(session.id).catch(() => undefined);
-    }
-  }, [assistantProviderLabel]);
+    return runHelpProviderTurn(
+      {
+        snapshot: () => ({
+          tabIds: [...helpLaneChromeRef.current.tabIds],
+          activeId: helpLaneChromeRef.current.activeId,
+        }),
+        restore: restoreHelpLaneChrome,
+        createEphemeralChat: () => api.sessionNewKind("chat"),
+        prompt: (sessionId, text) => api.sessionPrompt(sessionId, text),
+        deleteSession: (sessionId) => api.sessionDelete(sessionId),
+      },
+      prompt,
+      parseHelpAssistantAnswer,
+    );
+  }, [assistantProviderLabel, restoreHelpLaneChrome]);
   const searchHelpSemantically = useCallback(async (request: HelpSemanticRequest) => {
-    const session = await api.sessionNewKind("chat");
     const prompt = [
       "You are the optional GrokPtah Help Center semantic retriever.",
       request.instruction,
@@ -1197,13 +1216,21 @@ export default function App() {
       `Query: ${request.query}`,
       `Candidate article metadata:\n${JSON.stringify(request.candidates)}`,
     ].join("\n\n");
-    try {
-      const reply = await api.sessionPrompt(session.id, prompt);
-      return parseHelpSemanticAnswer(reply);
-    } finally {
-      await api.sessionDelete(session.id).catch(() => undefined);
-    }
-  }, [assistantProviderLabel]);
+    return runHelpProviderTurn(
+      {
+        snapshot: () => ({
+          tabIds: [...helpLaneChromeRef.current.tabIds],
+          activeId: helpLaneChromeRef.current.activeId,
+        }),
+        restore: restoreHelpLaneChrome,
+        createEphemeralChat: () => api.sessionNewKind("chat"),
+        prompt: (sessionId, text) => api.sessionPrompt(sessionId, text),
+        deleteSession: (sessionId) => api.sessionDelete(sessionId),
+      },
+      prompt,
+      parseHelpSemanticAnswer,
+    );
+  }, [assistantProviderLabel, restoreHelpLaneChrome]);
   const activeTabKind = kindForTab(activeTab, sessions, workspaceMode);
   const activeIsBuild = activeTabKind === "build";
   const activeCwd = activeLane?.cwd || activeSummary?.cwd || activeTab?.cwd;
@@ -2367,11 +2394,33 @@ export default function App() {
   ) {
     const prompt = (text ?? composer).trim();
     if (!prompt) return;
-    if (prompt === "/help") {
+    const helpIntercept = interceptHelpCommand({
+      prompt,
+      fromQueue: opts?.fromQueue,
+      reservation: opts?.reservation,
+    });
+    if (helpIntercept.handled) {
       if (text === undefined) {
         clearComposerFor(activeSessionId);
       }
-      setHelpOpen(true);
+      if (helpIntercept.openHelp) {
+        setHelpOpen(true);
+      }
+      if (helpIntercept.releaseReservationWithoutRestore) {
+        const sessionId = opts?.sessionId ?? activeSessionId;
+        if (sessionId) {
+          try {
+            const entries = await api.sessionQueueRestoreDrain(
+              sessionId,
+              opts?.reservation ?? null,
+              [],
+            );
+            dispatchQueue({ type: "replace", sessionId, entries });
+          } catch {
+            // Best-effort slot release; never re-queue /help or send it.
+          }
+        }
+      }
       return;
     }
     const targetSessionId = opts?.sessionId ?? activeSessionId;
@@ -3209,7 +3258,7 @@ export default function App() {
             </button>
             <button
               type="button"
-              className="sidebar-action-ghost"
+              className="sidebar-action-ghost sidebar-help-opener"
               onClick={() => setHelpOpen(true)}
               title="Open Help Center"
             >
