@@ -52,12 +52,21 @@ admission and recovery path.
   (`retryFailed` for failed/limit, `retryExpired` for interrupted/expired) and
   `attempt_count < maxAttempts`.
 
-`ManagedExecutionPolicy.allows_auto_retry` is the single predicate for
-**native auto-admission**. `retryEligible: false` does not rewrite a Work
-item that an operator reopened with `ptah_retry_work`: that item stays
-`queued` and claimable by an external/manual worker. The native supervisor
-skips it without mutating it and without creating another Run. The original
-failed native attempt remains inspectable.
+`ManagedExecutionPolicy.allows_auto_retry` supplies the managed-policy half of
+**native auto-admission**. The durable provider-attempt ledger is a second,
+mandatory fence: native retry is permitted only when every provider attempt
+for the Run is `SameRunSafe` (`KnownNotSent`). A `KnownAccepted` or
+`UncertainAccept` send, an admitted-but-unresolved provider row, an incomplete
+attempt page, or a missing Run binding fails closed. This prevents a generic
+managed retry flag from replaying request bytes that the gateway may already
+have accepted. An operator's explicit `ptah_retry_work` remains a deliberate
+new-Run decision; it is not an automatic replay.
+
+`retryEligible: false` does not rewrite a Work item that an operator reopened
+with `ptah_retry_work`: that item stays `queued` and claimable by an
+external/manual worker. The native supervisor skips it without mutating it and
+without creating another Run. The original failed native attempt remains
+inspectable.
 
 ## Dispatcher ownership
 
@@ -136,8 +145,9 @@ live. The executor:
 
 1. Does **not** resume the interrupted model invocation
 2. Closes the old intent (`finalized`) and the Work attempt (`expired`)
-3. Applies **both** `retryEligible` and Work retry (`retryExpired`)
-4. Creates a new attempt and finite Run only when both permit
+3. Applies **both** `retryEligible` and Work retry (`retryExpired`), plus the
+   provider-attempt retry fence
+4. Creates a new attempt and finite Run only when all three permit
 5. Otherwise leaves Work `failed` with an inspectable result
 
 The same close path is used for failed/limit Runs (`retryFailed`) and for
@@ -205,8 +215,9 @@ Crash recovery:
 - terminal Run → complete/fail/cancel the Work attempt and finalize the intent
 
 Late completion after lease expiry is rejected. Retry creates a new attempt
-and a new Run only when policy allows. Native admission never loops a
-forbidden retry: queued Work with `attempt_count >= 1` and
+and a new Run only when policy and the provider-attempt fence allow it. Native
+admission never loops a forbidden retry: queued Work with
+`attempt_count >= 1` and
 `retryEligible = false` is skipped, not sealed, so a manual `ptah_retry_work`
 remains claimable by an external worker.
 
