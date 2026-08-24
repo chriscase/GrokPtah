@@ -919,6 +919,14 @@ sandbox is broader. **No**
 live frozen-route, read-only, multi-hour enterprise
 review-lane certification exists. This row is **not** certified.
 
+The executable external procedure is
+[`ENTERPRISE_REVIEW_V1_HANDOFF.md`](ENTERPRISE_REVIEW_V1_HANDOFF.md). It pins
+the candidate source, cache/target ownership, broker lease boundary, held-out
+24-case paired campaign, denial matrix, quality thresholds, secret-free
+evidence, cleanup, and independent-review requirements. It is deliberately a
+handoff and does not upgrade this row until a real named gateway campaign
+passes.
+
 **Exit (all required):**
 
 - A user restricted to a **company-approved OpenAI-compatible gateway**,
