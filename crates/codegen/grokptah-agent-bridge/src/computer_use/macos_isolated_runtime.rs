@@ -122,6 +122,13 @@ pub struct IsolatedVisualPackagedRuntime {
 impl IsolatedVisualPackagedRuntime {
     pub fn launch(contract: IsolatedVisualLaunchContract) -> ComputerResult<Self> {
         contract.validate()?;
+        // Hold the exact read-only package handles through the native launch
+        // call. This binds the caller's manifest to measured artifact bytes
+        // and the helper's designated requirement before any child process is
+        // created; native launch then repeats its path/signature identity
+        // checks immediately before spawn.
+        let _verified_artifacts =
+            super::macos_isolated_artifacts::open_packaged_runtime_artifacts(&contract.manifest)?;
         // SAFETY: the native shim returns either an error buffer or ownership
         // of five distinct descriptors and one child PID. The paired free
         // function releases only the error buffer.
