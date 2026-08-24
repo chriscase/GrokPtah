@@ -16,6 +16,7 @@ mod coordination;
 mod isolated_visual;
 mod isolated_visual_artifacts;
 mod isolated_visual_channel;
+mod isolated_visual_driver;
 mod isolated_visual_frames;
 mod isolated_visual_helper;
 mod isolated_visual_helper_control;
@@ -57,6 +58,7 @@ pub use isolated_visual_channel::{
     ISOLATED_VISUAL_BINDING_MAGIC, ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES,
     ISOLATED_VISUAL_BINDING_TAG_BYTES, ISOLATED_VISUAL_BINDING_VERSION,
 };
+pub use isolated_visual_driver::IsolatedVisualRuntimeDriver;
 pub use isolated_visual_frames::{
     IsolatedVisualFrame, IsolatedVisualFrameCarrier, IsolatedVisualFrameChunk,
     ISOLATED_VISUAL_FRAME_CHUNK_BYTES, ISOLATED_VISUAL_FRAME_HEADER_BYTES,

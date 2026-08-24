@@ -22,6 +22,16 @@ const NATIVE_UNAUTHORIZED: i32 = 13;
 const MAX_NATIVE_ERROR_BYTES: usize = 512;
 const MAX_REQUIREMENT_DATA_BYTES: usize = 64 * 1024;
 
+/// Verified, still-open artifact handles for the one packaged helper launch.
+/// The paths and descriptors remain private to the host supervisor; only the
+/// path-free receipt may cross a projection boundary.
+pub(super) struct IsolatedVisualRuntimeArtifacts {
+    pub(super) helper: File,
+    pub(super) guest_image: File,
+    pub(super) configuration: File,
+    pub(super) receipt: IsolatedVisualPackagedArtifactReceipt,
+}
+
 #[repr(C)]
 struct NativeIsolatedArtifactsResult {
     status: i32,
@@ -99,6 +109,12 @@ fn close_returned_descriptors(result: &NativeIsolatedArtifactsResult) {
 pub(super) fn measure_packaged_artifacts(
     manifest: &IsolatedVisualManifest,
 ) -> ComputerResult<IsolatedVisualPackagedArtifactReceipt> {
+    Ok(open_packaged_runtime_artifacts(manifest)?.receipt)
+}
+
+pub(super) fn open_packaged_runtime_artifacts(
+    manifest: &IsolatedVisualManifest,
+) -> ComputerResult<IsolatedVisualRuntimeArtifacts> {
     manifest.validate()?;
     // SAFETY: the Objective-C shim returns a plain owned result whose buffers
     // are released with the paired function and whose descriptors transfer
@@ -150,7 +166,12 @@ pub(super) fn measure_packaged_artifacts(
         measurements,
     )?;
     receipt.validate_against_manifest(manifest)?;
-    Ok(receipt)
+    Ok(IsolatedVisualRuntimeArtifacts {
+        helper,
+        guest_image,
+        configuration,
+        receipt,
+    })
 }
 
 #[cfg(test)]
