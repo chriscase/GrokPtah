@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   buildHelpAssistantRequest,
   buildHelpSemanticRequest,
@@ -57,6 +57,8 @@ export function HelpCenter({
   const [selectedId, setSelectedId] = useState(HELP_ARTICLES[0]?.id ?? "");
   const [assistant, setAssistant] = useState<AssistantState>({ status: "idle" });
   const [semantic, setSemantic] = useState<SemanticState>({ status: "idle" });
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
 
   const lexicalResults = useMemo(() => {
     if (!query.trim()) {
@@ -86,11 +88,37 @@ export function HelpCenter({
 
   useEffect(() => {
     if (!open) return;
+    returnFocusRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    const focusTarget = dialogRef.current?.querySelector<HTMLElement>("#help-search-input");
+    focusTarget?.focus();
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
+      if (event.key !== "Tab") return;
+
+      const focusable = Array.from(
+        dialogRef.current?.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      );
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      returnFocusRef.current?.focus();
+      returnFocusRef.current = null;
+    };
   }, [open, onClose]);
 
   useEffect(() => {
@@ -182,6 +210,7 @@ export function HelpCenter({
 
   return (
     <div
+      ref={dialogRef}
       className="help-center"
       role="dialog"
       aria-modal="true"
@@ -211,7 +240,6 @@ export function HelpCenter({
             <input
               id="help-search-input"
               aria-label="Search help"
-              autoFocus
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder="Try “quota”, “stale frame”, or “find a build”"

@@ -35,6 +35,36 @@ describe("HelpCenter", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
+  it("keeps keyboard focus inside the modal and restores the opener", () => {
+    const onClose = vi.fn();
+    const opener = document.createElement("button");
+    opener.type = "button";
+    opener.textContent = "Open Help";
+    document.body.appendChild(opener);
+    opener.focus();
+
+    const { unmount } = render(<HelpCenter open onClose={onClose} />);
+    const dialog = screen.getByRole("dialog", { name: "Help Center" });
+    const close = screen.getByRole("button", { name: "Close Help Center" });
+    const focusables = dialog.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled])',
+    );
+    const last = focusables[focusables.length - 1];
+
+    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "Search help" }));
+    last.focus();
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(document.activeElement).toBe(close);
+
+    close.focus();
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(last);
+
+    unmount();
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
+  });
+
   it("renders an honest empty state for an unknown query", () => {
     render(<HelpCenter open onClose={vi.fn()} />);
     fireEvent.change(screen.getByRole("textbox", { name: "Search help" }), {
