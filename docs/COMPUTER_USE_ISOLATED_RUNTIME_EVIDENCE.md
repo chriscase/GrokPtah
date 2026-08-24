@@ -6,9 +6,9 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `cbd5baf6c85a561e61db12ddb61cd43f7b50d96b`
-- Bundle: `/private/tmp/grokptah-cu-stage35-cloexec-artifact-gate-v1.bundle`
-- Bundle SHA-256: `fae478dfe6ae6cf865cc5a3f59a72f5ce738464ce07f1858c7ef53c994a9e6b8`
+- Head: `dc0aea97d49278055fa007f073a00f1bd39b0e48`
+- Bundle: `/private/tmp/grokptah-cu-stage36-bounded-challenge-read-v1.bundle`
+- Bundle SHA-256: `a49c13cb97f7ceea4c5993ecf56622d96b108fc4ab66833ac2d00f355cdcbd36`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
 Current sealed implementation head: `eb9892e1ba5606c73b66abe60067fea5ae7eafb6`.
@@ -78,6 +78,12 @@ The close-on-exec artifact gate is sealed at:
 - Commit: `cbd5baf6c85a561e61db12ddb61cd43f7b50d96b`
 - Bundle: `/private/tmp/grokptah-cu-stage35-cloexec-artifact-gate-v1.bundle`
 - Bundle SHA-256: `fae478dfe6ae6cf865cc5a3f59a72f5ce738464ce07f1858c7ef53c994a9e6b8`
+
+The bounded FD9 challenge-read hardening is sealed at:
+
+- Commit: `dc0aea97d49278055fa007f073a00f1bd39b0e48`
+- Bundle: `/private/tmp/grokptah-cu-stage36-bounded-challenge-read-v1.bundle`
+- Bundle SHA-256: `a49c13cb97f7ceea4c5993ecf56622d96b108fc4ab66833ac2d00f355cdcbd36`
 
 ## What this candidate proves
 
