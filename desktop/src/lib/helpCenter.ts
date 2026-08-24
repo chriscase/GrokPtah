@@ -76,6 +76,20 @@ export const HELP_ARTICLES: HelpArticle[] = [
     ],
   },
   {
+    id: "providers.grok-build-boundary",
+    title: "Grok Build, Grok Bot, and external tools",
+    topic: "providers",
+    summary: "Keep the Grok Build route separate from Grok Bot and development-tool usage.",
+    body:
+      "GrokPtah can use an explicitly configured Grok Build route, but a real quota claim requires a named live campaign and secret-free receipts. The local always-on soak uses a loopback provider and does not contact Grok Build. Grok Bot is a separate product and is not a GrokPtah runtime dependency or manager; Claude Code, Cursor, and user-submitted Grok Build prompts are external development tools, not automatic runtime providers.",
+    aliases: ["grok build vs grok bot", "grokbot", "grok bot quota", "which grok", "external coding tools", "cursor grok"],
+    keywords: ["grok", "bot", "boundary", "cursor", "claude", "external"],
+    sources: [
+      { id: "provider.boundaries", path: "docs/PROVIDER_PRODUCT_BOUNDARIES.md", heading: "Grok Build route" },
+      { id: "provider.profiles", path: "docs/PROVIDER_PROFILES.md", heading: "Grok Build OIDC" },
+    ],
+  },
+  {
     id: "providers.restricted-gateway-review",
     title: "Review code through a restricted company gateway",
     topic: "providers",

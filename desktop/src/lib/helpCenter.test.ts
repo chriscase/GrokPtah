@@ -48,6 +48,9 @@ describe("offline Help Center corpus", () => {
     expect(searchHelp("grok build quota receipt")[0]?.article.id).toBe(
       "providers.live-gateway-evidence",
     );
+    expect(searchHelp("grok bot quota vs grok build")[0]?.article.id).toBe(
+      "providers.grok-build-boundary",
+    );
     expect(searchHelp("72 hour persistent workers")[0]?.article.id).toBe(
       "operations.always-on-soak",
     );

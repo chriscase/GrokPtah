@@ -10,7 +10,8 @@ Candidate: `f2644f23` (`codex/help-center-integration-v1`), based directly on
 - Started the desktop preview from the integration checkout.
 - Opened the real sidebar Help action and verified the accessible `Help Center`
   dialog.
-- Verified the dialog presents eleven source-backed articles, topic filtering,
+- Verified the dialog presents twelve source-backed articles, including the
+  Grok Build/Grok Bot boundary article, topic filtering,
   the offline lexical retrieval label, source cards, and the optional assistant
   boundary notice.
 - Verified the modal starts focus in Search help, wraps Tab/Shift+Tab within

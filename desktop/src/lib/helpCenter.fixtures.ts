@@ -31,6 +31,11 @@ export const HELP_RETRIEVAL_FIXTURES: HelpRetrievalFixture[] = [
     rationale: "paraphrase",
   },
   {
+    query: "grok bot quota vs grok build",
+    expectedId: "providers.grok-build-boundary",
+    rationale: "paraphrase",
+  },
+  {
     query: "weak company model code review",
     expectedId: "providers.restricted-gateway-review",
     rationale: "paraphrase",
