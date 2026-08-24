@@ -4,7 +4,12 @@ This note describes the isolated integration candidate on
 `codex/cu-isolated-guest-bootstrap-v1`. It is not a claim that `origin/main` is
 complete or that the product has reached 100%.
 
-## Newly certified in this candidate
+## Candidate progress (not a shipped or live certification)
+
+The items below are candidate implementation or deterministic-evidence
+progress. They do not imply that the corresponding origin/main, live-provider,
+packaged-hardware, or soak release gates have passed; each item retains its
+explicit caveats and remaining external evidence.
 
 - Long-horizon durable memory v2 is present with source-workspace addressing,
   project/private-agent/team scopes, host-gated critical writes, revision and
