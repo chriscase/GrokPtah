@@ -5,6 +5,7 @@
 
 use std::time::Instant;
 
+use grokptah_agent_bridge::orchestration::hash_payload;
 use grokptah_agent_bridge::provider_observation::InMemoryObservationRecorder;
 use grokptah_agent_bridge::{McpControlClient, McpRemoteError};
 use serde_json::{json, Value};
@@ -14,9 +15,9 @@ use crate::local_service::LocalService;
 use crate::manifest::ProbeDefinition;
 use crate::report::{
     diagnostic_failure_class, opaque_durable_id, ArgumentFieldCode, DiagnosticCode, DurableIdKind,
-    DurableStateCode, EntityKind, EvidenceCounters, OpaqueDurableId, PhaseCode, PhaseResult,
-    ProbeResult, ProbeStatus, ReconnectEvidence, RestartEvidence, StructuralTrace,
-    TraceOperationCode, TraceRecord, TransitionEvidence,
+    DurableStateCode, EntityKind, EvidenceCounters, LoopbackProviderObservation, OpaqueDurableId,
+    PhaseCode, PhaseResult, ProbeResult, ProbeStatus, ReconnectEvidence, RestartEvidence,
+    StructuralTrace, TraceOperationCode, TraceRecord, TransitionEvidence,
 };
 use crate::LAB_TRACE_SCHEMA;
 
@@ -71,6 +72,7 @@ struct ProbeBuilder<'a> {
     capture_provider_run: Option<ProviderRunEvidence>,
     provider_attempt_start: Option<u32>,
     capture_attempt_start: Option<u32>,
+    provider_observation: Option<LoopbackProviderObservation>,
 }
 
 impl<'a> ProbeBuilder<'a> {
@@ -88,6 +90,7 @@ impl<'a> ProbeBuilder<'a> {
             capture_provider_run: None,
             provider_attempt_start: None,
             capture_attempt_start: None,
+            provider_observation: None,
         }
     }
 
@@ -106,7 +109,37 @@ impl<'a> ProbeBuilder<'a> {
             .checked_add(1)
             .ok_or(DiagnosticCode::BoundExceeded)?;
         match client.call_tool(tool, arguments).await {
-            Ok(result) if !result.is_error => Ok(result.structured),
+            Ok(result) if !result.is_error => {
+                if matches!(
+                    tool,
+                    "ptah_get_run"
+                        | "ptah_list_runs"
+                        | "ptah_get_progress"
+                        | "ptah_promote_run"
+                        | "ptah_discard_run"
+                ) {
+                    let text = result
+                        .raw
+                        .get("content")
+                        .and_then(|content| content.get(0))
+                        .and_then(|item| item.get("text"))
+                        .and_then(|text| text.as_str())
+                        .unwrap_or("");
+                    let parsed_text = serde_json::from_str::<Value>(text).ok();
+                    if grokptah_agent_bridge::orchestration::public_run_contains_forbidden_fields(
+                        &result.structured,
+                    ) || parsed_text.as_ref().is_some_and(
+                        grokptah_agent_bridge::orchestration::public_run_contains_forbidden_fields,
+                    ) {
+                        return Err(DiagnosticCode::McpResultMalformed);
+                    }
+                }
+                if let Some(last) = self.records.last_mut() {
+                    last.result_digest = Some(hash_payload(&result.structured));
+                    last.opaque_entity_id = opaque_from_value(&result.structured);
+                }
+                Ok(result.structured)
+            }
             Ok(_) => {
                 self.counters.errors = self
                     .counters
@@ -154,6 +187,8 @@ impl<'a> ProbeBuilder<'a> {
             argument_fields,
             diagnostic,
             sequence: None,
+            result_digest: None,
+            opaque_entity_id: None,
         });
         Ok(())
     }
@@ -225,6 +260,7 @@ impl<'a> ProbeBuilder<'a> {
                 trace: None,
                 capture_refs: Vec::new(),
                 elapsed_millis,
+                provider_observation: self.provider_observation,
             },
             trace: StructuralTrace {
                 schema: LAB_TRACE_SCHEMA.into(),
@@ -239,6 +275,19 @@ impl<'a> ProbeBuilder<'a> {
             capture_attempt_start: self.capture_attempt_start,
         }
     }
+}
+
+fn opaque_from_value(value: &Value) -> Option<String> {
+    value
+        .pointer("/plan/planId")
+        .or_else(|| value.pointer("/run/runId"))
+        .or_else(|| value.pointer("/runId"))
+        .or_else(|| value.pointer("/work/workId"))
+        .or_else(|| value.pointer("/workId"))
+        .or_else(|| value.pointer("/sessionId"))
+        .or_else(|| value.pointer("/agentId"))
+        .and_then(Value::as_str)
+        .map(opaque_durable_id)
 }
 
 impl ProbeExecution {
@@ -283,6 +332,23 @@ pub fn implementation_tools(probe_id: &str) -> Option<&'static [&'static str]> {
             "ptah_create_routine",
             "ptah_fire_routine",
             "ptah_list_activations",
+        ]),
+        "manager-plan-lifecycle-v1" => Some(&[
+            "ptah_create_session",
+            "ptah_submit_task",
+            "ptah_cancel",
+            "ptah_get_run",
+            "ptah_list_persistent_agents",
+            "ptah_create_manager_plan",
+            "ptah_get_manager_plan",
+            "ptah_advance_manager_plan",
+            "ptah_tick_manager_plan",
+            "ptah_replan_manager_plan",
+            "ptah_get_work",
+            "ptah_claim_work",
+            "ptah_complete_work",
+            "ptah_fail_work",
+            "ptah_cancel_work",
         ]),
         "coordinator-parent-child-work-v1" => Some(&[
             "ptah_create_session",
@@ -452,6 +518,7 @@ pub async fn execute_minimal_probe(
         "coordinator-parent-child-work-v1" => {
             coordinator_parent_child(&mut probe, client, workspace).await
         }
+        "manager-plan-lifecycle-v1" => manager_plan_lifecycle(&mut probe, client, workspace).await,
         "core-bounded-run-terminal-v1" => {
             bounded_run_terminal(&mut probe, client, workspace, provider_recorder).await
         }
@@ -1790,6 +1857,7 @@ async fn native_interruption_retry_policy(
     workspace: &str,
     provider_recorder: Option<&InMemoryObservationRecorder>,
 ) -> Result<(), DiagnosticCode> {
+    // This path is the implementation for OracleCode::InterruptedRunNotReadmittedWithinWindow.
     let mut client = service.client();
     client
         .initialize()
@@ -3723,6 +3791,655 @@ async fn coordinator_parent_child(
     probe.retain_id(DurableIdKind::Work, &parent_id);
     probe.retain_id(DurableIdKind::Work, &child_id);
     Ok(())
+}
+
+/// One manager plan driven end to end through the public MCP surface:
+/// creation, a non-executable root container, dependency-ordered advance,
+/// revision-fenced observation, a failed step, and an explicit replan that
+/// supersedes the failure and reaches terminal success.
+async fn manager_plan_lifecycle(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    workspace: &str,
+) -> Result<(), DiagnosticCode> {
+    let agent = create_agent(probe, client, workspace).await?;
+    let created = probe
+        .call(
+            client,
+            TraceOperationCode::CreateManagerPlan,
+            "ptah_create_manager_plan",
+            json!({
+                "request_id": request_id("manager-plan"),
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "manager_agent_id": agent.agent_id,
+                "objective": "Certify the bounded manager plan lifecycle",
+                "steps": [
+                    {
+                        "stepId": "inspect",
+                        "kind": "certification",
+                        "objective": "Inspect the disposable fixture",
+                    },
+                    {
+                        "stepId": "report",
+                        "kind": "certification",
+                        "objective": "Report the inspection result",
+                        "dependencies": ["inspect"],
+                    },
+                ],
+                "max_in_flight": 1,
+                "max_replans": 2,
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::AgentId,
+                ArgumentFieldCode::Objective,
+                ArgumentFieldCode::Steps,
+            ],
+        )
+        .await?;
+    let plan_id = required_string(&created, &["plan", "planId"])?;
+    let root_work_id = required_string(&created, &["plan", "rootWorkId"])?;
+    if created["plan"]["state"].as_str() != Some("active") {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    let created_revision = required_revision(&created, &["plan", "revision"])?;
+    probe.transition(
+        EntityKind::ManagerPlan,
+        DurableStateCode::Absent,
+        DurableStateCode::Created,
+        Some(&plan_id),
+    );
+    probe.retain_id(DurableIdKind::ManagerPlan, &plan_id);
+
+    // The plan root is an explicit host-enforced container: it is visible as
+    // Work but must never be claimable, so it can never execute.
+    let root = probe
+        .call(
+            client,
+            TraceOperationCode::GetWork,
+            "ptah_get_work",
+            json!({
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "work_id": root_work_id,
+            }),
+            vec![
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::WorkId,
+            ],
+        )
+        .await?;
+    if root["work"]["isContainer"].as_bool() != Some(true) {
+        return Err(DiagnosticCode::OracleMismatch);
+    }
+    expect_rejected(
+        probe,
+        client,
+        TraceOperationCode::ClaimWork,
+        "ptah_claim_work",
+        json!({
+            "request_id": request_id("manager-root-claim"),
+            "session_id": agent.session_id,
+            "workspace": workspace,
+            "work_id": root_work_id,
+        }),
+        vec![
+            ArgumentFieldCode::RequestId,
+            ArgumentFieldCode::SessionId,
+            ArgumentFieldCode::Workspace,
+            ArgumentFieldCode::WorkId,
+        ],
+        DiagnosticCode::OracleMismatch,
+    )
+    .await?;
+
+    // Advance materializes only the step whose dependencies are satisfied.
+    let advance_args = json!({
+        "request_id": request_id("manager-advance-first"),
+        "session_id": agent.session_id,
+        "workspace": workspace,
+        "plan_id": plan_id,
+        "expected_revision": created_revision,
+    });
+    let advanced = probe
+        .call(
+            client,
+            TraceOperationCode::AdvanceManagerPlan,
+            "ptah_advance_manager_plan",
+            advance_args.clone(),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::PlanId,
+                ArgumentFieldCode::ExpectedRevision,
+            ],
+        )
+        .await?;
+    let first_work = single_created_work(&advanced)?;
+    if step_state(&advanced, "report")? != "pending" {
+        return Err(DiagnosticCode::OracleMismatch);
+    }
+    probe.transition(
+        EntityKind::ManagerStep,
+        DurableStateCode::Created,
+        DurableStateCode::Advanced,
+        Some(&first_work),
+    );
+
+    // Replaying one advance request must return the same materialized Work.
+    let replayed = probe
+        .call(
+            client,
+            TraceOperationCode::AdvanceManagerPlan,
+            "ptah_advance_manager_plan",
+            advance_args,
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::PlanId,
+                ArgumentFieldCode::ExpectedRevision,
+            ],
+        )
+        .await?;
+    if single_created_work(&replayed)? != first_work {
+        return Err(DiagnosticCode::IdempotencyReplayMismatch);
+    }
+
+    // A superseded plan revision must not be able to mutate the plan.
+    expect_rejected(
+        probe,
+        client,
+        TraceOperationCode::AdvanceManagerPlan,
+        "ptah_advance_manager_plan",
+        json!({
+            "request_id": request_id("manager-advance-stale"),
+            "session_id": agent.session_id,
+            "workspace": workspace,
+            "plan_id": plan_id,
+            "expected_revision": created_revision,
+        }),
+        vec![
+            ArgumentFieldCode::RequestId,
+            ArgumentFieldCode::SessionId,
+            ArgumentFieldCode::Workspace,
+            ArgumentFieldCode::PlanId,
+            ArgumentFieldCode::ExpectedRevision,
+        ],
+        DiagnosticCode::OracleMismatch,
+    )
+    .await?;
+
+    complete_manager_work(probe, client, workspace, &agent, &first_work).await?;
+
+    // One tick projects the terminal child outcome into exactly one durable
+    // notification, and repeating it does not notify the same Work revision
+    // twice.
+    let plan_revision = current_plan_revision(probe, client, workspace, &agent, &plan_id).await?;
+    let ticked = probe
+        .call(
+            client,
+            TraceOperationCode::TickManagerPlan,
+            "ptah_tick_manager_plan",
+            json!({
+                "request_id": request_id("manager-tick"),
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "plan_id": plan_id,
+                "expected_revision": plan_revision,
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::PlanId,
+                ArgumentFieldCode::ExpectedRevision,
+            ],
+        )
+        .await?;
+    let notified = ticked["messages"].as_array().map_or(0, Vec::len);
+    if notified == 0 {
+        return Err(DiagnosticCode::OracleMismatch);
+    }
+    let repeat_revision = required_revision(&ticked, &["plan", "revision"])?;
+    let repeated = probe
+        .call(
+            client,
+            TraceOperationCode::TickManagerPlan,
+            "ptah_tick_manager_plan",
+            json!({
+                "request_id": request_id("manager-tick-repeat"),
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "plan_id": plan_id,
+                "expected_revision": repeat_revision,
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::PlanId,
+                ArgumentFieldCode::ExpectedRevision,
+            ],
+        )
+        .await?;
+    if repeated["messages"].as_array().map_or(0, Vec::len) != 0 {
+        return Err(DiagnosticCode::OracleMismatch);
+    }
+
+    // A tick advances the active plan before it observes, so the dependent
+    // step is materialized once its dependency succeeded — and only then.
+    let observed = fetch_plan(probe, client, workspace, &agent, &plan_id).await?;
+    if step_state(&observed, "inspect")? != "succeeded" {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    let second_work = step_work_id(&observed, "report")?;
+
+    fail_manager_work(probe, client, workspace, &agent, &second_work).await?;
+
+    // A failed child stops the plan for an explicit decision. No replacement
+    // Work may be invented on the plan's behalf.
+    let plan_revision = current_plan_revision(probe, client, workspace, &agent, &plan_id).await?;
+    let halted = probe
+        .call(
+            client,
+            TraceOperationCode::AdvanceManagerPlan,
+            "ptah_advance_manager_plan",
+            json!({
+                "request_id": request_id("manager-advance-failure"),
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "plan_id": plan_id,
+                "expected_revision": plan_revision,
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::PlanId,
+                ArgumentFieldCode::ExpectedRevision,
+            ],
+        )
+        .await?;
+    if halted["plan"]["state"].as_str() != Some("needs_replan") {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    if halted["createdWork"]
+        .as_array()
+        .is_some_and(|created| !created.is_empty())
+    {
+        return Err(DiagnosticCode::OracleMismatch);
+    }
+    probe.transition(
+        EntityKind::ManagerPlan,
+        DurableStateCode::Active,
+        DurableStateCode::NeedsReplan,
+        Some(&plan_id),
+    );
+
+    // An explicit replan supersedes the failed step and its blocked
+    // descendants, and the plan can still reach terminal success.
+    let replanned = probe
+        .call(
+            client,
+            TraceOperationCode::ReplanManagerPlan,
+            "ptah_replan_manager_plan",
+            json!({
+                "request_id": request_id("manager-replan"),
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "plan_id": plan_id,
+                "reason": "Supersede the failed certification step",
+                "steps": [{
+                    "stepId": "replacement",
+                    "kind": "certification",
+                    "objective": "Report independently of the failed step",
+                }],
+                "expected_revision": required_revision(&halted, &["plan", "revision"])?,
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::PlanId,
+                ArgumentFieldCode::Reason,
+                ArgumentFieldCode::Steps,
+                ArgumentFieldCode::ExpectedRevision,
+            ],
+        )
+        .await?;
+    if step_state(&replanned, "report")? != "superseded" {
+        return Err(DiagnosticCode::OracleMismatch);
+    }
+    probe.transition(
+        EntityKind::ManagerStep,
+        DurableStateCode::Failed,
+        DurableStateCode::Superseded,
+        Some(&plan_id),
+    );
+
+    let resumed = probe
+        .call(
+            client,
+            TraceOperationCode::AdvanceManagerPlan,
+            "ptah_advance_manager_plan",
+            json!({
+                "request_id": request_id("manager-advance-replanned"),
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "plan_id": plan_id,
+                "expected_revision": required_revision(&replanned, &["plan", "revision"])?,
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::PlanId,
+                ArgumentFieldCode::ExpectedRevision,
+            ],
+        )
+        .await?;
+    let replacement_work = single_created_work(&resumed)?;
+    complete_manager_work(probe, client, workspace, &agent, &replacement_work).await?;
+
+    let plan_revision = current_plan_revision(probe, client, workspace, &agent, &plan_id).await?;
+    let settled = probe
+        .call(
+            client,
+            TraceOperationCode::AdvanceManagerPlan,
+            "ptah_advance_manager_plan",
+            json!({
+                "request_id": request_id("manager-advance-final"),
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "plan_id": plan_id,
+                "expected_revision": plan_revision,
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::PlanId,
+                ArgumentFieldCode::ExpectedRevision,
+            ],
+        )
+        .await?;
+    if settled["plan"]["state"].as_str() != Some("succeeded") {
+        return Err(DiagnosticCode::TerminalStateMissing);
+    }
+    probe.transition(
+        EntityKind::ManagerPlan,
+        DurableStateCode::NeedsReplan,
+        DurableStateCode::Succeeded,
+        Some(&plan_id),
+    );
+    Ok(())
+}
+
+fn required_revision(value: &Value, path: &[&str]) -> Result<u64, DiagnosticCode> {
+    let mut cursor = value;
+    for key in path {
+        cursor = cursor.get(*key).ok_or(DiagnosticCode::McpResultMalformed)?;
+    }
+    cursor.as_u64().ok_or(DiagnosticCode::McpResultMalformed)
+}
+
+fn single_created_work(value: &Value) -> Result<String, DiagnosticCode> {
+    let created = value["createdWork"]
+        .as_array()
+        .ok_or(DiagnosticCode::McpResultMalformed)?;
+    if created.len() != 1 {
+        return Err(DiagnosticCode::OracleMismatch);
+    }
+    required_string(&created[0], &["workId"])
+}
+
+fn step_work_id(value: &Value, step_id: &str) -> Result<String, DiagnosticCode> {
+    value["plan"]["steps"]
+        .as_array()
+        .ok_or(DiagnosticCode::McpResultMalformed)?
+        .iter()
+        .find(|step| step["stepId"].as_str() == Some(step_id))
+        .and_then(|step| step["workId"].as_str())
+        .map(str::to_owned)
+        .ok_or(DiagnosticCode::McpResultMalformed)
+}
+
+fn step_state(value: &Value, step_id: &str) -> Result<String, DiagnosticCode> {
+    value["plan"]["steps"]
+        .as_array()
+        .ok_or(DiagnosticCode::McpResultMalformed)?
+        .iter()
+        .find(|step| step["stepId"].as_str() == Some(step_id))
+        .and_then(|step| step["state"].as_str())
+        .map(str::to_owned)
+        .ok_or(DiagnosticCode::McpResultMalformed)
+}
+
+async fn fetch_plan(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    workspace: &str,
+    agent: &TestAgent,
+    plan_id: &str,
+) -> Result<Value, DiagnosticCode> {
+    probe
+        .call(
+            client,
+            TraceOperationCode::GetManagerPlan,
+            "ptah_get_manager_plan",
+            json!({
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "plan_id": plan_id,
+            }),
+            vec![
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::PlanId,
+            ],
+        )
+        .await
+}
+
+async fn current_plan_revision(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    workspace: &str,
+    agent: &TestAgent,
+    plan_id: &str,
+) -> Result<u64, DiagnosticCode> {
+    let plan = fetch_plan(probe, client, workspace, agent, plan_id).await?;
+    required_revision(&plan, &["plan", "revision"])
+}
+
+async fn claim_manager_work(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    workspace: &str,
+    agent: &TestAgent,
+    work_id: &str,
+    prefix: &str,
+) -> Result<(String, String), DiagnosticCode> {
+    let claimed = probe
+        .call(
+            client,
+            TraceOperationCode::ClaimWork,
+            "ptah_claim_work",
+            json!({
+                "request_id": request_id(prefix),
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "work_id": work_id,
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::WorkId,
+            ],
+        )
+        .await?;
+    Ok((
+        required_string(&claimed, &["attempt", "attemptId"])?,
+        required_string(&claimed, &["leaseToken"])?,
+    ))
+}
+
+async fn complete_manager_work(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    workspace: &str,
+    agent: &TestAgent,
+    work_id: &str,
+) -> Result<(), DiagnosticCode> {
+    let (attempt_id, lease_token) =
+        claim_manager_work(probe, client, workspace, agent, work_id, "manager-claim").await?;
+    probe
+        .call(
+            client,
+            TraceOperationCode::CompleteWork,
+            "ptah_complete_work",
+            json!({
+                "request_id": request_id("manager-complete"),
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "work_id": work_id,
+                "attempt_id": attempt_id,
+                "lease_token": lease_token,
+                "summary": "Certification step completed",
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::WorkId,
+                ArgumentFieldCode::AttemptId,
+            ],
+        )
+        .await?;
+    probe.retain_id(DurableIdKind::Work, work_id);
+    probe.transition(
+        EntityKind::Work,
+        DurableStateCode::Claimed,
+        DurableStateCode::Completed,
+        Some(work_id),
+    );
+    Ok(())
+}
+
+async fn fail_manager_work(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    workspace: &str,
+    agent: &TestAgent,
+    work_id: &str,
+) -> Result<(), DiagnosticCode> {
+    let (attempt_id, lease_token) = claim_manager_work(
+        probe,
+        client,
+        workspace,
+        agent,
+        work_id,
+        "manager-claim-fail",
+    )
+    .await?;
+    let failed = probe
+        .call(
+            client,
+            TraceOperationCode::FailWork,
+            "ptah_fail_work",
+            json!({
+                "request_id": request_id("manager-fail"),
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "work_id": work_id,
+                "attempt_id": attempt_id,
+                "lease_token": lease_token,
+                "summary": "Certification step failed",
+                "failure": "synthetic certification failure",
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::WorkId,
+                ArgumentFieldCode::AttemptId,
+            ],
+        )
+        .await?;
+    // Retain the failed outcome for the manager decision instead of letting
+    // Work retry policy re-queue it.
+    probe
+        .call(
+            client,
+            TraceOperationCode::CancelWork,
+            "ptah_cancel_work",
+            json!({
+                "request_id": request_id("manager-fail-seal"),
+                "session_id": agent.session_id,
+                "workspace": workspace,
+                "work_id": work_id,
+                "reason": "Preserve the failed outcome for an explicit replan",
+                "expected_revision": required_revision(&failed, &["work", "revision"])?,
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::WorkId,
+                ArgumentFieldCode::Reason,
+                ArgumentFieldCode::ExpectedRevision,
+            ],
+        )
+        .await?;
+    probe.retain_id(DurableIdKind::Work, work_id);
+    probe.transition(
+        EntityKind::Work,
+        DurableStateCode::Claimed,
+        DurableStateCode::Failed,
+        Some(work_id),
+    );
+    Ok(())
+}
+
+/// Call a tool that the host must refuse, and fail the probe when it is
+/// accepted. A rejected call is evidence, so it is still traced.
+async fn expect_rejected(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    operation: TraceOperationCode,
+    tool: &str,
+    arguments: Value,
+    argument_fields: Vec<ArgumentFieldCode>,
+    accepted: DiagnosticCode,
+) -> Result<(), DiagnosticCode> {
+    probe.counters.tool_calls = probe
+        .counters
+        .tool_calls
+        .checked_add(1)
+        .ok_or(DiagnosticCode::BoundExceeded)?;
+    let outcome = client.call_tool(tool, arguments).await;
+    match outcome {
+        Ok(result) if !result.is_error => {
+            probe.push_trace(operation, argument_fields, Some(accepted))?;
+            Err(accepted)
+        }
+        _ => {
+            probe.counters.errors = probe
+                .counters
+                .errors
+                .checked_add(1)
+                .ok_or(DiagnosticCode::BoundExceeded)?;
+            probe.push_trace(operation, argument_fields, None)?;
+            Ok(())
+        }
+    }
 }
 
 async fn create_agent(

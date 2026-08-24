@@ -12,6 +12,24 @@
 //! Which runs each surface may list is a separate gate: the cockpit is
 //! session-scoped; coordinator reads take [`ComputerReadBinding`].
 
+mod coordination;
+mod isolated_guest;
+mod isolated_visual;
+mod isolated_visual_artifacts;
+mod isolated_visual_channel;
+mod isolated_visual_driver;
+mod isolated_visual_frames;
+mod isolated_visual_helper;
+mod isolated_visual_helper_control;
+mod isolated_visual_input;
+mod isolated_visual_input_wire;
+mod isolated_visual_protocol;
+mod isolated_visual_runtime;
+mod isolated_visual_stream;
+#[cfg(target_os = "macos")]
+mod macos_isolated_artifacts;
+#[cfg(target_os = "macos")]
+mod macos_isolated_runtime;
 mod macos_observation;
 mod platform;
 mod policy;
@@ -22,17 +40,85 @@ mod simulator;
 mod store;
 mod types;
 
+pub use isolated_guest::{
+    project_captured_artifact, redact_isolated_capture, IsolatedCapturedArtifact,
+    IsolatedGuestLease, IsolatedGuestPhase, IsolatedGuestSession,
+};
+pub use isolated_visual::{
+    IsolatedVisualCleanupEvidence, IsolatedVisualLaunchContract, IsolatedVisualLifecycle,
+    IsolatedVisualLifecycleState, IsolatedVisualManifest, IsolatedVisualResourceLimits,
+    IsolatedVisualSecurityProfile, IsolatedVisualTerminalDisposition,
+    ISOLATED_VISUAL_GUEST_PROTOCOL_VERSION, ISOLATED_VISUAL_MANIFEST_SCHEMA_VERSION,
+    MACOS_ISOLATED_VISUAL_CANDIDATE_BACKEND_ID,
+};
+pub use isolated_visual_artifacts::{
+    measure_open_isolated_visual_artifact, measure_open_isolated_visual_artifacts,
+    measure_packaged_isolated_visual_artifacts, IsolatedVisualArtifactMeasurement,
+    IsolatedVisualArtifactMeasurements, IsolatedVisualArtifactRole,
+    IsolatedVisualPackagedArtifactReceipt, ISOLATED_VISUAL_APP_BUNDLE_IDENTIFIER,
+    ISOLATED_VISUAL_HELPER_SIGNING_IDENTIFIER, ISOLATED_VISUAL_MAX_CONFIGURATION_BYTES,
+    ISOLATED_VISUAL_MAX_GUEST_IMAGE_BYTES, ISOLATED_VISUAL_MAX_HELPER_BYTES,
+};
+pub use isolated_visual_channel::{
+    IsolatedVisualChannelBinding, ISOLATED_VISUAL_BINDING_CONTEXT,
+    ISOLATED_VISUAL_BINDING_DIGEST_BYTES, ISOLATED_VISUAL_BINDING_HEADER_BYTES,
+    ISOLATED_VISUAL_BINDING_MAGIC, ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES,
+    ISOLATED_VISUAL_BINDING_TAG_BYTES, ISOLATED_VISUAL_BINDING_VERSION,
+};
+pub use isolated_visual_driver::IsolatedVisualRuntimeDriver;
+pub use isolated_visual_frames::{
+    IsolatedVisualFrame, IsolatedVisualFrameCarrier, IsolatedVisualFrameChunk,
+    ISOLATED_VISUAL_FRAME_CHUNK_BYTES, ISOLATED_VISUAL_FRAME_HEADER_BYTES,
+    ISOLATED_VISUAL_FRAME_MAGIC, ISOLATED_VISUAL_FRAME_TAG_BYTES, ISOLATED_VISUAL_FRAME_VERSION,
+};
+pub use isolated_visual_helper::{
+    IsolatedVisualHelperEvent, IsolatedVisualHelperEventCode, IsolatedVisualHelperFailure,
+    IsolatedVisualHelperSupervisor, IsolatedVisualHelperSupervisorState,
+    ISOLATED_VISUAL_HELPER_CONTROL_BIND, ISOLATED_VISUAL_HELPER_CONTROL_START,
+    ISOLATED_VISUAL_HELPER_CONTROL_STOP, ISOLATED_VISUAL_HELPER_EVENT_BYTES,
+    ISOLATED_VISUAL_HELPER_EVENT_MAGIC, ISOLATED_VISUAL_HELPER_EVENT_VERSION,
+};
+pub use isolated_visual_helper_control::IsolatedVisualHelperControl;
+pub use isolated_visual_helper_control::{
+    read_isolated_visual_challenge, ISOLATED_VISUAL_CHALLENGE_BYTES,
+};
+pub use isolated_visual_input::{
+    IsolatedVisualInputGate, IsolatedVisualInputKeyState, IsolatedVisualInputMessage,
+    ISOLATED_VISUAL_MAX_SCROLL_DELTA,
+};
+pub use isolated_visual_input_wire::{
+    IsolatedVisualInputWire, ISOLATED_VISUAL_INPUT_HEADER_BYTES, ISOLATED_VISUAL_INPUT_MAGIC,
+    ISOLATED_VISUAL_INPUT_MAX_PACKET_BYTES, ISOLATED_VISUAL_INPUT_TAG_BYTES,
+    ISOLATED_VISUAL_INPUT_VERSION,
+};
+pub use isolated_visual_protocol::{
+    IsolatedVisualGuestFailure, IsolatedVisualGuestHealth, IsolatedVisualGuestMessage,
+    IsolatedVisualHostMessage, IsolatedVisualProtocolEnvelope, IsolatedVisualProtocolPayload,
+    IsolatedVisualProtocolSession, IsolatedVisualProtocolSurfaceBinding,
+    ISOLATED_VISUAL_CHANNEL_SECRET_BYTES, ISOLATED_VISUAL_MAX_SIGNED_ENVELOPE_BYTES,
+};
+pub use isolated_visual_runtime::IsolatedVisualRuntimeSession;
+pub use isolated_visual_stream::{
+    IsolatedVisualStream, ISOLATED_VISUAL_GUEST_INPUT_COMMAND, ISOLATED_VISUAL_STREAM_LENGTH_BYTES,
+    ISOLATED_VISUAL_STREAM_MAX_FRAME_PACKET_BYTES,
+};
+#[cfg(target_os = "macos")]
+pub(crate) use macos_isolated_runtime::IsolatedVisualPackagedRuntime;
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
-    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
-    ComputerPlatformStatus, ComputerTargetCandidate,
+    computer_isolated_visual_status, ComputerBackgroundSafetyReceipt,
+    ComputerIsolatedVisualBlocker, ComputerIsolatedVisualStatus, ComputerObservationPlatform,
+    ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate,
 };
 pub use policy::ComputerPolicy;
 pub use projection::{
-    project_run_at, ActionGrantSummary, ActionOutcomeSummary, ComputerErrorSummary,
-    ComputerRunCapacity, ComputerRunEventPage, ComputerRunEventRange, ComputerRunProgress,
-    ComputerRunProjection, ComputerScopeCapacity, ComputerTargetSummary, ObservationSummary,
-    DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
+    project_run_at, ActionGrantSummary, ActionOutcomeSummary, ComputerBackendPublicView,
+    ComputerErrorSummary, ComputerLocalApproval, ComputerLocalAuditEntry, ComputerLocalElement,
+    ComputerLocalError, ComputerLocalGrant, ComputerLocalLimits, ComputerLocalObservation,
+    ComputerLocalTarget, ComputerRunCapacity, ComputerRunEventPage, ComputerRunEventRange,
+    ComputerRunProgress, ComputerRunProjection, ComputerScopeCapacity, ComputerSurfaceCoordination,
+    ComputerSurfaceCoordinationState, ComputerSurfaceOccupant, ComputerTargetSummary,
+    ComputerUncertainSurfaceLease, ObservationSummary, DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
 };
 pub use reads::{ComputerReadBinding, ComputerRunReads};
 
@@ -50,10 +136,21 @@ mod macos_native;
 pub use service::ComputerUseService;
 pub use simulator::SimulatorBackend;
 pub use store::ComputerStore;
+pub(crate) use types::ResolvedAgentComputerRunAdmission;
 pub use types::{
-    ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAuditEntry, ComputerBackend,
-    ComputerCapabilities, ComputerControlDisposition, ComputerError, ComputerErrorCode,
-    ComputerObservation, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
-    EvidenceRef, GrantIssuer, ObservationGeometry, PointerButton, SemanticAction, SemanticElement,
-    Sensitivity,
+    macos_background_safe_capability_proof, macos_native_capability_proof,
+    macos_native_physical_input_domain, ActionClass, ActionGrant, ActionOutcome,
+    AgentComputerRunRequest, ComputerAction, ComputerAttentionPoint, ComputerAttentionTarget,
+    ComputerAuditEntry, ComputerAuthorityToken, ComputerBackend, ComputerCapabilities,
+    ComputerCapabilityProof, ComputerCapabilityTier, ComputerControlDisposition,
+    ComputerEmergencyControlToken, ComputerError, ComputerErrorCode, ComputerKey,
+    ComputerObservation, ComputerPrincipal, ComputerRun, ComputerRunState, ComputerSurfaceBinding,
+    ComputerSurfaceEvent, ComputerTarget, ComputerUseLimits, ComputerWorkAttemptBinding,
+    EvidenceRef, GrantIssuer, IsolationProofOrigin, ObservationAuthority, ObservationGeometry,
+    PhysicalInputDomain, PointerButton, PointerButtonState, SemanticAction, SemanticElement,
+    Sensitivity, SurfaceFreshnessFence, AGENT_PRINCIPAL_INTEGRATION_BLOCKER,
+    COMPUTER_RECEIPT_SCHEMA_VERSION, COMPUTER_RUN_SCHEMA_VERSION,
+    FOREGROUND_CONFLICT_DOMAIN_CAPACITY, MACOS_BACKGROUND_SAFE_BACKEND_ID,
+    MACOS_INTERRUPTED_BACKEND_ID, MACOS_NATIVE_BACKEND_ID, SIMULATOR_BACKGROUND_BACKEND_ID,
+    SIMULATOR_FOREGROUND_BACKEND_ID, SIMULATOR_ISOLATED_BACKEND_ID,
 };

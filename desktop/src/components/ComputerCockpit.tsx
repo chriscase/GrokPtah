@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import { api } from "../lib/api";
 import {
   computerActivityAnnouncement,
@@ -7,11 +14,14 @@ import {
 import type {
   ComputerAction,
   ComputerAgentEligibility,
+  ComputerBackgroundSafetyReceipt,
   ComputerCockpitSnapshot,
+  ComputerLocalApproval,
+  ComputerLocalElement,
   ComputerPermissionStatus,
   ComputerPlatformStatus,
-  ComputerRun,
-  ComputerSemanticElement,
+  ComputerRunReplayStatus,
+  ComputerSurfaceCoordination,
   ComputerTargetCandidate,
 } from "../lib/protocol";
 import { LaneScopeLine, type LaneScope } from "./LaneScopeLine";
@@ -20,6 +30,9 @@ const SIMULATOR_APP_ID = "com.grokptah.computer-use-simulator";
 
 type ComputerCockpitProps = {
   sessionId: string | null;
+  /** Exact app-owned Run identity. Once set, the cockpit must never follow a
+      newer preview or another Run merely because it changed recently. */
+  boundRunId?: string | null;
   sessionTitle?: string;
   scope?: LaneScope;
   model: string;
@@ -27,9 +40,14 @@ type ComputerCockpitProps = {
   computerUseTier?: string;
   computerCapabilitySource?: string;
   sessionBusy: boolean;
+  eventReplay?: ComputerRunReplayStatus;
   onClose: () => void;
   onSteer: (text: string) => Promise<string>;
   onRunState?: (state: string | null) => void;
+  onSnapshot?: (sessionId: string, snapshot: ComputerCockpitSnapshot) => void;
+  /** The app shell owns global emergency keys in production. Stories and
+      focused component tests may leave this false for standalone behavior. */
+  emergencyKeysManaged?: boolean;
 };
 
 const DEFAULT_AGENT_OBJECTIVE =
@@ -39,21 +57,21 @@ function titleCase(value: string) {
   return value.replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
-function isTerminal(run: ComputerRun) {
+function isTerminal(run: ComputerLocalApproval) {
   return ["completed", "failed", "cancelled", "interrupted", "limit_reached"].includes(
     run.state,
   );
 }
 
-function hasOperatorTakeover(run: ComputerRun) {
+function hasOperatorTakeover(run: ComputerLocalApproval) {
   return run.controlDisposition === "operator_takeover";
 }
 
 function elementByAction(
-  run: ComputerRun,
+  run: ComputerLocalApproval,
   action: string,
-): ComputerSemanticElement | undefined {
-  return run.currentObservation?.elements.find((element) =>
+): ComputerLocalElement | undefined {
+  return run.observation?.elements.find((element) =>
     element.actions.includes(action),
   );
 }
@@ -70,11 +88,74 @@ function actionText(action: ComputerAction) {
       return "Select the chosen element";
     case "scroll":
       return "Scroll the chosen element into view";
+    case "key_chord":
+      return "Send a key chord inside the isolated guest";
+    case "pointer_click":
+      return "Click inside the isolated guest";
+    case "pointer_move":
+      return "Move the agent cursor inside the isolated guest";
+    case "pointer_button":
+      return `${action.state === "down" ? "Press" : "Release"} the pointer button inside the isolated guest`;
+    case "text_input":
+      return action.text;
+    case "wait":
+      return "Wait for the isolated guest";
+  }
+}
+
+function focusableDialogElements(dialog: HTMLElement): HTMLElement[] {
+  return Array.from(
+    dialog.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ),
+  );
+}
+
+function coordinationCopy(coordination: ComputerSurfaceCoordination) {
+  if (coordination.blockedByUncertainOutcome) {
+    return {
+      label: "Waiting for local safety confirmation",
+      detail:
+        "A physical result is uncertain. GrokPtah will not grant this surface or replay the action until a local operator clears the fence.",
+      tone: "attention",
+    };
+  }
+  switch (coordination.state) {
+    case "queued":
+      return {
+        label: "Waiting for the shared surface",
+        detail: coordination.active
+          ? `Agent ${coordination.active.agentId} is using it. This run will continue automatically when the host can grant a fresh frame.`
+          : "This run is queued and will continue automatically when the host grants a fresh frame.",
+        tone: "waiting",
+      };
+    case "granted":
+      return {
+        label: "Surface reserved for this agent",
+        detail:
+          "The host granted exclusive observation authority. Other agents sharing this physical surface remain queued.",
+        tone: "reserved",
+      };
+    case "dispatching":
+      return {
+        label: "Agent is using the shared surface",
+        detail:
+          "One physical action is inside the durable dispatch fence. Stop and Take over remain visible above.",
+        tone: "active",
+      };
+    case "uncertain":
+      return {
+        label: "Shared surface is safety-fenced",
+        detail:
+          "The physical outcome is uncertain. No queued agent will be granted until local reconciliation.",
+        tone: "attention",
+      };
   }
 }
 
 export function ComputerCockpit({
   sessionId,
+  boundRunId = null,
   sessionTitle,
   scope,
   model,
@@ -82,14 +163,25 @@ export function ComputerCockpit({
   computerUseTier = "none",
   computerCapabilitySource = "unknown",
   sessionBusy,
+  eventReplay,
   onClose,
   onSteer,
   onRunState,
+  onSnapshot,
+  emergencyKeysManaged = false,
 }: ComputerCockpitProps) {
   const [snapshot, setSnapshot] = useState<ComputerCockpitSnapshot | null>(null);
   const [launchMode, setLaunchMode] = useState<"simulator" | "macos">("simulator");
   const [nativeTargets, setNativeTargets] = useState<ComputerTargetCandidate[]>([]);
   const [selectedNativeToken, setSelectedNativeToken] = useState<string | null>(null);
+  const [nativeExecutionMode, setNativeExecutionMode] = useState<
+    "foreground" | "measured_background"
+  >("foreground");
+  const [backgroundReceipt, setBackgroundReceipt] =
+    useState<ComputerBackgroundSafetyReceipt | null>(null);
+  const [backgroundElementLabel, setBackgroundElementLabel] = useState("Project label");
+  const [backgroundProbeText, setBackgroundProbeText] = useState("grokptah-background-probe");
+  const [disposableTargetAcknowledged, setDisposableTargetAcknowledged] = useState(false);
   const [platformStatus, setPlatformStatus] = useState<ComputerPlatformStatus | null>(null);
   const [scopeReviewed, setScopeReviewed] = useState(false);
   const [name, setName] = useState("Ada Lovelace");
@@ -97,11 +189,24 @@ export function ComputerCockpit({
   const [agentEligibility, setAgentEligibility] = useState<ComputerAgentEligibility | null>(null);
   const [agentBusy, setAgentBusy] = useState(false);
   const [steerText, setSteerText] = useState("");
+  const [reconciliationNote, setReconciliationNote] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const requestEpoch = useRef(0);
+  const emergencyEpoch = useRef(0);
   const proposalFocus = useRef<HTMLButtonElement | null>(null);
+  const approvalDialogRef = useRef<HTMLDivElement | null>(null);
+  const lastApprovalId = useRef<string | null>(null);
+
+  const publishSnapshot = useCallback(
+    (next: ComputerCockpitSnapshot) => {
+      setSnapshot(next);
+      onRunState?.(next.local?.state ?? null);
+      if (sessionId) onSnapshot?.(sessionId, next);
+    },
+    [onRunState, onSnapshot, sessionId],
+  );
 
   useEffect(() => {
     const epoch = ++requestEpoch.current;
@@ -109,23 +214,28 @@ export function ComputerCockpit({
     setScopeReviewed(false);
     setNativeTargets([]);
     setSelectedNativeToken(null);
+    setNativeExecutionMode("foreground");
+    setBackgroundReceipt(null);
+    setBackgroundElementLabel("Project label");
+    setBackgroundProbeText("grokptah-background-probe");
+    setDisposableTargetAcknowledged(false);
     setPlatformStatus(null);
     setError(null);
     setNotice(null);
     setBusy(false);
     setAgentBusy(false);
     setAgentEligibility(null);
+    setReconciliationNote("");
     setObjective(DEFAULT_AGENT_OBJECTIVE);
     if (!sessionId) {
       onRunState?.(null);
       return;
     }
     void api
-      .computerUseCockpitSnapshot(sessionId)
+      .computerUseCockpitSnapshot(sessionId, boundRunId)
       .then((next) => {
         if (requestEpoch.current !== epoch) return;
-        setSnapshot(next);
-        onRunState?.(next.run?.state ?? null);
+        publishSnapshot(next);
       })
       .catch((reason) => {
         if (requestEpoch.current !== epoch) return;
@@ -143,41 +253,159 @@ export function ComputerCockpit({
     return () => {
       void api.computerUseCockpitCancelAgent(sessionId).catch(() => {});
     };
-  }, [sessionId, onRunState]);
+  }, [boundRunId, onRunState, publishSnapshot, sessionId]);
 
   const apply = async (
     mutation: () => Promise<ComputerCockpitSnapshot>,
     success?: string,
-  ) => {
+  ): Promise<boolean> => {
     const epoch = requestEpoch.current;
+    const emergencyAtStart = emergencyEpoch.current;
     setBusy(true);
     setError(null);
     try {
       const next = await mutation();
-      if (requestEpoch.current !== epoch) return;
-      setSnapshot(next);
+      if (
+        requestEpoch.current !== epoch ||
+        emergencyEpoch.current !== emergencyAtStart
+      ) {
+        return false;
+      }
+      publishSnapshot(next);
       setNotice(success ?? null);
-      onRunState?.(next.run?.state ?? null);
+      return true;
     } catch (reason) {
-      if (requestEpoch.current === epoch) setError(String(reason));
+      if (
+        requestEpoch.current === epoch &&
+        emergencyEpoch.current === emergencyAtStart
+      ) {
+        setError(String(reason));
+      }
+      return false;
     } finally {
       if (requestEpoch.current === epoch) setBusy(false);
     }
   };
 
-  const run = snapshot?.run ?? null;
+  // Emergency controls must not join the ordinary mutation busy gate. They
+  // are specifically required to race an observation/action that is still
+  // awaiting its backend, and the host re-reads current durable state.
+  const applyEmergency = useCallback(
+    async (
+      mutation: () => Promise<ComputerCockpitSnapshot>,
+      success: string,
+    ): Promise<void> => {
+      const epoch = requestEpoch.current;
+      const controlEpoch = emergencyEpoch.current + 1;
+      emergencyEpoch.current = controlEpoch;
+      setError(null);
+      try {
+        const next = await mutation();
+        if (
+          requestEpoch.current !== epoch ||
+          emergencyEpoch.current !== controlEpoch
+        ) {
+          return;
+        }
+        publishSnapshot(next);
+        setNotice(success);
+      } catch (reason) {
+        if (
+          requestEpoch.current === epoch &&
+          emergencyEpoch.current === controlEpoch
+        ) {
+          setError(String(reason));
+        }
+      }
+    },
+    [publishSnapshot],
+  );
+
+  const run = snapshot?.local ?? null;
   // Status rendering reads the authoritative projection, which is the same
-  // payload an external coordinator observes. `run` is kept only for the
-  // local-only observation detail an approval needs.
+  // payload an external coordinator observes. `local` is kept only for the
+  // approval observation detail.
   const projection = snapshot?.projection ?? null;
   const activity = projection ? computerActivityState(projection) : null;
-  const observation = run?.currentObservation ?? null;
+  const observation = run?.observation ?? null;
   const nameElement = run ? elementByAction(run, "set_value") : undefined;
   const submitElement = run ? elementByAction(run, "invoke") : undefined;
   const statusElement = observation?.elements.find((element) =>
     ["status", "AXStaticText"].includes(element.role),
   );
   const approval = snapshot?.pendingApproval ?? null;
+
+  useEffect(() => {
+    const approvalId = approval?.approvalId ?? null;
+    if (approvalId && approvalId !== lastApprovalId.current) {
+      const first = approvalDialogRef.current
+        ? focusableDialogElements(approvalDialogRef.current)[0]
+        : undefined;
+      first?.focus();
+    } else if (!approvalId && lastApprovalId.current) {
+      proposalFocus.current?.focus();
+    }
+    lastApprovalId.current = approvalId;
+  }, [approval?.approvalId]);
+
+  const trapApprovalFocus = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      if (!approval || !sessionId || !run) return;
+      event.preventDefault();
+      void apply(
+        () => api.computerUseCockpitDiscardApproval(sessionId, run.runId),
+      ).finally(() => proposalFocus.current?.focus());
+      return;
+    }
+    if (event.key !== "Tab" || !approvalDialogRef.current) return;
+    const focusable = focusableDialogElements(approvalDialogRef.current);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  const agentProposalActive = approval?.proposalOrigin === "agent";
+  const agentAttentionElementId =
+    agentProposalActive && "element_id" in approval.action
+      ? approval.action.element_id
+      : null;
+  const agentProposalSequence =
+    agentProposalActive && observation
+      ? [...(run?.audit ?? [])]
+          .reverse()
+          .find(
+            (entry) =>
+              entry.surfaceEvent === "action_proposed" &&
+              entry.observationId === observation.observationId,
+          )?.sequence
+      : undefined;
+  const agentAttentionEntry =
+    agentProposalSequence !== undefined && observation
+      ? [...(run?.audit ?? [])]
+          .reverse()
+          .find(
+            (entry) =>
+              entry.surfaceEvent === "attention_moved" &&
+              entry.observationId === observation.observationId &&
+              entry.sequence > agentProposalSequence &&
+              entry.attention,
+          )
+      : undefined;
+  const agentAttention = agentAttentionEntry?.attention ?? null;
+  const agentAttentionLabel = agentProposalActive
+    ? observation?.elements.find(
+        (element) => element.elementId === agentAttentionElementId,
+      )?.label ?? run?.target.displayName ?? "authorized surface"
+    : null;
+  const coordination = snapshot?.coordination ?? null;
+  const coordinationStatus = coordination ? coordinationCopy(coordination) : null;
+  const reconciliation = snapshot?.reconciliation ?? null;
   const grantActive = Boolean(run?.grant && !run.grant.revokedAt);
   const timeline = useMemo(() => run?.audit.slice(-12).reverse() ?? [], [run]);
   const selectedNativeTarget = nativeTargets.find(
@@ -191,6 +419,35 @@ export function ComputerCockpit({
     agentEligibility?.model === model ? agentEligibility.tier : computerUseTier;
   const effectiveAgentSource =
     agentEligibility?.model === model ? agentEligibility.source : computerCapabilitySource;
+
+  useEffect(() => {
+    if (emergencyKeysManaged || !sessionId || !run || isTerminal(run)) return;
+    const onEmergencyKey = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || !event.shiftKey || event.altKey || event.metaKey) return;
+      const key = event.key.toLowerCase();
+      if (key === "s") {
+        event.preventDefault();
+        void applyEmergency(
+          () => api.computerUseCockpitStop(sessionId, run.runId),
+          "Computer Run stopped.",
+        );
+      } else if (key === "t" && !hasOperatorTakeover(run)) {
+        event.preventDefault();
+        void applyEmergency(
+          () => api.computerUseCockpitTakeOver(sessionId, run.runId),
+          "You have control. All Computer Use authority was revoked.",
+        );
+      } else if (key === "p" && run.state !== "paused") {
+        event.preventDefault();
+        void applyEmergency(
+          () => api.computerUseCockpitPause(sessionId, run.runId),
+          "Computer Run paused.",
+        );
+      }
+    };
+    window.addEventListener("keydown", onEmergencyKey);
+    return () => window.removeEventListener("keydown", onEmergencyKey);
+  }, [applyEmergency, emergencyKeysManaged, run, sessionId]);
 
   const qualifyAgent = async () => {
     if (!sessionId) return;
@@ -225,8 +482,7 @@ export function ComputerCockpit({
         objective.trim(),
       );
       if (requestEpoch.current !== epoch) return;
-      setSnapshot(result.snapshot);
-      onRunState?.(result.snapshot.run?.state ?? null);
+      publishSnapshot(result.snapshot);
       setNotice(
         result.completed
           ? `Model marked the run complete: ${result.summary}`
@@ -285,12 +541,45 @@ export function ComputerCockpit({
       );
       setNativeTargets(eligible);
       setSelectedNativeToken(null);
+      setBackgroundReceipt(null);
+      setDisposableTargetAcknowledged(false);
       setScopeReviewed(false);
       setNotice(
         eligible.length ? "Choose one exact macOS window." : "No eligible windows found.",
       );
     } catch (reason) {
       if (requestEpoch.current === epoch) setError(String(reason));
+    } finally {
+      if (requestEpoch.current === epoch) setBusy(false);
+    }
+  };
+
+  const measureBackgroundTextEntry = async () => {
+    if (!sessionId || !selectedNativeTarget) return;
+    const epoch = requestEpoch.current;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const receipt = await api.computerUseMeasureBackgroundTextEntry(
+        sessionId,
+        selectedNativeTarget.selectionToken,
+        selectedNativeTarget.target.appId,
+        backgroundElementLabel.trim(),
+        backgroundProbeText,
+        disposableTargetAcknowledged,
+      );
+      if (requestEpoch.current !== epoch) return;
+      setBackgroundReceipt(receipt);
+      setScopeReviewed(false);
+      setNotice(
+        "Background text entry measured. The disposable value was restored; start this Run before the short-lived proof expires.",
+      );
+    } catch (reason) {
+      if (requestEpoch.current === epoch) {
+        setBackgroundReceipt(null);
+        setError(String(reason));
+      }
     } finally {
       if (requestEpoch.current === epoch) setBusy(false);
     }
@@ -307,6 +596,24 @@ export function ComputerCockpit({
         action,
       ),
     );
+  };
+
+  const reconcileUncertainSurface = async () => {
+    if (!sessionId || !run || !reconciliation || !reconciliationNote.trim()) return;
+    const succeeded = await apply(
+      () =>
+        api.computerUseCockpitReconcileUncertainSurface(
+          sessionId,
+          run.runId,
+          reconciliation.leaseId,
+          reconciliation.expectedRevision,
+          reconciliation.surfaceId,
+          reconciliation.incarnation,
+          reconciliationNote.trim(),
+        ),
+      "The uncertain dispatch was quarantined. No physical outcome was claimed.",
+    );
+    if (succeeded) setReconciliationNote("");
   };
 
   return (
@@ -380,7 +687,11 @@ export function ComputerCockpit({
               </h2>
             </div>
             <span className="computer-origin">
-              {launchMode === "simulator" ? "Local simulator" : "Native Accessibility"}
+              {launchMode === "simulator"
+                ? "Local simulator"
+                : nativeExecutionMode === "measured_background"
+                  ? "Native Accessibility · measured background"
+                  : "Native Accessibility · foreground"}
             </span>
           </div>
           <div className="computer-launch-mode" role="group" aria-label="Computer Run target type">
@@ -465,6 +776,8 @@ export function ComputerCockpit({
                         checked={selectedNativeToken === candidate.selectionToken}
                         onChange={() => {
                           setSelectedNativeToken(candidate.selectionToken);
+                          setBackgroundReceipt(null);
+                          setDisposableTargetAcknowledged(false);
                           setScopeReviewed(false);
                           setNotice(null);
                         }}
@@ -480,6 +793,114 @@ export function ComputerCockpit({
                   ))}
                 </div>
               )}
+              {selectedNativeTarget && (
+                <div className="computer-background-calibration">
+                  <div
+                    className="computer-launch-mode"
+                    role="group"
+                    aria-label="macOS semantic execution mode"
+                  >
+                    <button
+                      type="button"
+                      className={nativeExecutionMode === "foreground" ? "active" : ""}
+                      aria-pressed={nativeExecutionMode === "foreground"}
+                      onClick={() => {
+                        setNativeExecutionMode("foreground");
+                        setBackgroundReceipt(null);
+                        setScopeReviewed(false);
+                      }}
+                    >
+                      Foreground semantic
+                    </button>
+                    <button
+                      type="button"
+                      className={nativeExecutionMode === "measured_background" ? "active" : ""}
+                      aria-pressed={nativeExecutionMode === "measured_background"}
+                      onClick={() => {
+                        setNativeExecutionMode("measured_background");
+                        setScopeReviewed(false);
+                      }}
+                    >
+                      Measured background text
+                    </button>
+                  </div>
+                  {nativeExecutionMode === "measured_background" && (
+                    <div className="computer-background-probe">
+                      <p className="settings-hint is-warning">
+                        Calibration changes one visible text field, proves GrokPtah did not change
+                        your foreground app, active window, or pointer, then restores the original
+                        value. Use only a disposable target. Invoke, selection, scroll, hidden
+                        windows, and automatic foreground fallback remain unavailable.
+                      </p>
+                      <label>
+                        <span>Exact accessibility label</span>
+                        <input
+                          value={backgroundElementLabel}
+                          maxLength={256}
+                          onChange={(event) => {
+                            setBackgroundElementLabel(event.target.value);
+                            setBackgroundReceipt(null);
+                            setScopeReviewed(false);
+                          }}
+                        />
+                      </label>
+                      <label>
+                        <span>Temporary probe value</span>
+                        <input
+                          value={backgroundProbeText}
+                          maxLength={256}
+                          onChange={(event) => {
+                            setBackgroundProbeText(event.target.value);
+                            setBackgroundReceipt(null);
+                            setScopeReviewed(false);
+                          }}
+                        />
+                      </label>
+                      <label className="computer-scope-check">
+                        <input
+                          type="checkbox"
+                          checked={disposableTargetAcknowledged}
+                          onChange={(event) => {
+                            setDisposableTargetAcknowledged(event.target.checked);
+                            setBackgroundReceipt(null);
+                            setScopeReviewed(false);
+                          }}
+                        />
+                        This exact target is disposable and may be changed and restored
+                      </label>
+                      {selectedNativeTarget.active && (
+                        <p className="settings-hint is-warning" role="status">
+                          Put another app in front, then refresh the window list. Background
+                          calibration is denied while this target is active.
+                        </p>
+                      )}
+                      <button
+                        type="button"
+                        disabled={
+                          busy ||
+                          selectedNativeTarget.active ||
+                          !disposableTargetAcknowledged ||
+                          !backgroundElementLabel.trim() ||
+                          !backgroundProbeText
+                        }
+                        onClick={() => void measureBackgroundTextEntry()}
+                      >
+                        Calibrate and restore
+                      </button>
+                      {backgroundReceipt && (
+                        <p className="computer-background-proof" role="status">
+                          <strong>Measured for this exact target</strong>
+                          <span>
+                            Visible text entry only · proof valid for {Math.round(
+                              backgroundReceipt.validForMillis / 1000,
+                            )} seconds
+                          </span>
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
           <dl className="computer-scope-grid">
@@ -491,14 +912,23 @@ export function ComputerCockpit({
                   : selectedNativeTarget?.target.appId ?? "Choose a window above"}
               </dd>
             </div>
-            <div><dt>Allowed input</dt><dd>Semantic invoke and visible text entry</dd></div>
+            <div>
+              <dt>Allowed input</dt>
+              <dd>
+                {launchMode === "macos" && nativeExecutionMode === "measured_background"
+                  ? "Visible text entry on one measured element; no activation"
+                  : "Semantic invoke and visible text entry"}
+              </dd>
+            </div>
             <div><dt>Grant</dt><dd>One action, then pause</dd></div>
             <div>
               <dt>Evidence</dt>
               <dd>
                 {launchMode === "simulator"
                   ? "Semantic demo data; no screen capture"
-                  : "Redacted window capture and bounded Accessibility tree"}
+                  : nativeExecutionMode === "measured_background"
+                    ? "Redacted capture plus before/after foreground, active-window, and pointer equality"
+                    : "Redacted window capture and bounded Accessibility tree"}
               </dd>
             </div>
           </dl>
@@ -516,13 +946,20 @@ export function ComputerCockpit({
             disabled={
               !scopeReviewed ||
               busy ||
-              (launchMode === "macos" && !selectedNativeTarget)
+              (launchMode === "macos" && !selectedNativeTarget) ||
+              (launchMode === "macos" &&
+                nativeExecutionMode === "measured_background" &&
+                !backgroundReceipt)
             }
             title={
               !scopeReviewed
                 ? "Review and accept the exact scope first"
                 : launchMode === "macos" && !selectedNativeTarget
                   ? "Choose an exact macOS window first"
+                  : launchMode === "macos" &&
+                      nativeExecutionMode === "measured_background" &&
+                      !backgroundReceipt
+                    ? "Calibrate and restore the disposable target first"
                   : undefined
             }
             onClick={() =>
@@ -530,14 +967,23 @@ export function ComputerCockpit({
                 () =>
                   launchMode === "simulator"
                     ? api.computerUseCockpitStartSimulator(sessionId, SIMULATOR_APP_ID)
-                    : api.computerUseCockpitStartNative(
-                        sessionId,
-                        selectedNativeTarget?.selectionToken ?? "",
-                        selectedNativeTarget?.target.appId ?? "",
-                      ),
+                    : nativeExecutionMode === "measured_background"
+                      ? api.computerUseCockpitStartMeasuredBackground(
+                          sessionId,
+                          selectedNativeTarget?.selectionToken ?? "",
+                          backgroundReceipt?.measurementToken ?? "",
+                          selectedNativeTarget?.target.appId ?? "",
+                        )
+                      : api.computerUseCockpitStartNative(
+                          sessionId,
+                          selectedNativeTarget?.selectionToken ?? "",
+                          selectedNativeTarget?.target.appId ?? "",
+                        ),
                 launchMode === "simulator"
                   ? "Simulator observed. No action has run."
-                  : "macOS target observed. No action has run.",
+                  : nativeExecutionMode === "measured_background"
+                    ? "Measured background target observed. No action has run."
+                    : "macOS target observed. No action has run.",
               )
             }
           >
@@ -557,11 +1003,13 @@ export function ComputerCockpit({
             <div className="computer-control-actions">
               <button
                 type="button"
-                disabled={busy || run.state !== "ready"}
-                title={run.state !== "ready" ? "Pause is available while the run is ready" : undefined}
+                disabled={isTerminal(run) || run.state === "paused"}
+                title="Pause now · Control+Shift+P"
+                aria-keyshortcuts="Control+Shift+P"
                 onClick={() =>
-                  void apply(() =>
-                    api.computerUseCockpitPause(sessionId, run.runId, run.version),
+                  void applyEmergency(
+                    () => api.computerUseCockpitPause(sessionId, run.runId),
+                    "Computer Run paused.",
                   )
                 }
               >
@@ -569,10 +1017,12 @@ export function ComputerCockpit({
               </button>
               <button
                 type="button"
-                disabled={busy || isTerminal(run) || run.state === "paused"}
+                disabled={isTerminal(run) || hasOperatorTakeover(run)}
+                title="Take over now · Control+Shift+T"
+                aria-keyshortcuts="Control+Shift+T"
                 onClick={() =>
-                  void apply(
-                    () => api.computerUseCockpitTakeOver(sessionId, run.runId, run.version),
+                  void applyEmergency(
+                    () => api.computerUseCockpitTakeOver(sessionId, run.runId),
                     "You have control. All Computer Use authority was revoked.",
                   )
                 }
@@ -582,9 +1032,11 @@ export function ComputerCockpit({
               <button
                 type="button"
                 className="danger"
-                disabled={busy || isTerminal(run)}
+                disabled={isTerminal(run)}
+                title="Stop now · Control+Shift+S"
+                aria-keyshortcuts="Control+Shift+S"
                 onClick={() =>
-                  void apply(
+                  void applyEmergency(
                     () => api.computerUseCockpitStop(sessionId, run.runId),
                     "Computer Run stopped.",
                   )
@@ -595,6 +1047,53 @@ export function ComputerCockpit({
             </div>
           </div>
 
+          {eventReplay?.runId === run.runId && eventReplay.gapDetected && (
+            <div className="computer-replay-gap" role="alert">
+              <strong>Event history is incomplete</strong>
+              <span>
+                Some earlier durable events are no longer retained. This Run is
+                still exactly bound; Pause, Take over, and Stop remain available.
+              </span>
+            </div>
+          )}
+
+          {coordination && coordinationStatus && (
+            <section
+              className={`computer-coordination tone-${coordinationStatus.tone}`}
+              aria-labelledby="computer-coordination-title"
+              aria-live="polite"
+            >
+              <span className="computer-coordination-marker" aria-hidden />
+              <div className="computer-coordination-copy">
+                <span className="computer-section-label">Shared Computer Use surface</span>
+                <h2 id="computer-coordination-title">{coordinationStatus.label}</h2>
+                <p>{coordinationStatus.detail}</p>
+              </div>
+              <dl>
+                <div>
+                  <dt>Queue</dt>
+                  <dd>
+                    {coordination.queuePosition
+                      ? `${coordination.queuePosition} of ${coordination.queueDepth}`
+                      : coordination.queueDepth
+                        ? `${coordination.queueDepth} waiting`
+                        : "Clear"}
+                  </dd>
+                </div>
+                <div>
+                  <dt>Surface owner</dt>
+                  <dd>
+                    {coordination.active
+                      ? coordination.active.runId === run.runId
+                        ? "This agent"
+                        : coordination.active.agentId
+                      : "None"}
+                  </dd>
+                </div>
+              </dl>
+            </section>
+          )}
+
           <div className="computer-cockpit-grid">
             <div className="computer-observation-column">
               <div className="computer-section-heading">
@@ -602,8 +1101,21 @@ export function ComputerCockpit({
                   <span className="computer-section-label">Observation</span>
                   <h2>{simulatorRun ? "Demo form" : "Semantic snapshot"}</h2>
                 </div>
-                <span>{observation ? `Frame ${observation.sequence}` : "No live frame"}</span>
+                <div className="computer-observation-meta">
+                  <span>{observation ? `Frame ${observation.sequence}` : "No live frame"}</span>
+                  {agentProposalActive && (
+                    <span className="computer-agent-attention-summary">
+                      Agent attention · {agentAttentionLabel}
+                    </span>
+                  )}
+                </div>
               </div>
+              {agentProposalActive && (
+                <p className="computer-visually-hidden" role="status" aria-live="polite">
+                  Agent attention is on {agentAttentionLabel} inside the authorized
+                  GrokPtah surface. The operating-system pointer has not moved.
+                </p>
+              )}
               {simulatorRun ? (
                 <div className={`computer-demo-surface ${observation ? "is-observed" : ""}`}>
                   <label>
@@ -612,14 +1124,41 @@ export function ComputerCockpit({
                   </label>
                   <button type="button" disabled={!submitElement?.enabled}>Submit</button>
                   <output>{statusElement?.label ?? "Observation unavailable"}</output>
+                  {agentAttention && (
+                    <span
+                      className="computer-agent-cursor"
+                      data-testid="computer-agent-cursor"
+                      style={{
+                        left: `${agentAttention.xBasisPoints / 100}%`,
+                        top: `${agentAttention.yBasisPoints / 100}%`,
+                      }}
+                      title="App-rendered agent attention marker; operating-system pointer unchanged"
+                      aria-hidden
+                    >
+                      <span className="computer-agent-cursor-arrow">↖</span>
+                      <span className="computer-agent-cursor-label">Agent</span>
+                    </span>
+                  )}
                 </div>
               ) : (
                 <div className="computer-native-observation" aria-label="Observed macOS elements">
                   {(observation?.elements ?? []).slice(0, 48).map((element) => (
-                    <div key={element.elementId}>
+                    <div
+                      key={element.elementId}
+                      className={
+                        agentProposalActive && element.elementId === agentAttentionElementId
+                          ? "has-agent-attention"
+                          : ""
+                      }
+                    >
                       <span>{element.role.replace(/^AX/, "")}</span>
                       <strong>{element.label ?? element.value ?? "Unlabelled element"}</strong>
                       <small>{element.actions.join(" · ") || "read only"}</small>
+                      {agentProposalActive && element.elementId === agentAttentionElementId && (
+                        <span className="computer-native-agent-marker" aria-hidden>
+                          ↖ Agent
+                        </span>
+                      )}
                     </div>
                   ))}
                   {!observation?.elements.length && <span>No safe semantic elements exposed.</span>}
@@ -667,15 +1206,51 @@ export function ComputerCockpit({
                 <div><dt>Grant expires</dt><dd>{grantActive && run.grant ? new Date(run.grant.expiresAt).toLocaleTimeString() : "Revoked"}</dd></div>
                 <div><dt>Pointer fallback</dt><dd>Disabled</dd></div>
               </dl>
-              {run.lastOutcome && <div className="computer-outcome">{run.lastOutcome.summary}</div>}
               {run.lastError && (
                 <div className="computer-alert is-error" role="alert">
                   <strong>{titleCase(run.lastError.code)}</strong>
-                  <span>{run.lastError.message}</span>
                 </div>
               )}
             </aside>
           </div>
+
+          {reconciliation && (
+            <section className="computer-reconciliation" aria-labelledby="computer-reconciliation-title">
+              <div>
+                <span className="computer-section-label">Physical dispatch fence</span>
+                <h2 id="computer-reconciliation-title">Outcome needs local confirmation</h2>
+                <p>
+                  The action crossed the injection boundary, but its physical result is unknown.
+                  GrokPtah will not replay it or call it successful. Confirm that this exact
+                  surface is clear before releasing the safety fence.
+                </p>
+              </div>
+              <dl>
+                <div><dt>Surface</dt><dd>{run.target.displayName}</dd></div>
+                <div><dt>Lease revision</dt><dd>{reconciliation.expectedRevision}</dd></div>
+                <div><dt>Surface identity</dt><dd><code>{reconciliation.surfaceId}</code></dd></div>
+                <div><dt>Incarnation</dt><dd><code>{reconciliation.incarnation}</code></dd></div>
+              </dl>
+              <label>
+                Operator confirmation note
+                <textarea
+                  rows={2}
+                  maxLength={128}
+                  value={reconciliationNote}
+                  placeholder="I verified this exact surface is clear."
+                  onChange={(event) => setReconciliationNote(event.target.value)}
+                />
+              </label>
+              <button
+                type="button"
+                className="primary"
+                disabled={busy || !reconciliationNote.trim()}
+                onClick={() => void reconcileUncertainSurface()}
+              >
+                Quarantine and release fence
+              </button>
+            </section>
+          )}
 
           {run.state === "ready" && observation && !approval && (
             <div className="computer-proposal">
@@ -795,12 +1370,21 @@ export function ComputerCockpit({
           )}
 
           {approval && (
-            <div className="computer-approval" role="dialog" aria-label="Approve Computer Use action">
+            <div
+              ref={approvalDialogRef}
+              className="computer-approval"
+              role="dialog"
+              aria-label="Approve Computer Use action"
+              aria-modal="true"
+              aria-labelledby="computer-approval-title"
+              aria-describedby="computer-approval-details"
+              onKeyDown={trapApprovalFocus}
+            >
               <div className="computer-approval-title">
-                <div><span className="computer-section-label">Approval required</span><h2>{approval.actionSummary}</h2></div>
+                <div><span className="computer-section-label">Approval required</span><h2 id="computer-approval-title">{approval.actionSummary}</h2></div>
                 <span className="computer-risk">{approval.risk}</span>
               </div>
-              <dl>
+              <dl id="computer-approval-details">
                 <div><dt>Target</dt><dd>{approval.targetLabel}</dd></div>
                 <div><dt>Will send</dt><dd>{actionText(approval.action)}</dd></div>
                 <div><dt>Bound to</dt><dd>Frame {observation?.sequence ?? "expired"} · one use</dd></div>
@@ -809,10 +1393,11 @@ export function ComputerCockpit({
                 <button
                   type="button"
                   disabled={busy}
+                  aria-keyshortcuts="Escape"
                   onClick={() =>
-                    void apply(() => api.computerUseCockpitDiscardApproval(sessionId)).finally(() =>
-                      proposalFocus.current?.focus(),
-                    )
+                    void apply(() =>
+                      api.computerUseCockpitDiscardApproval(sessionId, run.runId),
+                    ).finally(() => proposalFocus.current?.focus())
                   }
                 >
                   Reject
@@ -821,12 +1406,12 @@ export function ComputerCockpit({
                   type="button"
                   className="primary"
                   disabled={busy}
-                  autoFocus
                   onClick={() =>
                     void apply(
                       () =>
                         api.computerUseCockpitApprove(
                           sessionId,
+                          run.runId,
                           approval.approvalId,
                           crypto.randomUUID(),
                         ),
@@ -907,12 +1492,25 @@ export function ComputerCockpit({
               </button>
             </div>
             <div className="computer-timeline">
-              <span className="computer-section-label">Audit timeline</span>
+              <div className="computer-timeline-heading">
+                <span className="computer-section-label">Audit timeline</span>
+                {eventReplay?.runId === run.runId && (
+                  <span>
+                    {eventReplay.lastEvent
+                      ? titleCase(eventReplay.lastEvent)
+                      : "Replay connected"}
+                    {eventReplay.cursor !== null ? ` · through #${eventReplay.cursor}` : ""}
+                  </span>
+                )}
+              </div>
               <ol>
                 {timeline.map((entry) => (
                   <li key={entry.sequence}>
                     <span>{entry.sequence}</span>
-                    <div><strong>{titleCase(entry.operation)}</strong><small>{titleCase(entry.disposition)}</small></div>
+                    <div>
+                      <strong>{titleCase(entry.surfaceEvent)}</strong>
+                      <small>{titleCase(entry.operation)} · {titleCase(entry.disposition)}</small>
+                    </div>
                   </li>
                 ))}
               </ol>

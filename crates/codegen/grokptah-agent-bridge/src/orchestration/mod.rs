@@ -2,11 +2,15 @@
 //!
 //! Pure policy + durable records live here; the MCP transport is a thin adapter.
 
+mod authority;
 mod authz;
 mod continuation;
 pub(crate) mod managed;
 mod manager;
 mod message;
+mod provider_attempt;
+mod public_run;
+mod quota;
 mod routine;
 mod service;
 mod store;
@@ -15,9 +19,14 @@ mod types;
 mod worker;
 mod workload;
 
+pub use authority::{
+    required_operation, role_ceiling, validate_tool_registry, AuthorityCapabilityDocument,
+    AuthorityOperation, AuthorityRole, AuthorityStamp, RuntimeHostKind,
+    AUTHORITY_CAPABILITY_SCHEMA, AUTHORITY_SCHEMA_VERSION,
+};
 pub use authz::{
-    authenticate_bearer, canonical_workspace, constant_time_eq, require_bearer, AuthContext,
-    AuthCredential, WorkspaceAllowlist,
+    canonical_workspace, constant_time_eq, AuthContext, AuthCredential, ComputerReadGrant,
+    WorkspaceAllowlist,
 };
 pub use continuation::{
     assemble_continuation_context, AgentContinuationPlan, ContinuationAssemblyFailure,
@@ -28,22 +37,46 @@ pub use continuation::{
 };
 pub use managed::{
     assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
-    select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedExecutionIntent,
-    ManagedExecutionPolicy, ManagedFinalizationOutcome, ManagedFinalizationRecord,
-    ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause, ManagedWorkMode,
-    NativeExecutorStatus, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS, MANAGED_EXECUTION_SCHEMA_VERSION,
-    MANAGED_FINALIZATION_SCHEMA_VERSION, MANAGED_TRUNCATION_MARKER,
+    select_relevant_managed_messages, truncate_utf8_to_bytes, ManagedAdmissionCapacity,
+    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome,
+    ManagedFinalizationRecord, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
+    ManagedWorkMode, NativeExecutorStatus, ProviderRoute, DEFAULT_NATIVE_EXECUTOR_INTERVAL_MS,
+    MANAGED_EXECUTION_SCHEMA_VERSION, MANAGED_FINALIZATION_SCHEMA_VERSION,
+    MANAGED_TRUNCATION_MARKER, MAX_CONCURRENT_PROVIDER_RUNS, PROVIDER_CEILING_EXHAUSTED,
 };
 pub use manager::{
     parse_manager_directive, ManagerCoordinationMode, ManagerCoordinationPolicy,
     ManagerDecisionRecord, ManagerDecisionState, ManagerDirective, ManagerDirectiveEnvelope,
-    ManagerNotification, ManagerPlan, ManagerPlanState, ManagerStep, ManagerStepSpec,
-    ManagerStepState, MANAGER_SCHEMA_VERSION, MAX_MANAGER_DIRECTIVE_BYTES, MAX_MANAGER_IN_FLIGHT,
-    MAX_MANAGER_REPLANS, MAX_MANAGER_STEPS,
+    ManagerMemoryAttribution, ManagerNotification, ManagerPlan, ManagerPlanState, ManagerStep,
+    ManagerStepSpec, ManagerStepState, MANAGER_SCHEMA_VERSION, MAX_MANAGER_DIRECTIVE_BYTES,
+    MAX_MANAGER_IN_FLIGHT, MAX_MANAGER_MEMORY_CONTEXT_BYTES, MAX_MANAGER_REPLANS,
+    MAX_MANAGER_STEPS,
 };
 pub use message::{
     message_activation_unsupported, MessageKind, MessagePage, WorkMessage, MAX_MESSAGE_BODY_BYTES,
     MESSAGE_SCHEMA_VERSION,
+};
+pub use provider_attempt::{
+    ProviderAttemptRecord, ProviderAttemptState, ProviderRetryClass, ProviderSendCertainty,
+    PROVIDER_ATTEMPT_SCHEMA_VERSION,
+};
+pub(crate) use public_run::scrub_route_secret_needles;
+pub use public_run::{
+    encode_public_run_receipt, page_public_runs, project_public_run, project_public_run_progress,
+    public_provider_route_keys_are_allowlisted, public_run_contains_forbidden_fields,
+    public_run_from_receipt, public_run_handoff_value, public_run_progress_to_value,
+    public_run_to_value, PublicChangeRecord, PublicCompletionClaims, PublicCompletionEvidence,
+    PublicCompletionObservations, PublicCompletionUsage, PublicProviderAttempt,
+    PublicProviderExecution, PublicProviderQuota, PublicProviderRouteSummary, PublicQuotaLimits,
+    PublicRun, PublicRunAggregates, PublicRunApproval, PublicRunBounds, PublicRunExecution,
+    PublicRunPage, PublicRunProgress, PublicRunProgressDetail, PublicTestObservation,
+    PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS, PUBLIC_PROVIDER_ROUTE_KEYS, PUBLIC_RUN_LIST_PAGE_LIMIT,
+    PUBLIC_RUN_RECEIPT_SCHEMA,
+};
+pub use quota::{
+    QuotaClass, QuotaLimits, QuotaPoolKey, QuotaPoolUsage, QuotaReservation, QuotaReservationState,
+    DEFAULT_MAX_IN_FLIGHT_RESERVATIONS, DEFAULT_MAX_REQUESTS_PER_WINDOW,
+    DEFAULT_MAX_TOKENS_PER_WINDOW, DEFAULT_QUOTA_WINDOW_MS, QUOTA_LEDGER_SCHEMA_VERSION,
 };
 pub use routine::{
     occurrence_dedupe_key, ActivationCause, ActivationDisposition, ActivationRecord,
@@ -55,7 +88,11 @@ pub use routine::{
 pub(crate) use service::apply_run_aggregate;
 pub use service::{OrchestrationConfig, OrchestrationService};
 pub(crate) use store::workspaces_match;
-pub use store::{IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport};
+pub use store::{
+    AdmissionPersistCut, DurableAdmission, IdempotencyClaim, OrchStore, ProviderAttemptPage,
+    RetentionPolicy, RetentionReport, UncertainAdmission, MAX_PROVIDER_ATTEMPTS_PER_RUN_PAGE,
+    MAX_PUBLIC_RUN_LIST,
+};
 pub use supervisor::{
     ManagerSupervisorReport, ManagerSupervisorStatus, RoutineSupervisor, RoutineSupervisorStatus,
     WorkloadSupervisor, WorkloadSupervisorStatus, DEFAULT_MANAGER_TICK_INTERVAL,
@@ -67,10 +104,11 @@ pub use types::{
     safe_id_filename, AgentAuthorityPolicy, AgentLaneAssociation, AgentMemoryPolicy,
     AgentModelSpec, AgentRecord, AgentResumePlan, AgentRuntimeState, AgentSpec, AgentState,
     AuditEntry, ChangeRecord, ContinuationCheckpoint, ContinuationReason, IdempotencyReceipt,
-    OrchError, OrchErrorCode, PromotionState, RunAggregates, RunApproval, RunBounds, RunExecution,
-    RunExecutionMode, RunProgress, RunPurpose, RunRecord, RunState, RunStopCause, TestObservation,
-    AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS, DEFAULT_AGENT_TOOL_IDS,
-    DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
+    OrchError, OrchErrorCode, PromotionState, ProviderRouteSnapshot, RunAggregates, RunApproval,
+    RunBounds, RunExecution, RunExecutionMode, RunProgress, RunPurpose, RunRecord, RunState,
+    RunStopCause, TestObservation, AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS,
+    DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS,
+    MAX_AGENT_CONTEXT_BYTES, PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use worker::{
     reject_privilege_amplification, MeasuredCapability, WorkerHostKind, WorkerLivenessState,
@@ -79,6 +117,6 @@ pub use worker::{
 pub use workload::{
     lease_duration, AssignmentStatus, AttemptState, WorkApproval, WorkArtifactRef, WorkAttempt,
     WorkAttemptView, WorkClaim, WorkDecision, WorkDecisionAction, WorkDependency, WorkItem,
-    WorkItemSnapshot, WorkPolicy, WorkProgress, WorkResult, WorkRetryPolicy, WorkState,
-    WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
+    WorkItemSnapshot, WorkPolicy, WorkProgress, WorkProviderRouteConstraint, WorkResult,
+    WorkRetryPolicy, WorkState, WorkloadReconciliationReport, WORKLOAD_SCHEMA_VERSION,
 };

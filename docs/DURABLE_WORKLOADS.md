@@ -22,6 +22,23 @@ may attach a new WorkItem to the same Agent and Lane without changing this
 ownership model. See [DURABLE_ROUTINES.md](DURABLE_ROUTINES.md) and
 [COORDINATOR_WORKERS.md](COORDINATOR_WORKERS.md).
 
+## Enterprise review materialization
+
+An admitted company-gateway review is decomposed into seven independent
+specialist passes. `EnterpriseReviewPlan::work_plan()` projects those passes
+into a secret-free `EnterpriseReviewWorkPlan`; each item carries a stable
+plan-bound work key and a bounded `WorkTemplate`. The host-authorized
+`OrchestrationService::create_enterprise_review_work_plan` helper materializes
+the projection through the ordinary durable-work path, using those keys as
+per-pass idempotency request IDs. If a broker or host restarts after only some
+passes were stored, retrying the same plan replays the completed WorkItems and
+creates only the remainder. The projection also retains validated,
+secret-free admission evidence for the exact route/model/policy binding. This
+is the execution foundation for the
+enterprise review lane, not live provider or quality certification; admission,
+worker credential binding, gateway attestation, and the paired campaign remain
+separate gates.
+
 ## State and lease contract
 
 Work starts in `queued`. Missing or unsuccessful dependencies make it
@@ -45,6 +62,14 @@ existing exclusive store lock and atomic writes. It supports crash/reopen
 recovery and serializes competing claims. It intentionally accepts only one
 concurrent attempt per WorkItem in this first slice; a multi-node scheduler,
 database backend, and approval-decision operation remain follow-on work.
+Named bearers can be narrowed to one durable Agent identity with
+`AuthCredential::with_agent_binding`; the service rejects cross-agent worker,
+heartbeat, assignment, and message mutations for such a bearer. The host can
+issue and install a canonical-workspace worker credential and rotate it in
+place without replacing the primary bearer; already-open streams revalidate a
+secret-free token fingerprint. Retained issuance/rotation evidence and an
+independent long-running multi-worker proof are still required for the Stage 6
+release gate.
 
 ## Service reconciliation
 
@@ -95,9 +120,12 @@ Mutation tools:
 
 Mutating calls use the existing durable request-id/idempotency mechanism. A
 replayed request returns the original response; the same request ID with a
-different payload is rejected. The authenticated service currently exposes a
-single operator-equivalent bearer token, so claimant identity is the current
-auth token ID. Per-principal authorization is a separate security milestone.
+different payload is rejected. Unbound coordinator credentials may act on
+behalf of in-scope Agent resources and remain attributable by auth token.
+Bound worker credentials resolve omitted claimant identity to their bound
+Agent and fail closed on cross-agent requests. Per-principal issuance,
+rotation, and the independent multi-worker outcome remain separate release
+milestones.
 
 The desktop's remote-service adapter advertises and decodes the two read tools
 into typed `DurableWorkItem`, `DurableWorkAttempt`, and `RemoteWorkSnapshot`
@@ -127,6 +155,8 @@ The bridge integration tests cover:
 - dependency blocking and unblocking;
 - approval-aware completion;
 - duplicate claims, wrong tokens, and durable attempt history;
+- bound-worker claimant fencing and distinct independent leases surviving a
+  store reopen;
 - create and claim idempotency, including conflicting replay rejection;
 - omission of `leaseTokenHash` from protocol responses;
 - progress and completion through the live loopback MCP server;

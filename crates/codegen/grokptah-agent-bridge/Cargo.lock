@@ -507,6 +507,7 @@ dependencies = [
  "parking_lot",
  "regex",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

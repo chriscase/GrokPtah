@@ -1,8 +1,15 @@
 # Build and CI performance
 
-GrokPtah keeps the ordinary uncached Cargo and npm paths fully supported.
-Compiler caching is an optional acceleration: a miss compiles normally, and
-cached objects never replace formatting, lint, test, or packaging commands.
+GrokPtah keeps an uncached Cargo and npm path for proofs and for CI that
+unsets `RUSTC_WRAPPER`. **Local macOS operator builds** require
+`RUSTC_WRAPPER=sccache` against a stable shared cache **after `sccache` is
+verified on PATH**. Cached objects never replace formatting, lint, test, or
+packaging commands.
+
+The local target policy is **repository-family reuse outside checkouts**, not
+a private `target/` under every worktree. Per-worktree and `/private/tmp`
+multi-GB targets are not the default. See [Authoritative local build-cache
+policy](#authoritative-local-build-cache-policy).
 
 ## Measured baseline
 
@@ -31,8 +38,10 @@ workload took 18.55 seconds with 165 of 165 cacheable compilations served
 from cache, a reproduced 71.6% reduction for that compile-only workload.
 
 Rust objects did not hit when the source worktree and target path both
-changed. Keep each worktree's Cargo target private; do not point concurrent
-worktrees at a shared writable target directory.
+changed. That measurement is why compatible sequential lanes now reuse one
+**stable repository-family `CARGO_TARGET_DIR` outside checkouts**, not a
+private target under each worktree. Concurrent or incompatible builds still
+must not share a writable target; see the policy below.
 
 ## Implementation results
 
@@ -47,12 +56,15 @@ Adversarial cache checks used disposable targets and retained command logs:
   incompatible objects were not reused.
 - A deliberately interrupted compile recovered successfully in 21.62
   seconds; the partial cache reported no read or write errors.
-- Two simultaneous compile clients, each with a private target, completed in
+- Two simultaneous compile clients, each with a **private** target, completed in
   61.74 and 60.75 seconds against one cache with no corruption or cache
-  errors. Different target paths again produced Rust misses.
+  errors. Different target paths again produced Rust misses. Concurrent
+  lanes still isolate; compatible **sequential** lanes now reuse one family
+  target so those misses are not the default.
 - The 2 GiB configured maximum was reported by `sccache`. Disposable targets
   and caches were removed only after exact-path checks, reclaiming about 25
-  GiB while preserving the logs. Active worktree targets were not deleted.
+  GiB while preserving the logs. Targets still in use were not deleted
+  (current cleanup still refuses active, protected, and shared-family paths).
 
 Hosted before/after timing and GitHub cache size are recorded from the exact
 pull-request head because the local disk backend is not equivalent to
@@ -72,23 +84,144 @@ avoid that race without skipping any tests. The resulting GitHub compiler
 cache occupied 412,458,826 bytes across 576 content-addressed entries; the
 existing npm cache occupied 29,930,510 bytes.
 
-## Optional local compiler cache
+## Authoritative local build-cache policy
 
-Install `sccache` separately, then enable it in a shell:
+This section supersedes the earlier “each worktree keeps a private Cargo
+target” / “`sccache` is optional” operator rule. It is the GrokPtah local
+macOS policy after reclaiming on the order of ~90 GiB of stray per-worktree
+and `/private/tmp` targets. GitHub Actions cache behavior is unchanged
+below; hosted runners do not use `~/Library/Caches/grokptah`.
+
+**Build artifacts are disposable. Source and commits are deliverables.**
+
+### 1. Required `sccache` (after verify)
 
 ```sh
-export SCCACHE_DIR="$HOME/Library/Caches/GrokPtah/sccache"
+command -v sccache
+sccache --show-stats
+export SCCACHE_DIR="$HOME/Library/Caches/grokptah/sccache"
 export SCCACHE_CACHE_SIZE=2G
 export RUSTC_WRAPPER=sccache
 export CARGO_INCREMENTAL=0
+mkdir -p -- "$SCCACHE_DIR"
 ```
 
-The cache is local to GrokPtah and bounded to 2 GiB. It may be reused by
-GrokPtah worktrees, but a hit is not guaranteed when absolute source or
-target paths differ. The build does not require `sccache`; omit these
-variables when it is unavailable.
+Do not export `RUSTC_WRAPPER=sccache` until `sccache` is on PATH and
+`--show-stats` (or an equivalent start) succeeds. The canonical cache is
+`~/Library/Caches/grokptah/sccache`. An older document used
+`~/Library/Caches/GrokPtah/sccache`; on case-insensitive APFS those paths
+may alias the same directory. New handoffs name the lowercase `grokptah`
+path.
 
-Useful focused commands:
+Uncached proof (not the default operator path):
+
+```sh
+env -u RUSTC_WRAPPER -u SCCACHE_DIR CARGO_INCREMENTAL=0 cargo test --locked
+```
+
+### 2. Repository-family `CARGO_TARGET_DIR` (compatible, non-concurrent)
+
+Compatible, **non-concurrent** lanes reuse **one** stable repository-family
+target **outside checkouts**:
+
+```text
+~/Library/Caches/grokptah/cargo-target/<family-key>/
+```
+
+Fence `<family-key>` so a hit is only reused when all of these match:
+
+- rustc/cargo toolchain (`rust-toolchain.toml` / `rustc -vV`)
+- rustc target triple
+- cargo features and profile (dev/release, and the exact feature set)
+- lock/dependency graph (the workspace `Cargo.lock` identity in use)
+
+Nested workspaces in this repo (desktop `src-tauri`,
+`crates/codegen/grokptah-agent-bridge`, generated root workspace) are
+**different families** when their lockfiles or profiles differ. Do not point
+them at one writable target.
+
+Example:
+
+```sh
+export CARGO_TARGET_DIR="$HOME/Library/Caches/grokptah/cargo-target/${FAMILY_KEY}"
+mkdir -p -- "$CARGO_TARGET_DIR"
+```
+
+### 3. Never concurrently share a writable target
+
+Two `cargo`/`rustc` processes must not share one writable `CARGO_TARGET_DIR`.
+Truly **concurrent** or **incompatible** (toolchain, triple, features/profile,
+or lock/dependency graph) builds get an **exact isolated target only for that
+lane**:
+
+```text
+~/Library/Caches/grokptah/cargo-target/isolated/<lane-id>/
+```
+
+Remove that isolated target when the lane is inactive, after the cleanup
+gates below. Do not leave isolated targets as a second default family.
+
+### 4. Forbidden default locations
+
+Never put multi-GB Cargo targets under:
+
+- `/private/tmp` or `/tmp`
+- the review/worktree checkout (`<worktree>/target`) **by default**
+
+A worktree-local `target/` is not the operator default. Isolated-lane
+directories still live under `~/Library/Caches/grokptah/cargo-target/isolated/`,
+not under `/private/tmp`.
+
+### 5. Cleanup gates (refuse by default)
+
+Before deleting a target or sccache directory:
+
+1. Record the **exact** path.
+2. Record **size** (`du -sh -- "$path"`).
+3. Record **owner**.
+4. Confirm **no `cargo` or `rustc` process** is using it.
+5. Confirm **no open handles** (`lsof` on that path).
+
+**Refuse** deletion when the path is active, protected, or a live
+shared-family target. Do not `rm -rf` a guessed `target`, `$TMPDIR`, or
+another project’s cache. Isolated inactive lanes may be removed only after
+those checks pass.
+
+Reset only the documented GrokPtah sccache path (equality check is
+intentional):
+
+```sh
+expected="$HOME/Library/Caches/grokptah/sccache"
+test "${SCCACHE_DIR:-}" = "$expected"
+sccache --stop-server
+# still refuse if cargo/rustc is running or the directory has open handles
+rm -rf -- "$expected"
+```
+
+Do not substitute an unresolved, empty, home, or shared-unrelated cache
+path.
+
+### 6. Handoffs and Stage 11 drill evidence
+
+Handoffs record `CARGO_TARGET_DIR`, `SCCACHE_DIR`, owner, and reason
+(`sequential-family-reuse`, `concurrent-isolation`, or
+`incompatible-isolation`).
+
+Stage 11 drill evidence must cover all of:
+
+- **compatible sequential reuse** — a second non-concurrent compatible lane
+  reuses the family target
+- **concurrent forced isolation** — overlapping builds get distinct isolated
+  targets; no shared writable target
+- **incompatible forced isolation** — toolchain/target/features/profile/lock
+  mismatch does not join the family directory
+- **crash cleanup** — an inactive isolated target is removed only after the
+  cleanup gates
+- **active-target deletion refusal** — cleanup refuses a live family or
+  in-use isolated path
+
+Useful focused commands (inherit the verified `RUSTC_WRAPPER` / family
+`CARGO_TARGET_DIR`):
 
 ```sh
 cd crates/codegen/grokptah-agent-bridge
@@ -99,34 +232,16 @@ cd ../../../../desktop/src-tauri
 cargo test --locked
 ```
 
-For a deliberately uncached proof:
-
-```sh
-env -u RUSTC_WRAPPER -u SCCACHE_DIR CARGO_INCREMENTAL=0 cargo test --locked
-```
-
-## Diagnostics and reset
+## Diagnostics
 
 Inspect cache effectiveness and disk pressure:
 
 ```sh
 sccache --show-stats
 du -sh -- "${SCCACHE_DIR:?SCCACHE_DIR is not set}"
-df -h .
+du -sh -- "${CARGO_TARGET_DIR:?CARGO_TARGET_DIR is not set}"
+df -h "$HOME/Library/Caches/grokptah"
 ```
-
-Reset only the documented GrokPtah cache path:
-
-```sh
-expected="$HOME/Library/Caches/GrokPtah/sccache"
-test "${SCCACHE_DIR:-}" = "$expected"
-sccache --stop-server
-rm -rf -- "$expected"
-```
-
-The equality check is intentional. Do not substitute an unresolved, empty,
-home, or shared cache path. Cargo build outputs are separate; use `cargo
-clean` from the intended workspace rather than deleting a guessed target.
 
 ## GitHub Actions cache
 

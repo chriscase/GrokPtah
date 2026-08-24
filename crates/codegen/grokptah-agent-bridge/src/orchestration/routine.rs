@@ -388,7 +388,7 @@ impl RoutineRetryPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkTemplate {
     pub kind: String,
     pub objective: String,

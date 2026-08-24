@@ -15,10 +15,36 @@ use tempfile::tempdir;
 use tokio::time::timeout;
 use uuid::Uuid;
 
+/// Isolated smoke tests must not capture a live provider route. Conformance
+/// (`ServiceEnv`) already sets `GROKPTAH_AGENT_OFFLINE=1`; this older harness
+/// did not, so `ptah_submit_task` failed closed on missing credentials instead
+/// of proving capacity, scope, and restart.
+struct IsolatedOffline {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl IsolatedOffline {
+    fn enable() -> Self {
+        let previous = std::env::var_os("GROKPTAH_AGENT_OFFLINE");
+        std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+        Self { previous }
+    }
+}
+
+impl Drop for IsolatedOffline {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("GROKPTAH_AGENT_OFFLINE", value),
+            None => std::env::remove_var("GROKPTAH_AGENT_OFFLINE"),
+        }
+    }
+}
+
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
     let _serial = home_override_serial();
+    let _offline = IsolatedOffline::enable();
     let home = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     set_grokptah_home_override(Some(home.path().to_path_buf()));
@@ -76,6 +102,9 @@ async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
     assert!(tools.iter().any(|tool| tool.name == "ptah_list_runs"));
     assert!(tools.iter().any(|tool| tool.name == "ptah_create_routine"));
     assert!(tools.iter().any(|tool| tool.name == "ptah_fire_routine"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool.name == "ptah_get_native_coding_readiness"));
 
     let created = client
         .call_tool(
@@ -142,6 +171,7 @@ async fn standalone_service_exposes_authenticated_mcp_and_readiness() {
 #[allow(clippy::await_holding_lock)]
 async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart() {
     let _serial = home_override_serial();
+    let _offline = IsolatedOffline::enable();
     let home = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let workspace_path = dunce::canonicalize(workspace.path()).unwrap();
@@ -250,6 +280,35 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
     );
     let submit_session_id =
         Uuid::parse_str(created.structured["sessionId"].as_str().unwrap()).unwrap();
+    // Isolated offline turns complete immediately. Fill both admission slots so
+    // the smoke submit stays queued; cancel then proves submit+cancel without a
+    // live provider, matching the capacity-matrix harness.
+    let hold_a = client
+        .call_tool(
+            "ptah_create_session",
+            json!({
+                "workspace": workspace_path,
+                "title": "Smoke capacity hold A",
+            }),
+        )
+        .await
+        .unwrap();
+    let hold_b = client
+        .call_tool(
+            "ptah_create_session",
+            json!({
+                "workspace": workspace_path,
+                "title": "Smoke capacity hold B",
+            }),
+        )
+        .await
+        .unwrap();
+    let hold_a_id = Uuid::parse_str(hold_a.structured["sessionId"].as_str().unwrap()).unwrap();
+    let hold_b_id = Uuid::parse_str(hold_b.structured["sessionId"].as_str().unwrap()).unwrap();
+    host.reserve_orchestration_turn("smoke-hold-a", hold_a_id)
+        .unwrap();
+    host.reserve_orchestration_turn("smoke-hold-b", hold_b_id)
+        .unwrap();
     let submitted = client
         .call_tool(
             "ptah_submit_task",
@@ -265,6 +324,7 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
         .await
         .unwrap();
     assert!(!submitted.is_error, "submit task: {:?}", submitted.raw);
+    assert_eq!(submitted.structured["state"], "queued");
     let submitted_run_id = submitted.structured["runId"].as_str().unwrap();
     assert_eq!(
         submitted.structured["sessionId"],
@@ -287,6 +347,8 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
         "cancel submitted task: {:?}",
         submitted_cancel.raw
     );
+    host.release_orchestration_turn("smoke-hold-a");
+    host.release_orchestration_turn("smoke-hold-b");
 
     let mut stream = client
         .open_event_stream(scope.clone(), Some(first_seq.saturating_sub(1)))
@@ -463,6 +525,7 @@ async fn service_mcp_contract_covers_scoped_live_reconnect_controls_and_restart(
 #[allow(clippy::await_holding_lock)]
 async fn service_capacity_and_scope_matrix_is_fail_closed() {
     let _serial = home_override_serial();
+    let _offline = IsolatedOffline::enable();
     let home = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let workspace_path = dunce::canonicalize(workspace.path()).unwrap();
@@ -637,6 +700,7 @@ fn seed_active_run(
             client_id: Some("mcp".into()),
             state: RunState::Running,
             purpose: Default::default(),
+            provider_route: None,
             agent_id: Some(agent_id.clone()),
             retry_of: None,
             parent_run_id: None,

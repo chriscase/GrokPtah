@@ -159,7 +159,7 @@ async fn project_scope_matches_desktop_service_and_isolated_model_tools_across_r
 
     // Discard removes only the execution worktree; the completed memory tool
     // write remains durable at the source-workspace address.
-    host.discard_run(session.id, run_id).unwrap();
+    host.discard_public_session_run(session.id, run_id).unwrap();
     assert_eq!(
         host.memory_list(session.id, MemoryScope::Project)
             .unwrap()
@@ -174,7 +174,7 @@ async fn project_scope_matches_desktop_service_and_isolated_model_tools_across_r
         .await
         .unwrap();
     let promoted_run = host
-        .list_session_runs(session.id)
+        .list_public_session_runs(session.id)
         .unwrap()
         .into_iter()
         .filter(|run| run.run_id != run_id)
@@ -187,7 +187,8 @@ async fn project_scope_matches_desktop_service_and_isolated_model_tools_across_r
     )
     .unwrap();
     host.review_run(session.id, &promoted_run.run_id).unwrap();
-    host.promote_run(session.id, &promoted_run.run_id).unwrap();
+    host.promote_public_session_run(session.id, &promoted_run.run_id, None)
+        .unwrap();
     assert_eq!(
         fs::read_to_string(workspace.path().join("promoted.txt")).unwrap(),
         "promoted content"
@@ -249,6 +250,52 @@ async fn project_scope_matches_desktop_service_and_isolated_model_tools_across_r
             "fact retained through promotion",
         ]
     );
+}
+
+#[tokio::test]
+async fn versioned_memory_writes_replay_and_reject_payload_reuse() {
+    let _process = IsolatedProcess::install();
+    let workspace = fixture_repo();
+    let host = started_host(workspace.path());
+    let session = host.session_new().unwrap();
+
+    let first = host
+        .memory_remember_versioned(
+            session.id,
+            MemoryScope::Project,
+            "decision-1",
+            "Use the provider route frozen at admission",
+            "provider-route",
+            vec!["decision".into()],
+        )
+        .unwrap();
+    assert_eq!(first.1, 1);
+    assert!(!first.2);
+
+    let replay = host
+        .memory_remember_versioned(
+            session.id,
+            MemoryScope::Project,
+            "decision-1",
+            "Use the provider route frozen at admission",
+            "provider-route",
+            vec!["decision".into()],
+        )
+        .unwrap();
+    assert_eq!(replay, (first.0.clone(), 1, true));
+
+    let conflict = host.memory_remember_versioned(
+        session.id,
+        MemoryScope::Project,
+        "decision-1",
+        "Silently switch providers",
+        "provider-route",
+        vec!["decision".into()],
+    );
+    assert!(conflict.is_err());
+    let facts = host.memory_list(session.id, MemoryScope::Project).unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].id, first.0);
 }
 
 #[tokio::test]

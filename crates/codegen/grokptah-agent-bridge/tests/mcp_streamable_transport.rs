@@ -9,14 +9,14 @@ use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord, RunState,
-    WorkspaceAllowlist,
+    AuthCredential, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, RunRecord,
+    RunState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     canonical_workspace_string, set_grokptah_home_override, start_control_from_env,
     start_control_server, start_control_server_with, ActionClass, ActionGrant, AgentHost,
-    ComputerRun, ComputerUseService, ControlServerLimits, GrantIssuer, HostConfig,
-    McpControlClient, SessionKind, SimulatorBackend, CONTROL_TOOLS,
+    ComputerRun, ComputerUseService, ControlServerLimits, HostConfig, McpControlClient,
+    SessionKind, SimulatorBackend, CONTROL_TOOLS,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -56,6 +56,15 @@ fn setup() -> (
     (home, guard, host, ws, orch)
 }
 
+async fn initialized_session(addr: std::net::SocketAddr) -> String {
+    let mut client = McpControlClient::new(format!("http://{addr}"), "stream-token-200");
+    client.initialize().await.unwrap();
+    client
+        .session_id()
+        .expect("initialize must bind the transport session")
+        .to_string()
+}
+
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn streamable_compat_client_session_and_tools() {
@@ -68,7 +77,11 @@ async fn streamable_compat_client_session_and_tools() {
     assert!(init["protocolVersion"].as_str().unwrap().starts_with("202"));
     assert!(client.session_id().is_some());
     let tools = client.list_tools().await.unwrap();
-    assert_eq!(tools.len(), CONTROL_TOOLS.len());
+    let advertised = init["_meta"]["grokptah/authorityCapabilities"]["tools"]
+        .as_array()
+        .expect("initialize must advertise the bound capability document");
+    assert_eq!(tools.len(), advertised.len());
+    assert!(tools.len() < CONTROL_TOOLS.len());
     let cap = client
         .call_tool("ptah_get_capacity", json!({}))
         .await
@@ -237,6 +250,17 @@ async fn unauthenticated_and_oversized_fail_closed() {
         .await
         .unwrap();
     assert_eq!(unauth.status(), 401);
+
+    // Authentication must precede JSON parsing, so malformed unauthenticated
+    // input cannot probe the parser or session boundary.
+    let unauth_malformed = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body("{not-json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth_malformed.status(), 401);
 
     // Oversized body (auth present) — body limit 256KiB
     let big = "x".repeat(300_000);
@@ -444,7 +468,11 @@ async fn independent_node_mcp_sdk_interop() {
     );
     let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(report["ok"], true);
-    assert!(report["toolCount"].as_u64().unwrap() >= CONTROL_TOOLS.len() as u64);
+    let auth = orch.auth_header(Some("Bearer stream-token-200")).unwrap();
+    assert_eq!(
+        report["toolCount"].as_u64().unwrap(),
+        auth.capability_document().tools.len() as u64
+    );
     // Prefer official SDK path success when available.
     if report.get("sdkOk") == Some(&json!(false)) {
         eprintln!(
@@ -700,6 +728,11 @@ async fn session_map_hard_capped_under_initialize_spam() {
         "evicted session still accepted: {}",
         stale.status()
     );
+    let stale_body: serde_json::Value = stale.json().await.unwrap();
+    assert_eq!(
+        stale_body["error"]["data"]["code"], "unknown_session",
+        "evicted MCP transport session must be typed, not application invalid_request: {stale_body}"
+    );
     srv.stop();
     set_grokptah_home_override(None);
 }
@@ -751,6 +784,7 @@ async fn concurrency_cap_returns_429() {
         .unwrap();
     let url = format!("http://{}/mcp", srv.addr);
     let http = reqwest::Client::new();
+    let mcp_session = initialized_session(srv.addr).await;
     let body = json!({
         "jsonrpc":"2.0","id":1,"method":"tools/list","params":{}
     });
@@ -759,9 +793,11 @@ async fn concurrency_cap_returns_429() {
         let http = http.clone();
         let url = url.clone();
         let body = body.clone();
+        let mcp_session = mcp_session.clone();
         tokio::spawn(async move {
             http.post(&url)
                 .header("Authorization", "Bearer stream-token-200")
+                .header("mcp-session-id", &mcp_session)
                 .header("Content-Type", "application/json")
                 .json(&body)
                 .send()
@@ -772,9 +808,11 @@ async fn concurrency_cap_returns_429() {
         let http = http.clone();
         let url = url.clone();
         let body = body.clone();
+        let mcp_session = mcp_session.clone();
         tokio::spawn(async move {
             http.post(&url)
                 .header("Authorization", "Bearer stream-token-200")
+                .header("mcp-session-id", &mcp_session)
                 .header("Content-Type", "application/json")
                 .json(&body)
                 .send()
@@ -787,6 +825,7 @@ async fn concurrency_cap_returns_429() {
     let overflow = http
         .post(&url)
         .header("Authorization", "Bearer stream-token-200")
+        .header("mcp-session-id", &mcp_session)
         .header("Content-Type", "application/json")
         .json(&body)
         .send()
@@ -821,9 +860,11 @@ async fn request_timeout_returns_error() {
         .await
         .unwrap();
     let url = format!("http://{}/mcp", srv.addr);
+    let mcp_session = initialized_session(srv.addr).await;
     let resp = reqwest::Client::new()
         .post(&url)
         .header("Authorization", "Bearer stream-token-200")
+        .header("mcp-session-id", mcp_session)
         .header("Content-Type", "application/json")
         .json(&json!({
             "jsonrpc":"2.0","id":42,"method":"tools/list","params":{}
@@ -859,6 +900,7 @@ async fn unknown_and_forbidden_tools_fail_closed_over_http() {
     let srv = start_control_server(orch.clone(), 0).await.unwrap();
     let url = format!("http://{}/mcp", srv.addr);
     let http = reqwest::Client::new();
+    let mcp_session = initialized_session(srv.addr).await;
     for (name, expect_fragment) in [
         ("run_terminal_cmd", "not available"),
         ("ptah_shell", "not available"),
@@ -868,6 +910,7 @@ async fn unknown_and_forbidden_tools_fail_closed_over_http() {
         let resp = http
             .post(&url)
             .header("Authorization", "Bearer stream-token-200")
+            .header("mcp-session-id", &mcp_session)
             .header("Content-Type", "application/json")
             .json(&json!({
                 "jsonrpc":"2.0","id":7,"method":"tools/call",
@@ -1226,6 +1269,7 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
             client_id: Some("mcp".into()),
             state: RunState::Interrupted,
             purpose: Default::default(),
+            provider_route: None,
             agent_id: None,
             retry_of: None,
             parent_run_id: None,
@@ -1330,6 +1374,12 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
 async fn mcp_isolated_run_review_approval_and_restart_promotion() {
     std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock, host, ws, orch) = setup();
+    orch.set_auth_credentials(vec![AuthCredential::operator(
+        "primary",
+        "stream-token-200",
+    )
+    .unwrap()])
+        .unwrap();
     std::fs::write(ws.path().join("README.md"), "baseline\n").unwrap();
     for args in [
         vec!["init"],
@@ -1510,6 +1560,13 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
             bounds: RunBounds::default(),
         },
     );
+    orch2
+        .set_auth_credentials(vec![AuthCredential::operator(
+            "primary",
+            "stream-token-200",
+        )
+        .unwrap()])
+        .unwrap();
     let srv2 = start_control_server(orch2.clone(), 0).await.unwrap();
     let mut client2 = McpControlClient::new(format!("http://{}", srv2.addr), "stream-token-200");
     client2.initialize().await.unwrap();
@@ -2190,17 +2247,13 @@ fn desktop_computer_use_shares_the_host_store() {
 
 fn smoke_grant(run: &ComputerRun) -> ActionGrant {
     let now = Utc::now();
-    ActionGrant {
-        grant_id: format!("smoke-grant-{}", run.run_id),
-        run_id: run.run_id.clone(),
-        target: run.target.clone(),
-        action_classes: std::collections::BTreeSet::from([ActionClass::Semantic]),
-        issued_by: GrantIssuer::LocalUser,
-        issued_at: now,
-        expires_at: now + ChronoDuration::minutes(10),
-        uses_remaining: None,
-        revoked_at: None,
-    }
+    ActionGrant::for_run(
+        run,
+        std::collections::BTreeSet::from([ActionClass::Semantic]),
+        now,
+        now + ChronoDuration::minutes(10),
+        None,
+    )
 }
 
 /// Live desktop-equivalent proof for the read-only Computer Run tools: the
@@ -2211,7 +2264,7 @@ fn smoke_grant(run: &ComputerRun) -> ActionGrant {
 /// duplicate replay, stale-cursor recovery, cross-session/workspace
 /// rejection, capacity, auth-before-body, and reconnect replay.
 #[tokio::test]
-async fn live_computer_reads_node_smoke() {
+async fn remote_bearer_computer_reads_fail_closed() {
     let mut env = ProcessEnvGuard::new();
     let home = tempdir().unwrap();
     let ws = tempdir().unwrap();
@@ -2234,16 +2287,18 @@ async fn live_computer_reads_node_smoke() {
 
     let canon = canonical_workspace_string(ws.path()).unwrap();
     let canon_other = canonical_workspace_string(ws_other.path()).unwrap();
-    let computer = ComputerUseService::new(
+    let computer = ComputerUseService::new_simulator(
         std::sync::Arc::new(SimulatorBackend::new()),
         host.ensure_computer_store().unwrap(),
     );
 
     // Run A: bound, authorized, observed — projection metadata plus journal.
+    host.session_load(session.id).unwrap();
+    let caller_a = host.computer_operator_token(session.id).unwrap();
     let run_a = computer
         .create_run(
             "smoke-create-a",
-            session.id,
+            &caller_a,
             Some(canon.clone()),
             SimulatorBackend::demo_target(),
             Default::default(),
@@ -2252,21 +2307,24 @@ async fn live_computer_reads_node_smoke() {
     let run_a = computer
         .authorize(
             "smoke-grant-a",
+            &caller_a,
             &run_a.run_id,
             run_a.version,
             smoke_grant(&run_a),
         )
         .unwrap();
     computer
-        .observe("smoke-observe-a", &run_a.run_id, run_a.version)
+        .observe("smoke-observe-a", &caller_a, &run_a.run_id, run_a.version)
         .await
         .unwrap();
 
     // Run B: another session's run in another workspace — the rejection target.
+    host.session_load(other_session.id).unwrap();
+    let caller_b = host.computer_operator_token(other_session.id).unwrap();
     let run_b = computer
         .create_run(
             "smoke-create-b",
-            other_session.id,
+            &caller_b,
             Some(canon_other),
             SimulatorBackend::demo_target(),
             Default::default(),
@@ -2275,10 +2333,12 @@ async fn live_computer_reads_node_smoke() {
 
     // Run C: journal driven past the bounded ring so an early cursor is
     // genuinely evicted on the wire, using only public service operations.
+    host.session_load(session.id).unwrap();
+    let caller_a = host.computer_operator_token(session.id).unwrap();
     let run_c = computer
         .create_run(
             "smoke-create-c",
-            session.id,
+            &caller_a,
             Some(canon.clone()),
             SimulatorBackend::demo_target(),
             Default::default(),
@@ -2287,6 +2347,7 @@ async fn live_computer_reads_node_smoke() {
     let run_c = computer
         .authorize(
             "smoke-grant-c",
+            &caller_a,
             &run_c.run_id,
             run_c.version,
             smoke_grant(&run_c),
@@ -2296,7 +2357,12 @@ async fn live_computer_reads_node_smoke() {
     let mut spins = 0u32;
     loop {
         computer
-            .observe(&format!("smoke-observe-c-{spins}"), &run_c.run_id, version)
+            .observe(
+                &format!("smoke-observe-c-{spins}"),
+                &caller_a,
+                &run_c.run_id,
+                version,
+            )
             .await
             .unwrap();
         let current = computer.get_run(&run_c.run_id).unwrap().unwrap();
@@ -2327,38 +2393,52 @@ async fn live_computer_reads_node_smoke() {
         .await
         .expect("desktop env bootstrap must start control server");
     assert!(srv.addr.ip().is_loopback());
-
-    let url = format!("http://{}/mcp", srv.addr);
-    let sdk_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mcp_sdk_interop");
-    let output = tokio::process::Command::new("node")
-        .arg(sdk_dir.join("run_computer_reads_smoke.mjs"))
-        .env("GROKPTAH_MCP_URL", &url)
-        .env("GROKPTAH_MCP_TOKEN", &token)
-        .env("GROKPTAH_MCP_SESSION_ID", session.id.to_string())
-        .env("GROKPTAH_MCP_WORKSPACE", ws.path().display().to_string())
-        .env(
-            "GROKPTAH_MCP_OTHER_WORKSPACE",
-            ws_other.path().display().to_string(),
+    srv.orchestration_service()
+        .set_auth_credentials(vec![AuthCredential::with_computer_read_grant(
+            "primary",
+            &token,
+            session.id,
+            ws.path(),
         )
-        .env("GROKPTAH_MCP_COMPUTER_RUN_A", &run_a.run_id)
-        .env("GROKPTAH_MCP_COMPUTER_RUN_B", &run_b.run_id)
-        .env("GROKPTAH_MCP_COMPUTER_RUN_C", &run_c.run_id)
-        .output()
-        .await
-        .expect("spawn computer reads smoke");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "computer reads smoke failed\nstdout={stdout}\nstderr={stderr}"
+        .unwrap()])
+        .unwrap();
+
+    let mut client = McpControlClient::new(format!("http://{}", srv.addr), &token);
+    let initialized = client.initialize().await.unwrap();
+    assert_eq!(
+        initialized["_meta"]["grokptah/authorityCapabilities"]["hardDenials"],
+        json!(["approval", "promotion", "computer_use"])
     );
-    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(report["ok"], true, "computer reads smoke report={report}");
-    if let Some(failed) = report["failed"].as_array() {
-        assert!(failed.is_empty(), "failed checks: {failed:?}");
+    let tools = client.list_tools().await.unwrap();
+    for name in [
+        "ptah_list_computer_runs",
+        "ptah_get_computer_run",
+        "ptah_get_computer_run_events",
+        "ptah_get_computer_capacity",
+    ] {
+        assert!(
+            tools.iter().all(|tool| tool.name != name),
+            "remote bearer must not discover {name}"
+        );
     }
-    // Durable transcript for verifiers (`--nocapture`).
-    eprintln!("LIVE_COMPUTER_READS_SMOKE_REPORT {report}");
+    let denied = client
+        .call_tool(
+            "ptah_list_computer_runs",
+            json!({
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string()
+            }),
+        )
+        .await
+        .expect_err("undiscoverable remote Computer read must fail closed");
+    let encoded = denied.to_string();
+    assert!(encoded.contains("unknown tool"));
+    for run_id in [&run_a.run_id, &run_b.run_id, &run_c.run_id] {
+        assert!(
+            !encoded.contains(run_id),
+            "denial must not reveal Computer Run identity"
+        );
+    }
 
     srv.stop_and_wait().await;
     set_grokptah_home_override(None);

@@ -304,7 +304,9 @@ rejected.
 
 `ptah_get_run`, `ptah_list_runs`, and `ptah_get_handoff` expose the applied
 `bounds`, cumulative `usage`, `usageComplete`, `usagePendingRequests`, and typed
-`stopCause`. Accounting
+`stopCause`. `ptah_list_runs`, `ptah_get_run`, and `ptah_get_progress` serialize
+the allowlisted public Run projection; they omit the frozen `providerRoute`
+snapshot (base URL, credential ref/fingerprint, endpoint fingerprint). Accounting
 is persisted after each provider response rather than reconstructed from the
 process-local `/usage` counter, so a restart cannot turn consumed tokens back
 into zero. Enforcement happens at model-round boundaries: the response that

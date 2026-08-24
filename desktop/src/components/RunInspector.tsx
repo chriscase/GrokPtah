@@ -11,6 +11,8 @@ import { StateCard } from "./StateCard";
 
 type RunInspectorProps = {
   runs: DurableRun[];
+  totalCount?: number;
+  truncated?: boolean;
   laneTitle?: string | null;
   runtimeLabel?: string | null;
   scope?: LaneScope;
@@ -146,6 +148,8 @@ function eventLabel(update: SessionUpdate): string {
 
 export function RunInspector({
   runs,
+  totalCount,
+  truncated = false,
   laneTitle = null,
   runtimeLabel = null,
   scope,
@@ -399,6 +403,13 @@ export function RunInspector({
           <span>Watch live</span>
         </label>
       </div>
+
+      {truncated ? (
+        <p className="run-inspector-truncated" role="status">
+          Showing {runs.length} of {totalCount ?? runs.length} durable Runs.
+          Older Runs are omitted from this page.
+        </p>
+      ) : null}
 
       {error ? (
         <StateCard

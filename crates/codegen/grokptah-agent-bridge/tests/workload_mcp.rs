@@ -3,8 +3,8 @@
 mod common;
 
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkPolicy, WorkRetryPolicy,
-    WorkspaceAllowlist,
+    AuthCredential, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkPolicy,
+    WorkRetryPolicy, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
@@ -42,6 +42,12 @@ async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
             bounds: RunBounds::default(),
         },
     );
+    orch.set_auth_credentials(vec![AuthCredential::operator(
+        "primary",
+        "workload-token-305",
+    )
+    .unwrap()])
+        .unwrap();
     let server = start_control_server(orch, 0).await.unwrap();
     let mut client = McpControlClient::new(format!("http://{}", server.addr), "workload-token-305");
     client.initialize().await.unwrap();
@@ -120,24 +126,26 @@ async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
         .unwrap();
     assert_eq!(claim_replay.structured["attempt"]["attemptId"], attempt_id);
     assert_eq!(claim_replay.structured["leaseToken"], lease_token);
-    let receipt_name = format!(
-        "{}.json",
-        grokptah_agent_bridge::safe_id_filename("work-claim-305").unwrap()
-    );
-    let receipt_paths = [
-        home.path()
-            .join("orchestration")
-            .join("idempotency")
-            .join(&receipt_name),
+    let receipt_dirs = [
+        home.path().join("orchestration").join("idempotency"),
         home.path()
             .join(".grokptah")
             .join("orchestration")
-            .join("idempotency")
-            .join(&receipt_name),
+            .join("idempotency"),
     ];
-    let claim_receipt = receipt_paths
+    let claim_receipt = receipt_dirs
         .iter()
-        .find_map(|path| std::fs::read_to_string(path).ok())
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .find(|receipt| {
+            serde_json::from_str::<serde_json::Value>(receipt)
+                .ok()
+                .and_then(|value| value["tool"].as_str().map(str::to_owned))
+                .as_deref()
+                == Some("ptah_claim_work")
+        })
         .expect("durable claim receipt");
     assert!(!claim_receipt.contains("leaseToken"));
 

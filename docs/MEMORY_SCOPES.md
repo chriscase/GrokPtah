@@ -39,12 +39,30 @@ Project memory keeps the existing file and JSON format:
 ~/.grokptah/memory/<source-workspace-hash>.json
 ```
 
-Existing project facts therefore require no rewrite or one-time migration and
-remain visible after upgrade. Agent-private and team files use separate hashed
-paths under `~/.grokptah/memory/scopes/<source-workspace-hash>/`; IDs are
-validated and hashed before they become filenames. Fact content, exact-text
-deduplication, substring ranking, the 80-fact bound, per-fact character bound,
-and injected-context bound are unchanged.
+Existing project facts require no rewrite or one-time migration and remain
+visible after upgrade. Agent-private and team files use separate hashed paths
+under `~/.grokptah/memory/scopes/<source-workspace-hash>/`; IDs are validated
+and hashed before they become filenames.
+
+The v2 hot store adds host-stamped idempotency receipts, claim keys, revisions,
+compare-and-swap supersession, validity windows, surfaced conflicting heads,
+critical-fact protection, and bounded compaction. Retrieval excludes expired
+and superseded facts from the current view, reports unresolved conflicts, and
+keeps each scope independent. The exact ceilings remain enforced for facts,
+fact/tag/query sizes, receipts, persisted bytes, critical bytes, files, scope
+footprint, and the 6,000-byte injected project context.
+
+## Manager occurrence attribution
+
+An autonomous manager decision captures project memory once, under the exact
+AgentSpec revision active when the occurrence is created. The durable
+attribution binds the source workspace, the complete canonical memory policy,
+the exact quoted context and its byte count, and the decision Work objective.
+The proposal Run receives no second ambient memory injection and has no tool
+authority, so it cannot read agent-private/team memory or observe later project
+facts. Objective, AgentSpec, policy, context, or directive-digest drift fails
+closed before it can mutate a manager plan. See
+[`MANAGER_PLANS.md`](MANAGER_PLANS.md#durable-manager-decisions).
 
 ## Promotion, discard, and retention
 

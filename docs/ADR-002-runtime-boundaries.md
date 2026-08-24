@@ -97,15 +97,17 @@ The desktop and service are not assumed to have identical capabilities.
 The same domain record may therefore project different *available actions* on
 different hosts while preserving identical durable identity and state.
 
-Today the service exposes a static tool surface over `HostConfig::default()`;
-it does not yet advertise a declared capability document. Its shipped surface
-includes allowlisted Build-session creation/discovery, bounded run and queue
-control, durable history/events/checkpoints, explicit persistent-agent resume,
-review/approval/promotion for isolated runs, and scoped Computer Run reads when
-compiled on a capable host. Explicit capability advertisement is a required
-future contract before workload assignment may select a worker by capability.
-That contract must define stable capability identifiers, the host/version that
-asserted them, attempt-time capture, and typed unsupported/forbidden failures.
+On `origin/main` the service still exposes a static tool surface over
+`HostConfig::default()` and does not advertise a declared host-capability
+document. The current dream candidate binds stable host capability IDs,
+opaque runtime-home-derived instance identity, host kind, and bridge version
+into the versioned authority capability document returned at initialize. The
+desktop declares `desktop_local`; `grokptah-service` declares
+`standalone_service`; an undeclared Computer mutation fails with a typed
+`forbidden_scope` result rather than falling back. The shared black-box fixture
+checks those facts at initial connection and across owned restart. This remains
+candidate implementation, not Stage 4 certification, until an immutable
+exact-head golden, hosted CI, and the full parity exit pass.
 
 Hosted mode additionally requires host-level confinement: a dedicated service
 account plus systemd, container, VM, or equivalent policy limiting writable

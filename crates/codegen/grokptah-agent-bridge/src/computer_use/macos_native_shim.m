@@ -3,13 +3,21 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <Foundation/Foundation.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
+#import <Security/Security.h>
 
 #include <stdbool.h>
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <math.h>
 #include <stdlib.h>
+#include <spawn.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 typedef struct {
     int32_t status;
@@ -20,6 +28,40 @@ typedef struct {
     uint8_t *error;
     size_t error_len;
 } GPTMacNativeResult;
+
+typedef struct {
+    bool operating_system_supported;
+    bool framework_available;
+} GPTMacVirtualizationProbe;
+
+typedef struct {
+    int32_t status;
+    int32_t helper_fd;
+    int32_t guest_image_fd;
+    int32_t configuration_fd;
+    uint8_t *requirement_data;
+    size_t requirement_data_len;
+    uint8_t *error;
+    size_t error_len;
+} GPTMacIsolatedArtifactsResult;
+
+typedef struct {
+    int32_t status;
+    int32_t pid;
+    int32_t control_fd;
+    int32_t event_fd;
+    int32_t input_fd;
+    int32_t frame_fd;
+    int32_t challenge_fd;
+    uint8_t *error;
+    size_t error_len;
+} GPTMacIsolatedRuntimeSpawnResult;
+
+enum {
+    // Keep the inherited descriptor contract named at the native boundary;
+    // the helper and source verifier use the same fixed private channel.
+    GPT_CHALLENGE_FD = 9,
+};
 
 enum {
     GPT_MAC_OK = 0,
@@ -32,7 +74,95 @@ enum {
     GPT_MAC_BACKEND_FAILURE = 7,
     GPT_MAC_INVALID_REQUEST = 8,
     GPT_MAC_FORBIDDEN_ACTION = 9,
+    GPT_MAC_INTERRUPTED = 10,
+    GPT_MAC_UNCERTAIN_OUTCOME = 11,
+    GPT_MAC_BACKEND_UNAVAILABLE = 12,
+    GPT_MAC_UNAUTHORIZED = 13,
 };
+
+typedef struct {
+    atomic_bool signalled;
+} GPTMacActionCancellation;
+
+void *gpt_macos_cancellation_create(void) {
+    GPTMacActionCancellation *cancellation = malloc(sizeof(GPTMacActionCancellation));
+    if (cancellation != NULL) {
+        atomic_init(&cancellation->signalled, false);
+    }
+    return cancellation;
+}
+
+void gpt_macos_cancellation_signal(void *context) {
+    if (context != NULL) {
+        GPTMacActionCancellation *cancellation = context;
+        atomic_store_explicit(&cancellation->signalled, true, memory_order_seq_cst);
+    }
+}
+
+bool gpt_macos_cancellation_is_signalled(const void *context) {
+    if (context == NULL) {
+        return true;
+    }
+    const GPTMacActionCancellation *cancellation = context;
+    return atomic_load_explicit(&cancellation->signalled, memory_order_seq_cst);
+}
+
+void gpt_macos_cancellation_free(void *context) {
+    free(context);
+}
+
+typedef struct {
+    BOOL valid;
+    pid_t frontmost_process_id;
+    uint32_t active_window_id;
+    CGPoint pointer_location;
+} GPTMacUserInteractionState;
+
+static GPTMacUserInteractionState GPTCaptureUserInteractionState(void) {
+    GPTMacUserInteractionState state = {0};
+    NSRunningApplication *frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
+    if (frontmost == nil || frontmost.processIdentifier <= 0) {
+        return state;
+    }
+    CGEventRef event = CGEventCreate(NULL);
+    if (event == NULL) {
+        return state;
+    }
+    state.pointer_location = CGEventGetLocation(event);
+    CFRelease(event);
+    state.frontmost_process_id = frontmost.processIdentifier;
+
+    CFArrayRef windowInfo = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID);
+    if (windowInfo == NULL) {
+        return state;
+    }
+    for (NSDictionary *entry in (__bridge NSArray *)windowInfo) {
+        NSNumber *owner = entry[(id)kCGWindowOwnerPID];
+        NSNumber *layer = entry[(id)kCGWindowLayer];
+        NSNumber *window = entry[(id)kCGWindowNumber];
+        if ([owner isKindOfClass:[NSNumber class]] &&
+            owner.intValue == state.frontmost_process_id &&
+            [layer isKindOfClass:[NSNumber class]] && layer.intValue == 0 &&
+            [window isKindOfClass:[NSNumber class]] && window.unsignedIntValue != 0) {
+            state.active_window_id = window.unsignedIntValue;
+            break;
+        }
+    }
+    CFRelease(windowInfo);
+    state.valid = state.active_window_id != 0;
+    return state;
+}
+
+static BOOL GPTUserInteractionStateEqual(
+    GPTMacUserInteractionState before,
+    GPTMacUserInteractionState after) {
+    return before.valid && after.valid &&
+           before.frontmost_process_id == after.frontmost_process_id &&
+           before.active_window_id == after.active_window_id &&
+           CGPointEqualToPoint(before.pointer_location, after.pointer_location);
+}
 
 static const NSUInteger GPT_MAX_AX_DEPTH = 32;
 static const NSUInteger GPT_MAX_NATIVE_SCREENSHOT_DIMENSION = 4096;
@@ -114,6 +244,685 @@ bool gpt_macos_observation_supported(void) {
         return GPTLoadScreenCaptureKit();
     }
     return false;
+}
+
+GPTMacVirtualizationProbe gpt_macos_virtualization_probe(void) {
+    GPTMacVirtualizationProbe result = {0};
+    if (@available(macOS 14.0, *)) {
+        result.operating_system_supported = true;
+    } else {
+        return result;
+    }
+
+    static BOOL framework_available = NO;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *handle = dlopen(
+            "/System/Library/Frameworks/Virtualization.framework/Virtualization",
+            RTLD_LAZY | RTLD_LOCAL);
+        framework_available = handle != NULL &&
+                              NSClassFromString(@"VZVirtualMachine") != nil &&
+                              NSClassFromString(@"VZVirtualMachineConfiguration") != nil &&
+                              NSClassFromString(@"VZVirtioGraphicsDeviceConfiguration") != nil &&
+                              NSClassFromString(@"VZVirtioSocketDeviceConfiguration") != nil &&
+                              NSClassFromString(@"VZVirtualMachineView") != nil;
+    });
+    result.framework_available = framework_available;
+
+    return result;
+}
+
+static const size_t GPT_MAX_REQUIREMENT_DATA_BYTES = 64 * 1024;
+static NSString *const GPT_APP_BUNDLE_IDENTIFIER = @"com.chriscase.grokptah";
+static NSString *const GPT_HELPER_SIGNING_IDENTIFIER =
+    @"com.chriscase.grokptah.isolated-visual-helper";
+
+static GPTMacIsolatedArtifactsResult GPTEmptyIsolatedArtifactsResult(int32_t status) {
+    GPTMacIsolatedArtifactsResult result = {0};
+    result.status = status;
+    result.helper_fd = -1;
+    result.guest_image_fd = -1;
+    result.configuration_fd = -1;
+    return result;
+}
+
+static GPTMacIsolatedArtifactsResult GPTIsolatedArtifactsError(
+    int32_t status,
+    NSString *message) {
+    GPTMacIsolatedArtifactsResult result = GPTEmptyIsolatedArtifactsResult(status);
+    NSString *bounded = message.length > 512 ? [message substringToIndex:512] : message;
+    NSData *data = [bounded dataUsingEncoding:NSUTF8StringEncoding];
+    result.error = GPTCopyBytes(data, &result.error_len);
+    return result;
+}
+
+static void GPTCloseArtifactDescriptors(
+    int helperFD,
+    int guestImageFD,
+    int configurationFD) {
+    if (helperFD >= 0) {
+        close(helperFD);
+    }
+    if (guestImageFD >= 0) {
+        close(guestImageFD);
+    }
+    if (configurationFD >= 0) {
+        close(configurationFD);
+    }
+}
+
+static BOOL GPTAppendBundlePath(
+    const char *bundleRoot,
+    const char *relativePath,
+    char output[PATH_MAX]) {
+    int written = snprintf(output, PATH_MAX, "%s/%s", bundleRoot, relativePath);
+    return written > 0 && written < PATH_MAX;
+}
+
+static int GPTOpenPackagedArtifact(const char *path) {
+    return open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW_ANY);
+}
+
+static BOOL GPTSameArtifactIdentity(const struct stat *left, const struct stat *right) {
+    return left->st_dev == right->st_dev && left->st_ino == right->st_ino &&
+           left->st_mode == right->st_mode && left->st_size == right->st_size &&
+           left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
+           left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec &&
+           left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
+           left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+}
+
+static BOOL GPTPathStillNamesArtifact(const char *path, const struct stat *expected) {
+    int descriptor = GPTOpenPackagedArtifact(path);
+    if (descriptor < 0) {
+        return NO;
+    }
+    struct stat observed = {0};
+    BOOL matches = fstat(descriptor, &observed) == 0 &&
+                   GPTSameArtifactIdentity(expected, &observed);
+    close(descriptor);
+    return matches;
+}
+
+static BOOL GPTEntitlementIsTrue(NSDictionary *entitlements, NSString *key) {
+    id value = entitlements[key];
+    return [value isKindOfClass:[NSNumber class]] && [value boolValue];
+}
+
+static BOOL GPTEntitlementIsAbsentOrFalse(NSDictionary *entitlements, NSString *key) {
+    id value = entitlements[key];
+    return value == nil || ([value isKindOfClass:[NSNumber class]] && ![value boolValue]);
+}
+
+static NSString *GPTValidatePackagedCode(
+    NSURL *url,
+    NSString *expectedIdentifier,
+    NSString *expectedTeamIdentifier,
+    BOOL checkNestedCode,
+    BOOL requireVirtualization,
+    BOOL forbidVirtualization,
+    NSString *__autoreleasing *teamIdentifier,
+    NSData *__autoreleasing *designatedRequirementData) {
+    SecStaticCodeRef code = NULL;
+    OSStatus status = SecStaticCodeCreateWithPath(
+        (__bridge CFURLRef)url,
+        kSecCSDefaultFlags,
+        &code);
+    if (status != errSecSuccess || code == NULL) {
+        return @"Packaged isolated code could not be opened for signature validation";
+    }
+
+    SecCSFlags validationFlags = kSecCSCheckAllArchitectures | kSecCSStrictValidate |
+                                 kSecCSRestrictSymlinks | kSecCSRestrictSidebandData;
+    if (checkNestedCode) {
+        validationFlags |= kSecCSCheckNestedCode;
+    }
+    CFErrorRef validationError = NULL;
+    status = SecStaticCodeCheckValidityWithErrors(
+        code,
+        validationFlags,
+        NULL,
+        &validationError);
+    if (validationError != NULL) {
+        CFRelease(validationError);
+    }
+    if (status != errSecSuccess) {
+        CFRelease(code);
+        return @"Packaged isolated code failed strict offline signature validation";
+    }
+
+    CFDictionaryRef rawInformation = NULL;
+    status = SecCodeCopySigningInformation(
+        code,
+        kSecCSSigningInformation,
+        &rawInformation);
+    if (status != errSecSuccess || rawInformation == NULL) {
+        CFRelease(code);
+        return @"Packaged isolated code has no usable signing information";
+    }
+    NSDictionary *information = (__bridge NSDictionary *)rawInformation;
+    NSString *identifier = information[(__bridge NSString *)kSecCodeInfoIdentifier];
+    NSString *observedTeam = information[(__bridge NSString *)kSecCodeInfoTeamIdentifier];
+    NSNumber *signatureFlags = information[(__bridge NSString *)kSecCodeInfoFlags];
+    NSDictionary *entitlements =
+        information[(__bridge NSString *)kSecCodeInfoEntitlementsDict];
+    if (![identifier isKindOfClass:[NSString class]] ||
+        ![identifier isEqualToString:expectedIdentifier] ||
+        ![observedTeam isKindOfClass:[NSString class]] || observedTeam.length == 0 ||
+        (expectedTeamIdentifier != nil &&
+         ![observedTeam isEqualToString:expectedTeamIdentifier]) ||
+        ![signatureFlags isKindOfClass:[NSNumber class]]) {
+        CFRelease(rawInformation);
+        CFRelease(code);
+        return @"Packaged isolated code has the wrong signing identity";
+    }
+    uint32_t flags = signatureFlags.unsignedIntValue;
+    if ((flags & kSecCodeSignatureRuntime) == 0 ||
+        (flags & kSecCodeSignatureLibraryValidation) == 0 ||
+        (flags & kSecCodeSignatureAdhoc) != 0) {
+        CFRelease(rawInformation);
+        CFRelease(code);
+        return @"Packaged isolated code is not a hardened non-ad-hoc signature";
+    }
+    if (entitlements != nil && ![entitlements isKindOfClass:[NSDictionary class]]) {
+        CFRelease(rawInformation);
+        CFRelease(code);
+        return @"Packaged isolated code has malformed entitlements";
+    }
+    NSDictionary *checkedEntitlements = entitlements ?: @{};
+    BOOL virtualization = GPTEntitlementIsTrue(
+        checkedEntitlements,
+        @"com.apple.security.virtualization");
+    BOOL networkingAbsent = GPTEntitlementIsAbsentOrFalse(
+        checkedEntitlements,
+        @"com.apple.vm.networking");
+    BOOL debugAttachmentAbsent = GPTEntitlementIsAbsentOrFalse(
+        checkedEntitlements,
+        @"com.apple.security.get-task-allow");
+    if ((requireVirtualization && !virtualization) ||
+        (forbidVirtualization && virtualization) || !networkingAbsent ||
+        !debugAttachmentAbsent) {
+        CFRelease(rawInformation);
+        CFRelease(code);
+        return @"Packaged isolated code violates the virtualization entitlement boundary";
+    }
+    if (requireVirtualization) {
+        if (!GPTEntitlementIsTrue(
+                checkedEntitlements,
+                @"com.apple.security.app-sandbox")) {
+            CFRelease(rawInformation);
+            CFRelease(code);
+            return @"Packaged isolated helper is not sandboxed";
+        }
+        NSSet<NSString *> *allowedHelperEntitlements = [NSSet setWithArray:@[
+            @"com.apple.application-identifier",
+            @"com.apple.developer.team-identifier",
+            @"com.apple.security.app-sandbox",
+            @"com.apple.security.virtualization",
+        ]];
+        for (id key in checkedEntitlements) {
+            if (![key isKindOfClass:[NSString class]] ||
+                ![allowedHelperEntitlements containsObject:key]) {
+                CFRelease(rawInformation);
+                CFRelease(code);
+                return @"Packaged isolated helper requests an unreviewed entitlement";
+            }
+        }
+        NSString *applicationIdentifier =
+            checkedEntitlements[@"com.apple.application-identifier"];
+        NSString *entitlementTeam =
+            checkedEntitlements[@"com.apple.developer.team-identifier"];
+        NSString *expectedApplicationIdentifier = [NSString
+            stringWithFormat:@"%@.%@", observedTeam, expectedIdentifier];
+        BOOL applicationIdentifierMatches =
+            applicationIdentifier == nil ||
+            ([applicationIdentifier isKindOfClass:[NSString class]] &&
+             [applicationIdentifier isEqualToString:expectedApplicationIdentifier]);
+        BOOL entitlementTeamMatches =
+            entitlementTeam == nil ||
+            ([entitlementTeam isKindOfClass:[NSString class]] &&
+             [entitlementTeam isEqualToString:observedTeam]);
+        if (!applicationIdentifierMatches || !entitlementTeamMatches) {
+            CFRelease(rawInformation);
+            CFRelease(code);
+            return @"Packaged isolated helper has inconsistent sandbox identity entitlements";
+        }
+    }
+    if (teamIdentifier != NULL) {
+        *teamIdentifier = [observedTeam copy];
+    }
+
+    if (designatedRequirementData != NULL) {
+        SecRequirementRef requirement = NULL;
+        CFDataRef rawRequirementData = NULL;
+        status = SecCodeCopyDesignatedRequirement(
+            code,
+            kSecCSDefaultFlags,
+            &requirement);
+        if (status == errSecSuccess && requirement != NULL) {
+            status = SecRequirementCopyData(
+                requirement,
+                kSecCSDefaultFlags,
+                &rawRequirementData);
+        }
+        if (requirement != NULL) {
+            CFRelease(requirement);
+        }
+        if (status != errSecSuccess || rawRequirementData == NULL ||
+            CFDataGetLength(rawRequirementData) <= 0 ||
+            (size_t)CFDataGetLength(rawRequirementData) > GPT_MAX_REQUIREMENT_DATA_BYTES) {
+            if (rawRequirementData != NULL) {
+                CFRelease(rawRequirementData);
+            }
+            CFRelease(rawInformation);
+            CFRelease(code);
+            return @"Packaged helper has no bounded designated requirement";
+        }
+        *designatedRequirementData = [(__bridge NSData *)rawRequirementData copy];
+        CFRelease(rawRequirementData);
+    }
+    CFRelease(rawInformation);
+    CFRelease(code);
+    return nil;
+}
+
+GPTMacIsolatedArtifactsResult gpt_macos_isolated_artifacts_open(void) {
+    @autoreleasepool {
+        NSBundle *bundle = NSBundle.mainBundle;
+        if (![bundle.bundleIdentifier isEqualToString:GPT_APP_BUNDLE_IDENTIFIER]) {
+            return GPTIsolatedArtifactsError(
+                GPT_MAC_BACKEND_UNAVAILABLE,
+                @"The isolated environment is not running from the GrokPtah application bundle");
+        }
+        const char *bundlePath = bundle.bundleURL.path.fileSystemRepresentation;
+        char bundleRoot[PATH_MAX] = {0};
+        if (bundlePath == NULL || realpath(bundlePath, bundleRoot) == NULL) {
+            return GPTIsolatedArtifactsError(
+                GPT_MAC_BACKEND_UNAVAILABLE,
+                @"The GrokPtah application bundle could not be resolved");
+        }
+
+        char helperPath[PATH_MAX] = {0};
+        char guestImagePath[PATH_MAX] = {0};
+        char configurationPath[PATH_MAX] = {0};
+        if (!GPTAppendBundlePath(
+                bundleRoot,
+                "Contents/MacOS/grokptah-isolated-visual-helper",
+                helperPath) ||
+            !GPTAppendBundlePath(
+                bundleRoot,
+                "Contents/Resources/isolated-visual/grokptah-isolated-guest-v1.img",
+                guestImagePath) ||
+            !GPTAppendBundlePath(
+                bundleRoot,
+                "Contents/Resources/isolated-visual/grokptah-isolated-config-v1.json",
+                configurationPath)) {
+            return GPTIsolatedArtifactsError(
+                GPT_MAC_BACKEND_UNAVAILABLE,
+                @"The isolated environment bundle layout is invalid");
+        }
+
+        int helperFD = GPTOpenPackagedArtifact(helperPath);
+        int guestImageFD = GPTOpenPackagedArtifact(guestImagePath);
+        int configurationFD = GPTOpenPackagedArtifact(configurationPath);
+        if (helperFD < 0 || guestImageFD < 0 || configurationFD < 0) {
+            GPTCloseArtifactDescriptors(helperFD, guestImageFD, configurationFD);
+            return GPTIsolatedArtifactsError(
+                GPT_MAC_BACKEND_UNAVAILABLE,
+                @"The signed helper and measured guest artifacts are not packaged");
+        }
+        struct stat helperIdentity = {0};
+        struct stat guestImageIdentity = {0};
+        struct stat configurationIdentity = {0};
+        if (fstat(helperFD, &helperIdentity) != 0 ||
+            fstat(guestImageFD, &guestImageIdentity) != 0 ||
+            fstat(configurationFD, &configurationIdentity) != 0 ||
+            !S_ISREG(helperIdentity.st_mode) || !S_ISREG(guestImageIdentity.st_mode) ||
+            !S_ISREG(configurationIdentity.st_mode)) {
+            GPTCloseArtifactDescriptors(helperFD, guestImageFD, configurationFD);
+            return GPTIsolatedArtifactsError(
+                GPT_MAC_FORBIDDEN_ACTION,
+                @"The isolated environment contains an invalid artifact type");
+        }
+
+        NSURL *bundleURL = [NSURL fileURLWithFileSystemRepresentation:bundleRoot
+                                                          isDirectory:YES
+                                                        relativeToURL:nil];
+        NSString *teamIdentifier = nil;
+        NSString *validationFailure = GPTValidatePackagedCode(
+            bundleURL,
+            GPT_APP_BUNDLE_IDENTIFIER,
+            nil,
+            YES,
+            NO,
+            YES,
+            &teamIdentifier,
+            NULL);
+        if (validationFailure != nil) {
+            GPTCloseArtifactDescriptors(helperFD, guestImageFD, configurationFD);
+            return GPTIsolatedArtifactsError(GPT_MAC_UNAUTHORIZED, validationFailure);
+        }
+
+        NSURL *helperURL = [NSURL fileURLWithFileSystemRepresentation:helperPath
+                                                           isDirectory:NO
+                                                         relativeToURL:nil];
+        NSData *requirementData = nil;
+        validationFailure = GPTValidatePackagedCode(
+            helperURL,
+            GPT_HELPER_SIGNING_IDENTIFIER,
+            teamIdentifier,
+            NO,
+            YES,
+            NO,
+            NULL,
+            &requirementData);
+        if (validationFailure != nil) {
+            GPTCloseArtifactDescriptors(helperFD, guestImageFD, configurationFD);
+            return GPTIsolatedArtifactsError(GPT_MAC_UNAUTHORIZED, validationFailure);
+        }
+        if (!GPTPathStillNamesArtifact(helperPath, &helperIdentity) ||
+            !GPTPathStillNamesArtifact(guestImagePath, &guestImageIdentity) ||
+            !GPTPathStillNamesArtifact(configurationPath, &configurationIdentity)) {
+            GPTCloseArtifactDescriptors(helperFD, guestImageFD, configurationFD);
+            return GPTIsolatedArtifactsError(
+                GPT_MAC_TARGET_CHANGED,
+                @"An isolated environment artifact changed during package verification");
+        }
+
+        GPTMacIsolatedArtifactsResult result =
+            GPTEmptyIsolatedArtifactsResult(GPT_MAC_OK);
+        result.helper_fd = helperFD;
+        result.guest_image_fd = guestImageFD;
+        result.configuration_fd = configurationFD;
+        result.requirement_data = GPTCopyBytes(
+            requirementData,
+            &result.requirement_data_len);
+        if (result.requirement_data == NULL || result.requirement_data_len == 0) {
+            GPTCloseArtifactDescriptors(helperFD, guestImageFD, configurationFD);
+            free(result.requirement_data);
+            return GPTIsolatedArtifactsError(
+                GPT_MAC_BACKEND_FAILURE,
+                @"The packaged helper requirement could not be retained");
+        }
+        return result;
+    }
+}
+
+void gpt_macos_isolated_artifacts_result_free(GPTMacIsolatedArtifactsResult *result) {
+    if (result == NULL) {
+        return;
+    }
+    free(result->requirement_data);
+    free(result->error);
+    result->requirement_data = NULL;
+    result->requirement_data_len = 0;
+    result->error = NULL;
+    result->error_len = 0;
+}
+
+static GPTMacIsolatedRuntimeSpawnResult GPTEmptyIsolatedRuntimeSpawnResult(int32_t status) {
+    GPTMacIsolatedRuntimeSpawnResult result = {0};
+    result.status = status;
+    result.pid = -1;
+    result.control_fd = -1;
+    result.event_fd = -1;
+    result.input_fd = -1;
+    result.frame_fd = -1;
+    result.challenge_fd = -1;
+    return result;
+}
+
+static GPTMacIsolatedRuntimeSpawnResult GPTIsolatedRuntimeSpawnError(
+    int32_t status,
+    NSString *message) {
+    GPTMacIsolatedRuntimeSpawnResult result = GPTEmptyIsolatedRuntimeSpawnResult(status);
+    NSString *bounded = message.length > 512 ? [message substringToIndex:512] : message;
+    NSData *data = [bounded dataUsingEncoding:NSUTF8StringEncoding];
+    result.error = GPTCopyBytes(data, &result.error_len);
+    return result;
+}
+
+void gpt_macos_isolated_runtime_spawn_result_free(GPTMacIsolatedRuntimeSpawnResult *result) {
+    if (result == NULL) {
+        return;
+    }
+    free(result->error);
+    result->error = NULL;
+    result->error_len = 0;
+}
+
+static int GPTAddCloseIfDistinct(
+    posix_spawn_file_actions_t *actions,
+    int descriptor,
+    int target) {
+    if (descriptor < 0 || descriptor == target) {
+        return 0;
+    }
+    return posix_spawn_file_actions_addclose(actions, descriptor);
+}
+
+static BOOL GPTSetCloseOnExec(int descriptor) {
+    int flags = fcntl(descriptor, F_GETFD);
+    return flags >= 0 && fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+
+static BOOL GPTIsCloseOnExec(int descriptor) {
+    int flags = fcntl(descriptor, F_GETFD);
+    return flags >= 0 && (flags & FD_CLOEXEC) != 0;
+}
+
+static int GPTCreateCloseOnExecPipe(int pair[2]) {
+    pair[0] = -1;
+    pair[1] = -1;
+    if (pipe(pair) != 0 || !GPTSetCloseOnExec(pair[0]) || !GPTSetCloseOnExec(pair[1])) {
+        close(pair[0]);
+        close(pair[1]);
+        pair[0] = -1;
+        pair[1] = -1;
+        return -1;
+    }
+    return 0;
+}
+
+GPTMacIsolatedRuntimeSpawnResult gpt_macos_isolated_runtime_spawn(
+    int32_t helper_fd,
+    int32_t guest_image_fd,
+    int32_t configuration_fd) {
+    @autoreleasepool {
+#ifndef POSIX_SPAWN_CLOEXEC_DEFAULT
+        return GPTIsolatedRuntimeSpawnError(
+            GPT_MAC_BACKEND_UNAVAILABLE,
+            @"The macOS SDK does not provide close-on-exec spawn isolation");
+#else
+        if (helper_fd < 0 || guest_image_fd < 0 || configuration_fd < 0) {
+            return GPTIsolatedRuntimeSpawnError(
+                GPT_MAC_INVALID_REQUEST,
+                @"The measured isolated artifact descriptors are incomplete");
+        }
+
+        NSBundle *bundle = NSBundle.mainBundle;
+        const char *bundlePath = bundle.bundleURL.path.fileSystemRepresentation;
+        char bundleRoot[PATH_MAX] = {0};
+        char helperPath[PATH_MAX] = {0};
+        struct stat helperIdentity = {0};
+        struct stat guestImageIdentity = {0};
+        struct stat configurationIdentity = {0};
+        if (bundlePath == NULL || realpath(bundlePath, bundleRoot) == NULL ||
+            !GPTAppendBundlePath(
+                bundleRoot,
+                "Contents/MacOS/grokptah-isolated-visual-helper",
+                helperPath) ||
+            fstat(helper_fd, &helperIdentity) != 0 ||
+            fstat(guest_image_fd, &guestImageIdentity) != 0 ||
+            fstat(configuration_fd, &configurationIdentity) != 0 ||
+            !S_ISREG(helperIdentity.st_mode) ||
+            !S_ISREG(guestImageIdentity.st_mode) ||
+            !S_ISREG(configurationIdentity.st_mode) ||
+            !GPTIsCloseOnExec(helper_fd) ||
+            !GPTIsCloseOnExec(guest_image_fd) ||
+            !GPTIsCloseOnExec(configuration_fd) ||
+            !GPTPathStillNamesArtifact(helperPath, &helperIdentity)) {
+            return GPTIsolatedRuntimeSpawnError(
+                GPT_MAC_FORBIDDEN_ACTION,
+                @"Measured isolated artifact descriptors are not close-on-exec");
+        }
+
+        int control[2] = {-1, -1};
+        int events[2] = {-1, -1};
+        int input[2] = {-1, -1};
+        int frames[2] = {-1, -1};
+        int challenge[2] = {-1, -1};
+        int null_fd = -1;
+        if (GPTCreateCloseOnExecPipe(control) != 0 ||
+            GPTCreateCloseOnExecPipe(events) != 0 ||
+            GPTCreateCloseOnExecPipe(input) != 0 ||
+            GPTCreateCloseOnExecPipe(frames) != 0 ||
+            GPTCreateCloseOnExecPipe(challenge) != 0 ||
+            (null_fd = open("/dev/null", O_RDWR | O_CLOEXEC)) < 0) {
+            close(control[0]);
+            close(control[1]);
+            close(events[0]);
+            close(events[1]);
+            close(input[0]);
+            close(input[1]);
+            close(frames[0]);
+            close(frames[1]);
+            close(challenge[0]);
+            close(challenge[1]);
+            close(null_fd);
+            return GPTIsolatedRuntimeSpawnError(
+                GPT_MAC_BACKEND_FAILURE,
+                @"Could not allocate isolated helper pipes");
+        }
+
+        posix_spawn_file_actions_t actions;
+        posix_spawnattr_t attributes;
+        int action_status = posix_spawn_file_actions_init(&actions);
+        BOOL actions_initialized = action_status == 0;
+        BOOL attributes_initialized = NO;
+        if (action_status == 0) {
+            action_status = posix_spawnattr_init(&attributes);
+            attributes_initialized = action_status == 0;
+        }
+        short flags = POSIX_SPAWN_CLOEXEC_DEFAULT;
+        if (action_status == 0) {
+            action_status = posix_spawnattr_setflags(&attributes, flags);
+        }
+        int sources[] = {
+            helper_fd,
+            guest_image_fd,
+            configuration_fd,
+            control[0],
+            control[1],
+            events[0],
+            events[1],
+            input[0],
+            input[1],
+            frames[0],
+            frames[1],
+            challenge[0],
+            challenge[1],
+            null_fd,
+        };
+        int inherited_targets[] = {3, 4, 5, 6, 7, 8, GPT_CHALLENGE_FD};
+        int standard_targets[] = {0, 1, 2};
+        if (action_status == 0) {
+            action_status = posix_spawn_file_actions_adddup2(
+                &actions,
+                guest_image_fd,
+                3);
+        }
+        if (action_status == 0) {
+            action_status = posix_spawn_file_actions_adddup2(
+                &actions,
+                configuration_fd,
+                4);
+        }
+        if (action_status == 0) {
+            action_status = posix_spawn_file_actions_adddup2(&actions, control[0], 5);
+        }
+        if (action_status == 0) {
+            action_status = posix_spawn_file_actions_adddup2(&actions, events[1], 6);
+        }
+        if (action_status == 0) {
+            action_status = posix_spawn_file_actions_adddup2(&actions, input[0], 7);
+        }
+        if (action_status == 0) {
+            action_status = posix_spawn_file_actions_adddup2(&actions, frames[1], 8);
+        }
+        if (action_status == 0) {
+            action_status = posix_spawn_file_actions_adddup2(
+                &actions,
+                challenge[1],
+                GPT_CHALLENGE_FD);
+        }
+        for (size_t index = 0;
+             action_status == 0 && index < sizeof(standard_targets) / sizeof(standard_targets[0]);
+             ++index) {
+            action_status = posix_spawn_file_actions_adddup2(
+                &actions,
+                null_fd,
+                standard_targets[index]);
+        }
+        for (size_t index = 0; action_status == 0 && index < sizeof(sources) / sizeof(sources[0]);
+             ++index) {
+            int target = -1;
+            for (size_t target_index = 0;
+                 target_index < sizeof(inherited_targets) / sizeof(inherited_targets[0]);
+                 ++target_index) {
+                if (sources[index] == inherited_targets[target_index]) {
+                    target = inherited_targets[target_index];
+                    break;
+                }
+            }
+            action_status = GPTAddCloseIfDistinct(&actions, sources[index], target);
+        }
+
+        pid_t pid = -1;
+        char *arguments[] = {helperPath, NULL};
+        char *environment[] = {NULL};
+        if (action_status == 0) {
+            action_status = posix_spawn(
+                &pid,
+                helperPath,
+                &actions,
+                &attributes,
+                arguments,
+                environment);
+        }
+        if (attributes_initialized) {
+            posix_spawnattr_destroy(&attributes);
+        }
+        if (actions_initialized) {
+            posix_spawn_file_actions_destroy(&actions);
+        }
+        close(null_fd);
+        close(control[0]);
+        close(events[1]);
+        close(input[0]);
+        close(frames[1]);
+        close(challenge[1]);
+        if (action_status != 0 || pid < 0) {
+            close(control[1]);
+            close(events[0]);
+            close(input[1]);
+            close(frames[0]);
+            close(challenge[0]);
+            return GPTIsolatedRuntimeSpawnError(
+                GPT_MAC_BACKEND_FAILURE,
+                [NSString stringWithFormat:@"Isolated helper spawn failed (%d)", action_status]);
+        }
+        GPTMacIsolatedRuntimeSpawnResult result =
+            GPTEmptyIsolatedRuntimeSpawnResult(GPT_MAC_OK);
+        result.pid = (int32_t)pid;
+        result.control_fd = control[1];
+        result.event_fd = events[0];
+        result.input_fd = input[1];
+        result.frame_fd = frames[0];
+        result.challenge_fd = challenge[0];
+        return result;
+#endif
+    }
 }
 
 bool gpt_macos_screen_recording_granted(void) {
@@ -873,8 +1682,15 @@ static GPTMacNativeResult GPTActionResult(NSString *summary, id postcondition) {
         nil);
 }
 
-static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t requestLength) {
+static GPTMacNativeResult GPTActImpl(
+    const uint8_t *requestBytes,
+    size_t requestLength,
+    const void *cancellation) {
     @autoreleasepool {
+        if (gpt_macos_cancellation_is_signalled(cancellation)) {
+            return GPTErrorResult(
+                GPT_MAC_INTERRUPTED, @"macOS action was cancelled before native preflight");
+        }
         if (requestBytes == NULL || requestLength == 0 || requestLength > 64 * 1024) {
             return GPTErrorResult(GPT_MAC_INVALID_REQUEST, @"invalid macOS action request size");
         }
@@ -898,6 +1714,10 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
         NSString *bundleID = request[@"bundleId"];
         NSDictionary *action = request[@"action"];
         NSString *kind = [action isKindOfClass:[NSDictionary class]] ? action[@"kind"] : nil;
+        NSString *executionMode = request[@"executionMode"];
+        BOOL measuredBackground =
+            [executionMode isKindOfClass:[NSString class]] &&
+            [executionMode isEqualToString:@"measured_background"];
         CGRect expectedFrame = CGRectZero;
         if (![windowNumber isKindOfClass:[NSNumber class]] || windowNumber.unsignedIntValue == 0 ||
             ![processNumber isKindOfClass:[NSNumber class]] || processNumber.intValue <= 0 ||
@@ -905,6 +1725,8 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
             bundleID.length > 256 || GPTDeniedBundle(bundleID) ||
             ![action isKindOfClass:[NSDictionary class]] ||
             ![kind isKindOfClass:[NSString class]] ||
+            ![executionMode isKindOfClass:[NSString class]] ||
+            (![executionMode isEqualToString:@"foreground_required"] && !measuredBackground) ||
             !GPTReadFrame(request[@"expectedFrame"], &expectedFrame)) {
             return GPTErrorResult(GPT_MAC_INVALID_REQUEST, @"invalid macOS action binding");
         }
@@ -914,11 +1736,20 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
         if (![allowedKinds containsObject:kind]) {
             return GPTErrorResult(GPT_MAC_FORBIDDEN_ACTION, @"unsupported macOS semantic action");
         }
+        if (measuredBackground && ![kind isEqualToString:@"set_value"]) {
+            return GPTErrorResult(
+                GPT_MAC_FORBIDDEN_ACTION,
+                @"this measured background backend supports visible text entry only");
+        }
 
         if (@available(macOS 14.0, *)) {
             pid_t processID = processNumber.intValue;
             uint32_t windowID = windowNumber.unsignedIntValue;
             SCShareableContent *content = GPTShareableContent();
+            if (gpt_macos_cancellation_is_signalled(cancellation)) {
+                return GPTErrorResult(
+                    GPT_MAC_INTERRUPTED, @"macOS action was cancelled during native preflight");
+            }
             SCWindow *window = GPTFindWindow(content, windowID, processID, bundleID);
             if (window == nil) {
                 return GPTErrorResult(GPT_MAC_TARGET_CLOSED, @"selected macOS window closed");
@@ -937,13 +1768,29 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
                     GPT_MAC_TARGET_CHANGED,
                     @"selected macOS window has no exact Accessibility match");
             }
+            if (gpt_macos_cancellation_is_signalled(cancellation)) {
+                CFRelease(axWindow);
+                return GPTErrorResult(
+                    GPT_MAC_INTERRUPTED, @"macOS action was cancelled before Accessibility dispatch");
+            }
 
             if ([kind isEqualToString:@"activate"]) {
+                if (measuredBackground) {
+                    CFRelease(axWindow);
+                    return GPTErrorResult(
+                        GPT_MAC_FORBIDDEN_ACTION,
+                        @"measured background dispatch cannot activate a target");
+                }
                 if (request[@"elementIndex"] != [NSNull null] ||
                     request[@"expectedElement"] != [NSNull null]) {
                     CFRelease(axWindow);
                     return GPTErrorResult(
                         GPT_MAC_INVALID_REQUEST, @"activation must not carry an element");
+                }
+                if (gpt_macos_cancellation_is_signalled(cancellation)) {
+                    CFRelease(axWindow);
+                    return GPTErrorResult(
+                        GPT_MAC_INTERRUPTED, @"macOS activation was cancelled before dispatch");
                 }
                 NSRunningApplication *application =
                     [NSRunningApplication runningApplicationWithProcessIdentifier:processID];
@@ -951,11 +1798,23 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
                     [application activateWithOptions:NSApplicationActivateIgnoringOtherApps];
                 BOOL focused = NO;
                 for (NSUInteger attempt = 0; requested && attempt < 40; attempt++) {
+                    if (gpt_macos_cancellation_is_signalled(cancellation)) {
+                        CFRelease(axWindow);
+                        return GPTErrorResult(
+                            GPT_MAC_INTERRUPTED,
+                            @"macOS activation completion lost to local takeover");
+                    }
                     if (GPTTargetIsFocused(processID, bundleID, axWindow)) {
                         focused = YES;
                         break;
                     }
                     [NSThread sleepForTimeInterval:0.025];
+                }
+                if (gpt_macos_cancellation_is_signalled(cancellation)) {
+                    CFRelease(axWindow);
+                    return GPTErrorResult(
+                        GPT_MAC_INTERRUPTED,
+                        @"macOS activation completion lost to local takeover");
                 }
                 CFRelease(axWindow);
                 return focused
@@ -970,16 +1829,19 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
             NSString *requiredAction = [expectedElement isKindOfClass:[NSDictionary class]]
                 ? expectedElement[@"requiredAction"]
                 : nil;
+            BOOL targetFocused = GPTTargetIsFocused(processID, bundleID, axWindow);
             if (![elementIndex isKindOfClass:[NSNumber class]] ||
                 elementIndex.unsignedIntegerValue >= 10000 ||
                 ![expectedElement isKindOfClass:[NSDictionary class]] ||
                 ![requiredAction isKindOfClass:[NSString class]] ||
                 ![requiredAction isEqualToString:kind] ||
-                !GPTTargetIsFocused(processID, bundleID, axWindow)) {
+                (measuredBackground ? targetFocused : !targetFocused)) {
                 CFRelease(axWindow);
                 return GPTErrorResult(
                     GPT_MAC_TARGET_CHANGED,
-                    @"authorized macOS target lost exact focus before dispatch");
+                    measuredBackground
+                        ? @"measured background target became foreground before dispatch"
+                        : @"authorized macOS target lost exact focus before dispatch");
             }
             BOOL traversalTruncated = NO;
             AXUIElementRef element = GPTCopyAXElementAtIndex(
@@ -994,12 +1856,33 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
                     GPT_MAC_TARGET_CHANGED,
                     @"macOS element changed since the approved observation");
             }
-            if (!GPTTargetIsFocused(processID, bundleID, axWindow)) {
+            targetFocused = GPTTargetIsFocused(processID, bundleID, axWindow);
+            if (measuredBackground ? targetFocused : !targetFocused) {
                 CFRelease(element);
                 CFRelease(axWindow);
                 return GPTErrorResult(
                     GPT_MAC_TARGET_CHANGED,
-                    @"authorized macOS target lost focus at dispatch boundary");
+                    measuredBackground
+                        ? @"measured background target became foreground at dispatch boundary"
+                        : @"authorized macOS target lost focus at dispatch boundary");
+            }
+            GPTMacUserInteractionState interactionBefore = {0};
+            if (measuredBackground) {
+                interactionBefore = GPTCaptureUserInteractionState();
+                if (!interactionBefore.valid ||
+                    interactionBefore.frontmost_process_id == processID) {
+                    CFRelease(element);
+                    CFRelease(axWindow);
+                    return GPTErrorResult(
+                        GPT_MAC_FORBIDDEN_ACTION,
+                        @"foreground app/window/pointer state could not prove a background boundary");
+                }
+            }
+            if (gpt_macos_cancellation_is_signalled(cancellation)) {
+                CFRelease(element);
+                CFRelease(axWindow);
+                return GPTErrorResult(
+                    GPT_MAC_INTERRUPTED, @"macOS semantic action was cancelled before dispatch");
             }
 
             AXError actionError = kAXErrorActionUnsupported;
@@ -1063,7 +1946,26 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
                 summary = @"Scrolled the authorized macOS element into view";
             }
 
+            BOOL cancellationAfterDispatch =
+                gpt_macos_cancellation_is_signalled(cancellation);
             CFRelease(element);
+            if (cancellationAfterDispatch) {
+                CFRelease(axWindow);
+                return GPTErrorResult(
+                    GPT_MAC_INTERRUPTED,
+                    @"macOS semantic action completion lost to local takeover");
+            }
+            if (measuredBackground) {
+                GPTMacUserInteractionState interactionAfter =
+                    GPTCaptureUserInteractionState();
+                if (!GPTUserInteractionStateEqual(interactionBefore, interactionAfter) ||
+                    GPTTargetIsFocused(processID, bundleID, axWindow)) {
+                    CFRelease(axWindow);
+                    return GPTErrorResult(
+                        GPT_MAC_UNCERTAIN_OUTCOME,
+                        @"background action changed foreground app, active window, or physical pointer");
+                }
+            }
             if (actionError != kAXErrorSuccess) {
                 CFRelease(axWindow);
                 return GPTErrorResult(
@@ -1080,11 +1982,13 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
             CFRelease(axWindow);
             SCWindow *afterWindow = GPTFindWindow(
                 GPTShareableContent(), windowID, processID, bundleID);
-            if (!focusPreserved || afterWindow == nil ||
+            if ((measuredBackground ? focusPreserved : !focusPreserved) || afterWindow == nil ||
                 !GPTFrameMatches(expectedFrame, afterWindow.frame)) {
                 return GPTErrorResult(
                     GPT_MAC_TARGET_CHANGED,
-                    @"authorized macOS target changed after action dispatch");
+                    measuredBackground
+                        ? @"measured background target changed after action dispatch"
+                        : @"authorized macOS target changed after action dispatch");
             }
             return GPTActionResult(summary, postcondition);
         }
@@ -1092,9 +1996,12 @@ static GPTMacNativeResult GPTActImpl(const uint8_t *requestBytes, size_t request
     }
 }
 
-GPTMacNativeResult gpt_macos_act(const uint8_t *requestBytes, size_t requestLength) {
+GPTMacNativeResult gpt_macos_act(
+    const uint8_t *requestBytes,
+    size_t requestLength,
+    const void *cancellation) {
     @try {
-        return GPTActImpl(requestBytes, requestLength);
+        return GPTActImpl(requestBytes, requestLength, cancellation);
     } @catch (NSException *exception) {
         (void)exception;
         return GPTErrorResult(

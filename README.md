@@ -13,6 +13,8 @@ The name combines **Grok** (the agent lineage) with **Ptah** (Egyptian craftsman
 | **License** | [Apache License 2.0](LICENSE) |
 | **Repo** | [chriscase/GrokPtah](https://github.com/chriscase/GrokPtah) |
 | **Architecture** | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
+| **Capability matrix** | [`docs/CAPABILITY_MATRIX.md`](docs/CAPABILITY_MATRIX.md) |
+| **Road to 100%** | [`docs/ROADMAP_TO_100.md`](docs/ROADMAP_TO_100.md) |
 | **Dev setup** | [`docs/DEV_SETUP.md`](docs/DEV_SETUP.md) |
 
 ---
@@ -36,7 +38,7 @@ A deployment has one authoritative durable home. Desktop and other authorized
 clients connect through the service protocol; they do not synchronize or
 concurrently write copies of `GROKPTAH_HOME`.
 
-The agent can read and edit files, search the codebase, run shell commands (with approval), and — when you provide an xAI API key — call live models for the reply. Shell tool runs stream into the UI as a **single live process** (the terminal attaches to that stream; it does not re-run the command).
+The agent can read and edit files, search the codebase, run shell commands (with approval), and call live models when credentials resolve. Executable xAI credential order is `XAI_API_KEY`, then an optional OS keychain API key, then `GROKPTAH_TOKEN_COMMAND`, then a Grok Build session from `~/.grok/auth.json` (OIDC / cli-chat-proxy). That session/gateway **routing is Supported**; compatible gateway requests consume provider quota; GrokPtah does not sync a Grok Build account balance; a local host quota ledger is **Pending — not shipped** on draft [PR #352](https://github.com/chriscase/GrokPtah/pull/352). Exact live certification is a separate unproven question — see [`docs/CAPABILITY_MATRIX.md`](docs/CAPABILITY_MATRIX.md). Shell tool runs stream into the UI as a **single live process** (the terminal attaches to that stream; it does not re-run the command).
 
 ---
 
@@ -72,11 +74,13 @@ This is **not** an official xAI product. It is a personal/community fork for des
 - **Project** — open folder (native dialog); rules discovery (`AGENTS.md`, etc.)  
 - **Files & git** — tree, fuzzy open, status/diff/stage/commit, worktree list, agent-edit diffs  
 - **Terminal** — interactive multi-tab PTY; tool shells attach to the **live** tool process stream  
-- **Extensibility** — MCP config under `~/.grokptah` / project `.mcp.json`; plugins & skills on disk; hooks config  
-- **Auth** — store an xAI API key in the OS keychain (or `XAI_API_KEY`); open console for keys  
-- **Settings** — model, effort, tool safety profile (soft agent gates, not OS sandbox), appearance, permission mode  
+- **Extensibility** — MCP config under `~/.grokptah` / project `.mcp.json`; stdio MCP tools dispatch into the Build loop as `mcp__server__tool`; plugins & skills on disk; hooks config  
+- **Auth** — prefer `grok login` so `~/.grok/auth.json` exists (Grok Build OIDC session); optional xAI API key in the OS keychain or `XAI_API_KEY`; optional `GROKPTAH_TOKEN_COMMAND` after keychain and before the Grok Build session; OpenAI-compatible provider profiles  
+- **Persistent agents** — finite durable Runs, native managed execution, manager plans, hosted `grokptah-service` home ([`docs/NATIVE_AGENT_EXECUTION.md`](docs/NATIVE_AGENT_EXECUTION.md), [`docs/HEADLESS_SERVICE.md`](docs/HEADLESS_SERVICE.md))  
+- **Computer Use** — Experimental consented semantic **foreground** on macOS; no raw global mouse injection; foreground activation is **not** isolated or background-safe Computer Use. Isolated visual Computer Use ([#288](https://github.com/chriscase/GrokPtah/issues/288)) is a **mandatory unmet product exit**, not an unsupported alternative ([`docs/COMPUTER_USE.md`](docs/COMPUTER_USE.md)). Read-only Computer Run MCP tools are on main; mutations are not.  
+- **Settings** — model, effort, tool safety profile (soft agent gates, not OS sandbox), appearance, permission mode, provider qualification  
 
-Capability parity with the TUI is the target; the UI is desktop-native, not a pixel clone of the terminal theme.
+What is Supported vs Experimental vs Planned vs Explicitly unsupported is the [`capability matrix`](docs/CAPABILITY_MATRIX.md). The UI is desktop-native, not a pixel clone of the terminal theme. TUI feature-parity is a target, not a 100% claim.
 
 ### Parity eval harness (#93)
 
@@ -122,7 +126,7 @@ npm run tauri:build
 # → desktop/src-tauri/target/release/bundle/dmg/GrokPtah_*.dmg
 ```
 
-On first use: **Open folder**, optionally **Save key** (xAI API key) or set `XAI_API_KEY`.
+On first use: **Open folder**, then either run `grok login` (Grok Build session in `~/.grok/auth.json`), **Save key** / set `XAI_API_KEY`, or set `GROKPTAH_TOKEN_COMMAND` (after keychain, before the Grok Build session).
 
 ### CLI / TUI (upstream-style)
 
@@ -210,8 +214,10 @@ CI for desktop paths: [`.github/workflows/desktop.yml`](.github/workflows/deskto
 
 | Item | Where |
 |------|--------|
-| API key | OS keychain (desktop “Save key”) or env `XAI_API_KEY` |
-| Optional API base | `XAI_API_BASE` (default `https://api.x.ai/v1`) |
+| Grok Build session | `~/.grok/auth.json` after `grok login` (OIDC; cli-chat-proxy). Not a full in-app OAuth product flow. Last xAI credential source after env key, keychain, and `GROKPTAH_TOKEN_COMMAND`. |
+| API key (optional) | OS keychain (desktop “Save key”) or env `XAI_API_KEY` |
+| Token command (optional) | Env `GROKPTAH_TOKEN_COMMAND` — after keychain, before the Grok Build session (`auth_store.rs` `resolve_xai_credentials`) |
+| Optional API base | `XAI_API_BASE` (OIDC default remains cli-chat-proxy; this env is an explicit override) |
 | MCP servers | `~/.grokptah/mcp.json`, project `.mcp.json` |
 | Plugins / skills | `~/.grokptah/plugins`, `~/.grokptah/skills` |
 | Hooks | `~/.grokptah/hooks.json` (and project overrides when present) |
@@ -222,14 +228,35 @@ Desktop builds **do not** run the upstream xAI CLI auto-updater, so the app will
 
 ## Status & roadmap
 
-This fork tracks a desktop **TUI feature-parity** milestone (chat, tools, sessions, files/git, terminal, MCP/plugins/skills, settings, packaging). See open/closed work on the repo’s [issues](https://github.com/chriscase/GrokPtah/issues) and [milestone](https://github.com/chriscase/GrokPtah/milestone/1).
+Authoritative capability status: [`docs/CAPABILITY_MATRIX.md`](docs/CAPABILITY_MATRIX.md).
+Dependency-ordered path to a trustworthy 100% claim:
+[`docs/ROADMAP_TO_100.md`](docs/ROADMAP_TO_100.md). Neither document claims 100%
+or “parity complete.” Draft [PR #352](https://github.com/chriscase/GrokPtah/pull/352)
+(Native Coding Readiness Center, local host quota ledger, hosted-service CI) is
+**Pending — not shipped**. Stage 1 of the roadmap **cannot pass** while that PR
+remains draft; merge requires independently certified repair of the five
+confirmed P1s.
+
+GrokPtah **already routes** Grok Build session/gateway traffic via
+`~/.grok/auth.json` / OIDC. Compatible gateway requests consume provider quota.
+GrokPtah does not sync a Grok Build account balance. A **named secret-free
+provider-quota receipt** (campaign/credential/route-bound consumption and
+exhaustion/429) is a **mandatory unmet** 100% live-provider exit; a report
+that says quota was “not observed” fails that exit. Account-balance
+synchronization is not implemented and **not** a 100% requirement. The PR #352
+local host quota ledger is a separate pending feature until merged. Exact live
+certification remains unproven.
 
 Known intentional limits (today):
 
-- Happy-path agent is the **bridge host** (local tools + optional live chat API), not a full embed of every upstream `xai-grok-shell` path.  
-- Auth is API-key oriented (keychain + console), not a full interactive OAuth product flow.  
-- Plugin “marketplace” is a **local catalog** on disk, not a remote store.  
+- Happy-path agent is the **bridge host** (local tools + live provider profiles), not a full embed of every upstream `xai-grok-shell` path.
+- Auth uses Grok Build OIDC from `~/.grok/auth.json` and/or an API key / `GROKPTAH_TOKEN_COMMAND`. There is no full in-app OAuth product flow that replaces `grok login`. Executable order: `XAI_API_KEY`, keychain, `GROKPTAH_TOKEN_COMMAND`, then `~/.grok/auth.json`.
+- Plugin “marketplace” is a **local catalog** on disk, not a remote store.
 - Primary packaging target is **macOS**.
+- Computer Use is Experimental foreground-semantic on macOS; raw global input is Explicitly unsupported; isolated visual Computer Use is a **mandatory unmet** 100% exit ([#288](https://github.com/chriscase/GrokPtah/issues/288)).
+- Independent long-running workers ([#305](https://github.com/chriscase/GrokPtah/issues/305)) are a **mandatory unmet** 100% exit and cannot be descoped.
+- Selected packaged-desktop UX ([#308](https://github.com/chriscase/GrokPtah/issues/308)) is a **mandatory unmet** 100% exit; Explicitly unsupported covers documented non-goals only, not the Codex-class core interface.
+- **Every configured remote bearer can approve and promote within service scope.** Least-privilege `LocalOperator` / `RemoteCoordinator` / `Observer` separation is Planned and must precede any production-shaped 72-hour soak.
 
 ---
 

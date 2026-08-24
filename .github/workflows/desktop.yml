@@ -8,12 +8,14 @@ on:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
       - "evals/**"
+      - "desktop/src-tauri/macos/isolated-visual-guest/**"
       - ".github/workflows/desktop.yml"
   pull_request:
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
       - "evals/**"
+      - "desktop/src-tauri/macos/isolated-visual-guest/**"
       - ".github/workflows/desktop.yml"
 
 permissions:
@@ -60,6 +62,10 @@ jobs:
         run: |
           npm run typecheck
           npm test
+      - name: Validate isolated visual helper source
+        run: src-tauri/macos/isolated-visual-helper/verify-helper-source.sh
+      - name: Validate isolated visual guest source
+        run: src-tauri/macos/isolated-visual-guest/verify-guest-source.sh
       - name: Cargo tests (desktop)
         working-directory: desktop/src-tauri
         # cargo test compiles the library, binary, and test targets.

@@ -1,5 +1,8 @@
+use std::ffi::c_void;
+use std::ptr::NonNull;
 use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
 use async_trait::async_trait;
@@ -8,10 +11,14 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use super::macos_observation::{
-    MacNativeIdentity, MacObservationSource, RawMacActionRequest, RawMacObservation,
-    RawMacSemanticAction, RawMacSemanticNode, RawMacTarget,
+    MacActionCancellation, MacActionCancellationSignal, MacNativeIdentity, MacObservationSource,
+    MacSemanticExecutionMode, RawMacActionRequest, RawMacObservation, RawMacSemanticAction,
+    RawMacSemanticNode, RawMacTarget,
 };
-use super::platform::{ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus};
+use super::platform::{
+    ComputerIsolatedVisualStatus, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus,
+};
 use super::types::{
     ActionOutcome, ComputerAction, ComputerError, ComputerErrorCode, ComputerResult,
     ComputerUseLimits, ObservationGeometry, Sensitivity,
@@ -31,8 +38,15 @@ struct NativeResult {
     error_len: usize,
 }
 
+#[repr(C)]
+struct NativeVirtualizationProbe {
+    operating_system_supported: bool,
+    framework_available: bool,
+}
+
 unsafe extern "C" {
     fn gpt_macos_observation_supported() -> bool;
+    fn gpt_macos_virtualization_probe() -> NativeVirtualizationProbe;
     fn gpt_macos_screen_recording_granted() -> bool;
     fn gpt_macos_request_screen_recording() -> bool;
     fn gpt_macos_accessibility_granted() -> bool;
@@ -47,8 +61,29 @@ unsafe extern "C" {
         max_dimension: u32,
         max_png_bytes: u64,
     ) -> NativeResult;
-    fn gpt_macos_act(request_bytes: *const u8, request_len: usize) -> NativeResult;
+    fn gpt_macos_cancellation_create() -> *mut c_void;
+    fn gpt_macos_cancellation_signal(cancellation: *mut c_void);
+    fn gpt_macos_cancellation_is_signalled(cancellation: *const c_void) -> bool;
+    fn gpt_macos_cancellation_free(cancellation: *mut c_void);
+    fn gpt_macos_act(
+        request_bytes: *const u8,
+        request_len: usize,
+        cancellation: *const c_void,
+    ) -> NativeResult;
     fn gpt_macos_result_free(result: *mut NativeResult);
+}
+
+pub(crate) fn isolated_visual_status() -> ComputerIsolatedVisualStatus {
+    // Pure host/package introspection. The native side performs no VM launch,
+    // permission request, image read, or helper discovery.
+    let probe = unsafe { gpt_macos_virtualization_probe() };
+    let status = ComputerIsolatedVisualStatus::read_only_probe(
+        true,
+        probe.operating_system_supported,
+        probe.framework_available,
+    );
+    debug_assert!(status.validate().is_ok());
+    status
 }
 
 #[derive(Debug, Default)]
@@ -78,6 +113,49 @@ impl PermissionTracker {
 
     fn record_prompt(&self) {
         *self.prompted_at.lock() = Some(Instant::now());
+    }
+}
+
+#[derive(Debug)]
+struct NativeMacActionCancellation {
+    context: NonNull<c_void>,
+}
+
+// The Objective-C allocation contains only one C11 atomic boolean. Its
+// lifetime is owned by this value and every access crosses the atomic FFI.
+unsafe impl Send for NativeMacActionCancellation {}
+unsafe impl Sync for NativeMacActionCancellation {}
+
+impl NativeMacActionCancellation {
+    fn new() -> ComputerResult<Self> {
+        let context =
+            NonNull::new(unsafe { gpt_macos_cancellation_create() }).ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Internal,
+                    "macOS could not allocate an action cancellation signal",
+                )
+            })?;
+        Ok(Self { context })
+    }
+}
+
+impl MacActionCancellationSignal for NativeMacActionCancellation {
+    fn cancel(&self) {
+        unsafe { gpt_macos_cancellation_signal(self.context.as_ptr()) };
+    }
+
+    fn is_cancelled(&self) -> bool {
+        unsafe { gpt_macos_cancellation_is_signalled(self.context.as_ptr()) }
+    }
+
+    fn native_context(&self) -> *mut c_void {
+        self.context.as_ptr()
+    }
+}
+
+impl Drop for NativeMacActionCancellation {
+    fn drop(&mut self) {
+        unsafe { gpt_macos_cancellation_free(self.context.as_ptr()) };
     }
 }
 
@@ -225,14 +303,31 @@ impl MacObservationSource for NativeMacObservationSource {
         .map_err(join_error)?
     }
 
+    fn action_cancellation(&self) -> ComputerResult<MacActionCancellation> {
+        Ok(MacActionCancellation::new(Arc::new(
+            NativeMacActionCancellation::new()?,
+        )))
+    }
+
+    fn supports_measured_background(&self) -> bool {
+        true
+    }
+
     async fn act(
         &self,
         identity: &MacNativeIdentity,
         request: &RawMacActionRequest,
     ) -> ComputerResult<ActionOutcome> {
         let encoded = encode_action_request(identity, request)?;
+        let cancellation = request.cancellation.clone();
         tokio::task::spawn_blocking(move || {
-            let native = unsafe { gpt_macos_act(encoded.as_ptr(), encoded.len()) };
+            let native = unsafe {
+                gpt_macos_act(
+                    encoded.as_ptr(),
+                    encoded.len(),
+                    cancellation.native_context(),
+                )
+            };
             let output = copy_native_result(native)?;
             serde_json::from_slice(&output.json).map_err(|_| {
                 ComputerError::new(
@@ -286,6 +381,8 @@ fn native_error_code(status: i32) -> ComputerErrorCode {
         6 => ComputerErrorCode::LimitReached,
         8 => ComputerErrorCode::InvalidRequest,
         9 => ComputerErrorCode::ForbiddenAction,
+        10 => ComputerErrorCode::Interrupted,
+        11 => ComputerErrorCode::UncertainOutcome,
         _ => ComputerErrorCode::BackendFailure,
     }
 }
@@ -408,6 +505,7 @@ struct NativeActionEnvelope<'a> {
     element_index: Option<usize>,
     expected_element: Option<NativeExpectedElement<'a>>,
     action: NativeActionPayload<'a>,
+    execution_mode: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -460,6 +558,9 @@ fn encode_action_request(
         ),
         ComputerAction::KeyChord { .. }
         | ComputerAction::PointerClick { .. }
+        | ComputerAction::PointerMove { .. }
+        | ComputerAction::PointerButton { .. }
+        | ComputerAction::TextInput { .. }
         | ComputerAction::Wait { .. } => {
             return Err(ComputerError::new(
                 ComputerErrorCode::ForbiddenAction,
@@ -504,6 +605,10 @@ fn encode_action_request(
             text,
             delta_x,
             delta_y,
+        },
+        execution_mode: match request.execution_mode {
+            MacSemanticExecutionMode::ForegroundRequired => "foreground_required",
+            MacSemanticExecutionMode::MeasuredBackground => "measured_background",
         },
     };
     let encoded = serde_json::to_vec(&envelope)
@@ -558,6 +663,8 @@ mod tests {
     fn native_error_codes_are_closed() {
         assert_eq!(native_error_code(1), ComputerErrorCode::UnsupportedPlatform);
         assert_eq!(native_error_code(3), ComputerErrorCode::TargetClosed);
+        assert_eq!(native_error_code(10), ComputerErrorCode::Interrupted);
+        assert_eq!(native_error_code(11), ComputerErrorCode::UncertainOutcome);
         assert_eq!(native_error_code(999), ComputerErrorCode::BackendFailure);
     }
 
@@ -567,6 +674,16 @@ mod tests {
         assert_eq!(tracker.status(false), ComputerPermissionStatus::Missing);
         assert_eq!(tracker.status(true), ComputerPermissionStatus::Granted);
         assert_eq!(tracker.status(false), ComputerPermissionStatus::Revoked);
+    }
+
+    #[test]
+    fn native_action_cancellation_signal_is_exact_and_monotonic() {
+        let cancellation = NativeMacActionCancellation::new().unwrap();
+        assert!(!cancellation.is_cancelled());
+        cancellation.cancel();
+        assert!(cancellation.is_cancelled());
+        cancellation.cancel();
+        assert!(cancellation.is_cancelled());
     }
 
     #[test]
@@ -586,7 +703,6 @@ mod tests {
     fn native_shim_exposes_semantic_accessibility_without_raw_input() {
         let shim = include_str!("macos_native_shim.m");
         for forbidden in [
-            "CGEventCreate",
             "CGEventPost",
             "CGWarpMouseCursorPosition",
             "CGAssociateMouseAndMouseCursorPosition",
@@ -600,6 +716,13 @@ mod tests {
             );
         }
         assert!(shim.contains("gpt_macos_act"));
+        assert!(shim.contains("gpt_macos_cancellation_create"));
+        assert!(shim.contains("gpt_macos_cancellation_signal"));
+        assert!(shim.contains("GPT_MAC_INTERRUPTED"));
+        assert!(shim.contains("GPT_MAC_UNCERTAIN_OUTCOME"));
+        assert!(shim.contains("GPTCaptureUserInteractionState"));
+        assert!(shim.contains("CGEventGetLocation"));
+        assert!(shim.contains("measured_background"));
         assert!(shim.contains("AXUIElementPerformAction"));
         assert!(shim.contains("AXUIElementSetAttributeValue"));
         assert!(shim.contains("GPTTargetIsFocused"));

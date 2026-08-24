@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use super::message::MessageKind;
-use super::types::hash_payload;
+use super::types::{hash_payload, AgentMemoryPolicy};
 use super::workload::{AssignmentStatus, WorkDependency, WorkItem, WorkPolicy, WorkState};
 use super::OrchError;
 
@@ -22,6 +22,7 @@ pub const MAX_MANAGER_STEPS: usize = 64;
 pub const MAX_MANAGER_IN_FLIGHT: u32 = 16;
 pub const MAX_MANAGER_REPLANS: u32 = 16;
 pub const MAX_MANAGER_DIRECTIVE_BYTES: usize = 16 * 1024;
+pub const MAX_MANAGER_MEMORY_CONTEXT_BYTES: usize = crate::memory::MAX_INJECT_BYTES;
 const MAX_MANAGER_ID_BYTES: usize = 256;
 const MAX_MANAGER_TEXT_BYTES: usize = 32 * 1024;
 
@@ -82,8 +83,141 @@ pub enum ManagerDecisionState {
     HumanRequired,
 }
 
+/// Immutable attribution for the exact memory context presented to one
+/// manager-decision occurrence. The raw quoted context lives only in the
+/// occurrence's durable Work objective; this record carries bounded metadata
+/// and hashes so a directive cannot silently move to a different scope or
+/// later memory view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ManagerMemoryAttribution {
+    pub schema_version: u32,
+    pub manager_agent_id: String,
+    pub agent_spec_revision: u64,
+    pub source_workspace_digest: String,
+    pub project_scope_enabled: bool,
+    pub agent_private_scope_enabled: bool,
+    #[serde(default)]
+    pub team_scope_ids: Vec<String>,
+    pub scope_policy_digest: String,
+    pub project_context_digest: String,
+    pub project_context_bytes: u64,
+    pub project_context_present: bool,
+    pub attribution_digest: String,
+}
+
+impl ManagerMemoryAttribution {
+    pub fn new(
+        manager_agent_id: impl Into<String>,
+        agent_spec_revision: u64,
+        source_workspace: &str,
+        policy: &AgentMemoryPolicy,
+        project_context: &str,
+    ) -> Result<Self, OrchError> {
+        let manager_agent_id = manager_agent_id.into();
+        let mut team_scope_ids = policy.team_ids.clone();
+        team_scope_ids.sort();
+        team_scope_ids.dedup();
+        let source_workspace_digest = hash_payload(&json!({
+            "sourceWorkspace": source_workspace,
+        }));
+        let scope_policy_digest = hash_payload(&json!({
+            "projectScope": policy.project_scope,
+            "agentPrivateScope": policy.agent_private_scope,
+            "teamIds": team_scope_ids,
+        }));
+        let project_context_digest = hash_payload(&json!({
+            "projectContext": project_context,
+        }));
+        let mut attribution = Self {
+            schema_version: MANAGER_SCHEMA_VERSION,
+            manager_agent_id,
+            agent_spec_revision,
+            source_workspace_digest,
+            project_scope_enabled: policy.project_scope,
+            agent_private_scope_enabled: policy.agent_private_scope,
+            team_scope_ids,
+            scope_policy_digest,
+            project_context_digest,
+            project_context_bytes: project_context.len() as u64,
+            project_context_present: !project_context.is_empty(),
+            attribution_digest: String::new(),
+        };
+        attribution.attribution_digest = hash_payload(&attribution.digest_material());
+        attribution.validate()?;
+        Ok(attribution)
+    }
+
+    fn digest_material(&self) -> Value {
+        json!({
+            "schemaVersion": self.schema_version,
+            "managerAgentId": self.manager_agent_id,
+            "agentSpecRevision": self.agent_spec_revision,
+            "sourceWorkspaceDigest": self.source_workspace_digest,
+            "projectScopeEnabled": self.project_scope_enabled,
+            "agentPrivateScopeEnabled": self.agent_private_scope_enabled,
+            "teamScopeIds": self.team_scope_ids,
+            "scopePolicyDigest": self.scope_policy_digest,
+            "projectContextDigest": self.project_context_digest,
+            "projectContextBytes": self.project_context_bytes,
+            "projectContextPresent": self.project_context_present,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != MANAGER_SCHEMA_VERSION || self.agent_spec_revision == 0 {
+            return Err(invalid(
+                "manager memory attribution schema or revision is invalid",
+            ));
+        }
+        validate_id(&self.manager_agent_id, "manager memory agent_id")?;
+        if self.team_scope_ids.len() > 64 {
+            return Err(invalid("manager memory team scopes exceed their bound"));
+        }
+        let mut canonical_team_ids = self.team_scope_ids.clone();
+        canonical_team_ids.sort();
+        canonical_team_ids.dedup();
+        if canonical_team_ids != self.team_scope_ids {
+            return Err(invalid("manager memory team scopes are not canonical"));
+        }
+        for team_id in &self.team_scope_ids {
+            validate_id(team_id, "manager memory team_id")?;
+        }
+        for (value, field) in [
+            (&self.source_workspace_digest, "source_workspace_digest"),
+            (&self.scope_policy_digest, "scope_policy_digest"),
+            (&self.project_context_digest, "project_context_digest"),
+            (&self.attribution_digest, "attribution_digest"),
+        ] {
+            validate_sha256(value, field)?;
+        }
+        let expected_scope_digest = hash_payload(&json!({
+            "projectScope": self.project_scope_enabled,
+            "agentPrivateScope": self.agent_private_scope_enabled,
+            "teamIds": self.team_scope_ids,
+        }));
+        if self.scope_policy_digest != expected_scope_digest {
+            return Err(invalid(
+                "manager memory scope policy digest is inconsistent",
+            ));
+        }
+        if self.project_context_bytes > MAX_MANAGER_MEMORY_CONTEXT_BYTES as u64
+            || self.project_context_present != (self.project_context_bytes > 0)
+            || (!self.project_scope_enabled && self.project_context_present)
+        {
+            return Err(invalid(
+                "manager memory context bounds or scope are inconsistent",
+            ));
+        }
+        if self.attribution_digest != hash_payload(&self.digest_material()) {
+            return Err(invalid("manager memory attribution digest is inconsistent"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ManagerDecisionRecord {
     pub schema_version: u32,
     pub decision_id: String,
@@ -91,12 +225,14 @@ pub struct ManagerDecisionRecord {
     pub expected_plan_revision: u64,
     pub manager_agent_id: String,
     pub agent_spec_revision: u64,
+    pub memory_attribution: ManagerMemoryAttribution,
     #[serde(default)]
     pub triggering_work_ids: Vec<String>,
     #[serde(default)]
     pub triggering_message_ids: Vec<String>,
     pub input_snapshot_hash: String,
     pub decision_work_id: String,
+    pub decision_work_objective_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     pub state: ManagerDecisionState,
@@ -111,6 +247,16 @@ pub struct ManagerDecisionRecord {
 }
 
 impl ManagerDecisionRecord {
+    pub fn matches_directive_fences(&self, envelope: &ManagerDirectiveEnvelope) -> bool {
+        envelope.occurrence_id == self.decision_id
+            && envelope.plan_id == self.plan_id
+            && envelope.expected_plan_revision == self.expected_plan_revision
+            && envelope.manager_agent_id == self.manager_agent_id
+            && envelope.expected_agent_spec_revision == self.agent_spec_revision
+            && envelope.input_snapshot_hash == self.input_snapshot_hash
+            && envelope.memory_attribution_digest == self.memory_attribution.attribution_digest
+    }
+
     pub fn validate(&self) -> Result<(), OrchError> {
         if self.schema_version != MANAGER_SCHEMA_VERSION
             || self.expected_plan_revision == 0
@@ -124,6 +270,14 @@ impl ManagerDecisionRecord {
         {
             return Err(invalid("manager decision references exceed their bounds"));
         }
+        self.memory_attribution.validate()?;
+        if self.memory_attribution.manager_agent_id != self.manager_agent_id
+            || self.memory_attribution.agent_spec_revision != self.agent_spec_revision
+        {
+            return Err(invalid(
+                "manager decision memory attribution does not match its Agent fence",
+            ));
+        }
         for (value, field) in [
             (&self.decision_id, "decision_id"),
             (&self.plan_id, "plan_id"),
@@ -133,6 +287,10 @@ impl ManagerDecisionRecord {
         ] {
             validate_id(value, field)?;
         }
+        validate_sha256(
+            &self.decision_work_objective_digest,
+            "decision_work_objective_digest",
+        )?;
         for id in self
             .triggering_work_ids
             .iter()
@@ -149,6 +307,11 @@ impl ManagerDecisionRecord {
                 &serde_json::to_string(directive)
                     .map_err(|error| invalid(format!("invalid stored directive: {error}")))?,
             )?;
+            if !self.matches_directive_fences(directive) {
+                return Err(invalid(
+                    "stored manager directive does not match its occurrence fences",
+                ));
+            }
         }
         Ok(())
     }
@@ -165,6 +328,7 @@ pub struct ManagerDirectiveEnvelope {
     pub manager_agent_id: String,
     pub expected_agent_spec_revision: u64,
     pub input_snapshot_hash: String,
+    pub memory_attribution_digest: String,
     pub directive: ManagerDirective,
 }
 
@@ -183,12 +347,101 @@ pub enum ManagerDirective {
     NoSafeAction { reason: String },
 }
 
+/// A JSON document whose objects contain no repeated key at any depth.
+///
+/// `serde_json::Value` silently collapses a duplicate key to last-wins. At
+/// this boundary that would let one model response read one way to an auditor
+/// and act another way through the applicator, so the envelope refuses the
+/// document instead of choosing a winner.
+struct UniqueKeyJson(Value);
+
+impl<'de> Deserialize<'de> for UniqueKeyJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StrictValue;
+
+        impl<'de> serde::de::Visitor<'de> for StrictValue {
+            type Value = Value;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("JSON with unique object keys")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Value, E> {
+                Ok(Value::Bool(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
+                Ok(Value::from(value))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Value, E> {
+                Ok(Value::from(value))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Value, E> {
+                Ok(Value::from(value))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Value, E> {
+                Ok(Value::String(value.to_owned()))
+            }
+
+            fn visit_unit<E>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+
+            fn visit_none<E>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                UniqueKeyJson::deserialize(deserializer).map(|wrapped| wrapped.0)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut items = Vec::new();
+                while let Some(UniqueKeyJson(item)) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(Value::Array(items))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut object = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let UniqueKeyJson(value) = map.next_value()?;
+                    if object.insert(key.clone(), value).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate manager directive key `{key}`"
+                        )));
+                    }
+                }
+                Ok(Value::Object(object))
+            }
+        }
+
+        deserializer.deserialize_any(StrictValue).map(UniqueKeyJson)
+    }
+}
+
 pub fn parse_manager_directive(raw: &str) -> Result<ManagerDirectiveEnvelope, OrchError> {
     if raw.is_empty() || raw.len() > MAX_MANAGER_DIRECTIVE_BYTES {
         return Err(invalid("manager directive is empty or exceeds its bound"));
     }
     let mut deserializer = serde_json::Deserializer::from_str(raw);
-    let value = Value::deserialize(&mut deserializer)
+    let UniqueKeyJson(value) = UniqueKeyJson::deserialize(&mut deserializer)
         .map_err(|error| invalid(format!("invalid manager directive: {error}")))?;
     deserializer
         .end()
@@ -196,7 +449,14 @@ pub fn parse_manager_directive(raw: &str) -> Result<ManagerDirectiveEnvelope, Or
     validate_directive_json_shape(&value)?;
     let envelope = serde_json::from_value::<ManagerDirectiveEnvelope>(value)
         .map_err(|error| invalid(format!("invalid manager directive: {error}")))?;
-    if envelope.schema_version != MANAGER_SCHEMA_VERSION || envelope.expected_plan_revision == 0 {
+    // Revisions are one-based. Zero is never a real fence, and
+    // `ManagerDecisionRecord::validate` already refuses it, so the envelope
+    // parser refuses it too rather than leaving the downstream equality check
+    // as the only thing standing between a zero fence and a plan mutation.
+    if envelope.schema_version != MANAGER_SCHEMA_VERSION
+        || envelope.expected_plan_revision == 0
+        || envelope.expected_agent_spec_revision == 0
+    {
         return Err(invalid("manager directive schema or revision is invalid"));
     }
     for (value, field) in [
@@ -207,6 +467,10 @@ pub fn parse_manager_directive(raw: &str) -> Result<ManagerDirectiveEnvelope, Or
     ] {
         validate_id(value, field)?;
     }
+    validate_sha256(
+        &envelope.memory_attribution_digest,
+        "memory_attribution_digest",
+    )?;
     match &envelope.directive {
         ManagerDirective::AppendReplacementSteps {
             reason,
@@ -266,6 +530,7 @@ fn validate_directive_json_shape(value: &Value) -> Result<(), OrchError> {
             "managerAgentId",
             "expectedAgentSpecRevision",
             "inputSnapshotHash",
+            "memoryAttributionDigest",
             "directive",
         ],
         "$",
@@ -1168,6 +1433,19 @@ fn validate_text(value: &str, field: &str) -> Result<(), OrchError> {
     Ok(())
 }
 
+fn validate_sha256(value: &str, field: &str) -> Result<(), OrchError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(invalid(format!(
+            "{field} must be a 64-character lowercase hexadecimal digest"
+        )));
+    }
+    Ok(())
+}
+
 fn invalid(message: impl Into<String>) -> OrchError {
     OrchError::new(super::OrchErrorCode::InvalidRequest, message)
 }
@@ -1191,6 +1469,8 @@ fn work_state_label(state: WorkState) -> &'static str {
 mod tests {
     use super::*;
 
+    const MEMORY_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     fn spec(step_id: &str, dependencies: &[&str]) -> ManagerStepSpec {
         ManagerStepSpec {
             step_id: step_id.into(),
@@ -1201,6 +1481,86 @@ mod tests {
             assigned_agent_id: None,
             policy: WorkPolicy::default(),
         }
+    }
+
+    #[test]
+    fn manager_memory_attribution_is_canonical_bounded_and_tamper_evident() {
+        let policy = AgentMemoryPolicy {
+            project_scope: true,
+            agent_private_scope: false,
+            team_ids: vec!["team-b".into(), "team-a".into(), "team-b".into()],
+        };
+        let attribution = ManagerMemoryAttribution::new(
+            "manager",
+            7,
+            "/tmp/source",
+            &policy,
+            "quoted project context",
+        )
+        .unwrap();
+        assert_eq!(attribution.team_scope_ids, ["team-a", "team-b"]);
+        assert_eq!(attribution.project_context_bytes, 22);
+        attribution.validate().unwrap();
+
+        let mut tampered = attribution.clone();
+        tampered.project_context_bytes += 1;
+        assert!(tampered.validate().is_err());
+
+        let disabled = AgentMemoryPolicy {
+            project_scope: false,
+            ..AgentMemoryPolicy::default()
+        };
+        assert!(ManagerMemoryAttribution::new(
+            "manager",
+            7,
+            "/tmp/source",
+            &disabled,
+            "context must not cross a disabled scope",
+        )
+        .is_err());
+
+        let now = Utc::now();
+        let decision = ManagerDecisionRecord {
+            schema_version: MANAGER_SCHEMA_VERSION,
+            decision_id: "decision".into(),
+            plan_id: "plan".into(),
+            expected_plan_revision: 2,
+            manager_agent_id: "manager".into(),
+            agent_spec_revision: attribution.agent_spec_revision,
+            memory_attribution: attribution.clone(),
+            triggering_work_ids: Vec::new(),
+            triggering_message_ids: Vec::new(),
+            input_snapshot_hash: "snapshot".into(),
+            decision_work_id: "decision-work".into(),
+            decision_work_objective_digest: "b".repeat(64),
+            run_id: None,
+            state: ManagerDecisionState::AwaitingResult,
+            proposed_directive: None,
+            outcome: None,
+            applied_mutation_ids: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let envelope = ManagerDirectiveEnvelope {
+            schema_version: MANAGER_SCHEMA_VERSION,
+            occurrence_id: decision.decision_id.clone(),
+            plan_id: decision.plan_id.clone(),
+            expected_plan_revision: decision.expected_plan_revision,
+            manager_agent_id: decision.manager_agent_id.clone(),
+            expected_agent_spec_revision: decision.agent_spec_revision,
+            input_snapshot_hash: decision.input_snapshot_hash.clone(),
+            memory_attribution_digest: attribution.attribution_digest.clone(),
+            directive: ManagerDirective::NoSafeAction {
+                reason: "bounded fixture".into(),
+            },
+        };
+        assert!(decision.matches_directive_fences(&envelope));
+        let mut wrong_memory = envelope.clone();
+        wrong_memory.memory_attribution_digest = "c".repeat(64);
+        assert!(!decision.matches_directive_fences(&wrong_memory));
+        let mut stored = decision;
+        stored.proposed_directive = Some(wrong_memory);
+        assert!(stored.validate().is_err());
     }
 
     #[test]
@@ -1435,6 +1795,7 @@ mod tests {
             "managerAgentId": "agent-1",
             "expectedAgentSpecRevision": 2,
             "inputSnapshotHash": "abc",
+            "memoryAttributionDigest": MEMORY_DIGEST,
             "directive": {
                 "type": "append_replacement_steps",
                 "reason": "replace failure",
@@ -1459,5 +1820,208 @@ mod tests {
         assert!(parse_manager_directive(&nested_unknown.to_string()).is_err());
         assert!(parse_manager_directive("{} trailing").is_err());
         assert!(parse_manager_directive(&"x".repeat(MAX_MANAGER_DIRECTIVE_BYTES + 1)).is_err());
+    }
+
+    /// The directive envelope is the only place untrusted model output becomes
+    /// a durable plan mutation, so every rejection below is a boundary
+    /// guarantee rather than a formatting preference.
+    #[test]
+    fn directive_envelope_rejects_adversarial_model_output() {
+        fn envelope(directive: Value) -> String {
+            json!({
+                "schemaVersion": 1,
+                "occurrenceId": "decision-1",
+                "planId": "plan-1",
+                "expectedPlanRevision": 3,
+                "managerAgentId": "agent-1",
+                "expectedAgentSpecRevision": 2,
+                "inputSnapshotHash": "abc",
+                "memoryAttributionDigest": MEMORY_DIGEST,
+                "directive": directive
+            })
+            .to_string()
+        }
+        fn no_safe_action() -> Value {
+            json!({"type": "no_safe_action", "reason": "nothing safe"})
+        }
+        fn rejected(raw: &str, case: &str) {
+            assert!(
+                parse_manager_directive(raw).is_err(),
+                "envelope must fail closed: {case}"
+            );
+        }
+
+        // The three allowlisted directives are the whole vocabulary.
+        parse_manager_directive(&envelope(no_safe_action())).unwrap();
+        parse_manager_directive(&envelope(json!({
+            "type": "request_operator_intervention",
+            "reason": "needs a human"
+        })))
+        .unwrap();
+        parse_manager_directive(&envelope(json!({
+            "type": "append_replacement_steps",
+            "reason": "replace failure",
+            "replacesStepIds": ["failed"],
+            "steps": [{"stepId": "retry", "kind": "coding", "objective": "retry"}]
+        })))
+        .unwrap();
+        rejected(
+            &envelope(json!({"type": "apply_directly", "reason": "just do it"})),
+            "unknown directive type",
+        );
+
+        // Unknown fields are refused inside every variant, not only the one
+        // the recursive shape check descends into.
+        rejected(
+            &envelope(json!({
+                "type": "no_safe_action",
+                "reason": "nothing safe",
+                "smuggled": {"applyAnyway": true}
+            })),
+            "unknown field in a non-append directive",
+        );
+        rejected(
+            &envelope(json!({
+                "type": "request_operator_intervention",
+                "reason": "needs a human",
+                "replacesStepIds": ["failed"],
+                "steps": [{"stepId": "sneaky", "kind": "coding", "objective": "sneak"}]
+            })),
+            "append payload smuggled into an intervention directive",
+        );
+
+        // Fences must be real. Revisions are one-based on both axes.
+        for (field, value, case) in [
+            ("expectedPlanRevision", json!(0), "zero plan revision"),
+            ("expectedAgentSpecRevision", json!(0), "zero spec revision"),
+            ("expectedPlanRevision", json!(-1), "negative plan revision"),
+            (
+                "expectedPlanRevision",
+                json!(3.5),
+                "fractional plan revision",
+            ),
+            ("schemaVersion", json!(2), "future schema version"),
+        ] {
+            let mut tampered: Value = serde_json::from_str(&envelope(no_safe_action())).unwrap();
+            tampered[field] = value;
+            rejected(&tampered.to_string(), case);
+        }
+
+        // Identity fields are bounded and path-safe, because they are used as
+        // durable record keys.
+        for (field, value, case) in [
+            ("planId", json!("../../etc/passwd"), "plan id traversal"),
+            ("occurrenceId", json!(""), "empty occurrence id"),
+            ("managerAgentId", json!("a/b"), "agent id separator"),
+            (
+                "inputSnapshotHash",
+                json!("x".repeat(MAX_MANAGER_ID_BYTES + 1)),
+                "oversized snapshot hash",
+            ),
+            (
+                "memoryAttributionDigest",
+                json!("A".repeat(64)),
+                "non-canonical memory attribution digest",
+            ),
+        ] {
+            let mut tampered: Value = serde_json::from_str(&envelope(no_safe_action())).unwrap();
+            tampered[field] = value;
+            rejected(&tampered.to_string(), case);
+        }
+
+        // Replacement graphs stay inside the plan's declared bounds.
+        rejected(
+            &envelope(json!({
+                "type": "append_replacement_steps",
+                "reason": "r",
+                "replacesStepIds": [],
+                "steps": [{"stepId": "retry", "kind": "coding", "objective": "retry"}]
+            })),
+            "replacement naming no superseded step",
+        );
+        rejected(
+            &envelope(json!({
+                "type": "append_replacement_steps",
+                "reason": "r",
+                "replacesStepIds": (0..=MAX_MANAGER_STEPS).map(|index| format!("s{index}")).collect::<Vec<_>>(),
+                "steps": [{"stepId": "retry", "kind": "coding", "objective": "retry"}]
+            })),
+            "oversized replaced-step list",
+        );
+        rejected(
+            &envelope(json!({
+                "type": "append_replacement_steps",
+                "reason": "r",
+                "replacesStepIds": ["failed"],
+                "steps": (0..=MAX_MANAGER_STEPS)
+                    .map(|index| json!({"stepId": format!("s{index}"), "kind": "coding", "objective": "o"}))
+                    .collect::<Vec<_>>()
+            })),
+            "oversized replacement step list",
+        );
+        rejected(
+            &envelope(json!({
+                "type": "append_replacement_steps",
+                "reason": "r",
+                "replacesStepIds": ["failed"],
+                "steps": [{"stepId": "a", "kind": "coding", "objective": "o", "dependencies": ["a"]}]
+            })),
+            "self-dependent replacement step",
+        );
+        rejected(
+            &envelope(json!({"type": "no_safe_action", "reason": ""})),
+            "empty directive reason",
+        );
+
+        // Transport-level shapes that must never reach the typed envelope.
+        for (raw, case) in [
+            ("[]", "array root"),
+            ("\"envelope\"", "string root"),
+            ("null", "null root"),
+            ("", "empty output"),
+        ] {
+            rejected(raw, case);
+        }
+        let mut depth_bomb = String::new();
+        for _ in 0..2_000 {
+            depth_bomb.push('[');
+        }
+        depth_bomb.push('1');
+        for _ in 0..2_000 {
+            depth_bomb.push(']');
+        }
+        rejected(&depth_bomb, "deeply nested output");
+        rejected(
+            r#"{"schemaVersion":1,"schemaVersion":1,"occurrenceId":"d","planId":"p","expectedPlanRevision":3,"managerAgentId":"a","expectedAgentSpecRevision":2,"inputSnapshotHash":"h","memoryAttributionDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","directive":{"type":"no_safe_action","reason":"r"}}"#,
+            "duplicate envelope key",
+        );
+        rejected(
+            r#"{"schemaVersion":1,"occurrenceId":"d","planId":"p","expectedPlanRevision":3,"managerAgentId":"a","expectedAgentSpecRevision":2,"inputSnapshotHash":"h","memoryAttributionDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","directive":{"type":"no_safe_action","reason":"audited","reason":"applied"}}"#,
+            "duplicate key nested in the directive",
+        );
+        rejected(
+            r#"{"schemaVersion":1,"occurrenceId":"d","planId":"p","expectedPlanRevision":3,"managerAgentId":"a","expectedAgentSpecRevision":2,"inputSnapshotHash":"h","memoryAttributionDigest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","directive":{"type":"append_replacement_steps","reason":"r","replacesStepIds":["failed"],"steps":[{"stepId":"audited","stepId":"applied","kind":"coding","objective":"o"}]}}"#,
+            "duplicate key nested inside an array element",
+        );
+        rejected(
+            &format!(
+                "{} {}",
+                envelope(no_safe_action()),
+                envelope(no_safe_action())
+            ),
+            "two concatenated envelopes",
+        );
+
+        // Ordinary multi-line operator text stays legal; the bound is on size
+        // and NUL, not on formatting.
+        parse_manager_directive(&envelope(json!({
+            "type": "no_safe_action",
+            "reason": "line one\nline two\ttabbed"
+        })))
+        .unwrap();
+        rejected(
+            &envelope(json!({"type": "no_safe_action", "reason": "a\u{0}b"})),
+            "NUL in directive reason",
+        );
     }
 }
