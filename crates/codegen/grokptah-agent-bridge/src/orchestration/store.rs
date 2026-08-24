@@ -4912,7 +4912,19 @@ impl OrchStore {
             retry_eligible,
             ..ManagedExecutionPolicy::default()
         };
-        let retry = policy.allows_auto_retry(&item, attempt_number.saturating_add(1), cause);
+        // Provider dispatch is a separate durable boundary from managed-work
+        // retry policy. A completed or uncertain send may already have been
+        // accepted by the gateway, so never let the generic managed retry
+        // flag silently replay it. An admitted row is also unsafe: recovery
+        // has not yet established that request bytes were not accepted.
+        let provider_retry_safe = intent
+            .run_id
+            .as_deref()
+            .map(|run_id| self.provider_retry_safe_for_run_unlocked(run_id))
+            .transpose()?
+            .unwrap_or(false);
+        let retry = provider_retry_safe
+            && policy.allows_auto_retry(&item, attempt_number.saturating_add(1), cause);
         let attempt_state = match cause {
             ManagedRetryCause::Expired | ManagedRetryCause::Interrupted => AttemptState::Expired,
             ManagedRetryCause::Failed => AttemptState::Failed,
@@ -5280,6 +5292,16 @@ impl OrchStore {
             self.save_managed_intent_unlocked(&intent)?;
         }
         Ok(Some(intent))
+    }
+
+    fn provider_retry_safe_for_run_unlocked(&self, run_id: &str) -> anyhow::Result<bool> {
+        let attempts = self.list_provider_attempts_for_run_unlocked(run_id)?;
+        if attempts.truncated {
+            return Ok(false);
+        }
+        Ok(attempts.attempts.iter().all(|attempt| {
+            attempt.retry_class == Some(super::provider_attempt::ProviderRetryClass::SameRunSafe)
+        }))
     }
 
     pub fn resolve_parked_managed_permission(
@@ -8799,6 +8821,9 @@ mod tests {
             finished.retry_class,
             Some(super::super::provider_attempt::ProviderRetryClass::SameRunSafe)
         );
+        assert!(store
+            .provider_retry_safe_for_run_unlocked(&run.run_id)
+            .unwrap());
         let after = store.load_run(&run.run_id).unwrap().unwrap();
         assert_eq!(after.aggregates.usage_pending_requests, 0);
         assert!(after.aggregates.usage_complete);
@@ -8824,10 +8849,11 @@ mod tests {
                 .admit_run_with_quota(&run, &reservation)
                 .into_result()
                 .unwrap();
-            store
-                .begin_provider_attempt(&run.run_id)
-                .unwrap()
-                .attempt_id
+            let attempt = store.begin_provider_attempt(&run.run_id).unwrap();
+            assert!(!store
+                .provider_retry_safe_for_run_unlocked(&run.run_id)
+                .unwrap());
+            attempt.attempt_id
             // Crash after the durable row and possible transport entry.
         };
 
@@ -8844,6 +8870,9 @@ mod tests {
             attempt.retry_class,
             Some(super::super::provider_attempt::ProviderRetryClass::ExplicitNewRunOnly)
         );
+        assert!(!reopened
+            .provider_retry_safe_for_run_unlocked(&run.run_id)
+            .unwrap());
         let recovered_run = reopened.load_run(&run.run_id).unwrap().unwrap();
         assert_eq!(recovered_run.state, RunState::Interrupted);
         assert!(!recovered_run.aggregates.usage_complete);
