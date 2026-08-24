@@ -227,7 +227,8 @@ available.
    exact Run/surface/incarnation, but it is source-only and not dispatched. A shared session-binding
    contract now length-prefixes Run, surface, incarnation, and input-domain identities, derives a
    challenge-bound channel key, and carries a confirmation tag before frame/input traffic. Rust and
-   freestanding guest C share the digest and vectors; the helper/guest socket loop still does not
+   freestanding guest C share the digest and vectors; the Rust frame/input carriers can derive
+   interoperable keys from the same challenge, but the helper/guest socket loop still does not
    consume the binding packet.
 6. Integrate app-owned cursor, focus/drag preview, timeline, persistent emergency controls, and
    accessibility states in the cockpit.

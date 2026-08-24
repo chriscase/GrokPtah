@@ -696,7 +696,8 @@ and a credentialed nested-signing assembler. The helper's closed inherited-descr
    twice and compares image/manifest bytes; it deliberately does not embed or publish the output.
    The Rust bridge and freestanding guest C now also share a length-prefixed
    Run/surface/incarnation/input-domain binding digest, challenge-derived channel key, and
-   confirmation tag; the binding packet remains source-only and is not consumed by the helper/guest
+   confirmation tag. The Rust frame/input carriers can derive interoperable keys from that
+   challenge, but the binding packet remains source-only and is not consumed by the helper/guest
    socket loop. These are contracts and unshipped source/pipeline primitives, not packaged evidence. See
 [`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,
 signed/built helper, guest image, packaged entitlement proof, or host-native dispatch exists yet, so these

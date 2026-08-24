@@ -19,8 +19,9 @@ input backend, or `HostNative` dispatch proof.
   length-prefixed fields, then derives a challenge-bound channel key and confirmation tag. It does
   not carry paths, model traffic, or reusable secrets.
 - `isolated_visual_channel.rs` mirrors that canonical digest/key/confirmation contract for the host
-  bridge and can encode the fixed binding header plus its four identity fields. It is a source
-  contract only: the helper/guest socket loop still does not consume it.
+  bridge, encodes the fixed binding header plus its four identity fields, and supplies challenge-
+  bound constructors for the Rust frame/input carriers. It is a source contract only: the
+  helper/guest socket loop still does not consume it.
 
 ## Reproducible Linux workflow
 

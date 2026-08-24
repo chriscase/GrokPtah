@@ -6,6 +6,7 @@ use super::isolated_visual::{
     IsolatedVisualLaunchContract, IsolatedVisualResourceLimits,
     ISOLATED_VISUAL_GUEST_PROTOCOL_VERSION,
 };
+use super::isolated_visual_channel::IsolatedVisualChannelBinding;
 use super::types::{ComputerError, ComputerErrorCode, ComputerResult};
 
 pub const ISOLATED_VISUAL_FRAME_MAGIC: u32 = 0x4750_5446;
@@ -98,6 +99,29 @@ impl IsolatedVisualFrameCarrier {
         channel_secret: &[u8],
     ) -> ComputerResult<Self> {
         Self::new(FrameCarrierRole::HostReceiver, contract, channel_secret)
+    }
+
+    /// Constructs the source-only guest carrier from the authenticated
+    /// bootstrap challenge and exact session identity. Runtime dispatch still
+    /// requires the signed helper/guest proof described in the roadmap.
+    pub fn new_guest_with_challenge(
+        contract: &IsolatedVisualLaunchContract,
+        challenge: &[u8; 32],
+    ) -> ComputerResult<Self> {
+        let binding = IsolatedVisualChannelBinding::from_contract(contract)?;
+        let channel_secret = binding.derive_channel_secret(challenge)?;
+        Self::new(FrameCarrierRole::GuestSender, contract, &channel_secret)
+    }
+
+    /// Constructs the source-only host carrier from the same challenge-bound
+    /// session key the guest derives after binding.
+    pub fn new_host_with_challenge(
+        contract: &IsolatedVisualLaunchContract,
+        challenge: &[u8; 32],
+    ) -> ComputerResult<Self> {
+        let binding = IsolatedVisualChannelBinding::from_contract(contract)?;
+        let channel_secret = binding.derive_channel_secret(challenge)?;
+        Self::new(FrameCarrierRole::HostReceiver, contract, &channel_secret)
     }
 
     fn new(
@@ -563,6 +587,23 @@ mod tests {
         let frame = host.open_chunk(&chunks[1]).unwrap().unwrap();
         assert_eq!(frame.bytes, payload);
         assert_eq!(frame.request_nonce, nonce);
+    }
+
+    #[test]
+    fn challenge_binding_derives_interoperable_frame_keys() {
+        let contract = contract();
+        let challenge = [0x42_u8; 32];
+        let mut guest =
+            IsolatedVisualFrameCarrier::new_guest_with_challenge(&contract, &challenge).unwrap();
+        let mut host =
+            IsolatedVisualFrameCarrier::new_host_with_challenge(&contract, &challenge).unwrap();
+        let chunks = guest
+            .seal_frame(1, &Uuid::new_v4().to_string(), 800, 600, b"bound-frame")
+            .unwrap();
+        assert_eq!(
+            host.open_chunk(&chunks[0]).unwrap().unwrap().bytes,
+            b"bound-frame"
+        );
     }
 
     #[test]

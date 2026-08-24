@@ -4,6 +4,7 @@ use uuid::Uuid;
 use super::isolated_visual::{
     IsolatedVisualLaunchContract, ISOLATED_VISUAL_GUEST_PROTOCOL_VERSION,
 };
+use super::isolated_visual_channel::IsolatedVisualChannelBinding;
 use super::isolated_visual_input::{
     IsolatedVisualInputGate, IsolatedVisualInputKeyState, IsolatedVisualInputMessage,
 };
@@ -60,6 +61,29 @@ impl IsolatedVisualInputWire {
         channel_secret: &[u8],
     ) -> ComputerResult<Self> {
         Self::new(InputWireRole::GuestReceiver, contract, channel_secret)
+    }
+
+    /// Constructs the source-only host sender from the exact bootstrap
+    /// challenge and identity binding; it cannot widen the current locked
+    /// Computer Use capability by itself.
+    pub fn new_host_with_challenge(
+        contract: &IsolatedVisualLaunchContract,
+        challenge: &[u8; 32],
+    ) -> ComputerResult<Self> {
+        let binding = IsolatedVisualChannelBinding::from_contract(contract)?;
+        let channel_secret = binding.derive_channel_secret(challenge)?;
+        Self::new(InputWireRole::HostSender, contract, &channel_secret)
+    }
+
+    /// Constructs the source-only guest receiver from the same challenge-bound
+    /// key used by the host sender.
+    pub fn new_guest_with_challenge(
+        contract: &IsolatedVisualLaunchContract,
+        challenge: &[u8; 32],
+    ) -> ComputerResult<Self> {
+        let binding = IsolatedVisualChannelBinding::from_contract(contract)?;
+        let channel_secret = binding.derive_channel_secret(challenge)?;
+        Self::new(InputWireRole::GuestReceiver, contract, &channel_secret)
     }
 
     fn new(
@@ -600,6 +624,26 @@ mod tests {
         assert_eq!(guest.open(&mut guest_gate, &encoded).unwrap(), message);
         assert_eq!(host_gate.accepted_events(), 1);
         assert_eq!(guest_gate.next_input_sequence(), 1);
+    }
+
+    #[test]
+    fn challenge_binding_derives_interoperable_input_keys() {
+        let contract = contract();
+        let challenge = [0x52_u8; 32];
+        let mut host_gate = IsolatedVisualInputGate::new(contract.manifest.limits.clone()).unwrap();
+        let mut guest_gate =
+            IsolatedVisualInputGate::new(contract.manifest.limits.clone()).unwrap();
+        host_gate.bind_frame(4, 800, 600).unwrap();
+        guest_gate.bind_frame(4, 800, 600).unwrap();
+        let host = IsolatedVisualInputWire::new_host_with_challenge(&contract, &challenge).unwrap();
+        let guest =
+            IsolatedVisualInputWire::new_guest_with_challenge(&contract, &challenge).unwrap();
+        let nonce = Uuid::new_v4().to_string();
+        let message = IsolatedVisualInputMessage::PointerMove { x: 42, y: 17 };
+        let encoded = host
+            .seal(&mut host_gate, 4, 1, &nonce, message.clone())
+            .unwrap();
+        assert_eq!(guest.open(&mut guest_gate, &encoded).unwrap(), message);
     }
 
     #[test]
