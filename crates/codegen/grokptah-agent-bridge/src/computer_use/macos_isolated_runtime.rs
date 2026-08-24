@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use super::isolated_guest::IsolatedGuestLease;
 use super::isolated_visual::{
-    IsolatedVisualCleanupEvidence, IsolatedVisualLaunchContract, IsolatedVisualTerminalDisposition,
+    IsolatedVisualCleanupEvidence, IsolatedVisualLaunchContract, IsolatedVisualLifecycleState,
+    IsolatedVisualTerminalDisposition,
 };
 use super::isolated_visual_driver::IsolatedVisualRuntimeDriver;
 use super::isolated_visual_frames::IsolatedVisualFrame;
@@ -291,10 +292,10 @@ impl IsolatedVisualPackagedRuntime {
         agent_id: impl Into<String>,
     ) -> ComputerResult<IsolatedGuestLease> {
         let agent_id = agent_id.into();
-        if self.exited {
+        if !packaged_guest_is_acquirable(self.exited, self.driver.runtime().lifecycle_state()) {
             return Err(ComputerError::new(
                 ComputerErrorCode::InvalidState,
-                "isolated packaged guest has already exited",
+                "isolated packaged guest is stopping, failed, or already exited",
             ));
         }
         if let Some(existing) = &self.lease {
@@ -488,6 +489,16 @@ impl IsolatedVisualPackagedRuntime {
     }
 }
 
+fn packaged_guest_is_acquirable(exited: bool, state: IsolatedVisualLifecycleState) -> bool {
+    !exited
+        && matches!(
+            state,
+            IsolatedVisualLifecycleState::Prepared
+                | IsolatedVisualLifecycleState::Starting
+                | IsolatedVisualLifecycleState::ReadOnlyReady
+        )
+}
+
 fn finish_terminal_stop<T>(
     lease: &mut Option<IsolatedGuestLease>,
     result: ComputerResult<T>,
@@ -507,7 +518,10 @@ impl Drop for IsolatedVisualPackagedRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{descriptors_are_distinct, finish_terminal_stop, IsolatedGuestLease};
+    use super::{
+        descriptors_are_distinct, finish_terminal_stop, packaged_guest_is_acquirable,
+        IsolatedGuestLease,
+    };
     use crate::computer_use::types::{ComputerError, ComputerErrorCode};
 
     #[test]
@@ -533,5 +547,35 @@ mod tests {
         );
         assert!(lease.is_none());
         assert_eq!(result.unwrap_err().code, ComputerErrorCode::BackendFailure);
+    }
+
+    #[test]
+    fn stopping_or_failed_packaged_guest_cannot_be_reacquired() {
+        use super::super::isolated_visual::IsolatedVisualLifecycleState;
+
+        assert!(packaged_guest_is_acquirable(
+            false,
+            IsolatedVisualLifecycleState::Prepared
+        ));
+        assert!(packaged_guest_is_acquirable(
+            false,
+            IsolatedVisualLifecycleState::ReadOnlyReady
+        ));
+        assert!(!packaged_guest_is_acquirable(
+            false,
+            IsolatedVisualLifecycleState::Stopping
+        ));
+        assert!(!packaged_guest_is_acquirable(
+            false,
+            IsolatedVisualLifecycleState::CleanupPending
+        ));
+        assert!(!packaged_guest_is_acquirable(
+            false,
+            IsolatedVisualLifecycleState::Terminated
+        ));
+        assert!(!packaged_guest_is_acquirable(
+            true,
+            IsolatedVisualLifecycleState::ReadOnlyReady
+        ));
     }
 }
