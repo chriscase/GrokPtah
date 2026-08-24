@@ -21,6 +21,8 @@ typedef unsigned long gpt_size;
 #define GPT_GUEST_BOOTSTRAP_VERSION 1U
 #define GPT_GUEST_BOOTSTRAP_EVENT_READY 1U
 #define GPT_GUEST_BOOTSTRAP_EVENT_SHUTDOWN_ACK 2U
+#define GPT_GUEST_BOOTSTRAP_EVENT_BINDING_ACK 3U
+#define GPT_GUEST_BOOTSTRAP_BIND 3U
 #define GPT_GUEST_BOOTSTRAP_STOP 2U
 #define GPT_GUEST_BOOTSTRAP_PORT 17001U
 
@@ -481,6 +483,7 @@ static int gpt_guest_bootstrap_tag(
     gpt_u8 output[GPT_GUEST_BOOTSTRAP_TAG_BYTES]) {
     static const gpt_u8 ready[] = "grokptah-isolated-guest-ready-v1";
     static const gpt_u8 shutdown[] = "grokptah-isolated-guest-shutdown-v1";
+    static const gpt_u8 binding[] = "grokptah-isolated-guest-binding-v1";
     const gpt_u8 *message;
     gpt_size message_length;
     if (event == GPT_GUEST_BOOTSTRAP_EVENT_READY) {
@@ -489,6 +492,9 @@ static int gpt_guest_bootstrap_tag(
     } else if (event == GPT_GUEST_BOOTSTRAP_EVENT_SHUTDOWN_ACK) {
         message = shutdown;
         message_length = sizeof(shutdown) - 1U;
+    } else if (event == GPT_GUEST_BOOTSTRAP_EVENT_BINDING_ACK) {
+        message = binding;
+        message_length = sizeof(binding) - 1U;
     } else {
         return 0;
     }

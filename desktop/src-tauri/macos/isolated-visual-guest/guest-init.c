@@ -171,13 +171,60 @@ __attribute__((noreturn)) void _start(void) {
     }
 
     gpt_u8 command = 0;
-    if (!gpt_read_exact(socket, &command, 1U) || command != GPT_GUEST_BOOTSTRAP_STOP ||
-        !gpt_guest_bootstrap_frame(
-            challenge,
-            GPT_GUEST_BOOTSTRAP_EVENT_SHUTDOWN_ACK,
-            frame) ||
-        !gpt_write_exact(socket, frame, sizeof(frame))) {
-        gpt_power_off(22);
+    for (;;) {
+        if (!gpt_read_exact(socket, &command, 1U)) {
+            gpt_power_off(22);
+        }
+        if (command == GPT_GUEST_BOOTSTRAP_STOP) {
+            if (!gpt_guest_bootstrap_frame(
+                    challenge,
+                    GPT_GUEST_BOOTSTRAP_EVENT_SHUTDOWN_ACK,
+                    frame) ||
+                !gpt_write_exact(socket, frame, sizeof(frame))) {
+                gpt_power_off(22);
+            }
+            break;
+        }
+        if (command != GPT_GUEST_BOOTSTRAP_BIND) {
+            gpt_power_off(23);
+        }
+
+        gpt_u8 binding_header[GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES];
+        if (!gpt_read_exact(socket, binding_header, sizeof(binding_header))) {
+            gpt_power_off(24);
+        }
+        gpt_u16 binding_lengths[4] = {
+            gpt_load_be16(binding_header + 8U),
+            gpt_load_be16(binding_header + 10U),
+            gpt_load_be16(binding_header + 12U),
+            gpt_load_be16(binding_header + 14U),
+        };
+        gpt_size binding_payload_bytes = 0;
+        gpt_u32 index;
+        for (index = 0; index < 4U; ++index) {
+            if (binding_lengths[index] == 0 ||
+                binding_lengths[index] > GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES) {
+                gpt_power_off(25);
+            }
+            binding_payload_bytes += binding_lengths[index];
+        }
+        if (binding_payload_bytes > 4U * GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES) {
+            gpt_power_off(26);
+        }
+        gpt_u8 binding_payload[4U * GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES];
+        if (!gpt_read_exact(socket, binding_payload, binding_payload_bytes) ||
+            !gpt_isolated_visual_binding_valid(
+                challenge,
+                binding_header,
+                binding_payload,
+                binding_payload_bytes) ||
+            !gpt_guest_bootstrap_frame(
+                challenge,
+                GPT_GUEST_BOOTSTRAP_EVENT_BINDING_ACK,
+                frame) ||
+            !gpt_write_exact(socket, frame, sizeof(frame))) {
+            gpt_power_off(27);
+        }
     }
     gpt_syscall3(GPT_SYS_CLOSE, socket, 0, 0);
     gpt_power_off(0);

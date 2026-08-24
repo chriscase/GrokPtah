@@ -56,7 +56,8 @@ for forbidden in AF_INET execve '/bin/sh' mount ptrace; do
     exit 1
   fi
 done
-for required in GPT_AF_VSOCK GPT_GUEST_BOOTSTRAP_PORT GPT_SYS_REBOOT GPT_SYS_SOCKET; do
+for required in GPT_AF_VSOCK GPT_GUEST_BOOTSTRAP_PORT GPT_GUEST_BOOTSTRAP_BIND \
+  GPT_GUEST_BOOTSTRAP_EVENT_BINDING_ACK GPT_SYS_REBOOT GPT_SYS_SOCKET; do
   grep -F "$required" "$guest_source" >/dev/null
 done
 for required in \

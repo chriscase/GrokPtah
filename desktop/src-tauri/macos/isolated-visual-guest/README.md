@@ -11,8 +11,11 @@ input backend, or `HostNative` dispatch proof.
   storage, shared filesystems, host input, audio, USB, and credential-bearing kernel surfaces are
   disabled.
 - `guest-init.c` is a freestanding Linux arm64 PID 1. It uses raw syscalls only, connects to the
-  host over VSOCK port `17001`, authenticates the fixed READY frame with the host challenge, waits
-  for the fixed STOP byte, emits the authenticated shutdown acknowledgement, and powers off.
+  host over VSOCK port `17001`, authenticates the fixed READY frame with the host challenge, accepts
+  zero or more authenticated binding commands, emits a binding acknowledgement for each accepted
+  identity, then accepts the fixed STOP byte, emits the authenticated shutdown acknowledgement,
+  and powers off. The zero-binding path preserves the current lifecycle smoke contract until a
+  host supervisor supplies the per-run packet.
 - `protocol.h` is shared by the guest and macOS helper. It contains the fixed bootstrap frame
   format, the freestanding HMAC-SHA-256 implementation, and the fixed session-binding header.
   The binding hashes Run, surface, incarnation, and isolated input-domain identities with

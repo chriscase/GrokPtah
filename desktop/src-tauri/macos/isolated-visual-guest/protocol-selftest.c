@@ -64,11 +64,16 @@ int main(void) {
     }
     gpt_u8 ready[GPT_GUEST_BOOTSTRAP_FRAME_BYTES];
     gpt_u8 stopped[GPT_GUEST_BOOTSTRAP_FRAME_BYTES];
+    gpt_u8 binding_ack[GPT_GUEST_BOOTSTRAP_FRAME_BYTES];
     if (!gpt_guest_bootstrap_frame(challenge, GPT_GUEST_BOOTSTRAP_EVENT_READY, ready) ||
         !gpt_guest_bootstrap_frame(
             challenge,
             GPT_GUEST_BOOTSTRAP_EVENT_SHUTDOWN_ACK,
             stopped) ||
+        !gpt_guest_bootstrap_frame(
+            challenge,
+            GPT_GUEST_BOOTSTRAP_EVENT_BINDING_ACK,
+            binding_ack) ||
         !gpt_guest_bootstrap_frame_valid(
             challenge,
             GPT_GUEST_BOOTSTRAP_EVENT_READY,
@@ -77,7 +82,12 @@ int main(void) {
             challenge,
             GPT_GUEST_BOOTSTRAP_EVENT_SHUTDOWN_ACK,
             stopped) ||
-        require_bytes(ready, stopped, sizeof(ready))) {
+        !gpt_guest_bootstrap_frame_valid(
+            challenge,
+            GPT_GUEST_BOOTSTRAP_EVENT_BINDING_ACK,
+            binding_ack) ||
+        require_bytes(ready, stopped, sizeof(ready)) ||
+        require_bytes(ready, binding_ack, sizeof(ready))) {
         fputs("bootstrap frame self-test failed\n", stderr);
         return 1;
     }
