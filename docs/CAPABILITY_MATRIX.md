@@ -38,6 +38,13 @@ defined in [`ROADMAP_TO_100.md`](ROADMAP_TO_100.md). PR #352 remains an open
 draft; stage 1 cannot pass until it (or a superseding implementation) merges
 after the five confirmed P1s are independently certified.
 
+Candidate-only update (2026-08-24): isolated guest bootstrap proof from draft
+PR #374 (`5919e3343af20a78e17459b8ac8454bbc5aeca7e`) is integrated in the
+review branch at merge `d543c3e8fef46c40a51b8a19cd19aa0748574e92`. It adds
+guest phases, one-Agent lease fencing, mandatory cleanup, and a frame-free
+capture projection. It is not shipped on `origin/main`, and its focused Rust
+tests remain external PR-head evidence rather than combined-head qualification.
+
 ## Status vocabulary
 
 Exactly one of the four status columns is the *shipped-on-main* claim for the
