@@ -96,6 +96,12 @@ below; hosted runners do not use `~/Library/Caches/grokptah`.
 
 ### 1. Required `sccache` (after verify)
 
+The read-only preflight verifier
+[`verify-build-cache-policy.sh`](verify-build-cache-policy.sh) checks the
+canonical wrapper/cache/target paths, refuses checkout-local targets, and
+records disk, process, target-handle, and `sccache` ownership evidence. Run it
+before any local Rust command; it never deletes or cleans an artifact.
+
 ```sh
 command -v sccache
 sccache --show-stats
