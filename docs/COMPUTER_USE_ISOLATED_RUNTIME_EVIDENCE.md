@@ -6,9 +6,9 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `e733c5016f9131f01a8167afcbad5eb37973a06d`
-- Bundle: `/private/tmp/grokptah-cu-stage34-measured-descriptor-spawn-v1.bundle`
-- Bundle SHA-256: `02c99b875f45839b7fde168e9ced3079ab2670e04a0710bc2df3bbeb85727b9b`
+- Head: `cbd5baf6c85a561e61db12ddb61cd43f7b50d96b`
+- Bundle: `/private/tmp/grokptah-cu-stage35-cloexec-artifact-gate-v1.bundle`
+- Bundle SHA-256: `fae478dfe6ae6cf865cc5a3f59a72f5ce738464ce07f1858c7ef53c994a9e6b8`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
 Current sealed implementation head: `eb9892e1ba5606c73b66abe60067fea5ae7eafb6`.
@@ -72,6 +72,12 @@ The measured-descriptor spawn hardening is sealed at:
 - Commit: `e733c5016f9131f01a8167afcbad5eb37973a06d`
 - Bundle: `/private/tmp/grokptah-cu-stage34-measured-descriptor-spawn-v1.bundle`
 - Bundle SHA-256: `02c99b875f45839b7fde168e9ced3079ab2670e04a0710bc2df3bbeb85727b9b`
+
+The close-on-exec artifact gate is sealed at:
+
+- Commit: `cbd5baf6c85a561e61db12ddb61cd43f7b50d96b`
+- Bundle: `/private/tmp/grokptah-cu-stage35-cloexec-artifact-gate-v1.bundle`
+- Bundle SHA-256: `fae478dfe6ae6cf865cc5a3f59a72f5ce738464ce07f1858c7ef53c994a9e6b8`
 
 ## What this candidate proves
 
