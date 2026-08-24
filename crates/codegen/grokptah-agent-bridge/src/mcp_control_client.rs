@@ -15,6 +15,7 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::capability_contract::CapabilitySet;
 use crate::events::SessionUpdate;
 
 /// Bound a coordinator-side SSE frame independently from the server body
@@ -31,6 +32,7 @@ pub struct McpControlClient {
     initialized: bool,
     protocol_version: Option<String>,
     session_id: Option<String>,
+    capability_set: Option<CapabilitySet>,
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +295,7 @@ impl McpControlClient {
             initialized: false,
             protocol_version: None,
             session_id: None,
+            capability_set: None,
         }
     }
 
@@ -306,6 +309,14 @@ impl McpControlClient {
 
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// Capabilities advertised by the most recent initialize response.
+    ///
+    /// Older control servers may omit the contract; consumers must treat
+    /// `None` as an unknown capability set and fail closed for mutations.
+    pub fn capability_set(&self) -> Option<&CapabilitySet> {
+        self.capability_set.as_ref()
     }
 
     fn next_id(&mut self) -> u64 {
@@ -404,6 +415,11 @@ impl McpControlClient {
             .get("protocolVersion")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        self.capability_set = result
+            .get("serverInfo")
+            .and_then(|server_info| server_info.get("capabilityContract"))
+            .map(|contract| serde_json::from_value(contract.clone()))
+            .transpose()?;
         // Notification may return 202 with empty body — tolerate either shape.
         let _ = self.notify("notifications/initialized", json!({})).await;
         self.initialized = true;
@@ -451,6 +467,7 @@ impl McpControlClient {
             .await?;
         self.session_id = None;
         self.initialized = false;
+        self.capability_set = None;
         if resp.status().as_u16() == 204 || resp.status().is_success() {
             Ok(())
         } else {
@@ -671,6 +688,20 @@ mod tests {
         );
         assert!(client.is_initialized());
         assert!(client.session_id().is_some());
+        let capability_set = client
+            .capability_set()
+            .expect("server advertises capability contract");
+        assert_eq!(
+            capability_set.contract,
+            crate::capability_contract::CAPABILITY_CONTRACT_VERSION
+        );
+        assert!(capability_set.get("run.execute").is_some());
+        assert_eq!(
+            capability_set
+                .get("computer.control")
+                .map(|capability| capability.human_gate),
+            Some(true)
+        );
 
         let tools = client.list_tools().await.unwrap();
         assert!(tools.iter().any(|t| t.name == "ptah_get_capacity"));

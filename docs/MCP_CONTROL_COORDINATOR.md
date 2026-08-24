@@ -177,11 +177,79 @@ GET /health
 
 ### Lifecycle
 
-1. `initialize` → negotiate `protocolVersion` + capabilities; response sets `mcp-session-id`
+1. `initialize` → negotiate `protocolVersion` + capabilities; response sets
+   `mcp-session-id` and includes `serverInfo.capabilityContract`
 2. `notifications/initialized` → **202** Accepted (no result body)
 3. `tools/list` / `tools/call` with `mcp-session-id` (legacy clients may omit session)
 4. `DELETE /mcp` with `mcp-session-id` → **204**; stale id fails closed
 5. Reconnect = new `initialize` (new session id)
+
+### Cross-product capability discovery
+
+The initialize response advertises a transport-neutral
+`serverInfo.capabilityContract` object. Its `contract` value is currently
+`grokptah.capabilities.v1`; `capabilities` contains stable ids such as
+`session.observe`, `run.execute`, `run.review`, `run.promote`,
+`computer.observe`, and `computer.control` when their underlying control tools
+are present. Each descriptor includes its authority tier, whether it mutates
+state, whether a human/lease gate is required, and the host's current
+availability.
+
+This is discovery, not authorization. A consumer must still authenticate,
+bind every operation to the exact session/workspace/run scope, and obtain the
+explicit approval or Computer Use lease required by the descriptor. Promote
+and Computer Use control are advertised as `gated` rather than silently
+appearing available. ContextDesk's desktop adapter and War Room broker should
+negotiate this object before rendering or enabling a control.
+
+The normative validation schema is checked in at
+[`docs/schemas/grokptah-capabilities.v1.schema.json`](./schemas/grokptah-capabilities.v1.schema.json).
+Non-Rust consumers should validate the contract before enabling a capability;
+an unknown contract version or malformed descriptor is an unavailable
+capability, not a reason to guess.
+
+The Tauri-free desktop-side operation facade is staged at
+[`desktop/src/lib/grokptahOperations.ts`](../desktop/src/lib/grokptahOperations.ts).
+It keeps the exact session/workspace/run identity fence and request-id shape in
+one place for trusted adapters. For a War Room browser, use a server-side
+broker instead; [`docs/WEB_BROKER_PROTOCOL.md`](./WEB_BROKER_PROTOCOL.md) is the
+normative boundary for opaque browser ids, redacted events, approvals, and
+reconnect recovery.
+
+The host-neutral Rust DTO contract is staged in
+[`crates/common/grokptah-agent-sdk`](../crates/common/grokptah-agent-sdk). It is
+safe for a ContextDesk backend to depend on because it contains no desktop,
+provider, filesystem, network, or credential authority.
+
+Example (abbreviated):
+
+```json
+{
+  "serverInfo": {
+    "name": "grokptah-control",
+    "version": "0.1.0",
+    "capabilityContract": {
+      "contract": "grokptah.capabilities.v1",
+      "capabilities": [
+        {
+          "id": "run.execute",
+          "tier": "execute",
+          "mutating": true,
+          "human_gate": false,
+          "availability": "available"
+        },
+        {
+          "id": "computer.control",
+          "tier": "computer_control",
+          "mutating": true,
+          "human_gate": true,
+          "availability": "gated"
+        }
+      ]
+    }
+  }
+}
+```
 
 ## Tool inventory (`CONTROL_TOOLS`)
 
@@ -191,6 +259,8 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | Tool | Kind | Required arguments |
 |------|------|--------------------|
 | `ptah_list_sessions` | read | _(none)_ |
+| `ptah_list_persistent_agents` | read | _(none)_ |
+| `ptah_get_persistent_agent` | read | `session_id`, `workspace`, `agent_id` |
 | `ptah_get_capacity` | read | _(none)_ |
 | `ptah_get_run` | read | `session_id`, `workspace`, `run_id` |
 | `ptah_get_progress` | read | `session_id`, `workspace`, `run_id` |
@@ -204,6 +274,7 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 | `ptah_get_computer_run_events` | read | `session_id`, `workspace`, `run_id`; optional `after_seq`, `limit` (1–500, default 100) |
 | `ptah_get_computer_capacity` | read | `session_id`, `workspace` |
 | `ptah_submit_task` | mutate | `request_id`, `session_id`, `workspace`, `prompt`; optional `bounds`, `execution_mode`, `allow_queue` |
+| `ptah_resume_persistent_agent` | mutate | `request_id`, `session_id`, `workspace`, `agent_id`, `prompt`; optional `max_rounds` |
 | `ptah_retry_run` | mutate | `request_id`, `session_id`, `workspace`, `run_id`, `prompt`; optional narrower `bounds`, matching `execution_mode`, `allow_queue` |
 | `ptah_approve_run` | mutate | exact run/session/workspace, source and final fingerprints, exact `changed_files`; optional bounded `ttl_ms` |
 | `ptah_promote_run` | mutate | `request_id`, exact run/session/workspace, `approval_id` |

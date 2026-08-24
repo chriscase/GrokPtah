@@ -62,6 +62,7 @@ pub fn run() {
             commands::agent_start,
             commands::agent_stop,
             commands::agent_status,
+            commands::capability_contract,
             commands::persistent_agent_list,
             commands::persistent_agent_get,
             commands::persistent_agent_resume_plan,

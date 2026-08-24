@@ -85,9 +85,11 @@ evidence that an extraction reduces coupling. The ordering is:
 3. extract to a separate crate only when the second consumer exists;
 4. publish a library only when versioning and compatibility have a real need.
 
-ContextDesk is not present in this repository and is not a second consumer for
-this decision. No ContextDesk-specific integration, SDK, or crate extraction
-is planned from this ADR.
+This ADR was written before a concrete cross-product consumer was recorded.
+That trigger is now present: ContextDesk requires GrokPtah capabilities from
+both a local desktop adapter and a War Room broker. [`ADR-003`](./ADR-003-cross-product-capability-surface.md)
+records the authorized extraction and its security boundaries. It does not
+replace this ADR's authority tiers, durable-ID rules, or fail-closed policy.
 
 ### 6. Durable dependencies are by ID
 

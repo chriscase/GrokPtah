@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokptah:schema:capabilities:v1",
+  "title": "GrokPtah Capability Contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "capabilities"],
+  "properties": {
+    "contract": {
+      "const": "grokptah.capabilities.v1"
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/capability"
+      }
+    }
+  },
+  "$defs": {
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "tier",
+        "mutating",
+        "human_gate",
+        "availability",
+        "description"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9_]*)+$"
+        },
+        "tier": {
+          "enum": [
+            "observe",
+            "execute",
+            "review",
+            "promote",
+            "computer_observe",
+            "computer_control"
+          ]
+        },
+        "mutating": {
+          "type": "boolean"
+        },
+        "human_gate": {
+          "type": "boolean"
+        },
+        "availability": {
+          "enum": ["available", "gated", "unavailable"]
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

@@ -68,6 +68,13 @@ pub fn agent_status(state: State<'_, AppState>) -> grokptah_agent_bridge::AgentS
     state.host.status()
 }
 
+/// Return the same negotiated capability contract advertised by MCP clients.
+/// This is discovery only; promotion and Computer Use remain grant-gated.
+#[tauri::command]
+pub fn capability_contract() -> grokptah_agent_bridge::CapabilitySet {
+    grokptah_agent_bridge::advertised_capabilities()
+}
+
 #[tauri::command]
 pub async fn persistent_agent_list(
     state: State<'_, AppState>,

@@ -32,11 +32,13 @@ import type {
   PromptQueueTakeResult,
   SteeringReceipt,
 } from "./promptQueue";
+import type { CapabilitySet } from "./capabilities";
 
 export const api = {
   agentStart: () => invoke<void>("agent_start"),
   agentStop: () => invoke<void>("agent_stop"),
   agentStatus: () => invoke<AgentStatus>("agent_status"),
+  capabilityContract: () => invoke<CapabilitySet>("capability_contract"),
   persistentAgentList: () =>
     invoke<PersistentAgent[]>("persistent_agent_list"),
   persistentAgentGet: (agentId: string) =>

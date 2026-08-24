@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokptah:schema:run:v1",
+  "title": "GrokPtah Run Contract v1",
+  "$defs": {
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxPromptBytes": { "type": ["integer", "null"], "minimum": 1 },
+        "maxRounds": { "type": ["integer", "null"], "minimum": 1, "maximum": 24 },
+        "maxDurationMs": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionId", "workspace", "runId"],
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1 },
+        "workspace": { "type": "string", "minLength": 1 },
+        "runId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "submitTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestId", "sessionId", "workspace", "prompt"],
+      "properties": {
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "sessionId": { "type": "string", "minLength": 1 },
+        "workspace": { "type": "string", "minLength": 1 },
+        "prompt": { "type": "string", "minLength": 1 },
+        "bounds": { "$ref": "#/$defs/bounds" },
+        "executionMode": { "enum": ["shared", "isolated_worktree", null] },
+        "allowQueue": { "type": ["boolean", "null"] }
+      }
+    },
+    "runState": {
+      "enum": [
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "limit_reached"
+      ]
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seq", "ts", "update"],
+      "properties": {
+        "seq": { "type": "integer", "minimum": 0 },
+        "ts": { "type": "string", "minLength": 1 },
+        "update": {}
+      }
+    },
+    "runEventPage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entries", "cursorExpired"],
+      "properties": {
+        "entries": { "type": "array", "items": { "$ref": "#/$defs/event" } },
+        "nextCursor": { "type": ["integer", "null"], "minimum": 0 },
+        "cursorExpired": { "type": "boolean" }
+      }
+    },
+    "changedFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "summary"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "summary": { "type": "string" }
+      }
+    },
+    "reviewReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["changedFiles", "diff", "diffTruncated", "fingerprint"],
+      "properties": {
+        "changedFiles": { "type": "array", "items": { "$ref": "#/$defs/changedFile" } },
+        "diff": { "type": "string" },
+        "diffTruncated": { "type": "boolean" },
+        "fingerprint": { "type": "string", "minLength": 1 }
+      }
+    },
+    "notification": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "scope", "event"],
+          "properties": {
+            "kind": { "const": "event" },
+            "scope": { "$ref": "#/$defs/scope" },
+            "event": { "$ref": "#/$defs/event" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "scope", "afterSeq", "reason", "pollTool"],
+          "properties": {
+            "kind": { "const": "recovery" },
+            "scope": { "$ref": "#/$defs/scope" },
+            "afterSeq": { "type": "integer", "minimum": 0 },
+            "reason": { "type": "string", "minLength": 1 },
+            "pollTool": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    }
+  }
+}

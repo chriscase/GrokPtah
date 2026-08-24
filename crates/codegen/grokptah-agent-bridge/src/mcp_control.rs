@@ -1305,7 +1305,8 @@ fn handle_initialize(
             },
             "serverInfo": {
                 "name": "grokptah-control",
-                "version": env!("CARGO_PKG_VERSION")
+                "version": env!("CARGO_PKG_VERSION"),
+                "capabilityContract": crate::capability_contract::advertised_capabilities()
             },
             "instructions": "Authenticated loopback orchestration control. Build sessions only."
         }),

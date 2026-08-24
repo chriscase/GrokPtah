@@ -5,6 +5,7 @@
 
 mod agents_personas;
 mod auth_store;
+pub mod capability_contract;
 mod completion;
 mod computer_agent;
 pub mod computer_use;
@@ -49,6 +50,10 @@ mod worktree_gc;
 
 pub use agents_personas::{
     discover_agents, discover_personas, resolve_agent, resolve_persona, AgentDef, PersonaDef,
+};
+pub use capability_contract::{
+    advertised_capabilities, CapabilityAvailability, CapabilityDescriptor, CapabilitySet,
+    CapabilityTier, CAPABILITY_CONTRACT_VERSION,
 };
 pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, RiskTier};
 pub use gateway_config::{
