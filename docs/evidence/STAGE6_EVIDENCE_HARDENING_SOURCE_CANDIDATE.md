@@ -35,6 +35,15 @@ Allowed static verification on the exact clean source head passed on
 and `cargo metadata --locked --offline --no-deps`. No local compilation or
 test execution was performed; those remain external Grok Build gates.
 
+An independent read-only Grok review of this exact head returned
+**PASS-WITH-BLOCKERS**. The reviewer found that the credential and evidence
+contracts are coherent but that the runner does not yet prove cross-worker
+identity isolation, least-privilege mutation denial, lease-bearing restart
+recovery, or complete MCP/stderr secret scanning; one coordinator document is
+also contradictory. The bounded findings and required closure evidence are
+recorded in
+[`STAGE6_EVIDENCE_HARDENING_SECURITY_REVIEW.md`](STAGE6_EVIDENCE_HARDENING_SECURITY_REVIEW.md).
+
 ## Explicit non-claims
 
 The source documentation explicitly records that this candidate has no live
@@ -46,10 +55,12 @@ push, rebase, PR update, or source patch was performed by this audit.
 
 ## Required next gate
 
-1. Run the exact external Stage 6 procedure against the corrected bundle
+1. Close the independent review blockers and record direct tests for identity,
+   lease, restart, and complete secret-scan behavior.
+2. Run the exact external Stage 6 procedure against the corrected bundle
    above, with the mandatory namespaced
    `sccache` and external `CARGO_TARGET_DIR` settings, serially owning the
    shared target.
-2. Obtain an independent review and retain the secret-free campaign artifact
+3. Obtain a fresh independent review and retain the secret-free campaign artifact
    outside the repository. Until all of that exists, keep Stage 6 explicitly
    open and do not update capability status to PASS.

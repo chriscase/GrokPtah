@@ -76,6 +76,12 @@ require_text 'Stage 6 remains open.' \
   docs/STAGE6_EVIDENCE_HARDENING_EXTERNAL_HANDOFF.md
 require_text 'keep Stage 6 explicitly' \
   docs/evidence/STAGE6_EVIDENCE_HARDENING_SOURCE_CANDIDATE.md
+require_text '**PASS-WITH-BLOCKERS.**' \
+  docs/evidence/STAGE6_EVIDENCE_HARDENING_SECURITY_REVIEW.md
+require_text 'review does not qualify Stage 6' \
+  docs/evidence/STAGE6_EVIDENCE_HARDENING_SECURITY_REVIEW.md
+require_text 'STAGE6_EVIDENCE_HARDENING_SECURITY_REVIEW.md' \
+  docs/CAPABILITY_MATRIX.md
 
 printf 'qualification_doc_state=consistent\n'
 printf 'current_visual_handoff=v15\n'

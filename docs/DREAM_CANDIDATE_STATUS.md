@@ -232,7 +232,13 @@ The provenance and next external gates are recorded in
 [`STAGE6_EVIDENCE_HARDENING_SOURCE_CANDIDATE.md`](evidence/STAGE6_EVIDENCE_HARDENING_SOURCE_CANDIDATE.md).
 The copyable, cache-safe external procedure is
 [`STAGE6_EVIDENCE_HARDENING_EXTERNAL_HANDOFF.md`](STAGE6_EVIDENCE_HARDENING_EXTERNAL_HANDOFF.md).
-It is not integrated, independently reviewed, or a Stage 6 certification.
+An independent read-only review returned **PASS-WITH-BLOCKERS**; its five
+findings and closure evidence are recorded in
+[`STAGE6_EVIDENCE_HARDENING_SECURITY_REVIEW.md`](evidence/STAGE6_EVIDENCE_HARDENING_SECURITY_REVIEW.md).
+It is not integrated or a Stage 6 certification. The review specifically
+blocks claims of cross-worker identity isolation, least-privilege mutation
+denial, lease-bearing restart recovery, and complete MCP/stderr secret
+scanning until direct tests and complete scans exist.
 
 ### Always-On v52 route-identity repair — 2026-08-24
 

@@ -212,8 +212,12 @@ The independent-worker source candidate is now pinned to exact head
 `/private/tmp/grokptah-stage6-evidence-hardening-v1-exact-984ff9a.bundle`
 (SHA-256 `cfa741b67c51bc9804b566440a855348727d398c7d97279b2e61e5cbeb12b91b`).
 Static checks pass; the compiled smoke, retained 72-hour artifact, and
-independent review remain open. This note does not change the matrix status
-to PASS.
+independent review remain open. A separate read-only review returned
+**PASS-WITH-BLOCKERS**, identifying missing direct proof for cross-worker
+identity isolation, least-privilege mutation denial, lease-bearing restart
+recovery, and complete MCP/stderr secret scanning; see
+[`STAGE6_EVIDENCE_HARDENING_SECURITY_REVIEW.md`](evidence/STAGE6_EVIDENCE_HARDENING_SECURITY_REVIEW.md).
+This note does not change the matrix status to PASS.
 
 ## Issue-state index (cite state, not stale checkboxes)
 
