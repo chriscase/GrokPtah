@@ -143,8 +143,11 @@ describe("HelpCenter", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Prepare cited question" }));
     expect(onAskAssistant).not.toHaveBeenCalled();
-    expect(screen.getByRole("alertdialog", { name: "Confirm assistant request" })).toBeInTheDocument();
+    const assistantConfirm = screen.getByRole("alertdialog", { name: "Confirm assistant request" });
+    expect(assistantConfirm).toBeInTheDocument();
     expect(screen.getByText(/Company gateway · review-model/)).toBeInTheDocument();
+    expect(within(assistantConfirm).getByText(/product\.readme/)).toBeInTheDocument();
+    expect(within(assistantConfirm).getByText(/README\.md/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Send cited context" }));
     await waitFor(() => expect(onAskAssistant).toHaveBeenCalledOnce());
@@ -182,7 +185,10 @@ describe("HelpCenter", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Prepare meaning search" }));
     expect(onSearchSemantic).not.toHaveBeenCalled();
-    expect(screen.getByRole("alertdialog", { name: "Confirm meaning search" })).toBeInTheDocument();
+    const semanticConfirm = screen.getByRole("alertdialog", { name: "Confirm meaning search" });
+    expect(semanticConfirm).toBeInTheDocument();
+    expect(within(semanticConfirm).getByText(/providers\.gateway/)).toBeInTheDocument();
+    expect(within(semanticConfirm).getAllByText(/docs\/PROVIDER_PROFILES\.md/).length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("button", { name: "Search by meaning" }));
     await waitFor(() => expect(onSearchSemantic).toHaveBeenCalledOnce());
     expect(screen.getByRole("heading", { name: "Provider routes and gateway policy" })).toBeInTheDocument();

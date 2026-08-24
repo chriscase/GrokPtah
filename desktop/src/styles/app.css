@@ -2473,6 +2473,36 @@ button:disabled {
   padding-top: 0.65rem;
 }
 
+.help-confirm-details {
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 0.45rem 0.6rem;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.help-confirm-details summary {
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.help-confirm-details p {
+  margin: 0.45rem 0 0;
+}
+
+.help-confirm-details ul {
+  display: grid;
+  gap: 0.25rem;
+  margin: 0.45rem 0 0;
+  padding-left: 1.1rem;
+  line-height: 1.45;
+}
+
+.help-confirm-details code {
+  overflow-wrap: anywhere;
+}
+
 .help-assistant-confirm button {
   min-height: 44px;
 }

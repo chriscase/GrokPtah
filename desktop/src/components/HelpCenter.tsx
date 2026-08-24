@@ -546,6 +546,17 @@ export function HelpCenter({
             <p id="help-semantic-confirm-copy">
               Send this query and article metadata to {assistantProviderLabel ?? "the selected provider"} for meaning-based ranking? No article body or workspace data will be sent.
             </p>
+            <details className="help-confirm-details">
+              <summary>Review exact metadata</summary>
+              <p>Query: <code>{semantic.request.query}</code></p>
+              <ul aria-label="Meaning search metadata">
+                {semantic.request.candidates.map((candidate) => (
+                  <li key={candidate.articleId}>
+                    <code>{candidate.articleId}</code> · {candidate.sources.map((source) => `${source.id} · ${source.path}`).join(", ")}
+                  </li>
+                ))}
+              </ul>
+            </details>
             <button type="button" className="primary" onClick={() => void confirmSemanticRequest()}>
               Search by meaning
             </button>
@@ -571,6 +582,16 @@ export function HelpCenter({
             <p id="help-assistant-confirm-copy">
               Ready to send the cited article bundle ({assistant.request.sources.length} source{assistant.request.sources.length === 1 ? "" : "s"}) via {assistantProviderLabel ?? "the selected provider"}?
             </p>
+            <details className="help-confirm-details">
+              <summary>Review exact cited sources</summary>
+              <ul aria-label="Assistant request sources">
+                {assistant.request.sources.map((source) => (
+                  <li key={source.id}>
+                    <code>{source.id}</code> · {source.path} · {source.heading}
+                  </li>
+                ))}
+              </ul>
+            </details>
             <button type="button" className="primary" onClick={() => void confirmAssistantRequest()}>
               Send cited context
             </button>
