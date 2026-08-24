@@ -290,7 +290,7 @@ export function PersistentAgentPanel({
           description="Your saved Agent identities are unchanged. Try again, or open the technical details if support needs the diagnostic."
           actionLabel="Refresh"
           onAction={onRefresh}
-          technicalDetail={error}
+          technicalDetail={safeErrorMessage(error)}
         />
       ) : !busy && sortedAgents.length === 0 ? (
         <StateCard

@@ -69,7 +69,11 @@ export function RoutineBoard({
         </button>
       </header>
       {error && (
-        <StateCard variant="error" title="Routine state unavailable" description={error} />
+        <StateCard
+          variant="error"
+          title="Routine state unavailable"
+          description={safeErrorMessage(error)}
+        />
       )}
       {actionError && (
         <StateCard variant="error" title="Routine action failed" description={actionError} />

@@ -46,6 +46,25 @@ const plan: PersistentAgentResumePlan = {
 };
 
 describe("PersistentAgentPanel", () => {
+  it("redacts parent-provided refresh diagnostics before technical details", () => {
+    render(
+      <PersistentAgentPanel
+        agents={[]}
+        activeLaneId={null}
+        error="store failed at /Users/chriscase/.grokptah/agents (api_key=sk-secret)"
+        onRefresh={vi.fn()}
+        onOpenSession={vi.fn()}
+        onInspect={vi.fn(async () => plan)}
+        onResume={vi.fn(async () => "never")}
+      />,
+    );
+
+    expect(screen.getByText(/local path redacted/)).toBeTruthy();
+    expect(screen.getByText(/\[redacted\]/)).toBeTruthy();
+    expect(screen.queryByText(/Users\/chriscase/)).toBeNull();
+    expect(screen.queryByText(/sk-secret/)).toBeNull();
+  });
+
   it("inspects a checkpoint and requires an explicit resume prompt", async () => {
     const onInspect = vi.fn(async () => plan);
     const onResume = vi.fn(async () => "Resumed successfully");

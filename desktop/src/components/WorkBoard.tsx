@@ -245,7 +245,7 @@ export function WorkBoard({
           description="The last durable snapshot remains available when possible. Try again or inspect the technical details."
           actionLabel="Refresh"
           onAction={onRefresh}
-          technicalDetail={error}
+          technicalDetail={safeErrorMessage(error)}
         />
       )}
 

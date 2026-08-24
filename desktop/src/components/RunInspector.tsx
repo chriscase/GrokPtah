@@ -423,7 +423,7 @@ export function RunInspector({
           }
           actionLabel="Retry refresh"
           onAction={onRefresh}
-          technicalDetail={error}
+          technicalDetail={safeErrorMessage(error)}
         />
       ) : runs.length === 0 ? (
         <StateCard
