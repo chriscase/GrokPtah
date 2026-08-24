@@ -83,6 +83,25 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
             .write_input(&mut self.runtime, input_sequence, request_nonce, message)
     }
 
+    pub fn write_input_with_timeout(
+        &mut self,
+        input_sequence: u64,
+        request_nonce: &str,
+        message: IsolatedVisualInputMessage,
+        timeout: Duration,
+    ) -> ComputerResult<()>
+    where
+        IW: AsRawFd,
+    {
+        self.stream.write_input_with_timeout(
+            &mut self.runtime,
+            input_sequence,
+            request_nonce,
+            message,
+            timeout,
+        )
+    }
+
     pub fn stop(&mut self, disposition: IsolatedVisualTerminalDisposition) -> ComputerResult<()> {
         self.helper.send_stop(&mut self.runtime, disposition)
     }

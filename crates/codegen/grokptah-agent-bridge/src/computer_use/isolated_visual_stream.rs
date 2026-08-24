@@ -122,6 +122,40 @@ impl<R: Read + AsRawFd, W: Write> IsolatedVisualStream<R, W> {
     }
 }
 
+impl<R: Read, W: Write + AsRawFd> IsolatedVisualStream<R, W> {
+    /// Seals and writes one host input packet with a finite writable deadline.
+    /// The packaged supervisor uses a raw pipe here so a stalled guest cannot
+    /// fill a buffered writer and hold the host indefinitely.
+    pub fn write_input_with_timeout(
+        &mut self,
+        runtime: &mut IsolatedVisualRuntimeSession,
+        input_sequence: u64,
+        request_nonce: &str,
+        message: IsolatedVisualInputMessage,
+        timeout: Duration,
+    ) -> ComputerResult<()> {
+        let packet = runtime.seal_input(input_sequence, request_nonce, message)?;
+        if packet.len() > ISOLATED_VISUAL_INPUT_MAX_PACKET_BYTES {
+            return Err(ComputerError::new(
+                ComputerErrorCode::LimitReached,
+                "isolated input packet exceeds the stream bound",
+            ));
+        }
+        let deadline = Instant::now() + timeout;
+        write_all_with_deadline(
+            &mut self.writer,
+            &[ISOLATED_VISUAL_GUEST_INPUT_COMMAND],
+            deadline,
+        )?;
+        write_all_with_deadline(
+            &mut self.writer,
+            &(packet.len() as u32).to_be_bytes(),
+            deadline,
+        )?;
+        write_all_with_deadline(&mut self.writer, &packet, deadline)
+    }
+}
+
 fn read_exact<R: Read>(reader: &mut R, bytes: &mut [u8]) -> ComputerResult<()> {
     reader.read_exact(bytes).map_err(|error| {
         if error.kind() == io::ErrorKind::UnexpectedEof {
@@ -179,6 +213,50 @@ fn read_exact_with_deadline<R: Read + AsRawFd>(
                 ));
             }
             Ok(read) => offset += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(stream_error(error)),
+        }
+    }
+    Ok(())
+}
+
+fn write_all_with_deadline<W: Write + AsRawFd>(
+    writer: &mut W,
+    bytes: &[u8],
+    deadline: Instant,
+) -> ComputerResult<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout_millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: writer.as_raw_fd(),
+            events: libc::POLLOUT | libc::POLLERR | libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: the descriptor is borrowed from the supervisor-owned
+        // writer and remains valid for this bounded poll/write iteration.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_millis) };
+        if ready == 0 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::BackendFailure,
+                "isolated visual input write timed out",
+            ));
+        }
+        if ready < 0 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::BackendFailure,
+                "isolated visual input write poll failed",
+            ));
+        }
+        match writer.write(&bytes[offset..]) {
+            Ok(0) => {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::TargetClosed,
+                    "isolated visual input pipe closed",
+                ));
+            }
+            Ok(written) => offset += written,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(stream_error(error)),
         }

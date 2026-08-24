@@ -30,6 +30,7 @@ const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNNING_EVENT_TIMEOUT: Duration = Duration::from_secs(60);
 const BOUND_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
 const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const STOPPING_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[repr(C)]
@@ -119,12 +120,7 @@ fn terminate_process(pid: libc::pid_t) {
 pub struct IsolatedVisualPackagedRuntime {
     pid: libc::pid_t,
     exited: bool,
-    driver: IsolatedVisualRuntimeDriver<
-        BufReader<File>,
-        BufWriter<File>,
-        BufReader<File>,
-        BufWriter<File>,
-    >,
+    driver: IsolatedVisualRuntimeDriver<BufReader<File>, BufWriter<File>, BufReader<File>, File>,
 }
 
 impl IsolatedVisualPackagedRuntime {
@@ -210,7 +206,7 @@ impl IsolatedVisualPackagedRuntime {
         );
         let stream = IsolatedVisualStream::new(
             BufReader::new(unsafe { File::from_raw_fd(native.frame_fd) }),
-            BufWriter::new(unsafe { File::from_raw_fd(native.input_fd) }),
+            unsafe { File::from_raw_fd(native.input_fd) },
         );
         unsafe { gpt_macos_isolated_runtime_spawn_result_free(&mut native) };
         Ok(Self {
@@ -262,10 +258,12 @@ impl IsolatedVisualPackagedRuntime {
         request_nonce: &str,
         message: IsolatedVisualInputMessage,
     ) -> ComputerResult<()> {
-        match self
-            .driver
-            .write_input(input_sequence, request_nonce, message)
-        {
+        match self.driver.write_input_with_timeout(
+            input_sequence,
+            request_nonce,
+            message,
+            INPUT_WRITE_TIMEOUT,
+        ) {
             Ok(()) => Ok(()),
             Err(error) => self.abort_with_error(error),
         }
