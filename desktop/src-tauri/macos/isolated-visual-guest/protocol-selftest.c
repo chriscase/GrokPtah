@@ -59,6 +59,24 @@ int main(void) {
         fputs("tampered bootstrap frame was accepted\n", stderr);
         return 1;
     }
+    ready[20] ^= 1U;
+    if (gpt_guest_bootstrap_frame_valid(
+            challenge,
+            GPT_GUEST_BOOTSTRAP_EVENT_SHUTDOWN_ACK,
+            ready)) {
+        fputs("ready frame accepted as shutdown acknowledgement\n", stderr);
+        return 1;
+    }
+    gpt_u8 wrong_challenge[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES];
+    memcpy(wrong_challenge, challenge, sizeof(wrong_challenge));
+    wrong_challenge[0] ^= 1U;
+    if (gpt_guest_bootstrap_frame_valid(
+            wrong_challenge,
+            GPT_GUEST_BOOTSTRAP_EVENT_READY,
+            ready)) {
+        fputs("bootstrap frame accepted with wrong challenge\n", stderr);
+        return 1;
+    }
     puts("isolated guest bootstrap protocol self-test: ok");
     return 0;
 }
