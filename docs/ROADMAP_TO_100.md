@@ -697,9 +697,9 @@ and a credentialed nested-signing assembler. The helper's closed inherited-descr
    The Rust bridge and freestanding guest C now also share a length-prefixed
    Run/surface/incarnation/input-domain binding digest, challenge-derived channel key, and
    confirmation tag. The Rust frame/input carriers can derive interoperable keys from that
-   challenge, but the binding packet remains source-only and is not consumed by the helper/guest
-   socket loop. The helper source now defines a private control-channel relay and validates the
-   guest acknowledgement, but no packaged supervisor invokes that relay yet. These are contracts
+   challenge, and the helper/guest source loop now consumes the binding packet and returns an
+   authenticated acknowledgement. The helper source defines a private control-channel relay and
+   validates the guest acknowledgement, but no packaged supervisor invokes that relay yet. These are contracts
    and unshipped source/pipeline primitives, not packaged evidence. See
 [`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,
 signed/built helper, guest image, packaged entitlement proof, or host-native dispatch exists yet, so these

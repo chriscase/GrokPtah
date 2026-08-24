@@ -45,9 +45,9 @@ seconds. The parent must still prove exact process/handle cleanup before deletin
 
 The fixed event bytes and control values are shared with the freestanding guest protocol header.
 The bridge contains a host-supervisor codec/state machine that accepts only the prepared → start →
-running → stop → stopped sequence (or one terminal failure). It does not spawn a helper, hold a
-descriptor, or mint an isolated capability; it is a pre-runtime ABI seam so a future supervisor
-cannot silently accept reordered, unknown, or post-terminal events.
+running → bind-sent → bound → stop → stopped sequence (or one terminal failure). It does not spawn
+a helper, hold a descriptor, or mint an isolated capability; it is a pre-runtime ABI seam so a
+future supervisor cannot silently accept reordered, unknown, or post-terminal events.
 
 The start path configures one bounded graphics scanout, entropy, and virtio socket. Network, shared
 directories, audio, storage, keyboards, pointing devices, and serial devices are explicitly empty.
