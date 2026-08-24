@@ -13,7 +13,8 @@ const SECRET_PATTERNS = [
   /(?:x-api-key|x-auth-token)\s*[:=]\s*\S+/gi,
 ];
 
-const LOCAL_PATH_PATTERN = /(?:\/Users\/|\/private\/tmp\/|\/var\/folders\/|[A-Za-z]:\\)[^\s),;]+/g;
+const LOCAL_PATH_PATTERN =
+  /(?:\/(?:Users|tmp|var\/folders|Volumes)\/|\/private\/(?:tmp|var)\/|[A-Za-z]:\\)[^\s),;]+/g;
 
 /** Remove credentials, local filesystem paths, and UI-only secret placeholders. */
 export function sanitizeSensitiveText(text: string): string {

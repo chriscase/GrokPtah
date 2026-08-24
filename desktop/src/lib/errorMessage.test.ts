@@ -4,9 +4,14 @@ import { safeErrorMessage, sanitizeSensitiveText } from "./errorMessage";
 describe("safe backend error messages", () => {
   it("redacts credentials, local paths, and UI placeholders", () => {
     const text = sanitizeSensitiveText(
-      "401 api_key=sk-live-value at /Users/chriscase/project; Saved (leave blank to keep)",
+      "401 api_key=sk-live-value at /Users/chriscase/project; native temp /tmp/grokptah-run; Saved (leave blank to keep)",
     );
-    expect(text).toBe("401 [redacted] at [local path redacted]; [redacted]");
+    expect(text).toBe(
+      "401 [redacted] at [local path redacted]; native temp [local path redacted]; [redacted]",
+    );
+    expect(sanitizeSensitiveText("helper failed at /private/var/folders/abc/state")).toBe(
+      "helper failed at [local path redacted]",
+    );
   });
 
   it("bounds long failures and handles empty unknown values", () => {
