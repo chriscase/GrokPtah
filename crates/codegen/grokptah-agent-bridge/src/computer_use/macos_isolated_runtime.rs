@@ -29,6 +29,7 @@ const PREPARED_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNNING_EVENT_TIMEOUT: Duration = Duration::from_secs(60);
 const BOUND_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
+const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const STOPPING_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[repr(C)]
@@ -249,7 +250,7 @@ impl IsolatedVisualPackagedRuntime {
     }
 
     pub fn read_frame(&mut self) -> ComputerResult<Option<IsolatedVisualFrame>> {
-        match self.driver.read_frame() {
+        match self.driver.read_frame_with_timeout(FRAME_READ_TIMEOUT) {
             Ok(frame) => Ok(frame),
             Err(error) => self.abort_with_error(error),
         }

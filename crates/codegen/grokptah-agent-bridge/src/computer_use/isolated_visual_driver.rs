@@ -62,6 +62,17 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
         self.stream.read_frame_chunk(&mut self.runtime)
     }
 
+    pub fn read_frame_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> ComputerResult<Option<IsolatedVisualFrame>>
+    where
+        FR: AsRawFd,
+    {
+        self.stream
+            .read_frame_chunk_with_timeout(&mut self.runtime, timeout)
+    }
+
     pub fn write_input(
         &mut self,
         input_sequence: u64,

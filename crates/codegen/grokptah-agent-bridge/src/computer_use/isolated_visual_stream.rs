@@ -1,4 +1,6 @@
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
+use std::time::{Duration, Instant};
 
 use super::isolated_visual_frames::{IsolatedVisualFrame, ISOLATED_VISUAL_FRAME_CHUNK_BYTES};
 use super::isolated_visual_input::IsolatedVisualInputMessage;
@@ -86,6 +88,40 @@ impl<R: Read, W: Write> IsolatedVisualStream<R, W> {
     }
 }
 
+impl<R: Read + AsRawFd, W: Write> IsolatedVisualStream<R, W> {
+    /// Reads one complete guest frame chunk with a finite wait. The packaged
+    /// supervisor uses this path so a silent guest cannot hold a run forever.
+    pub fn read_frame_chunk_with_timeout(
+        &mut self,
+        runtime: &mut IsolatedVisualRuntimeSession,
+        timeout: Duration,
+    ) -> ComputerResult<Option<IsolatedVisualFrame>> {
+        let deadline = Instant::now() + timeout;
+        let length = self
+            .read_length_with_deadline(ISOLATED_VISUAL_STREAM_MAX_FRAME_PACKET_BYTES, deadline)?;
+        let mut packet = vec![0_u8; length];
+        read_exact_with_deadline(&mut self.reader, &mut packet, deadline)?;
+        runtime.open_frame_chunk(&packet)
+    }
+
+    fn read_length_with_deadline(
+        &mut self,
+        maximum: usize,
+        deadline: Instant,
+    ) -> ComputerResult<usize> {
+        let mut length_bytes = [0_u8; ISOLATED_VISUAL_STREAM_LENGTH_BYTES];
+        read_exact_with_deadline(&mut self.reader, &mut length_bytes, deadline)?;
+        let length = u32::from_be_bytes(length_bytes) as usize;
+        if length == 0 || length > maximum {
+            return Err(ComputerError::new(
+                ComputerErrorCode::LimitReached,
+                "isolated stream packet length exceeds its bound",
+            ));
+        }
+        Ok(length)
+    }
+}
+
 fn read_exact<R: Read>(reader: &mut R, bytes: &mut [u8]) -> ComputerResult<()> {
     reader.read_exact(bytes).map_err(|error| {
         if error.kind() == io::ErrorKind::UnexpectedEof {
@@ -104,6 +140,50 @@ fn stream_error(error: io::Error) -> ComputerError {
         ComputerErrorCode::BackendFailure,
         format!("isolated visual stream I/O failed: {error}"),
     )
+}
+
+fn read_exact_with_deadline<R: Read + AsRawFd>(
+    reader: &mut R,
+    bytes: &mut [u8],
+    deadline: Instant,
+) -> ComputerResult<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout_millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: the descriptor is borrowed from the supervisor-owned
+        // reader and remains valid for this bounded poll/read iteration.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_millis) };
+        if ready == 0 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::BackendFailure,
+                "isolated visual frame read timed out",
+            ));
+        }
+        if ready < 0 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::BackendFailure,
+                "isolated visual frame poll failed",
+            ));
+        }
+        match reader.read(&mut bytes[offset..]) {
+            Ok(0) => {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::TargetClosed,
+                    "isolated visual stream closed mid-packet",
+                ));
+            }
+            Ok(read) => offset += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(stream_error(error)),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
