@@ -257,7 +257,7 @@ pub fn computer_use_admission(capabilities: &ModelCapabilities) -> ComputerUseAd
     let mut tier = if source == CapabilitySource::Unknown {
         ComputerUseTier::None
     } else {
-        capabilities.computer_use_tier
+        capabilities.effective_computer_use_tier()
     };
     if tier == ComputerUseTier::VisualFallbackAct
         && (!capabilities.image_input
@@ -773,6 +773,19 @@ mod tests {
         let measured = computer_use_admission(&caps);
         assert!(measured.enabled);
         assert_eq!(measured.tier, ComputerUseTier::SemanticAct);
+
+        caps.computer_use_tier = ComputerUseTier::VisualFallbackAct;
+        caps.image_input = true;
+        caps.image_media_types = vec!["image/png".into()];
+        caps.max_image_bytes = Some(1024);
+        let unqualified_visual = computer_use_admission(&caps);
+        assert!(unqualified_visual.enabled);
+        assert_eq!(unqualified_visual.tier, ComputerUseTier::SemanticAct);
+        caps.computer_qualification_schema =
+            Some(crate::gateway_config::ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA.into());
+        let qualified_visual = computer_use_admission(&caps);
+        assert!(qualified_visual.enabled);
+        assert_eq!(qualified_visual.tier, ComputerUseTier::VisualFallbackAct);
     }
 
     #[test]

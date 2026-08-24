@@ -98,6 +98,7 @@ pub use gateway_config::{
     save as save_gateway_config, CapabilitySource, ComputerUseTier, GatewayConfig,
     ModelCapabilities, ModelSelection, ProviderDeadlineClass, ProviderDialect, ProviderKind,
     ProviderModel, ProviderProfile, ProviderProfileUpdate,
+    ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA,
 };
 pub use isolation::prepare_isolation_cwd;
 pub use live_attestation::{

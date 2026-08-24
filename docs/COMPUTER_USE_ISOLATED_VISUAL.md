@@ -74,6 +74,14 @@ microphone, credential forwarding, host home mount, or host application enumerat
 the default isolated profile. Adding any one of those is a new capability and security review; it
 cannot be enabled by a model prompt or provider profile.
 
+Capability admission has a separate proof fence as well: the ordinary
+`grokptah.computer-qualification.v1` record measures semantic observation/action against the
+in-process fixture and can never grant visual fallback. A model is downgraded to semantic
+authority unless its exact capability record carries
+`grokptah.isolated-visual-computer-qualification.v1`, which may be written only after the
+credentialed packaged-runtime campaign and independent review pass. Until then, a declared or
+manually supplied visual tier does not expose isolated visual authority.
+
 The guest starts from a read-only measured base plus an empty per-Run overlay. Stop, cancel,
 takeover, timeout, disconnect, helper failure, guest crash, app crash, or host restart performs the
 same terminal sequence:

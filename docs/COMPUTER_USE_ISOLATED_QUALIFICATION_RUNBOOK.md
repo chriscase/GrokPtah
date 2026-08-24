@@ -17,6 +17,9 @@ claim.
 - A source verifier, Linux image comparison, or package signature check is **not** a VM boot proof.
 - Do not enable `HostNative` or `ComputerUseTier::VisualFallbackAct` from this runbook; dispatch
   remains disabled until independent security review and the complete campaign pass.
+- The ordinary `grokptah.computer-qualification.v1` schema is semantic-only. The campaign may
+  write `grokptah.isolated-visual-computer-qualification.v1` only after every packaged VM,
+  frame/input, takeover, cleanup, and independent-review gate passes.
 
 ## 1. Host preflight
 

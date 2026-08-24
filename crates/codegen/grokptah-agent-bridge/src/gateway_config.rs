@@ -20,6 +20,11 @@ pub const XAI_PROVIDER_ID: &str = "xai";
 pub const MODEL_SELECTION_PREFIX: &str = "ptah.model.v1:";
 pub const CAPABILITY_QUALIFICATION_SCHEMA: &str = "grokptah.provider-qualification.v1";
 pub const COMPUTER_CAPABILITY_QUALIFICATION_SCHEMA: &str = "grokptah.computer-qualification.v1";
+/// Separate qualification evidence is required before a model may receive
+/// visual fallback authority. The ordinary computer qualification only
+/// measures semantic observation/action against the in-process fixture.
+pub const ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA: &str =
+    "grokptah.isolated-visual-computer-qualification.v1";
 pub const MAX_QUALIFIED_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const MANAGED_QUALIFICATIONS_VERSION: u32 = 1;
 const ALLOWED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/webp"];
@@ -192,6 +197,12 @@ impl ModelCapabilities {
             && (!self.image_input
                 || self.image_media_types.is_empty()
                 || self.max_image_bytes.is_none())
+        {
+            return ComputerUseTier::SemanticAct;
+        }
+        if self.computer_use_tier == ComputerUseTier::VisualFallbackAct
+            && self.computer_qualification_schema.as_deref()
+                != Some(ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA)
         {
             return ComputerUseTier::SemanticAct;
         }
@@ -1733,6 +1744,13 @@ mod tests {
         capabilities.image_input = true;
         capabilities.image_media_types = vec!["image/png".into()];
         capabilities.max_image_bytes = Some(1024);
+        assert_eq!(
+            capabilities.effective_computer_use_tier(),
+            ComputerUseTier::SemanticAct,
+            "visual fallback requires isolated-runtime qualification evidence"
+        );
+        capabilities.computer_qualification_schema =
+            Some(ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA.into());
         assert_eq!(
             capabilities.effective_computer_use_tier(),
             ComputerUseTier::VisualFallbackAct
