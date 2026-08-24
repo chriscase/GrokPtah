@@ -6,10 +6,10 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Source head at evidence cutoff: `cabd4b6e8f94a1d6e6982f69dbaad8dd5967b7d1`
-- Bundle: not created for the current head; the historical stage-41 bundle is
-  recorded below and does not include the later hardening commits.
-- Bundle SHA-256: not applicable to the current head.
+- Source head at evidence cutoff: `3a88fb41e29a55aeabb54defe82761b129b6ab11`
+- Bundle: `/private/tmp/grokptah-cu-isolated-visual-v1.bundle`
+- Bundle SHA-256: `5281f6992189d802f0bfd25027fa3eea82b23a68c6f9c6a7e6448cc6fb0bb2ed`
+- Bundle verification: complete history; `git bundle verify` passed.
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
 Current sealed implementation head: `d2a578ff3a91907da308c03bdc78b4d35d933dc5`.
@@ -141,51 +141,51 @@ The package-bundle path hardening extension is sealed at:
 
 The staged-package publication extension is sealed at:
 
-- Commit: `2631aa0165a1a9d5f629251da7dded71aa47d8c3`.
+- Commit: `2631aa0b7f911ee3f2a08a659d0501e8f9c84441`.
 - Bundle: not created; this remains a source-only extension pending the
   credentialed packaged-runtime campaign.
 
 The clean isolated-resource-tree extension is sealed at:
 
-- Commit: `878ab78566f53a9b0f564aed55baf4c8cb7f3b23`.
+- Commit: `878ab78ecd67795715836ccdec1d1d16bf68211a`.
 - Bundle: not created; this remains a source-only extension pending the
   credentialed packaged-runtime campaign.
 
 The fail-closed entitlement-inspection extension is sealed at:
 
-- Commit: `b1e5ff5aebfb0fa5512acf7e630231a6138801af`.
+- Commit: `b1e5ff5eaa4dc85b90e3ef29c27328dc5b9e6e08`.
 - Bundle: not created; this remains a source-only extension pending the
   credentialed packaged-runtime campaign.
 
 The atomic guest-artifact publication extension is sealed at:
 
-- Commit: `d2cd5aa7d20cc907a7f8c0a2157f3dcaed162b5c`.
+- Commit: `d2cd5aaa97dbcaa653df1270b7252dd7d3df9a15`.
 - Bundle: not created; this remains a source-only extension pending the
   credentialed packaged-runtime campaign.
 
 The bounded kernel-source fetch extension is sealed at:
 
-- Commit: `f8b9ea8b9e0ec4cf3e87f541fd9dc99dc15804ab`.
+- Commit: `f8b9ea8eecd2d4b20e4dcaa70377c337278b2589`.
 - Bundle: not created; this remains a source-only extension pending the
   credentialed packaged-runtime campaign.
 
 The kernel-source download-size cap extension is sealed at:
 
-- Commit: `c6373c3f4cedfb7b8f8a68dd3f0190fc50d3e3c9`.
+- Commit: `c6373c3e97f505db37420f9b520270c9dbad51d9`.
 - Bundle: not created; this remains a source-only extension pending the
   credentialed packaged-runtime campaign.
 
 The disposable helper-compiler-cache extension is sealed at:
 
-- Commit: `44f3d13a2ea64c6a1f19a1ae60827125c22f2f5a`.
+- Commit: `44f3d13ba0f2161a3a379a108519072c3cbb8064`.
 - Bundle: not created; this remains a source-only extension pending the
   credentialed packaged-runtime campaign.
 
 The shellcheck-clean verifier extension is sealed at:
 
-- Commit: `cabd4b6e8f94a1d6e6982f69dbaad8dd5967b7d1`.
-- Bundle: not created; this remains a source-only extension pending the
-  credentialed packaged-runtime campaign.
+- Commit: `cabd4b623a4ca2383ed5283eb4d2830f7480b3e2`.
+- Included in the current source bundle above; no signed runtime claim is
+  implied.
 
 ## What this candidate proves
 
