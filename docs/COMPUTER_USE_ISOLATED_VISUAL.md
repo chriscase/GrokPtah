@@ -238,7 +238,8 @@ available.
    guest acknowledgement, but no packaged supervisor invokes it yet. A source-only
    `IsolatedVisualRuntimeSession` now couples that helper event order to lifecycle cleanup, frame
    freshness, and challenge-bound input admission; it still does not spawn or dispatch a packaged
-   runtime.
+   runtime. The exact source candidate and safe-check record are captured in
+   [`COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md`](COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md).
 6. Integrate app-owned cursor, focus/drag preview, timeline, persistent emergency controls, and
    accessibility states in the cockpit.
 7. Run adversarial, crash/restart, resource, packaged hardware, and recurring expert UI reviews.

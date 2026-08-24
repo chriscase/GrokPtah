@@ -703,7 +703,8 @@ and a credentialed nested-signing assembler. The helper's closed inherited-descr
    and unshipped source/pipeline primitives, not packaged evidence. A source-only
    `IsolatedVisualRuntimeSession` now couples helper event order to lifecycle cleanup, frame
    freshness, and challenge-bound input admission; it does not spawn or dispatch a packaged
-   runtime. See
+   runtime. Its source identity and safe-check record are captured in
+   [`COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md`](COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md). See
 [`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,
 signed/built helper, guest image, packaged entitlement proof, or host-native dispatch exists yet, so these
 source slices satisfy no #288 acceptance checkbox.
