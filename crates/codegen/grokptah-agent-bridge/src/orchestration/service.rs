@@ -7670,8 +7670,12 @@ impl OrchestrationService {
         }
 
         let was_pending = self.remove_pending(rid);
-        let reservation_released = self.host.release_turn_reservation(session_id, rid);
-        let teardown_complete = if was_pending || reservation_released {
+        // Releasing an unconsumed reservation is not teardown. The turn may
+        // still be inside session_prompt_inner's pre-lock setup, and the
+        // orchestration admission lease is independent of the session
+        // reservation map.
+        self.host.release_turn_reservation(session_id, rid);
+        let teardown_complete = if was_pending {
             true
         } else {
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -7681,6 +7685,10 @@ impl OrchestrationService {
             .await
             .is_ok()
         };
+        // Exactly-once: AdmissionGuard::drop also releases by run_id, and
+        // HashMap::remove is idempotent, so a later drop cannot free a
+        // successor run's slot or underflow capacity.
+        self.host.release_orchestration_turn(rid);
 
         // A completed teardown should have reconciled every provider marker.
         // If it did not—or teardown itself timed out—persist incomplete usage
