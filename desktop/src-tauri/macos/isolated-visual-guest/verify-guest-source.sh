@@ -11,7 +11,7 @@ guest_source="$script_dir/guest-init.c"
 protocol_header="$script_dir/protocol.h"
 fragment="$script_dir/kernel.config.fragment"
 lock="$script_dir/guest-source.lock.json"
-work=$(mktemp -d /private/tmp/grokptah-guest-source-proof.XXXXXX)
+work=$(mktemp -d "${TMPDIR:-/tmp}/grokptah-guest-source-proof.XXXXXX")
 cleanup() {
   rm -rf -- "$work"
 }

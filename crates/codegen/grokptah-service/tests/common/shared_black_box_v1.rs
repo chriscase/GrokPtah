@@ -275,6 +275,32 @@ struct ScanCtx<'a> {
     hits: Vec<RedactionHit>,
 }
 
+struct RedactionNeedles<'a> {
+    bearer: &'a str,
+    api_key: &'a str,
+    gateway: &'a str,
+    gateway_authority: &'a str,
+    marker: &'a str,
+}
+
+struct DriveSixPhases<'a> {
+    kind: EndpointKind,
+    scenario: &'a Scenario,
+    home: &'a Path,
+    workspace: &'a Path,
+    token: &'a str,
+    gateway: &'a MockGateway,
+    proposal_file: &'a str,
+}
+
+struct WorkStateWait<'a> {
+    session_id: &'a str,
+    workspace: &'a str,
+    work_id: &'a str,
+    states: &'a [&'a str],
+    advance: Duration,
+}
+
 struct IdCanon {
     map: BTreeMap<String, String>,
 }
@@ -462,23 +488,27 @@ async fn run_v1(
             scan_raw(
                 value,
                 origin,
-                &token,
-                &api_key,
-                &gateway_base,
-                &gateway_authority,
-                &marker,
+                RedactionNeedles {
+                    bearer: &token,
+                    api_key: &api_key,
+                    gateway: &gateway_base,
+                    gateway_authority: &gateway_authority,
+                    marker: &marker,
+                },
                 &mut hits,
             );
         };
         drive_six_phases(
-            kind,
-            scenario,
+            DriveSixPhases {
+                kind,
+                scenario,
+                home: &home,
+                workspace: &workspace,
+                token: &token,
+                gateway: &gateway,
+                proposal_file: &proposal_path,
+            },
             launched,
-            &home,
-            &workspace,
-            &token,
-            &gateway,
-            &proposal_path,
             &mut scan,
         )
         .await
@@ -836,16 +866,19 @@ fn host_capability_contract(
 type ScanFn<'a> = dyn FnMut(&Value, &str) + 'a;
 
 async fn drive_six_phases(
-    kind: EndpointKind,
-    scenario: &Scenario,
+    ctx: DriveSixPhases<'_>,
     mut launched: Launched,
-    home: &Path,
-    workspace: &Path,
-    token: &str,
-    gateway: &MockGateway,
-    proposal_file: &str,
     scan: &mut ScanFn<'_>,
 ) -> (Value, Launched, Vec<String>) {
+    let DriveSixPhases {
+        kind,
+        scenario,
+        home,
+        workspace,
+        token,
+        gateway,
+        proposal_file,
+    } = ctx;
     let workspace_text = workspace.display().to_string();
     let mut defects: Vec<String> = Vec::new();
     let initial_capability = authority_capability_document(
@@ -1052,11 +1085,13 @@ async fn drive_six_phases(
     wait_work_state(
         &mut launched,
         scenario,
-        &session_id,
-        &workspace_text,
-        &native_work_id,
-        &["succeeded"],
-        Duration::from_millis(scenario.native_ms()),
+        WorkStateWait {
+            session_id: &session_id,
+            workspace: &workspace_text,
+            work_id: &native_work_id,
+            states: &["succeeded"],
+            advance: Duration::from_millis(scenario.native_ms()),
+        },
         scan,
     )
     .await;
@@ -1175,11 +1210,13 @@ async fn drive_six_phases(
     wait_work_state(
         &mut launched,
         scenario,
-        &session_id,
-        &workspace_text,
-        &decision_work_id,
-        &["succeeded", "failed", "cancelled"],
-        Duration::from_millis(scenario.native_ms()),
+        WorkStateWait {
+            session_id: &session_id,
+            workspace: &workspace_text,
+            work_id: &decision_work_id,
+            states: &["succeeded", "failed", "cancelled"],
+            advance: Duration::from_millis(scenario.native_ms()),
+        },
         scan,
     )
     .await;
@@ -1931,13 +1968,16 @@ async fn wait_run_terminal(
 async fn wait_work_state(
     launched: &mut Launched,
     scenario: &Scenario,
-    session_id: &str,
-    workspace: &str,
-    work_id: &str,
-    states: &[&str],
-    advance: Duration,
+    wait: WorkStateWait<'_>,
     scan: &mut ScanFn<'_>,
 ) {
+    let WorkStateWait {
+        session_id,
+        workspace,
+        work_id,
+        states,
+        advance,
+    } = wait;
     for _ in 0..scenario.max_ticks() {
         yield_budget(scenario.yields() as usize).await;
         let snap = call_ok(
@@ -2193,19 +2233,15 @@ fn collect_leak_paths(value: &Value, path: &str, out: &mut Vec<String>) {
 fn scan_raw(
     value: &Value,
     origin: &str,
-    bearer: &str,
-    api_key: &str,
-    gateway: &str,
-    gateway_authority: &str,
-    marker: &str,
+    needles: RedactionNeedles<'_>,
     hits: &mut Vec<RedactionHit>,
 ) {
     let mut ctx = ScanCtx {
-        bearer,
-        api_key,
-        gateway,
-        gateway_authority,
-        marker,
+        bearer: needles.bearer,
+        api_key: needles.api_key,
+        gateway: needles.gateway,
+        gateway_authority: needles.gateway_authority,
+        marker: needles.marker,
         hits: Vec::new(),
     };
     walk_scan(value, origin, &mut ctx);
@@ -2290,11 +2326,13 @@ fn scan_normalized_secrets(
     scan_raw(
         value,
         "normalized",
-        bearer,
-        api_key,
-        gateway,
-        gateway_authority,
-        marker,
+        RedactionNeedles {
+            bearer,
+            api_key,
+            gateway,
+            gateway_authority,
+            marker,
+        },
         &mut hits,
     );
     out.extend(
@@ -2311,7 +2349,7 @@ fn normalize_result(
     gateway_authority: &str,
 ) -> Value {
     replace_authorities(&mut value, workspace, home, gateway, gateway_authority);
-    strip_ephemerals(&mut value, None);
+    strip_ephemerals(&mut value);
     let mut canon = IdCanon {
         map: BTreeMap::new(),
     };
@@ -2356,7 +2394,7 @@ fn visit_strings(value: &mut Value, edit: &mut dyn FnMut(&str) -> String) {
     }
 }
 
-fn strip_ephemerals(value: &mut Value, key: Option<&str>) {
+fn strip_ephemerals(value: &mut Value) {
     match value {
         Value::Object(map) => {
             let keys: Vec<String> = map.keys().cloned().collect();
@@ -2366,13 +2404,13 @@ fn strip_ephemerals(value: &mut Value, key: Option<&str>) {
                     continue;
                 }
                 if let Some(child) = map.get_mut(&k) {
-                    strip_ephemerals(child, Some(&k));
+                    strip_ephemerals(child);
                 }
             }
         }
         Value::Array(items) => {
             for child in items {
-                strip_ephemerals(child, key);
+                strip_ephemerals(child);
             }
         }
         _ => {}
@@ -2420,18 +2458,16 @@ fn collect_ids(value: &Value, key: Option<&str>, canon: &mut IdCanon) {
         Value::Array(items) => {
             let mut items = items.clone();
             if key.is_some_and(is_set_array_key) {
-                items.sort_by_key(|item| canonical_sort_key(item));
+                items.sort_by_key(canonical_sort_key);
             }
             for child in &items {
                 collect_ids(child, key, canon);
             }
         }
         Value::String(text) => {
-            if should_canonicalize(key, text) {
-                if !canon.map.contains_key(text) {
-                    let next = format!("$ID_{}", canon.map.len() + 1);
-                    canon.map.insert(text.clone(), next);
-                }
+            if should_canonicalize(key, text) && !canon.map.contains_key(text) {
+                let next = format!("$ID_{}", canon.map.len() + 1);
+                canon.map.insert(text.clone(), next);
             }
             for captured in find_generated_ids(text) {
                 if !canon.map.contains_key(&captured) {
@@ -2845,9 +2881,7 @@ fn display_path(path: &str) -> String {
 }
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .canonicalize()
+    dunce::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.."))
         .expect("canonicalize repo root")
 }
 
@@ -3234,11 +3268,13 @@ fn redaction_scan_fails_on_forbidden_secrets() {
             "text": "sbb-v1-api-key-1a2b3c4d5e6f708192a3b4c5d6e7f809"
         }),
         "probe",
-        "sbb-v1-mcp-bearer-7f3c9e1a4b8d2e6f0c5a9d3b7e1f4a8c",
-        "sbb-v1-api-key-1a2b3c4d5e6f708192a3b4c5d6e7f809",
-        "http://127.0.0.1:9",
-        "127.0.0.1:9",
-        "sbb-v1-private-gateway-sentinel",
+        RedactionNeedles {
+            bearer: "sbb-v1-mcp-bearer-7f3c9e1a4b8d2e6f0c5a9d3b7e1f4a8c",
+            api_key: "sbb-v1-api-key-1a2b3c4d5e6f708192a3b4c5d6e7f809",
+            gateway: "http://127.0.0.1:9",
+            gateway_authority: "127.0.0.1:9",
+            marker: "sbb-v1-private-gateway-sentinel",
+        },
         &mut hits,
     );
     let reasons: Vec<_> = hits.iter().map(|hit| hit.reason.as_str()).collect();
@@ -3281,10 +3317,12 @@ fn write_golden_document_roundtrip_does_not_touch_repo_goldens() {
 
 #[test]
 fn committed_preload_is_armed() {
-    assert!(
-        PRELOAD_IMMUTABLE_GOLDEN,
-        "committed fixture must fail closed on missing/pending goldens before launch"
-    );
+    const {
+        assert!(
+            PRELOAD_IMMUTABLE_GOLDEN,
+            "committed fixture must fail closed on missing/pending goldens before launch"
+        );
+    }
 }
 
 #[test]
