@@ -18,6 +18,7 @@ mod isolated_visual_artifacts;
 mod isolated_visual_channel;
 mod isolated_visual_frames;
 mod isolated_visual_helper;
+mod isolated_visual_helper_control;
 mod isolated_visual_input;
 mod isolated_visual_input_wire;
 mod isolated_visual_protocol;
@@ -68,6 +69,7 @@ pub use isolated_visual_helper::{
     ISOLATED_VISUAL_HELPER_CONTROL_STOP, ISOLATED_VISUAL_HELPER_EVENT_BYTES,
     ISOLATED_VISUAL_HELPER_EVENT_MAGIC, ISOLATED_VISUAL_HELPER_EVENT_VERSION,
 };
+pub use isolated_visual_helper_control::IsolatedVisualHelperControl;
 pub use isolated_visual_input::{
     IsolatedVisualInputGate, IsolatedVisualInputKeyState, IsolatedVisualInputMessage,
     ISOLATED_VISUAL_MAX_SCROLL_DELTA,

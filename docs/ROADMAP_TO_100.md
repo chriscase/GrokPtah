@@ -704,7 +704,9 @@ and a credentialed nested-signing assembler. The helper's closed inherited-descr
    `IsolatedVisualRuntimeSession` now couples helper event order to lifecycle cleanup, frame
    freshness, and challenge-bound input admission; it does not spawn or dispatch a packaged
    runtime. A bounded length-delimited `IsolatedVisualStream` supplies the private transport seam
-   while still opening no VSOCK and dispatching no packaged runtime. Its source identity and safe-check record are captured in
+   while still opening no VSOCK and dispatching no packaged runtime. `IsolatedVisualHelperControl`
+   binds inherited helper control/event descriptors to the coordinator without spawning a process.
+   Its source identity and safe-check record are captured in
    [`COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md`](COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md). See
 [`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,
 signed/built helper, guest image, packaged entitlement proof, or host-native dispatch exists yet, so these

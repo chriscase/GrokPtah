@@ -26,6 +26,9 @@ Computer Use backend or satisfy the #288 release gate.
   seam: it refuses oversized allocations, maps mid-packet EOF to a terminal
   condition, delegates frame authentication/freshness to the runtime session,
   and writes only authenticated input packets.
+- `IsolatedVisualHelperControl` binds inherited control/event descriptors to
+  the same coordinator, serializing only the start/bind/stop controls and
+  accepting only decoded fixed-size helper events.
 - Source tests exercise the bound transition, frame-carrier round trip,
   frame-fenced input packet, stop transition, and pre-binding rejection paths.
 

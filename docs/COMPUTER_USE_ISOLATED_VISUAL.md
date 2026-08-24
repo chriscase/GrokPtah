@@ -240,7 +240,9 @@ available.
    freshness, and challenge-bound input admission; it still does not spawn or dispatch a packaged
    runtime. A bounded length-delimited `IsolatedVisualStream` now supplies the private transport
    seam, delegating frame authentication and input admission to that coordinator; it still does
-   not open a VSOCK or dispatch a packaged runtime. The exact source candidate and safe-check record are captured in
+   not open a VSOCK or dispatch a packaged runtime. `IsolatedVisualHelperControl` similarly binds
+   inherited helper control/event descriptors to the coordinator without spawning a process. The
+   exact source candidate and safe-check record are captured in
    [`COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md`](COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md).
 6. Integrate app-owned cursor, focus/drag preview, timeline, persistent emergency controls, and
    accessibility states in the cockpit.
