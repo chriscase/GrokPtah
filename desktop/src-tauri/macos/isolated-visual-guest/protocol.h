@@ -42,6 +42,13 @@ typedef unsigned long gpt_size;
 #define GPT_ISOLATED_VISUAL_FRAME_TAG_BYTES 32U
 #define GPT_ISOLATED_VISUAL_FRAME_CHUNK_BYTES 65536U
 
+/* Host-to-guest input packets. They never target the host input domain. */
+#define GPT_ISOLATED_VISUAL_INPUT_MAGIC 0x47505441U
+#define GPT_ISOLATED_VISUAL_INPUT_VERSION 1U
+#define GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES 64U
+#define GPT_ISOLATED_VISUAL_INPUT_TAG_BYTES 32U
+#define GPT_ISOLATED_VISUAL_INPUT_MAX_TEXT_BYTES 4096U
+
 typedef struct __attribute__((packed)) {
     gpt_u32 magic;
     gpt_u16 version;
@@ -73,6 +80,27 @@ typedef struct __attribute__((packed)) {
 _Static_assert(
     sizeof(gpt_isolated_visual_frame_header) == GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES,
     "unexpected isolated visual frame header layout");
+
+typedef struct __attribute__((packed)) {
+    gpt_u32 magic;
+    gpt_u16 version;
+    gpt_u16 protocol_version;
+    gpt_u64 frame_sequence;
+    gpt_u64 input_sequence;
+    gpt_u8 request_nonce[16];
+    gpt_u8 kind;
+    gpt_u8 state;
+    gpt_u16 code;
+    gpt_u32 x;
+    gpt_u32 y;
+    gpt_u32 delta_x;
+    gpt_u32 delta_y;
+    gpt_u32 text_bytes;
+} gpt_isolated_visual_input_header;
+
+_Static_assert(
+    sizeof(gpt_isolated_visual_input_header) == GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES,
+    "unexpected isolated visual input header layout");
 
 typedef struct {
     gpt_u32 state[8];

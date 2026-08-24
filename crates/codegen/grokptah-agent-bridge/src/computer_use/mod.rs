@@ -18,6 +18,7 @@ mod isolated_visual_artifacts;
 mod isolated_visual_frames;
 mod isolated_visual_helper;
 mod isolated_visual_input;
+mod isolated_visual_input_wire;
 mod isolated_visual_protocol;
 #[cfg(target_os = "macos")]
 mod macos_isolated_artifacts;
@@ -61,6 +62,11 @@ pub use isolated_visual_helper::{
 pub use isolated_visual_input::{
     IsolatedVisualInputGate, IsolatedVisualInputKeyState, IsolatedVisualInputMessage,
     ISOLATED_VISUAL_MAX_SCROLL_DELTA,
+};
+pub use isolated_visual_input_wire::{
+    IsolatedVisualInputWire, ISOLATED_VISUAL_INPUT_HEADER_BYTES, ISOLATED_VISUAL_INPUT_MAGIC,
+    ISOLATED_VISUAL_INPUT_MAX_PACKET_BYTES, ISOLATED_VISUAL_INPUT_TAG_BYTES,
+    ISOLATED_VISUAL_INPUT_VERSION,
 };
 pub use isolated_visual_protocol::{
     IsolatedVisualGuestFailure, IsolatedVisualGuestHealth, IsolatedVisualGuestMessage,

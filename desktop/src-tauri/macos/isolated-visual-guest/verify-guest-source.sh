@@ -61,7 +61,8 @@ for required in GPT_AF_VSOCK GPT_GUEST_BOOTSTRAP_PORT GPT_SYS_REBOOT GPT_SYS_SOC
 done
 for required in \
   GPT_ISOLATED_VISUAL_FRAME_MAGIC GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES \
-  gpt_isolated_visual_frame_header; do
+  gpt_isolated_visual_frame_header GPT_ISOLATED_VISUAL_INPUT_MAGIC \
+  GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES gpt_isolated_visual_input_header; do
   grep -F "$required" "$protocol_header" >/dev/null
 done
 printf 'isolated guest source, protocol, and closed kernel fragment: pass\n'

@@ -58,7 +58,9 @@ input through the authenticated protocol documented in `docs/COMPUTER_USE_ISOLAT
 the Rust candidate now includes a bounded authenticated guest-to-host frame-chunk carrier, but the
 helper/guest socket loop does not yet feed it. A separate host-side input gate now models guest
 pointer, button, scroll, key, and Unicode text edges against the latest frame and poisons stale or
-incomplete state; it is not wired to a socket and no input capability is enabled.
+incomplete state. The source candidate also defines a separate authenticated 64-byte input packet
+header with a closed key/button code set; it is not wired to a socket and no input capability is
+enabled.
 
 ## Build and package boundaries
 
