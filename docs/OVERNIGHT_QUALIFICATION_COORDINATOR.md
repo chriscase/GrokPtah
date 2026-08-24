@@ -5,6 +5,12 @@ this document.** This coordinator serializes the two currently prepared
 external gates so they cannot contend for the shared Rust target or be
 mistaken for one another.
 
+This is an opportunistic external sub-sequence, not a replacement for the
+dependency-ordered [full 100% handoff](OVERNIGHT_100_PERCENT_GROK_BUILD_HANDOFF.md).
+Lane A may repair and qualify the Always-On route, but it cannot claim Stage 6
+until the required Stage 1–5 reports exist; Lane B likewise cannot claim Stage
+9 without its complete packaged evidence.
+
 ## Copyable Grok Build prompt
 
 ```text
@@ -27,7 +33,7 @@ Global rules for both lanes:
 - If any identity, process-ownership, security, or cleanup precondition is
   missing, return NOT_QUALIFIED for that lane and stop that lane.
 
-Lane A — Always-On v52 (Stage 6 / #301, #305):
+Lane A — Always-On v52 route repair (preparatory Stage 6 evidence / #301, #305):
 - Use only this immutable bundle:
   /private/tmp/grokptah-dream-stage4-v52-public-run-correction.bundle
 - Bundle SHA-256:
@@ -79,4 +85,3 @@ The coordinator is intentionally serial. A v52 service-process result cannot
 qualify isolated visual Computer Use, and a v15 packaged result cannot qualify
 Always-On or enterprise-gateway behavior. The final project claim remains
 blocked until every roadmap stage has its own retained evidence.
-
