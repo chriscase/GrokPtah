@@ -115,6 +115,12 @@ The raw-reader channel alignment is sealed at:
 - Bundle: `/private/tmp/grokptah-cu-stage41-raw-polled-channels-v1.bundle`
 - Bundle SHA-256: `5b18f786ee1962a8ea4085a170422db5e28d6ba02fda6a500d44165610bc2518`
 
+The monotonic VM-deadline hardening extension is sealed at:
+
+- Commit: `15c127d514679ff412c6d47d0e1b44cc4ffd19f8`
+- Bundle: not created; this remains a source-only extension pending the
+  credentialed packaged-runtime campaign.
+
 ## What this candidate proves
 
 - The helper control ABI has an explicit `bind` command and authenticated
