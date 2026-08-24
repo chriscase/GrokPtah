@@ -6,12 +6,13 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `a454357a46a61800c8dd993c2b837402bb7ff586`
-- Bundle: `/private/tmp/grokptah-cu-stage41-raw-polled-channels-v1.bundle`
-- Bundle SHA-256: `5b18f786ee1962a8ea4085a170422db5e28d6ba02fda6a500d44165610bc2518`
+- Source head at evidence cutoff: `d2a578ff3a91907da308c03bdc78b4d35d933dc5`
+- Bundle: not created for the current head; the historical stage-41 bundle is
+  recorded below and does not include the later hardening commits.
+- Bundle SHA-256: not applicable to the current head.
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current sealed implementation head: `eb9892e1ba5606c73b66abe60067fea5ae7eafb6`.
+Current sealed implementation head: `d2a578ff3a91907da308c03bdc78b4d35d933dc5`.
 
 The later guest-input validation extension is sealed at:
 
@@ -119,6 +120,17 @@ The monotonic VM-deadline hardening extension is sealed at:
 
 - Commit: `15c127d514679ff412c6d47d0e1b44cc4ffd19f8`
 - Bundle: not created; this remains a source-only extension pending the
+  credentialed packaged-runtime campaign.
+
+The bounded guest/helper transport and supervisor-reap hardening extensions are
+sealed at:
+
+- Commits: `a2d76f3849a2999cb95735037d7632948df84a3b`,
+  `91dfce8c9c4f9a09d3648c3d3a8f4abf051a0338`,
+  `078d2c22002534d38b112445b6dcd2afb3e86a3f`,
+  `3782716fb652181220e93ce38284b5d4ab1acd6a`, and
+  `d2a578ff3a91907da308c03bdc78b4d35d933dc5`.
+- Bundle: not created; these remain source-only extensions pending the
   credentialed packaged-runtime campaign.
 
 ## What this candidate proves
