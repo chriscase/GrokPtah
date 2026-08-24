@@ -6,12 +6,12 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `34d942e80b1af2526b9fbf401e1bed4b3bfe372b`
-- Bundle: `/private/tmp/grokptah-cu-stage21-packaged-supervisor-v1.bundle`
-- Bundle SHA-256: `b36d41acf4a71603a4cb0a34c637132c5602c08ec3c1574b6d25572507d0b270`
+- Head: `579da66cc0fcc6c9bb317a5365a6739e51c354c1`
+- Bundle: `/private/tmp/grokptah-cu-stage22-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `5b85859068edf71afe35270b201b1a0847b1d73fa42033fd1d42633a7398808e`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current sealed implementation head: `34d942e80b1af2526b9fbf401e1bed4b3bfe372b`.
+Current sealed implementation head: `579da66cc0fcc6c9bb317a5365a6739e51c354c1`.
 
 The later guest-input validation extension is sealed at:
 
@@ -57,9 +57,9 @@ The private guest-challenge channel extension is sealed at:
 
 The bounded packaged-supervisor source extension is sealed at:
 
-- Commit: `34d942e80b1af2526b9fbf401e1bed4b3bfe372b`
-- Bundle: `/private/tmp/grokptah-cu-stage21-packaged-supervisor-v1.bundle`
-- Bundle SHA-256: `b36d41acf4a71603a4cb0a34c637132c5602c08ec3c1574b6d25572507d0b270`
+- Commit: `579da66cc0fcc6c9bb317a5365a6739e51c354c1`
+- Bundle: `/private/tmp/grokptah-cu-stage22-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `5b85859068edf71afe35270b201b1a0847b1d73fa42033fd1d42633a7398808e`
 
 ## What this candidate proves
 
@@ -111,6 +111,12 @@ The bounded packaged-supervisor source extension is sealed at:
   event waits, and force-cleans an unresponsive helper. This is a packaged-
   supervisor **source candidate**; no signed app has launched it and no VM
   boot/render/input/cleanup result is claimed.
+- Before native spawn, the Rust launch seam now opens the exact package through
+  the existing read-only measurement/receipt verifier and binds the caller's
+  manifest to helper, guest-image, configuration, and designated-requirement
+  digests. A structurally valid but mismatched manifest therefore cannot reach
+  the child process; the native shim repeats path/signature checks immediately
+  before spawn.
 - The freestanding guest source validates the authenticated input packet,
   sequence fence, identity-bound HMAC, coordinate/key/text bounds, and closed
   message kind set after binding. Input remains fail-closed until a reviewed
