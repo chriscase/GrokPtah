@@ -1,9 +1,11 @@
+import { useCallback, useEffect, useRef } from "react";
 import type { PermissionRequest } from "../lib/protocol";
 import {
   sessionIdForPermission,
   type PermissionDecision,
 } from "../lib/permissionQueue";
 import type { DenyHistoryEntry } from "../lib/denyHistory";
+import { trapTabKey } from "../lib/overlayA11y";
 import { LaneScopeLine, type LaneScope } from "./LaneScopeLine";
 
 export type PermissionModalProps = {
@@ -48,14 +50,42 @@ export function PermissionModal({
     typeof detail.risk === "string" ? detail.risk : undefined;
   const riskTier =
     typeof detail.risk_tier === "string" ? detail.risk_tier : undefined;
+  const allowAlways = riskTier !== "deny";
 
-  async function respond(decision: PermissionDecision) {
-    await onRespond(request.id, decision, sessionId);
-  }
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const denyRef = useRef<HTMLButtonElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+
+  const respond = useCallback(
+    async (decision: PermissionDecision) => {
+      await onRespond(request.id, decision, sessionId);
+    },
+    [onRespond, request.id, sessionId],
+  );
+
+  useEffect(() => {
+    previousFocusRef.current = document.activeElement as HTMLElement | null;
+    denyRef.current?.focus();
+    return () => {
+      previousFocusRef.current?.focus?.();
+    };
+  }, [request.id]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      void respond("deny");
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [respond]);
 
   return (
     <div className="modal-backdrop" data-testid="permission-modal-backdrop">
       <div
+        ref={dialogRef}
         className="modal permission-modal"
         role="dialog"
         aria-modal="true"
@@ -63,6 +93,8 @@ export function PermissionModal({
         data-testid="permission-modal"
         data-session-id={sessionId}
         data-request-id={request.id}
+        tabIndex={-1}
+        onKeyDown={(event) => trapTabKey(event, dialogRef.current)}
       >
         <h3 id="permission-modal-title">Needs your response</h3>
         {scope && <LaneScopeLine scope={scope} compact />}
@@ -158,6 +190,7 @@ export function PermissionModal({
         </details>
         <div className="modal-actions">
           <button
+            ref={denyRef}
             type="button"
             className="danger"
             data-testid="permission-deny"
@@ -165,13 +198,15 @@ export function PermissionModal({
           >
             Deny
           </button>
-          <button
-            type="button"
-            data-testid="permission-always"
-            onClick={() => void respond("always_allow")}
-          >
-            Always allow {request.tool_name}
-          </button>
+          {allowAlways && (
+            <button
+              type="button"
+              data-testid="permission-always"
+              onClick={() => void respond("always_allow")}
+            >
+              Always allow {request.tool_name}
+            </button>
+          )}
           <button
             type="button"
             className="primary"

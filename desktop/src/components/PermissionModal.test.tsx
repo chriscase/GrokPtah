@@ -199,4 +199,64 @@ describe("PermissionModal (#141)", () => {
       screen.getByTestId("permission-deny-history-item").textContent,
     ).toMatch(/run_terminal_cmd/);
   });
+
+  it("focuses Deny on open, restores the opener, and treats Escape as deny", async () => {
+    const opener = document.createElement("button");
+    opener.textContent = "opener";
+    document.body.append(opener);
+    opener.focus();
+    expect(document.activeElement).toBe(opener);
+
+    const answers: string[] = [];
+    const { unmount } = render(
+      <PermissionModal
+        request={makeReq("req-focus", "session-focus")}
+        onRespond={async (_id, decision) => {
+          answers.push(decision);
+        }}
+      />,
+    );
+
+    expect(document.activeElement).toBe(screen.getByTestId("permission-deny"));
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    await waitFor(() => expect(answers).toEqual(["deny"]));
+    unmount();
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
+  });
+
+  it("traps Tab inside the dialog", () => {
+    render(
+      <PermissionModal
+        request={makeReq("req-trap", "session-trap")}
+        onRespond={vi.fn()}
+      />,
+    );
+    const deny = screen.getByTestId("permission-deny");
+    const allow = screen.getByTestId("permission-allow");
+    deny.focus();
+    fireEvent.keyDown(screen.getByTestId("permission-modal"), {
+      key: "Tab",
+      shiftKey: true,
+    });
+    expect(document.activeElement).toBe(allow);
+    allow.focus();
+    fireEvent.keyDown(screen.getByTestId("permission-modal"), { key: "Tab" });
+    expect(document.activeElement).toBe(deny);
+  });
+
+  it("does not offer Always allow when the risk tier is deny", () => {
+    render(
+      <PermissionModal
+        request={makeReq("req-deny-tier", "session-deny", "run_terminal_cmd", {
+          risk: "destructive host command",
+          risk_tier: "deny",
+        })}
+        onRespond={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTestId("permission-always")).toBeNull();
+    expect(screen.getByTestId("permission-deny")).toBeTruthy();
+    expect(screen.getByTestId("permission-allow")).toBeTruthy();
+  });
 });
