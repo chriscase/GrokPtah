@@ -11,7 +11,7 @@ Computer Use backend or satisfy the #288 release gate.
 - Bundle SHA-256: `bdd76c7ceaa910e261d4805bd52bc4172c054f5e7ebc060ac2688839d43ca5b0`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current sealed implementation head: `7823283284a484f5586edfc79a9dd2109d2a98b1`.
+Current sealed implementation head: `c195ea5b6a5fb4f3f2a12911738baaff4abb6143`.
 
 The later guest-input validation extension is sealed at:
 
@@ -30,6 +30,12 @@ The runtime-driver integration extension is sealed at:
 - Commit: `7823283284a484f5586edfc79a9dd2109d2a98b1`
 - Bundle: `/private/tmp/grokptah-cu-stage15-runtime-driver-v1.bundle`
 - Bundle SHA-256: `5b0f3ca91c9c62b34e500a82a9ad0878541ae2e0714003c8cd6b6786ccdaa8ca`
+
+The helper relay extension is sealed at:
+
+- Commit: `c195ea5b6a5fb4f3f2a12911738baaff4abb6143`
+- Bundle: `/private/tmp/grokptah-cu-stage16-helper-relay-v1.bundle`
+- Bundle SHA-256: `f06788d22d3c49b4cbf981f20ad050cda00ba21362231541c7b0e3f6b01bc8b3`
 
 ## What this candidate proves
 
@@ -54,6 +60,11 @@ The runtime-driver integration extension is sealed at:
   supervisor from advancing those seams through unrelated state machines,
   while still deliberately accepting inherited descriptors rather than
   spawning a process or claiming a packaged VM capability.
+- The signed-helper source now validates private FD7/FD8 relay descriptors,
+  forwards only bounded host input packets to the guest VSOCK, and forwards
+  only bounded guest frame packets to the host. The guest still has no capture
+  source, so this proves relay plumbing and fail-closed bounds—not a rendered
+  frame or a working model-facing Computer Use run.
 - The freestanding guest source validates the authenticated input packet,
   sequence fence, identity-bound HMAC, coordinate/key/text bounds, and closed
   message kind set after binding. It intentionally has no valid frame source
