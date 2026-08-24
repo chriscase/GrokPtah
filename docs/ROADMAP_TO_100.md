@@ -188,10 +188,18 @@ Until every item holds, **do not claim 100%.**
 
 ## No-Unverified-at-100
 
-The [Unverified](#unverified-explicit) list is the **current** 2026-08-22 gap
+The [Unverified](#unverified-explicit) list is the **current** 2026-08-24 gap
 list. A trustworthy 100% claim is **invalid** if any of the following still
 appear there, are omitted from recorded evidence, or are waived by descope /
 Explicitly unsupported / “not observed” status-relabeling.
+
+Candidate update (2026-08-24): draft PR #374 adds isolated-guest lifecycle,
+lease, cleanup, and capture-redaction source proof in the review candidate;
+its focused external tests do not qualify packaged VM hardware, guest boot,
+rendered frames, host input, or soak. The candidate readiness UI now exposes
+provider-route configuration, unsynchronized provider quota, and the boundary
+between measured model evidence and a live campaign certificate. Neither
+candidate-only change alters the `origin/main` claim or closes a live gate.
 
 **This follow-up’s three exits — forbidden to remain Unverified at 100%:**
 
@@ -1020,7 +1028,7 @@ has no Explicitly unsupported waiver if we claim the full product vision.
 
 ## Unverified (explicit)
 
-The following remain **unverified** as of 2026-08-22. They are not
+The following remain **unverified** as of 2026-08-24. They are not
 shipped facts. Items marked **must not remain Unverified at 100%** are
 listed in [No-Unverified-at-100](#no-unverified-at-100); a 100% claim that
 still carries them here is invalid.
