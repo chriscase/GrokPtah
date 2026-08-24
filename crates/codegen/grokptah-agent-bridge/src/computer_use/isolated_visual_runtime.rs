@@ -219,7 +219,7 @@ impl IsolatedVisualRuntimeSession {
         self.input_gate.terminal_check()
     }
 
-    pub fn complete_cleanup(
+    pub(crate) fn complete_cleanup(
         &mut self,
         evidence: &IsolatedVisualCleanupEvidence,
     ) -> ComputerResult<()> {

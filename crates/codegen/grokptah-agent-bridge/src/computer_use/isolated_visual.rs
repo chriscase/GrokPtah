@@ -233,17 +233,40 @@ pub enum IsolatedVisualTerminalDisposition {
 
 /// Secret-free result of exact process/open-handle and resource deletion
 /// checks. The lifecycle consumes it only when it matches the bound surface.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IsolatedVisualCleanupEvidence {
-    pub surface: ComputerSurfaceBinding,
-    pub helper_process_absent: bool,
-    pub no_open_handles: bool,
-    pub overlay_removed: bool,
-    pub frame_cache_removed: bool,
+    surface: ComputerSurfaceBinding,
+    helper_process_absent: bool,
+    no_open_handles: bool,
+    overlay_removed: bool,
+    frame_cache_removed: bool,
 }
 
 impl IsolatedVisualCleanupEvidence {
+    /// Construct evidence only after the host supervisor has completed every
+    /// exact process, handle, overlay, and frame-cache check. This constructor
+    /// is crate-private so a model, provider, or external coordinator cannot
+    /// manufacture terminal cleanup authority from serialized booleans.
+    pub(crate) fn verified(
+        surface: ComputerSurfaceBinding,
+        helper_process_absent: bool,
+        no_open_handles: bool,
+        overlay_removed: bool,
+        frame_cache_removed: bool,
+    ) -> ComputerResult<Self> {
+        surface.validate()?;
+        let evidence = Self {
+            surface,
+            helper_process_absent,
+            no_open_handles,
+            overlay_removed,
+            frame_cache_removed,
+        };
+        evidence.validates_for(&evidence.surface)?;
+        Ok(evidence)
+    }
+
     fn validates_for(&self, surface: &ComputerSurfaceBinding) -> ComputerResult<()> {
         self.surface.validate()?;
         if &self.surface != surface {

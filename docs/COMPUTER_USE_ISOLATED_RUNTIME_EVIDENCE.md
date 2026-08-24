@@ -204,6 +204,10 @@ The monotonic VM-deadline hardening extension is sealed at:
 - Supervisor teardown checks child ownership with `waitpid(WNOHANG)` before
   signaling and treats an already-reaped child as complete, preventing a late
   destructor from signaling a recycled PID.
+- Cleanup evidence is now host-created and serialization-only: its fields are
+  private, it cannot be deserialized from a coordinator/model payload, and
+  cleanup completion is crate-private until the supervisor has performed the
+  exact checks.
 - The stop boundary now rejects held keyboard/button state, waits for the
   helper to exit, and leaves the lifecycle in `CleanupPending` until explicit
   per-surface process, handle, overlay, and frame-cache evidence completes it.
