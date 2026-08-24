@@ -6,12 +6,12 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `5a640eb49896d572122950f6cb3f09bd02cf9b13`
-- Bundle: `/private/tmp/grokptah-cu-stage29-packaged-supervisor-v1.bundle`
-- Bundle SHA-256: `e26ff15bd69ec043dd79e1a1c659af0f9b00f401efbcc423ce02505547e905ce`
+- Head: `3529c66037615cbf1de7ae82be780bcebf931b62`
+- Bundle: `/private/tmp/grokptah-cu-stage30-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `abd7bd10661795f74d21a53ba9c77b970af158b7196bd569b630b71053f89bee`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current sealed implementation head: `5a640eb49896d572122950f6cb3f09bd02cf9b13`.
+Current sealed implementation head: `3529c66037615cbf1de7ae82be780bcebf931b62`.
 
 The later guest-input validation extension is sealed at:
 
@@ -57,9 +57,9 @@ The private guest-challenge channel extension is sealed at:
 
 The bounded packaged-supervisor source extension is sealed at:
 
-- Commit: `5a640eb49896d572122950f6cb3f09bd02cf9b13`
-- Bundle: `/private/tmp/grokptah-cu-stage29-packaged-supervisor-v1.bundle`
-- Bundle SHA-256: `e26ff15bd69ec043dd79e1a1c659af0f9b00f401efbcc423ce02505547e905ce`
+- Commit: `3529c66037615cbf1de7ae82be780bcebf931b62`
+- Bundle: `/private/tmp/grokptah-cu-stage30-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `abd7bd10661795f74d21a53ba9c77b970af158b7196bd569b630b71053f89bee`
 
 ## What this candidate proves
 
@@ -124,6 +124,9 @@ The bounded packaged-supervisor source extension is sealed at:
 - Frame-authentication, frame-stream, and input-wire failures take the same
   poison-and-reap path. A user-level held-input stop rejection remains
   retryable because no terminal transition has been committed yet.
+- The lifecycle transition from `Stopping` to `CleanupPending` now accepts the
+  already-recorded terminal disposition, matching the intended stop/cleanup
+  protocol and its deterministic test.
 - Before native spawn, the Rust launch seam now opens the exact package through
   the existing read-only measurement/receipt verifier and binds the caller's
   manifest to helper, guest-image, configuration, and designated-requirement
