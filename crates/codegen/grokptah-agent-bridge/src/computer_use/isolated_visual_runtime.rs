@@ -18,8 +18,8 @@ use super::types::{ComputerError, ComputerErrorCode, ComputerResult};
 ///
 /// This object deliberately does not spawn a process or enable a capability.
 /// It joins the lifecycle, helper control ABI, binding acknowledgement, frame
-/// carrier, and input gate so a future packaged supervisor has one stateful
-/// contract to drive. Frame bytes and channel secrets never cross its public
+/// carrier, and input gate so the packaged supervisor has one stateful contract
+/// to drive. Frame bytes and channel secrets never cross its public
 /// debug/projection boundary.
 pub struct IsolatedVisualRuntimeSession {
     lifecycle: IsolatedVisualLifecycle,

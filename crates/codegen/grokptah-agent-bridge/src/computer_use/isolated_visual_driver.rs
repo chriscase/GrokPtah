@@ -8,7 +8,7 @@ use super::types::ComputerResult;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
-/// The single host-side seam a packaged supervisor should drive.
+/// The single host-side seam the packaged supervisor drives.
 ///
 /// The driver deliberately accepts inherited readers/writers instead of
 /// opening a process or socket. That keeps descriptor ownership in the
