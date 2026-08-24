@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { safeErrorMessage } from "../lib/errorMessage";
 
 type Props = {
   children: ReactNode;
@@ -41,7 +42,7 @@ export class ErrorBoundary extends Component<Props, State> {
             The rest of the app should still work.
           </p>
           <pre className="error-boundary-detail">
-            {this.state.error.message}
+            {safeErrorMessage(this.state.error)}
           </pre>
           <button
             type="button"
