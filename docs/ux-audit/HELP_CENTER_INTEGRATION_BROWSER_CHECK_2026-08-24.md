@@ -2,7 +2,7 @@
 
 Date: 2026-08-24
 
-Candidate: `db88467a05d9559aff8cf89f2d6ad6eed1e1f23e`
+Candidate implementation: `c17e3644129d70d281979f66c75c6618ab22a31a`
 (`codex/help-center-integration-v1`), based directly on `origin/main`
 `67e29bd34dc64049432c715c93c2cef2185c63ea`.
 

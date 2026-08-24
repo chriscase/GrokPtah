@@ -7,10 +7,13 @@ acceptance, and not a 100% claim.
 
 - Candidate worktree: `/private/tmp/grokptah-help-integration-v1`
 - Candidate branch: `codex/help-center-integration-v1`
-- Candidate revision: `db88467a05d9559aff8cf89f2d6ad6eed1e1f23e`
+- Candidate implementation revision: `c17e3644129d70d281979f66c75c6618ab22a31a`
 - Base: `origin/main` `67e29bd34dc64049432c715c93c2cef2185c63ea`
 - Working tree: clean after the candidate commit
 - Date: 2026-08-24
+
+The evidence-note commit is part of this same clean candidate branch; record
+`git rev-parse HEAD` when assembling the promotion packet.
 
 ## Surface delivered
 
