@@ -141,14 +141,16 @@ complete or that the product has reached 100%.
 
 ### Latest desktop safety continuation — 2026-08-24
 
-Candidate `70c080890b3835fdbe4f7a2926822189c1dcc902` adds a shared,
+Candidate `98fca57573aedf4aa160469956e0ddf306b0a572` extends the shared,
 bounded backend-error display boundary across the desktop surfaces. Credential-
 shaped values, local paths, and UI-only secret placeholders are redacted before
 errors reach search, session, run, routine, worker, settings, terminal, remote
 agent, provider-readiness, or Computer Run UI. Computer Run storage contention
 also has a clear retry path. The focused redaction tests and full desktop suite
-(49 files, 382 tests) pass; this is source/UI safety evidence only and is not a
-packaged-desktop acceptance or expert UX cadence record.
+(49 files, 383 tests) pass; this is source/UI safety evidence only and is not a
+packaged-desktop acceptance or expert UX cadence record. Parent-provided load
+diagnostics now pass through the same boundary before technical details render,
+closing the path visible in the earlier persistent-agent capture.
 
 ## Verification recorded
 
