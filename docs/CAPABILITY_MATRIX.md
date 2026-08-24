@@ -20,6 +20,11 @@ No capability in this matrix is live-certified against Grok Build. Hermetic
 and deterministic tests are not live certification. **This matrix does not
 claim 100%.**
 
+For the isolated-visual row, “no host supervisor” means no **dispatchable or qualified** host
+supervisor. The candidate now contains a crate-private macOS packaged-supervisor source seam that
+owns descriptors and lifecycle transitions, but it remains source-only and cannot mint visual
+authority or substitute for the signed packaged-runtime campaign.
+
 ## Evidence baseline (pinned 2026-08-22 UTC)
 
 | Pin | SHA |
