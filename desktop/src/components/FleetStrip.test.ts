@@ -14,6 +14,7 @@ describe("FleetStrip cockpit exceed (#174 continuous)", () => {
     expect(src).toMatch(/totalTokens/);
     expect(src).toMatch(/aria-pressed/);
     expect(src).toMatch(/aria-label/);
+    expect(src).toMatch(/aria-label="Hide Live rail"/);
     expect(src).toMatch(/data-testid="fleet-card"/);
     expect(src).toMatch(/data-running-subagents/);
     expect(src).toMatch(/data-queue-count/);

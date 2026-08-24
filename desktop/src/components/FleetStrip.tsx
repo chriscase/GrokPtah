@@ -173,6 +173,7 @@ export const FleetStrip = memo(function FleetStrip({
         <button
           type="button"
           className="fleet-strip-hide"
+          aria-label="Hide Live rail"
           title="Hide Live rail (⌘⇧L)"
           onClick={onHide}
         >

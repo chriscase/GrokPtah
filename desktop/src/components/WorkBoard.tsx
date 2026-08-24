@@ -166,7 +166,14 @@ export function WorkBoard({
                 Durable objectives survive Lane archival and service reconnects.
               </p>
             </div>
-            <button type="button" className="run-inspector-refresh" onClick={onRefresh} disabled={busy}>
+            <button
+              type="button"
+              className="run-inspector-refresh"
+              aria-label="Refresh durable work"
+              title="Refresh durable work"
+              onClick={onRefresh}
+              disabled={busy}
+            >
               {busy ? "…" : "↻"}
             </button>
             {mutationsEnabled && onCreate && (

@@ -82,6 +82,7 @@ describe("WorkBoard", () => {
     expect(screen.getAllByText("awaiting approval").length).toBeGreaterThan(1);
     expect(screen.getByText("Attempt history")).toBeInTheDocument();
     expect(screen.getByText(/lease until/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh durable work" })).toBeInTheDocument();
   });
 
   it("filters to work needing attention and opens linked runs", async () => {

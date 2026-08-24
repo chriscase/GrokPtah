@@ -3548,6 +3548,7 @@ export default function App() {
             <button
               type="button"
               className="session-tab-new"
+              aria-label={`New ${workspaceMode} tab`}
               title={`New ${workspaceMode} tab`}
               onClick={() => void createSession(workspaceMode)}
             >
@@ -3783,6 +3784,7 @@ export default function App() {
             <button
               type="button"
               className="terminal-peek-dismiss"
+              aria-label="Dismiss shell bar"
               title="Dismiss shell bar"
               onClick={() => {
                 setTermPeek(false);
