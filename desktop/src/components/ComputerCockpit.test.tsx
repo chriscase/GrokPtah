@@ -252,6 +252,26 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ComputerCockpit", () => {
+  it("sanitizes backend error details and offers a retry", async () => {
+    mocks.snapshot
+      .mockRejectedValueOnce(
+        new Error(
+          "Computer Use storage is unavailable: /Users/chriscase/.grokptah/computer-use is already open (Resource temporarily unavailable (os error 35))",
+        ),
+      )
+      .mockResolvedValueOnce(snapshot(localView()));
+
+    render(<ComputerCockpit {...props} />);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Computer Run storage is busy.");
+    expect(alert).not.toHaveTextContent("/Users/chriscase");
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry Computer Run" }));
+    await screen.findByText("Frame 1");
+    expect(mocks.snapshot).toHaveBeenCalledTimes(2);
+  });
+
   it("reopens only the exact app-owned Run binding", async () => {
     mocks.snapshot.mockResolvedValue(snapshot(localView()));
     const onSnapshot = vi.fn();

@@ -57,6 +57,29 @@ function titleCase(value: string) {
   return value.replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
+const COMPUTER_SECRET_PATTERNS = [
+  /\bxai-[A-Za-z0-9._-]+/gi,
+  /\bsk-[A-Za-z0-9._-]+/gi,
+  /Bearer\s+\S+/gi,
+  /authorization\s*[:=]\s*\S+/gi,
+  /api[_-]?key\s*[:=]\s*\S+/gi,
+  /(?:x-api-key|x-auth-token)\s*[:=]\s*\S+/gi,
+];
+
+const COMPUTER_LOCAL_PATH_PATTERN = /(?:\/Users\/|\/private\/tmp\/|\/var\/folders\/|[A-Za-z]:\\)[^\s)]+/g;
+
+function describeComputerError(reason: unknown): string {
+  const raw = reason instanceof Error ? reason.message : String(reason);
+  if (/already open|resource temporarily unavailable|error\s*35|storage unavailable/i.test(raw)) {
+    return "Computer Run storage is busy. Close the other Computer Run or retry.";
+  }
+  let safe = raw;
+  for (const pattern of COMPUTER_SECRET_PATTERNS) safe = safe.replace(pattern, "[redacted]");
+  safe = safe.replace(COMPUTER_LOCAL_PATH_PATTERN, "[local path redacted]").trim();
+  if (!safe) return "The Computer Run could not be loaded.";
+  return safe.length > 320 ? `${safe.slice(0, 317)}…` : safe;
+}
+
 function isTerminal(run: ComputerLocalApproval) {
   return ["completed", "failed", "cancelled", "interrupted", "limit_reached"].includes(
     run.state,
@@ -239,7 +262,7 @@ export function ComputerCockpit({
       })
       .catch((reason) => {
         if (requestEpoch.current !== epoch) return;
-        setError(String(reason));
+        setError(describeComputerError(reason));
         onRunState?.(null);
       });
     void api
@@ -254,6 +277,24 @@ export function ComputerCockpit({
       void api.computerUseCockpitCancelAgent(sessionId).catch(() => {});
     };
   }, [boundRunId, onRunState, publishSnapshot, sessionId]);
+
+  const retrySnapshot = async () => {
+    if (!sessionId) return;
+    const epoch = requestEpoch.current;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const next = await api.computerUseCockpitSnapshot(sessionId, boundRunId);
+      if (requestEpoch.current !== epoch) return;
+      publishSnapshot(next);
+      setNotice("Computer Run refreshed.");
+    } catch (reason) {
+      if (requestEpoch.current === epoch) setError(describeComputerError(reason));
+    } finally {
+      if (requestEpoch.current === epoch) setBusy(false);
+    }
+  };
 
   const apply = async (
     mutation: () => Promise<ComputerCockpitSnapshot>,
@@ -279,7 +320,7 @@ export function ComputerCockpit({
         requestEpoch.current === epoch &&
         emergencyEpoch.current === emergencyAtStart
       ) {
-        setError(String(reason));
+        setError(describeComputerError(reason));
       }
       return false;
     } finally {
@@ -314,7 +355,7 @@ export function ComputerCockpit({
           requestEpoch.current === epoch &&
           emergencyEpoch.current === controlEpoch
         ) {
-          setError(String(reason));
+          setError(describeComputerError(reason));
         }
       }
     },
@@ -461,7 +502,7 @@ export function ComputerCockpit({
       setAgentEligibility(eligibility);
       setNotice(`${eligibility.model} passed the semantic simulator check.`);
     } catch (reason) {
-      if (requestEpoch.current === epoch) setError(String(reason));
+      if (requestEpoch.current === epoch) setError(describeComputerError(reason));
     } finally {
       if (requestEpoch.current === epoch) setAgentBusy(false);
     }
@@ -489,7 +530,7 @@ export function ComputerCockpit({
           : `Model proposal ready for review: ${result.summary}`,
       );
     } catch (reason) {
-      if (requestEpoch.current === epoch) setError(String(reason));
+      if (requestEpoch.current === epoch) setError(describeComputerError(reason));
     } finally {
       if (requestEpoch.current === epoch) setAgentBusy(false);
     }
@@ -503,7 +544,7 @@ export function ComputerCockpit({
       const status = await api.computerUseStatus();
       if (requestEpoch.current === epoch) setPlatformStatus(status);
     } catch (reason) {
-      if (requestEpoch.current === epoch) setError(String(reason));
+      if (requestEpoch.current === epoch) setError(describeComputerError(reason));
     } finally {
       if (requestEpoch.current === epoch) setBusy(false);
     }
@@ -522,7 +563,7 @@ export function ComputerCockpit({
       setPlatformStatus(status);
       setNotice("Permission status refreshed.");
     } catch (reason) {
-      if (requestEpoch.current === epoch) setError(String(reason));
+      if (requestEpoch.current === epoch) setError(describeComputerError(reason));
     } finally {
       if (requestEpoch.current === epoch) setBusy(false);
     }
@@ -548,7 +589,7 @@ export function ComputerCockpit({
         eligible.length ? "Choose one exact macOS window." : "No eligible windows found.",
       );
     } catch (reason) {
-      if (requestEpoch.current === epoch) setError(String(reason));
+      if (requestEpoch.current === epoch) setError(describeComputerError(reason));
     } finally {
       if (requestEpoch.current === epoch) setBusy(false);
     }
@@ -578,7 +619,7 @@ export function ComputerCockpit({
     } catch (reason) {
       if (requestEpoch.current === epoch) {
         setBackgroundReceipt(null);
-        setError(String(reason));
+        setError(describeComputerError(reason));
       }
     } finally {
       if (requestEpoch.current === epoch) setBusy(false);
@@ -669,6 +710,16 @@ export function ComputerCockpit({
         <div className="computer-alert is-error" role="alert">
           <strong>Computer Run needs attention</strong>
           <span>{error}</span>
+          {sessionId && (
+            <button
+              type="button"
+              className="computer-retry"
+              disabled={busy}
+              onClick={() => void retrySnapshot()}
+            >
+              Retry Computer Run
+            </button>
+          )}
         </div>
       )}
       {notice && !error && (
@@ -1481,7 +1532,7 @@ export function ComputerCockpit({
                       setNotice(message);
                     })
                     .catch((reason) => {
-                      if (requestEpoch.current === epoch) setError(String(reason));
+                      if (requestEpoch.current === epoch) setError(describeComputerError(reason));
                     })
                     .finally(() => {
                       if (requestEpoch.current === epoch) setBusy(false);

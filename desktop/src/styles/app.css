@@ -5202,10 +5202,26 @@ button:disabled {
   align-items: baseline;
 }
 
+.computer-alert .computer-retry {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
 .computer-alert.is-error {
   color: var(--danger);
   border-color: #5c2a2e;
   background: rgba(145, 45, 55, 0.08);
+}
+
+@media (max-width: 760px) {
+  .computer-alert {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .computer-alert .computer-retry {
+    margin-left: 0;
+  }
 }
 
 .computer-replay-gap {
