@@ -462,7 +462,10 @@ static BOOL GPTWriteSocketExact(
         do {
             polled = poll(&descriptor, 1, waitMilliseconds);
         } while (polled < 0 && errno == EINTR && !GPTStopRequested);
-        if (polled <= 0 || (descriptor.revents & (POLLERR | POLLHUP)) != 0) {
+        if (polled <= 0 ||
+            (descriptor.revents & POLLERR) != 0 ||
+            ((descriptor.revents & POLLHUP) != 0 &&
+             (descriptor.revents & POLLOUT) == 0)) {
             return NO;
         }
         ssize_t written = write(connection.fileDescriptor, cursor, remaining);
@@ -498,7 +501,10 @@ static BOOL GPTReadSocketExact(
         do {
             polled = poll(&descriptor, 1, waitMilliseconds);
         } while (polled < 0 && errno == EINTR && !GPTStopRequested);
-        if (polled <= 0 || (descriptor.revents & (POLLERR | POLLHUP)) != 0) {
+        if (polled <= 0 ||
+            (descriptor.revents & POLLERR) != 0 ||
+            ((descriptor.revents & POLLHUP) != 0 &&
+             (descriptor.revents & POLLIN) == 0)) {
             return NO;
         }
         ssize_t count = read(connection.fileDescriptor, cursor, remaining);
