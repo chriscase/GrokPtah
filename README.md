@@ -237,6 +237,11 @@ or “parity complete.” Draft [PR #352](https://github.com/chriscase/GrokPtah/
 remains draft; merge requires independently certified repair of the five
 confirmed P1s.
 
+The currently prepared external qualification sequence is documented in
+[`docs/OVERNIGHT_QUALIFICATION_COORDINATOR.md`](docs/OVERNIGHT_QUALIFICATION_COORDINATOR.md):
+Always-On v52 first, then isolated visual v15, serialized with the shared
+cache/target policy and explicit fail-closed reports.
+
 GrokPtah **already routes** Grok Build session/gateway traffic via
 `~/.grok/auth.json` / OIDC. Compatible gateway requests consume provider quota.
 GrokPtah does not sync a Grok Build account balance. A **named secret-free
