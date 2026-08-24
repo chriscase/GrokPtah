@@ -33,6 +33,7 @@ const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const STOPPING_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
+const FORCE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[repr(C)]
 struct NativeIsolatedRuntimeSpawnResult {
@@ -102,16 +103,29 @@ fn close_spawn_descriptors(result: &NativeIsolatedRuntimeSpawnResult) {
     }
 }
 
-fn terminate_process(pid: libc::pid_t) {
+fn terminate_process(pid: libc::pid_t) -> bool {
     if pid <= 0 {
-        return;
+        return true;
     }
     // SAFETY: the PID was returned by our launch shim. A failed kill is
-    // intentionally ignored during drop; the normal stop path reports it.
+    // intentionally followed by bounded reap polling; the normal stop path
+    // reports a failure to reap rather than blocking forever.
     unsafe {
         let _ = libc::kill(pid, libc::SIGKILL);
-        let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
     }
+    let attempts = FORCE_REAP_TIMEOUT.as_millis().max(1) / 100;
+    for _ in 0..attempts {
+        // SAFETY: this is the child PID owned by this supervisor.
+        let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        if result == pid {
+            return true;
+        }
+        if result < 0 {
+            return std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
 }
 
 /// A macOS-only supervisor that owns the packaged helper process and all five
@@ -329,12 +343,18 @@ impl IsolatedVisualPackagedRuntime {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        terminate_process(self.pid);
-        self.exited = true;
-        Err(ComputerError::new(
-            ComputerErrorCode::BackendFailure,
-            "isolated helper exceeded its bounded exit grace period",
-        ))
+        if terminate_process(self.pid) {
+            self.exited = true;
+            Err(ComputerError::new(
+                ComputerErrorCode::BackendFailure,
+                "isolated helper exceeded its bounded exit grace period",
+            ))
+        } else {
+            Err(ComputerError::new(
+                ComputerErrorCode::BackendFailure,
+                "isolated helper could not be reaped after forced termination",
+            ))
+        }
     }
 }
 
