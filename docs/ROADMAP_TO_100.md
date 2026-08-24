@@ -905,7 +905,10 @@ materializes the seven bounded passes into durable WorkItems with stable
 idempotency keys. Each pass carries the signed provider/model/endpoint/
 credential constraint in its durable WorkPolicy, and native execution compares
 that constraint with the exact provider snapshot before creating a Run;
-offline execution and every route or credential drift fail closed. **No**
+offline execution and every route or credential drift fail closed. The same
+WorkPolicy carries a `read-only` sandbox ceiling for enterprise passes; both
+interactive assignment and managed execution reject a worker whose captured
+sandbox is broader. **No**
 live frozen-route, read-only, multi-hour enterprise
 review-lane certification exists. This row is **not** certified.
 
