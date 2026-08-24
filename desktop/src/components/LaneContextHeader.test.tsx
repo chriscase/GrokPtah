@@ -478,6 +478,24 @@ describe("workspace and archival actions", () => {
     expect(fact("Runtime").dd).toHaveTextContent("Local desktop · Connected");
   });
 
+  it("redacts sensitive backend details before rendering the blocked alert", () => {
+    render(
+      <LaneContextHeader
+        lane={lane({ workspace_status: "missing" })}
+        fallbackTitle="Fallback"
+        runLabel="Workspace blocked"
+        runLive={false}
+        scopeError="open failed: /Users/alice/project (api_key=sk-live-secret)"
+      />,
+    );
+
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("open failed: [local path redacted]");
+    expect(alert).toHaveTextContent("[redacted]");
+    expect(alert).not.toHaveTextContent("/Users/alice/project");
+    expect(alert).not.toHaveTextContent("sk-live-secret");
+  });
+
   it("suppresses the blocked card while archived so restore stays the one action", () => {
     render(
       <LaneContextHeader

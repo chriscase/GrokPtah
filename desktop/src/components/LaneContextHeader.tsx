@@ -1,4 +1,5 @@
 import type { LaneSummary, RuntimeConnectionState, RuntimeTarget } from "../lib/protocol";
+import { safeErrorMessage } from "../lib/errorMessage";
 import { StateCard } from "./StateCard";
 import "./LaneContextHeader.css";
 
@@ -218,7 +219,7 @@ export function LaneContextHeader({
         <StateCard
           variant="blocked"
           title="Lane workspace unavailable"
-          description={scopeError}
+          description={safeErrorMessage(scopeError)}
         />
       )}
     </section>

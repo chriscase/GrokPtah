@@ -73,6 +73,7 @@ import {
   enqueuePermission,
   headPermission,
 } from "./lib/permissionQueue";
+import { safeErrorMessage } from "./lib/errorMessage";
 import {
   clampDocks,
   SPLIT_MIN_WIDTH,
@@ -687,9 +688,9 @@ export default function App() {
       setRunsSessionId(scopeKey);
       setRunsTotalCount(0);
       setRunsTruncated(false);
-      setRunsError(`Could not refresh durable runs: ${String(error)}`);
+      setRunsError(`Could not refresh durable runs: ${safeErrorMessage(error)}`);
       if (remote) {
-        const message = String(error);
+        const message = safeErrorMessage(error);
         setRemoteServiceStatus((current) => ({
           ...current,
           connected: false,
@@ -714,7 +715,7 @@ export default function App() {
       setPersistentAgents(await api.persistentAgentList());
       setPersistentAgentsError(null);
     } catch (error) {
-      setPersistentAgentsError(`Could not refresh persistent agents: ${String(error)}`);
+      setPersistentAgentsError(`Could not refresh persistent agents: ${safeErrorMessage(error)}`);
     } finally {
       setPersistentAgentsBusy(false);
     }
@@ -752,7 +753,7 @@ export default function App() {
           : sessions[0]?.sessionId ?? null,
       );
     } catch (error) {
-      const message = String(error);
+      const message = safeErrorMessage(error);
       setRemoteServiceStatus((current) => ({
         ...current,
         connected: false,
@@ -807,13 +808,13 @@ export default function App() {
         const failedStatus = await api.remoteServiceStatus().catch(() => ({
           connected: false,
           connectionState: "error" as const,
-          lastError: String(error),
+          lastError: safeErrorMessage(error),
         }));
         setRemoteServiceStatus({
           ...failedStatus,
           connected: false,
           connectionState: failedStatus.connectionState ?? "error",
-          lastError: failedStatus.lastError ?? String(error),
+          lastError: safeErrorMessage(failedStatus.lastError ?? error),
         });
         setRemoteSessions((current) =>
           current.map((session) => ({ ...session, runtimeConnection: "error" })),
@@ -1161,7 +1162,7 @@ export default function App() {
         setWorkError(null);
       } catch (error) {
         setWorkSnapshot(null);
-        setWorkError(`Could not open durable Work Item: ${String(error)}`);
+        setWorkError(`Could not open durable Work Item: ${safeErrorMessage(error)}`);
       }
     },
     [activeLane, activeSessionId, executionTarget, remoteServiceStatus.connected, selectedRemoteLane],
@@ -1198,7 +1199,7 @@ export default function App() {
       );
       setWorkError(null);
     } catch (error) {
-      setWorkError(`Could not refresh durable Work Items: ${String(error)}`);
+      setWorkError(`Could not refresh durable Work Items: ${safeErrorMessage(error)}`);
     } finally {
       setWorkBusy(false);
     }
@@ -1252,7 +1253,7 @@ export default function App() {
         setRoutineError(null);
       } catch (error) {
         setRoutineSnapshot(null);
-        setRoutineError(`Could not open routine: ${String(error)}`);
+        setRoutineError(`Could not open routine: ${safeErrorMessage(error)}`);
       }
     },
     [activeLane, activeSessionId, executionTarget, remoteServiceStatus.connected, selectedRemoteLane],
@@ -1285,7 +1286,7 @@ export default function App() {
       );
       setRoutineError(null);
     } catch (error) {
-      setRoutineError(`Could not refresh routines: ${String(error)}`);
+      setRoutineError(`Could not refresh routines: ${safeErrorMessage(error)}`);
     } finally {
       setRoutineBusy(false);
     }
@@ -1512,7 +1513,7 @@ export default function App() {
         setSubagents(await api.subagentsList());
       } catch (error) {
         if (scopeRequest === laneScopeRequestRef.current) {
-          setLaneScopeBlocked({ id: summary.id, message: String(error) });
+          setLaneScopeBlocked({ id: summary.id, message: safeErrorMessage(error) });
         }
         setTabs((prev) =>
           prev.map((t) =>
@@ -1520,7 +1521,7 @@ export default function App() {
               ? {
                   ...t,
                   workspaceStatus: summary.workspace_status ?? t.workspaceStatus,
-                  activity: errorActivity(String(error)),
+                  activity: errorActivity(safeErrorMessage(error)),
                 }
               : t,
           ),
@@ -1579,8 +1580,8 @@ export default function App() {
       }
     }).catch((error) => {
       if (request === laneScopeRequestRef.current) {
-        setLaneScopeBlocked({ id, message: String(error) });
-        patchTab(id, (tab) => ({ ...tab, activity: errorActivity(String(error)) }));
+        setLaneScopeBlocked({ id, message: safeErrorMessage(error) });
+        patchTab(id, (tab) => ({ ...tab, activity: errorActivity(safeErrorMessage(error)) }));
       }
     }).finally(() => {
       if (request === laneScopeRequestRef.current) {
@@ -2619,7 +2620,7 @@ export default function App() {
         setRightTab("tasks");
       } catch (error) {
         restoreComposer(prompt, activeSessionId);
-        reportRemoteError(`Remote submission failed: ${String(error)}`);
+        reportRemoteError(`Remote submission failed: ${safeErrorMessage(error)}`);
       }
       return;
     }
@@ -2664,7 +2665,7 @@ export default function App() {
         if (fromComposer) restoreComposer(prompt, id);
         patchTab(id, (tab) => ({
           ...tab,
-          activity: errorActivity(String(error)),
+          activity: errorActivity(safeErrorMessage(error)),
         }));
       }
       return;
@@ -2706,7 +2707,7 @@ export default function App() {
         if (fromComposer) restoreComposer(prompt, id);
         patchTab(id, (tab) => ({
           ...tab,
-          activity: errorActivity(String(error)),
+          activity: errorActivity(safeErrorMessage(error)),
         }));
       }
       return;
@@ -2722,7 +2723,7 @@ export default function App() {
         if (fromComposer) restoreComposer(prompt, id);
         patchTab(id, (tab) => ({
           ...tab,
-          activity: errorActivity(String(error)),
+          activity: errorActivity(safeErrorMessage(error)),
         }));
         return;
       }
@@ -2803,7 +2804,7 @@ export default function App() {
           patchTab(id, (t) => ({
             ...t,
             busy: false,
-            activity: errorActivity(String(e)),
+            activity: errorActivity(safeErrorMessage(e)),
           }));
         }
         return;
@@ -2830,7 +2831,7 @@ export default function App() {
           patchTab(id, (t) => ({
             ...t,
             busy: false,
-            activity: errorActivity(String(e)),
+            activity: errorActivity(safeErrorMessage(e)),
           }));
         }
         return;
@@ -2857,7 +2858,7 @@ export default function App() {
           patchTab(id, (t) => ({
             ...t,
             busy: false,
-            activity: errorActivity(String(e)),
+            activity: errorActivity(safeErrorMessage(e)),
           }));
         }
         return;
@@ -2888,7 +2889,7 @@ export default function App() {
           patchTab(id, (t) => ({
             ...t,
             busy: false,
-            activity: errorActivity(String(e)),
+            activity: errorActivity(safeErrorMessage(e)),
           }));
         }
         return;
@@ -2958,7 +2959,7 @@ export default function App() {
           patchTab(id, (t) => ({
             ...t,
             busy: false,
-            activity: errorActivity(String(e)),
+            activity: errorActivity(safeErrorMessage(e)),
           }));
         }
         return;
@@ -2999,10 +3000,10 @@ export default function App() {
       patchTab(id, (t) => ({
         ...t,
         busy: false,
-        activity: errorActivity(String(e)),
+        activity: errorActivity(safeErrorMessage(e)),
         transcript: [
           ...t.transcript,
-          { kind: "error", text: String(e) },
+          { kind: "error", text: safeErrorMessage(e) },
         ],
       }));
       // Drained batches have already left the queue. Rethrow so the drain
@@ -3081,7 +3082,7 @@ export default function App() {
         setWorkspaceMode("build");
         await openTab(session, true);
       } catch (error) {
-        setPersistentAgentsError(`Could not open agent session: ${String(error)}`);
+        setPersistentAgentsError(`Could not open agent session: ${safeErrorMessage(error)}`);
       }
     },
     [openTab],
@@ -3975,7 +3976,7 @@ export default function App() {
                 onError={(message) => {
                   patchTab(activeSessionId, (tab) => ({
                     ...tab,
-                    activity: errorActivity(message),
+                    activity: errorActivity(safeErrorMessage(message)),
                   }));
                 }}
               />
@@ -4091,7 +4092,7 @@ export default function App() {
                       } catch (error) {
                         patchTab(activeSummary.id, (tab) => ({
                           ...tab,
-                          activity: errorActivity(String(error)),
+                          activity: errorActivity(safeErrorMessage(error)),
                         }));
                       }
                     }}
@@ -4425,7 +4426,7 @@ export default function App() {
                           setWorktrees(await api.listWorktrees());
                           setGitDiff(msg);
                         } catch (e) {
-                          setGitDiff(String(e));
+                          setGitDiff(safeErrorMessage(e));
                         } finally {
                           setWtBusy(false);
                         }
@@ -4453,7 +4454,7 @@ export default function App() {
                           setWorktrees(await api.listWorktrees());
                           setGitDiff(`Opened worktree as project: ${abs}`);
                         } catch (e) {
-                          setGitDiff(String(e));
+                          setGitDiff(safeErrorMessage(e));
                         } finally {
                           setWtBusy(false);
                         }
@@ -4481,7 +4482,7 @@ export default function App() {
                           setWorktrees(await api.listWorktrees());
                           setGitDiff(msg || "Worktree removed");
                         } catch (e) {
-                          setGitDiff(String(e));
+                          setGitDiff(safeErrorMessage(e));
                         } finally {
                           setWtBusy(false);
                         }
@@ -5498,12 +5499,12 @@ function applyUpdate(
       withTab(sid!, (tab) => {
         const next = mapTranscript(
           tab,
-          (t) => [...t, { kind: "error", text: u.message }],
+          (t) => [...t, { kind: "error", text: safeErrorMessage(u.message) }],
           { busy: false },
         );
         return {
           ...next,
-          activity: errorActivity(u.message),
+          activity: errorActivity(safeErrorMessage(u.message)),
         };
       });
       break;
@@ -5561,7 +5562,7 @@ function applyUpdate(
             ...t,
             {
               kind: "error" as const,
-              text: `Rate limited: ${u.message}${
+              text: `Rate limited: ${safeErrorMessage(u.message)}${
                 u.retry_after_ms
                   ? ` (retry ~${Math.ceil(u.retry_after_ms / 1000)}s)`
                   : ""
@@ -5572,7 +5573,7 @@ function applyUpdate(
         );
         return {
           ...next,
-          activity: errorActivity(u.message),
+          activity: errorActivity(safeErrorMessage(u.message)),
         };
       });
       break;
