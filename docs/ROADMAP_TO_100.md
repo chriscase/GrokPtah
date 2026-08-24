@@ -544,6 +544,9 @@ source qualification from immutable bundle
 (SHA-256 `4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`).
 No packaged VM, guest boot, rendered-frame, host-input, signing, or soak claim
 may be inferred until that report and the later hardware campaign return.
+The subsequent source-only stop-failure correction is frozen separately at
+`40730e4` with its own bundle and handoff; it must not be conflated with the
+active `b250b70` result.
 
 **Exit (all required):**
 
