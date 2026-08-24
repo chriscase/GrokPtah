@@ -59,6 +59,16 @@ just the simulator module. If any phase fails, return `NOT QUALIFIED` with the
 first exact failure and stop; do not patch the disposable checkout during the
 verification lane.
 
+Before the external build, the local source-boundary check may be run without
+Rust compilation:
+
+```sh
+bash docs/verify-packaged-lease-fence.sh
+```
+
+It only proves that the intended lease markers and candidate identity are
+present. It is not a substitute for the external compile/test commands below.
+
 ## Interpretation
 
 Return `PASS` only for the source lease-fence checks above, with exact SHA and
