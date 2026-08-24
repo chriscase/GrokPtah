@@ -701,6 +701,24 @@ static int GPTAddCloseIfDistinct(
     return posix_spawn_file_actions_addclose(actions, descriptor);
 }
 
+static BOOL GPTSetCloseOnExec(int descriptor) {
+    int flags = fcntl(descriptor, F_GETFD);
+    return flags >= 0 && fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+
+static int GPTCreateCloseOnExecPipe(int pair[2]) {
+    pair[0] = -1;
+    pair[1] = -1;
+    if (pipe(pair) != 0 || !GPTSetCloseOnExec(pair[0]) || !GPTSetCloseOnExec(pair[1])) {
+        close(pair[0]);
+        close(pair[1]);
+        pair[0] = -1;
+        pair[1] = -1;
+        return -1;
+    }
+    return 0;
+}
+
 GPTMacIsolatedRuntimeSpawnResult gpt_macos_isolated_runtime_spawn(void) {
     @autoreleasepool {
 #ifndef POSIX_SPAWN_CLOEXEC_DEFAULT
@@ -751,8 +769,11 @@ GPTMacIsolatedRuntimeSpawnResult gpt_macos_isolated_runtime_spawn(void) {
         int frames[2] = {-1, -1};
         int challenge[2] = {-1, -1};
         int null_fd = -1;
-        if (pipe(control) != 0 || pipe(events) != 0 || pipe(input) != 0 ||
-            pipe(frames) != 0 || pipe(challenge) != 0 ||
+        if (GPTCreateCloseOnExecPipe(control) != 0 ||
+            GPTCreateCloseOnExecPipe(events) != 0 ||
+            GPTCreateCloseOnExecPipe(input) != 0 ||
+            GPTCreateCloseOnExecPipe(frames) != 0 ||
+            GPTCreateCloseOnExecPipe(challenge) != 0 ||
             (null_fd = open("/dev/null", O_RDWR | O_CLOEXEC)) < 0) {
             close(control[0]);
             close(control[1]);
