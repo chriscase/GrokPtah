@@ -83,6 +83,10 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
         self.runtime.complete_cleanup(evidence)
     }
 
+    pub(crate) fn fail(&mut self) -> ComputerResult<()> {
+        self.runtime.fail()
+    }
+
     pub fn into_parts(
         self,
     ) -> (

@@ -207,14 +207,31 @@ impl IsolatedVisualPackagedRuntime {
 
     /// Drives the fixed Prepared → start → Running → bind → Bound sequence.
     pub fn start(&mut self) -> ComputerResult<()> {
-        self.driver
-            .receive_helper_event_with_timeout(PREPARED_EVENT_TIMEOUT)?;
-        self.driver.start()?;
-        self.driver
-            .receive_helper_event_with_timeout(RUNNING_EVENT_TIMEOUT)?;
-        self.driver.bind()?;
-        self.driver
+        if let Err(error) = self
+            .driver
+            .receive_helper_event_with_timeout(PREPARED_EVENT_TIMEOUT)
+        {
+            return self.abort_with_error(error);
+        }
+        if let Err(error) = self.driver.start() {
+            return self.abort_with_error(error);
+        }
+        if let Err(error) = self
+            .driver
+            .receive_helper_event_with_timeout(RUNNING_EVENT_TIMEOUT)
+        {
+            return self.abort_with_error(error);
+        }
+        if let Err(error) = self.driver.bind() {
+            return self.abort_with_error(error);
+        }
+        if let Err(error) = self
+            .driver
             .receive_helper_event_with_timeout(BOUND_EVENT_TIMEOUT)
+        {
+            return self.abort_with_error(error);
+        }
+        Ok(())
     }
 
     pub fn read_frame(&mut self) -> ComputerResult<Option<IsolatedVisualFrame>> {
@@ -246,6 +263,14 @@ impl IsolatedVisualPackagedRuntime {
         evidence: &IsolatedVisualCleanupEvidence,
     ) -> ComputerResult<()> {
         self.driver.complete_cleanup(evidence)
+    }
+
+    fn abort_with_error<T>(&mut self, error: ComputerError) -> ComputerResult<T> {
+        let _ = self.driver.fail();
+        if !self.exited {
+            let _ = self.wait_for_exit();
+        }
+        Err(error)
     }
 
     pub fn runtime(&self) -> &IsolatedVisualRuntimeSession {
