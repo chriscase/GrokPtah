@@ -17,7 +17,8 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     discovered_tool_names, model_selection_key, set_grokptah_home_override, start_control_server,
-    AgentHost, EventBus, HostConfig, SessionKind, SessionUpdate, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    AgentHost, EventBus, HostConfig, McpControlClient, SessionKind, SessionUpdate, CONTROL_TOOLS,
+    FORBIDDEN_TOOLS,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -1695,6 +1696,201 @@ async fn cancel_isolates_sessions() {
     let run_b = rb["runId"].as_str().unwrap().to_string();
     let state_b = wait_run_terminal(&orch, &auth, &run_b, Duration::from_secs(10)).await;
     assert_eq!(state_b, RunState::Completed);
+    set_grokptah_home_override(None);
+}
+
+fn git_init_baseline(path: &std::path::Path) {
+    std::fs::write(path.join("README.md"), "baseline\n").unwrap();
+    for args in [
+        ["init"].as_slice(),
+        ["add", "README.md"].as_slice(),
+        [
+            "-c",
+            "user.name=GrokPtah Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "baseline",
+        ]
+        .as_slice(),
+    ] {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .status()
+            .expect("git must be installed");
+        assert!(status.success(), "git {args:?} failed");
+    }
+}
+
+/// A committed cancel must finish turn teardown and free orchestration
+/// admission before returning, so the same session can admit an isolated
+/// run with `allow_queue=false` immediately. Reservation release alone is
+/// not teardown.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn cancel_busy_turn_then_same_session_isolated_submit_is_admitted() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    git_init_baseline(ws.path());
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 1);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+
+    let busy = orch
+        .submit_task(
+            &auth,
+            "busy-then-isolated-cancel",
+            session.id,
+            ws.path(),
+            "run sleep 2".into(),
+            Some(json!({"maxPromptBytes": 10000, "maxRounds": 8, "maxDurationMs": 30000})),
+        )
+        .await
+        .unwrap();
+    let busy_id = busy["runId"].as_str().unwrap().to_string();
+    let busy_started = std::time::Instant::now();
+    while !host.session_busy(session.id) && busy_started.elapsed() < Duration::from_secs(2) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(host.orchestration_active_count(), 1);
+
+    let cancelled = orch
+        .cancel(
+            &auth,
+            "busy-then-isolated-cancel-req",
+            session.id,
+            ws.path(),
+            Some(busy_id.as_str()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled["cancelled"], true);
+    assert_eq!(cancelled["wasQueued"], false);
+    assert_eq!(cancelled["teardownComplete"], true);
+    assert!(!host.session_busy(session.id));
+    assert_eq!(
+        host.orchestration_active_count(),
+        0,
+        "committed cancel must release admission before returning"
+    );
+
+    let replay = orch
+        .cancel(
+            &auth,
+            "busy-then-isolated-cancel-req",
+            session.id,
+            ws.path(),
+            Some(busy_id.as_str()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, cancelled);
+    assert_eq!(host.orchestration_active_count(), 0);
+    assert!(!host.session_busy(session.id));
+    let agent = host.ensure_session_agent(session.id).unwrap();
+    let stored = orch
+        .store()
+        .load_agent(&agent.agent_id)
+        .unwrap()
+        .expect("session Agent");
+    assert_ne!(
+        stored.current_run_id.as_deref(),
+        Some(busy_id.as_str()),
+        "cancel must release the persistent Agent pointer"
+    );
+
+    let isolated = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "busy-then-isolated-submit",
+            session.id,
+            ws.path(),
+            "write coordinator-campaign.txt: created after cancel".into(),
+            Some(json!({"maxPromptBytes": 10000, "maxRounds": 8, "maxDurationMs": 30000})),
+            RunExecutionMode::IsolatedWorktree,
+            false,
+        )
+        .await
+        .expect("isolated_worktree submit after cancel must be admitted");
+    let isolated_id = isolated["runId"]
+        .as_str()
+        .expect("admitted isolated run must have runId")
+        .to_string();
+    assert_eq!(isolated["executionMode"], "isolated_worktree");
+    assert_eq!(isolated["state"], "running");
+    assert_eq!(host.orchestration_active_count(), 1);
+    let stored = orch
+        .store()
+        .load_agent(&agent.agent_id)
+        .unwrap()
+        .expect("session Agent");
+    assert_eq!(stored.current_run_id.as_deref(), Some(isolated_id.as_str()));
+
+    let durable = orch.get_run(&auth, &isolated_id).unwrap();
+    assert_eq!(durable["runId"], isolated_id);
+    assert_eq!(durable["sessionId"], session.id.to_string());
+
+    let srv = start_control_server(orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", srv.addr), "t");
+    client.initialize().await.unwrap();
+    let first_read = client
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "run_id": isolated_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!first_read.is_error, "durable read: {:?}", first_read.raw);
+    assert_eq!(first_read.structured["runId"], isolated_id);
+    client.close_session().await.unwrap();
+    client.initialize().await.unwrap();
+    let reconnect_read = client
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": session.id,
+                "workspace": ws.path().display().to_string(),
+                "run_id": isolated_id
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !reconnect_read.is_error,
+        "reconnect read: {:?}",
+        reconnect_read.raw
+    );
+    assert_eq!(reconnect_read.structured["runId"], isolated_id);
+    srv.stop();
+
+    let isolated_state =
+        wait_run_terminal(&orch, &auth, &isolated_id, Duration::from_secs(10)).await;
+    assert_eq!(isolated_state, RunState::Completed);
+    assert_eq!(host.orchestration_active_count(), 0);
+    assert!(!host.session_busy(session.id));
+
+    let replay_after = orch
+        .cancel(
+            &auth,
+            "busy-then-isolated-cancel-req",
+            session.id,
+            ws.path(),
+            Some(busy_id.as_str()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay_after, cancelled);
+    assert_eq!(host.orchestration_active_count(), 0);
+
     set_grokptah_home_override(None);
 }
 

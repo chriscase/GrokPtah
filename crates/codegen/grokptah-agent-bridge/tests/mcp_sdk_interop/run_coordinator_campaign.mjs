@@ -64,6 +64,21 @@ function structured(json) {
   return json?.result?.structuredContent ?? json?.result ?? null;
 }
 
+function jsonRpcError(json) {
+  return json?.error ?? null;
+}
+
+function toolIsError(json) {
+  return json?.result?.isError === true;
+}
+
+function failedPhaseOf(recorded) {
+  for (const [name, ok] of Object.entries(recorded)) {
+    if (!ok) return name;
+  }
+  return null;
+}
+
 async function mcpFetch(method, params, { id, sessionId = mcpSession, notification = false } = {}) {
   const body = notification
     ? { jsonrpc: "2.0", method, params }
@@ -150,7 +165,15 @@ function changedFilesAreBounded(review) {
 
 const watchdog = setTimeout(() => {
   log("watchdog timeout");
-  console.log(JSON.stringify({ ok: false, reason: "watchdog", checks, steps }));
+  console.log(
+    JSON.stringify({
+      ok: false,
+      reason: "watchdog",
+      failedPhase: failedPhaseOf(checks) ?? "watchdog",
+      checks,
+      steps,
+    })
+  );
   process.exit(3);
 }, 60_000);
 
@@ -444,11 +467,34 @@ try {
   });
   const isolated = structured(isolatedSubmit.json);
   const isolatedRunId = isolated?.runId;
+  const isolatedSubmitError = jsonRpcError(isolatedSubmit.json);
+  const isolatedSubmitIsError = toolIsError(isolatedSubmit.json);
+  const isolatedSubmitOk =
+    isolatedSubmit.status === 200 &&
+    !isolatedSubmitIsError &&
+    isolatedSubmitError == null &&
+    typeof isolatedRunId === "string" &&
+    isolated?.executionMode === "isolated_worktree";
+  record("isolatedSubmit", isolatedSubmitOk, {
+    status: isolatedSubmit.status,
+    runId: isolatedRunId,
+    isError: isolatedSubmitIsError,
+    error: isolatedSubmitError,
+    executionMode: isolated?.executionMode ?? null,
+  });
   const isolatedTerminal = isolatedRunId ? await pollTerminal(isolatedRunId) : null;
   record(
     "isolatedRun",
-    isolatedSubmit.status === 200 && isolatedTerminal?.state === "completed" && isolated.executionMode === "isolated_worktree",
-    { runId: isolatedRunId, state: isolatedTerminal?.state }
+    isolatedSubmitOk &&
+      isolatedTerminal?.state === "completed" &&
+      isolated?.executionMode === "isolated_worktree",
+    {
+      runId: isolatedRunId,
+      state: isolatedTerminal?.state,
+      status: isolatedSubmit.status,
+      isError: isolatedSubmitIsError,
+      error: isolatedSubmitError,
+    }
   );
   if (isolatedRunId) {
     const reviewResponse = await call("ptah_review_run", { run_id: isolatedRunId });
@@ -621,23 +667,40 @@ try {
     : { status: 0, json: null };
   record(
     "durableReadAfterReconnect",
-    reconnect.status === 200 && !!mcpSession && reconnectRead.status === 200 &&
+    isolatedSubmitOk &&
+      reconnect.status === 200 &&
+      !!mcpSession &&
+      reconnectRead.status === 200 &&
       structured(reconnectRead.json)?.runId === isolatedRunId,
-    { sessionId: mcpSession, runId: isolatedRunId }
+    {
+      sessionId: mcpSession,
+      runId: isolatedRunId,
+      status: reconnectRead.status,
+      isError: toolIsError(reconnectRead.json),
+      error: jsonRpcError(reconnectRead.json),
+    }
   );
 
   clearTimeout(watchdog);
   const failed = Object.entries(checks)
     .filter(([, ok]) => !ok)
     .map(([name]) => name);
+  const failedPhase = failedPhaseOf(checks);
   console.log(
     JSON.stringify({
       ok: failed.length === 0,
       failed,
+      failedPhase,
       checks,
       steps,
       sharedRunId,
       isolatedRunId,
+      isolatedSubmit: {
+        status: isolatedSubmit.status,
+        isError: isolatedSubmitIsError,
+        error: isolatedSubmitError,
+        runId: isolatedRunId ?? null,
+      },
       toolCount: names.length,
       coordinator: "reference-fetch-mcp-streamable-http",
     })
@@ -646,6 +709,14 @@ try {
 } catch (error) {
   clearTimeout(watchdog);
   console.error(error);
-  console.log(JSON.stringify({ ok: false, error: String(error), checks, steps }));
+  console.log(
+    JSON.stringify({
+      ok: false,
+      error: String(error),
+      failedPhase: failedPhaseOf(checks) ?? "exception",
+      checks,
+      steps,
+    })
+  );
   process.exit(1);
 }
