@@ -546,7 +546,7 @@ export function HelpCenter({
             <p id="help-semantic-confirm-copy">
               Send this query and article metadata to {assistantProviderLabel ?? "the selected provider"} for meaning-based ranking? No article body or workspace data will be sent.
             </p>
-            <details className="help-confirm-details">
+            <details className="help-confirm-details" open>
               <summary>Review exact metadata</summary>
               <p>Query: <code>{semantic.request.query}</code></p>
               <ul aria-label="Meaning search metadata">
@@ -582,7 +582,7 @@ export function HelpCenter({
             <p id="help-assistant-confirm-copy">
               Ready to send the cited article bundle ({assistant.request.sources.length} source{assistant.request.sources.length === 1 ? "" : "s"}) via {assistantProviderLabel ?? "the selected provider"}?
             </p>
-            <details className="help-confirm-details">
+            <details className="help-confirm-details" open>
               <summary>Review exact cited sources</summary>
               <ul aria-label="Assistant request sources">
                 {assistant.request.sources.map((source) => (
