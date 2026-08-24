@@ -6,6 +6,7 @@ import type {
   RunReview,
   SessionUpdate,
 } from "../lib/protocol";
+import { safeErrorMessage } from "../lib/errorMessage";
 import { LaneScopeLine, type LaneScope } from "./LaneScopeLine";
 import { StateCard } from "./StateCard";
 
@@ -224,7 +225,7 @@ export function RunInspector({
       const result = await onReview(runId);
       setReviews((current) => ({ ...current, [runId]: result }));
     } catch (error) {
-      setActionError(String(error));
+      setActionError(safeErrorMessage(error));
     } finally {
       setReviewing(null);
     }
@@ -242,7 +243,7 @@ export function RunInspector({
       });
       onRefresh();
     } catch (error) {
-      setActionError(String(error));
+      setActionError(safeErrorMessage(error));
     } finally {
       setReviewing(null);
     }
@@ -255,7 +256,7 @@ export function RunInspector({
       await onApprove(runId);
       onRefresh();
     } catch (error) {
-      setActionError(String(error));
+      setActionError(safeErrorMessage(error));
     } finally {
       setReviewing(null);
     }
@@ -271,7 +272,7 @@ export function RunInspector({
       await onDiscard(runId);
       onRefresh();
     } catch (error) {
-      setActionError(String(error));
+      setActionError(safeErrorMessage(error));
     } finally {
       setReviewing(null);
     }
@@ -287,7 +288,7 @@ export function RunInspector({
       setRetryPrompts((current) => ({ ...current, [runId]: "" }));
       onRefresh();
     } catch (error) {
-      setActionError(String(error));
+      setActionError(safeErrorMessage(error));
     } finally {
       setReviewing(null);
     }
@@ -303,7 +304,7 @@ export function RunInspector({
       setSteerPrompts((current) => ({ ...current, [runId]: "" }));
       onRefresh();
     } catch (error) {
-      setActionError(String(error));
+      setActionError(safeErrorMessage(error));
     } finally {
       setReviewing(null);
     }
@@ -317,7 +318,7 @@ export function RunInspector({
       await onCancel(runId);
       onRefresh();
     } catch (error) {
-      setActionError(String(error));
+      setActionError(safeErrorMessage(error));
     } finally {
       setReviewing(null);
     }
@@ -343,7 +344,7 @@ export function RunInspector({
         };
       });
     } catch (error) {
-      setEventErrors((current) => ({ ...current, [runId]: String(error) }));
+      setEventErrors((current) => ({ ...current, [runId]: safeErrorMessage(error) }));
     } finally {
       setEventLoading(null);
     }

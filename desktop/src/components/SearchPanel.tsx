@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
+import { safeErrorMessage } from "../lib/errorMessage";
 import type { SearchHit } from "../lib/protocol";
 import { StyledSelect } from "./StyledSelect";
 
@@ -61,7 +62,7 @@ export function SearchPanel({
       setHits(res);
       setSearched(true);
     } catch (e) {
-      setError(String(e));
+      setError(safeErrorMessage(e));
       setHits([]);
     } finally {
       setBusy(false);

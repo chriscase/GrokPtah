@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { safeErrorMessage } from "../lib/errorMessage";
 import type {
   PersistentAgent,
   PersistentAgentResumePlan,
@@ -105,7 +106,7 @@ export function PersistentAgentPanel({
     } catch (inspectError) {
       setPlanErrors((current) => ({
         ...current,
-        [agent.agentId]: String(inspectError),
+        [agent.agentId]: safeErrorMessage(inspectError),
       }));
     } finally {
       setPlanBusy(null);
@@ -126,7 +127,7 @@ export function PersistentAgentPanel({
     } catch (resumeError) {
       setResponses((current) => ({
         ...current,
-        [agent.agentId]: `Resume failed: ${String(resumeError)}`,
+        [agent.agentId]: `Resume failed: ${safeErrorMessage(resumeError)}`,
       }));
     } finally {
       setResumeBusy(null);
@@ -142,7 +143,7 @@ export function PersistentAgentPanel({
       setRemoteToken("");
       onRefresh();
     } catch (connectError) {
-      setRemoteError(String(connectError));
+      setRemoteError(safeErrorMessage(connectError));
     } finally {
       setRemoteBusy(false);
     }
@@ -156,7 +157,7 @@ export function PersistentAgentPanel({
       await onDisconnectRemote();
       onRefresh();
     } catch (disconnectError) {
-      setRemoteError(String(disconnectError));
+      setRemoteError(safeErrorMessage(disconnectError));
     } finally {
       setRemoteBusy(false);
     }
@@ -267,7 +268,7 @@ export function PersistentAgentPanel({
                         setRemoteWorkspace("");
                         setRemoteTitle("");
                       })
-                      .catch((createError) => setRemoteError(`Remote session failed: ${String(createError)}`))
+                      .catch((createError) => setRemoteError(`Remote session failed: ${safeErrorMessage(createError)}`))
                       .finally(() => setRemoteSessionBusy(false));
                   }}
                 >

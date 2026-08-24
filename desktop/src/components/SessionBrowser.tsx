@@ -7,6 +7,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import { api } from "../lib/api";
+import { safeErrorMessage } from "../lib/errorMessage";
 import type { SessionSummary } from "../lib/protocol";
 import { StateCard } from "./StateCard";
 import { StyledSelect } from "./StyledSelect";
@@ -134,7 +135,7 @@ export function SessionBrowser({
       setAllTags(t);
     } catch (e) {
       if (gen !== genRef.current) return;
-      setLoadError(String(e));
+      setLoadError(safeErrorMessage(e));
     } finally {
       if (gen === genRef.current) setLoading(false);
     }
@@ -400,7 +401,7 @@ export function SessionBrowser({
     } catch (e) {
       setActionError({
         label,
-        message: String(e),
+        message: safeErrorMessage(e),
         retry: () => {
           void runOp(label, op);
         },

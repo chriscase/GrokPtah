@@ -8,6 +8,7 @@ import type {
   QualificationCheck,
   QualificationEvidence,
 } from "../lib/protocol";
+import { sanitizeSensitiveText } from "../lib/errorMessage";
 import "./ProviderReadinessCenter.css";
 
 export const READINESS_VERDICT_LABEL = {
@@ -127,30 +128,8 @@ export type ProviderReadinessCenterProps = ProviderReadinessInput & {
   onResolveCredentials: () => void;
 };
 
-const PLACEHOLDER_SECRETS = [
-  "Saved (leave blank to keep)",
-  "Provider key",
-  "xai-…",
-];
-
-const SECRET_PATTERNS = [
-  /\bxai-[A-Za-z0-9._-]+/gi,
-  /\bsk-[A-Za-z0-9._-]+/gi,
-  /Bearer\s+\S+/gi,
-  /authorization\s*[:=]\s*\S+/gi,
-  /api[_-]?key\s*[:=]\s*\S+/gi,
-  /(?:x-api-key|x-auth-token)\s*[:=]\s*\S+/gi,
-];
-
 export function sanitizeReadinessText(text: string): string {
-  let next = text;
-  for (const placeholder of PLACEHOLDER_SECRETS) {
-    next = next.split(placeholder).join("[redacted]");
-  }
-  for (const pattern of SECRET_PATTERNS) {
-    next = next.replace(pattern, "[redacted]");
-  }
-  return next;
+  return sanitizeSensitiveText(text);
 }
 
 export function computerUseTierLabel(tier: ComputerUseTier): string {

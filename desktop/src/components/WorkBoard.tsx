@@ -4,6 +4,7 @@ import type {
   DurableWorkItem,
   RemoteWorkSnapshot,
 } from "../lib/protocol";
+import { safeErrorMessage } from "../lib/errorMessage";
 import type { LaneScope } from "./LaneScopeLine";
 import { LaneScopeLine } from "./LaneScopeLine";
 import { StateCard } from "./StateCard";
@@ -130,7 +131,7 @@ export function WorkBoard({
       await action();
       return true;
     } catch (error) {
-      setActionError(String(error));
+      setActionError(safeErrorMessage(error));
       return false;
     } finally {
       setActionBusy(false);

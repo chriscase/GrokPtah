@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
+import { safeErrorMessage } from "../lib/errorMessage";
 import type {
   AuthState,
   ComputerIsolatedVisualStatus,
@@ -139,7 +140,7 @@ export function SettingsPanel({
       );
       setGatewayDeadline(profile?.deadlineClass ?? "standard");
     } catch (e) {
-      setNotice(String(e));
+      setNotice(safeErrorMessage(e));
     }
   }, [models]);
 
@@ -167,7 +168,7 @@ export function SettingsPanel({
 
   useEffect(() => {
     if (!open || section !== "computer") return;
-    void refreshComputerUse().catch((error) => setNotice(String(error)));
+    void refreshComputerUse().catch((error) => setNotice(safeErrorMessage(error)));
   }, [open, refreshComputerUse, section]);
 
   useEffect(() => {
@@ -213,7 +214,7 @@ export function SettingsPanel({
       onChromeChange();
       if (okMsg) setNotice(okMsg);
     } catch (e) {
-      setNotice(String(e));
+      setNotice(safeErrorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -240,7 +241,7 @@ export function SettingsPanel({
       if (okMsg) setNotice(okMsg);
       return result;
     } catch (error) {
-      if (isCurrent()) setNotice(String(error));
+      if (isCurrent()) setNotice(safeErrorMessage(error));
       return undefined;
     } finally {
       setBusy(false);
@@ -361,7 +362,7 @@ export function SettingsPanel({
       onChromeChange();
     } catch (error) {
       if (readinessSelection.current !== selectionAtStart) return;
-      setQualificationError(String(error));
+      setQualificationError(safeErrorMessage(error));
     } finally {
       qualifyInFlight.current = false;
       setBusy(false);

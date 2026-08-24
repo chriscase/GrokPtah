@@ -3,6 +3,7 @@ import type {
   SubagentExecutionMode,
   SubagentInfo,
 } from "../lib/protocol";
+import { safeErrorMessage } from "../lib/errorMessage";
 
 const MODE_LABELS: Record<SubagentExecutionMode, string> = {
   unknown: "Legacy mode",
@@ -32,7 +33,7 @@ export function SubagentCard({
     try {
       await onCancel(agent.id);
     } catch (cancelError) {
-      setError(String(cancelError));
+      setError(safeErrorMessage(cancelError));
     } finally {
       setCancelling(false);
     }

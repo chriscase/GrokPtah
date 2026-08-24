@@ -11,6 +11,7 @@ import {
   computerActivityAnnouncement,
   computerActivityState,
 } from "../lib/computerActivity";
+import { safeErrorMessage } from "../lib/errorMessage";
 import type {
   ComputerAction,
   ComputerAgentEligibility,
@@ -57,27 +58,12 @@ function titleCase(value: string) {
   return value.replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
-const COMPUTER_SECRET_PATTERNS = [
-  /\bxai-[A-Za-z0-9._-]+/gi,
-  /\bsk-[A-Za-z0-9._-]+/gi,
-  /Bearer\s+\S+/gi,
-  /authorization\s*[:=]\s*\S+/gi,
-  /api[_-]?key\s*[:=]\s*\S+/gi,
-  /(?:x-api-key|x-auth-token)\s*[:=]\s*\S+/gi,
-];
-
-const COMPUTER_LOCAL_PATH_PATTERN = /(?:\/Users\/|\/private\/tmp\/|\/var\/folders\/|[A-Za-z]:\\)[^\s)]+/g;
-
 function describeComputerError(reason: unknown): string {
   const raw = reason instanceof Error ? reason.message : String(reason);
   if (/already open|resource temporarily unavailable|error\s*35|storage unavailable/i.test(raw)) {
     return "Computer Run storage is busy. Close the other Computer Run or retry.";
   }
-  let safe = raw;
-  for (const pattern of COMPUTER_SECRET_PATTERNS) safe = safe.replace(pattern, "[redacted]");
-  safe = safe.replace(COMPUTER_LOCAL_PATH_PATTERN, "[local path redacted]").trim();
-  if (!safe) return "The Computer Run could not be loaded.";
-  return safe.length > 320 ? `${safe.slice(0, 317)}…` : safe;
+  return safeErrorMessage(reason, "The Computer Run could not be loaded.");
 }
 
 function isTerminal(run: ComputerLocalApproval) {

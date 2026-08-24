@@ -4,6 +4,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { api, type PtyBacklog } from "../lib/api";
+import { safeErrorMessage } from "../lib/errorMessage";
 
 type PtyOutput = { id: string; data: string; seq: number };
 type PtyExit = { id: string };
@@ -262,7 +263,7 @@ export function TerminalPane({
         if (disposed) return;
         await refreshTabs();
       } catch (e) {
-        term.writeln("PTY unavailable: " + String(e));
+        term.writeln("PTY unavailable: " + safeErrorMessage(e));
       }
     })();
 
@@ -314,7 +315,7 @@ export function TerminalPane({
       else term.writeln(`\x1b[90m[tab]\x1b[0m`);
       await api.ptyResize(id, term.cols, term.rows);
     } catch (e) {
-      term.writeln(String(e));
+      term.writeln(safeErrorMessage(e));
     } finally {
       applyingBacklogRef.current.delete(id);
       const q = pendingLiveRef.current.get(id);

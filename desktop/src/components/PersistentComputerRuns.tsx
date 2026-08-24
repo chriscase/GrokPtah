@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../lib/api";
+import { safeErrorMessage } from "../lib/errorMessage";
 import type {
   ComputerCockpitSnapshot,
   ComputerLocalApproval,
@@ -76,7 +77,7 @@ export function PersistentComputerRuns({
               : `${run.target.displayName} paused.`,
         );
       } catch (error) {
-        if (operationEpoch.current.get(key) === epoch) setNotice(String(error));
+        if (operationEpoch.current.get(key) === epoch) setNotice(safeErrorMessage(error));
       }
     },
     [onSnapshot],

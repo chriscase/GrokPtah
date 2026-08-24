@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { safeErrorMessage } from "../lib/errorMessage";
 import type { DurableRoutine, RemoteRoutineSnapshot } from "../lib/protocol";
 import { StateCard } from "./StateCard";
 
@@ -49,7 +50,7 @@ export function RoutineBoard({
     try {
       await action();
     } catch (cause) {
-      setActionError(String(cause));
+      setActionError(safeErrorMessage(cause));
     }
   }
 
