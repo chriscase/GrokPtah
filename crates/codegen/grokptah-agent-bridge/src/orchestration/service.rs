@@ -3956,6 +3956,10 @@ impl OrchestrationService {
             .transpose()?;
         let manager_spec = manager.as_ref().and_then(|agent| agent.spec.clone());
         let ceiling = self.config.lock().bounds.clone();
+        super::worker::reject_sandbox_amplification(
+            work.policy.sandbox_profile_ceiling.as_deref(),
+            &worker_spec,
+        )?;
         reject_privilege_amplification(
             manager_spec.as_ref(),
             &worker_spec,

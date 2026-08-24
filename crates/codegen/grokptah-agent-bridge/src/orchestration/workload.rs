@@ -271,6 +271,12 @@ pub struct WorkPolicy {
     /// Generic WorkItems omit it; enterprise gateway review passes require it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_route_constraint: Option<WorkProviderRouteConstraint>,
+    /// Optional sandbox ceiling captured by the work item. A worker may be
+    /// narrower than this ceiling, never broader. Enterprise review passes
+    /// set this to `read-only` so a durable retry cannot be assigned to a
+    /// workspace-writing worker after admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_profile_ceiling: Option<String>,
 }
 
 impl Default for WorkPolicy {
@@ -282,6 +288,7 @@ impl Default for WorkPolicy {
             max_concurrent_attempts: 1,
             managed_execution: super::managed::ManagedWorkMode::Inherit,
             provider_route_constraint: None,
+            sandbox_profile_ceiling: None,
         }
     }
 }
@@ -297,6 +304,11 @@ impl WorkPolicy {
         }
         if let Some(constraint) = &self.provider_route_constraint {
             constraint.validate()?;
+        }
+        if let Some(profile) = &self.sandbox_profile_ceiling {
+            if !matches!(profile.as_str(), "read-only" | "workspace-write" | "full") {
+                return Err(invalid("policy.sandbox_profile_ceiling is unknown"));
+            }
         }
         Ok(())
     }

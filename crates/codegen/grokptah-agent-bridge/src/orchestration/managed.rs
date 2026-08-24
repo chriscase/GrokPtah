@@ -513,6 +513,13 @@ pub fn managed_execution_eligible(
             "managed execution cannot grant Computer Use or bypass permissions",
         ));
     }
+    // Enterprise review work carries a sandbox ceiling. Check it here as
+    // well as the interactive assignment path because managed execution
+    // claims work directly after acceptance.
+    super::worker::reject_sandbox_amplification(
+        work.policy.sandbox_profile_ceiling.as_deref(),
+        spec,
+    )?;
     if policy.requires_approval_before_execution
         && !decisions
             .iter()

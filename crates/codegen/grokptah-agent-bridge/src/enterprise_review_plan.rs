@@ -139,6 +139,7 @@ impl EnterpriseReviewPass {
                     backoff_ms: 0,
                 },
                 provider_route_constraint: Some(self.provider_route_constraint.clone()),
+                sandbox_profile_ceiling: Some("read-only".into()),
                 ..crate::orchestration::WorkPolicy::default()
             },
         }
@@ -683,6 +684,7 @@ impl EnterpriseReviewWorkPlan {
                 || !valid_fingerprint(&item.work_key)
                 || !valid_fingerprint(&item.objective_digest)
                 || item.template.kind != format!("enterprise_review:{}", item.kind.id())
+                || item.template.policy.sandbox_profile_ceiling.as_deref() != Some("read-only")
                 || item
                     .template
                     .policy
@@ -934,6 +936,7 @@ mod tests {
                 && item.review_id == first.review_id
                 && item.template.validate().is_ok()
                 && item.template.objective.contains(&item.objective_digest)
+                && item.template.policy.sandbox_profile_ceiling.as_deref() == Some("read-only")
                 && item
                     .template
                     .policy
@@ -996,6 +999,17 @@ mod tests {
         drifted_route.work_plan_digest = work_plan_digest(&drifted_route);
         assert_eq!(
             drifted_route.validate(),
+            Err(EnterpriseReviewPlanError::InvalidField("work_item"))
+        );
+
+        let mut broadened_sandbox = first.clone();
+        broadened_sandbox.work_items[0]
+            .template
+            .policy
+            .sandbox_profile_ceiling = None;
+        broadened_sandbox.work_plan_digest = work_plan_digest(&broadened_sandbox);
+        assert_eq!(
+            broadened_sandbox.validate(),
             Err(EnterpriseReviewPlanError::InvalidField("work_item"))
         );
 

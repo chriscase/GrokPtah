@@ -55,7 +55,8 @@ the exact route/model/policy binding, so a recovered plan cannot silently
 broaden its permissions or fallback policy.
 Every projected `WorkTemplate` also carries the signed provider, model,
 endpoint, credential-identity, and route-binding fingerprints in its immutable
-`WorkPolicy`. Native execution first rejects provider/model drift during
+`WorkPolicy`, plus a `read-only` sandbox ceiling. Worker assignment rejects any
+captured `workspace-write` or `full` sandbox against that ceiling. Native execution first rejects provider/model drift during
 managed-work selection, then compares the full constraint with the exact
 `ProviderRouteSnapshot` captured immediately before Run creation. Offline
 execution, another endpoint, another credential principal, or a premium

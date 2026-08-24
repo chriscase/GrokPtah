@@ -227,6 +227,47 @@ pub fn reject_privilege_amplification(
     Ok(())
 }
 
+/// Reject a worker whose captured sandbox is broader than the durable work
+/// item permits. This is a ceiling, not a request to broaden a worker: a
+/// read-only worker is valid for every ceiling, while workspace-write/full
+/// workers are refused for a read-only enterprise review.
+pub fn reject_sandbox_amplification(
+    sandbox_profile_ceiling: Option<&str>,
+    worker: &AgentSpec,
+) -> Result<(), OrchError> {
+    let Some(ceiling) = sandbox_profile_ceiling else {
+        return Ok(());
+    };
+    let ceiling_rank = sandbox_profile_rank(ceiling).ok_or_else(|| {
+        OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "work policy contains an unknown sandbox profile ceiling",
+        )
+    })?;
+    let worker_rank = sandbox_profile_rank(&worker.authority.sandbox_profile).ok_or_else(|| {
+        OrchError::new(
+            OrchErrorCode::ForbiddenScope,
+            "worker has an unknown sandbox profile",
+        )
+    })?;
+    if worker_rank > ceiling_rank {
+        return Err(OrchError::new(
+            OrchErrorCode::ForbiddenScope,
+            "assignment would broaden the work item's sandbox profile",
+        ));
+    }
+    Ok(())
+}
+
+fn sandbox_profile_rank(profile: &str) -> Option<u8> {
+    match profile {
+        "read-only" => Some(0),
+        "workspace-write" => Some(1),
+        "full" => Some(2),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +346,22 @@ mod tests {
         // so the rejection above is about authority and not about bounds.
         worker.authority.computer_use_allowed = false;
         reject_privilege_amplification(None, &worker, &server, &server).unwrap();
+    }
+
+    #[test]
+    fn broader_sandbox_workers_are_not_assignable_to_read_only_work() {
+        let server = bounds(10_000, 8, 60_000, Some(10_000));
+        let mut worker = spec(server.clone());
+        worker.authority.sandbox_profile = "read-only".into();
+        reject_sandbox_amplification(Some("read-only"), &worker).unwrap();
+
+        worker.authority.sandbox_profile = "workspace-write".into();
+        let error = reject_sandbox_amplification(Some("read-only"), &worker).unwrap_err();
+        assert_eq!(error.code, OrchErrorCode::ForbiddenScope);
+
+        worker.authority.sandbox_profile = "full".into();
+        assert!(reject_sandbox_amplification(Some("workspace-write"), &worker).is_err());
+        reject_sandbox_amplification(None, &worker).unwrap();
     }
 
     /// Work may never request more than the narrowest of the manager, worker,
