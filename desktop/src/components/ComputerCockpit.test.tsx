@@ -636,6 +636,43 @@ describe("ComputerCockpit", () => {
     expect(screen.getByText("One action authorized")).toBeTruthy();
   });
 
+  it("lets keyboard users reject a pending approval with Escape", async () => {
+    const ready = snapshot(localView());
+    const pending = {
+      ...ready,
+      pendingApproval: {
+        approvalId: "approval-escape",
+        ownerSessionId: "session-1",
+        runId: "run-1",
+        runVersion: 3,
+        observationId: "observation-1",
+        targetLabel: "Computer Use Simulator",
+        action: {
+          type: "set_value" as const,
+          element_id: "observation-1-name",
+          text: "Ada Lovelace",
+        },
+        actionSummary: "Enter visible text in Name",
+        risk: "Text entry",
+        proposalOrigin: "operator" as const,
+        createdAt: "2026-08-13T10:00:01Z",
+      },
+    };
+    mocks.snapshot.mockResolvedValue(ready);
+    mocks.stage.mockResolvedValue(pending);
+    mocks.discard.mockResolvedValue(ready);
+    render(<ComputerCockpit {...props} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stage text entry" }));
+    const dialog = await screen.findByRole("dialog", { name: "Enter visible text in Name" });
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    await waitFor(() =>
+      expect(mocks.discard).toHaveBeenCalledWith("session-1", "run-1"),
+    );
+    expect(screen.queryByRole("dialog", { name: "Enter visible text in Name" })).toBeNull();
+  });
+
   it("does not offer reauthorization after operator takeover", async () => {
     mocks.snapshot.mockResolvedValue(
       snapshot({

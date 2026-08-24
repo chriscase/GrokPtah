@@ -349,6 +349,14 @@ export function ComputerCockpit({
   }, [approval?.approvalId]);
 
   const trapApprovalFocus = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      if (!approval || !sessionId || !run) return;
+      event.preventDefault();
+      void apply(
+        () => api.computerUseCockpitDiscardApproval(sessionId, run.runId),
+      ).finally(() => proposalFocus.current?.focus());
+      return;
+    }
     if (event.key !== "Tab" || !approvalDialogRef.current) return;
     const focusable = focusableDialogElements(approvalDialogRef.current);
     if (!focusable.length) return;
@@ -1385,6 +1393,7 @@ export function ComputerCockpit({
                 <button
                   type="button"
                   disabled={busy}
+                  aria-keyshortcuts="Escape"
                   onClick={() =>
                     void apply(() =>
                       api.computerUseCockpitDiscardApproval(sessionId, run.runId),
