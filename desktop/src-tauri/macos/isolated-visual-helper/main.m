@@ -24,6 +24,8 @@ static const int GPT_EVENT_FD = 6;
  * packets toward the host. They are private inherited pipes/sockets. */
 static const int GPT_INPUT_FD = 7;
 static const int GPT_FRAME_FD = 8;
+/* FD9 carries the per-launch guest challenge to the host coordinator. */
+static const int GPT_CHALLENGE_FD = 9;
 static const size_t GPT_MAX_CONFIGURATION_BYTES = 1024 * 1024;
 static const size_t GPT_MAX_FRAME_PACKET_BYTES =
     GPT_ISOLATED_VISUAL_FRAME_MAX_PACKET_BYTES;
@@ -110,16 +112,19 @@ static BOOL GPTValidateDescriptors(void) {
     struct stat events = {0};
     struct stat input = {0};
     struct stat frames = {0};
+    struct stat challenge = {0};
     if (!GPTDescriptorHasAccess(GPT_GUEST_IMAGE_FD, O_RDONLY) ||
         !GPTDescriptorHasAccess(GPT_CONFIGURATION_FD, O_RDONLY) ||
         !GPTDescriptorHasAccess(GPT_CONTROL_FD, O_RDONLY) ||
         !GPTDescriptorHasAccess(GPT_EVENT_FD, O_WRONLY) ||
         !GPTDescriptorHasAccess(GPT_INPUT_FD, O_RDONLY) ||
         !GPTDescriptorHasAccess(GPT_FRAME_FD, O_WRONLY) ||
+        !GPTDescriptorHasAccess(GPT_CHALLENGE_FD, O_WRONLY) ||
         fstat(GPT_GUEST_IMAGE_FD, &guest) != 0 ||
         fstat(GPT_CONFIGURATION_FD, &configuration) != 0 ||
         fstat(GPT_CONTROL_FD, &control) != 0 || fstat(GPT_EVENT_FD, &events) != 0 ||
-        fstat(GPT_INPUT_FD, &input) != 0 || fstat(GPT_FRAME_FD, &frames) != 0) {
+        fstat(GPT_INPUT_FD, &input) != 0 || fstat(GPT_FRAME_FD, &frames) != 0 ||
+        fstat(GPT_CHALLENGE_FD, &challenge) != 0) {
         return NO;
     }
     if (!S_ISREG(guest.st_mode) || !S_ISREG(configuration.st_mode) || guest.st_size <= 0 ||
@@ -135,8 +140,9 @@ static BOOL GPTValidateDescriptors(void) {
     BOOL eventsIsPrivateChannel = S_ISFIFO(events.st_mode) || S_ISSOCK(events.st_mode);
     BOOL inputIsPrivateChannel = S_ISFIFO(input.st_mode) || S_ISSOCK(input.st_mode);
     BOOL framesIsPrivateChannel = S_ISFIFO(frames.st_mode) || S_ISSOCK(frames.st_mode);
+    BOOL challengeIsPrivateChannel = S_ISFIFO(challenge.st_mode) || S_ISSOCK(challenge.st_mode);
     return controlIsPrivateChannel && eventsIsPrivateChannel && inputIsPrivateChannel &&
-           framesIsPrivateChannel;
+           framesIsPrivateChannel && challengeIsPrivateChannel;
 }
 
 static NSData *GPTReadBoundedConfiguration(void) {
@@ -713,6 +719,11 @@ static BOOL GPTGuestWaitForReady(
             kSecRandomDefault,
             GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES,
             challenge) != errSecSuccess ||
+        !GPTWriteDescriptorExact(
+            GPT_CHALLENGE_FD,
+            challenge,
+            GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES,
+            GPT_GUEST_HANDSHAKE_TIMEOUT_MS) ||
         !GPTWriteSocketExact(
             connection,
             challenge,

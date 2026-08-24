@@ -53,12 +53,14 @@ future supervisor cannot silently accept reordered, unknown, or post-terminal ev
 
 The start path configures one bounded graphics scanout, entropy, and virtio socket. Network, shared
 directories, audio, storage, keyboards, pointing devices, and serial devices are explicitly empty.
-The helper performs a bounded challenge/response with the guest bootstrap agent before emitting
+The helper performs a bounded challenge/response with the guest bootstrap agent, writes the private
+per-launch challenge to FD9 for the host coordinator, and then emits
 `running`, and requires an authenticated shutdown acknowledgement before terminal success. The
 guest agent—not the host pointer or clipboard—must eventually own framebuffer capture and guest-local
 input through the authenticated protocol documented in `docs/COMPUTER_USE_ISOLATED_VISUAL.md`;
-the helper now relays bounded guest frame packets over FD8 and host-authenticated input packets over
-FD7. The freestanding guest has a fixed `/dev/fb0` capture source, a deterministic fixture renderer,
+the helper now relays bounded guest frame packets over FD8, host-authenticated input packets over
+FD7, and the private guest challenge over FD9. The freestanding guest has a fixed `/dev/fb0` capture
+source, a deterministic fixture renderer,
 and an authenticated frame-chunk emitter, but it does not provide a reviewed GUI image or a packaged
 rendered surface yet. A separate
 host-side input gate now models guest pointer, button, scroll, key, and Unicode text edges against

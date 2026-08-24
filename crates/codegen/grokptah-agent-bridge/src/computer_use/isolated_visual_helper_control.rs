@@ -7,6 +7,8 @@ use super::isolated_visual_helper::{
 use super::isolated_visual_runtime::IsolatedVisualRuntimeSession;
 use super::types::{ComputerError, ComputerErrorCode, ComputerResult};
 
+pub const ISOLATED_VISUAL_CHALLENGE_BYTES: usize = 32;
+
 /// Host-side adapter for the helper's inherited private control/event pipes.
 ///
 /// The adapter does not spawn the helper or own its descriptors. It only
@@ -96,6 +98,21 @@ fn stream_error(error: io::Error) -> ComputerError {
     )
 }
 
+/// Reads the helper-generated per-launch challenge from its private inherited
+/// channel. The challenge is held only by the host runtime coordinator and is
+/// never serialized into a model/provider projection.
+pub fn read_isolated_visual_challenge<R: Read>(reader: &mut R) -> ComputerResult<[u8; 32]> {
+    let mut challenge = [0_u8; ISOLATED_VISUAL_CHALLENGE_BYTES];
+    read_exact(reader, &mut challenge)?;
+    if challenge.iter().all(|byte| *byte == 0) {
+        return Err(ComputerError::new(
+            ComputerErrorCode::BackendFailure,
+            "isolated helper returned an empty guest challenge",
+        ));
+    }
+    Ok(challenge)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +125,18 @@ mod tests {
         let mut bytes = [0_u8; ISOLATED_VISUAL_HELPER_EVENT_BYTES];
         let error = read_exact(&mut control.event_reader, &mut bytes).unwrap_err();
         assert_eq!(error.code, ComputerErrorCode::TargetClosed);
+    }
+
+    #[test]
+    fn challenge_reader_requires_a_complete_nonzero_challenge() {
+        let mut complete = Cursor::new(vec![7_u8; ISOLATED_VISUAL_CHALLENGE_BYTES]);
+        assert_eq!(
+            read_isolated_visual_challenge(&mut complete).unwrap(),
+            [7_u8; ISOLATED_VISUAL_CHALLENGE_BYTES]
+        );
+        let mut truncated = Cursor::new(vec![7_u8; 31]);
+        assert!(read_isolated_visual_challenge(&mut truncated).is_err());
+        let mut empty = Cursor::new(vec![0_u8; ISOLATED_VISUAL_CHALLENGE_BYTES]);
+        assert!(read_isolated_visual_challenge(&mut empty).is_err());
     }
 }

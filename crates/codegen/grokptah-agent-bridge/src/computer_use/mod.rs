@@ -72,6 +72,9 @@ pub use isolated_visual_helper::{
     ISOLATED_VISUAL_HELPER_EVENT_MAGIC, ISOLATED_VISUAL_HELPER_EVENT_VERSION,
 };
 pub use isolated_visual_helper_control::IsolatedVisualHelperControl;
+pub use isolated_visual_helper_control::{
+    read_isolated_visual_challenge, ISOLATED_VISUAL_CHALLENGE_BYTES,
+};
 pub use isolated_visual_input::{
     IsolatedVisualInputGate, IsolatedVisualInputKeyState, IsolatedVisualInputMessage,
     ISOLATED_VISUAL_MAX_SCROLL_DELTA,

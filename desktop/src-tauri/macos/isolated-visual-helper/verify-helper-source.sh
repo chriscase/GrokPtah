@@ -61,6 +61,7 @@ for required in \
   'GPTIsolatedHelperFailureGuestProtocol' \
   'GPT_INPUT_FD' \
   'GPT_FRAME_FD' \
+  'GPT_CHALLENGE_FD' \
   'GPTRelayHostInputToGuest' \
   'GPTRelayGuestFrameToHost'; do
   grep -F "$required" "$helper_source" >/dev/null
@@ -104,13 +105,16 @@ event_fifo="$work/events"
 event_capture="$work/events.bin"
 input_fifo="$work/input"
 frame_fifo="$work/frames"
-mkfifo -m 0600 "$control_fifo" "$event_fifo" "$input_fifo" "$frame_fifo"
+challenge_fifo="$work/challenge"
+mkfifo -m 0600 "$control_fifo" "$event_fifo" "$input_fifo" "$frame_fifo" "$challenge_fifo"
 dd if="$event_fifo" of="$event_capture" status=none &
 event_reader=$!
 dd if="$frame_fifo" of=/dev/null status=none &
 frame_reader=$!
 cat < /dev/null >"$input_fifo" &
 input_writer=$!
+dd if="$challenge_fifo" of=/dev/null status=none &
+challenge_reader=$!
 printf '\003' >"$control_fifo" &
 control_writer=$!
 set +e
@@ -120,13 +124,15 @@ set +e
   5<"$control_fifo" \
   6>"$event_fifo" \
   7<"$input_fifo" \
-  8>"$frame_fifo"
+  8>"$frame_fifo" \
+  9>"$challenge_fifo"
 helper_exit=$?
 set -e
 wait "$control_writer"
 wait "$event_reader"
 wait "$frame_reader"
 wait "$input_writer"
+wait "$challenge_reader"
 if [ "$helper_exit" -ne 4 ]; then
   echo "invalid start command was not rejected before VM launch" >&2
   exit 1
