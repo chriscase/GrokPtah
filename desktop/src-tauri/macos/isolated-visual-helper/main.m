@@ -20,7 +20,13 @@ static const int GPT_GUEST_IMAGE_FD = 3;
 static const int GPT_CONFIGURATION_FD = 4;
 static const int GPT_CONTROL_FD = 5;
 static const int GPT_EVENT_FD = 6;
+/* FD7 carries host-approved input toward the guest; FD8 carries guest frame
+ * packets toward the host. They are private inherited pipes/sockets. */
+static const int GPT_INPUT_FD = 7;
+static const int GPT_FRAME_FD = 8;
 static const size_t GPT_MAX_CONFIGURATION_BYTES = 1024 * 1024;
+static const size_t GPT_MAX_FRAME_PACKET_BYTES =
+    GPT_ISOLATED_VISUAL_FRAME_MAX_PACKET_BYTES;
 static const int GPT_GUEST_HANDSHAKE_TIMEOUT_MS = 30000;
 static const int GPT_GUEST_SHUTDOWN_TIMEOUT_MS = 5000;
 static NSString *const GPT_KERNEL_COMMAND_LINE =
@@ -102,13 +108,18 @@ static BOOL GPTValidateDescriptors(void) {
     struct stat configuration = {0};
     struct stat control = {0};
     struct stat events = {0};
+    struct stat input = {0};
+    struct stat frames = {0};
     if (!GPTDescriptorHasAccess(GPT_GUEST_IMAGE_FD, O_RDONLY) ||
         !GPTDescriptorHasAccess(GPT_CONFIGURATION_FD, O_RDONLY) ||
         !GPTDescriptorHasAccess(GPT_CONTROL_FD, O_RDONLY) ||
         !GPTDescriptorHasAccess(GPT_EVENT_FD, O_WRONLY) ||
+        !GPTDescriptorHasAccess(GPT_INPUT_FD, O_RDONLY) ||
+        !GPTDescriptorHasAccess(GPT_FRAME_FD, O_WRONLY) ||
         fstat(GPT_GUEST_IMAGE_FD, &guest) != 0 ||
         fstat(GPT_CONFIGURATION_FD, &configuration) != 0 ||
-        fstat(GPT_CONTROL_FD, &control) != 0 || fstat(GPT_EVENT_FD, &events) != 0) {
+        fstat(GPT_CONTROL_FD, &control) != 0 || fstat(GPT_EVENT_FD, &events) != 0 ||
+        fstat(GPT_INPUT_FD, &input) != 0 || fstat(GPT_FRAME_FD, &frames) != 0) {
         return NO;
     }
     if (!S_ISREG(guest.st_mode) || !S_ISREG(configuration.st_mode) || guest.st_size <= 0 ||
@@ -122,7 +133,10 @@ static BOOL GPTValidateDescriptors(void) {
     }
     BOOL controlIsPrivateChannel = S_ISFIFO(control.st_mode) || S_ISSOCK(control.st_mode);
     BOOL eventsIsPrivateChannel = S_ISFIFO(events.st_mode) || S_ISSOCK(events.st_mode);
-    return controlIsPrivateChannel && eventsIsPrivateChannel;
+    BOOL inputIsPrivateChannel = S_ISFIFO(input.st_mode) || S_ISSOCK(input.st_mode);
+    BOOL framesIsPrivateChannel = S_ISFIFO(frames.st_mode) || S_ISSOCK(frames.st_mode);
+    return controlIsPrivateChannel && eventsIsPrivateChannel && inputIsPrivateChannel &&
+           framesIsPrivateChannel;
 }
 
 static NSData *GPTReadBoundedConfiguration(void) {
@@ -425,29 +439,33 @@ static int GPTReadControlByte(uint8_t *command, int timeoutMilliseconds) {
     return count == 1 ? 1 : -1;
 }
 
-static int GPTReadControlExact(void *bytes, size_t length, int timeoutMilliseconds) {
+static int GPTReadDescriptorExact(
+    int descriptor,
+    void *bytes,
+    size_t length,
+    int timeoutMilliseconds) {
     uint8_t *cursor = bytes;
     size_t remaining = length;
     uint64_t deadline = GPTMonotonicMilliseconds() + (uint64_t)timeoutMilliseconds;
     while (remaining > 0 && !GPTStopRequested) {
         uint64_t now = GPTMonotonicMilliseconds();
         int waitMilliseconds = now >= deadline ? 0 : (int)(deadline - now);
-        struct pollfd descriptor = {
-            .fd = GPT_CONTROL_FD,
+        struct pollfd descriptorState = {
+            .fd = descriptor,
             .events = POLLIN | POLLERR | POLLHUP,
             .revents = 0,
         };
         int polled;
         do {
-            polled = poll(&descriptor, 1, waitMilliseconds);
+            polled = poll(&descriptorState, 1, waitMilliseconds);
         } while (polled < 0 && errno == EINTR && !GPTStopRequested);
         if (polled <= 0 ||
-            (descriptor.revents & POLLERR) != 0 ||
-            ((descriptor.revents & POLLHUP) != 0 &&
-             (descriptor.revents & POLLIN) == 0)) {
+            (descriptorState.revents & POLLERR) != 0 ||
+            ((descriptorState.revents & POLLHUP) != 0 &&
+             (descriptorState.revents & POLLIN) == 0)) {
             return polled == 0 ? 0 : -1;
         }
-        ssize_t count = read(GPT_CONTROL_FD, cursor, remaining);
+        ssize_t count = read(descriptor, cursor, remaining);
         if (count < 0 && errno == EINTR) {
             continue;
         }
@@ -458,6 +476,48 @@ static int GPTReadControlExact(void *bytes, size_t length, int timeoutMillisecon
         remaining -= (size_t)count;
     }
     return remaining == 0 ? 1 : -1;
+}
+
+static int GPTReadControlExact(void *bytes, size_t length, int timeoutMilliseconds) {
+    return GPTReadDescriptorExact(GPT_CONTROL_FD, bytes, length, timeoutMilliseconds);
+}
+
+static BOOL GPTWriteDescriptorExact(
+    int descriptor,
+    const void *bytes,
+    size_t length,
+    int timeoutMilliseconds) {
+    const uint8_t *cursor = bytes;
+    size_t remaining = length;
+    uint64_t deadline = GPTMonotonicMilliseconds() + (uint64_t)timeoutMilliseconds;
+    while (remaining > 0 && !GPTStopRequested) {
+        uint64_t now = GPTMonotonicMilliseconds();
+        int waitMilliseconds = now >= deadline ? 0 : (int)(deadline - now);
+        struct pollfd descriptorState = {
+            .fd = descriptor,
+            .events = POLLOUT | POLLERR | POLLHUP,
+            .revents = 0,
+        };
+        int polled;
+        do {
+            polled = poll(&descriptorState, 1, waitMilliseconds);
+        } while (polled < 0 && errno == EINTR && !GPTStopRequested);
+        if (polled <= 0 || (descriptorState.revents & POLLERR) != 0 ||
+            ((descriptorState.revents & POLLHUP) != 0 &&
+             (descriptorState.revents & POLLOUT) == 0)) {
+            return NO;
+        }
+        ssize_t written = write(descriptor, cursor, remaining);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            return NO;
+        }
+        cursor += written;
+        remaining -= (size_t)written;
+    }
+    return remaining == 0;
 }
 
 static uint64_t GPTMonotonicMilliseconds(void) {
@@ -544,6 +604,97 @@ static BOOL GPTReadSocketExact(
         remaining -= (size_t)count;
     }
     return remaining == 0;
+}
+
+/* The helper is only a bounded transport relay. The Rust runtime authenticates
+ * frame packets and seals input packets; the guest independently validates the
+ * input packet before acting on it. */
+static BOOL GPTRelayHostInputToGuest(VZVirtioSocketConnection *connection) {
+    uint8_t command = 0;
+    uint8_t lengthBytes[4] = {0};
+    if (GPTReadDescriptorExact(
+            GPT_INPUT_FD,
+            &command,
+            sizeof(command),
+            GPT_GUEST_HANDSHAKE_TIMEOUT_MS) != 1 ||
+        command != GPT_GUEST_BOOTSTRAP_INPUT ||
+        GPTReadDescriptorExact(
+            GPT_INPUT_FD,
+            lengthBytes,
+            sizeof(lengthBytes),
+            GPT_GUEST_HANDSHAKE_TIMEOUT_MS) != 1) {
+        return NO;
+    }
+    uint32_t packetBytes = gpt_load_be32(lengthBytes);
+    if (packetBytes < GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES +
+                           GPT_ISOLATED_VISUAL_INPUT_TAG_BYTES ||
+        packetBytes > GPT_ISOLATED_VISUAL_INPUT_MAX_PACKET_BYTES) {
+        return NO;
+    }
+    uint8_t *packet = malloc(packetBytes);
+    if (packet == NULL) {
+        return NO;
+    }
+    BOOL read = GPTReadDescriptorExact(
+                    GPT_INPUT_FD,
+                    packet,
+                    packetBytes,
+                    GPT_GUEST_HANDSHAKE_TIMEOUT_MS) == 1;
+    BOOL written = read &&
+                   GPTWriteSocketExact(
+                       connection,
+                       &command,
+                       sizeof(command),
+                       GPT_GUEST_HANDSHAKE_TIMEOUT_MS) &&
+                   GPTWriteSocketExact(
+                       connection,
+                       lengthBytes,
+                       sizeof(lengthBytes),
+                       GPT_GUEST_HANDSHAKE_TIMEOUT_MS) &&
+                   GPTWriteSocketExact(
+                       connection,
+                       packet,
+                       packetBytes,
+                       GPT_GUEST_HANDSHAKE_TIMEOUT_MS);
+    free(packet);
+    return written;
+}
+
+static BOOL GPTRelayGuestFrameToHost(VZVirtioSocketConnection *connection) {
+    uint8_t lengthBytes[4] = {0};
+    if (!GPTReadSocketExact(
+            connection,
+            lengthBytes,
+            sizeof(lengthBytes),
+            GPT_GUEST_HANDSHAKE_TIMEOUT_MS)) {
+        return NO;
+    }
+    uint32_t packetBytes = gpt_load_be32(lengthBytes);
+    if (packetBytes == 0 || packetBytes > GPT_MAX_FRAME_PACKET_BYTES) {
+        return NO;
+    }
+    uint8_t *packet = malloc(packetBytes);
+    if (packet == NULL) {
+        return NO;
+    }
+    BOOL read = GPTReadSocketExact(
+        connection,
+        packet,
+        packetBytes,
+        GPT_GUEST_HANDSHAKE_TIMEOUT_MS);
+    BOOL written = read &&
+                   GPTWriteDescriptorExact(
+                       GPT_FRAME_FD,
+                       lengthBytes,
+                       sizeof(lengthBytes),
+                       GPT_GUEST_HANDSHAKE_TIMEOUT_MS) &&
+                   GPTWriteDescriptorExact(
+                       GPT_FRAME_FD,
+                       packet,
+                       packetBytes,
+                       GPT_GUEST_HANDSHAKE_TIMEOUT_MS);
+    free(packet);
+    return written;
 }
 
 static BOOL GPTGuestWaitForReady(
@@ -849,13 +1000,60 @@ int main(int argc, const char *argv[]) {
                     guestStopped = YES;
                     break;
                 }
-                command = 0;
-                int result = GPTReadControlByte(&command, 1000);
-                if (result == 1 && command == GPT_ISOLATED_HELPER_CONTROL_STOP) {
+                VZVirtioSocketConnection *guestConnection = guestSocketDelegate.connection;
+                if (guestConnection == nil || guestConnection.fileDescriptor < 0) {
+                    controlLost = YES;
                     break;
                 }
-                if (result == 1 && command == GPT_ISOLATED_HELPER_CONTROL_BIND) {
-                    if (guestBound || !GPTGuestAcceptBindingControl(guestSocketDelegate, challenge)) {
+                struct pollfd descriptors[3] = {
+                    {
+                        .fd = GPT_CONTROL_FD,
+                        .events = POLLIN | POLLERR | POLLHUP,
+                        .revents = 0,
+                    },
+                    {
+                        .fd = GPT_INPUT_FD,
+                        .events = POLLIN | POLLERR | POLLHUP,
+                        .revents = 0,
+                    },
+                    {
+                        .fd = guestConnection.fileDescriptor,
+                        .events = POLLIN | POLLERR | POLLHUP,
+                        .revents = 0,
+                    },
+                };
+                int polled;
+                do {
+                    polled = poll(descriptors, 3, 1000);
+                } while (polled < 0 && errno == EINTR && !GPTStopRequested);
+                if (polled < 0) {
+                    controlLost = YES;
+                    break;
+                }
+                if (polled == 0) {
+                    elapsedSeconds += 1;
+                    continue;
+                }
+                if ((descriptors[0].revents & (POLLERR | POLLHUP)) != 0 &&
+                    (descriptors[0].revents & POLLIN) == 0) {
+                    controlLost = YES;
+                    break;
+                }
+                if ((descriptors[0].revents & POLLIN) != 0) {
+                    command = 0;
+                    ssize_t count;
+                    do {
+                        count = read(GPT_CONTROL_FD, &command, sizeof(command));
+                    } while (count < 0 && errno == EINTR && !GPTStopRequested);
+                    if (count != 1) {
+                        controlLost = YES;
+                        break;
+                    }
+                    if (command == GPT_ISOLATED_HELPER_CONTROL_STOP) {
+                        break;
+                    }
+                    if (command != GPT_ISOLATED_HELPER_CONTROL_BIND || guestBound ||
+                        !GPTGuestAcceptBindingControl(guestSocketDelegate, challenge)) {
                         controlLost = YES;
                         break;
                     }
@@ -864,10 +1062,24 @@ int main(int argc, const char *argv[]) {
                         controlLost = YES;
                         break;
                     }
-                    continue;
                 }
-                if (result < 0 ||
-                    (result == 1 && command != GPT_ISOLATED_HELPER_CONTROL_STOP)) {
+                if ((descriptors[1].revents & (POLLERR | POLLHUP)) != 0 &&
+                    (descriptors[1].revents & POLLIN) == 0) {
+                    controlLost = YES;
+                    break;
+                }
+                if ((descriptors[1].revents & POLLIN) != 0 &&
+                    (!guestBound || !GPTRelayHostInputToGuest(guestConnection))) {
+                    controlLost = YES;
+                    break;
+                }
+                if ((descriptors[2].revents & (POLLERR | POLLHUP)) != 0 &&
+                    (descriptors[2].revents & POLLIN) == 0) {
+                    guestStopped = YES;
+                    break;
+                }
+                if ((descriptors[2].revents & POLLIN) != 0 &&
+                    (!guestBound || !GPTRelayGuestFrameToHost(guestConnection))) {
                     controlLost = YES;
                     break;
                 }

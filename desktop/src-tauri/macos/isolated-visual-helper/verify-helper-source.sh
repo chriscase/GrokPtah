@@ -58,7 +58,11 @@ for required in \
   'setSocketListener:guestSocketListener' \
   'GPTGuestWaitForReady' \
   'GPTGuestRequestShutdown' \
-  'GPTIsolatedHelperFailureGuestProtocol'; do
+  'GPTIsolatedHelperFailureGuestProtocol' \
+  'GPT_INPUT_FD' \
+  'GPT_FRAME_FD' \
+  'GPTRelayHostInputToGuest' \
+  'GPTRelayGuestFrameToHost'; do
   grep -F "$required" "$helper_source" >/dev/null
 done
 for required in \
@@ -71,7 +75,8 @@ for required in \
   'gpt_isolated_helper_event' \
   'GPT_ISOLATED_VISUAL_BINDING_MAGIC' \
   'GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES' \
-  'gpt_isolated_visual_binding_header'; do
+  'gpt_isolated_visual_binding_header' \
+  'GPT_ISOLATED_VISUAL_FRAME_MAX_PACKET_BYTES'; do
   grep -F "$required" "$shared_protocol" >/dev/null
 done
 grep -F 'GPTGuestAcceptBindingControl' "$helper_source" >/dev/null
@@ -97,17 +102,31 @@ otool -L "$helper" | grep -F '/Virtualization.framework/'
 control_fifo="$work/control"
 event_fifo="$work/events"
 event_capture="$work/events.bin"
-mkfifo -m 0600 "$control_fifo" "$event_fifo"
+input_fifo="$work/input"
+frame_fifo="$work/frames"
+mkfifo -m 0600 "$control_fifo" "$event_fifo" "$input_fifo" "$frame_fifo"
 dd if="$event_fifo" of="$event_capture" status=none &
 event_reader=$!
+dd if="$frame_fifo" of=/dev/null status=none &
+frame_reader=$!
+cat < /dev/null >"$input_fifo" &
+input_writer=$!
 printf '\003' >"$control_fifo" &
 control_writer=$!
 set +e
-"$helper" 3<"$configuration" 4<"$configuration" 5<"$control_fifo" 6>"$event_fifo"
+"$helper" \
+  3<"$configuration" \
+  4<"$configuration" \
+  5<"$control_fifo" \
+  6>"$event_fifo" \
+  7<"$input_fifo" \
+  8>"$frame_fifo"
 helper_exit=$?
 set -e
 wait "$control_writer"
 wait "$event_reader"
+wait "$frame_reader"
+wait "$input_writer"
 if [ "$helper_exit" -ne 4 ]; then
   echo "invalid start command was not rejected before VM launch" >&2
   exit 1

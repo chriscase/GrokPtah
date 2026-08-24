@@ -20,7 +20,8 @@ int main(void) {
     }
     if (sizeof(gpt_isolated_visual_frame_header) != GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES ||
         GPT_ISOLATED_VISUAL_FRAME_TAG_BYTES != 32U ||
-        GPT_ISOLATED_VISUAL_FRAME_CHUNK_BYTES != 65536U) {
+        GPT_ISOLATED_VISUAL_FRAME_CHUNK_BYTES != 65536U ||
+        GPT_ISOLATED_VISUAL_FRAME_MAX_PACKET_BYTES != 65668U) {
         fputs("isolated visual frame ABI self-test failed\n", stderr);
         return 1;
     }

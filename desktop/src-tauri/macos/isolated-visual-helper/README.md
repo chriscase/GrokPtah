@@ -15,11 +15,13 @@ The future host supervisor must supply exactly these already-verified descriptor
 | 4 | read only | exact `grokptah-isolated-config-v1.json` bytes |
 | 5 | read only pipe/socket | private host control channel |
 | 6 | write only pipe/socket | private helper event channel |
+| 7 | read only pipe/socket | private authenticated input relay |
+| 8 | write only pipe/socket | private authenticated frame relay |
 
 FDs 3 and 4 must be nonempty regular files, non-executable, not group/world writable, and within the
-32 GiB / 1 MiB ceilings. The helper rewinds them before use. FDs 5 and 6 must be private pipes or
-sockets with the exact direction shown. Paths, secrets, environment values, arbitrary log text, and
-model/provider traffic never cross this bootstrap ABI.
+32 GiB / 1 MiB ceilings. The helper rewinds them before use. FDs 5 through 8 must be private pipes
+or sockets with the exact direction shown. Paths, secrets, environment values, arbitrary log text,
+and model/provider traffic never cross this bootstrap ABI.
 
 ## Closed bootstrap protocol
 
@@ -34,7 +36,7 @@ Every event is exactly 16 bytes in network byte order:
 |---|---|
 | 0–3 | magic `0x47505449` (`GPTI`) |
 | 4–5 | version `1` |
-| 6–7 | event: prepared `1`, running `2`, stopped `3`, failure `4` |
+| 6–7 | event: prepared `1`, running `2`, stopped `3`, failure `4`, bound `5` |
 | 8–11 | closed numeric failure detail, or zero |
 | 12–15 | reserved zero |
 
@@ -55,12 +57,12 @@ The helper performs a bounded challenge/response with the guest bootstrap agent 
 `running`, and requires an authenticated shutdown acknowledgement before terminal success. The
 guest agent—not the host pointer or clipboard—must eventually own framebuffer capture and guest-local
 input through the authenticated protocol documented in `docs/COMPUTER_USE_ISOLATED_VISUAL.md`;
-the Rust candidate now includes a bounded authenticated guest-to-host frame-chunk carrier, but the
-helper/guest socket loop does not yet feed it. A separate host-side input gate now models guest
-pointer, button, scroll, key, and Unicode text edges against the latest frame and poisons stale or
-incomplete state. The source candidate also defines a separate authenticated 64-byte input packet
-header with a closed key/button code set; it is not wired to a socket and no input capability is
-enabled. Rust and freestanding guest C also share a length-prefixed session-binding digest,
+the helper now relays bounded guest frame packets over FD8 and host-authenticated input packets over
+FD7, but the guest still has no capture source and therefore emits no valid frames. A separate
+host-side input gate now models guest pointer, button, scroll, key, and Unicode text edges against
+the latest frame and poisons stale or incomplete state. The source candidate also defines a
+separate authenticated 64-byte input packet header with a closed key/button code set; the helper
+relays it but does not authenticate it, and no input capability is enabled. Rust and freestanding guest C also share a length-prefixed session-binding digest,
 challenge-derived channel key, and confirmation-tag contract; the packet is not consumed by the
 helper/guest socket loop. The Rust host-supervisor state machine now requires this binding step
 before it will send the terminal stop command. The helper now accepts a private control-channel bind
