@@ -6,7 +6,7 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Source head at evidence cutoff: `f8b9ea8b9e0ec4cf3e87f541fd9dc99dc15804ab`
+- Source head at evidence cutoff: `c6373c3f4cedfb7b8f8a68dd3f0190fc50d3e3c9`
 - Bundle: not created for the current head; the historical stage-41 bundle is
   recorded below and does not include the later hardening commits.
 - Bundle SHA-256: not applicable to the current head.
@@ -166,6 +166,12 @@ The atomic guest-artifact publication extension is sealed at:
 The bounded kernel-source fetch extension is sealed at:
 
 - Commit: `f8b9ea8b9e0ec4cf3e87f541fd9dc99dc15804ab`.
+- Bundle: not created; this remains a source-only extension pending the
+  credentialed packaged-runtime campaign.
+
+The kernel-source download-size cap extension is sealed at:
+
+- Commit: `c6373c3f4cedfb7b8f8a68dd3f0190fc50d3e3c9`.
 - Bundle: not created; this remains a source-only extension pending the
   credentialed packaged-runtime campaign.
 
