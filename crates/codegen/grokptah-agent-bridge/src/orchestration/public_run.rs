@@ -985,6 +985,18 @@ fn scrub_public_run(
             run.error_code = Some(PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS.into());
         }
     }
+    // The typed scrub above intentionally names the usual diagnostic fields,
+    // but every string in the public DTO is still untrusted durable content.
+    // Sweep the complete allowlisted projection before the final fail-closed
+    // check so a newly added public field cannot turn a safe redaction into a
+    // `ptah_get_run` internal error or leak a route secret.
+    let mut encoded = serde_json::to_value(&*run)
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+    if scrub_value_strings(&mut encoded, &needles) {
+        *run = serde_json::from_value(encoded)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        run.error_code = Some(PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS.into());
+    }
     let encoded = serde_json::to_value(&*run)
         .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
     let needle_refs: Vec<&str> = needles.iter().map(String::as_str).collect();
@@ -1321,6 +1333,34 @@ mod tests {
         let sanitized = public_run_from_receipt(&store, leaked_receipt).unwrap();
         assert_payload_hides_route(&sanitized, run.provider_route.as_ref().unwrap());
         assert_eq!(sanitized["runId"], run.run_id);
+    }
+
+    #[test]
+    fn public_projection_redacts_route_needles_in_every_allowlisted_string() {
+        let temp = tempdir().unwrap();
+        let store = OrchStore::open(temp.path()).unwrap();
+        let route = leaky_route();
+        let mut run = leaky_run(route.clone());
+        run.request_id = CREDENTIAL_REF_SENTINEL.into();
+        run.client_id = Some(BASE_URL_SENTINEL.into());
+        run.agent_id = Some(CREDENTIAL_FP_SENTINEL.into());
+        run.continuation_context_id = Some(route.selection_key.clone());
+        let reservation =
+            QuotaReservation::for_run(&run, "owner-a", QuotaLimits::default(), Utc::now()).unwrap();
+        store
+            .admit_run_with_quota(&run, &reservation)
+            .into_result()
+            .unwrap();
+
+        let projected =
+            project_public_run(&store, &store.load_run(&run.run_id).unwrap().unwrap()).unwrap();
+        let payload = public_run_to_value(&projected).unwrap();
+        assert_payload_hides_route(&payload, &route);
+        assert_eq!(payload["errorCode"], PUBLIC_ERROR_PRIVILEGED_DIAGNOSTICS);
+        assert_eq!(payload["requestId"], "");
+        assert_eq!(payload["clientId"], "");
+        assert_eq!(payload["agentId"], "");
+        assert_eq!(payload["continuationContextId"], "");
     }
 
     #[test]
