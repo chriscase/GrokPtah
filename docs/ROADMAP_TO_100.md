@@ -1084,8 +1084,14 @@ still carries them here is invalid.
 - Packaged-identity Computer Use hardware matrix ([#274](https://github.com/chriscase/GrokPtah/issues/274)).
   **Must not remain Unverified at 100%.**
 - Isolated visual Computer Use ([#288](https://github.com/chriscase/GrokPtah/issues/288)).
-  **Must not remain Unverified at 100%.**
-- Always-on 72-hour operational soak. **Must not remain Unverified at 100%.**
+  The b250 source lease-fence sub-gate is **PASS**
+  ([source report](evidence/COMPUTER_USE_PACKAGED_LEASE_B250B70_SOURCE_REPORT.md)),
+  but the packaged/hardware campaign remains queued in v15. **Must not remain
+  Unverified at 100%.**
+- Always-on 72-hour operational soak. The v51 public-run campaign is
+  **NOT_QUALIFIED**; the exact v52 route-identity repair remains an external
+  source/service qualification procedure. **Must not remain Unverified at
+  100%.**
 - Independent long-running worker / multi-worker outcome
   ([#305](https://github.com/chriscase/GrokPtah/issues/305) core).
   **Must not remain Unverified at 100%.** Cannot be closed by descope.
