@@ -336,6 +336,37 @@ mod tests {
             .is_err());
     }
 
+    #[test]
+    fn poisoned_input_stop_requires_failure_cleanup_before_transition() {
+        let contract = contract();
+        let mut runtime = IsolatedVisualRuntimeSession::new(contract, [7; 32]).unwrap();
+        runtime
+            .accept_helper_event(IsolatedVisualHelperEvent::decode(&event(1, 0)).unwrap())
+            .unwrap();
+        runtime.start_control().unwrap();
+        runtime
+            .accept_helper_event(IsolatedVisualHelperEvent::decode(&event(2, 0)).unwrap())
+            .unwrap();
+        runtime.bind_control().unwrap();
+        runtime
+            .accept_helper_event(IsolatedVisualHelperEvent::decode(&event(5, 0)).unwrap())
+            .unwrap();
+
+        runtime.input_gate.poison();
+        assert!(runtime
+            .stop_control(IsolatedVisualTerminalDisposition::Cancelled)
+            .is_err());
+        assert_eq!(
+            runtime.lifecycle_state(),
+            IsolatedVisualLifecycleState::ReadOnlyReady
+        );
+        runtime.fail().unwrap();
+        assert_eq!(
+            runtime.lifecycle_state(),
+            IsolatedVisualLifecycleState::CleanupPending
+        );
+    }
+
     fn event(code: u16, detail: u32) -> [u8; 16] {
         let mut bytes = [0; 16];
         bytes[0..4].copy_from_slice(&0x4750_5449u32.to_be_bytes());
