@@ -19,6 +19,15 @@ trap cleanup EXIT HUP INT TERM
 
 sh -n "$script_dir/fetch-kernel-source.sh"
 sh -n "$script_dir/build-guest-image.sh"
+for required in staged_output_image staged_output_manifest \
+  published_image published_manifest \
+  'trap - EXIT HUP INT TERM' \
+  "trap 'exit 129' HUP" "trap 'exit 130' INT" "trap 'exit 143' TERM" \
+  'mv "$staged_output_image" "$output_image"' \
+  'mv "$staged_output_manifest" "$output_manifest"' \
+  'guest image or manifest output appeared during staged build'; do
+  grep -F "$required" "$script_dir/build-guest-image.sh" >/dev/null
+done
 jq -e '
   .schemaVersion == 1 and
   .kernelVersion == "6.12.104" and

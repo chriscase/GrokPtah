@@ -64,10 +64,29 @@ if [ "$observed_source_sha" != "$expected_source_sha" ]; then
 fi
 
 work=$(mktemp -d /tmp/grokptah-isolated-guest-build.XXXXXX)
+published_image=0
+published_manifest=0
 cleanup() {
+  status=$?
+  trap - EXIT HUP INT TERM
   rm -rf -- "$work"
+  if [ "$status" -ne 0 ]; then
+    if [ "$published_image" -eq 1 ]; then
+      rm -f -- "$output_image"
+    fi
+    if [ "$published_manifest" -eq 1 ]; then
+      rm -f -- "$output_manifest"
+    fi
+  fi
+  exit "$status"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+staged_output_image="$work/grokptah-isolated-guest-v1.Image"
+staged_output_manifest="$work/grokptah-isolated-guest-v1.manifest.json"
 
 top_level=$(tar -tf "$source_tarball" | sed -n '1s#/.*##p')
 if [ -z "$top_level" ] ||
@@ -142,12 +161,12 @@ make -C "$kernel" ARCH=arm64 LLVM=1 KCONFIG_NOTIMESTAMP=1 LOCALVERSION=-grokptah
   -j"${JOBS:-2}" Image
 image="$kernel/arch/arm64/boot/Image"
 test -s "$image"
-install -m 0444 "$image" "$output_image"
+install -m 0444 "$image" "$staged_output_image"
 
 source_sha=$(sha256sum "$source_tarball" | awk '{print $1}')
 initramfs_sha=$(sha256sum "$initramfs" | awk '{print $1}')
 config_sha=$(sha256sum "$kernel/.config" | awk '{print $1}')
-image_sha=$(sha256sum "$output_image" | awk '{print $1}')
+image_sha=$(sha256sum "$staged_output_image" | awk '{print $1}')
 clang_sha=$(clang --version | sha256sum | awk '{print $1}')
 lld_sha=$(ld.lld --version | sha256sum | awk '{print $1}')
 make_sha=$(make --version | sha256sum | awk '{print $1}')
@@ -159,7 +178,7 @@ export GPT_IMAGE_SHA="$image_sha"
 export GPT_CLANG_SHA="$clang_sha"
 export GPT_LLD_SHA="$lld_sha"
 export GPT_MAKE_SHA="$make_sha"
-python3 - "$output_manifest" <<'PY'
+python3 - "$staged_output_manifest" <<'PY'
 import json
 import os
 import sys
@@ -188,5 +207,14 @@ with open(output, "w", encoding="utf-8") as handle:
     json.dump(data, handle, sort_keys=True, separators=(",", ":"))
     handle.write("\n")
 PY
-chmod 0444 "$output_manifest"
+chmod 0444 "$staged_output_manifest"
+if [ -e "$output_image" ] || [ -L "$output_image" ] ||
+   [ -e "$output_manifest" ] || [ -L "$output_manifest" ]; then
+  echo "guest image or manifest output appeared during staged build" >&2
+  exit 73
+fi
+mv "$staged_output_image" "$output_image"
+published_image=1
+mv "$staged_output_manifest" "$output_manifest"
+published_manifest=1
 printf 'guest_image=%s\nimage_sha256=%s\nmanifest=%s\n' "$output_image" "$image_sha" "$output_manifest"
