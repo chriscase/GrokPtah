@@ -56,6 +56,12 @@ desktop/src-tauri/macos/isolated-visual-guest/build-guest-image.sh \
   /absolute/runner-temp/manifest.json
 ```
 
+Do not replace either script with an ad-hoc `curl`, `tar`, kernel build, or
+artifact copy. The fetch script enforces the locked HTTPS source, redirect,
+time, size, and digest gates; the builder stages image/manifest outputs and
+publishes them only after the complete manifest is written. If either command
+fails, verify that its requested final output paths are absent before retrying.
+
 Build two isolated outputs and compare both image and manifest bytes. If either differs, stop and
 retain a failed reproducibility record; do not package either output.
 
@@ -82,6 +88,10 @@ that:
   device is configured;
 - the embedded guest/configuration bytes match the reviewed manifest;
 - helper and outer-app code identities/team requirements match the release policy.
+
+The package script assembles under a disposable staging app and publishes the
+requested output only after all checks pass. If it fails, the requested output
+path must remain absent; do not promote a staging directory manually.
 
 If any check is unavailable, the result is `not qualified`, not “best effort.”
 
