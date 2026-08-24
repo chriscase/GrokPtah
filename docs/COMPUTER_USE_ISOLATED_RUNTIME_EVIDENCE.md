@@ -22,6 +22,10 @@ Computer Use backend or satisfy the #288 release gate.
   lifecycle, challenge-derived frame/input channels, frame freshness, input
   admission, restart poisoning, and cleanup evidence. Debug output redacts the
   challenge and carriers remain outside model-facing projections.
+- `IsolatedVisualStream` provides a bounded length-delimited private transport
+  seam: it refuses oversized allocations, maps mid-packet EOF to a terminal
+  condition, delegates frame authentication/freshness to the runtime session,
+  and writes only authenticated input packets.
 - Source tests exercise the bound transition, frame-carrier round trip,
   frame-fenced input packet, stop transition, and pre-binding rejection paths.
 

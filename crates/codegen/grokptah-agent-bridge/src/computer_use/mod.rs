@@ -22,6 +22,7 @@ mod isolated_visual_input;
 mod isolated_visual_input_wire;
 mod isolated_visual_protocol;
 mod isolated_visual_runtime;
+mod isolated_visual_stream;
 #[cfg(target_os = "macos")]
 mod macos_isolated_artifacts;
 mod macos_observation;
@@ -83,6 +84,10 @@ pub use isolated_visual_protocol::{
     ISOLATED_VISUAL_CHANNEL_SECRET_BYTES, ISOLATED_VISUAL_MAX_SIGNED_ENVELOPE_BYTES,
 };
 pub use isolated_visual_runtime::IsolatedVisualRuntimeSession;
+pub use isolated_visual_stream::{
+    IsolatedVisualStream, ISOLATED_VISUAL_STREAM_LENGTH_BYTES,
+    ISOLATED_VISUAL_STREAM_MAX_FRAME_PACKET_BYTES,
+};
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
     computer_isolated_visual_status, ComputerBackgroundSafetyReceipt,
