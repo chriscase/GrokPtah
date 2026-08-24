@@ -114,6 +114,13 @@ export class GrokPtahOperations {
     });
   }
 
+  async listPersistentAgents<T = unknown>(
+    scope: GrokPtahScope,
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("agent.continuity");
+    return this.invoke<T>("ptah_list_persistent_agents", scopeArgs(scope));
+  }
+
   async resumePersistentAgent<T = unknown>(
     scope: GrokPtahScope,
     agentId: string,

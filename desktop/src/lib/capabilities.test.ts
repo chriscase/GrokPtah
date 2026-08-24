@@ -59,6 +59,12 @@ describe("capability discovery", () => {
     expect(
       parseCapabilitySet({
         ...payload,
+        capabilities: [{ ...payload.capabilities[0], id: `run.${"x".repeat(128)}` }],
+      }),
+    ).toBeNull();
+    expect(
+      parseCapabilitySet({
+        ...payload,
         capabilities: [payload.capabilities[0], payload.capabilities[0]],
       }),
     ).toBeNull();

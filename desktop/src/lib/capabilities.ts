@@ -53,6 +53,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 const CAPABILITY_ID = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9_]*)+$/;
+const MAX_CAPABILITY_ID_LENGTH = 128;
 const DESCRIPTOR_KEYS = new Set([
   "id",
   "tier",
@@ -71,6 +72,7 @@ function parseDescriptor(value: unknown): CapabilityDescriptor | null {
   if (
     typeof id !== "string" ||
     !CAPABILITY_ID.test(id) ||
+    id.length > MAX_CAPABILITY_ID_LENGTH ||
     typeof tier !== "string" ||
     !TIERS.has(tier as CapabilityTier) ||
     typeof mutating !== "boolean" ||

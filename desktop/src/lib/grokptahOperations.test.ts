@@ -159,6 +159,9 @@ describe("GrokPtahOperations", () => {
     await expect(
       operations.getPersistentAgent({ sessionId: "session-1", workspace: "/repo" }, "agent-1"),
     ).rejects.toMatchObject({ capabilityId: "agent.continuity" });
+    await expect(
+      operations.listPersistentAgents({ sessionId: "session-1", workspace: "/repo" }),
+    ).rejects.toMatchObject({ capabilityId: "agent.continuity" });
     expect(fetcher).not.toHaveBeenCalled();
   });
 
