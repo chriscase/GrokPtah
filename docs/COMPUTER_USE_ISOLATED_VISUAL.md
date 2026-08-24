@@ -241,7 +241,10 @@ available.
    runtime. A bounded length-delimited `IsolatedVisualStream` now supplies the private transport
    seam, delegating frame authentication and input admission to that coordinator; it still does
    not open a VSOCK or dispatch a packaged runtime. `IsolatedVisualHelperControl` similarly binds
-   inherited helper control/event descriptors to the coordinator without spawning a process. The
+   inherited helper control/event descriptors to the coordinator without spawning a process. A
+   source-only `IsolatedVisualRuntimeDriver` now joins those helper and stream adapters behind one
+   lifecycle-owned API, preventing a future supervisor from advancing them through unrelated
+   state machines. The
    freestanding guest now validates the authenticated length-bounded input ABI after binding, while
    still refusing input until a real captured frame establishes a freshness fence. It also
    independently tracks held mouse-button and key state, rejecting duplicate downs, mismatched

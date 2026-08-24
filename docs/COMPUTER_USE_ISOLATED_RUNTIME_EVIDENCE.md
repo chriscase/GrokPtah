@@ -11,7 +11,7 @@ Computer Use backend or satisfy the #288 release gate.
 - Bundle SHA-256: `bdd76c7ceaa910e261d4805bd52bc4172c054f5e7ebc060ac2688839d43ca5b0`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current sealed branch head: `d34f7654fceb29e5164468108e74b6a414a51aa4`.
+Current sealed implementation head: `7823283284a484f5586edfc79a9dd2109d2a98b1`.
 
 The later guest-input validation extension is sealed at:
 
@@ -24,6 +24,12 @@ The guest held-input enforcement extension is sealed at:
 - Commit: `d34f7654fceb29e5164468108e74b6a414a51aa4`
 - Bundle: `/private/tmp/grokptah-cu-stage14-guest-input-state-v1.bundle`
 - Bundle SHA-256: `16abf1113ae91dbcc436e0999a2412313d1d2191bb6e96638ef3f19c09e9a123`
+
+The runtime-driver integration extension is sealed at:
+
+- Commit: `7823283284a484f5586edfc79a9dd2109d2a98b1`
+- Bundle: `/private/tmp/grokptah-cu-stage15-runtime-driver-v1.bundle`
+- Bundle SHA-256: `5b0f3ca91c9c62b34e500a82a9ad0878541ae2e0714003c8cd6b6786ccdaa8ca`
 
 ## What this candidate proves
 
@@ -43,6 +49,11 @@ The guest held-input enforcement extension is sealed at:
 - `IsolatedVisualHelperControl` binds inherited control/event descriptors to
   the same coordinator, serializing only the start/bind/stop controls and
   accepting only decoded fixed-size helper events.
+- `IsolatedVisualRuntimeDriver` joins the helper control adapter and private
+  frame/input stream behind one lifecycle-owned API. It prevents a future
+  supervisor from advancing those seams through unrelated state machines,
+  while still deliberately accepting inherited descriptors rather than
+  spawning a process or claiming a packaged VM capability.
 - The freestanding guest source validates the authenticated input packet,
   sequence fence, identity-bound HMAC, coordinate/key/text bounds, and closed
   message kind set after binding. It intentionally has no valid frame source
