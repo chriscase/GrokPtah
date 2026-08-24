@@ -50,6 +50,26 @@ before and after, a shared target growing from 2.7 GiB to 2.9 GiB, and zero
 `lsof` handles after the run. The target was retained; no protected process or
 developer checkout was touched.
 
+After recording the external report, the repository-owned source verifiers
+were run read-only on the candidate:
+
+```text
+sh docs/verify-packaged-lease-fence.sh
+  packaged_lease_fence_source=present
+  packaged_lease_fence_candidate=b250b70
+  packaged_lease_fence_claim_status=source_only
+  packaged_lease_fence_bundle=verified
+
+sh docs/verify-packaged-lease-stop-failure-fence.sh
+  packaged_lease_stop_failure_source=present
+  packaged_lease_stop_failure_candidate=40730e4
+  packaged_lease_stop_failure_claim_status=source_only
+  packaged_lease_stop_failure_bundle=verified
+```
+
+These are source/documentation verifiers; they do not launch a VM or replace
+the v15 packaged qualification campaign.
+
 ## What this does and does not prove
 
 The result proves the source-level lease and launch-descriptor checks for the
