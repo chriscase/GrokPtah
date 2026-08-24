@@ -66,6 +66,17 @@ require_text 'cannot claim Stage 6' docs/OVERNIGHT_QUALIFICATION_COORDINATOR.md
 require_text 'Do not edit the capability matrix or claim 100%' \
   docs/OVERNIGHT_QUALIFICATION_COORDINATOR.md
 
+# Stage 6's newly resealed source candidate must remain an external, gated
+# procedure until its smoke and long-running evidence are independently held.
+require_text 'cfa741b67c51bc9804b566440a855348727d398c7d97279b2e61e5cbeb12b91b' \
+  docs/STAGE6_EVIDENCE_HARDENING_EXTERNAL_HANDOFF.md
+require_text 'The input bundle is now exact and complete' \
+  docs/STAGE6_EVIDENCE_HARDENING_EXTERNAL_HANDOFF.md
+require_text 'Stage 6 remains open.' \
+  docs/STAGE6_EVIDENCE_HARDENING_EXTERNAL_HANDOFF.md
+require_text 'keep Stage 6 explicitly' \
+  docs/evidence/STAGE6_EVIDENCE_HARDENING_SOURCE_CANDIDATE.md
+
 printf 'qualification_doc_state=consistent\n'
 printf 'current_visual_handoff=v15\n'
 printf 'b250_source_evidence=pass_source_only\n'
