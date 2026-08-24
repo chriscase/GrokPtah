@@ -222,6 +222,18 @@ in `/private/tmp/grokptah-cu-isolated-visual-v15.bundle` (SHA-256
 It remains source-only and must not be conflated with the recorded `b250b70`
 source result.
 
+A separate external Stage 6 evidence-hardening source candidate was observed
+at `/private/tmp/grokptah-stage6-evidence-hardening`, HEAD
+`984ff9a4b13a6f2eb2054c84d5880abd5a0d4e1a`. Its original bundle advertised
+an older head and remains rejected; a corrected exact-head bundle was resealed
+at `/private/tmp/grokptah-stage6-evidence-hardening-v1-exact-984ff9a.bundle`
+(SHA-256 `cfa741b67c51bc9804b566440a855348727d398c7d97279b2e61e5cbeb12b91b`).
+The provenance and next external gates are recorded in
+[`STAGE6_EVIDENCE_HARDENING_SOURCE_CANDIDATE.md`](evidence/STAGE6_EVIDENCE_HARDENING_SOURCE_CANDIDATE.md).
+The copyable, cache-safe external procedure is
+[`STAGE6_EVIDENCE_HARDENING_EXTERNAL_HANDOFF.md`](STAGE6_EVIDENCE_HARDENING_EXTERNAL_HANDOFF.md).
+It is not integrated, independently reviewed, or a Stage 6 certification.
+
 ### Always-On v52 route-identity repair — 2026-08-24
 
 The v51 campaign reached the real `grokptah-service` process but failed closed

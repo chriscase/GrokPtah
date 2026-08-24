@@ -542,6 +542,12 @@ packaged Computer Use campaign. The
 serialized, cache-safe overnight coordinator for v52 followed by the later
 v15 campaign is
 [`OVERNIGHT_QUALIFICATION_COORDINATOR.md`](OVERNIGHT_QUALIFICATION_COORDINATOR.md).
+An external Stage 6 evidence-hardening candidate has since been resealed at
+exact head `984ff9a4b13a6f2eb2054c84d5880abd5a0d4e1a`; its provenance and
+cache-safe Grok Build procedure are
+[`STAGE6_EVIDENCE_HARDENING_SOURCE_CANDIDATE.md`](evidence/STAGE6_EVIDENCE_HARDENING_SOURCE_CANDIDATE.md)
+and [`STAGE6_EVIDENCE_HARDENING_EXTERNAL_HANDOFF.md`](STAGE6_EVIDENCE_HARDENING_EXTERNAL_HANDOFF.md).
+This is queued work only and does not alter the Stage 6 exit or certify a soak.
 The dream candidate now accepts externally managed, Agent-bound worker credentials,
 scopes them to
 the final service workspace allowlist, rejects token reuse, and has a real
