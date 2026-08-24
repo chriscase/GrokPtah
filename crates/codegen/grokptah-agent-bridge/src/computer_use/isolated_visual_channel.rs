@@ -156,6 +156,87 @@ impl IsolatedVisualChannelBinding {
         );
         Ok(packet)
     }
+
+    /// Decodes and authenticates the fixed binding packet on the guest side.
+    /// The challenge is never serialized into the packet; a wrong challenge,
+    /// changed identity, or changed confirmation fails closed.
+    pub fn decode_header_and_payload(packet: &[u8], challenge: &[u8; 32]) -> ComputerResult<Self> {
+        if packet.len() < ISOLATED_VISUAL_BINDING_HEADER_BYTES
+            || packet.len()
+                > ISOLATED_VISUAL_BINDING_HEADER_BYTES + 4 * ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::LimitReached,
+                "isolated visual binding packet exceeds its bound",
+            ));
+        }
+        if read_u32(packet, 0)? != ISOLATED_VISUAL_BINDING_MAGIC
+            || read_u16(packet, 4)? != ISOLATED_VISUAL_BINDING_VERSION
+            || read_u16(packet, 6)? != ISOLATED_VISUAL_GUEST_PROTOCOL_VERSION as u16
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenTarget,
+                "isolated visual binding version or magic is unsupported",
+            ));
+        }
+        let lengths = [
+            read_u16(packet, 8)? as usize,
+            read_u16(packet, 10)? as usize,
+            read_u16(packet, 12)? as usize,
+            read_u16(packet, 14)? as usize,
+        ];
+        if lengths
+            .iter()
+            .any(|length| *length == 0 || *length > ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES)
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "isolated visual binding field exceeds its bound",
+            ));
+        }
+        let payload_bytes = lengths.iter().sum::<usize>();
+        if packet.len() != ISOLATED_VISUAL_BINDING_HEADER_BYTES + payload_bytes {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "isolated visual binding packet length is inconsistent",
+            ));
+        }
+        let payload = &packet[ISOLATED_VISUAL_BINDING_HEADER_BYTES..];
+        let mut offset = 0;
+        let mut fields = Vec::with_capacity(4);
+        for (index, length) in lengths.into_iter().enumerate() {
+            let end = offset + length;
+            let field = std::str::from_utf8(&payload[offset..end]).map_err(|_| {
+                ComputerError::new(
+                    ComputerErrorCode::InvalidRequest,
+                    format!("isolated visual binding field {index} is not UTF-8"),
+                )
+            })?;
+            fields.push(field.to_owned());
+            offset = end;
+        }
+        let binding = Self {
+            run_id: fields.remove(0),
+            surface_id: fields.remove(0),
+            incarnation: fields.remove(0),
+            input_domain_id: fields.remove(0),
+        };
+        let digest = binding.digest()?;
+        if !constant_time_eq(&digest, &packet[16..48]) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "isolated visual binding digest does not match its identities",
+            ));
+        }
+        let confirmation = binding.confirmation_tag(challenge)?;
+        if !constant_time_eq(&confirmation, &packet[48..80]) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "isolated visual binding confirmation failed",
+            ));
+        }
+        Ok(binding)
+    }
 }
 
 fn put_u16(output: &mut Vec<u8>, value: usize) {
@@ -164,6 +245,49 @@ fn put_u16(output: &mut Vec<u8>, value: usize) {
 
 fn put_u32(output: &mut Vec<u8>, value: u32) {
     output.extend_from_slice(&value.to_be_bytes());
+}
+
+fn read_u16(packet: &[u8], offset: usize) -> ComputerResult<u16> {
+    let end = offset.checked_add(2).ok_or_else(|| {
+        ComputerError::new(
+            ComputerErrorCode::InvalidRequest,
+            "isolated visual binding header offset overflow",
+        )
+    })?;
+    let bytes = packet.get(offset..end).ok_or_else(|| {
+        ComputerError::new(
+            ComputerErrorCode::InvalidRequest,
+            "isolated visual binding header is truncated",
+        )
+    })?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32(packet: &[u8], offset: usize) -> ComputerResult<u32> {
+    let end = offset.checked_add(4).ok_or_else(|| {
+        ComputerError::new(
+            ComputerErrorCode::InvalidRequest,
+            "isolated visual binding header offset overflow",
+        )
+    })?;
+    let bytes = packet.get(offset..end).ok_or_else(|| {
+        ComputerError::new(
+            ComputerErrorCode::InvalidRequest,
+            "isolated visual binding header is truncated",
+        )
+    })?;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0_u8;
+    for (left, right) in left.iter().zip(right.iter()) {
+        difference |= left ^ right;
+    }
+    difference == 0
 }
 
 #[cfg(test)]
@@ -191,6 +315,24 @@ mod tests {
         assert_eq!(
             packet.len(),
             ISOLATED_VISUAL_BINDING_HEADER_BYTES + 5 + 9 + 13 + 7
+        );
+        assert_eq!(
+            IsolatedVisualChannelBinding::decode_header_and_payload(&packet, &[0; 32]).unwrap(),
+            binding
+        );
+        let mut tampered = packet.clone();
+        tampered[16] ^= 1;
+        assert_eq!(
+            IsolatedVisualChannelBinding::decode_header_and_payload(&tampered, &[0; 32])
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Unauthorized
+        );
+        assert_eq!(
+            IsolatedVisualChannelBinding::decode_header_and_payload(&packet, &[1; 32])
+                .unwrap_err()
+                .code,
+            ComputerErrorCode::Unauthorized
         );
     }
 }
