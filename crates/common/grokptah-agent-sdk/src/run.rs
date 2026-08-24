@@ -7,6 +7,7 @@ pub type IdempotencyKey = String;
 
 /// The exact identity fence required for a run operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunScope {
     /// Authenticated GrokPtah session identity.
     pub session_id: String,
@@ -128,7 +129,7 @@ pub struct RunEventPage {
 
 /// Stream notification for event consumers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "camelCase")]
 pub enum RunNotification {
     /// A scoped event journal update.
     Event { scope: RunScope, event: RunEvent },
@@ -191,5 +192,25 @@ mod tests {
         assert_eq!(value["sessionId"], "session-1");
         assert_eq!(value["bounds"]["maxRounds"], 8);
         assert_eq!(value["executionMode"], "isolated_worktree");
+    }
+
+    #[test]
+    fn scope_and_recovery_notification_match_the_v1_json_schema() {
+        let value = serde_json::to_value(RunNotification::Recovery {
+            scope: RunScope {
+                session_id: "session-1".into(),
+                workspace: "/approved".into(),
+                run_id: "run-1".into(),
+            },
+            after_seq: 7,
+            reason: "cursor_expired".into(),
+            poll_tool: "ptah_get_events".into(),
+        })
+        .expect("notification serializes");
+        assert_eq!(value["scope"]["sessionId"], "session-1");
+        assert_eq!(value["scope"]["runId"], "run-1");
+        assert_eq!(value["afterSeq"], 7);
+        assert_eq!(value["pollTool"], "ptah_get_events");
+        assert!(value.get("after_seq").is_none());
     }
 }

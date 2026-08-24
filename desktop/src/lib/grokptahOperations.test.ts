@@ -100,4 +100,49 @@ describe("GrokPtahOperations", () => {
     ).rejects.toThrow("sessionId must not be empty");
     expect(fetcher).not.toHaveBeenCalled();
   });
+
+  it("fails closed when the negotiated set omits a requested capability", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const operations = new GrokPtahOperations(clientWithCapabilities(fetcher, []));
+    await expect(
+      operations.submitTask(
+        { sessionId: "session-1", workspace: "/repo" },
+        "request-1",
+        "review",
+      ),
+    ).rejects.toMatchObject({ capabilityId: "run.execute", state: "unavailable" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("exposes queue CAS operations through the same capability fence", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      response({ jsonrpc: "2.0", id: 1, result: { ok: true } }),
+    );
+    const operations = new GrokPtahOperations(
+      clientWithCapabilities(fetcher, [
+        {
+          id: "run.queue",
+          tier: "execute",
+          mutating: true,
+          human_gate: false,
+          availability: "available",
+          description: "Queue",
+        },
+      ]),
+    );
+    await operations.reorderQueue(
+      { sessionId: "session-1", workspace: "/repo" },
+      "request-1",
+      "entry-1",
+      0,
+      3,
+      9,
+    );
+    expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body)).params.arguments).toMatchObject({
+      entry_id: "entry-1",
+      to_index: 0,
+      expected_version: 3,
+      expected_revision: 9,
+    });
+  });
 });

@@ -84,9 +84,12 @@ contract is stabilized. A small `@grokptah/client` package should later expose
 typed TypeScript methods and cursor-aware event streams without exposing
 tokens, raw prompts, or arbitrary desktop state.
 
-The current Tauri-free source barrel is
-`desktop/src/lib/public.ts`; it is an implementation staging point, not yet a
-published package or compatibility promise.
+The Tauri-free source barrels are split by trust boundary. Browser consumers
+use `desktop/src/lib/public.ts`, which exports only the broker client,
+capability contracts, and help index. A trusted desktop/server adapter may use
+`desktop/src/lib/trusted.ts`, which contains the direct MCP client and therefore
+must never be shipped in a browser bundle. Both are implementation staging
+points, not yet published packages or compatibility promises.
 
 The project-wide ordered status and 100% exit gate are tracked in
 [`docs/ROADMAP_TO_100.md`](./ROADMAP_TO_100.md).

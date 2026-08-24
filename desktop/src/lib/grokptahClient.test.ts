@@ -84,6 +84,76 @@ describe("GrokPtahClient", () => {
     await expect(malformed.initialize()).rejects.toThrow("protocolVersion");
   });
 
+  it("rejects a valid protocol handshake without a valid capability contract", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      response({
+        jsonrpc: "2.0",
+        id: 1,
+        result: { protocolVersion: "2025-03-26", serverInfo: {} },
+      }),
+    );
+    const client = new GrokPtahClient({
+      baseUrl: "http://127.0.0.1:39200/mcp",
+      token: "secret",
+      fetcher,
+    });
+    await expect(client.initialize()).rejects.toThrow("valid capability contract");
+    expect(client.isInitialized).toBe(false);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps remote errors share-safe and bounded", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        response(
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            result: {
+              protocolVersion: "2025-03-26",
+              serverInfo: {
+                capabilityContract: {
+                  contract: CAPABILITY_CONTRACT,
+                  capabilities: [],
+                },
+              },
+            },
+          },
+          200,
+          { "mcp-session-id": "transport-1" },
+        ),
+      )
+      .mockResolvedValueOnce(response(null, 202))
+      .mockResolvedValueOnce(
+        response({
+          jsonrpc: "2.0",
+          id: 2,
+          error: {
+            code: -32000,
+            message: "safe message",
+            data: {
+              code: "forbidden_scope",
+              requestId: "req-1",
+              privilegedPath: "/Users/private",
+            },
+          },
+        }),
+      );
+    const client = new GrokPtahClient({
+      baseUrl: "http://127.0.0.1:39200/mcp",
+      token: "secret",
+      fetcher,
+    });
+    await client.initialize();
+    await expect(client.callTool("ptah_get_run", {})).rejects.toMatchObject({
+      name: "GrokPtahRemoteError",
+      code: "forbidden_scope",
+      message: "safe message",
+      requestId: "req-1",
+    });
+  });
+
   it("replays scoped SSE events and stops at an explicit recovery frame", async () => {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {

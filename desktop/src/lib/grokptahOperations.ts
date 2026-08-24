@@ -6,6 +6,7 @@ import {
 import {
   GrokPtahClient,
   type GrokPtahCallResult,
+  GrokPtahRemoteError,
   type GrokPtahRunScope,
 } from "./grokptahClient";
 
@@ -217,6 +218,98 @@ export class GrokPtahOperations {
     });
   }
 
+  async editQueue<T = unknown>(
+    scope: GrokPtahScope,
+    requestId: string,
+    entryId: string,
+    version: number,
+    text: string,
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("run.queue");
+    return this.invoke<T>("ptah_edit_queue", {
+      request_id: nonEmpty(requestId, "requestId"),
+      ...scopeArgs(scope),
+      entry_id: nonEmpty(entryId, "entryId"),
+      version,
+      text: nonEmpty(text, "text"),
+    });
+  }
+
+  async removeQueue<T = unknown>(
+    scope: GrokPtahScope,
+    requestId: string,
+    entryId: string,
+    expectedVersion: number,
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("run.queue");
+    return this.invoke<T>("ptah_remove_queue", {
+      request_id: nonEmpty(requestId, "requestId"),
+      ...scopeArgs(scope),
+      entry_id: nonEmpty(entryId, "entryId"),
+      expected_version: expectedVersion,
+    });
+  }
+
+  async reorderQueue<T = unknown>(
+    scope: GrokPtahScope,
+    requestId: string,
+    entryId: string,
+    toIndex: number,
+    expectedVersion: number,
+    expectedRevision: number,
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("run.queue");
+    return this.invoke<T>("ptah_reorder_queue", {
+      request_id: nonEmpty(requestId, "requestId"),
+      ...scopeArgs(scope),
+      entry_id: nonEmpty(entryId, "entryId"),
+      to_index: toIndex,
+      expected_version: expectedVersion,
+      expected_revision: expectedRevision,
+    });
+  }
+
+  async clearQueue<T = unknown>(
+    scope: GrokPtahScope,
+    requestId: string,
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("run.queue");
+    return this.invoke<T>("ptah_clear_queue", {
+      request_id: nonEmpty(requestId, "requestId"),
+      ...scopeArgs(scope),
+    });
+  }
+
+  async runNext<T = unknown>(
+    scope: GrokPtahScope,
+    requestId: string,
+    entryId: string,
+    expectedVersion: number,
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("run.queue");
+    return this.invoke<T>("ptah_run_next", {
+      request_id: nonEmpty(requestId, "requestId"),
+      ...scopeArgs(scope),
+      entry_id: nonEmpty(entryId, "entryId"),
+      expected_version: expectedVersion,
+    });
+  }
+
+  async steerQueued<T = unknown>(
+    scope: GrokPtahScope,
+    requestId: string,
+    entryId: string,
+    expectedVersion: number,
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("run.queue");
+    return this.invoke<T>("ptah_steer_queued", {
+      request_id: nonEmpty(requestId, "requestId"),
+      ...scopeArgs(scope),
+      entry_id: nonEmpty(entryId, "entryId"),
+      expected_version: expectedVersion,
+    });
+  }
+
   async approveRun<T = unknown>(
     scope: GrokPtahRunScope,
     requestId: string,
@@ -363,7 +456,10 @@ export class GrokPtahOperations {
     args: Record<string, unknown>,
   ): Promise<GrokPtahOperationResult<T>> {
     const result: GrokPtahCallResult = await this.client.callTool(tool, args);
-    if (result.isError) throw new Error(`GrokPtah ${tool} returned an error`);
+    if (result.isError) {
+      if (result.error) throw new GrokPtahRemoteError(result.error);
+      throw new Error(`GrokPtah ${tool} returned an error`);
+    }
     return {
       value: (result.structuredContent ?? result.content ?? result.raw) as T,
       raw: result.raw,
@@ -373,7 +469,6 @@ export class GrokPtahOperations {
   private requireAvailable(id: string): void {
     const capability = findCapability(this.client.capabilities, id);
     if (capability && capabilityActionState(capability) === "ready") return;
-    if (!capability && !this.client.capabilities) return;
     throw new GrokPtahCapabilityError(id, "unavailable");
   }
 

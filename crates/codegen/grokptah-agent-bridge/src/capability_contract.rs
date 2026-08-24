@@ -43,7 +43,16 @@ pub fn advertised_capabilities() -> CapabilitySet {
             description: "Submit, retry, and cancel bounded Build runs.".into(),
         });
     }
-    if has("ptah_get_queue") && has("ptah_queue_prompt") && has("ptah_steer") {
+    if has("ptah_get_queue")
+        && has("ptah_queue_prompt")
+        && has("ptah_edit_queue")
+        && has("ptah_remove_queue")
+        && has("ptah_reorder_queue")
+        && has("ptah_clear_queue")
+        && has("ptah_run_next")
+        && has("ptah_steer_queued")
+        && has("ptah_steer")
+    {
         capabilities.push(CapabilityDescriptor {
             id: "run.queue".into(),
             tier: CapabilityTier::Execute,

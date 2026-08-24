@@ -18,7 +18,7 @@ enough to close a stage.
 | 4. Gateway and enterprise | Least-privilege gateway profiles, quota/route truth, review through restricted company gateways | [Provider profiles](./PROVIDER_PROFILES.md); live enterprise certification remains unverified | In progress |
 | 5. Safe Computer Use | Redacted observation, semantic action, isolation, leases, stale-frame rejection, coordination | [Computer Use design](./COMPUTER_USE.md); source proof exists, packaged VM/hardware proof remains | In progress |
 | 6. Operator UX | Fast power-user workflows, keyboard/screen-reader correctness, understandable approvals and recovery | UI wave and Help Center fixes are in draft PRs #377/#380; independent expert acceptance remains | In progress |
-| 7. Semantic help | Searchable in-app help with contextual guidance and an optional assistant boundary | Help Center work is under review; full semantic corpus/assistant qualification remains | In progress |
+| 7. Semantic help | Searchable in-app help with contextual guidance and an optional assistant boundary | [Local Help Center contract](../desktop/src/lib/help.ts), accessible panel, and bounded assistant context are implemented; expert corpus/assistant qualification remains | In progress |
 | 8. Embeddable platform | Stable Rust DTOs, desktop adapter, browser-safe broker, reusable UI primitives | [Cross-product ADR](./ADR-003-cross-product-capability-surface.md), [broker protocol](./WEB_BROKER_PROTOCOL.md), [SDK](../crates/common/grokptah-agent-sdk/README.md) | Foundation implemented; consumer integration pending |
 | 9. Independent qualification | Strongest-model code/security/UI review, cross-language conformance, soak, gateway, packaged-CU, and recovery evidence | [Independent review protocol](./INDEPENDENT_REVIEW_PROTOCOL.md) | Pending exact candidate head |
 | 10. Release and adoption | Versioned packages, examples, migration docs, reproducible builds, signed artifacts, release runbook | Packaging and hosted-service work remain separate release gates | Not started |
@@ -52,7 +52,7 @@ the same candidate release:
   start another Cargo build wave on its shared target.
 - Put the current integration changes on an exact reviewable candidate, then
   run the independent strongest-model review protocol with Fast off.
-- Implement ContextDesk's server broker and desktop adapter against the SDK and
+- Integrate ContextDesk's server broker and desktop adapter against the SDK and
   add cross-repository conformance fixtures.
 - Resolve the open UI/help, orchestration-race, packaged Computer Use, and
   always-on certification PRs only after their evidence gates pass.

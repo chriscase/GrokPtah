@@ -17,6 +17,7 @@ describe("GrokPtahBrokerClient", () => {
     const client = new GrokPtahBrokerClient({
       baseUrl: "https://contextdesk.example",
       fetcher,
+      csrfToken: "csrf-1",
     });
 
     await client.submitRun(
@@ -33,9 +34,19 @@ describe("GrokPtahBrokerClient", () => {
       headers: {
         Accept: "application/json",
         "Idempotency-Key": "intent-1",
+        "X-CSRF-Token": "csrf-1",
       },
     });
     expect(fetcher.mock.calls[0][1]?.headers).not.toHaveProperty("Authorization");
+  });
+
+  it("fails closed before a mutating request without a broker CSRF token", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new GrokPtahBrokerClient({ baseUrl: "https://contextdesk.example", fetcher });
+    await expect(
+      client.submitRun("binding-1", { prompt: "review" }, "intent-1"),
+    ).rejects.toMatchObject<GrokPtahBrokerError>({ code: "csrf_required" });
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it("maps stable broker errors without exposing a privileged body", async () => {

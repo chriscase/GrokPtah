@@ -30,6 +30,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+use grokptah_agent_sdk::{ErrorCode as PublicErrorCode, ErrorEnvelope};
+
 use crate::computer_use::ComputerClientIdentity;
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
@@ -1346,12 +1348,46 @@ fn status_for(e: &OrchError) -> StatusCode {
 }
 
 fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
-    let mut data = json!({ "code": e.code.as_str() });
-    if let Some(extra) = e.data.as_ref().and_then(Value::as_object) {
-        for (key, value) in extra {
-            data[key] = value.clone();
+    let request_id = id
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(|value| value.chars().take(256).collect::<String>());
+    let public = ErrorEnvelope {
+        code: public_error_code(&e.code),
+        message: public_error_message(&e.code).into(),
+        request_id,
+    };
+    let mut data = serde_json::to_value(public).unwrap_or_else(|_| {
+        json!({
+            "code": "internal",
+            "message": "The operation failed.",
+            "requestId": null
+        })
+    });
+    // Preserve the detailed stable transport code and only the bounded cursor
+    // range needed for recovery. Never forward arbitrary OrchError data.
+    data["code"] = Value::String(e.code.as_str().into());
+    if let Some(range) = e
+        .data
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|extra| extra.get("eventRange"))
+        .and_then(Value::as_object)
+    {
+        let mut safe_range = serde_json::Map::new();
+        for key in ["startSeq", "endSeq"] {
+            if let Some(value) = range.get(key).and_then(Value::as_u64) {
+                safe_range.insert(key.into(), Value::from(value));
+            }
+        }
+        if !safe_range.is_empty() {
+            data["eventRange"] = Value::Object(safe_range);
         }
     }
+    let message = data
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("The operation failed.");
     (
         status,
         Json(JsonRpcResp {
@@ -1360,12 +1396,50 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
             result: None,
             error: Some(json!({
                 "code": -32000,
-                "message": e.message,
+                "message": message,
                 "data": data,
             })),
         }),
     )
         .into_response()
+}
+
+fn public_error_code(code: &OrchErrorCode) -> PublicErrorCode {
+    match code {
+        OrchErrorCode::Unauthenticated => PublicErrorCode::Unauthenticated,
+        OrchErrorCode::ForbiddenScope | OrchErrorCode::WorkspaceMismatch => {
+            PublicErrorCode::ForbiddenScope
+        }
+        OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted => PublicErrorCode::Capacity,
+        OrchErrorCode::StaleVersion | OrchErrorCode::CursorExpired => {
+            PublicErrorCode::StaleOrRecovery
+        }
+        OrchErrorCode::Timeout => PublicErrorCode::Internal,
+        OrchErrorCode::InvalidRequest | OrchErrorCode::Unsupported | OrchErrorCode::Conflict => {
+            PublicErrorCode::InvalidRequest
+        }
+        OrchErrorCode::Internal => PublicErrorCode::Internal,
+    }
+}
+
+fn public_error_message(code: &OrchErrorCode) -> &'static str {
+    match code {
+        OrchErrorCode::Unauthenticated => "Authentication is required.",
+        OrchErrorCode::ForbiddenScope | OrchErrorCode::WorkspaceMismatch => {
+            "The requested scope is not allowed."
+        }
+        OrchErrorCode::SessionBusy | OrchErrorCode::CapacityExhausted => {
+            "Bounded capacity is unavailable."
+        }
+        OrchErrorCode::StaleVersion | OrchErrorCode::CursorExpired => {
+            "The requested state is stale or requires recovery."
+        }
+        OrchErrorCode::Timeout => "The request exceeded its bounded deadline.",
+        OrchErrorCode::InvalidRequest => "The request is invalid.",
+        OrchErrorCode::Unsupported => "The operation is unsupported.",
+        OrchErrorCode::Conflict => "The request conflicts with current state.",
+        OrchErrorCode::Internal => "The operation failed.",
+    }
 }
 
 fn tools_list_result() -> Value {

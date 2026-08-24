@@ -71,7 +71,7 @@ export type GrokPtahBrokerClientOptions = {
   baseUrl: string;
   fetcher?: typeof fetch;
   credentials?: RequestCredentials;
-  /** Optional broker-issued CSRF token; never a GrokPtah bearer token. */
+  /** Broker-issued CSRF token required for every mutating request. */
   csrfToken?: string;
 };
 
@@ -268,11 +268,19 @@ export class GrokPtahBrokerClient {
     } = {},
   ): Promise<T> {
     const headers: Record<string, string> = { Accept: "application/json" };
+    const method = options.method ?? "GET";
+    if (method === "POST" && !this.csrfToken) {
+      throw new GrokPtahBrokerError(
+        0,
+        "csrf_required",
+        "A broker-issued CSRF token is required for mutating requests",
+      );
+    }
     if (options.body !== undefined) headers["Content-Type"] = "application/json";
     if (options.idempotencyKey) headers["Idempotency-Key"] = options.idempotencyKey;
-    if (options.method === "POST" && this.csrfToken) headers["X-CSRF-Token"] = this.csrfToken;
+    if (method === "POST" && this.csrfToken) headers["X-CSRF-Token"] = this.csrfToken;
     const response = await this.fetcher(`${this.apiUrl}${path}`, {
-      method: options.method ?? "GET",
+      method,
       headers,
       credentials: this.credentials,
       ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),

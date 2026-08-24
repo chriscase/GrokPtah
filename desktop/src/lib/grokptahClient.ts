@@ -10,8 +10,28 @@ export type GrokPtahCallResult = {
   structuredContent?: unknown;
   content?: unknown;
   isError?: boolean;
+  error?: GrokPtahSafeError;
   raw: unknown;
 };
+
+/** Share-safe MCP error data; privileged diagnostics are intentionally dropped. */
+export type GrokPtahSafeError = {
+  code: string;
+  message: string;
+  requestId?: string;
+};
+
+export class GrokPtahRemoteError extends Error {
+  readonly code: string;
+  readonly requestId?: string;
+
+  constructor(error: GrokPtahSafeError) {
+    super(error.message);
+    this.name = "GrokPtahRemoteError";
+    this.code = error.code;
+    this.requestId = error.requestId;
+  }
+}
 
 export type GrokPtahRunScope = {
   sessionId: string;
@@ -113,6 +133,10 @@ export class GrokPtahClient {
     this.protocolVersion = result.protocolVersion;
     const serverInfo = isRecord(result.serverInfo) ? result.serverInfo : null;
     this.capabilitySet = parseCapabilitySet(serverInfo?.capabilityContract);
+    if (!this.capabilitySet) {
+      this.protocolVersion = null;
+      throw new Error("GrokPtah initialize response has no valid capability contract");
+    }
     await this.notify("notifications/initialized", {});
     return result;
   }
@@ -145,6 +169,7 @@ export class GrokPtahClient {
       structuredContent: result.structuredContent,
       content: result.content,
       isError: result.isError === true,
+      error: parseSafeError(result.error),
       raw: result,
     };
   }
@@ -292,7 +317,12 @@ export class GrokPtahClient {
       throw new Error(`GrokPtah MCP request failed with HTTP ${response.status}`);
     }
     if (isRecord(body) && body.error) {
-      throw new Error(`GrokPtah MCP error: ${JSON.stringify(body.error)}`);
+      throw new GrokPtahRemoteError(
+        parseSafeError(body.error) ?? {
+          code: "remote_error",
+          message: "GrokPtah MCP request failed",
+        },
+      );
     }
     if (isRecord(body) && "result" in body) {
       const sessionId = response.headers.get("mcp-session-id");
@@ -386,5 +416,17 @@ function parseSseNotification(frame: string): GrokPtahRunNotification | null {
       pollTool: params.pollTool,
     };
   }
-  return { kind: "unknown", sseId, method: body.method, params: body.params };
+  throw new Error(`GrokPtah SSE notification method is unsupported: ${body.method}`);
+}
+
+function parseSafeError(value: unknown): GrokPtahSafeError | undefined {
+  if (!isRecord(value)) return undefined;
+  const data = isRecord(value.data) ? value.data : {};
+  const code = typeof data.code === "string" ? data.code : "remote_error";
+  const rawMessage = typeof value.message === "string" ? value.message : "GrokPtah request failed";
+  return {
+    code: code.slice(0, 128),
+    message: rawMessage.slice(0, 512),
+    ...(typeof data.requestId === "string" ? { requestId: data.requestId.slice(0, 256) } : {}),
+  };
 }

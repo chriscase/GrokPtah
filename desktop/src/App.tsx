@@ -25,6 +25,7 @@ import {
 import { ComputerCockpit } from "./components/ComputerCockpit";
 import { FleetStrip } from "./components/FleetStrip";
 import { SearchPanel } from "./components/SearchPanel";
+import { HelpPanel } from "./components/HelpPanel";
 import { SessionBrowser } from "./components/SessionBrowser";
 import { SessionPane } from "./components/SessionPane";
 import { SettingsPanel } from "./components/SettingsPanel";
@@ -342,6 +343,7 @@ export default function App() {
   const projectCwdHintRef = useRef<string | null>(null);
   const [sessionBrowserOpen, setSessionBrowserOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   /**
    * Ordered dock slots (session ids visible as columns). Phase 14.1 multi-zone.
    * Empty or single-element = classic single-pane; up to maxDocks columns.
@@ -2324,6 +2326,14 @@ export default function App() {
             >
               Browse
             </button>
+            <button
+              type="button"
+              className="sidebar-action-ghost"
+              onClick={() => setHelpOpen(true)}
+              title="Open Help Center"
+            >
+              Help
+            </button>
           </div>
         </div>
         <p className="session-hint">
@@ -3793,6 +3803,8 @@ export default function App() {
           })();
         }}
       />
+
+      <HelpPanel open={helpOpen} onClose={() => setHelpOpen(false)} />
 
       {aboutOpen && (
         <div className="modal-backdrop" onClick={() => setAboutOpen(false)}>
