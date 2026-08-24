@@ -169,10 +169,9 @@ static int gpt_write_exact(int descriptor, const gpt_u8 *bytes, gpt_size length)
     return offset == length;
 }
 
-static void gpt_sleep_retry(void) {
+static int gpt_sleep_retry(void) {
     gpt_timespec delay = {.seconds = 0, .nanoseconds = 100000000L};
-    while (gpt_syscall3(GPT_SYS_NANOSLEEP, (long)&delay, 0, 0) == -GPT_EINTR) {
-    }
+    return gpt_syscall3(GPT_SYS_NANOSLEEP, (long)&delay, 0, 0) == 0;
 }
 
 static int gpt_open_framebuffer(void) {
@@ -428,7 +427,9 @@ static int gpt_connect_to_host(void) {
         if (result == 0) {
             return (int)descriptor;
         }
-        gpt_sleep_retry();
+        if (!gpt_sleep_retry()) {
+            break;
+        }
     }
     gpt_syscall3(GPT_SYS_CLOSE, descriptor, 0, 0);
     return -1;

@@ -62,6 +62,7 @@ for required in GPT_AF_VSOCK GPT_GUEST_BOOTSTRAP_PORT GPT_GUEST_BOOTSTRAP_BIND \
   GPT_SYS_OPENAT GPT_SYS_LSEEK GPT_SYS_POLL GPT_SYS_GETRANDOM GPT_GUEST_FRAME_BYTES \
   GPT_POLLOUT GPT_POLLNVAL GPT_GUEST_IO_ATTEMPTS GPT_GUEST_IO_WAIT_MILLISECONDS \
   gpt_wait_for_io 'attempts < GPT_GUEST_IO_ATTEMPTS' GPT_O_RDWR gpt_open_framebuffer \
+  gpt_sleep_retry GPT_SYS_NANOSLEEP \
   'ready < 0' \
   gpt_render_fixture gpt_capture_frame gpt_send_frame \
   gpt_apply_fixture_input; do

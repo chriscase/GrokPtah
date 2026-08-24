@@ -217,6 +217,9 @@ The monotonic VM-deadline hardening extension is sealed at:
   `poll`/`read` as a bounded transport failure rather than retrying inside an
   unbounded signal loop; the outer lifecycle can therefore perform its normal
   cleanup and report the original failure.
+- Guest connection backoff likewise treats an interrupted `nanosleep` as a
+  failed attempt, so signal interruption cannot extend the finite connection
+  retry budget indefinitely.
 - The stop boundary now rejects held keyboard/button state, waits for the
   helper to exit, and leaves the lifecycle in `CleanupPending` until explicit
   per-surface process, handle, overlay, and frame-cache evidence completes it.
