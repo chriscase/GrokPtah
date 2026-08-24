@@ -83,6 +83,70 @@ int main(void) {
         fputs("invalid isolated input packet was accepted\n", stderr);
         return 1;
     }
+    gpt_u8 state_packet[GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES +
+                       GPT_ISOLATED_VISUAL_INPUT_TAG_BYTES] = {0};
+    gpt_u32 held_keys_mask = 0;
+    gpt_u8 held_button = 0;
+    gpt_store_be16(state_packet + 42U, 1U);
+    state_packet[40U] = 2U;
+    state_packet[41U] = 1U;
+    if (!gpt_isolated_visual_input_apply_state(
+            state_packet,
+            &held_keys_mask,
+            &held_button) ||
+        held_button != 1U ||
+        gpt_isolated_visual_input_apply_state(
+            state_packet,
+            &held_keys_mask,
+            &held_button)) {
+        fputs("duplicate button down was accepted\n", stderr);
+        return 1;
+    }
+    state_packet[41U] = 2U;
+    state_packet[42U] = 0U;
+    state_packet[43U] = 2U;
+    if (gpt_isolated_visual_input_apply_state(
+            state_packet,
+            &held_keys_mask,
+            &held_button) ||
+        held_button != 1U) {
+        fputs("mismatched button up was accepted or state changed\n", stderr);
+        return 1;
+    }
+    state_packet[43U] = 1U;
+    if (!gpt_isolated_visual_input_apply_state(
+            state_packet,
+            &held_keys_mask,
+            &held_button) ||
+        held_button != 0U) {
+        fputs("matching button up did not clear held state\n", stderr);
+        return 1;
+    }
+    state_packet[40U] = 4U;
+    state_packet[41U] = 1U;
+    state_packet[42U] = 0U;
+    state_packet[43U] = 3U;
+    if (!gpt_isolated_visual_input_apply_state(
+            state_packet,
+            &held_keys_mask,
+            &held_button) ||
+        (held_keys_mask & (1U << 2U)) == 0U ||
+        gpt_isolated_visual_input_apply_state(
+            state_packet,
+            &held_keys_mask,
+            &held_button)) {
+        fputs("duplicate key down was accepted\n", stderr);
+        return 1;
+    }
+    state_packet[41U] = 2U;
+    if (!gpt_isolated_visual_input_apply_state(
+            state_packet,
+            &held_keys_mask,
+            &held_button) ||
+        held_keys_mask != 0U) {
+        fputs("key up did not clear held state\n", stderr);
+        return 1;
+    }
     gpt_u8 ready[GPT_GUEST_BOOTSTRAP_FRAME_BYTES];
     gpt_u8 stopped[GPT_GUEST_BOOTSTRAP_FRAME_BYTES];
     gpt_u8 binding_ack[GPT_GUEST_BOOTSTRAP_FRAME_BYTES];

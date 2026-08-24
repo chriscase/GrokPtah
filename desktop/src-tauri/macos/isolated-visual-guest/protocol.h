@@ -634,6 +634,63 @@ static GPT_GUEST_UNUSED int gpt_isolated_visual_input_valid(
     }
 }
 
+/* Keep held-input state independent from the host's model-facing state. */
+static GPT_GUEST_UNUSED int gpt_isolated_visual_input_apply_state(
+    const gpt_u8 *packet,
+    gpt_u32 *held_keys_mask,
+    gpt_u8 *held_button) {
+    gpt_u8 kind;
+    gpt_u8 state;
+    gpt_u16 code;
+    gpt_u32 key_bit;
+    if (packet == 0 || held_keys_mask == 0 || held_button == 0) {
+        return 0;
+    }
+    kind = packet[40U];
+    state = packet[41U];
+    code = gpt_load_be16(packet + 42U);
+    if (kind == 2U) {
+        if (state == 1U) {
+            if (*held_button != 0U) {
+                return 0;
+            }
+            *held_button = (gpt_u8)code;
+            return 1;
+        }
+        if (state == 2U) {
+            if (*held_button != (gpt_u8)code) {
+                return 0;
+            }
+            *held_button = 0;
+            return 1;
+        }
+        return 0;
+    }
+    if (kind == 4U) {
+        if (code == 0U || code > 18U) {
+            return 0;
+        }
+        key_bit = 1U << (code - 1U);
+        if (state == 1U) {
+            if ((*held_keys_mask & key_bit) != 0U) {
+                return 0;
+            }
+            *held_keys_mask |= key_bit;
+            return 1;
+        }
+        if (state == 2U) {
+            if ((*held_keys_mask & key_bit) == 0U) {
+                return 0;
+            }
+            *held_keys_mask &= ~key_bit;
+            return 1;
+        }
+        return 0;
+    }
+    /* Pointer, scroll, and text events do not hold state. */
+    return 1;
+}
+
 static int gpt_guest_bootstrap_tag(
     const gpt_u8 challenge[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES],
     gpt_u16 event,

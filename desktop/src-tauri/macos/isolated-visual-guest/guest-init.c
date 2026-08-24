@@ -177,11 +177,16 @@ __attribute__((noreturn)) void _start(void) {
     gpt_u16 binding_lengths[4] = {0, 0, 0, 0};
     gpt_u64 last_frame_sequence = 0;
     gpt_u64 last_input_sequence = 0;
+    gpt_u32 held_keys_mask = 0;
+    gpt_u8 held_button = 0;
     for (;;) {
         if (!gpt_read_exact(socket, &command, 1U)) {
             gpt_power_off(22);
         }
         if (command == GPT_GUEST_BOOTSTRAP_STOP) {
+            if (bound && (held_keys_mask != 0U || held_button != 0U)) {
+                gpt_power_off(32);
+            }
             if (!gpt_guest_bootstrap_frame(
                     challenge,
                     GPT_GUEST_BOOTSTRAP_EVENT_SHUTDOWN_ACK,
@@ -216,7 +221,11 @@ __attribute__((noreturn)) void _start(void) {
                     last_frame_sequence,
                     last_input_sequence,
                     GPT_ISOLATED_VISUAL_MAX_DISPLAY_WIDTH,
-                    GPT_ISOLATED_VISUAL_MAX_DISPLAY_HEIGHT)) {
+                    GPT_ISOLATED_VISUAL_MAX_DISPLAY_HEIGHT) ||
+                !gpt_isolated_visual_input_apply_state(
+                    packet,
+                    &held_keys_mask,
+                    &held_button)) {
                 gpt_power_off(24);
             }
             last_input_sequence += 1U;
@@ -284,6 +293,8 @@ __attribute__((noreturn)) void _start(void) {
         bound = 1;
         last_frame_sequence = 0;
         last_input_sequence = 0;
+        held_keys_mask = 0;
+        held_button = 0;
     }
     gpt_syscall3(GPT_SYS_CLOSE, socket, 0, 0);
     gpt_power_off(0);
