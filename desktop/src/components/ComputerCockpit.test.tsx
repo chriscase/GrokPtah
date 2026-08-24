@@ -599,6 +599,16 @@ describe("ComputerCockpit", () => {
     expect(await screen.findByText("Ada Lovelace")).toBeTruthy();
     expect(screen.getByText("Frame 1 · one use")).toBeTruthy();
     expect(screen.queryByTestId("computer-agent-cursor")).toBeNull();
+    const approvalDialog = screen.getByRole("dialog", { name: "Enter visible text in Name" });
+    const reject = screen.getByRole("button", { name: "Reject" });
+    const approve = screen.getByRole("button", { name: "Approve once" });
+    expect(reject).toHaveFocus();
+    approve.focus();
+    fireEvent.keyDown(approvalDialog, { key: "Tab" });
+    expect(reject).toHaveFocus();
+    reject.focus();
+    fireEvent.keyDown(approvalDialog, { key: "Tab", shiftKey: true });
+    expect(approve).toHaveFocus();
     fireEvent.click(screen.getByRole("button", { name: "Approve once" }));
 
     expect(

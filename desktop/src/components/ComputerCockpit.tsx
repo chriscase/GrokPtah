@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from "react";
 import { api } from "../lib/api";
 import {
   computerActivityAnnouncement,
@@ -96,6 +103,14 @@ function actionText(action: ComputerAction) {
   }
 }
 
+function focusableDialogElements(dialog: HTMLElement): HTMLElement[] {
+  return Array.from(
+    dialog.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ),
+  );
+}
+
 function coordinationCopy(coordination: ComputerSurfaceCoordination) {
   if (coordination.blockedByUncertainOutcome) {
     return {
@@ -181,6 +196,8 @@ export function ComputerCockpit({
   const requestEpoch = useRef(0);
   const emergencyEpoch = useRef(0);
   const proposalFocus = useRef<HTMLButtonElement | null>(null);
+  const approvalDialogRef = useRef<HTMLDivElement | null>(null);
+  const lastApprovalId = useRef<string | null>(null);
 
   const publishSnapshot = useCallback(
     (next: ComputerCockpitSnapshot) => {
@@ -317,6 +334,34 @@ export function ComputerCockpit({
     ["status", "AXStaticText"].includes(element.role),
   );
   const approval = snapshot?.pendingApproval ?? null;
+
+  useEffect(() => {
+    const approvalId = approval?.approvalId ?? null;
+    if (approvalId && approvalId !== lastApprovalId.current) {
+      const first = approvalDialogRef.current
+        ? focusableDialogElements(approvalDialogRef.current)[0]
+        : undefined;
+      first?.focus();
+    } else if (!approvalId && lastApprovalId.current) {
+      proposalFocus.current?.focus();
+    }
+    lastApprovalId.current = approvalId;
+  }, [approval?.approvalId]);
+
+  const trapApprovalFocus = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Tab" || !approvalDialogRef.current) return;
+    const focusable = focusableDialogElements(approvalDialogRef.current);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
   const agentProposalActive = approval?.proposalOrigin === "agent";
   const agentAttentionElementId =
     agentProposalActive && "element_id" in approval.action
@@ -1318,12 +1363,14 @@ export function ComputerCockpit({
 
           {approval && (
             <div
+              ref={approvalDialogRef}
               className="computer-approval"
               role="dialog"
               aria-label="Approve Computer Use action"
               aria-modal="true"
               aria-labelledby="computer-approval-title"
               aria-describedby="computer-approval-details"
+              onKeyDown={trapApprovalFocus}
             >
               <div className="computer-approval-title">
                 <div><span className="computer-section-label">Approval required</span><h2 id="computer-approval-title">{approval.actionSummary}</h2></div>
@@ -1350,7 +1397,6 @@ export function ComputerCockpit({
                   type="button"
                   className="primary"
                   disabled={busy}
-                  autoFocus
                   onClick={() =>
                     void apply(
                       () =>
