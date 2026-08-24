@@ -6,12 +6,12 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `63363b4603c3b971424716820ba568610f7e5f4a`
-- Bundle: `/private/tmp/grokptah-cu-stage25-packaged-supervisor-v1.bundle`
-- Bundle SHA-256: `a199ba07fe1211a7d7a4f4ea14c987416250c4dd18d0ff7faf31ae58c9e64ad6`
+- Head: `78a4f5844e9162846dc472554e5990bcaefaaeb5`
+- Bundle: `/private/tmp/grokptah-cu-stage26-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `47f9b122f4af6ce15cbb0885471a299957af83e45d6217e4129a07a00637e346`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current sealed implementation head: `63363b4603c3b971424716820ba568610f7e5f4a`.
+Current sealed implementation head: `78a4f5844e9162846dc472554e5990bcaefaaeb5`.
 
 The later guest-input validation extension is sealed at:
 
@@ -57,9 +57,9 @@ The private guest-challenge channel extension is sealed at:
 
 The bounded packaged-supervisor source extension is sealed at:
 
-- Commit: `63363b4603c3b971424716820ba568610f7e5f4a`
-- Bundle: `/private/tmp/grokptah-cu-stage25-packaged-supervisor-v1.bundle`
-- Bundle SHA-256: `a199ba07fe1211a7d7a4f4ea14c987416250c4dd18d0ff7faf31ae58c9e64ad6`
+- Commit: `78a4f5844e9162846dc472554e5990bcaefaaeb5`
+- Bundle: `/private/tmp/grokptah-cu-stage26-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `47f9b122f4af6ce15cbb0885471a299957af83e45d6217e4129a07a00637e346`
 
 ## What this candidate proves
 
@@ -112,6 +112,9 @@ The bounded packaged-supervisor source extension is sealed at:
   pipe with close-on-exec set in the parent. This is a packaged-
   supervisor **source candidate**; no signed app has launched it and no VM
   boot/render/input/cleanup result is claimed.
+- The packaged supervisor exposes read-only runtime inspection while keeping
+  lifecycle-state mutation behind its driver; callers cannot obtain a public
+  mutable session reference and bypass the ordered helper protocol.
 - Before native spawn, the Rust launch seam now opens the exact package through
   the existing read-only measurement/receipt verifier and binds the caller's
   manifest to helper, guest-image, configuration, and designated-requirement
