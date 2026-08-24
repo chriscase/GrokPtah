@@ -117,6 +117,9 @@ for required in \
   'GPTRelayGuestFrameToHost'; do
   grep -F "$required" "$helper_source" >/dev/null
 done
+for required in waitpid WNOHANG SIGKILL EINTR; do
+  grep -F "$required" "$runtime_source" >/dev/null
+done
 for required in \
   'gpt_macos_isolated_runtime_spawn' \
   'int32_t helper_fd' \

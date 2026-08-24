@@ -222,6 +222,9 @@ The monotonic VM-deadline hardening extension is sealed at:
   retry budget indefinitely.
 - The guest and helper source verifiers now reject regressions that reintroduce
   signal-retry loops around transport `poll`/`read` or guest reconnect sleep.
+- Supervisor child waits now treat `waitpid` interruption as a bounded retry,
+  while preserving the pre-signal ownership check that prevents a recycled PID
+  from being signaled during cleanup.
 - The stop boundary now rejects held keyboard/button state, waits for the
   helper to exit, and leaves the lifecycle in `CleanupPending` until explicit
   per-surface process, handle, overlay, and frame-cache evidence completes it.

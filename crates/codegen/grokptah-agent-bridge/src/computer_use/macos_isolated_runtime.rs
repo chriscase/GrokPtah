@@ -114,7 +114,15 @@ fn terminate_process(pid: libc::pid_t) -> bool {
         return true;
     }
     if initial < 0 {
-        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            return true;
+        }
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return false;
+        }
+        // EINTR leaves ownership unresolved but does not reap the child. Keep
+        // the supervisor-owned PID and continue to the bounded kill/reap path.
     }
     // SAFETY: the PID was returned by our launch shim. A failed kill is
     // intentionally followed by bounded reap polling; the normal stop path
@@ -130,7 +138,14 @@ fn terminate_process(pid: libc::pid_t) -> bool {
             return true;
         }
         if result < 0 {
-            return std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                return true;
+            }
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return false;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -347,9 +362,13 @@ impl IsolatedVisualPackagedRuntime {
                 return Ok(());
             }
             if result < 0 {
-                if std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ECHILD) {
                     self.exited = true;
                     return Ok(());
+                }
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
                 }
                 return Err(ComputerError::new(
                     ComputerErrorCode::BackendFailure,
