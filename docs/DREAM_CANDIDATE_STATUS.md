@@ -141,7 +141,7 @@ complete or that the product has reached 100%.
 
 ### Latest desktop safety continuation — 2026-08-24
 
-Candidate `98fca57573aedf4aa160469956e0ddf306b0a572` extends the shared,
+Candidate `a20b819421027f43cbc9c259699ff14724ab1d22` extends the shared,
 bounded backend-error display boundary across the desktop surfaces. Credential-
 shaped values, local paths, and UI-only secret placeholders are redacted before
 errors reach search, session, run, routine, worker, settings, terminal, remote
@@ -150,7 +150,10 @@ also has a clear retry path. The focused redaction tests and full desktop suite
 (49 files, 383 tests) pass; this is source/UI safety evidence only and is not a
 packaged-desktop acceptance or expert UX cadence record. Parent-provided load
 diagnostics now pass through the same boundary before technical details render,
-closing the path visible in the earlier persistent-agent capture.
+closing the path visible in the earlier persistent-agent capture. The visual
+review also found unlabeled glyph-only operator controls; Work refresh, new-tab,
+shell-dismiss, and Live-rail-hide controls now expose explicit accessible names
+with regression coverage. This remains source/UI evidence, not packaged review.
 
 ## Verification recorded
 
