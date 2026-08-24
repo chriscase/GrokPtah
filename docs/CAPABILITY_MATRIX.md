@@ -56,6 +56,11 @@ row. The other three are `—`. Pending draft-PR work is never marked Supported.
 | 72-hour operational soak | Required for always-on Grokbot exit | Not a logical-years memory proof |
 | Open draft PR | **Pending — not shipped** | No |
 
+For isolated visual Computer Use, the ordinary `grokptah.computer-qualification.v1` record is
+semantic-only. Visual fallback additionally requires a **measured** record with the separate
+`grokptah.isolated-visual-computer-qualification.v1` schema, issued only after the packaged
+campaign and independent review pass.
+
 ## Distinctions that must not be collapsed
 
 1. **Grok Build session/gateway routing is already Supported.** GrokPtah loads

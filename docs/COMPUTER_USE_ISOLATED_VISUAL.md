@@ -77,7 +77,7 @@ cannot be enabled by a model prompt or provider profile.
 Capability admission has a separate proof fence as well: the ordinary
 `grokptah.computer-qualification.v1` record measures semantic observation/action against the
 in-process fixture and can never grant visual fallback. A model is downgraded to semantic
-authority unless its exact capability record carries
+authority unless its exact **measured** capability record carries
 `grokptah.isolated-visual-computer-qualification.v1`, which may be written only after the
 credentialed packaged-runtime campaign and independent review pass. Until then, a declared or
 manually supplied visual tier does not expose isolated visual authority.

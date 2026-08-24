@@ -201,6 +201,11 @@ impl ModelCapabilities {
             return ComputerUseTier::SemanticAct;
         }
         if self.computer_use_tier == ComputerUseTier::VisualFallbackAct
+            && self.computer_capability_source != CapabilitySource::Measured
+        {
+            return ComputerUseTier::SemanticAct;
+        }
+        if self.computer_use_tier == ComputerUseTier::VisualFallbackAct
             && self.computer_qualification_schema.as_deref()
                 != Some(ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA)
         {
@@ -1748,6 +1753,12 @@ mod tests {
             capabilities.effective_computer_use_tier(),
             ComputerUseTier::SemanticAct,
             "visual fallback requires isolated-runtime qualification evidence"
+        );
+        capabilities.computer_capability_source = CapabilitySource::Measured;
+        assert_eq!(
+            capabilities.effective_computer_use_tier(),
+            ComputerUseTier::SemanticAct,
+            "measured provenance alone does not grant visual fallback"
         );
         capabilities.computer_qualification_schema =
             Some(ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA.into());
