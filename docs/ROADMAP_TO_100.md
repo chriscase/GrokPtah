@@ -539,7 +539,10 @@ dedicated procedure is
 [`ALWAYS_ON_GROKBOT_V52_ROUTE_IDENTITY_HANDOFF.md`](ALWAYS_ON_GROKBOT_V52_ROUTE_IDENTITY_HANDOFF.md).
 It must not be treated as a second certification or conflated with the
 packaged Computer Use campaign. The
-dream candidate now accepts externally managed, Agent-bound worker credentials,
+serialized, cache-safe overnight coordinator for v52 followed by the later
+v15 campaign is
+[`OVERNIGHT_QUALIFICATION_COORDINATOR.md`](OVERNIGHT_QUALIFICATION_COORDINATOR.md).
+The dream candidate now accepts externally managed, Agent-bound worker credentials,
 scopes them to
 the final service workspace allowlist, rejects token reuse, and has a real
 service-process harness that holds two independent worker leases across the
