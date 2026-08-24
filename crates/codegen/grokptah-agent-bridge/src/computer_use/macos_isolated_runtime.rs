@@ -401,11 +401,13 @@ impl IsolatedVisualPackagedRuntime {
         {
             return self.abort_with_error(error);
         }
+        // Stop is terminal even when bounded reaping reports an error. Never
+        // leave a live lease attached to a stopping/exited guest: a failed
+        // stop must not create a path to resume or retry input. Cleanup still
+        // requires its independent exact evidence and may fail closed while
+        // the process/handles are unresolved.
         let result = self.wait_for_exit();
-        if result.is_ok() {
-            self.lease = None;
-        }
-        result
+        finish_terminal_stop(&mut self.lease, result)
     }
 
     /// Completes the terminal transition only after the caller has verified
@@ -486,6 +488,14 @@ impl IsolatedVisualPackagedRuntime {
     }
 }
 
+fn finish_terminal_stop<T>(
+    lease: &mut Option<IsolatedGuestLease>,
+    result: ComputerResult<T>,
+) -> ComputerResult<T> {
+    *lease = None;
+    result
+}
+
 impl Drop for IsolatedVisualPackagedRuntime {
     fn drop(&mut self) {
         if !self.exited {
@@ -497,12 +507,31 @@ impl Drop for IsolatedVisualPackagedRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::descriptors_are_distinct;
+    use super::{descriptors_are_distinct, finish_terminal_stop, IsolatedGuestLease};
+    use crate::computer_use::types::{ComputerError, ComputerErrorCode};
 
     #[test]
     fn native_launch_descriptor_set_must_be_complete_and_unique() {
         assert!(descriptors_are_distinct(&[3, 4, 5, 6, 7]));
         assert!(!descriptors_are_distinct(&[3, 4, 4, 6, 7]));
         assert!(!descriptors_are_distinct(&[3, -1, 5, 6, 7]));
+    }
+
+    #[test]
+    fn terminal_stop_revokes_lease_even_when_reaping_fails() {
+        let mut lease = Some(IsolatedGuestLease {
+            lease_id: "lease".into(),
+            agent_id: "agent".into(),
+            revision: 1,
+        });
+        let result = finish_terminal_stop::<()>(
+            &mut lease,
+            Err(ComputerError::new(
+                ComputerErrorCode::BackendFailure,
+                "reap failed",
+            )),
+        );
+        assert!(lease.is_none());
+        assert_eq!(result.unwrap_err().code, ComputerErrorCode::BackendFailure);
     }
 }
