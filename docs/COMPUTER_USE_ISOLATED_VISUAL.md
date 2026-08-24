@@ -214,15 +214,16 @@ available.
    separate authenticated binary guest-to-host frame-chunk carrier with bounded 64 KiB chunks,
    whole-frame SHA-256, exact offsets, and strict reassembly. Tamper, replay, wrong-secret,
    wrong-nonce, input, oversized-frame, reordered-chunk, digest-mismatch, and unknown-field paths
-   fail closed. The helper/guest bootstrap handshake and bounded FD7/FD8 relay are now present,
-   but the guest application capture and renderer are not wired yet, so this is not a rendered
-   frame or isolation proof.
+   fail closed. The helper/guest bootstrap handshake and bounded FD7/FD8 relay are now present;
+   the freestanding guest has a fixed `/dev/fb0` capture source and authenticated frame-chunk
+   emitter, but no reviewed GUI guest image or host renderer is wired into a packaged runtime yet.
 5. Add guest pointer state and one-action local approval; then key/text/scroll/drag independently.
    The source candidate now includes a non-dispatchable host-side input gate that binds every
    pointer/button/scroll/key/text edge to the latest frame, requires strictly increasing input
    sequence, enforces the measured display/text/event ceilings, and refuses terminal state while a
-   key or button remains held. It does not authenticate or send a socket message yet; the packaged
-   guest agent and one-action approval path remain required before any input claim. A separate
+   key or button remains held. The host-side gate does not itself authenticate or send a socket
+   message; the packaged guest agent and one-action approval path remain required before any input
+   claim. A separate
    authenticated binary host-to-guest input packet ABI now binds the same frame/input sequences and
    exact Run/surface/incarnation, but it is source-only and not dispatched. A shared session-binding
    contract now length-prefixes Run, surface, incarnation, and input-domain identities, derives a

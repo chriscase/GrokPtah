@@ -6,12 +6,12 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `d488aa4c31e8992f1537a4956e43e7bfcef2acdc`
-- Bundle: `/private/tmp/grokptah-cu-stage10-runtime-session-v1.bundle`
-- Bundle SHA-256: `bdd76c7ceaa910e261d4805bd52bc4172c054f5e7ebc060ac2688839d43ca5b0`
+- Head: `203de561e7189b8e19f17bc515b094450aa6387b`
+- Bundle: `/private/tmp/grokptah-cu-stage17-guest-frame-capture-v1.bundle`
+- Bundle SHA-256: `c7c8e1f45b70743e7dfbec19cde73dfec156e851238d29e1df43b5d4b19ac0a8`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current sealed implementation head: `c195ea5b6a5fb4f3f2a12911738baaff4abb6143`.
+Current sealed implementation head: `203de561e7189b8e19f17bc515b094450aa6387b`.
 
 The later guest-input validation extension is sealed at:
 
@@ -36,6 +36,12 @@ The helper relay extension is sealed at:
 - Commit: `c195ea5b6a5fb4f3f2a12911738baaff4abb6143`
 - Bundle: `/private/tmp/grokptah-cu-stage16-helper-relay-v1.bundle`
 - Bundle SHA-256: `f06788d22d3c49b4cbf981f20ad050cda00ba21362231541c7b0e3f6b01bc8b3`
+
+The guest framebuffer-capture extension is sealed at:
+
+- Commit: `203de561e7189b8e19f17bc515b094450aa6387b`
+- Bundle: `/private/tmp/grokptah-cu-stage17-guest-frame-capture-v1.bundle`
+- Bundle SHA-256: `c7c8e1f45b70743e7dfbec19cde73dfec156e851238d29e1df43b5d4b19ac0a8`
 
 ## What this candidate proves
 
@@ -62,13 +68,18 @@ The helper relay extension is sealed at:
   spawning a process or claiming a packaged VM capability.
 - The signed-helper source now validates private FD7/FD8 relay descriptors,
   forwards only bounded host input packets to the guest VSOCK, and forwards
-  only bounded guest frame packets to the host. The guest still has no capture
-  source, so this proves relay plumbing and fail-closed bounds—not a rendered
-  frame or a working model-facing Computer Use run.
+  only bounded guest frame packets to the host. This proves relay plumbing and
+  fail-closed bounds, not a rendered frame or a working model-facing Computer
+  Use run.
+- The freestanding guest now has a bounded `/dev/fb0` capture path: it reads a
+  fixed 1280×800×4-byte surface, hashes it, emits authenticated 64 KiB frame
+  chunks with fresh UUIDv4 nonces, and advances the frame freshness fence. This
+  is source-level capture plumbing only; no reviewed guest image, GUI surface,
+  or packaged rendered frame has been qualified.
 - The freestanding guest source validates the authenticated input packet,
   sequence fence, identity-bound HMAC, coordinate/key/text bounds, and closed
-  message kind set after binding. It intentionally has no valid frame source
-  yet, so input remains fail-closed until guest capture is implemented.
+  message kind set after binding. Input remains fail-closed until a reviewed
+  packaged guest capture establishes the frame-freshness fence.
 - The guest independently tracks held mouse-button and key state: duplicate
   downs, mismatched releases, invalid key transitions, and shutdown with any
   held input fail closed. Binding resets the held-state fence, and the
@@ -95,14 +106,15 @@ No local cargo test/check/clippy campaign was run under the controlled build
 policy. No packaged helper, signed app, reviewed guest image, host process
 supervisor, VM launch, socket frame renderer, input dispatch, hardware matrix,
 soak campaign, or `HostNative` capability claim exists yet. The bundle is a
-reviewable source candidate, not release evidence.
+reviewable source candidate, not release evidence; the framebuffer extension
+proves only bounded source-level capture and frame authentication.
 
 ## Next required gates
 
-1. Run the controlled Rust qualification campaign and independent review.
-2. Produce and review the deterministic guest image, signed helper, and exact
+1. Produce and review the deterministic guest image, signed helper, and exact
    packaged app on a credentialed macOS host.
-3. Wire the packaged supervisor to this coordinator and run lifecycle,
+2. Wire the packaged supervisor to this coordinator and run lifecycle,
    restart, resource, security, hardware, and accessibility campaigns.
-4. Connect the guest capture/render loop and one-action-approved input path;
+3. Connect the guest capture/render loop and one-action-approved input path;
    only then consider the #288 acceptance criteria and native dispatch.
+4. Run the controlled Rust qualification campaign and independent review.
