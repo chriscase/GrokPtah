@@ -53,6 +53,10 @@ for required in \
   'com.apple.security.get-task-allow'; do
   grep -F "$required" "$script_dir/package-signed-app.sh" >/dev/null
 done
+for required in input_contents input_info_plist output_contents output_resources \
+  'realpath "$safe_dir"' 'mkdir "$resource_dir"'; do
+  grep -F "$required" "$script_dir/package-signed-app.sh" >/dev/null
+done
 xcrun clang -fobjc-arc -fblocks -fsyntax-only -mmacosx-version-min=11.0 \
   -Wall -Wextra -Werror "$native_shim"
 native_object="$work/macos_native_shim.o"

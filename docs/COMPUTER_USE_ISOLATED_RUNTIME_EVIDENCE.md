@@ -207,6 +207,10 @@ sealed at:
   helper and outer-app signing: only the helper must carry App Sandbox plus
   Virtualization, while helper and outer app reject VM networking and
   `get-task-allow`.
+- The package assembler rejects symlinked or non-canonical `Contents`,
+  `Info.plist`, `MacOS`, and `Resources` paths before installing the helper,
+  guest image, configuration, or manifest, and creates the isolated resource
+  directory only beneath those verified parents.
 - Package assembly also requires the exact GrokPtah bundle identifier and
   matching signed team identity for the helper and outer app; a misidentified
   or cross-team artifact fails before it can be used as a runtime candidate.

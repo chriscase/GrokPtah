@@ -54,8 +54,17 @@ if [ ! -d "$input_app" ] || [ ! -f "$guest_image" ] ||
   echo "expected an app directory, regular guest image, and reviewed configuration" >&2
   exit 66
 fi
+input_contents="$input_app/Contents"
+input_info_plist="$input_contents/Info.plist"
+if [ ! -d "$input_contents" ] || [ -L "$input_contents" ] ||
+   [ "$(realpath "$input_contents")" != "$input_contents" ] ||
+   [ ! -f "$input_info_plist" ] || [ -L "$input_info_plist" ] ||
+   [ "$(realpath "$input_info_plist")" != "$input_info_plist" ]; then
+  echo "input app has unsafe Contents or Info.plist paths" >&2
+  exit 65
+fi
 input_bundle_identifier=$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - \
-  "$input_app/Contents/Info.plist" 2>/dev/null || true)
+  "$input_info_plist" 2>/dev/null || true)
 if [ "$input_bundle_identifier" != "com.chriscase.grokptah" ]; then
   echo "input app has an unexpected bundle identifier" >&2
   exit 65
@@ -106,13 +115,25 @@ fi
 /usr/bin/codesign --verify --strict --all-architectures "$helper"
 
 /usr/bin/ditto "$input_app" "$output_app"
+output_contents="$output_app/Contents"
+output_resources="$output_contents/Resources"
 macos_dir="$output_app/Contents/MacOS"
 resource_dir="$output_app/Contents/Resources/isolated-visual"
-if [ ! -d "$macos_dir" ] || [ -L "$macos_dir" ]; then
-  echo "input app has no safe Contents/MacOS directory" >&2
+for safe_dir in "$output_contents" "$output_resources" "$macos_dir"; do
+  if [ ! -d "$safe_dir" ] || [ -L "$safe_dir" ] ||
+     [ "$(realpath "$safe_dir")" != "$safe_dir" ]; then
+    echo "copied app has an unsafe bundle directory: $safe_dir" >&2
+    exit 65
+  fi
+done
+if [ -L "$resource_dir" ] ||
+   { [ -e "$resource_dir" ] && [ ! -d "$resource_dir" ]; }; then
+  echo "isolated resource directory is not a safe directory" >&2
   exit 65
 fi
-mkdir -p "$resource_dir"
+if [ ! -e "$resource_dir" ]; then
+  mkdir "$resource_dir"
+fi
 chmod 0755 "$resource_dir"
 if [ -L "$resource_dir" ] || [ "$(realpath "$resource_dir")" != "$resource_dir" ]; then
   echo "isolated resource directory must not be a symlink" >&2
