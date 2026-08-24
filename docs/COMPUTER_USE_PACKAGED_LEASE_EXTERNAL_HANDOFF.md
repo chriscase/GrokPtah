@@ -16,6 +16,8 @@ failure revokes ownership; cleanup is refused while ownership remains.
 - PR #374 head: `5919e3343af20a78e17459b8ac8454bbc5aeca7e`
 - Main/base: `67e29bd34dc64049432c715c93c2cef2185c63ea`
 - Developer checkout: `6409645cb7d0fe6d75585f0610366340f808b8ec` (must remain untouched)
+- Optional immutable input bundle: `/private/tmp/grokptah-packaged-lease-b250b70-v2.bundle`
+- Bundle SHA-256: `4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`
 
 Use a disposable checkout at this exact head. Do not merge, push, rebase,
 undraft, create a PR, modify the developer checkout, or alter any existing
