@@ -194,6 +194,8 @@ fail-closed for ownership as well: the lease is revoked even when bounded
 helper reaping reports an error, while exact cleanup evidence remains
 mandatory. Its focused regression is formatted but still requires the same
 external runner; it does not change the active `b250b70` campaign.
+The frozen follow-up procedure is
+[`COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md).
 
 Grok Build ran the focused `isolated_guest` library proof (8 passed) plus the
 committed-stop cleanup regression (1 passed) on the isolated PR head with the

@@ -61,6 +61,8 @@ after any terminal stop/reap result, including bounded reap failure, so a
 failed stop cannot be resumed. Exact cleanup evidence remains independent;
 this correction is source-only and is not part of the active `b250b70`
 external campaign.
+Its future external procedure is
+[`COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md).
 
 Candidate-only UI update (2026-08-24): the Provider Readiness Center now
 surfaces provider-route configuration, the fact that provider/Grok Build

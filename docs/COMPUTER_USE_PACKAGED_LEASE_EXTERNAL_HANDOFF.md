@@ -19,6 +19,10 @@ failure revokes ownership; cleanup is refused while ownership remains.
 - Optional immutable input bundle: `/private/tmp/grokptah-packaged-lease-b250b70-v2.bundle`
 - Bundle SHA-256: `4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`
 
+The later source-only stop-failure correction is intentionally not part of
+this active campaign. Its separate future handoff is
+[`COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md).
+
 Use a disposable checkout at this exact head. Do not merge, push, rebase,
 undraft, create a PR, modify the developer checkout, or alter any existing
 app/session/worktree.
