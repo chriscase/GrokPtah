@@ -81,7 +81,7 @@ launch remains **NOT QUALIFIED**.
 After the campaign, run `docs/verify-isolated-runtime-evidence.sh` from the docs-only handoff
 checkpoint (the docs-only checkpoint from this refresh) or another checkout that contains that
 exact script. The immutable source bundle is the current candidate at `baa28f74…`; the verifier is
-a source-level evidence aid and
-must not be treated as a VM qualification result. Then update `ROADMAP_TO_100.md`, `CAPABILITY_MATRIX.md`, and
+a source-level evidence aid that also checks the handoff/evidence identities agree; it must not be
+treated as a VM qualification result. Then update `ROADMAP_TO_100.md`, `CAPABILITY_MATRIX.md`, and
 `COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md` together. Do not change an unsupported or planned
 status based on this handoff alone.
