@@ -170,6 +170,34 @@ chmod 0444 "$manifest"
   "$output_app"
 /usr/bin/codesign --verify --deep --strict --all-architectures "$output_app"
 
+assert_entitlement_present() {
+  artifact=$1
+  entitlement=$2
+  if ! /usr/bin/codesign -d --entitlements :- "$artifact" 2>&1 |
+    grep -F "$entitlement" >/dev/null; then
+    echo "signed artifact is missing required entitlement: $entitlement" >&2
+    exit 65
+  fi
+}
+
+assert_entitlement_absent() {
+  artifact=$1
+  entitlement=$2
+  if /usr/bin/codesign -d --entitlements :- "$artifact" 2>&1 |
+    grep -F "$entitlement" >/dev/null; then
+    echo "signed artifact carries forbidden entitlement: $entitlement" >&2
+    exit 65
+  fi
+}
+
+assert_entitlement_present "$packaged_helper" "com.apple.security.app-sandbox"
+assert_entitlement_present "$packaged_helper" "com.apple.security.virtualization"
+assert_entitlement_absent "$packaged_helper" "com.apple.vm.networking"
+assert_entitlement_absent "$packaged_helper" "com.apple.security.get-task-allow"
+assert_entitlement_absent "$output_app" "com.apple.security.virtualization"
+assert_entitlement_absent "$output_app" "com.apple.vm.networking"
+assert_entitlement_absent "$output_app" "com.apple.security.get-task-allow"
+
 printf 'packaged_app=%s\n' "$output_app"
 printf 'helper_content_sha256=%s\n' "$helper_sha"
 printf 'helper_signing_requirement_sha256=%s\n' "$requirement_sha"

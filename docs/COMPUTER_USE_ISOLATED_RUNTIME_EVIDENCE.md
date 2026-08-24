@@ -191,6 +191,10 @@ The monotonic VM-deadline hardening extension is sealed at:
 - Fixed-size helper lifecycle events also use that bounded writer, so a stalled
   host event reader cannot pin the helper indefinitely before its VM cleanup
   path runs.
+- The credentialed package assembler now audits signed entitlements after both
+  helper and outer-app signing: only the helper must carry App Sandbox plus
+  Virtualization, while helper and outer app reject VM networking and
+  `get-task-allow`.
 - The stop boundary now rejects held keyboard/button state, waits for the
   helper to exit, and leaves the lifecycle in `CleanupPending` until explicit
   per-surface process, handle, overlay, and frame-cache evidence completes it.
