@@ -11,11 +11,19 @@ Computer Use backend or satisfy the #288 release gate.
 - Bundle SHA-256: `bdd76c7ceaa910e261d4805bd52bc4172c054f5e7ebc060ac2688839d43ca5b0`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
+Current sealed branch head: `d34f7654fceb29e5164468108e74b6a414a51aa4`.
+
 The later guest-input validation extension is sealed at:
 
 - Commit: `5c5f21457d200b45dcad9ddd9d5bede0500344fd`
 - Bundle: `/private/tmp/grokptah-cu-stage13-guest-input-validation-v1.bundle`
 - Bundle SHA-256: `5c9e8c98e9e23d93cf926b32c456eb08339db9f527c5614534622e41bec8c67f`
+
+The guest held-input enforcement extension is sealed at:
+
+- Commit: `d34f7654fceb29e5164468108e74b6a414a51aa4`
+- Bundle: `/private/tmp/grokptah-cu-stage14-guest-input-state-v1.bundle`
+- Bundle SHA-256: `16abf1113ae91dbcc436e0999a2412313d1d2191bb6e96638ef3f19c09e9a123`
 
 ## What this candidate proves
 
@@ -39,6 +47,10 @@ The later guest-input validation extension is sealed at:
   sequence fence, identity-bound HMAC, coordinate/key/text bounds, and closed
   message kind set after binding. It intentionally has no valid frame source
   yet, so input remains fail-closed until guest capture is implemented.
+- The guest independently tracks held mouse-button and key state: duplicate
+  downs, mismatched releases, invalid key transitions, and shutdown with any
+  held input fail closed. Binding resets the held-state fence, and the
+  protocol self-test covers both button and key transitions.
 - Source tests exercise the bound transition, frame-carrier round trip,
   frame-fenced input packet, stop transition, and pre-binding rejection paths.
 
