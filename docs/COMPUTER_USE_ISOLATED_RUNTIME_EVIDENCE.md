@@ -6,12 +6,12 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `5e2ab5e3fe6b0ed435b10abde86eba50ce203be4`
-- Bundle: `/private/tmp/grokptah-cu-stage27-packaged-supervisor-v1.bundle`
-- Bundle SHA-256: `4e39d6d4d97ffc09d4b8004bfac60e9f425ba1a914f59b27a03746aeaccc648d`
+- Head: `6114f76a2a4aa380f6f34b9182315833f0a4ed3c`
+- Bundle: `/private/tmp/grokptah-cu-stage28-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `9971849b7598855707cfd32ef458ad0fa83a80abea546140490eb7c88c7be70e`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current sealed implementation head: `5e2ab5e3fe6b0ed435b10abde86eba50ce203be4`.
+Current sealed implementation head: `6114f76a2a4aa380f6f34b9182315833f0a4ed3c`.
 
 The later guest-input validation extension is sealed at:
 
@@ -57,9 +57,9 @@ The private guest-challenge channel extension is sealed at:
 
 The bounded packaged-supervisor source extension is sealed at:
 
-- Commit: `5e2ab5e3fe6b0ed435b10abde86eba50ce203be4`
-- Bundle: `/private/tmp/grokptah-cu-stage27-packaged-supervisor-v1.bundle`
-- Bundle SHA-256: `4e39d6d4d97ffc09d4b8004bfac60e9f425ba1a914f59b27a03746aeaccc648d`
+- Commit: `6114f76a2a4aa380f6f34b9182315833f0a4ed3c`
+- Bundle: `/private/tmp/grokptah-cu-stage28-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `9971849b7598855707cfd32ef458ad0fa83a80abea546140490eb7c88c7be70e`
 
 ## What this candidate proves
 
@@ -118,6 +118,9 @@ The bounded packaged-supervisor source extension is sealed at:
 - The stop boundary now rejects held keyboard/button state, waits for the
   helper to exit, and leaves the lifecycle in `CleanupPending` until explicit
   per-surface process, handle, overlay, and frame-cache evidence completes it.
+- Startup protocol, helper-I/O, and guest-event failures now transition the
+  session to failure/cleanup-pending and reap or force-stop the child before
+  returning the original error; they cannot leave a half-started helper behind.
 - Before native spawn, the Rust launch seam now opens the exact package through
   the existing read-only measurement/receipt verifier and binds the caller's
   manifest to helper, guest-image, configuration, and designated-requirement
