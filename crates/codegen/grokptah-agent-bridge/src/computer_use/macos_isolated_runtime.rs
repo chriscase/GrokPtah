@@ -106,6 +106,16 @@ fn terminate_process(pid: libc::pid_t) -> bool {
     if pid <= 0 {
         return true;
     }
+    // Reap/check ownership before sending a signal. If the child already
+    // exited, or another owner reaped it, the numeric PID must never be
+    // treated as a live process that can be killed after PID reuse.
+    let initial = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+    if initial == pid {
+        return true;
+    }
+    if initial < 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+    }
     // SAFETY: the PID was returned by our launch shim. A failed kill is
     // intentionally followed by bounded reap polling; the normal stop path
     // reports a failure to reap rather than blocking forever.
@@ -337,6 +347,10 @@ impl IsolatedVisualPackagedRuntime {
                 return Ok(());
             }
             if result < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                    self.exited = true;
+                    return Ok(());
+                }
                 return Err(ComputerError::new(
                     ComputerErrorCode::BackendFailure,
                     "isolated helper wait failed",

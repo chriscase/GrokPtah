@@ -201,6 +201,9 @@ The monotonic VM-deadline hardening extension is sealed at:
 - The packaged runtime launcher is crate-private until qualification completes;
   it is no longer re-exported as a public provider/plugin API, so an unproven
   helper cannot be started by an external caller or model-facing surface.
+- Supervisor teardown checks child ownership with `waitpid(WNOHANG)` before
+  signaling and treats an already-reaped child as complete, preventing a late
+  destructor from signaling a recycled PID.
 - The stop boundary now rejects held keyboard/button state, waits for the
   helper to exit, and leaves the lifecycle in `CleanupPending` until explicit
   per-surface process, handle, overlay, and frame-cache evidence completes it.
