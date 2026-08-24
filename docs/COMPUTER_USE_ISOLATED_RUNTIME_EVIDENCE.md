@@ -14,6 +14,23 @@ Computer Use backend or satisfy the #288 release gate.
 
 Current bundled source head: `baa28f748c13a6ceda381e068004cd46aea2658c`.
 
+## Post-bundle candidate continuation
+
+The bundle above is intentionally retained as source-only evidence at its
+recorded cutoff. The candidate branch continued afterward and must not be
+described as covered by that bundle:
+
+- Current candidate head: `295a4ff62939af1a3034119653c83c7a0a2e1bff`
+  (`fix(desktop): allow safe approval escape`).
+- Post-bundle changes include the approval-dialog keyboard/focus safety fixes
+  (`6a00ea3` and `295a4ff`) and the enterprise/v52 handoff documentation
+  (`7aef495` and `c7423a0`).
+- No new signed package, guest image, VM launch, rendered-frame/input run, or
+  qualification bundle exists for those later commits.
+- Reviewers must either use the exact bundle cutoff above for source-only
+  claims or create a new bundle after re-running the full source verifiers;
+  the later candidate commits cannot be silently inferred from v12.
+
 The earlier v1, v2, v3, v4, v5, and v6 bundles remain retained as historical source-only
 evidence: `/private/tmp/grokptah-cu-isolated-visual-v1.bundle` (cutoff
 `3a88fb41e29a55aeabb54defe82761b129b6ab11`) and
