@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   buildHelpAssistantRequest,
   buildHelpSemanticRequest,
@@ -74,6 +74,7 @@ export function HelpCenter({
   const surfaceRef = useRef<HTMLDivElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
   const confirmDialogRef = useRef<HTMLDivElement>(null);
+  const articleButtonRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const onCloseRef = useRef(onClose);
   const topConfirmRef = useRef<ConfirmKind | null>(null);
   const prevTopConfirmRef = useRef<ConfirmKind | null>(null);
@@ -323,6 +324,24 @@ export function HelpCenter({
     }
   };
 
+  const moveArticleSelection = (
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    index: number,
+  ) => {
+    if (results.length === 0) return;
+    let nextIndex: number | null = null;
+    if (event.key === "ArrowDown") nextIndex = (index + 1) % results.length;
+    if (event.key === "ArrowUp") nextIndex = (index - 1 + results.length) % results.length;
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = results.length - 1;
+    if (nextIndex === null) return;
+
+    event.preventDefault();
+    const nextId = results[nextIndex].article.id;
+    setSelectedId(nextId);
+    articleButtonRefs.current[nextId]?.focus();
+  };
+
   if (!open) return null;
 
   return (
@@ -407,14 +426,20 @@ export function HelpCenter({
           {semantic.status === "loading" && <p className="help-retrieval-status" role="status">Ranking help by meaning…</p>}
           {semantic.status === "error" && <p className="help-retrieval-status" role="alert">{semantic.message}</p>}
           <ul className="help-list" role="listbox" aria-label="Help article results">
-            {results.map(({ article, matchedTerms, confidence }) => (
+            {results.map(({ article, matchedTerms, confidence }, index) => (
               <li key={article.id}>
                 <button
                   type="button"
                   role="option"
+                  id={`help-article-option-${article.id}`}
+                  ref={(element) => {
+                    articleButtonRefs.current[article.id] = element;
+                  }}
+                  tabIndex={article.id === selected?.id ? 0 : -1}
                   className={`help-list-item ${article.id === selected?.id ? "is-selected" : ""}`}
                   aria-selected={article.id === selected?.id}
                   onClick={() => setSelectedId(article.id)}
+                  onKeyDown={(event) => moveArticleSelection(event, index)}
                 >
                   <span className="help-list-topic">{article.topic.replace("-", " ")}</span>
                   <strong>{article.title}</strong>

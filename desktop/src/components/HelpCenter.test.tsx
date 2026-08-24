@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HelpCenter } from "./HelpCenter";
 
@@ -24,6 +24,25 @@ describe("HelpCenter", () => {
     expect(screen.queryByRole("heading", { name: "Sessions, builds, and chats" })).not.toBeInTheDocument();
     expect(screen.getByText(/Source-backed offline guidance/)).toBeInTheDocument();
     expect(screen.getByText(/Heuristic match confidence:/)).toHaveTextContent(/ranking signal only, not certification/);
+  });
+
+  it("supports roving arrow-key navigation through article results", () => {
+    render(<HelpCenter open onClose={vi.fn()} />);
+    const options = within(screen.getByRole("listbox", { name: "Help article results" })).getAllByRole("option");
+
+    expect(options[0]).toHaveAttribute("tabindex", "0");
+    expect(options[1]).toHaveAttribute("tabindex", "-1");
+    options[0].focus();
+    fireEvent.keyDown(options[0], { key: "ArrowDown" });
+
+    expect(document.activeElement).toBe(options[1]);
+    expect(options[1]).toHaveAttribute("aria-selected", "true");
+    expect(options[0]).toHaveAttribute("tabindex", "-1");
+
+    fireEvent.keyDown(options[1], { key: "End" });
+    expect(document.activeElement).toBe(options[options.length - 1]);
+    fireEvent.keyDown(options[options.length - 1], { key: "Home" });
+    expect(document.activeElement).toBe(options[0]);
   });
 
   it("closes on Escape without changing the source corpus", () => {
