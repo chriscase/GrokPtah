@@ -45,6 +45,11 @@ guest phases, one-Agent lease fencing, mandatory cleanup, and a frame-free
 capture projection. It is not shipped on `origin/main`, and its focused Rust
 tests remain external PR-head evidence rather than combined-head qualification.
 
+The candidate follow-up additionally applies the exact Agent lease to the
+macOS packaged-runtime supervisor’s start/read/input/stop methods and refuses
+cleanup while the lease is live. This remains source-only and unexposed until
+the signed package, real guest, and lifecycle campaign qualify it.
+
 Candidate-only UI update (2026-08-24): the Provider Readiness Center now
 surfaces provider-route configuration, the fact that provider/Grok Build
 account quota is not synchronized, and the boundary between measured model

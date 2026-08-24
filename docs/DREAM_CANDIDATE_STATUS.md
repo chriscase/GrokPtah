@@ -177,6 +177,12 @@ path/clipboard/credential/network-free capture projection that omits frame
 bytes. Its changed-file allowlist is limited to the guest/lifecycle bridge,
 one orchestration error mapping, and the bootstrap handoff document.
 
+The candidate follow-up also threads that lease into the macOS packaged-runtime
+supervisor: start, frame reads, input, and stop require the exact Agent lease;
+failure revokes it; cleanup refuses to proceed while ownership remains. This
+is a source-level denial boundary only and is not a packaged-runtime or
+hardware qualification.
+
 Grok Build ran the focused `isolated_guest` library proof (8 passed) plus the
 committed-stop cleanup regression (1 passed) on the isolated PR head with the
 required sccache/target policy. Those are external PR-head results, not a Rust

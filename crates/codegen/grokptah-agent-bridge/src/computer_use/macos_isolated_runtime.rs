@@ -2,6 +2,7 @@ use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::time::Duration;
 
+use super::isolated_guest::IsolatedGuestLease;
 use super::isolated_visual::{
     IsolatedVisualCleanupEvidence, IsolatedVisualLaunchContract, IsolatedVisualTerminalDisposition,
 };
@@ -184,6 +185,7 @@ fn terminate_process(pid: libc::pid_t) -> bool {
 pub(crate) struct IsolatedVisualPackagedRuntime {
     pid: libc::pid_t,
     exited: bool,
+    lease: Option<IsolatedGuestLease>,
     driver: IsolatedVisualRuntimeDriver<File, File, File, File>,
 }
 
@@ -277,12 +279,45 @@ impl IsolatedVisualPackagedRuntime {
         Ok(Self {
             pid,
             exited: false,
+            lease: None,
             driver: IsolatedVisualRuntimeDriver::new(runtime, helper, stream),
         })
     }
 
+    /// Claims this packaged guest for exactly one Agent. The supervisor is
+    /// intentionally unusable until the caller presents the returned lease.
+    pub(crate) fn acquire(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> ComputerResult<IsolatedGuestLease> {
+        let agent_id = agent_id.into();
+        if self.exited {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidState,
+                "isolated packaged guest has already exited",
+            ));
+        }
+        if let Some(existing) = &self.lease {
+            if existing.agent_id != agent_id.as_str() {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Conflict,
+                    "isolated packaged guest is already leased to another agent",
+                ));
+            }
+            return Ok(existing.clone());
+        }
+        let lease = IsolatedGuestLease::issue(agent_id)?;
+        self.lease = Some(lease.clone());
+        Ok(lease)
+    }
+
     /// Drives the fixed Prepared → start → Running → bind → Bound sequence.
-    pub(crate) fn start(&mut self) -> ComputerResult<()> {
+    pub(crate) fn start(
+        &mut self,
+        agent_id: &str,
+        lease: &IsolatedGuestLease,
+    ) -> ComputerResult<()> {
+        self.require_lease(agent_id, lease)?;
         if let Err(error) = self
             .driver
             .receive_helper_event_with_timeout(PREPARED_EVENT_TIMEOUT)
@@ -310,7 +345,12 @@ impl IsolatedVisualPackagedRuntime {
         Ok(())
     }
 
-    pub(crate) fn read_frame(&mut self) -> ComputerResult<Option<IsolatedVisualFrame>> {
+    pub(crate) fn read_frame(
+        &mut self,
+        agent_id: &str,
+        lease: &IsolatedGuestLease,
+    ) -> ComputerResult<Option<IsolatedVisualFrame>> {
+        self.require_lease(agent_id, lease)?;
         match self.driver.read_frame_with_timeout(FRAME_READ_TIMEOUT) {
             Ok(frame) => Ok(frame),
             Err(error) => self.abort_with_error(error),
@@ -319,10 +359,13 @@ impl IsolatedVisualPackagedRuntime {
 
     pub(crate) fn write_input(
         &mut self,
+        agent_id: &str,
+        lease: &IsolatedGuestLease,
         input_sequence: u64,
         request_nonce: &str,
         message: IsolatedVisualInputMessage,
     ) -> ComputerResult<()> {
+        self.require_lease(agent_id, lease)?;
         match self.driver.write_input_with_timeout(
             input_sequence,
             request_nonce,
@@ -336,8 +379,11 @@ impl IsolatedVisualPackagedRuntime {
 
     pub(crate) fn stop(
         &mut self,
+        agent_id: &str,
+        lease: &IsolatedGuestLease,
         disposition: IsolatedVisualTerminalDisposition,
     ) -> ComputerResult<()> {
+        self.require_lease(agent_id, lease)?;
         if let Err(error) = self
             .driver
             .stop_with_timeout(disposition, CONTROL_WRITE_TIMEOUT)
@@ -355,7 +401,11 @@ impl IsolatedVisualPackagedRuntime {
         {
             return self.abort_with_error(error);
         }
-        self.wait_for_exit()
+        let result = self.wait_for_exit();
+        if result.is_ok() {
+            self.lease = None;
+        }
+        result
     }
 
     /// Completes the terminal transition only after the caller has verified
@@ -365,11 +415,18 @@ impl IsolatedVisualPackagedRuntime {
         &mut self,
         evidence: &IsolatedVisualCleanupEvidence,
     ) -> ComputerResult<()> {
+        if self.lease.is_some() {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidState,
+                "isolated packaged guest cleanup requires the lease to be revoked",
+            ));
+        }
         self.driver.complete_cleanup(evidence)
     }
 
     fn abort_with_error<T>(&mut self, error: ComputerError) -> ComputerResult<T> {
         let _ = self.driver.fail();
+        self.lease = None;
         if !self.exited {
             let _ = self.wait_for_exit();
         }
@@ -378,6 +435,16 @@ impl IsolatedVisualPackagedRuntime {
 
     pub(crate) fn runtime(&self) -> &IsolatedVisualRuntimeSession {
         self.driver.runtime()
+    }
+
+    fn require_lease(&self, agent_id: &str, presented: &IsolatedGuestLease) -> ComputerResult<()> {
+        let Some(live) = &self.lease else {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "isolated packaged guest control requires a valid lease",
+            ));
+        };
+        live.require(agent_id, presented)
     }
 
     fn wait_for_exit(&mut self) -> ComputerResult<()> {

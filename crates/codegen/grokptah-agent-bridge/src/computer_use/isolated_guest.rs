@@ -147,6 +147,39 @@ pub struct IsolatedGuestLease {
     pub revision: u64,
 }
 
+impl IsolatedGuestLease {
+    pub(crate) fn issue(agent_id: impl Into<String>) -> ComputerResult<Self> {
+        let agent_id = agent_id.into();
+        if agent_id.is_empty() || agent_id.len() > 256 || agent_id.contains('\0') {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "isolated guest agent_id is invalid",
+            ));
+        }
+        Ok(Self {
+            lease_id: uuid::Uuid::new_v4().to_string(),
+            agent_id,
+            revision: 1,
+        })
+    }
+
+    pub(crate) fn require(&self, agent_id: &str, presented: &Self) -> ComputerResult<()> {
+        if self.agent_id != agent_id {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "isolated guest is leased to another agent",
+            ));
+        }
+        if self.lease_id != presented.lease_id || self.revision != presented.revision {
+            return Err(ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "isolated guest lease is stale",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Simulator-owned guest bootstrap session. Not a VM and not a durable store.
 pub struct IsolatedGuestSession {
     runtime: IsolatedVisualRuntimeSession,
@@ -175,12 +208,6 @@ impl IsolatedGuestSession {
     /// One Agent per guest. A second Agent is denied while a lease is live.
     pub fn acquire(&mut self, agent_id: impl Into<String>) -> ComputerResult<IsolatedGuestLease> {
         let agent_id = agent_id.into();
-        if agent_id.is_empty() || agent_id.len() > 256 || agent_id.contains('\0') {
-            return Err(ComputerError::new(
-                ComputerErrorCode::InvalidRequest,
-                "isolated guest agent_id is invalid",
-            ));
-        }
         if !matches!(
             self.phase(),
             IsolatedGuestPhase::Create | IsolatedGuestPhase::Ready | IsolatedGuestPhase::Running
@@ -199,11 +226,7 @@ impl IsolatedGuestSession {
             }
             return Ok(existing.clone());
         }
-        let lease = IsolatedGuestLease {
-            lease_id: uuid::Uuid::new_v4().to_string(),
-            agent_id,
-            revision: 1,
-        };
+        let lease = IsolatedGuestLease::issue(agent_id)?;
         self.lease = Some(lease.clone());
         Ok(lease)
     }
@@ -342,19 +365,7 @@ impl IsolatedGuestSession {
                 "isolated guest control requires a valid lease",
             ));
         };
-        if live.agent_id != agent_id {
-            return Err(ComputerError::new(
-                ComputerErrorCode::ForbiddenAction,
-                "isolated guest is leased to another agent",
-            ));
-        }
-        if live.lease_id != presented.lease_id || live.revision != presented.revision {
-            return Err(ComputerError::new(
-                ComputerErrorCode::StaleObservation,
-                "isolated guest lease is stale",
-            ));
-        }
-        Ok(())
+        live.require(agent_id, presented)
     }
 
     fn revoke_lease(&mut self) {

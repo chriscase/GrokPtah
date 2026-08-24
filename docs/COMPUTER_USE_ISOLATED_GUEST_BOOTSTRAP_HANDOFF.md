@@ -24,6 +24,10 @@ contract:
 4. Captured-artifact projection drops frame bytes. Metadata redaction strips
    path, clipboard, credential, and network keys and fail-closes on leftover
    needles.
+5. The macOS packaged-runtime supervisor now carries the same exact
+   one-Agent lease fence: start, frame reads, guest input, and stop require a
+   matching lease; failure revokes it; cleanup is refused until the lease is
+   gone. This is still an unexposed source seam until packaged qualification.
 
 Durable `ComputerSurfaceLease` records and Isolated Visual denial boundaries
 are not replaced or relaxed.
@@ -43,3 +47,7 @@ are not replaced or relaxed.
 - Long soak
 - Multi-agent desktop acceptance on a live macOS surface
 - Signed helper packaging and entitlement measurement as a qualification result
+
+The packaged-runtime lease follow-up is candidate commit `HEAD` after the
+PR integration; it is not part of PR #374’s GitHub allowlist and does not
+change the source-only qualification status above.
