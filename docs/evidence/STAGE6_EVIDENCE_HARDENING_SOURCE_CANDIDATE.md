@@ -30,6 +30,11 @@ scoped worker provisioning across service restarts, and a worker evidence
 contract. Its source documentation describes bounded standalone-service smoke
 and one accepted-request restart fencing with a loopback fake provider.
 
+Allowed static verification on the exact clean source head passed on
+2026-08-24: `rustfmt --edition 2021 --check` over the eight changed Rust files
+and `cargo metadata --locked --offline --no-deps`. No local compilation or
+test execution was performed; those remain external Grok Build gates.
+
 ## Explicit non-claims
 
 The source documentation explicitly records that this candidate has no live
