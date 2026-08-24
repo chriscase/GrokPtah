@@ -708,8 +708,8 @@ and a credentialed nested-signing assembler. The helper's closed inherited-descr
    binds inherited helper control/event descriptors to the coordinator without spawning a process.
    The freestanding guest now validates the authenticated length-bounded input ABI after binding,
    captures a fixed `/dev/fb0` surface, renders a deterministic fixture, and emits authenticated
-   bounded frame chunks; the helper relays those chunks over the private FD8 channel. Input still
-   refuses admission until a reviewed
+   bounded frame chunks; the helper relays those chunks over the private FD8 channel and returns
+   its per-launch challenge over private FD9. Input still refuses admission until a reviewed
    packaged capture establishes a freshness fence. Its source identity and safe-check record are captured in
    [`COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md`](COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md). See
 [`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,

@@ -218,7 +218,8 @@ available.
    the freestanding guest has a fixed `/dev/fb0` capture source, a deterministic fixture renderer,
    and authenticated frame-chunk emitter; validated fixture pointer/button/scroll state changes
    the next surface, but no reviewed GUI guest image or host renderer is wired into a packaged
-   runtime yet.
+   runtime yet. The helper returns its per-launch challenge over a private inherited channel so a
+   future supervisor can bind the host and guest without exposing challenge material to a model.
 5. Add guest pointer state and one-action local approval; then key/text/scroll/drag independently.
    The source candidate now includes a non-dispatchable host-side input gate that binds every
    pointer/button/scroll/key/text edge to the latest frame, requires strictly increasing input

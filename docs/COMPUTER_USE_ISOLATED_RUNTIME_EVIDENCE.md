@@ -6,12 +6,12 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `bf1e1b7f0c27598ce155e2d734a23a6f095010ea`
-- Bundle: `/private/tmp/grokptah-cu-stage18-guest-fixture-v1.bundle`
-- Bundle SHA-256: `15d033f19c615c53e663ef9257c29e1ee4574ea137decdfe23a6ee80d111c401`
+- Head: `cadcbff96e663c81117241e8e372c59c2f7da6cd`
+- Bundle: `/private/tmp/grokptah-cu-stage19-challenge-channel-v1.bundle`
+- Bundle SHA-256: `e0ae9b2a8a0d311e0571c96c33239b47c5ab9cf612ddded1e3f83b461865e870`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current sealed implementation head: `bf1e1b7f0c27598ce155e2d734a23a6f095010ea`.
+Current sealed implementation head: `cadcbff96e663c81117241e8e372c59c2f7da6cd`.
 
 The later guest-input validation extension is sealed at:
 
@@ -48,6 +48,12 @@ The deterministic guest-fixture rendering extension is sealed at:
 - Commit: `bf1e1b7f0c27598ce155e2d734a23a6f095010ea`
 - Bundle: `/private/tmp/grokptah-cu-stage18-guest-fixture-v1.bundle`
 - Bundle SHA-256: `15d033f19c615c53e663ef9257c29e1ee4574ea137decdfe23a6ee80d111c401`
+
+The private guest-challenge channel extension is sealed at:
+
+- Commit: `cadcbff96e663c81117241e8e372c59c2f7da6cd`
+- Bundle: `/private/tmp/grokptah-cu-stage19-challenge-channel-v1.bundle`
+- Bundle SHA-256: `e0ae9b2a8a0d311e0571c96c33239b47c5ab9cf612ddded1e3f83b461865e870`
 
 ## What this candidate proves
 
@@ -86,6 +92,10 @@ The deterministic guest-fixture rendering extension is sealed at:
   the guest framebuffer before capture. Validated pointer, button, and scroll
   packets update only that fixture's cursor/state; this is a qualification
   surface, not arbitrary guest GUI support or a packaged render proof.
+- The helper now writes the generated per-launch challenge to a private FD9
+  channel, and the Rust host adapter reads a complete nonzero challenge without
+  serializing it. This closes the host-binding input seam while leaving process
+  launch and package qualification explicitly unclaimed.
 - The freestanding guest source validates the authenticated input packet,
   sequence fence, identity-bound HMAC, coordinate/key/text bounds, and closed
   message kind set after binding. Input remains fail-closed until a reviewed
