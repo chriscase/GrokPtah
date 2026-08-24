@@ -235,6 +235,9 @@ The clean isolated-resource-tree extension is sealed at:
   requested output path is published only after deep signature, identity, and
   entitlement checks pass, so a failed attempt cannot leave a partial app at
   the caller's output path.
+- Entitlement inspection now fails closed if `codesign` cannot produce the
+  signed XML; a pipeline failure can no longer be mistaken for a forbidden
+  entitlement being absent.
 - Package assembly also requires the exact GrokPtah bundle identifier and
   matching signed team identity for the helper and outer app; a misidentified
   or cross-team artifact fails before it can be used as a runtime candidate.

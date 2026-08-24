@@ -218,8 +218,11 @@ fi
 assert_entitlement_present() {
   artifact=$1
   entitlement=$2
-  if ! /usr/bin/codesign -d --entitlements :- "$artifact" 2>&1 |
-    grep -F "$entitlement" >/dev/null; then
+  entitlements=$(/usr/bin/codesign -d --entitlements :- "$artifact" 2>&1) || {
+    echo "could not inspect signed artifact entitlements: $artifact" >&2
+    exit 65
+  }
+  if ! printf '%s\n' "$entitlements" | grep -F "$entitlement" >/dev/null; then
     echo "signed artifact is missing required entitlement: $entitlement" >&2
     exit 65
   fi
@@ -228,8 +231,11 @@ assert_entitlement_present() {
 assert_entitlement_absent() {
   artifact=$1
   entitlement=$2
-  if /usr/bin/codesign -d --entitlements :- "$artifact" 2>&1 |
-    grep -F "$entitlement" >/dev/null; then
+  entitlements=$(/usr/bin/codesign -d --entitlements :- "$artifact" 2>&1) || {
+    echo "could not inspect signed artifact entitlements: $artifact" >&2
+    exit 65
+  }
+  if printf '%s\n' "$entitlements" | grep -F "$entitlement" >/dev/null; then
     echo "signed artifact carries forbidden entitlement: $entitlement" >&2
     exit 65
   fi
