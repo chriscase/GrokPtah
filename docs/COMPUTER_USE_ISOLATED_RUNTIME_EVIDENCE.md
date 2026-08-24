@@ -11,6 +11,12 @@ Computer Use backend or satisfy the #288 release gate.
 - Bundle SHA-256: `bdd76c7ceaa910e261d4805bd52bc4172c054f5e7ebc060ac2688839d43ca5b0`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
+The later guest-input validation extension is sealed at:
+
+- Commit: `5c5f21457d200b45dcad9ddd9d5bede0500344fd`
+- Bundle: `/private/tmp/grokptah-cu-stage13-guest-input-validation-v1.bundle`
+- Bundle SHA-256: `5c9e8c98e9e23d93cf926b32c456eb08339db9f527c5614534622e41bec8c67f`
+
 ## What this candidate proves
 
 - The helper control ABI has an explicit `bind` command and authenticated
