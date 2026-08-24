@@ -1,8 +1,9 @@
 # Isolated visual guest source candidate
 
 This directory contains the Linux arm64 source candidate for the Stage 9 isolated visual
-Computer Use substrate. It is not a guest artifact, signed package, boot proof, frame carrier,
-input backend, or `HostNative` dispatch proof.
+Computer Use substrate. It is not a reviewed guest artifact, signed package, boot proof, or
+`HostNative` dispatch proof. Its source includes bounded frame and fixture-input carriers, but
+those are not packaged VM evidence.
 
 ## Source contract
 
@@ -25,8 +26,9 @@ input backend, or `HostNative` dispatch proof.
   not carry paths, model traffic, or reusable secrets.
 - `isolated_visual_channel.rs` mirrors that canonical digest/key/confirmation contract for the host
   bridge, encodes the fixed binding header plus its four identity fields, and supplies challenge-
-  bound constructors for the Rust frame/input carriers. It is a source contract only: the
-  helper/guest socket loop still does not consume it.
+  bound constructors for the Rust frame/input carriers. The helper and guest source loops consume
+  the binding packet; the Rust constructors remain source-level contracts until the packaged
+  runtime exercises them.
 
 ## Reproducible Linux workflow
 
