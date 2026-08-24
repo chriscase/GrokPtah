@@ -28,6 +28,7 @@
 #define GPT_REBOOT_POWER_OFF 0x4321fedcL
 #define GPT_AT_FDCWD (-100L)
 #define GPT_O_RDONLY 0L
+#define GPT_O_RDWR 2L
 #define GPT_O_CLOEXEC 524288L
 #define GPT_SEEK_SET 0L
 #define GPT_POLLIN 1U
@@ -135,7 +136,7 @@ static int gpt_open_framebuffer(void) {
         GPT_SYS_OPENAT,
         GPT_AT_FDCWD,
         (long)path,
-        GPT_O_RDONLY | GPT_O_CLOEXEC,
+        GPT_O_RDWR | GPT_O_CLOEXEC,
         0,
         0,
         0);
@@ -174,6 +175,123 @@ static gpt_u8 gpt_frame_bytes[GPT_GUEST_FRAME_BYTES];
 static gpt_u8 gpt_frame_packet[GPT_ISOLATED_VISUAL_FRAME_MAX_PACKET_BYTES];
 static gpt_u8 gpt_frame_authentication[GPT_ISOLATED_VISUAL_FRAME_AUTH_MAX_BYTES];
 
+static gpt_u32 gpt_fixture_cursor_x = GPT_GUEST_FRAME_WIDTH / 2U;
+static gpt_u32 gpt_fixture_cursor_y = GPT_GUEST_FRAME_HEIGHT / 2U;
+static gpt_u8 gpt_fixture_button = 0;
+static gpt_u32 gpt_fixture_generation = 0;
+
+static void gpt_fixture_pixel(gpt_u8 *bytes, gpt_u32 x, gpt_u32 y, gpt_u32 color) {
+    gpt_size offset = ((gpt_size)y * GPT_GUEST_FRAME_WIDTH + x) * 4U;
+    bytes[offset] = (gpt_u8)color;
+    bytes[offset + 1U] = (gpt_u8)(color >> 8U);
+    bytes[offset + 2U] = (gpt_u8)(color >> 16U);
+    bytes[offset + 3U] = (gpt_u8)(color >> 24U);
+}
+
+static void gpt_fixture_rect(
+    gpt_u8 *bytes,
+    gpt_u32 left,
+    gpt_u32 top,
+    gpt_u32 right,
+    gpt_u32 bottom,
+    gpt_u32 color) {
+    gpt_u32 x;
+    gpt_u32 y;
+    if (left >= right || top >= bottom || left >= GPT_GUEST_FRAME_WIDTH ||
+        top >= GPT_GUEST_FRAME_HEIGHT) {
+        return;
+    }
+    if (right > GPT_GUEST_FRAME_WIDTH) {
+        right = GPT_GUEST_FRAME_WIDTH;
+    }
+    if (bottom > GPT_GUEST_FRAME_HEIGHT) {
+        bottom = GPT_GUEST_FRAME_HEIGHT;
+    }
+    for (y = top; y < bottom; ++y) {
+        for (x = left; x < right; ++x) {
+            gpt_fixture_pixel(bytes, x, y, color);
+        }
+    }
+}
+
+static int gpt_render_fixture(int framebuffer) {
+    gpt_u32 x;
+    gpt_u32 y;
+    gpt_u32 generation = gpt_fixture_generation & 0x3fU;
+    for (y = 0; y < GPT_GUEST_FRAME_HEIGHT; ++y) {
+        for (x = 0; x < GPT_GUEST_FRAME_WIDTH; ++x) {
+            gpt_u32 red = 0x18U + ((x * 0x38U) / GPT_GUEST_FRAME_WIDTH);
+            gpt_u32 green = 0x20U + ((y * 0x42U) / GPT_GUEST_FRAME_HEIGHT);
+            gpt_u32 blue = 0x38U + generation;
+            gpt_fixture_pixel(
+                gpt_frame_bytes,
+                x,
+                y,
+                0xff000000U | (red << 16U) | (green << 8U) | blue);
+        }
+    }
+    gpt_fixture_rect(
+        gpt_frame_bytes,
+        48U,
+        40U,
+        GPT_GUEST_FRAME_WIDTH - 48U,
+        104U,
+        0xff24324aU);
+    gpt_fixture_rect(gpt_frame_bytes, 80U, 150U, 600U, 640U, 0xff182235U);
+    gpt_fixture_rect(gpt_frame_bytes, 640U, 150U, 1200U, 640U, 0xff101827U);
+    gpt_fixture_rect(
+        gpt_frame_bytes,
+        96U,
+        184U,
+        520U,
+        gpt_fixture_button != 0U ? 340U : 300U,
+        gpt_fixture_button != 0U ? 0xff4e9f72U : 0xff35527dU);
+    gpt_fixture_rect(gpt_frame_bytes, 96U, 360U, 520U, 396U, 0xff41536eU);
+    gpt_fixture_rect(gpt_frame_bytes, 96U, 440U, 520U, 476U, 0xff41536eU);
+    gpt_fixture_rect(gpt_frame_bytes, 680U, 196U, 1160U, 228U, 0xff31445fU);
+    gpt_fixture_rect(gpt_frame_bytes, 680U, 252U, 1080U, 284U, 0xff31445fU);
+    gpt_fixture_rect(gpt_frame_bytes, 680U, 308U, 1120U, 340U, 0xff31445fU);
+    gpt_fixture_rect(
+        gpt_frame_bytes,
+        gpt_fixture_cursor_x > 5U ? gpt_fixture_cursor_x - 5U : 0U,
+        gpt_fixture_cursor_y > 5U ? gpt_fixture_cursor_y - 5U : 0U,
+        gpt_fixture_cursor_x + 6U,
+        gpt_fixture_cursor_y + 6U,
+        gpt_fixture_button != 0U ? 0xffffd166U : 0xfff5f7fbU);
+    if (gpt_syscall3(GPT_SYS_LSEEK, framebuffer, 0, GPT_SEEK_SET) < 0) {
+        return 0;
+    }
+    return gpt_write_exact(framebuffer, gpt_frame_bytes, GPT_GUEST_FRAME_BYTES);
+}
+
+static void gpt_apply_fixture_input(const gpt_u8 *packet) {
+    gpt_u8 kind = packet[40U];
+    gpt_u8 state = packet[41U];
+    gpt_u32 x = gpt_load_be32(packet + 44U);
+    gpt_u32 y = gpt_load_be32(packet + 48U);
+    gpt_i32 delta_x = (gpt_i32)gpt_load_be32(packet + 52U);
+    gpt_i32 delta_y = (gpt_i32)gpt_load_be32(packet + 56U);
+    if (kind == 1U || kind == 2U) {
+        gpt_fixture_cursor_x = x;
+        gpt_fixture_cursor_y = y;
+        if (kind == 2U) {
+            gpt_fixture_button = state == 1U ? 1U : 0U;
+        }
+    } else if (kind == 3U) {
+        gpt_i32 next_x = (gpt_i32)gpt_fixture_cursor_x + delta_x;
+        gpt_i32 next_y = (gpt_i32)gpt_fixture_cursor_y + delta_y;
+        gpt_fixture_cursor_x = next_x < 0 ? 0U : (gpt_u32)next_x;
+        gpt_fixture_cursor_y = next_y < 0 ? 0U : (gpt_u32)next_y;
+        if (gpt_fixture_cursor_x >= GPT_GUEST_FRAME_WIDTH) {
+            gpt_fixture_cursor_x = GPT_GUEST_FRAME_WIDTH - 1U;
+        }
+        if (gpt_fixture_cursor_y >= GPT_GUEST_FRAME_HEIGHT) {
+            gpt_fixture_cursor_y = GPT_GUEST_FRAME_HEIGHT - 1U;
+        }
+    }
+    gpt_fixture_generation += 1U;
+}
+
 static int gpt_send_frame(
     int socket,
     int framebuffer,
@@ -192,7 +310,7 @@ static int gpt_send_frame(
         (GPT_GUEST_FRAME_BYTES + GPT_ISOLATED_VISUAL_FRAME_CHUNK_BYTES - 1U) /
         GPT_ISOLATED_VISUAL_FRAME_CHUNK_BYTES;
     gpt_u32 chunk_index;
-    if (!gpt_capture_frame(framebuffer, gpt_frame_bytes) ||
+    if (!gpt_render_fixture(framebuffer) || !gpt_capture_frame(framebuffer, gpt_frame_bytes) ||
         !gpt_fill_frame_nonce(request_nonce)) {
         return 0;
     }
@@ -391,6 +509,7 @@ __attribute__((noreturn)) void _start(void) {
                     &held_button)) {
                 gpt_power_off(24);
             }
+            gpt_apply_fixture_input(packet);
             last_input_sequence += 1U;
             continue;
         }
