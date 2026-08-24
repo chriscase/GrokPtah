@@ -6,12 +6,12 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `3529c66037615cbf1de7ae82be780bcebf931b62`
-- Bundle: `/private/tmp/grokptah-cu-stage30-packaged-supervisor-v1.bundle`
-- Bundle SHA-256: `abd7bd10661795f74d21a53ba9c77b970af158b7196bd569b630b71053f89bee`
+- Head: `334d045a654f9dee2909158871b8187bb642db45`
+- Bundle: `/private/tmp/grokptah-cu-stage31-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `e0980baf1f80a05c422df6317b412e3db6a7d2658a690b5c5d0ef077023e5275`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current sealed implementation head: `3529c66037615cbf1de7ae82be780bcebf931b62`.
+Current sealed implementation head: `334d045a654f9dee2909158871b8187bb642db45`.
 
 The later guest-input validation extension is sealed at:
 
@@ -57,9 +57,9 @@ The private guest-challenge channel extension is sealed at:
 
 The bounded packaged-supervisor source extension is sealed at:
 
-- Commit: `3529c66037615cbf1de7ae82be780bcebf931b62`
-- Bundle: `/private/tmp/grokptah-cu-stage30-packaged-supervisor-v1.bundle`
-- Bundle SHA-256: `abd7bd10661795f74d21a53ba9c77b970af158b7196bd569b630b71053f89bee`
+- Commit: `334d045a654f9dee2909158871b8187bb642db45`
+- Bundle: `/private/tmp/grokptah-cu-stage31-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `e0980baf1f80a05c422df6317b412e3db6a7d2658a690b5c5d0ef077023e5275`
 
 ## What this candidate proves
 
