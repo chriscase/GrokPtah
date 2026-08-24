@@ -1168,8 +1168,7 @@ impl Stage6WorkerPool {
         self.reconnect_and_assert_authority(campaign).await;
 
         self.credential_lifecycle.clear();
-        for index in 0..self.lanes.len() {
-            let lane = &self.lanes[index];
+        for (index, lane) in self.lanes.iter().enumerate() {
             let old_fingerprint = hash_payload(&json!(old_tokens[index].as_str()));
             let new_fingerprint = hash_payload(&json!(lane.token.as_str()));
             let evidence_digest = hash_payload(&json!({
