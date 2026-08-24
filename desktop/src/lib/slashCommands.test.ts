@@ -22,6 +22,19 @@ describe("slash commands (#148)", () => {
     expect(app).toMatch(/\/cd /);
     expect(app).toMatch(/sessionFork|sessionRename|exportTranscript|setProjectCwd/);
   });
+
+  it("opens Help locally for exact /help, including queued sends", () => {
+    const app = readFileSync(join(root, "..", "App.tsx"), "utf8");
+    expect(app).toMatch(/if \(prompt === ["']\/help["']\) \{/);
+    expect(app).not.toMatch(/!opts\?\.fromQueue && prompt === ["']\/help["']/);
+    const helpIdx = app.search(/if \(prompt === ["']\/help["']\) \{/);
+    const queueIdx = app.search(/tabBusy && !opts\?\.fromQueue/);
+    const promptIdx = app.search(/api\.sessionPrompt\(id, prompt/);
+    expect(helpIdx).toBeGreaterThan(-1);
+    expect(helpIdx).toBeLessThan(queueIdx);
+    expect(helpIdx).toBeLessThan(promptIdx);
+    expect(app).toMatch(/setHelpOpen\(true\)/);
+  });
 });
 
 describe("launch splash (#150)", () => {

@@ -64,3 +64,67 @@ describe("resume / continue (#38)", () => {
     expect(app).toMatch(/archived \? api\.sessionInspect\(id\) : api\.sessionLoad\(id\)/);
   });
 });
+
+function hexToRgb(hex: string): [number, number, number] {
+  const value = hex.replace("#", "");
+  return [
+    parseInt(value.slice(0, 2), 16),
+    parseInt(value.slice(2, 4), 16),
+    parseInt(value.slice(4, 6), 16),
+  ];
+}
+
+function relativeLuminance([r, g, b]: [number, number, number]): number {
+  const linear = [r, g, b].map((channel) => {
+    const srgb = channel / 255;
+    return srgb <= 0.04045 ? srgb / 12.92 : ((srgb + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+}
+
+function contrastRatio(foreground: string, background: string): number {
+  const lighter = Math.max(relativeLuminance(hexToRgb(foreground)), relativeLuminance(hexToRgb(background)));
+  const darker = Math.min(relativeLuminance(hexToRgb(foreground)), relativeLuminance(hexToRgb(background)));
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+describe("Help overlay and small-label contract", () => {
+  it("keeps light amber/accent 10px labels at WCAG AA against Help surfaces", () => {
+    const css = readFileSync(join(root, "..", "styles", "app.css"), "utf8");
+    const lightStart = css.indexOf('[data-theme="light"]');
+    const lightBlock = css.slice(lightStart, css.indexOf("}", lightStart) + 1);
+    const label = lightBlock.match(/--accent-label:\s*(#[0-9a-fA-F]{6})/)?.[1];
+    const panel = lightBlock.match(/--bg-panel:\s*(#[0-9a-fA-F]{6})/)?.[1];
+    const page = lightBlock.match(/--bg:\s*(#[0-9a-fA-F]{6})/)?.[1];
+    expect(label).toBeTruthy();
+    expect(panel).toBeTruthy();
+    expect(page).toBeTruthy();
+    expect(contrastRatio(label!, panel!)).toBeGreaterThanOrEqual(4.5);
+    expect(contrastRatio(label!, page!)).toBeGreaterThanOrEqual(4.5);
+
+    const darkStart = css.indexOf(":root,");
+    const darkBlock = css.slice(darkStart, css.indexOf("}", darkStart) + 1);
+    const darkLabel = darkBlock.match(/--accent-label:\s*(#[0-9a-fA-F]{6})/)?.[1];
+    const darkPanel = darkBlock.match(/--bg-panel:\s*(#[0-9a-fA-F]{6})/)?.[1];
+    expect(darkLabel).toBeTruthy();
+    expect(darkPanel).toBeTruthy();
+    expect(contrastRatio(darkLabel!, darkPanel!)).toBeGreaterThanOrEqual(4.5);
+
+    const amberStart = css.indexOf('html[data-accent="amber"]');
+    const amberBlock = css.slice(amberStart, css.indexOf("}", amberStart) + 1);
+    expect(amberBlock).not.toMatch(/--accent-label:/);
+
+    expect(css).toMatch(/\.help-eyebrow[\s\S]{0,180}color:\s*var\(--accent-label\)/);
+    expect(css).toMatch(/\.help-list-topic,\s*\n\.help-article-topic \{\n  color:\s*var\(--accent-label\)/);
+  });
+
+  it("defines a global overlay contract where consent stacks above Help", () => {
+    const css = readFileSync(join(root, "..", "styles", "app.css"), "utf8");
+    const help = Number(css.match(/--z-layer-help:\s*(\d+)/)?.[1]);
+    const consent = Number(css.match(/--z-layer-consent:\s*(\d+)/)?.[1]);
+    expect(help).toBeGreaterThan(0);
+    expect(consent).toBeGreaterThan(help);
+    expect(css).toMatch(/\.help-center\s*\{[\s\S]*?z-index:\s*var\(--z-layer-help\)/);
+    expect(css).toMatch(/\[data-modal-layer=["']consent["']\][\s\S]{0,80}z-index:\s*var\(--z-layer-consent\)/);
+  });
+});

@@ -75,4 +75,10 @@ describe("SLASH_COMMANDS", () => {
     expect(cmds).toContain("/sandbox");
     expect(cmds).toContain("/context");
   });
+
+  it("describes /help as opening the Help Center, not a command list", () => {
+    const help = SLASH_COMMANDS.find((item) => item.cmd === "/help");
+    expect(help?.desc).toMatch(/help center/i);
+    expect(help?.desc).not.toMatch(/show commands/i);
+  });
 });

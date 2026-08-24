@@ -1180,7 +1180,7 @@ export function normalizeSessionUpdate(raw: unknown): SessionUpdate | null {
 }
 
 export const SLASH_COMMANDS = [
-  { cmd: "/help", desc: "Show commands" },
+  { cmd: "/help", desc: "Open the Help Center" },
   { cmd: "/plan", desc: "Propose a plan (accept starts execution)" },
   { cmd: "/yolo", desc: "Always approve tools" },
   { cmd: "/explore", desc: "Spawn explore subagent" },

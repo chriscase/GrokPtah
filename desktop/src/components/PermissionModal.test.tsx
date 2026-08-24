@@ -80,6 +80,10 @@ describe("PermissionModal (#141)", () => {
       "data-session-id",
       "session-background-aaaa",
     );
+    expect(screen.getByTestId("permission-modal-backdrop")).toHaveAttribute(
+      "data-modal-layer",
+      "consent",
+    );
     expect(screen.getByTestId("permission-session").textContent).toContain(
       "session-",
     );

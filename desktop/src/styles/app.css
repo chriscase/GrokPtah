@@ -36,6 +36,10 @@
   --state-info: #7db8ff;
   --state-attention: #f0b429;
   --state-danger: #f07178;
+  --accent-label: #f0b429;
+  /* Overlay contract: consent/permission must always stack above Help. */
+  --z-layer-help: 86;
+  --z-layer-consent: 120;
   --radius: 6px;
   /* Body / prose — proportional so code pops against it (#125) */
   --font: "Inter", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", sans-serif;
@@ -81,6 +85,7 @@
   --state-info: #155fc1;
   --state-attention: #8a6508;
   --state-danger: #c23b44;
+  --accent-label: #8a6508;
 }
 
 * {
@@ -2108,11 +2113,42 @@ button:disabled {
 .help-center {
   position: fixed;
   inset: 0;
-  z-index: 86;
+  z-index: var(--z-layer-help);
   display: grid;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: 1fr;
   background: var(--bg);
   color: var(--text);
+}
+
+.help-surface {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.help-confirm-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  padding: 1.25rem;
+  background: var(--overlay-scrim);
+}
+
+.help-confirm-layer .help-semantic-confirm,
+.help-confirm-layer .help-assistant-confirm {
+  width: min(420px, 100%);
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.9rem 1rem 1rem;
+  background: var(--bg-panel);
+  color: var(--text);
+  font-size: 12px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
 }
 
 .help-header {
@@ -2146,7 +2182,7 @@ button:disabled {
 
 .help-eyebrow {
   margin-bottom: 0.2rem;
-  color: var(--accent);
+  color: var(--accent-label);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.09em;
@@ -2324,7 +2360,7 @@ button:disabled {
 
 .help-list-topic,
 .help-article-topic {
-  color: var(--accent);
+  color: var(--accent-label);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.07em;
@@ -2488,6 +2524,8 @@ button:disabled {
   .help-center,
   .help-header,
   .help-nav,
+  .help-surface,
+  .help-confirm-layer,
   .help-source-card,
   .help-assistant-card,
   .help-semantic-confirm,
@@ -4094,6 +4132,10 @@ button:disabled {
   align-items: center;
   justify-content: center;
   z-index: 50;
+}
+
+.modal-backdrop[data-modal-layer="consent"] {
+  z-index: var(--z-layer-consent);
 }
 
 .modal {

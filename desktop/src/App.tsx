@@ -2367,6 +2367,13 @@ export default function App() {
   ) {
     const prompt = (text ?? composer).trim();
     if (!prompt) return;
+    if (prompt === "/help") {
+      if (text === undefined) {
+        clearComposerFor(activeSessionId);
+      }
+      setHelpOpen(true);
+      return;
+    }
     const targetSessionId = opts?.sessionId ?? activeSessionId;
     if (targetSessionId && archivedLaneIds.has(targetSessionId)) {
       const message =
@@ -2589,18 +2596,6 @@ export default function App() {
       transcript: [...t.transcript, { kind: "user", text: prompt }],
     }));
     try {
-      if (!opts?.fromQueue && prompt === "/help") {
-        patchTab(id, (t) => ({
-          ...t,
-          busy: false,
-          activity: idleActivity(),
-          transcript: t.transcript.filter(
-            (x) => !(x.kind === "user" && x.text === prompt),
-          ),
-        }));
-        setHelpOpen(true);
-        return;
-      }
       if (!opts?.fromQueue && prompt === "/compact") {
         await api.sessionCompact(id);
         // Compact only shrinks the server context window — rehydrate full

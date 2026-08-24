@@ -192,4 +192,99 @@ describe("HelpCenter", () => {
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/ranking rejected/));
     expect(screen.getByRole("heading", { name: "Review code through a restricted company gateway" })).toBeInTheDocument();
   });
+
+  it("traps Tab inside the top confirmation and restores the layer opener, not the Help opener", () => {
+    const onClose = vi.fn();
+    const opener = document.createElement("button");
+    opener.type = "button";
+    opener.textContent = "Open Help";
+    document.body.appendChild(opener);
+    opener.focus();
+    const focusSpy = vi.spyOn(opener, "focus");
+
+    const { unmount } = render(
+      <HelpCenter open onClose={onClose} onAskAssistant={vi.fn()} />,
+    );
+    const prepare = screen.getByRole("button", { name: "Prepare cited question" });
+    focusSpy.mockClear();
+    fireEvent.click(prepare);
+
+    const alert = screen.getByRole("alertdialog", { name: "Confirm assistant request" });
+    const primary = screen.getByRole("button", { name: "Send cited context" });
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    expect(document.activeElement).toBe(primary);
+    expect(focusSpy).not.toHaveBeenCalled();
+
+    cancel.focus();
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(document.activeElement).toBe(primary);
+    expect(document.activeElement).not.toBe(
+      screen.getByRole("button", { name: "Close Help Center", hidden: true }),
+    );
+
+    primary.focus();
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(cancel);
+    expect(alert.contains(document.activeElement)).toBe(true);
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(document.activeElement).toBe(prepare);
+    expect(focusSpy).not.toHaveBeenCalled();
+
+    unmount();
+    expect(focusSpy).toHaveBeenCalled();
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
+  });
+
+  it("closes stacked confirmations one layer at a time", () => {
+    const onClose = vi.fn();
+    render(
+      <HelpCenter
+        open
+        onClose={onClose}
+        onAskAssistant={vi.fn()}
+        onSearchSemantic={vi.fn()}
+      />,
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "Search help" }), {
+      target: { value: "gateway" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Prepare meaning search" }));
+    expect(screen.getByRole("alertdialog", { name: "Confirm meaning search" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Prepare cited question", hidden: true }));
+    expect(screen.getByRole("alertdialog", { name: "Confirm assistant request" })).toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog", { name: "Confirm meaning search" })).not.toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alertdialog", { name: "Confirm assistant request" })).not.toBeInTheDocument();
+    expect(screen.getByRole("alertdialog", { name: "Confirm meaning search" })).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("does not make consent-layer siblings inert while Help is open", () => {
+    render(
+      <div className="app-shell">
+        <main data-testid="app-background">Active coding lane</main>
+        <div data-modal-layer="consent" data-testid="consent-layer">
+          Allow this tool?
+        </div>
+        <HelpCenter open onClose={vi.fn()} />
+      </div>,
+    );
+
+    expect(screen.getByTestId("app-background")).toHaveAttribute("inert");
+    expect(screen.getByTestId("consent-layer")).not.toHaveAttribute("inert");
+    expect(screen.getByTestId("consent-layer")).not.toHaveAttribute("aria-hidden", "true");
+  });
 });

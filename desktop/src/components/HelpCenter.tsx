@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   buildHelpAssistantRequest,
   buildHelpSemanticRequest,
@@ -45,6 +45,18 @@ type SemanticState =
   | { status: "results"; results: ReturnType<typeof searchHelp>; uncertainty: string }
   | { status: "error"; message: string };
 
+type ConfirmKind = "semantic" | "assistant";
+
+const FOCUSABLE_SELECTOR =
+  'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
+
+function focusableIn(root: HTMLElement | null): HTMLElement[] {
+  if (!root) return [];
+  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+    (element) => !element.closest("[inert]"),
+  );
+}
+
 export function HelpCenter({
   open,
   onClose,
@@ -57,9 +69,17 @@ export function HelpCenter({
   const [selectedId, setSelectedId] = useState(HELP_ARTICLES[0]?.id ?? "");
   const [assistant, setAssistant] = useState<AssistantState>({ status: "idle" });
   const [semantic, setSemantic] = useState<SemanticState>({ status: "idle" });
+  const [confirmStack, setConfirmStack] = useState<ConfirmKind[]>([]);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const surfaceRef = useRef<HTMLDivElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
   const confirmDialogRef = useRef<HTMLDivElement>(null);
+  const onCloseRef = useRef(onClose);
+  const topConfirmRef = useRef<ConfirmKind | null>(null);
+  const prevTopConfirmRef = useRef<ConfirmKind | null>(null);
+  const layerReturnFocusRef = useRef<Partial<Record<ConfirmKind, HTMLElement | null>>>({});
+
+  onCloseRef.current = onClose;
 
   const lexicalResults = useMemo(() => {
     if (!query.trim()) {
@@ -87,32 +107,55 @@ export function HelpCenter({
     null;
   const selected = selectedResult?.article ?? null;
 
+  const topConfirm = (() => {
+    for (let index = confirmStack.length - 1; index >= 0; index -= 1) {
+      const kind = confirmStack[index];
+      if (kind === "assistant" && assistant.status === "confirm") return "assistant";
+      if (kind === "semantic" && semantic.status === "confirm") return "semantic";
+    }
+    return null;
+  })();
+  topConfirmRef.current = topConfirm;
+
+  const dismissConfirm = (kind: ConfirmKind) => {
+    if (kind === "assistant") setAssistant({ status: "idle" });
+    else setSemantic({ status: "idle" });
+    setConfirmStack((stack) => stack.filter((entry) => entry !== kind));
+  };
+
+  const pushConfirm = (kind: ConfirmKind, opener: HTMLElement | null) => {
+    layerReturnFocusRef.current[kind] = opener;
+    setConfirmStack((stack) => [...stack.filter((entry) => entry !== kind), kind]);
+  };
+
   useEffect(() => {
     if (!open) return;
     returnFocusRef.current = document.activeElement instanceof HTMLElement
       ? document.activeElement
       : null;
+    prevTopConfirmRef.current = null;
+    layerReturnFocusRef.current = {};
     const focusTarget = dialogRef.current?.querySelector<HTMLElement>("#help-search-input");
     focusTarget?.focus();
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        if (semantic.status === "confirm") {
-          setSemantic({ status: "idle" });
-        } else if (assistant.status === "confirm") {
+        const top = topConfirmRef.current;
+        if (top === "assistant") {
           setAssistant({ status: "idle" });
+          setConfirmStack((stack) => stack.filter((kind) => kind !== "assistant"));
+        } else if (top === "semantic") {
+          setSemantic({ status: "idle" });
+          setConfirmStack((stack) => stack.filter((kind) => kind !== "semantic"));
         } else {
-          onClose();
+          onCloseRef.current();
         }
         return;
       }
       if (event.key !== "Tab") return;
 
-      const focusable = Array.from(
-        dialogRef.current?.querySelectorAll<HTMLElement>(
-          'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
-        ) ?? [],
-      );
+      const trapRoot = topConfirmRef.current ? confirmDialogRef.current : dialogRef.current;
+      const focusable = focusableIn(trapRoot);
       if (focusable.length === 0) return;
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
@@ -130,22 +173,36 @@ export function HelpCenter({
       returnFocusRef.current?.focus();
       returnFocusRef.current = null;
     };
-  }, [assistant.status, onClose, open, semantic.status]);
+  }, [open]);
 
-  useEffect(() => {
-    if (!open || (assistant.status !== "confirm" && semantic.status !== "confirm")) return;
-    const focusTarget = confirmDialogRef.current?.querySelector<HTMLElement>(
-      "button.primary, button:not([disabled])",
-    );
-    focusTarget?.focus();
-  }, [assistant.status, open, semantic.status]);
+  useLayoutEffect(() => {
+    if (!open) {
+      prevTopConfirmRef.current = null;
+      return;
+    }
+    const previous = prevTopConfirmRef.current;
+    prevTopConfirmRef.current = topConfirm;
+    if (topConfirm) {
+      const focusTarget = confirmDialogRef.current?.querySelector<HTMLElement>(
+        "button.primary, button:not([disabled])",
+      );
+      focusTarget?.focus();
+      return;
+    }
+    if (previous) {
+      layerReturnFocusRef.current[previous]?.focus();
+    }
+  }, [open, topConfirm]);
 
   useEffect(() => {
     if (!open || !dialogRef.current) return;
     const shell = dialogRef.current.parentElement;
     if (!shell) return;
     const siblings = Array.from(shell.children).filter(
-      (child): child is HTMLElement => child !== dialogRef.current && child instanceof HTMLElement,
+      (child): child is HTMLElement =>
+        child !== dialogRef.current &&
+        child instanceof HTMLElement &&
+        child.dataset.modalLayer !== "consent",
     );
     const previous = siblings.map((element) => ({
       element,
@@ -174,14 +231,20 @@ export function HelpCenter({
 
   useEffect(() => {
     setAssistant({ status: "idle" });
+    setConfirmStack((stack) => stack.filter((kind) => kind !== "assistant"));
   }, [selectedId, query]);
 
   useEffect(() => {
     setSemantic({ status: "idle" });
+    setConfirmStack((stack) => stack.filter((kind) => kind !== "semantic"));
   }, [query, topic]);
 
-  const beginAssistantRequest = () => {
+  const beginAssistantRequest = (opener: HTMLElement | null = null) => {
     if (!selected || !onAskAssistant) return;
+    pushConfirm(
+      "assistant",
+      opener ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null),
+    );
     setAssistant({
       status: "confirm",
       request: buildHelpAssistantRequest(selected, query || selected.title, retrievalMode),
@@ -190,6 +253,7 @@ export function HelpCenter({
 
   const confirmAssistantRequest = async () => {
     if (assistant.status !== "confirm" || !onAskAssistant) return;
+    setConfirmStack((stack) => stack.filter((kind) => kind !== "assistant"));
     setAssistant({ status: "loading" });
     try {
       const answer = await onAskAssistant(assistant.request);
@@ -207,9 +271,13 @@ export function HelpCenter({
     }
   };
 
-  const beginSemanticRequest = () => {
+  const beginSemanticRequest = (opener: HTMLElement | null = null) => {
     const trimmed = query.trim();
     if (!trimmed || !onSearchSemantic) return;
+    pushConfirm(
+      "semantic",
+      opener ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null),
+    );
     setSemantic({
       status: "confirm",
       request: buildHelpSemanticRequest(
@@ -221,6 +289,7 @@ export function HelpCenter({
 
   const confirmSemanticRequest = async () => {
     if (semantic.status !== "confirm" || !onSearchSemantic) return;
+    setConfirmStack((stack) => stack.filter((kind) => kind !== "semantic"));
     setSemantic({ status: "loading" });
     try {
       const answer = await onSearchSemantic(semantic.request);
@@ -260,11 +329,18 @@ export function HelpCenter({
     <div
       ref={dialogRef}
       className="help-center"
+      data-modal-layer="help"
       role="dialog"
       aria-modal="true"
       aria-labelledby="help-center-title"
       aria-describedby="help-center-subtitle"
     >
+      <div
+        className="help-surface"
+        ref={surfaceRef}
+        aria-hidden={topConfirm ? true : undefined}
+        {...(topConfirm ? { inert: "" } : {})}
+      >
       <header className="help-header">
         <div>
           <p className="help-eyebrow">GrokPtah guidance</p>
@@ -318,38 +394,15 @@ export function HelpCenter({
               ? "Provider semantic ranking · corpus IDs preserved"
               : "Offline lexical index · citations preserved"}
           </p>
-          {onSearchSemantic && semantic.status === "idle" && (
+            {onSearchSemantic && (semantic.status === "idle" || semantic.status === "confirm") && (
             <button
               type="button"
               className="help-semantic-search"
-              onClick={beginSemanticRequest}
+              onClick={(event) => beginSemanticRequest(event.currentTarget)}
               disabled={!query.trim()}
             >
               Prepare meaning search
             </button>
-          )}
-          {onSearchSemantic && semantic.status === "confirm" && (
-            <div
-              ref={confirmDialogRef}
-              className="help-semantic-confirm"
-              role="alertdialog"
-              aria-modal="true"
-              aria-labelledby="help-semantic-confirm-title"
-              aria-describedby="help-semantic-confirm-copy"
-            >
-              <p>
-                <strong id="help-semantic-confirm-title">Confirm meaning search</strong>
-              </p>
-              <p id="help-semantic-confirm-copy">
-                Send this query and article metadata to {assistantProviderLabel ?? "the selected provider"} for meaning-based ranking? No article body or workspace data will be sent.
-              </p>
-              <button type="button" className="primary" onClick={() => void confirmSemanticRequest()}>
-                Search by meaning
-              </button>
-              <button type="button" onClick={() => setSemantic({ status: "idle" })}>
-                Cancel
-              </button>
-            </div>
           )}
           {semantic.status === "loading" && <p className="help-retrieval-status" role="status">Ranking help by meaning…</p>}
           {semantic.status === "error" && <p className="help-retrieval-status" role="alert">{semantic.message}</p>}
@@ -424,33 +477,10 @@ export function HelpCenter({
                     configured provider. No workspace, session, credential, or
                     clipboard data is included.
                   </p>
-                  {assistant.status === "idle" && (
-                    <button type="button" onClick={beginAssistantRequest}>
+                  {(assistant.status === "idle" || assistant.status === "confirm") && (
+                    <button type="button" onClick={(event) => beginAssistantRequest(event.currentTarget)}>
                       Prepare cited question
                     </button>
-                  )}
-                  {assistant.status === "confirm" && (
-                    <div
-                      ref={confirmDialogRef}
-                      className="help-assistant-confirm"
-                      role="alertdialog"
-                      aria-modal="true"
-                      aria-labelledby="help-assistant-confirm-title"
-                      aria-describedby="help-assistant-confirm-copy"
-                    >
-                      <p>
-                        <strong id="help-assistant-confirm-title">Confirm assistant request</strong>
-                      </p>
-                      <p id="help-assistant-confirm-copy">
-                        Ready to send the cited article bundle ({assistant.request.sources.length} source{assistant.request.sources.length === 1 ? "" : "s"}) via {assistantProviderLabel ?? "the selected provider"}?
-                      </p>
-                      <button type="button" className="primary" onClick={() => void confirmAssistantRequest()}>
-                        Send cited context
-                      </button>
-                      <button type="button" onClick={() => setAssistant({ status: "idle" })}>
-                        Cancel
-                      </button>
-                    </div>
                   )}
                   {assistant.status === "loading" && <p role="status">Waiting for the configured provider…</p>}
                   {assistant.status === "answer" && (
@@ -473,6 +503,58 @@ export function HelpCenter({
           )}
         </article>
       </div>
+      </div>
+
+      {topConfirm === "semantic" && semantic.status === "confirm" && (
+        <div className="help-confirm-layer">
+          <div
+            ref={confirmDialogRef}
+            className="help-semantic-confirm"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="help-semantic-confirm-title"
+            aria-describedby="help-semantic-confirm-copy"
+          >
+            <p>
+              <strong id="help-semantic-confirm-title">Confirm meaning search</strong>
+            </p>
+            <p id="help-semantic-confirm-copy">
+              Send this query and article metadata to {assistantProviderLabel ?? "the selected provider"} for meaning-based ranking? No article body or workspace data will be sent.
+            </p>
+            <button type="button" className="primary" onClick={() => void confirmSemanticRequest()}>
+              Search by meaning
+            </button>
+            <button type="button" onClick={() => dismissConfirm("semantic")}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+      {topConfirm === "assistant" && assistant.status === "confirm" && (
+        <div className="help-confirm-layer">
+          <div
+            ref={confirmDialogRef}
+            className="help-assistant-confirm"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="help-assistant-confirm-title"
+            aria-describedby="help-assistant-confirm-copy"
+          >
+            <p>
+              <strong id="help-assistant-confirm-title">Confirm assistant request</strong>
+            </p>
+            <p id="help-assistant-confirm-copy">
+              Ready to send the cited article bundle ({assistant.request.sources.length} source{assistant.request.sources.length === 1 ? "" : "s"}) via {assistantProviderLabel ?? "the selected provider"}?
+            </p>
+            <button type="button" className="primary" onClick={() => void confirmAssistantRequest()}>
+              Send cited context
+            </button>
+            <button type="button" onClick={() => dismissConfirm("assistant")}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
