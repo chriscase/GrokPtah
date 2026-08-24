@@ -213,6 +213,10 @@ The monotonic VM-deadline hardening extension is sealed at:
   trickling host channel cannot leave freestanding guest PID 1 in an
   unbounded blocking syscall. Terminal poll errors, hangups, and invalid
   descriptors fail immediately instead of consuming the temporary-stall budget.
+- The helper's control, guest-socket, and input relays treat an interrupted
+  `poll`/`read` as a bounded transport failure rather than retrying inside an
+  unbounded signal loop; the outer lifecycle can therefore perform its normal
+  cleanup and report the original failure.
 - The stop boundary now rejects held keyboard/button state, waits for the
   helper to exit, and leaves the lifecycle in `CleanupPending` until explicit
   per-surface process, handle, overlay, and frame-cache evidence completes it.

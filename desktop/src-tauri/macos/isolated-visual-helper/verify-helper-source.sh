@@ -101,6 +101,9 @@ for required in \
   'GPTGuestWaitForReady' \
   'GPTGuestRequestShutdown' \
   'GPTWriteDescriptorExact' \
+  'poll(&descriptor' \
+  'poll(&descriptorState' \
+  'poll(descriptors' \
   'GPTMonotonicMilliseconds' \
   'GPTDeadlineAfter' \
   'durationMilliseconds' \

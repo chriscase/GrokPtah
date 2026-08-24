@@ -426,16 +426,12 @@ static int GPTReadControlByte(uint8_t *command, int timeoutMilliseconds) {
         .revents = 0,
     };
     int polled;
-    do {
-        polled = poll(&descriptor, 1, timeoutMilliseconds);
-    } while (polled < 0 && errno == EINTR && !GPTStopRequested);
+    polled = poll(&descriptor, 1, timeoutMilliseconds);
     if (polled <= 0) {
         return polled;
     }
     ssize_t count;
-    do {
-        count = read(GPT_CONTROL_FD, command, 1);
-    } while (count < 0 && errno == EINTR && !GPTStopRequested);
+    count = read(GPT_CONTROL_FD, command, 1);
     return count == 1 ? 1 : -1;
 }
 
@@ -462,9 +458,7 @@ static int GPTReadDescriptorExact(
             .revents = 0,
         };
         int polled;
-        do {
-            polled = poll(&descriptorState, 1, waitMilliseconds);
-        } while (polled < 0 && errno == EINTR && !GPTStopRequested);
+        polled = poll(&descriptorState, 1, waitMilliseconds);
         if (polled <= 0 ||
             (descriptorState.revents & POLLERR) != 0 ||
             ((descriptorState.revents & POLLHUP) != 0 &&
@@ -511,9 +505,7 @@ static BOOL GPTWriteDescriptorExact(
             .revents = 0,
         };
         int polled;
-        do {
-            polled = poll(&descriptorState, 1, waitMilliseconds);
-        } while (polled < 0 && errno == EINTR && !GPTStopRequested);
+        polled = poll(&descriptorState, 1, waitMilliseconds);
         if (polled <= 0 || (descriptorState.revents & POLLERR) != 0 ||
             ((descriptorState.revents & POLLHUP) != 0 &&
              (descriptorState.revents & POLLOUT) == 0)) {
@@ -576,9 +568,7 @@ static BOOL GPTWriteSocketExact(
             .revents = 0,
         };
         int polled;
-        do {
-            polled = poll(&descriptor, 1, waitMilliseconds);
-        } while (polled < 0 && errno == EINTR && !GPTStopRequested);
+        polled = poll(&descriptor, 1, waitMilliseconds);
         if (polled <= 0 ||
             (descriptor.revents & POLLERR) != 0 ||
             ((descriptor.revents & POLLHUP) != 0 &&
@@ -621,9 +611,7 @@ static BOOL GPTReadSocketExact(
             .revents = 0,
         };
         int polled;
-        do {
-            polled = poll(&descriptor, 1, waitMilliseconds);
-        } while (polled < 0 && errno == EINTR && !GPTStopRequested);
+        polled = poll(&descriptor, 1, waitMilliseconds);
         if (polled <= 0 ||
             (descriptor.revents & POLLERR) != 0 ||
             ((descriptor.revents & POLLHUP) != 0 &&
@@ -1091,9 +1079,7 @@ int main(int argc, const char *argv[]) {
                                        ? 1000
                                        : (int)remainingMilliseconds;
                 int polled;
-                do {
-                    polled = poll(descriptors, 3, pollTimeout);
-                } while (polled < 0 && errno == EINTR && !GPTStopRequested);
+                polled = poll(descriptors, 3, pollTimeout);
                 if (polled < 0) {
                     controlLost = YES;
                     break;
@@ -1109,9 +1095,7 @@ int main(int argc, const char *argv[]) {
                 if ((descriptors[0].revents & POLLIN) != 0) {
                     command = 0;
                     ssize_t count;
-                    do {
-                        count = read(GPT_CONTROL_FD, &command, sizeof(command));
-                    } while (count < 0 && errno == EINTR && !GPTStopRequested);
+                    count = read(GPT_CONTROL_FD, &command, sizeof(command));
                     if (count != 1) {
                         controlLost = YES;
                         break;
