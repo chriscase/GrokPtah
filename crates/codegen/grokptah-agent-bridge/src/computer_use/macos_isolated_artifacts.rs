@@ -91,19 +91,26 @@ fn copy_native_error(result: &NativeIsolatedArtifactsResult) -> String {
 }
 
 fn close_returned_descriptors(result: &NativeIsolatedArtifactsResult) {
-    for descriptor in [
+    let descriptors = [
         result.helper_fd,
         result.guest_image_fd,
         result.configuration_fd,
-    ] {
-        if descriptor >= 0 {
+    ];
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        if *descriptor >= 0 && descriptors[..index].iter().all(|prior| prior != descriptor) {
             // SAFETY: this path runs only before ownership is transferred to a
-            // `File`, and each returned descriptor is distinct by contract.
+            // `File`, and each returned descriptor is closed at most once.
             unsafe {
-                libc::close(descriptor);
+                libc::close(*descriptor);
             }
         }
     }
+}
+
+fn descriptors_are_distinct(descriptors: &[i32]) -> bool {
+    descriptors.iter().enumerate().all(|(index, descriptor)| {
+        *descriptor >= 0 && descriptors[..index].iter().all(|prior| prior != descriptor)
+    })
 }
 
 pub(super) fn measure_packaged_artifacts(
@@ -127,7 +134,11 @@ pub(super) fn open_packaged_runtime_artifacts(
         unsafe { gpt_macos_isolated_artifacts_result_free(&mut native) };
         return Err(error);
     }
-    if native.helper_fd < 0 || native.guest_image_fd < 0 || native.configuration_fd < 0 {
+    if !descriptors_are_distinct(&[
+        native.helper_fd,
+        native.guest_image_fd,
+        native.configuration_fd,
+    ]) {
         close_returned_descriptors(&native);
         unsafe { gpt_macos_isolated_artifacts_result_free(&mut native) };
         return Err(ComputerError::new(
@@ -220,5 +231,12 @@ mod tests {
         ] {
             assert!(shim.contains(required), "native shim omits {required}");
         }
+    }
+
+    #[test]
+    fn artifact_descriptor_set_must_be_complete_and_unique() {
+        assert!(descriptors_are_distinct(&[3, 4, 5]));
+        assert!(!descriptors_are_distinct(&[3, 4, 4]));
+        assert!(!descriptors_are_distinct(&[3, -1, 5]));
     }
 }

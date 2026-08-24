@@ -90,15 +90,24 @@ fn close_fd(descriptor: i32) {
     }
 }
 
+fn descriptors_are_distinct(descriptors: &[i32]) -> bool {
+    descriptors.iter().enumerate().all(|(index, descriptor)| {
+        *descriptor >= 0 && descriptors[..index].iter().all(|prior| prior != descriptor)
+    })
+}
+
 fn close_spawn_descriptors(result: &NativeIsolatedRuntimeSpawnResult) {
-    for descriptor in [
+    let descriptors = [
         result.control_fd,
         result.event_fd,
         result.input_fd,
         result.frame_fd,
         result.challenge_fd,
-    ] {
-        close_fd(descriptor);
+    ];
+    for (index, descriptor) in descriptors.iter().enumerate() {
+        if *descriptor >= 0 && descriptors[..index].iter().all(|prior| prior != descriptor) {
+            close_fd(*descriptor);
+        }
     }
 }
 
@@ -188,11 +197,13 @@ impl IsolatedVisualPackagedRuntime {
             return Err(error);
         }
         if native.pid <= 0
-            || native.control_fd < 0
-            || native.event_fd < 0
-            || native.input_fd < 0
-            || native.frame_fd < 0
-            || native.challenge_fd < 0
+            || !descriptors_are_distinct(&[
+                native.control_fd,
+                native.event_fd,
+                native.input_fd,
+                native.frame_fd,
+                native.challenge_fd,
+            ])
         {
             close_spawn_descriptors(&native);
             terminate_process(native.pid);
@@ -398,5 +409,17 @@ impl Drop for IsolatedVisualPackagedRuntime {
             terminate_process(self.pid);
             self.exited = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::descriptors_are_distinct;
+
+    #[test]
+    fn native_launch_descriptor_set_must_be_complete_and_unique() {
+        assert!(descriptors_are_distinct(&[3, 4, 5, 6, 7]));
+        assert!(!descriptors_are_distinct(&[3, 4, 4, 6, 7]));
+        assert!(!descriptors_are_distinct(&[3, -1, 5, 6, 7]));
     }
 }
