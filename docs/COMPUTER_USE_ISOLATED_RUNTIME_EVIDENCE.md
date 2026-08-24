@@ -160,7 +160,9 @@ The bounded forced-reap hardening is sealed at:
   challenge read as well as each helper-event wait, force-cleans an
   unresponsive helper with a bounded forced reap, bounds guest frame reads,
   host input writes, and helper control writes, and creates every runtime pipe
-  with close-on-exec set in the parent. This is a packaged-
+  with close-on-exec set in the parent. Packaged channels use raw file readers
+  so polling and consumption cannot disagree through hidden user-space buffers.
+  This is a packaged-
   supervisor **source candidate**; no signed app has launched it and no VM
   boot/render/input/cleanup result is claimed.
 - The packaged supervisor exposes read-only runtime inspection while keeping

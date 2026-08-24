@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io::BufReader;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::time::Duration;
 
@@ -135,7 +134,7 @@ fn terminate_process(pid: libc::pid_t) -> bool {
 pub struct IsolatedVisualPackagedRuntime {
     pid: libc::pid_t,
     exited: bool,
-    driver: IsolatedVisualRuntimeDriver<BufReader<File>, File, BufReader<File>, File>,
+    driver: IsolatedVisualRuntimeDriver<File, File, File, File>,
 }
 
 impl IsolatedVisualPackagedRuntime {
@@ -181,8 +180,7 @@ impl IsolatedVisualPackagedRuntime {
 
         // SAFETY: each descriptor is transferred from the native result once.
         let pid = native.pid;
-        let mut challenge_reader =
-            unsafe { BufReader::new(File::from_raw_fd(native.challenge_fd)) };
+        let mut challenge_reader = unsafe { File::from_raw_fd(native.challenge_fd) };
         let challenge = match read_isolated_visual_challenge_with_timeout(
             &mut challenge_reader,
             CHALLENGE_TIMEOUT,
@@ -216,13 +214,13 @@ impl IsolatedVisualPackagedRuntime {
         // SAFETY: successful construction transfers each remaining descriptor
         // into exactly one Rust File owner.
         let helper = IsolatedVisualHelperControl::new(
-            BufReader::new(unsafe { File::from_raw_fd(native.event_fd) }),
+            unsafe { File::from_raw_fd(native.event_fd) },
             unsafe { File::from_raw_fd(native.control_fd) },
         );
-        let stream = IsolatedVisualStream::new(
-            BufReader::new(unsafe { File::from_raw_fd(native.frame_fd) }),
-            unsafe { File::from_raw_fd(native.input_fd) },
-        );
+        let stream =
+            IsolatedVisualStream::new(unsafe { File::from_raw_fd(native.frame_fd) }, unsafe {
+                File::from_raw_fd(native.input_fd)
+            });
         unsafe { gpt_macos_isolated_runtime_spawn_result_free(&mut native) };
         Ok(Self {
             pid,
