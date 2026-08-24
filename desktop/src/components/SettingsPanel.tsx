@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { safeErrorMessage } from "../lib/errorMessage";
+import { trapTabKey } from "../lib/focusTrap";
 import type {
   AuthState,
   ComputerIsolatedVisualStatus,
@@ -94,6 +95,7 @@ export function SettingsPanel({
   const [hostAdmission, setHostAdmission] =
     useState<NativeCodingReadinessProjection | null>(null);
   const gatewayKeyRef = useRef<HTMLInputElement>(null);
+  const settingsDialogRef = useRef<HTMLDivElement>(null);
   const qualifyInFlight = useRef(false);
   const readinessSelection = useRef(0);
   const readinessReportSelection = useRef(-1);
@@ -177,15 +179,6 @@ export function SettingsPanel({
     setComputerTargets([]);
     setComputerPreview(null);
   }, [open, section]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
 
   useEffect(() => {
     if (!open || section !== "auth") return;
@@ -376,11 +369,21 @@ export function SettingsPanel({
       role="presentation"
     >
       <div
+        ref={settingsDialogRef}
         className={`settings-panel ${placement === "dock" ? "is-docked" : ""}`}
         role="dialog"
         aria-modal={placement === "modal"}
         aria-label="Settings"
         onClick={(e) => e.stopPropagation()}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            onClose();
+            return;
+          }
+          if (placement === "modal") {
+            trapTabKey(event.nativeEvent, settingsDialogRef.current);
+          }
+        }}
       >
         <header className="settings-header">
           <div className="settings-title">

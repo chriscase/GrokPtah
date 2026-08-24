@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { safeErrorMessage } from "../lib/errorMessage";
+import { trapTabKey } from "../lib/focusTrap";
 import type { SearchHit } from "../lib/protocol";
 import { StyledSelect } from "./StyledSelect";
 
@@ -28,19 +29,11 @@ export function SearchPanel({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [searched, setSearched] = useState(false);
+  const dialogRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (open) setKind(defaultKind);
   }, [open, defaultKind]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
 
   const runSearch = useCallback(async () => {
     const q = query.trim();
@@ -72,7 +65,20 @@ export function SearchPanel({
   if (!open) return null;
 
   return (
-    <div className="search-panel" role="dialog" aria-modal="true" aria-label="Search">
+    <div
+      ref={dialogRef}
+      className="search-panel"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Search"
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          onClose();
+          return;
+        }
+        trapTabKey(event.nativeEvent, dialogRef.current);
+      }}
+    >
       <header className="sp-header">
         <div>
           <h2>Search</h2>
