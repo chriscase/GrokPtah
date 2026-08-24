@@ -24,6 +24,29 @@ typedef unsigned long gpt_size;
 #define GPT_GUEST_BOOTSTRAP_STOP 2U
 #define GPT_GUEST_BOOTSTRAP_PORT 17001U
 
+/* Fixed host-supervisor ABI emitted by the signed helper. */
+#define GPT_ISOLATED_HELPER_EVENT_MAGIC 0x47505449U
+#define GPT_ISOLATED_HELPER_EVENT_VERSION 1U
+#define GPT_ISOLATED_HELPER_EVENT_BYTES 16U
+#define GPT_ISOLATED_HELPER_EVENT_PREPARED 1U
+#define GPT_ISOLATED_HELPER_EVENT_RUNNING 2U
+#define GPT_ISOLATED_HELPER_EVENT_STOPPED 3U
+#define GPT_ISOLATED_HELPER_EVENT_FAILURE 4U
+#define GPT_ISOLATED_HELPER_CONTROL_START 1U
+#define GPT_ISOLATED_HELPER_CONTROL_STOP 2U
+
+typedef struct __attribute__((packed)) {
+    gpt_u32 magic;
+    gpt_u16 version;
+    gpt_u16 code;
+    gpt_u32 detail;
+    gpt_u32 reserved;
+} gpt_isolated_helper_event;
+
+_Static_assert(
+    sizeof(gpt_isolated_helper_event) == GPT_ISOLATED_HELPER_EVENT_BYTES,
+    "unexpected isolated helper event layout");
+
 typedef struct {
     gpt_u32 state[8];
     gpt_u64 bit_count;

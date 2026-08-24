@@ -43,6 +43,12 @@ unexpected guest stop, and bounded shutdown failure fail closed. SIGINT/SIGTERM 
 path. Graceful shutdown gets two seconds before a destructive stop; destructive stop gets ten
 seconds. The parent must still prove exact process/handle cleanup before deleting any per-Run files.
 
+The fixed event bytes and control values are shared with the freestanding guest protocol header.
+The bridge contains a host-supervisor codec/state machine that accepts only the prepared → start →
+running → stop → stopped sequence (or one terminal failure). It does not spawn a helper, hold a
+descriptor, or mint an isolated capability; it is a pre-runtime ABI seam so a future supervisor
+cannot silently accept reordered, unknown, or post-terminal events.
+
 The start path configures one bounded graphics scanout, entropy, and virtio socket. Network, shared
 directories, audio, storage, keyboards, pointing devices, and serial devices are explicitly empty.
 The helper performs a bounded challenge/response with the guest bootstrap agent before emitting

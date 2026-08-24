@@ -8,6 +8,17 @@ static int require_bytes(const gpt_u8 *observed, const gpt_u8 *expected, gpt_siz
 }
 
 int main(void) {
+    gpt_u8 helper_event[GPT_ISOLATED_HELPER_EVENT_BYTES] = {0};
+    gpt_store_be32(helper_event, GPT_ISOLATED_HELPER_EVENT_MAGIC);
+    gpt_store_be16(helper_event + 4U, GPT_ISOLATED_HELPER_EVENT_VERSION);
+    gpt_store_be16(helper_event + 6U, GPT_ISOLATED_HELPER_EVENT_PREPARED);
+    if (helper_event[0] != 'G' || helper_event[1] != 'P' || helper_event[2] != 'T' ||
+        helper_event[3] != 'I' || sizeof(gpt_isolated_helper_event) !=
+        GPT_ISOLATED_HELPER_EVENT_BYTES) {
+        fputs("helper event ABI self-test failed\n", stderr);
+        return 1;
+    }
+
     static const gpt_u8 expected_hmac[32] = {
         0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53,
         0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b, 0xf1, 0x2b,

@@ -21,21 +21,17 @@ static const int GPT_CONFIGURATION_FD = 4;
 static const int GPT_CONTROL_FD = 5;
 static const int GPT_EVENT_FD = 6;
 static const size_t GPT_MAX_CONFIGURATION_BYTES = 1024 * 1024;
-static const uint8_t GPT_CONTROL_START = 1;
-static const uint8_t GPT_CONTROL_STOP = 2;
 static const int GPT_GUEST_HANDSHAKE_TIMEOUT_MS = 30000;
 static const int GPT_GUEST_SHUTDOWN_TIMEOUT_MS = 5000;
-static const uint32_t GPT_EVENT_MAGIC = 0x47505449;
-static const uint16_t GPT_EVENT_VERSION = 1;
 static NSString *const GPT_KERNEL_COMMAND_LINE =
     @"panic=-1 reboot=t init=/init grokptah.isolated_visual=1";
 static char *GPT_EMPTY_ENVIRONMENT[] = {NULL};
 
 typedef NS_ENUM(uint16_t, GPTIsolatedHelperEventCode) {
-    GPTIsolatedHelperEventPrepared = 1,
-    GPTIsolatedHelperEventRunning = 2,
-    GPTIsolatedHelperEventStopped = 3,
-    GPTIsolatedHelperEventFailure = 4,
+    GPTIsolatedHelperEventPrepared = GPT_ISOLATED_HELPER_EVENT_PREPARED,
+    GPTIsolatedHelperEventRunning = GPT_ISOLATED_HELPER_EVENT_RUNNING,
+    GPTIsolatedHelperEventStopped = GPT_ISOLATED_HELPER_EVENT_STOPPED,
+    GPTIsolatedHelperEventFailure = GPT_ISOLATED_HELPER_EVENT_FAILURE,
 };
 
 typedef NS_ENUM(uint32_t, GPTIsolatedHelperFailure) {
@@ -51,14 +47,6 @@ typedef NS_ENUM(uint32_t, GPTIsolatedHelperFailure) {
     GPTIsolatedHelperFailureGuestStopped = 10,
     GPTIsolatedHelperFailureGuestProtocol = 11,
 };
-
-typedef struct __attribute__((packed)) {
-    uint32_t magic;
-    uint16_t version;
-    uint16_t code;
-    uint32_t detail;
-    uint32_t reserved;
-} GPTIsolatedHelperEvent;
 
 typedef struct {
     NSUInteger cpuCount;
@@ -93,9 +81,9 @@ static BOOL GPTWriteExact(int descriptor, const void *bytes, size_t length) {
 }
 
 static BOOL GPTWriteEvent(GPTIsolatedHelperEventCode code, uint32_t detail) {
-    GPTIsolatedHelperEvent event = {
-        .magic = CFSwapInt32HostToBig(GPT_EVENT_MAGIC),
-        .version = CFSwapInt16HostToBig(GPT_EVENT_VERSION),
+    gpt_isolated_helper_event event = {
+        .magic = CFSwapInt32HostToBig(GPT_ISOLATED_HELPER_EVENT_MAGIC),
+        .version = CFSwapInt16HostToBig(GPT_ISOLATED_HELPER_EVENT_VERSION),
         .code = CFSwapInt16HostToBig(code),
         .detail = CFSwapInt32HostToBig(detail),
         .reserved = 0,
@@ -661,7 +649,8 @@ int main(int argc, const char *argv[]) {
                 return GPTIsolatedHelperFailureControlLost;
             }
             uint8_t command = 0;
-            if (GPTReadControlByte(&command, 30000) != 1 || command != GPT_CONTROL_START ||
+            if (GPTReadControlByte(&command, 30000) != 1 ||
+                command != GPT_ISOLATED_HELPER_CONTROL_START ||
                 GPTStopRequested) {
                 GPTWriteEvent(
                     GPTIsolatedHelperEventFailure,
@@ -748,10 +737,11 @@ int main(int argc, const char *argv[]) {
                 }
                 command = 0;
                 int result = GPTReadControlByte(&command, 1000);
-                if (result == 1 && command == GPT_CONTROL_STOP) {
+                if (result == 1 && command == GPT_ISOLATED_HELPER_CONTROL_STOP) {
                     break;
                 }
-                if (result < 0 || (result == 1 && command != GPT_CONTROL_STOP)) {
+                if (result < 0 ||
+                    (result == 1 && command != GPT_ISOLATED_HELPER_CONTROL_STOP)) {
                     controlLost = YES;
                     break;
                 }

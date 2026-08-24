@@ -8,6 +8,7 @@ fi
 
 script_dir=$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd -P)
 helper_source="$script_dir/main.m"
+shared_protocol="$script_dir/../isolated-visual-guest/protocol.h"
 configuration="$script_dir/grokptah-isolated-config-v1.json"
 work=$(mktemp -d /private/tmp/grokptah-helper-source-proof.XXXXXX)
 cleanup() {
@@ -59,6 +60,14 @@ for required in \
   'GPTGuestRequestShutdown' \
   'GPTIsolatedHelperFailureGuestProtocol'; do
   grep -F "$required" "$helper_source" >/dev/null
+done
+for required in \
+  'GPT_ISOLATED_HELPER_EVENT_MAGIC' \
+  'GPT_ISOLATED_HELPER_EVENT_BYTES' \
+  'GPT_ISOLATED_HELPER_CONTROL_START' \
+  'GPT_ISOLATED_HELPER_CONTROL_STOP' \
+  'gpt_isolated_helper_event'; do
+  grep -F "$required" "$shared_protocol" >/dev/null
 done
 for forbidden in \
   VZNATNetworkDeviceAttachment \

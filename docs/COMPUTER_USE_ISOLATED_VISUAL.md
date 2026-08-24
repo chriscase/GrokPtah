@@ -194,6 +194,10 @@ available.
    input devices, requires an explicit start byte, performs a challenge/response ready handshake
    with the guest bootstrap agent, and requires an authenticated shutdown acknowledgement before
    bounded graceful-then-forced stop.
+   The helper's fixed event/control ABI is shared with the freestanding protocol header, and a
+   host-supervisor codec/state machine rejects reordered, unknown, and post-terminal events before
+   any packaged process-spawn seam exists. This is an ABI/source guard only: it does not spawn the
+   helper, retain descriptors, boot a guest, or mint an isolated capability.
    The assembler signs the helper before the outer unprivileged app and derives the content and
    designated-requirement manifest. CI links only the unsigned helper source. The repository now
    also carries a pinned Linux arm64 guest-source lock, closed kernel fragment, freestanding guest
