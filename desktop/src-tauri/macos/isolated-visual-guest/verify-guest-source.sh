@@ -19,11 +19,13 @@ trap cleanup EXIT HUP INT TERM
 
 sh -n "$script_dir/fetch-kernel-source.sh"
 sh -n "$script_dir/build-guest-image.sh"
+# shellcheck disable=SC2016 # literal source fragments are intentional
 for required in '--proto-redir' '--connect-timeout 15' '--max-time 900' \
   '--max-filesize 2147483648' \
   'output appeared during source fetch' 'mv "$temporary" "$output"'; do
   grep -F -- "$required" "$script_dir/fetch-kernel-source.sh" >/dev/null
 done
+# shellcheck disable=SC2016 # literal source fragments are intentional
 for required in staged_output_image staged_output_manifest \
   published_image published_manifest \
   'trap - EXIT HUP INT TERM' \

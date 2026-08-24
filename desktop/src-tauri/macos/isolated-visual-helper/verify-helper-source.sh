@@ -53,6 +53,7 @@ for required in \
   'com.apple.security.get-task-allow'; do
   grep -F "$required" "$script_dir/package-signed-app.sh" >/dev/null
 done
+# shellcheck disable=SC2016 # literal source fragments are intentional
 for required in input_contents input_info_plist package_app output_contents output_resources \
   'realpath "$safe_dir"' 'mkdir "$resource_dir"' \
   'input app already contains isolated resource directory' \
@@ -61,6 +62,7 @@ for required in input_contents input_info_plist package_app output_contents outp
   'mv "$package_app" "$output_app"'; do
   grep -F "$required" "$script_dir/package-signed-app.sh" >/dev/null
 done
+# shellcheck disable=SC2016 # literal source fragments are intentional
 for required in module_cache 'CLANG_MODULE_CACHE_PATH="$module_cache"' \
   'rm -rf -- "$module_cache"'; do
   grep -F "$required" "$script_dir/build-helper.sh" >/dev/null
