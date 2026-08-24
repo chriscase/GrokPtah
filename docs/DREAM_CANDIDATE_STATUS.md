@@ -141,7 +141,7 @@ complete or that the product has reached 100%.
 
 ### Latest desktop safety continuation — 2026-08-24
 
-Candidate `af609a4278f71998a58e9f352fdc3b2795281d94` extends the shared,
+Candidate `d543c3e8fef46c40a51b8a19cd19aa0748574e92` extends the shared,
 bounded backend-error display boundary across the desktop surfaces. Credential-
 shaped values, local paths, and UI-only secret placeholders are redacted before
 errors reach search, session, run, routine, worker, settings, terminal, remote
@@ -166,6 +166,23 @@ limit events now use the same bounded display path, with a timeline regression.
 The shared sanitizer also covers ordinary `/tmp`, `/private/var`, and mounted
 volume paths that can appear in native/runtime failures.
 This remains source/UI evidence, not packaged review.
+
+### Isolated guest bootstrap continuation — 2026-08-24
+
+Draft PR #374 (`5919e3343af20a78e17459b8ac8454bbc5aeca7e`) was integrated into
+this candidate as merge `d543c3e8fef46c40a51b8a19cd19aa0748574e92`. The slice
+adds a closed five-phase guest projection, one-Agent lease ownership with
+exact lease/revision fencing, mandatory cleanup after cancel/failure, and a
+path/clipboard/credential/network-free capture projection that omits frame
+bytes. Its changed-file allowlist is limited to the guest/lifecycle bridge,
+one orchestration error mapping, and the bootstrap handoff document.
+
+Grok Build ran the focused `isolated_guest` library proof (8 passed) plus the
+committed-stop cleanup regression (1 passed) on the isolated PR head with the
+required sccache/target policy. Those are external PR-head results, not a Rust
+qualification of this combined candidate. Packaged VM launch, real guest boot,
+rendered frames, host input, signed helper packaging, hardware acceptance, and
+soak evidence remain unverified.
 
 ## Verification recorded
 
