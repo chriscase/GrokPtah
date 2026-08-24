@@ -117,6 +117,16 @@ resumed automatically.
 
 ## 5. Promotion decision
 
+Before attaching a source handoff, run the read-only evidence consistency check:
+
+```sh
+docs/verify-isolated-runtime-evidence.sh
+```
+
+It validates the documented source cutoff, bundle digest and complete history,
+and the explicit nonclaims. A failed evidence check is a handoff failure, not
+permission to infer a qualification result.
+
 Only an independently reviewed report containing every item above may recommend closing #288 or
 granting isolated visual dispatch. A report that ends at source validation, package signing, or
 `launchAttempted: false` remains an implementation candidate. Attach the report to the exact
