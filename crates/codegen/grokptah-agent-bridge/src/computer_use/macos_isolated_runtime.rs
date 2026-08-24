@@ -389,12 +389,12 @@ impl IsolatedVisualPackagedRuntime {
             .driver
             .stop_with_timeout(disposition, CONTROL_WRITE_TIMEOUT)
         {
-            if self.driver.runtime().lifecycle_state()
-                == super::isolated_visual::IsolatedVisualLifecycleState::Stopping
-            {
-                return self.abort_with_error(error);
-            }
-            return Err(error);
+            // A stop failure before the lifecycle enters Stopping is still
+            // terminal: a poisoned input gate, a failed control write, or an
+            // invalid helper state must not leave a live child and lease that
+            // can be retried. Abort revokes ownership and records the exact
+            // cleanup-required failure boundary.
+            return self.abort_with_error(error);
         }
         if let Err(error) = self
             .driver
