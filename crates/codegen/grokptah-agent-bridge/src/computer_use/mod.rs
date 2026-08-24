@@ -15,6 +15,7 @@
 mod coordination;
 mod isolated_visual;
 mod isolated_visual_artifacts;
+mod isolated_visual_channel;
 mod isolated_visual_frames;
 mod isolated_visual_helper;
 mod isolated_visual_input;
@@ -46,6 +47,12 @@ pub use isolated_visual_artifacts::{
     IsolatedVisualPackagedArtifactReceipt, ISOLATED_VISUAL_APP_BUNDLE_IDENTIFIER,
     ISOLATED_VISUAL_HELPER_SIGNING_IDENTIFIER, ISOLATED_VISUAL_MAX_CONFIGURATION_BYTES,
     ISOLATED_VISUAL_MAX_GUEST_IMAGE_BYTES, ISOLATED_VISUAL_MAX_HELPER_BYTES,
+};
+pub use isolated_visual_channel::{
+    IsolatedVisualChannelBinding, ISOLATED_VISUAL_BINDING_CONTEXT,
+    ISOLATED_VISUAL_BINDING_DIGEST_BYTES, ISOLATED_VISUAL_BINDING_HEADER_BYTES,
+    ISOLATED_VISUAL_BINDING_MAGIC, ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES,
+    ISOLATED_VISUAL_BINDING_TAG_BYTES, ISOLATED_VISUAL_BINDING_VERSION,
 };
 pub use isolated_visual_frames::{
     IsolatedVisualFrame, IsolatedVisualFrameCarrier, IsolatedVisualFrameChunk,

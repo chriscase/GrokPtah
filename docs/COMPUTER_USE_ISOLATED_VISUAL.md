@@ -224,7 +224,11 @@ available.
    key or button remains held. It does not authenticate or send a socket message yet; the packaged
    guest agent and one-action approval path remain required before any input claim. A separate
    authenticated binary host-to-guest input packet ABI now binds the same frame/input sequences and
-   exact Run/surface/incarnation, but it is source-only and not dispatched.
+   exact Run/surface/incarnation, but it is source-only and not dispatched. A shared session-binding
+   contract now length-prefixes Run, surface, incarnation, and input-domain identities, derives a
+   challenge-bound channel key, and carries a confirmation tag before frame/input traffic. Rust and
+   freestanding guest C share the digest and vectors; the helper/guest socket loop still does not
+   consume the binding packet.
 6. Integrate app-owned cursor, focus/drag preview, timeline, persistent emergency controls, and
    accessibility states in the cockpit.
 7. Run adversarial, crash/restart, resource, packaged hardware, and recurring expert UI reviews.

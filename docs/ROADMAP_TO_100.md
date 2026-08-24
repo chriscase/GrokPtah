@@ -694,7 +694,10 @@ and a credentialed nested-signing assembler. The helper's closed inherited-descr
    guest-source lock, closed kernel fragment, freestanding guest PID 1, protocol self-test, and a
    Linux-only deterministic image-builder candidate. A dedicated Linux workflow builds that source
    twice and compares image/manifest bytes; it deliberately does not embed or publish the output.
-   These are contracts and unshipped source/pipeline primitives, not packaged evidence. See
+   The Rust bridge and freestanding guest C now also share a length-prefixed
+   Run/surface/incarnation/input-domain binding digest, challenge-derived channel key, and
+   confirmation tag; the binding packet remains source-only and is not consumed by the helper/guest
+   socket loop. These are contracts and unshipped source/pipeline primitives, not packaged evidence. See
 [`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,
 signed/built helper, guest image, packaged entitlement proof, or host-native dispatch exists yet, so these
 source slices satisfy no #288 acceptance checkbox.

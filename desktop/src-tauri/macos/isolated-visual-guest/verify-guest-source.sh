@@ -62,7 +62,10 @@ done
 for required in \
   GPT_ISOLATED_VISUAL_FRAME_MAGIC GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES \
   gpt_isolated_visual_frame_header GPT_ISOLATED_VISUAL_INPUT_MAGIC \
-  GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES gpt_isolated_visual_input_header; do
+  GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES gpt_isolated_visual_input_header \
+  GPT_ISOLATED_VISUAL_BINDING_MAGIC GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES \
+  gpt_isolated_visual_binding_header gpt_isolated_visual_binding_digest \
+  gpt_isolated_visual_channel_secret gpt_isolated_visual_binding_valid; do
   grep -F "$required" "$protocol_header" >/dev/null
 done
 printf 'isolated guest source, protocol, and closed kernel fragment: pass\n'

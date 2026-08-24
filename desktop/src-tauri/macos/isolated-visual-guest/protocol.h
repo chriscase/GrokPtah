@@ -49,6 +49,14 @@ typedef unsigned long gpt_size;
 #define GPT_ISOLATED_VISUAL_INPUT_TAG_BYTES 32U
 #define GPT_ISOLATED_VISUAL_INPUT_MAX_TEXT_BYTES 4096U
 
+/* Host/guest session binding and channel-key derivation. */
+#define GPT_ISOLATED_VISUAL_BINDING_MAGIC 0x47505442U
+#define GPT_ISOLATED_VISUAL_BINDING_VERSION 1U
+#define GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES 80U
+#define GPT_ISOLATED_VISUAL_BINDING_DIGEST_BYTES 32U
+#define GPT_ISOLATED_VISUAL_BINDING_TAG_BYTES 32U
+#define GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES 256U
+
 typedef struct __attribute__((packed)) {
     gpt_u32 magic;
     gpt_u16 version;
@@ -102,6 +110,22 @@ _Static_assert(
     sizeof(gpt_isolated_visual_input_header) == GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES,
     "unexpected isolated visual input header layout");
 
+typedef struct __attribute__((packed)) {
+    gpt_u32 magic;
+    gpt_u16 version;
+    gpt_u16 protocol_version;
+    gpt_u16 run_id_bytes;
+    gpt_u16 surface_id_bytes;
+    gpt_u16 incarnation_bytes;
+    gpt_u16 input_domain_bytes;
+    gpt_u8 binding_digest[GPT_ISOLATED_VISUAL_BINDING_DIGEST_BYTES];
+    gpt_u8 confirmation_tag[GPT_ISOLATED_VISUAL_BINDING_TAG_BYTES];
+} gpt_isolated_visual_binding_header;
+
+_Static_assert(
+    sizeof(gpt_isolated_visual_binding_header) == GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES,
+    "unexpected isolated visual binding header layout");
+
 typedef struct {
     gpt_u32 state[8];
     gpt_u64 bit_count;
@@ -116,6 +140,10 @@ static gpt_u32 gpt_rotr32(gpt_u32 value, gpt_u32 count) {
 static gpt_u32 gpt_load_be32(const gpt_u8 *bytes) {
     return ((gpt_u32)bytes[0] << 24U) | ((gpt_u32)bytes[1] << 16U) |
            ((gpt_u32)bytes[2] << 8U) | (gpt_u32)bytes[3];
+}
+
+static gpt_u16 gpt_load_be16(const gpt_u8 *bytes) {
+    return ((gpt_u16)bytes[0] << 8U) | (gpt_u16)bytes[1];
 }
 
 static void gpt_store_be16(gpt_u8 *bytes, gpt_u16 value) {
@@ -261,6 +289,42 @@ static void gpt_sha256(const gpt_u8 *bytes, gpt_size length, gpt_u8 output[32]) 
     gpt_sha256_finish(&context, output);
 }
 
+static int gpt_isolated_visual_binding_digest(
+    const gpt_u8 *run_id,
+    gpt_u16 run_id_bytes,
+    const gpt_u8 *surface_id,
+    gpt_u16 surface_id_bytes,
+    const gpt_u8 *incarnation,
+    gpt_u16 incarnation_bytes,
+    const gpt_u8 *input_domain,
+    gpt_u16 input_domain_bytes,
+    gpt_u8 output[GPT_ISOLATED_VISUAL_BINDING_DIGEST_BYTES]) {
+    static const gpt_u8 context[] = "grokptah-isolated-visual-binding-v1";
+    const gpt_u8 *fields[] = {run_id, surface_id, incarnation, input_domain};
+    const gpt_u16 lengths[] = {
+        run_id_bytes,
+        surface_id_bytes,
+        incarnation_bytes,
+        input_domain_bytes,
+    };
+    gpt_sha256_context hash;
+    gpt_u8 length_bytes[4];
+    gpt_u32 index;
+    gpt_sha256_init(&hash);
+    gpt_sha256_update(&hash, context, sizeof(context) - 1U);
+    for (index = 0; index < 4U; ++index) {
+        if (fields[index] == 0 || lengths[index] == 0 ||
+            lengths[index] > GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES) {
+            return 0;
+        }
+        gpt_store_be32(length_bytes, lengths[index]);
+        gpt_sha256_update(&hash, length_bytes, sizeof(length_bytes));
+        gpt_sha256_update(&hash, fields[index], lengths[index]);
+    }
+    gpt_sha256_finish(&hash, output);
+    return 1;
+}
+
 static void gpt_hmac_sha256(
     const gpt_u8 *key,
     gpt_size key_length,
@@ -297,6 +361,106 @@ static void gpt_hmac_sha256(
     gpt_sha256_update(&outer, pad, 64U);
     gpt_sha256_update(&outer, inner_digest, 32U);
     gpt_sha256_finish(&outer, output);
+}
+
+static void gpt_isolated_visual_channel_secret(
+    const gpt_u8 challenge[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES],
+    const gpt_u8 binding_digest[GPT_ISOLATED_VISUAL_BINDING_DIGEST_BYTES],
+    gpt_u8 output[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES]) {
+    static const gpt_u8 context[] = "grokptah-isolated-visual-channel-v1";
+    gpt_u8 message[sizeof(context) - 1U + GPT_ISOLATED_VISUAL_BINDING_DIGEST_BYTES];
+    gpt_size index;
+    for (index = 0; index < sizeof(context) - 1U; ++index) {
+        message[index] = context[index];
+    }
+    for (index = 0; index < GPT_ISOLATED_VISUAL_BINDING_DIGEST_BYTES; ++index) {
+        message[sizeof(context) - 1U + index] = binding_digest[index];
+    }
+    gpt_hmac_sha256(
+        challenge,
+        GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES,
+        message,
+        sizeof(message),
+        output);
+}
+
+static void gpt_isolated_visual_binding_confirmation(
+    const gpt_u8 channel_secret[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES],
+    const gpt_u8 binding_digest[GPT_ISOLATED_VISUAL_BINDING_DIGEST_BYTES],
+    gpt_u8 output[GPT_ISOLATED_VISUAL_BINDING_TAG_BYTES]) {
+    static const gpt_u8 context[] = "grokptah-isolated-visual-channel-confirm-v1";
+    gpt_u8 message[sizeof(context) - 1U + GPT_ISOLATED_VISUAL_BINDING_DIGEST_BYTES];
+    gpt_size index;
+    for (index = 0; index < sizeof(context) - 1U; ++index) {
+        message[index] = context[index];
+    }
+    for (index = 0; index < GPT_ISOLATED_VISUAL_BINDING_DIGEST_BYTES; ++index) {
+        message[sizeof(context) - 1U + index] = binding_digest[index];
+    }
+    gpt_hmac_sha256(
+        channel_secret,
+        GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES,
+        message,
+        sizeof(message),
+        output);
+}
+
+static GPT_GUEST_UNUSED int gpt_constant_time_equal(
+    const gpt_u8 *left,
+    const gpt_u8 *right,
+    gpt_size length);
+
+static GPT_GUEST_UNUSED int gpt_isolated_visual_binding_valid(
+    const gpt_u8 challenge[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES],
+    const gpt_u8 *header,
+    const gpt_u8 *payload,
+    gpt_size payload_bytes) {
+    gpt_u16 lengths[4];
+    gpt_size offset = 0;
+    gpt_u8 digest[GPT_ISOLATED_VISUAL_BINDING_DIGEST_BYTES];
+    gpt_u8 channel_secret[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES];
+    gpt_u8 confirmation[GPT_ISOLATED_VISUAL_BINDING_TAG_BYTES];
+    gpt_u32 index;
+    if (header == 0 || payload == 0 ||
+        gpt_load_be32(header) != GPT_ISOLATED_VISUAL_BINDING_MAGIC ||
+        gpt_load_be16(header + 4U) != GPT_ISOLATED_VISUAL_BINDING_VERSION ||
+        gpt_load_be16(header + 6U) != GPT_GUEST_BOOTSTRAP_VERSION) {
+        return 0;
+    }
+    lengths[0] = gpt_load_be16(header + 8U);
+    lengths[1] = gpt_load_be16(header + 10U);
+    lengths[2] = gpt_load_be16(header + 12U);
+    lengths[3] = gpt_load_be16(header + 14U);
+    for (index = 0; index < 4U; ++index) {
+        if (lengths[index] == 0 ||
+            lengths[index] > GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES) {
+            return 0;
+        }
+        offset += lengths[index];
+    }
+    if (offset != payload_bytes ||
+        !gpt_isolated_visual_binding_digest(
+            payload,
+            lengths[0],
+            payload + lengths[0],
+            lengths[1],
+            payload + lengths[0] + lengths[1],
+            lengths[2],
+            payload + lengths[0] + lengths[1] + lengths[2],
+            lengths[3],
+            digest) ||
+        !gpt_constant_time_equal(
+            digest,
+            header + 16U,
+            GPT_ISOLATED_VISUAL_BINDING_DIGEST_BYTES)) {
+        return 0;
+    }
+    gpt_isolated_visual_channel_secret(challenge, digest, channel_secret);
+    gpt_isolated_visual_binding_confirmation(channel_secret, digest, confirmation);
+    return gpt_constant_time_equal(
+        confirmation,
+        header + 48U,
+        GPT_ISOLATED_VISUAL_BINDING_TAG_BYTES);
 }
 
 static GPT_GUEST_UNUSED int gpt_constant_time_equal(

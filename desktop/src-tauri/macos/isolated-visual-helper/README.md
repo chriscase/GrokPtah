@@ -60,7 +60,9 @@ helper/guest socket loop does not yet feed it. A separate host-side input gate n
 pointer, button, scroll, key, and Unicode text edges against the latest frame and poisons stale or
 incomplete state. The source candidate also defines a separate authenticated 64-byte input packet
 header with a closed key/button code set; it is not wired to a socket and no input capability is
-enabled.
+enabled. Rust and freestanding guest C also share a length-prefixed session-binding digest,
+challenge-derived channel key, and confirmation-tag contract; the packet is not consumed by the
+helper/guest socket loop.
 
 ## Build and package boundaries
 

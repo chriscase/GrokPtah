@@ -30,6 +30,13 @@ int main(void) {
         fputs("isolated visual input ABI self-test failed\n", stderr);
         return 1;
     }
+    if (sizeof(gpt_isolated_visual_binding_header) !=
+            GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES ||
+        GPT_ISOLATED_VISUAL_BINDING_DIGEST_BYTES != 32U ||
+        GPT_ISOLATED_VISUAL_BINDING_TAG_BYTES != 32U) {
+        fputs("isolated visual binding ABI self-test failed\n", stderr);
+        return 1;
+    }
 
     static const gpt_u8 expected_hmac[32] = {
         0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53,
@@ -98,6 +105,74 @@ int main(void) {
             GPT_GUEST_BOOTSTRAP_EVENT_READY,
             ready)) {
         fputs("bootstrap frame accepted with wrong challenge\n", stderr);
+        return 1;
+    }
+
+    static const gpt_u8 binding_digest_expected[32] = {
+        0xbb, 0xfa, 0x00, 0x3d, 0x74, 0xa3, 0x72, 0xbc,
+        0xf2, 0x33, 0xbe, 0xe0, 0x74, 0x5f, 0x75, 0xd5,
+        0xa7, 0xf2, 0x55, 0x19, 0xac, 0xd9, 0xfb, 0x8e,
+        0xdb, 0x14, 0x18, 0xfe, 0xec, 0xfa, 0x3d, 0x5c,
+    };
+    static const gpt_u8 run_id[] = "run-1";
+    static const gpt_u8 surface_id[] = "surface-1";
+    static const gpt_u8 incarnation[] = "incarnation-1";
+    static const gpt_u8 input_domain[] = "domain-1";
+    gpt_u8 binding_digest[GPT_ISOLATED_VISUAL_BINDING_DIGEST_BYTES];
+    if (!gpt_isolated_visual_binding_digest(
+            run_id,
+            sizeof(run_id) - 1U,
+            surface_id,
+            sizeof(surface_id) - 1U,
+            incarnation,
+            sizeof(incarnation) - 1U,
+            input_domain,
+            sizeof(input_domain) - 1U,
+            binding_digest) ||
+        !require_bytes(binding_digest, binding_digest_expected, sizeof(binding_digest))) {
+        fputs("isolated visual binding digest self-test failed\n", stderr);
+        return 1;
+    }
+    gpt_u8 channel_secret[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES];
+    gpt_u8 confirmation[GPT_ISOLATED_VISUAL_BINDING_TAG_BYTES];
+    gpt_isolated_visual_channel_secret(challenge, binding_digest, channel_secret);
+    gpt_isolated_visual_binding_confirmation(channel_secret, binding_digest, confirmation);
+    gpt_isolated_visual_binding_header binding = {0};
+    gpt_store_be32((gpt_u8 *)&binding, GPT_ISOLATED_VISUAL_BINDING_MAGIC);
+    gpt_store_be16((gpt_u8 *)&binding + 4U, GPT_ISOLATED_VISUAL_BINDING_VERSION);
+    gpt_store_be16((gpt_u8 *)&binding + 6U, GPT_GUEST_BOOTSTRAP_VERSION);
+    gpt_store_be16((gpt_u8 *)&binding + 8U, sizeof(run_id) - 1U);
+    gpt_store_be16((gpt_u8 *)&binding + 10U, sizeof(surface_id) - 1U);
+    gpt_store_be16((gpt_u8 *)&binding + 12U, sizeof(incarnation) - 1U);
+    gpt_store_be16((gpt_u8 *)&binding + 14U, sizeof(input_domain) - 1U);
+    memcpy(binding.binding_digest, binding_digest, sizeof(binding_digest));
+    memcpy(binding.confirmation_tag, confirmation, sizeof(confirmation));
+    gpt_u8 binding_payload[sizeof(run_id) + sizeof(surface_id) + sizeof(incarnation) +
+                           sizeof(input_domain) - 4U];
+    gpt_size binding_offset = 0;
+    memcpy(binding_payload + binding_offset, run_id, sizeof(run_id) - 1U);
+    binding_offset += sizeof(run_id) - 1U;
+    memcpy(binding_payload + binding_offset, surface_id, sizeof(surface_id) - 1U);
+    binding_offset += sizeof(surface_id) - 1U;
+    memcpy(binding_payload + binding_offset, incarnation, sizeof(incarnation) - 1U);
+    binding_offset += sizeof(incarnation) - 1U;
+    memcpy(binding_payload + binding_offset, input_domain, sizeof(input_domain) - 1U);
+    binding_offset += sizeof(input_domain) - 1U;
+    if (!gpt_isolated_visual_binding_valid(
+            challenge,
+            (const gpt_u8 *)&binding,
+            binding_payload,
+            binding_offset)) {
+        fputs("isolated visual binding packet was rejected\n", stderr);
+        return 1;
+    }
+    binding_payload[0] ^= 1U;
+    if (gpt_isolated_visual_binding_valid(
+            challenge,
+            (const gpt_u8 *)&binding,
+            binding_payload,
+            binding_offset)) {
+        fputs("tampered isolated visual binding was accepted\n", stderr);
         return 1;
     }
     puts("isolated guest bootstrap protocol self-test: ok");

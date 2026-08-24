@@ -66,7 +66,10 @@ for required in \
   'GPT_ISOLATED_HELPER_EVENT_BYTES' \
   'GPT_ISOLATED_HELPER_CONTROL_START' \
   'GPT_ISOLATED_HELPER_CONTROL_STOP' \
-  'gpt_isolated_helper_event'; do
+  'gpt_isolated_helper_event' \
+  'GPT_ISOLATED_VISUAL_BINDING_MAGIC' \
+  'GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES' \
+  'gpt_isolated_visual_binding_header'; do
   grep -F "$required" "$shared_protocol" >/dev/null
 done
 for forbidden in \

@@ -14,8 +14,13 @@ input backend, or `HostNative` dispatch proof.
   host over VSOCK port `17001`, authenticates the fixed READY frame with the host challenge, waits
   for the fixed STOP byte, emits the authenticated shutdown acknowledgement, and powers off.
 - `protocol.h` is shared by the guest and macOS helper. It contains the fixed bootstrap frame
-  format and freestanding HMAC-SHA-256 implementation; it does not carry paths, secrets, or model
-  traffic.
+  format, the freestanding HMAC-SHA-256 implementation, and the fixed session-binding header.
+  The binding hashes Run, surface, incarnation, and isolated input-domain identities with
+  length-prefixed fields, then derives a challenge-bound channel key and confirmation tag. It does
+  not carry paths, model traffic, or reusable secrets.
+- `isolated_visual_channel.rs` mirrors that canonical digest/key/confirmation contract for the host
+  bridge and can encode the fixed binding header plus its four identity fields. It is a source
+  contract only: the helper/guest socket loop still does not consume it.
 
 ## Reproducible Linux workflow
 
@@ -37,9 +42,10 @@ workflows validate the source but do not fetch, embed, sign, or publish a guest 
 
 ## Current proof boundary
 
-Local validation proves shell syntax, lock-file shape, protocol self-test, arm64 guest syntax, the
-closed kernel fragment, Objective-C helper syntax/linking, and the helper's invalid-start event
-path. It does not prove Linux CI execution, kernel boot, VSOCK operation on a real VM, framebuffer
-capture, guest application input, cleanup under crashes, signing, notarization, hardware support,
-or the #288 acceptance campaign. A CI image comparison must not be promoted to a reviewed release
-guest without those additional gates.
+Local validation proves shell syntax, lock-file shape, protocol/self-test vectors (including the
+cross-language binding digest and challenge-derived confirmation), arm64 guest syntax, the closed
+kernel fragment, Objective-C helper syntax/linking, and the helper's invalid-start event path. It
+does not prove Linux CI execution, kernel boot, VSOCK operation on a real VM, framebuffer capture,
+guest application input, cleanup under crashes, signing, notarization, hardware support, or the
+#288 acceptance campaign. A CI image comparison must not be promoted to a reviewed release guest
+without those additional gates.
