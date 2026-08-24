@@ -58,6 +58,11 @@ CI installs `libdbus-1-dev` and `pkg-config` for that compile
 (`.github/workflows/hosted-service.yml`). A live D-Bus secret service is not
 assumed here; bridge tests and offline tools do not need a keychain.
 
+`cargo test --lib` in the bridge workspace is expected to fail a small
+`computer_use::isolated_visual*` / `macos_observation` subset on Linux (macOS
+guest/path/TCC assumptions). Hosted-service CI and `--skip computer_use` cover
+the Linux-runnable surface.
+
 ### Dependency refresh
 
 The environment `install` / Cloud Agent update script only refreshes desktop npm
