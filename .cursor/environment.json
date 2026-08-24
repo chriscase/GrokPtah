@@ -1,0 +1,19 @@
+{
+  "name": "GrokPtah",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "user": "ubuntu",
+  "install": "if [ -f desktop/package-lock.json ]; then (cd desktop && npm ci); fi",
+  "ports": [
+    {
+      "name": "desktop-vite",
+      "port": 1430
+    },
+    {
+      "name": "grokptah-service",
+      "port": 39200
+    }
+  ]
+}
