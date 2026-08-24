@@ -6,7 +6,7 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Source head at evidence cutoff: `44f3d13a2ea64c6a1f19a1ae60827125c22f2f5a`
+- Source head at evidence cutoff: `cabd4b6e8f94a1d6e6982f69dbaad8dd5967b7d1`
 - Bundle: not created for the current head; the historical stage-41 bundle is
   recorded below and does not include the later hardening commits.
 - Bundle SHA-256: not applicable to the current head.
@@ -178,6 +178,12 @@ The kernel-source download-size cap extension is sealed at:
 The disposable helper-compiler-cache extension is sealed at:
 
 - Commit: `44f3d13a2ea64c6a1f19a1ae60827125c22f2f5a`.
+- Bundle: not created; this remains a source-only extension pending the
+  credentialed packaged-runtime campaign.
+
+The shellcheck-clean verifier extension is sealed at:
+
+- Commit: `cabd4b6e8f94a1d6e6982f69dbaad8dd5967b7d1`.
 - Bundle: not created; this remains a source-only extension pending the
   credentialed packaged-runtime campaign.
 
