@@ -7,6 +7,7 @@ use super::isolated_visual_runtime::IsolatedVisualRuntimeSession;
 use super::types::{ComputerError, ComputerErrorCode, ComputerResult};
 
 pub const ISOLATED_VISUAL_STREAM_LENGTH_BYTES: usize = 4;
+pub const ISOLATED_VISUAL_GUEST_INPUT_COMMAND: u8 = 4;
 pub const ISOLATED_VISUAL_STREAM_MAX_FRAME_PACKET_BYTES: usize =
     100 + ISOLATED_VISUAL_FRAME_CHUNK_BYTES + 32;
 
@@ -61,6 +62,9 @@ impl<R: Read, W: Write> IsolatedVisualStream<R, W> {
                 "isolated input packet exceeds the stream bound",
             ));
         }
+        self.writer
+            .write_all(&[ISOLATED_VISUAL_GUEST_INPUT_COMMAND])
+            .map_err(stream_error)?;
         self.writer
             .write_all(&(packet.len() as u32).to_be_bytes())
             .map_err(stream_error)?;

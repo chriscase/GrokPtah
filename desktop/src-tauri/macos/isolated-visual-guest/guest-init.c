@@ -171,6 +171,12 @@ __attribute__((noreturn)) void _start(void) {
     }
 
     gpt_u8 command = 0;
+    gpt_u8 bound = 0;
+    gpt_u8 channel_secret[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES] = {0};
+    gpt_u8 binding_payload[4U * GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES] = {0};
+    gpt_u16 binding_lengths[4] = {0, 0, 0, 0};
+    gpt_u64 last_frame_sequence = 0;
+    gpt_u64 last_input_sequence = 0;
     for (;;) {
         if (!gpt_read_exact(socket, &command, 1U)) {
             gpt_power_off(22);
@@ -185,15 +191,51 @@ __attribute__((noreturn)) void _start(void) {
             }
             break;
         }
+        if (command == GPT_GUEST_BOOTSTRAP_INPUT) {
+            gpt_u8 length_bytes[4];
+            gpt_u32 packet_bytes;
+            gpt_u8 packet[GPT_ISOLATED_VISUAL_INPUT_MAX_PACKET_BYTES];
+            if (!bound || !gpt_read_exact(socket, length_bytes, sizeof(length_bytes))) {
+                gpt_power_off(23);
+            }
+            packet_bytes = gpt_load_be32(length_bytes);
+            if (packet_bytes < GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES +
+                                    GPT_ISOLATED_VISUAL_INPUT_TAG_BYTES ||
+                packet_bytes > GPT_ISOLATED_VISUAL_INPUT_MAX_PACKET_BYTES ||
+                !gpt_read_exact(socket, packet, packet_bytes) ||
+                !gpt_isolated_visual_input_valid(
+                    channel_secret,
+                    binding_payload,
+                    binding_lengths[0],
+                    binding_payload + binding_lengths[0],
+                    binding_lengths[1],
+                    binding_payload + binding_lengths[0] + binding_lengths[1],
+                    binding_lengths[2],
+                    packet,
+                    packet_bytes,
+                    last_frame_sequence,
+                    last_input_sequence,
+                    GPT_ISOLATED_VISUAL_MAX_DISPLAY_WIDTH,
+                    GPT_ISOLATED_VISUAL_MAX_DISPLAY_HEIGHT)) {
+                gpt_power_off(24);
+            }
+            last_input_sequence += 1U;
+            continue;
+        }
         if (command != GPT_GUEST_BOOTSTRAP_BIND) {
-            gpt_power_off(23);
+            gpt_power_off(25);
         }
 
         gpt_u8 binding_header[GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES];
-        if (!gpt_read_exact(socket, binding_header, sizeof(binding_header))) {
-            gpt_power_off(24);
+        gpt_u8 candidate_payload[4U * GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES];
+        gpt_u8 candidate_channel_secret[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES];
+        if (bound) {
+            gpt_power_off(26);
         }
-        gpt_u16 binding_lengths[4] = {
+        if (!gpt_read_exact(socket, binding_header, sizeof(binding_header))) {
+            gpt_power_off(27);
+        }
+        gpt_u16 lengths[4] = {
             gpt_load_be16(binding_header + 8U),
             gpt_load_be16(binding_header + 10U),
             gpt_load_be16(binding_header + 12U),
@@ -202,29 +244,46 @@ __attribute__((noreturn)) void _start(void) {
         gpt_size binding_payload_bytes = 0;
         gpt_u32 index;
         for (index = 0; index < 4U; ++index) {
-            if (binding_lengths[index] == 0 ||
-                binding_lengths[index] > GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES) {
-                gpt_power_off(25);
+            if (lengths[index] == 0 ||
+                lengths[index] > GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES) {
+                gpt_power_off(28);
             }
-            binding_payload_bytes += binding_lengths[index];
+            binding_payload_bytes += lengths[index];
         }
         if (binding_payload_bytes > 4U * GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES) {
-            gpt_power_off(26);
+            gpt_power_off(29);
         }
-        gpt_u8 binding_payload[4U * GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES];
-        if (!gpt_read_exact(socket, binding_payload, binding_payload_bytes) ||
+        if (!gpt_read_exact(socket, candidate_payload, binding_payload_bytes) ||
             !gpt_isolated_visual_binding_valid(
                 challenge,
                 binding_header,
-                binding_payload,
-                binding_payload_bytes) ||
-            !gpt_guest_bootstrap_frame(
+                candidate_payload,
+                binding_payload_bytes)) {
+            gpt_power_off(30);
+        }
+        gpt_isolated_visual_channel_secret(
+            challenge,
+            binding_header + 16U,
+            candidate_channel_secret);
+        if (!gpt_guest_bootstrap_frame(
                 challenge,
                 GPT_GUEST_BOOTSTRAP_EVENT_BINDING_ACK,
                 frame) ||
             !gpt_write_exact(socket, frame, sizeof(frame))) {
-            gpt_power_off(27);
+            gpt_power_off(31);
         }
+        for (index = 0; index < 4U; ++index) {
+            binding_lengths[index] = lengths[index];
+        }
+        for (index = 0; index < binding_payload_bytes; ++index) {
+            binding_payload[index] = candidate_payload[index];
+        }
+        for (index = 0; index < GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES; ++index) {
+            channel_secret[index] = candidate_channel_secret[index];
+        }
+        bound = 1;
+        last_frame_sequence = 0;
+        last_input_sequence = 0;
     }
     gpt_syscall3(GPT_SYS_CLOSE, socket, 0, 0);
     gpt_power_off(0);

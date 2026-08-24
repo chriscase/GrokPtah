@@ -242,7 +242,8 @@ available.
    seam, delegating frame authentication and input admission to that coordinator; it still does
    not open a VSOCK or dispatch a packaged runtime. `IsolatedVisualHelperControl` similarly binds
    inherited helper control/event descriptors to the coordinator without spawning a process. The
-   exact source candidate and safe-check record are captured in
+   freestanding guest now validates the authenticated length-bounded input ABI after binding, while
+   still refusing input until a real captured frame establishes a freshness fence. The exact source candidate and safe-check record are captured in
    [`COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md`](COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md).
 6. Integrate app-owned cursor, focus/drag preview, timeline, persistent emergency controls, and
    accessibility states in the cockpit.

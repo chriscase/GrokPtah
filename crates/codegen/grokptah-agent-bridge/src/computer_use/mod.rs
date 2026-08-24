@@ -87,7 +87,7 @@ pub use isolated_visual_protocol::{
 };
 pub use isolated_visual_runtime::IsolatedVisualRuntimeSession;
 pub use isolated_visual_stream::{
-    IsolatedVisualStream, ISOLATED_VISUAL_STREAM_LENGTH_BYTES,
+    IsolatedVisualStream, ISOLATED_VISUAL_GUEST_INPUT_COMMAND, ISOLATED_VISUAL_STREAM_LENGTH_BYTES,
     ISOLATED_VISUAL_STREAM_MAX_FRAME_PACKET_BYTES,
 };
 pub use macos_observation::MacOsObservationPlatform;

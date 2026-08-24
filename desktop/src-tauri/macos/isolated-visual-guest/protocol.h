@@ -6,6 +6,7 @@ typedef unsigned char gpt_u8;
 typedef unsigned short gpt_u16;
 typedef unsigned int gpt_u32;
 typedef unsigned long long gpt_u64;
+typedef signed int gpt_i32;
 typedef unsigned long gpt_size;
 
 #if defined(__GNUC__)
@@ -23,6 +24,7 @@ typedef unsigned long gpt_size;
 #define GPT_GUEST_BOOTSTRAP_EVENT_SHUTDOWN_ACK 2U
 #define GPT_GUEST_BOOTSTRAP_EVENT_BINDING_ACK 3U
 #define GPT_GUEST_BOOTSTRAP_BIND 3U
+#define GPT_GUEST_BOOTSTRAP_INPUT 4U
 #define GPT_GUEST_BOOTSTRAP_STOP 2U
 #define GPT_GUEST_BOOTSTRAP_PORT 17001U
 
@@ -56,6 +58,13 @@ typedef unsigned long gpt_size;
 #define GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES 64U
 #define GPT_ISOLATED_VISUAL_INPUT_TAG_BYTES 32U
 #define GPT_ISOLATED_VISUAL_INPUT_MAX_TEXT_BYTES 4096U
+#define GPT_ISOLATED_VISUAL_INPUT_MAX_PACKET_BYTES \
+    (GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES + \
+     GPT_ISOLATED_VISUAL_INPUT_MAX_TEXT_BYTES + \
+     GPT_ISOLATED_VISUAL_INPUT_TAG_BYTES)
+#define GPT_ISOLATED_VISUAL_MAX_SCROLL_DELTA 10000U
+#define GPT_ISOLATED_VISUAL_MAX_DISPLAY_WIDTH 1280U
+#define GPT_ISOLATED_VISUAL_MAX_DISPLAY_HEIGHT 800U
 
 /* Host/guest session binding and channel-key derivation. */
 #define GPT_ISOLATED_VISUAL_BINDING_MAGIC 0x47505442U
@@ -148,6 +157,15 @@ static gpt_u32 gpt_rotr32(gpt_u32 value, gpt_u32 count) {
 static gpt_u32 gpt_load_be32(const gpt_u8 *bytes) {
     return ((gpt_u32)bytes[0] << 24U) | ((gpt_u32)bytes[1] << 16U) |
            ((gpt_u32)bytes[2] << 8U) | (gpt_u32)bytes[3];
+}
+
+static gpt_u64 gpt_load_be64(const gpt_u8 *bytes) {
+    gpt_u64 value = 0;
+    gpt_u32 index;
+    for (index = 0; index < 8U; ++index) {
+        value = (value << 8U) | bytes[index];
+    }
+    return value;
 }
 
 static gpt_u16 gpt_load_be16(const gpt_u8 *bytes) {
@@ -481,6 +499,139 @@ static GPT_GUEST_UNUSED int gpt_constant_time_equal(
         difference |= left[index] ^ right[index];
     }
     return difference == 0;
+}
+
+static GPT_GUEST_UNUSED int gpt_isolated_visual_input_valid(
+    const gpt_u8 channel_secret[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES],
+    const gpt_u8 *run_id,
+    gpt_u16 run_id_bytes,
+    const gpt_u8 *surface_id,
+    gpt_u16 surface_id_bytes,
+    const gpt_u8 *incarnation,
+    gpt_u16 incarnation_bytes,
+    const gpt_u8 *packet,
+    gpt_size packet_bytes,
+    gpt_u64 expected_frame_sequence,
+    gpt_u64 expected_input_sequence,
+    gpt_u32 display_width,
+    gpt_u32 display_height) {
+    static const gpt_u8 context[] = "grokptah-isolated-visual-input-v1";
+    const gpt_size tag_bytes = GPT_ISOLATED_VISUAL_INPUT_TAG_BYTES;
+    const gpt_size authentication_bytes = packet_bytes - tag_bytes;
+    const gpt_u8 *text;
+    gpt_u8 nonce_nonzero = 0;
+    gpt_u8 authentication[5120];
+    gpt_u8 expected_tag[GPT_ISOLATED_VISUAL_INPUT_TAG_BYTES];
+    gpt_u8 length_bytes[4];
+    gpt_size authentication_offset = 0;
+    gpt_size index;
+    const gpt_u8 *fields[] = {run_id, surface_id, incarnation};
+    const gpt_u16 lengths[] = {run_id_bytes, surface_id_bytes, incarnation_bytes};
+    gpt_u8 kind;
+    gpt_u8 state;
+    gpt_u16 code;
+    gpt_u32 x;
+    gpt_u32 y;
+    gpt_i32 delta_x;
+    gpt_i32 delta_y;
+    gpt_u32 text_bytes;
+    if (channel_secret == 0 || packet == 0 || display_width == 0 || display_height == 0 ||
+        packet_bytes < GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES + tag_bytes ||
+        packet_bytes > GPT_ISOLATED_VISUAL_INPUT_MAX_PACKET_BYTES) {
+        return 0;
+    }
+    for (index = 0; index < 3U; ++index) {
+        if (fields[index] == 0 || lengths[index] == 0 ||
+            lengths[index] > GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES) {
+            return 0;
+        }
+    }
+    if (gpt_load_be32(packet) != GPT_ISOLATED_VISUAL_INPUT_MAGIC ||
+        gpt_load_be16(packet + 4U) != GPT_ISOLATED_VISUAL_INPUT_VERSION ||
+        gpt_load_be16(packet + 6U) != GPT_GUEST_BOOTSTRAP_VERSION) {
+        return 0;
+    }
+    if (gpt_load_be64(packet + 8U) == 0 ||
+        gpt_load_be64(packet + 8U) != expected_frame_sequence ||
+        gpt_load_be64(packet + 16U) == 0 || expected_input_sequence == ~0ULL ||
+        gpt_load_be64(packet + 16U) != expected_input_sequence + 1U) {
+        return 0;
+    }
+    for (index = 0; index < 16U; ++index) {
+        nonce_nonzero |= packet[24U + index];
+    }
+    if (nonce_nonzero == 0) {
+        return 0;
+    }
+    kind = packet[40U];
+    state = packet[41U];
+    code = gpt_load_be16(packet + 42U);
+    x = gpt_load_be32(packet + 44U);
+    y = gpt_load_be32(packet + 48U);
+    delta_x = (gpt_i32)gpt_load_be32(packet + 52U);
+    delta_y = (gpt_i32)gpt_load_be32(packet + 56U);
+    text_bytes = gpt_load_be32(packet + 60U);
+    if (text_bytes > GPT_ISOLATED_VISUAL_INPUT_MAX_TEXT_BYTES ||
+        packet_bytes != GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES + text_bytes + tag_bytes) {
+        return 0;
+    }
+    text = packet + GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES;
+    for (index = 0; index < text_bytes; ++index) {
+        if (text[index] == 0) {
+            return 0;
+        }
+    }
+    for (index = 0; index < sizeof(context) - 1U; ++index) {
+        authentication[authentication_offset++] = context[index];
+    }
+    for (index = 0; index < 3U; ++index) {
+        gpt_store_be32(length_bytes, lengths[index]);
+        authentication[authentication_offset++] = length_bytes[0];
+        authentication[authentication_offset++] = length_bytes[1];
+        authentication[authentication_offset++] = length_bytes[2];
+        authentication[authentication_offset++] = length_bytes[3];
+        for (gpt_size field_index = 0; field_index < lengths[index]; ++field_index) {
+            authentication[authentication_offset++] = fields[index][field_index];
+        }
+    }
+    for (index = 0; index < authentication_bytes; ++index) {
+        authentication[authentication_offset++] = packet[index];
+    }
+    gpt_hmac_sha256(
+        channel_secret,
+        GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES,
+        authentication,
+        authentication_offset,
+        expected_tag);
+    if (!gpt_constant_time_equal(
+            expected_tag,
+            packet + authentication_bytes,
+            GPT_ISOLATED_VISUAL_INPUT_TAG_BYTES)) {
+        return 0;
+    }
+    switch (kind) {
+        case 1U:
+            return state == 0 && code == 0 && x < display_width && y < display_height &&
+                   delta_x == 0 && delta_y == 0 && text_bytes == 0;
+        case 2U:
+            return (state == 1U || state == 2U) && (code == 1U || code == 2U) &&
+                   x < display_width && y < display_height && delta_x == 0 && delta_y == 0 &&
+                   text_bytes == 0;
+        case 3U:
+            return state == 0 && code == 0 && x == 0 && y == 0 && text_bytes == 0 &&
+                   delta_x <= (gpt_i32)GPT_ISOLATED_VISUAL_MAX_SCROLL_DELTA &&
+                   delta_x >= -(gpt_i32)GPT_ISOLATED_VISUAL_MAX_SCROLL_DELTA &&
+                   delta_y <= (gpt_i32)GPT_ISOLATED_VISUAL_MAX_SCROLL_DELTA &&
+                   delta_y >= -(gpt_i32)GPT_ISOLATED_VISUAL_MAX_SCROLL_DELTA;
+        case 4U:
+            return (state == 1U || state == 2U) && code >= 1U && code <= 18U && x == 0 &&
+                   y == 0 && delta_x == 0 && delta_y == 0 && text_bytes == 0;
+        case 5U:
+            return state == 0 && code == 0 && x == 0 && y == 0 && delta_x == 0 &&
+                   delta_y == 0 && text_bytes > 0;
+        default:
+            return 0;
+    }
 }
 
 static int gpt_guest_bootstrap_tag(

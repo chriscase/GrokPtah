@@ -57,13 +57,14 @@ for forbidden in AF_INET execve '/bin/sh' mount ptrace; do
   fi
 done
 for required in GPT_AF_VSOCK GPT_GUEST_BOOTSTRAP_PORT GPT_GUEST_BOOTSTRAP_BIND \
-  GPT_GUEST_BOOTSTRAP_EVENT_BINDING_ACK GPT_SYS_REBOOT GPT_SYS_SOCKET; do
+  GPT_GUEST_BOOTSTRAP_INPUT GPT_GUEST_BOOTSTRAP_EVENT_BINDING_ACK GPT_SYS_REBOOT GPT_SYS_SOCKET; do
   grep -F "$required" "$guest_source" >/dev/null
 done
 for required in \
   GPT_ISOLATED_VISUAL_FRAME_MAGIC GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES \
   gpt_isolated_visual_frame_header GPT_ISOLATED_VISUAL_INPUT_MAGIC \
-  GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES gpt_isolated_visual_input_header \
+  GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES GPT_ISOLATED_VISUAL_INPUT_MAX_PACKET_BYTES \
+  gpt_isolated_visual_input_header gpt_isolated_visual_input_valid \
   GPT_ISOLATED_VISUAL_BINDING_MAGIC GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES \
   gpt_isolated_visual_binding_header gpt_isolated_visual_binding_digest \
   gpt_isolated_visual_channel_secret gpt_isolated_visual_binding_valid; do

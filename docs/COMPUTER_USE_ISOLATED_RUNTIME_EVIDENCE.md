@@ -29,6 +29,10 @@ Computer Use backend or satisfy the #288 release gate.
 - `IsolatedVisualHelperControl` binds inherited control/event descriptors to
   the same coordinator, serializing only the start/bind/stop controls and
   accepting only decoded fixed-size helper events.
+- The freestanding guest source validates the authenticated input packet,
+  sequence fence, identity-bound HMAC, coordinate/key/text bounds, and closed
+  message kind set after binding. It intentionally has no valid frame source
+  yet, so input remains fail-closed until guest capture is implemented.
 - Source tests exercise the bound transition, frame-carrier round trip,
   frame-fenced input packet, stop transition, and pre-binding rejection paths.
 

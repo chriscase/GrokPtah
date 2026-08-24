@@ -62,6 +62,27 @@ int main(void) {
     for (gpt_u32 index = 0; index < sizeof(challenge); ++index) {
         challenge[index] = (gpt_u8)index;
     }
+    gpt_u8 invalid_input[GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES +
+                        GPT_ISOLATED_VISUAL_INPUT_TAG_BYTES] = {0};
+    if (GPT_GUEST_BOOTSTRAP_INPUT != 4U ||
+        GPT_ISOLATED_VISUAL_INPUT_MAX_PACKET_BYTES != 4192U ||
+        gpt_isolated_visual_input_valid(
+            challenge,
+            (const gpt_u8 *)"run",
+            3U,
+            (const gpt_u8 *)"surface",
+            7U,
+            (const gpt_u8 *)"incarnation",
+            11U,
+            invalid_input,
+            sizeof(invalid_input),
+            1U,
+            0U,
+            1280U,
+            800U)) {
+        fputs("invalid isolated input packet was accepted\n", stderr);
+        return 1;
+    }
     gpt_u8 ready[GPT_GUEST_BOOTSTRAP_FRAME_BYTES];
     gpt_u8 stopped[GPT_GUEST_BOOTSTRAP_FRAME_BYTES];
     gpt_u8 binding_ack[GPT_GUEST_BOOTSTRAP_FRAME_BYTES];
