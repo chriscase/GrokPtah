@@ -189,6 +189,12 @@ the external run is using immutable bundle
 `4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`). No
 result for that follow-up has been returned yet.
 
+The next source-only correction (`f561dd8`) makes terminal stop failure
+fail-closed for ownership as well: the lease is revoked even when bounded
+helper reaping reports an error, while exact cleanup evidence remains
+mandatory. Its focused regression is formatted but still requires the same
+external runner; it does not change the active `b250b70` campaign.
+
 Grok Build ran the focused `isolated_guest` library proof (8 passed) plus the
 committed-stop cleanup regression (1 passed) on the isolated PR head with the
 required sccache/target policy. Those are external PR-head results, not a Rust
