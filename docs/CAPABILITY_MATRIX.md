@@ -56,11 +56,12 @@ the active external run is pinned to immutable bundle
 `4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`). No
 result is recorded yet.
 
-Candidate follow-up `f561dd8` additionally revokes packaged-guest ownership
-after any terminal stop/reap result, including bounded reap failure, so a
-failed stop cannot be resumed. Exact cleanup evidence remains independent;
-this correction is source-only and is not part of the active `b250b70`
-external campaign.
+Candidate follow-up `40730e4` additionally revokes packaged-guest ownership
+after any terminal stop/reap result, including bounded reap failure, and
+denies reacquisition after stopping/cleanup/termination, so a failed stop
+cannot be resumed by the same or a replacement agent. Exact cleanup evidence
+remains independent; this correction is source-only and is not part of the
+active `b250b70` external campaign.
 Its future external procedure is
 [`COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md).
 

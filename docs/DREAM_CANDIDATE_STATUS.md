@@ -189,11 +189,12 @@ the external run is using immutable bundle
 `4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`). No
 result for that follow-up has been returned yet.
 
-The next source-only correction (`f561dd8`) makes terminal stop failure
+The next source-only correction (`40730e4`) makes terminal stop failure
 fail-closed for ownership as well: the lease is revoked even when bounded
-helper reaping reports an error, while exact cleanup evidence remains
-mandatory. Its focused regression is formatted but still requires the same
-external runner; it does not change the active `b250b70` campaign.
+helper reaping reports an error, and stopping/cleanup/terminated runtimes
+cannot admit a replacement agent. Exact cleanup evidence remains mandatory.
+Its focused regressions are formatted but still require the same external
+runner; it does not change the active `b250b70` campaign.
 The frozen follow-up procedure is
 [`COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md).
 
