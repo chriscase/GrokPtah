@@ -6,12 +6,12 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `cadcbff96e663c81117241e8e372c59c2f7da6cd`
-- Bundle: `/private/tmp/grokptah-cu-stage19-challenge-channel-v1.bundle`
-- Bundle SHA-256: `e0ae9b2a8a0d311e0571c96c33239b47c5ab9cf612ddded1e3f83b461865e870`
+- Head: `62ffb0dd60cb166b2dbc66e02922425e1461c88d`
+- Bundle: `/private/tmp/grokptah-cu-stage20-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `30a3484b89c19c65f52ddc94a0a41d76ec9414cadcaa3805ac738078451df12a`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current sealed implementation head: `cadcbff96e663c81117241e8e372c59c2f7da6cd`.
+Current sealed implementation head: `62ffb0dd60cb166b2dbc66e02922425e1461c88d`.
 
 The later guest-input validation extension is sealed at:
 
@@ -55,6 +55,12 @@ The private guest-challenge channel extension is sealed at:
 - Bundle: `/private/tmp/grokptah-cu-stage19-challenge-channel-v1.bundle`
 - Bundle SHA-256: `e0ae9b2a8a0d311e0571c96c33239b47c5ab9cf612ddded1e3f83b461865e870`
 
+The bounded packaged-supervisor source extension is sealed at:
+
+- Commit: `62ffb0dd60cb166b2dbc66e02922425e1461c88d`
+- Bundle: `/private/tmp/grokptah-cu-stage20-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `30a3484b89c19c65f52ddc94a0a41d76ec9414cadcaa3805ac738078451df12a`
+
 ## What this candidate proves
 
 - The helper control ABI has an explicit `bind` command and authenticated
@@ -96,6 +102,15 @@ The private guest-challenge channel extension is sealed at:
   channel, and the Rust host adapter reads a complete nonzero challenge without
   serializing it. This closes the host-binding input seam while leaving process
   launch and package qualification explicitly unclaimed.
+- The native macOS shim now performs the reviewed package-open step, rechecks
+  helper identity immediately before `posix_spawn`, creates only the five
+  private parent/child channels, maps the fixed descriptor contract under
+  `POSIX_SPAWN_CLOEXEC_DEFAULT`, and routes child stdio to `/dev/null`. The
+  macOS Rust supervisor owns the returned PID and descriptors, consumes FD9,
+  drives the bounded Prepared → Running → Bound lifecycle, applies bounded
+  event waits, and force-cleans an unresponsive helper. This is a packaged-
+  supervisor **source candidate**; no signed app has launched it and no VM
+  boot/render/input/cleanup result is claimed.
 - The freestanding guest source validates the authenticated input packet,
   sequence fence, identity-bound HMAC, coordinate/key/text bounds, and closed
   message kind set after binding. Input remains fail-closed until a reviewed
@@ -109,23 +124,29 @@ The private guest-challenge channel extension is sealed at:
 
 ## Safe validation performed
 
+- `rustfmt --edition 2021 --check` on each changed Rust source file
 - `cargo fmt --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml --all -- --check`
+  (reports pre-existing unrelated `xai-grok-pager` whitespace; no such file was
+  changed here)
 - `cargo metadata --locked --offline --no-deps --format-version=1`
 - `desktop/src-tauri/macos/isolated-visual-guest/verify-guest-source.sh`
 - `desktop/src-tauri/macos/isolated-visual-helper/verify-helper-source.sh`
 - `git diff --check`
 
-The guest verifier reported its protocol self-test and closed-source checks
-passing. The helper verifier linked an arm64 Mach-O against
-`Virtualization.framework` and passed its entitlement/configuration/source
-checks.
+The changed Rust files were rustfmt-clean. The guest verifier reported its
+protocol self-test and closed-source checks passing. The helper verifier linked
+an arm64 Mach-O against `Virtualization.framework` and passed its
+entitlement/configuration/source checks, including the native-spawn symbols.
+The repository-wide formatter still reports pre-existing unrelated whitespace
+in the xai-grok-pager crate; that code was not modified by this candidate.
 
 ## Explicit nonclaims
 
 No local cargo test/check/clippy campaign was run under the controlled build
-policy. No packaged helper, signed app, reviewed guest image, host process
-supervisor, VM launch, socket frame renderer, input dispatch, hardware matrix,
-soak campaign, or `HostNative` capability claim exists yet. The bundle is a
+policy. No packaged helper, signed app, reviewed guest image, VM launch, socket
+frame renderer, input dispatch, hardware matrix, soak campaign, or `HostNative`
+capability claim exists yet. A host process-supervisor **source candidate** now
+exists, but it has not been exercised against a signed package. The bundle is a
 reviewable source candidate, not release evidence; the framebuffer extension
 proves only bounded source-level capture and frame authentication.
 
@@ -133,8 +154,10 @@ proves only bounded source-level capture and frame authentication.
 
 1. Produce and review the deterministic guest image, signed helper, and exact
    packaged app on a credentialed macOS host.
-2. Wire the packaged supervisor to this coordinator and run lifecycle,
-   restart, resource, security, hardware, and accessibility campaigns.
-3. Connect the guest capture/render loop and one-action-approved input path;
-   only then consider the #288 acceptance criteria and native dispatch.
-4. Run the controlled Rust qualification campaign and independent review.
+2. Exercise `IsolatedVisualPackagedRuntime` against that package: launch, boot,
+   challenge/bind, render, input, stop, crash, restart, resource, and exact
+   overlay/handle cleanup.
+3. Run the security, hardware, accessibility, and recurring expert-UI
+   campaigns; retain the packaged evidence and independent review.
+4. Enable `HostNative` only after the #288 acceptance criteria and the
+   controlled Rust qualification campaign pass.

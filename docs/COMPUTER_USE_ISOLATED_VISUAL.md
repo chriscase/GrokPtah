@@ -195,17 +195,20 @@ available.
    with the guest bootstrap agent, and requires an authenticated shutdown acknowledgement before
    bounded graceful-then-forced stop.
    The helper's fixed event/control ABI is shared with the freestanding protocol header, and a
-   host-supervisor codec/state machine rejects reordered, unknown, and post-terminal events before
-   any packaged process-spawn seam exists. This is an ABI/source guard only: it does not spawn the
-   helper, retain descriptors, boot a guest, or mint an isolated capability.
+   host-supervisor codec/state machine rejects reordered, unknown, and post-terminal events. The
+   candidate now also contains a macOS packaged-supervisor seam: it revalidates the signed artifact
+   handles immediately before `posix_spawn`, maps only the fixed guest/configuration and five
+   private channel descriptors under `POSIX_SPAWN_CLOEXEC_DEFAULT`, consumes the private per-launch
+   challenge, and owns bounded helper lifecycle/cleanup. This remains source-level wiring only:
+   no signed package has launched it and no VM boot/render/input/cleanup evidence exists.
    The assembler signs the helper before the outer unprivileged app and derives the content and
    designated-requirement manifest. CI links only the unsigned helper source. The repository now
    also carries a pinned Linux arm64 guest-source lock, closed kernel fragment, freestanding guest
    PID 1, protocol self-test, and a Linux-only deterministic image-builder candidate. Dedicated
    Linux CI builds that source twice and compares image/manifest bytes, but no output is embedded
    or reviewed as a release artifact. This slice supplies no reviewed guest image, signing
-   identity, built helper, assembled app, host supervisor, launch, or cleanup run. Actual guest
-   production plus signed-package and destructive campaign evidence remain.
+   identity, built helper, assembled app, packaged launch, or cleanup run. Actual guest production
+   plus signed-package and destructive campaign evidence remain.
 4. Add authenticated virtio-socket frame/health transport and render read-only frames. The candidate
    now defines the transport-independent, read-only protocol core: a non-serializable/redacted
    32-byte channel key authenticates the exact protocol version, Run, surface incarnation, message
@@ -218,8 +221,9 @@ available.
    the freestanding guest has a fixed `/dev/fb0` capture source, a deterministic fixture renderer,
    and authenticated frame-chunk emitter; validated fixture pointer/button/scroll state changes
    the next surface, but no reviewed GUI guest image or host renderer is wired into a packaged
-   runtime yet. The helper returns its per-launch challenge over a private inherited channel so a
-   future supervisor can bind the host and guest without exposing challenge material to a model.
+   runtime yet. The helper returns its per-launch challenge over a private inherited channel so the
+   supervisor can bind the host and guest without exposing challenge material to a model; the
+   supervisor source candidate reads that channel but has not been run from a signed package.
 5. Add guest pointer state and one-action local approval; then key/text/scroll/drag independently.
    The source candidate now includes a non-dispatchable host-side input gate that binds every
    pointer/button/scroll/key/text edge to the latest frame, requires strictly increasing input
@@ -239,14 +243,16 @@ available.
    binding command and returns an authenticated binding acknowledgement; the existing zero-binding
    STOP path remains available for the current bootstrap smoke until the supervisor is wired. The
    helper source now defines the corresponding private control-channel relay and validates the
-   guest acknowledgement, but no packaged supervisor invokes it yet. A source-only
+   guest acknowledgement. The packaged-supervisor source candidate invokes the relay through
+   inherited descriptors, but no signed package has exercised that path yet. A source-only
    `IsolatedVisualRuntimeSession` now couples that helper event order to lifecycle cleanup, frame
    freshness, and challenge-bound input admission; it still does not spawn or dispatch a packaged
    runtime. A bounded length-delimited `IsolatedVisualStream` now supplies the private transport
    seam, delegating frame authentication and input admission to that coordinator; it still does
-   not open a VSOCK or dispatch a packaged runtime. `IsolatedVisualHelperControl` similarly binds
-   inherited helper control/event descriptors to the coordinator without spawning a process. A
-   source-only `IsolatedVisualRuntimeDriver` now joins those helper and stream adapters behind one
+   not open a VSOCK itself. `IsolatedVisualHelperControl` similarly binds inherited helper
+   control/event descriptors to the coordinator. `IsolatedVisualPackagedRuntime` now owns the
+   native child process and descriptor transfer on macOS, while a source-only
+   `IsolatedVisualRuntimeDriver` joins those helper and stream adapters behind one
    lifecycle-owned API, preventing a future supervisor from advancing them through unrelated
    state machines. The
    freestanding guest now validates the authenticated length-bounded input ABI after binding, while
@@ -266,7 +272,8 @@ available.
 The existing simulator remains the only dispatchable isolated proof. The Stage 8 measured
 background candidate is not a substitute. The typed input, read-only host-probe, no-input lifecycle,
 open-handle content-measurement, fixed-path packaged-identity verifier, unshipped helper/assembler
-source, pinned guest-source/image-builder candidate, and authenticated read-protocol candidates do not enable
+source, pinned guest-source/image-builder candidate, authenticated read-protocol candidates, and
+packaged-supervisor source seam do not enable
 `HostNative`, expose isolated actions to a model or cockpit approval flow, qualify a provider for
 visual fallback, package a VM image/helper, carry or render frame bytes, or satisfy any #288
 acceptance checkbox. The verifier can establish signed package identity only when invoked by a real

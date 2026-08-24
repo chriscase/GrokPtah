@@ -699,8 +699,10 @@ and a credentialed nested-signing assembler. The helper's closed inherited-descr
    confirmation tag. The Rust frame/input carriers can derive interoperable keys from that
    challenge, and the helper/guest source loop now consumes the binding packet and returns an
    authenticated acknowledgement. The helper source defines a private control-channel relay and
-   validates the guest acknowledgement, but no packaged supervisor invokes that relay yet. These are contracts
-   and unshipped source/pipeline primitives, not packaged evidence. A source-only
+   validates the guest acknowledgement. The candidate now also contains a macOS packaged-supervisor
+   source seam that revalidates signed artifact handles, spawns only the allowlisted helper
+   descriptors with close-on-exec, consumes the private challenge, and owns bounded lifecycle
+   cleanup. These are contracts and unshipped source/pipeline primitives, not packaged evidence. A source-only
    `IsolatedVisualRuntimeSession` now couples helper event order to lifecycle cleanup, frame
    freshness, and challenge-bound input admission; it does not spawn or dispatch a packaged
    runtime. A bounded length-delimited `IsolatedVisualStream` supplies the private transport seam
@@ -712,9 +714,11 @@ and a credentialed nested-signing assembler. The helper's closed inherited-descr
    its per-launch challenge over private FD9. Input still refuses admission until a reviewed
    packaged capture establishes a freshness fence. Its source identity and safe-check record are captured in
    [`COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md`](COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md). See
-[`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,
-signed/built helper, guest image, packaged entitlement proof, or host-native dispatch exists yet, so these
-source slices satisfy no #288 acceptance checkbox.
+[`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). The host-supervisor source
+seam is not wired into capability admission and has not been run from a signed package. No VM boot,
+signed/built helper, reviewed guest image, packaged entitlement proof, rendered frame, input,
+cleanup, or host-native dispatch evidence exists yet, so these source slices satisfy no #288
+acceptance checkbox.
 
 **Exit:** every [#288](https://github.com/chriscase/GrokPtah/issues/288)
 acceptance criterion. **This row cannot be marked Explicitly unsupported as
