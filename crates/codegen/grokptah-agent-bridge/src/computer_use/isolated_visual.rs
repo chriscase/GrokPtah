@@ -596,6 +596,35 @@ mod tests {
     }
 
     #[test]
+    fn failure_after_committed_stop_still_requires_exact_cleanup() {
+        let mut lifecycle = IsolatedVisualLifecycle::new(contract()).unwrap();
+        lifecycle.begin_start().unwrap();
+        lifecycle.mark_read_only_ready().unwrap();
+        lifecycle
+            .begin_stop(IsolatedVisualTerminalDisposition::Interrupted)
+            .unwrap();
+
+        // A helper failure after the stop boundary must not reopen the run or
+        // replace the already-recorded terminal disposition. It only advances
+        // the same cleanup-pending path used by a normal stopped event.
+        lifecycle.fail().unwrap();
+        assert_eq!(
+            lifecycle.state,
+            IsolatedVisualLifecycleState::CleanupPending
+        );
+        assert_eq!(
+            lifecycle.terminal_disposition,
+            Some(IsolatedVisualTerminalDisposition::Interrupted)
+        );
+        assert!(lifecycle.mark_read_only_ready().is_err());
+
+        lifecycle
+            .complete_cleanup(&cleanup(&lifecycle.contract.surface))
+            .unwrap();
+        assert_eq!(lifecycle.state, IsolatedVisualLifecycleState::Terminated);
+    }
+
+    #[test]
     fn serialized_contract_contains_no_host_paths_or_channel_secret() {
         let value = serde_json::to_value(contract()).unwrap();
         let object = value.as_object().unwrap();
