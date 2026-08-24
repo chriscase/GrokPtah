@@ -141,13 +141,13 @@ complete or that the product has reached 100%.
 
 ### Latest desktop safety continuation — 2026-08-24
 
-Candidate `95a3a20b40c59dbb3f1d88b3ad3f7df6b36ea7d9` extends the shared,
+Candidate `9d1427fd34920866458c221c9192f422b5286835` extends the shared,
 bounded backend-error display boundary across the desktop surfaces. Credential-
 shaped values, local paths, and UI-only secret placeholders are redacted before
 errors reach search, session, run, routine, worker, settings, terminal, remote
 agent, provider-readiness, or Computer Run UI. Computer Run storage contention
 also has a clear retry path. The focused redaction tests and full desktop suite
-(49 files, 383 tests) pass; this is source/UI safety evidence only and is not a
+(51 files, 387 tests) pass; this is source/UI safety evidence only and is not a
 packaged-desktop acceptance or expert UX cadence record. Parent-provided load
 diagnostics now pass through the same boundary before technical details render,
 closing the path visible in the earlier persistent-agent capture. The visual
@@ -156,8 +156,11 @@ shell-dismiss, and Live-rail-hide controls now expose explicit accessible names
 with regression coverage. Search and modal Settings now keep Tab traversal
 inside the true modal surface, with a shared focus-trap helper and component
 regression coverage, and closing either surface returns focus to its opener.
-The full desktop suite now passes 51 files / 386 tests. This remains source/UI
-evidence, not packaged review.
+The full desktop suite now passes 51 files / 387 tests. The App-owned activity,
+transcript, durable-work, lane-scope, remote-connection, and rate-limit error
+paths now use the same bounded sanitizer, and the selected-lane blocked alert
+has a regression for path/credential leakage. This remains source/UI evidence,
+not packaged review.
 
 ## Verification recorded
 
