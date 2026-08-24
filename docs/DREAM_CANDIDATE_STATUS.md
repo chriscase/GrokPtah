@@ -198,6 +198,18 @@ runner; it does not change the active `b250b70` campaign.
 The frozen follow-up procedure is
 [`COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md).
 
+The current continuation additionally closes the pre-`Stopping` stop-control
+failure path: a poisoned input gate or failed control write now aborts the
+helper, revokes the lease, and requires exact cleanup rather than leaving a
+live child eligible for retry. Static formatting, offline metadata, and the
+source verifiers pass. The corrected full Stage 9 campaign is sealed separately
+in `/private/tmp/grokptah-cu-isolated-visual-v14.bundle` (SHA-256
+`c9f4d2aa4692789c9f02ff71f7126089e9ceebb856de7d9cef9a7f6458b72a66`, cutoff
+`0137969dcfbb7453dd716d1ed1894e4cfc7334b9`) with the queued procedure in
+[`COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V14.md`](COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V14.md).
+It remains source-only and must not be conflated with the active `b250b70`
+campaign.
+
 ### Always-On v52 route-identity repair — 2026-08-24
 
 The v51 campaign reached the real `grokptah-service` process but failed closed
