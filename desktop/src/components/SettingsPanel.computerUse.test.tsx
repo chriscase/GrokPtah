@@ -99,15 +99,20 @@ const preview: ComputerObservationPreview = {
   imageDataUrl: "data:image/png;base64,AA==",
 };
 
-function settingsPanel(open = true) {
+function settingsPanel(
+  open = true,
+  placement: "dock" | "modal" = "dock",
+  onClose = vi.fn(),
+) {
   return (
     <SettingsPanel
       open={open}
-      onClose={vi.fn()}
+      onClose={onClose}
       models={[]}
       auth={{ signed_in: false }}
       onAuthChange={vi.fn()}
       onChromeChange={vi.fn()}
+      placement={placement}
     />
   );
 }
@@ -129,6 +134,21 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("Computer Use settings", () => {
+  it("returns focus to the opener after a modal closes", async () => {
+    const opener = document.createElement("button");
+    opener.textContent = "Open settings";
+    document.body.append(opener);
+    opener.focus();
+    const view = render(settingsPanel(true, "modal"));
+
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Settings" })).toBeInTheDocument());
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Close settings" }));
+
+    view.rerender(settingsPanel(false, "modal"));
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
+  });
+
   it("never requests consent or captures on open", async () => {
     renderSettings();
     fireEvent.click(screen.getByText("Computer Use"));

@@ -16,7 +16,11 @@ afterEach(() => {
 describe("SearchPanel", () => {
   it("keeps keyboard focus inside the modal and closes on Escape", () => {
     const onClose = vi.fn();
-    render(
+    const opener = document.createElement("button");
+    opener.textContent = "Open search";
+    document.body.append(opener);
+    opener.focus();
+    const view = render(
       <SearchPanel
         open
         onClose={onClose}
@@ -39,5 +43,15 @@ describe("SearchPanel", () => {
 
     fireEvent.keyDown(close, { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(1);
+
+    view.rerender(
+      <SearchPanel
+        open={false}
+        onClose={onClose}
+        onOpenSession={vi.fn()}
+      />,
+    );
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
   });
 });

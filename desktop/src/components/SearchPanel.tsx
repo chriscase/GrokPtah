@@ -30,10 +30,23 @@ export function SearchPanel({
   const [error, setError] = useState<string | null>(null);
   const [searched, setSearched] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const queryRef = useRef<HTMLInputElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (open) setKind(defaultKind);
   }, [open, defaultKind]);
+
+  useEffect(() => {
+    if (!open) {
+      restoreFocusRef.current?.focus();
+      restoreFocusRef.current = null;
+      return;
+    }
+    restoreFocusRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    queryRef.current?.focus();
+  }, [open]);
 
   const runSearch = useCallback(async () => {
     const q = query.trim();
@@ -100,7 +113,7 @@ export function SearchPanel({
       >
         <input
           className="sp-query"
-          autoFocus
+          ref={queryRef}
           placeholder="Search messages, titles, tags, folders…"
           value={query}
           onChange={(e) => setQuery(e.target.value)}

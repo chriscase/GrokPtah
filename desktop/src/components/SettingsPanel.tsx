@@ -96,6 +96,7 @@ export function SettingsPanel({
     useState<NativeCodingReadinessProjection | null>(null);
   const gatewayKeyRef = useRef<HTMLInputElement>(null);
   const settingsDialogRef = useRef<HTMLDivElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
   const qualifyInFlight = useRef(false);
   const readinessSelection = useRef(0);
   const readinessReportSelection = useRef(-1);
@@ -151,6 +152,23 @@ export function SettingsPanel({
     void refresh();
     setNotice(null);
   }, [open, refresh]);
+
+  useEffect(() => {
+    if (!open) {
+      restoreFocusRef.current?.focus();
+      restoreFocusRef.current = null;
+      return;
+    }
+    restoreFocusRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    if (placement === "modal") {
+      settingsDialogRef.current
+        ?.querySelector<HTMLElement>(
+          'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])',
+        )
+        ?.focus();
+    }
+  }, [open, placement]);
 
   useEffect(() => {
     if (!open) return;
