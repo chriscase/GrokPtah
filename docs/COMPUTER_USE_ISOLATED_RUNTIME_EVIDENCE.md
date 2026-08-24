@@ -6,21 +6,23 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Source head at evidence cutoff: `207d023b029a1ed9a04bcd62de729a1784baa332`
-- Bundle: `/private/tmp/grokptah-cu-isolated-visual-v4.bundle`
-- Bundle SHA-256: `4556ac06b65585e9cddfdc6bdd70753e2225967572d0f1438ebf25b02078f2ad`
+- Source head at evidence cutoff: `ab8542584fb96313f6dc927b0e745411ee67edd1`
+- Bundle: `/private/tmp/grokptah-cu-isolated-visual-v5.bundle`
+- Bundle SHA-256: `36d44b33688788e8d7ddf00399d41f53451aeb1040e1d0d95db0c9d03d690a42`
 - Bundle verification: complete history; `git bundle verify` passed.
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current bundled source head: `207d023b029a1ed9a04bcd62de729a1784baa332`.
+Current bundled source head: `ab8542584fb96313f6dc927b0e745411ee67edd1`.
 
-The earlier v1, v2, and v3 bundles remain retained as historical source-only
+The earlier v1, v2, v3, and v4 bundles remain retained as historical source-only
 evidence: `/private/tmp/grokptah-cu-isolated-visual-v1.bundle` (cutoff
 `3a88fb41e29a55aeabb54defe82761b129b6ab11`) and
 `/private/tmp/grokptah-cu-isolated-visual-v2.bundle` (cutoff
 `4ea37f3a223f74817f629f0b844c76d4916b895c`) and
 `/private/tmp/grokptah-cu-isolated-visual-v3.bundle` (cutoff
-`d69c6f82d706273c701c7056b0df135e2b386201`). They must not be used for a new
+`d69c6f82d706273c701c7056b0df135e2b386201`), and
+`/private/tmp/grokptah-cu-isolated-visual-v4.bundle` (cutoff
+`207d023b029a1ed9a04bcd62de729a1784baa332`). They must not be used for a new
 qualification campaign now that the candidate contains later security fixes.
 
 The later guest-input validation extension is sealed at:

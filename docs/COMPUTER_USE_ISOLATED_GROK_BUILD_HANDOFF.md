@@ -9,9 +9,9 @@ cleanup result.
 
 ## Exact candidate
 
-- Source bundle: `/private/tmp/grokptah-cu-isolated-visual-v4.bundle`
-- Bundle SHA-256: `4556ac06b65585e9cddfdc6bdd70753e2225967572d0f1438ebf25b02078f2ad`
-- Source cutoff: `207d023b029a1ed9a04bcd62de729a1784baa332`
+- Source bundle: `/private/tmp/grokptah-cu-isolated-visual-v5.bundle`
+- Bundle SHA-256: `36d44b33688788e8d7ddf00399d41f53451aeb1040e1d0d95db0c9d03d690a42`
+- Source cutoff: `ab8542584fb96313f6dc927b0e745411ee67edd1`
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
 - Docs-only handoff checkpoint (contains the evidence verifier): `e35318c55193f31547bd001a30c6a6eeebaf827d`
 - Main checkout must remain untouched at `6409645cb7d0fe6d75585f0610366340f808b8ec`.
@@ -26,9 +26,9 @@ Use only the exact source bundle and SHA below. Create a disposable checkout; do
 developer checkout, existing app sessions, Git branches, or GitHub. Do not infer a VM capability
 from source tests, a Linux image comparison, package signing, or launchAttempted=false.
 
-Bundle: /private/tmp/grokptah-cu-isolated-visual-v4.bundle
-Bundle SHA-256: 4556ac06b65585e9cddfdc6bdd70753e2225967572d0f1438ebf25b02078f2ad
-Source cutoff: 207d023b029a1ed9a04bcd62de729a1784baa332
+Bundle: /private/tmp/grokptah-cu-isolated-visual-v5.bundle
+Bundle SHA-256: 36d44b33688788e8d7ddf00399d41f53451aeb1040e1d0d95db0c9d03d690a42
+Source cutoff: ab8542584fb96313f6dc927b0e745411ee67edd1
 
 Before any build, report macOS version/build, Virtualization.framework availability, signing
 identity fingerprint (never private material), free disk, active cargo/rustc processes, intended
@@ -80,7 +80,7 @@ launch remains **NOT QUALIFIED**.
 
 After the campaign, run `docs/verify-isolated-runtime-evidence.sh` from the docs-only handoff
 checkpoint (`e35318c…`) or another checkout that contains that exact script. The immutable source
-bundle is the current candidate at `207d023b…`; the verifier is a source-level evidence aid and
+bundle is the current candidate at `ab854258…`; the verifier is a source-level evidence aid and
 must not be treated as a VM qualification result. Then update `ROADMAP_TO_100.md`, `CAPABILITY_MATRIX.md`, and
 `COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md` together. Do not change an unsupported or planned
 status based on this handoff alone.
