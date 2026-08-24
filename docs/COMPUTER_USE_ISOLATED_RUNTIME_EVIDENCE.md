@@ -6,9 +6,9 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `ab922776f8ff0f47c426e2dc423b7224ba38f032`
-- Bundle: `/private/tmp/grokptah-cu-stage40-bounded-forced-reap-v1.bundle`
-- Bundle SHA-256: `f789c57ef73ceeae576f372f9b947d8fc8a09b584bf07f8bfff27f0b083519bb`
+- Head: `a454357a46a61800c8dd993c2b837402bb7ff586`
+- Bundle: `/private/tmp/grokptah-cu-stage41-raw-polled-channels-v1.bundle`
+- Bundle SHA-256: `5b18f786ee1962a8ea4085a170422db5e28d6ba02fda6a500d44165610bc2518`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
 Current sealed implementation head: `eb9892e1ba5606c73b66abe60067fea5ae7eafb6`.
@@ -108,6 +108,12 @@ The bounded forced-reap hardening is sealed at:
 - Commit: `ab922776f8ff0f47c426e2dc423b7224ba38f032`
 - Bundle: `/private/tmp/grokptah-cu-stage40-bounded-forced-reap-v1.bundle`
 - Bundle SHA-256: `f789c57ef73ceeae576f372f9b947d8fc8a09b584bf07f8bfff27f0b083519bb`
+
+The raw-reader channel alignment is sealed at:
+
+- Commit: `a454357a46a61800c8dd993c2b837402bb7ff586`
+- Bundle: `/private/tmp/grokptah-cu-stage41-raw-polled-channels-v1.bundle`
+- Bundle SHA-256: `5b18f786ee1962a8ea4085a170422db5e28d6ba02fda6a500d44165610bc2518`
 
 ## What this candidate proves
 
