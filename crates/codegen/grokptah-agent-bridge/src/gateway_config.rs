@@ -1796,6 +1796,34 @@ mod tests {
     }
 
     #[test]
+    fn user_editable_profile_cannot_self_assert_isolated_visual_authority() {
+        let mut model = ProviderModel::unqualified("forged-isolated-visual");
+        model.capabilities.tools = true;
+        model.capabilities.image_input = true;
+        model.capabilities.image_media_types = vec!["image/png".into()];
+        model.capabilities.max_image_bytes = Some(1024);
+        model.capabilities.computer_use_tier = ComputerUseTier::VisualFallbackAct;
+        model.capabilities.computer_capability_source = CapabilitySource::Measured;
+        model.capabilities.computer_qualification_schema =
+            Some(ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA.into());
+        let mut profile =
+            ProviderProfile::openai_compatible("corp", "Corp", "https://gw.example/v1");
+        profile.upsert_model(model);
+        let mut config = GatewayConfig::default();
+        config.profiles.push(profile);
+
+        config.normalize();
+
+        let capabilities = &config.profiles[0].models[0].capabilities;
+        assert_eq!(capabilities.computer_use_tier, ComputerUseTier::None);
+        assert_eq!(
+            capabilities.computer_capability_source,
+            CapabilitySource::Unknown
+        );
+        assert!(capabilities.computer_qualification_schema.is_none());
+    }
+
+    #[test]
     fn effective_tier_fails_closed_for_incoherent_profile_claims() {
         let mut capabilities = ModelCapabilities {
             computer_use_tier: ComputerUseTier::VisualFallbackAct,
