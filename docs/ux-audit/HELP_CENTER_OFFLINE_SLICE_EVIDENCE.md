@@ -55,10 +55,14 @@ to repeat at promotion time.
 
 ## Browser visual pass
 
-Prior local browser evidence covered the real Help dialog, twelve article
-buttons, topic/search behavior, source cards, and a 720px narrow viewport. That
-evidence predates the final boundary/accessibility correction and must be
-re-run for packaged promotion. It is not packaged desktop acceptance.
+A current read-only in-app browser recheck was performed against implementation
+head `f35813ef` at the default dark viewport and at 720×800. It verified the
+real sidebar Help entry, 12 article options, initial search focus, the
+restricted-gateway ranking for `why is the company gateway model weak?`, the
+source card (`docs/PROVIDER_PROFILES.md` · `Provider profiles`), and Escape
+dismissal. `document.documentElement.scrollWidth` equaled
+`window.innerWidth` at 720px. The visual result remains local browser evidence,
+not packaged desktop acceptance, forced-colors certification, or expert sign-off.
 
 ## Remaining gates
 

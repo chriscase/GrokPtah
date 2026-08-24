@@ -31,6 +31,24 @@ browser or re-run the candidate's 46-file / 244-test baseline.
 - `npm audit --audit-level=high` reports zero vulnerabilities; no runtime
   dependency was added.
 
+## Current-head browser recheck
+
+The corrected implementation head `f35813ef` was opened in the isolated local
+preview with the in-app browser. At the default dark viewport and 720×800
+narrow viewport:
+
+- the Help dialog opened from the real sidebar entry and placed focus in
+  Search help;
+- 12 article options rendered, with the restricted-company review ranked first
+  for `why is the company gateway model weak?`;
+- the source card showed `docs/PROVIDER_PROFILES.md · Provider profiles`;
+- the offline lexical label and non-certification confidence note were visible;
+- `document.documentElement.scrollWidth == window.innerWidth` at 720px; and
+- Escape closed the dialog without leaving it open.
+
+This remains local browser evidence; packaged desktop, forced-colors, and
+independent expert acceptance are still open.
+
 ## Not yet evidenced
 
 - Packaged desktop keyboard/forced-colors acceptance after the final correction.
