@@ -81,4 +81,8 @@ for required in \
   gpt_isolated_visual_channel_secret gpt_isolated_visual_binding_valid; do
   grep -F "$required" "$protocol_header" >/dev/null
 done
+if grep -F 'while (gpt_syscall3(GPT_SYS_NANOSLEEP' "$guest_source" >/dev/null; then
+  echo "guest reconnect backoff must not retry nanosleep inside an unbounded loop" >&2
+  exit 1
+fi
 printf 'isolated guest source, protocol, and closed kernel fragment: pass\n'

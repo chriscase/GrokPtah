@@ -144,6 +144,14 @@ for required in \
   'GPT_ISOLATED_VISUAL_FRAME_MAX_PACKET_BYTES'; do
   grep -F "$required" "$shared_protocol" >/dev/null
 done
+for forbidden in \
+  'while (polled < 0 && errno == EINTR' \
+  'while (count < 0 && errno == EINTR'; do
+  if grep -F "$forbidden" "$helper_source" >/dev/null; then
+    echo "helper transport must not retry inside an unbounded EINTR loop: $forbidden" >&2
+    exit 1
+  fi
+done
 grep -F 'GPTGuestAcceptBindingControl' "$helper_source" >/dev/null
 grep -F 'GPTIsolatedHelperEventBound' "$helper_source" >/dev/null
 for forbidden in \

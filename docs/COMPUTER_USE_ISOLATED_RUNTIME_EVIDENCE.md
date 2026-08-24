@@ -220,6 +220,8 @@ The monotonic VM-deadline hardening extension is sealed at:
 - Guest connection backoff likewise treats an interrupted `nanosleep` as a
   failed attempt, so signal interruption cannot extend the finite connection
   retry budget indefinitely.
+- The guest and helper source verifiers now reject regressions that reintroduce
+  signal-retry loops around transport `poll`/`read` or guest reconnect sleep.
 - The stop boundary now rejects held keyboard/button state, waits for the
   helper to exit, and leaves the lifecycle in `CleanupPending` until explicit
   per-surface process, handle, overlay, and frame-cache evidence completes it.
