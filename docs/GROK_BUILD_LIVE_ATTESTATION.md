@@ -52,6 +52,12 @@ adds it only when `LiveCredentialAttestation::certification_ready()` is true.
 Missing or mismatched binding, incomplete authoritative usage, or observation
 recorder drops must remain indeterminate in the certification lab.
 
+The provider-quota receipt set is fail-closed: the consumption receipt must
+show at least one request and token, while the exhaustion receipt must be an
+observed HTTP 429 with zero successful requests and zero successful tokens.
+This prevents a claimed exhaustion event from smuggling a second consumption
+quantity into the secret-free evidence.
+
 The candidate also exposes `LiveProviderCampaignEvidence`, a secret-free
 positive projection that can be assembled only from a ready attestation and a
 validated provider-quota receipt set. It binds the named campaign, opaque

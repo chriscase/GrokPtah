@@ -108,7 +108,8 @@ impl ProviderQuotaReceipt {
                 }
             }
             ProviderQuotaReceiptKind::Exhausted => {
-                if self.status_code != Some(429) || self.request_count != 0 {
+                if self.status_code != Some(429) || self.request_count != 0 || self.token_count != 0
+                {
                     return Err(ProviderQuotaReceiptError::ExhaustionNot429);
                 }
             }
@@ -296,6 +297,15 @@ mod tests {
         pair.exhausted.receipt_digest = expected_receipt_digest(&pair.exhausted);
         assert_eq!(
             pair.validate(),
+            Err(ProviderQuotaReceiptError::ExhaustionNot429)
+        );
+
+        let mut nonzero_exhaustion = set();
+        nonzero_exhaustion.exhausted.token_count = 1;
+        nonzero_exhaustion.exhausted.receipt_digest =
+            expected_receipt_digest(&nonzero_exhaustion.exhausted);
+        assert_eq!(
+            nonzero_exhaustion.validate(),
             Err(ProviderQuotaReceiptError::ExhaustionNot429)
         );
 
