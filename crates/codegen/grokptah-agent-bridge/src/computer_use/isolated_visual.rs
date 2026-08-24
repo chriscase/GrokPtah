@@ -346,6 +346,11 @@ impl IsolatedVisualLifecycle {
             self.bump_revision();
             return Ok(());
         }
+        if self.state == IsolatedVisualLifecycleState::Stopping
+            && self.terminal_disposition.is_some()
+        {
+            return self.require_cleanup();
+        }
         Err(invalid_transition())
     }
 

@@ -235,7 +235,10 @@ impl IsolatedVisualPackagedRuntime {
     }
 
     pub fn read_frame(&mut self) -> ComputerResult<Option<IsolatedVisualFrame>> {
-        self.driver.read_frame()
+        match self.driver.read_frame() {
+            Ok(frame) => Ok(frame),
+            Err(error) => self.abort_with_error(error),
+        }
     }
 
     pub fn write_input(
@@ -244,14 +247,30 @@ impl IsolatedVisualPackagedRuntime {
         request_nonce: &str,
         message: IsolatedVisualInputMessage,
     ) -> ComputerResult<()> {
-        self.driver
+        match self
+            .driver
             .write_input(input_sequence, request_nonce, message)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => self.abort_with_error(error),
+        }
     }
 
     pub fn stop(&mut self, disposition: IsolatedVisualTerminalDisposition) -> ComputerResult<()> {
-        self.driver.stop(disposition)?;
-        self.driver
-            .receive_helper_event_with_timeout(STOPPING_EVENT_TIMEOUT)?;
+        if let Err(error) = self.driver.stop(disposition) {
+            if self.driver.runtime().lifecycle_state()
+                == super::isolated_visual::IsolatedVisualLifecycleState::Stopping
+            {
+                return self.abort_with_error(error);
+            }
+            return Err(error);
+        }
+        if let Err(error) = self
+            .driver
+            .receive_helper_event_with_timeout(STOPPING_EVENT_TIMEOUT)
+        {
+            return self.abort_with_error(error);
+        }
         self.wait_for_exit()
     }
 
