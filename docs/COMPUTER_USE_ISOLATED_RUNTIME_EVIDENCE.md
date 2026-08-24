@@ -12,7 +12,7 @@ Computer Use backend or satisfy the #288 release gate.
 - Bundle verification: complete history; `git bundle verify` passed.
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current sealed implementation head: `d2a578ff3a91907da308c03bdc78b4d35d933dc5`.
+Current bundled source head: `3a88fb41e29a55aeabb54defe82761b129b6ab11`.
 
 The later guest-input validation extension is sealed at:
 
