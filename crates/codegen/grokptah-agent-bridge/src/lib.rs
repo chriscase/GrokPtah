@@ -166,6 +166,8 @@ pub use completion::{
     CompletionUsage,
 };
 pub use computer_agent::{ComputerAgentEligibility, ComputerAgentProposal};
+#[cfg(target_os = "macos")]
+pub use computer_use::IsolatedVisualPackagedRuntime;
 pub use computer_use::{
     canonical_workspace_string, computer_isolated_visual_status,
     macos_background_safe_capability_proof, macos_native_capability_proof,

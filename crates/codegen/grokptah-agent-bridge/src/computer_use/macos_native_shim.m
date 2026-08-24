@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <stdlib.h>
+#include <spawn.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -43,6 +44,24 @@ typedef struct {
     uint8_t *error;
     size_t error_len;
 } GPTMacIsolatedArtifactsResult;
+
+typedef struct {
+    int32_t status;
+    int32_t pid;
+    int32_t control_fd;
+    int32_t event_fd;
+    int32_t input_fd;
+    int32_t frame_fd;
+    int32_t challenge_fd;
+    uint8_t *error;
+    size_t error_len;
+} GPTMacIsolatedRuntimeSpawnResult;
+
+enum {
+    // Keep the inherited descriptor contract named at the native boundary;
+    // the helper and source verifier use the same fixed private channel.
+    GPT_CHALLENGE_FD = 9,
+};
 
 enum {
     GPT_MAC_OK = 0,
@@ -639,6 +658,253 @@ void gpt_macos_isolated_artifacts_result_free(GPTMacIsolatedArtifactsResult *res
     result->requirement_data_len = 0;
     result->error = NULL;
     result->error_len = 0;
+}
+
+static GPTMacIsolatedRuntimeSpawnResult GPTEmptyIsolatedRuntimeSpawnResult(int32_t status) {
+    GPTMacIsolatedRuntimeSpawnResult result = {0};
+    result.status = status;
+    result.pid = -1;
+    result.control_fd = -1;
+    result.event_fd = -1;
+    result.input_fd = -1;
+    result.frame_fd = -1;
+    result.challenge_fd = -1;
+    return result;
+}
+
+static GPTMacIsolatedRuntimeSpawnResult GPTIsolatedRuntimeSpawnError(
+    int32_t status,
+    NSString *message) {
+    GPTMacIsolatedRuntimeSpawnResult result = GPTEmptyIsolatedRuntimeSpawnResult(status);
+    NSString *bounded = message.length > 512 ? [message substringToIndex:512] : message;
+    NSData *data = [bounded dataUsingEncoding:NSUTF8StringEncoding];
+    result.error = GPTCopyBytes(data, &result.error_len);
+    return result;
+}
+
+void gpt_macos_isolated_runtime_spawn_result_free(GPTMacIsolatedRuntimeSpawnResult *result) {
+    if (result == NULL) {
+        return;
+    }
+    free(result->error);
+    result->error = NULL;
+    result->error_len = 0;
+}
+
+static int GPTAddCloseIfDistinct(
+    posix_spawn_file_actions_t *actions,
+    int descriptor,
+    int target) {
+    if (descriptor < 0 || descriptor == target) {
+        return 0;
+    }
+    return posix_spawn_file_actions_addclose(actions, descriptor);
+}
+
+GPTMacIsolatedRuntimeSpawnResult gpt_macos_isolated_runtime_spawn(void) {
+    @autoreleasepool {
+#ifndef POSIX_SPAWN_CLOEXEC_DEFAULT
+        return GPTIsolatedRuntimeSpawnError(
+            GPT_MAC_BACKEND_UNAVAILABLE,
+            @"The macOS SDK does not provide close-on-exec spawn isolation");
+#else
+        GPTMacIsolatedArtifactsResult artifacts = gpt_macos_isolated_artifacts_open();
+        if (artifacts.status != GPT_MAC_OK) {
+            NSString *message = artifacts.error == NULL
+                ? @"Packaged isolated artifacts could not be verified"
+                : [[NSString alloc]
+                      initWithBytes:artifacts.error
+                             length:artifacts.error_len
+                           encoding:NSUTF8StringEncoding];
+            GPTMacIsolatedRuntimeSpawnResult result = GPTIsolatedRuntimeSpawnError(
+                artifacts.status,
+                message ?: @"Packaged isolated artifacts could not be verified");
+            gpt_macos_isolated_artifacts_result_free(&artifacts);
+            return result;
+        }
+
+        NSBundle *bundle = NSBundle.mainBundle;
+        const char *bundlePath = bundle.bundleURL.path.fileSystemRepresentation;
+        char bundleRoot[PATH_MAX] = {0};
+        char helperPath[PATH_MAX] = {0};
+        struct stat helperIdentity = {0};
+        if (bundlePath == NULL || realpath(bundlePath, bundleRoot) == NULL ||
+            !GPTAppendBundlePath(
+                bundleRoot,
+                "Contents/MacOS/grokptah-isolated-visual-helper",
+                helperPath) ||
+            fstat(artifacts.helper_fd, &helperIdentity) != 0 ||
+            !GPTPathStillNamesArtifact(helperPath, &helperIdentity)) {
+            GPTCloseArtifactDescriptors(
+                artifacts.helper_fd,
+                artifacts.guest_image_fd,
+                artifacts.configuration_fd);
+            gpt_macos_isolated_artifacts_result_free(&artifacts);
+            return GPTIsolatedRuntimeSpawnError(
+                GPT_MAC_TARGET_CHANGED,
+                @"The packaged helper changed before isolated launch");
+        }
+
+        int control[2] = {-1, -1};
+        int events[2] = {-1, -1};
+        int input[2] = {-1, -1};
+        int frames[2] = {-1, -1};
+        int challenge[2] = {-1, -1};
+        int null_fd = -1;
+        if (pipe(control) != 0 || pipe(events) != 0 || pipe(input) != 0 ||
+            pipe(frames) != 0 || pipe(challenge) != 0 ||
+            (null_fd = open("/dev/null", O_RDWR | O_CLOEXEC)) < 0) {
+            close(control[0]);
+            close(control[1]);
+            close(events[0]);
+            close(events[1]);
+            close(input[0]);
+            close(input[1]);
+            close(frames[0]);
+            close(frames[1]);
+            close(challenge[0]);
+            close(challenge[1]);
+            close(null_fd);
+            GPTCloseArtifactDescriptors(
+                artifacts.helper_fd,
+                artifacts.guest_image_fd,
+                artifacts.configuration_fd);
+            gpt_macos_isolated_artifacts_result_free(&artifacts);
+            return GPTIsolatedRuntimeSpawnError(
+                GPT_MAC_BACKEND_FAILURE,
+                @"Could not allocate isolated helper pipes");
+        }
+
+        posix_spawn_file_actions_t actions;
+        posix_spawnattr_t attributes;
+        int action_status = posix_spawn_file_actions_init(&actions);
+        BOOL actions_initialized = action_status == 0;
+        BOOL attributes_initialized = NO;
+        if (action_status == 0) {
+            action_status = posix_spawnattr_init(&attributes);
+            attributes_initialized = action_status == 0;
+        }
+        short flags = POSIX_SPAWN_CLOEXEC_DEFAULT;
+        if (action_status == 0) {
+            action_status = posix_spawnattr_setflags(&attributes, flags);
+        }
+        int sources[] = {
+            artifacts.helper_fd,
+            artifacts.guest_image_fd,
+            artifacts.configuration_fd,
+            control[0],
+            control[1],
+            events[0],
+            events[1],
+            input[0],
+            input[1],
+            frames[0],
+            frames[1],
+            challenge[0],
+            challenge[1],
+            null_fd,
+        };
+        int inherited_targets[] = {3, 4, 5, 6, 7, 8, 9};
+        int standard_targets[] = {0, 1, 2};
+        if (action_status == 0) {
+            action_status = posix_spawn_file_actions_adddup2(
+                &actions,
+                artifacts.guest_image_fd,
+                3);
+        }
+        if (action_status == 0) {
+            action_status = posix_spawn_file_actions_adddup2(
+                &actions,
+                artifacts.configuration_fd,
+                4);
+        }
+        if (action_status == 0) {
+            action_status = posix_spawn_file_actions_adddup2(&actions, control[0], 5);
+        }
+        if (action_status == 0) {
+            action_status = posix_spawn_file_actions_adddup2(&actions, events[1], 6);
+        }
+        if (action_status == 0) {
+            action_status = posix_spawn_file_actions_adddup2(&actions, input[0], 7);
+        }
+        if (action_status == 0) {
+            action_status = posix_spawn_file_actions_adddup2(&actions, frames[1], 8);
+        }
+        if (action_status == 0) {
+            action_status = posix_spawn_file_actions_adddup2(&actions, challenge[1], 9);
+        }
+        for (size_t index = 0;
+             action_status == 0 && index < sizeof(standard_targets) / sizeof(standard_targets[0]);
+             ++index) {
+            action_status = posix_spawn_file_actions_adddup2(
+                &actions,
+                null_fd,
+                standard_targets[index]);
+        }
+        for (size_t index = 0; action_status == 0 && index < sizeof(sources) / sizeof(sources[0]);
+             ++index) {
+            int target = -1;
+            for (size_t target_index = 0;
+                 target_index < sizeof(inherited_targets) / sizeof(inherited_targets[0]);
+                 ++target_index) {
+                if (sources[index] == inherited_targets[target_index]) {
+                    target = inherited_targets[target_index];
+                    break;
+                }
+            }
+            action_status = GPTAddCloseIfDistinct(&actions, sources[index], target);
+        }
+
+        pid_t pid = -1;
+        char *arguments[] = {helperPath, NULL};
+        char *environment[] = {NULL};
+        if (action_status == 0) {
+            action_status = posix_spawn(
+                &pid,
+                helperPath,
+                &actions,
+                &attributes,
+                arguments,
+                environment);
+        }
+        if (attributes_initialized) {
+            posix_spawnattr_destroy(&attributes);
+        }
+        if (actions_initialized) {
+            posix_spawn_file_actions_destroy(&actions);
+        }
+        close(null_fd);
+        GPTCloseArtifactDescriptors(
+            artifacts.helper_fd,
+            artifacts.guest_image_fd,
+            artifacts.configuration_fd);
+        gpt_macos_isolated_artifacts_result_free(&artifacts);
+        close(control[0]);
+        close(events[1]);
+        close(input[0]);
+        close(frames[1]);
+        close(challenge[1]);
+        if (action_status != 0 || pid < 0) {
+            close(control[1]);
+            close(events[0]);
+            close(input[1]);
+            close(frames[0]);
+            close(challenge[0]);
+            return GPTIsolatedRuntimeSpawnError(
+                GPT_MAC_BACKEND_FAILURE,
+                [NSString stringWithFormat:@"Isolated helper spawn failed (%d)", action_status]);
+        }
+        GPTMacIsolatedRuntimeSpawnResult result =
+            GPTEmptyIsolatedRuntimeSpawnResult(GPT_MAC_OK);
+        result.pid = (int32_t)pid;
+        result.control_fd = control[1];
+        result.event_fd = events[0];
+        result.input_fd = input[1];
+        result.frame_fd = frames[0];
+        result.challenge_fd = challenge[0];
+        return result;
+#endif
+    }
 }
 
 bool gpt_macos_screen_recording_granted(void) {

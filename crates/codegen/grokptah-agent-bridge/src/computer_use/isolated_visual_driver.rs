@@ -5,6 +5,8 @@ use super::isolated_visual_input::IsolatedVisualInputMessage;
 use super::isolated_visual_runtime::IsolatedVisualRuntimeSession;
 use super::isolated_visual_stream::IsolatedVisualStream;
 use super::types::ComputerResult;
+use std::os::fd::AsRawFd;
+use std::time::Duration;
 
 /// The single host-side seam a packaged supervisor should drive.
 ///
@@ -46,6 +48,14 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
 
     pub fn receive_helper_event(&mut self) -> ComputerResult<()> {
         self.helper.receive_event(&mut self.runtime)
+    }
+
+    pub fn receive_helper_event_with_timeout(&mut self, timeout: Duration) -> ComputerResult<()>
+    where
+        ER: AsRawFd,
+    {
+        self.helper
+            .receive_event_with_timeout(&mut self.runtime, timeout)
     }
 
     pub fn bind(&mut self) -> ComputerResult<()> {

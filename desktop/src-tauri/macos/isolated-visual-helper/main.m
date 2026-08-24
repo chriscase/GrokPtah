@@ -714,17 +714,7 @@ static BOOL GPTGuestWaitForReady(
         return NO;
     }
     VZVirtioSocketConnection *connection = socketDelegate.connection;
-    if (connection == nil ||
-        SecRandomCopyBytes(
-            kSecRandomDefault,
-            GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES,
-            challenge) != errSecSuccess ||
-        !GPTWriteDescriptorExact(
-            GPT_CHALLENGE_FD,
-            challenge,
-            GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES,
-            GPT_GUEST_HANDSHAKE_TIMEOUT_MS) ||
-        !GPTWriteSocketExact(
+    if (connection == nil || !GPTWriteSocketExact(
             connection,
             challenge,
             GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES,
@@ -920,6 +910,21 @@ int main(int argc, const char *argv[]) {
                     GPTIsolatedHelperFailureInvalidConfiguration);
                 return GPTIsolatedHelperFailureInvalidConfiguration;
             }
+            gpt_u8 challenge[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES] = {0};
+            if (SecRandomCopyBytes(
+                    kSecRandomDefault,
+                    GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES,
+                    challenge) != errSecSuccess ||
+                !GPTWriteDescriptorExact(
+                    GPT_CHALLENGE_FD,
+                    challenge,
+                    GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES,
+                    GPT_GUEST_HANDSHAKE_TIMEOUT_MS)) {
+                GPTWriteEvent(
+                    GPTIsolatedHelperEventFailure,
+                    GPTIsolatedHelperFailureControlLost);
+                return GPTIsolatedHelperFailureControlLost;
+            }
             if (!GPTWriteEvent(GPTIsolatedHelperEventPrepared, 0)) {
                 return GPTIsolatedHelperFailureControlLost;
             }
@@ -988,7 +993,6 @@ int main(int argc, const char *argv[]) {
                     GPTIsolatedHelperFailureStartFailed);
                 return GPTIsolatedHelperFailureStartFailed;
             }
-            gpt_u8 challenge[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES] = {0};
             if (!GPTGuestWaitForReady(guestSocketDelegate, challenge)) {
                 GPTStopVirtualMachine(virtualMachine, delegate, queue);
                 GPTWriteEvent(

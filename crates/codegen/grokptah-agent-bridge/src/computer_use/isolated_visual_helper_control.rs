@@ -1,4 +1,6 @@
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
+use std::time::Duration;
 
 use super::isolated_visual::IsolatedVisualTerminalDisposition;
 use super::isolated_visual_helper::{
@@ -44,6 +46,41 @@ impl<R: Read, W: Write> IsolatedVisualHelperControl<R, W> {
         read_exact(&mut self.event_reader, &mut bytes)?;
         let event = IsolatedVisualHelperEvent::decode(&bytes)?;
         runtime.accept_helper_event(event)
+    }
+
+    /// Waits for one helper event without allowing a dead helper to hold the
+    /// supervisor forever. The underlying read remains exact and ordered;
+    /// polling only supplies the lifecycle timeout.
+    pub fn receive_event_with_timeout(
+        &mut self,
+        runtime: &mut IsolatedVisualRuntimeSession,
+        timeout: Duration,
+    ) -> ComputerResult<()>
+    where
+        R: AsRawFd,
+    {
+        let timeout_millis = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: self.event_reader.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLERR | libc::POLLHUP,
+            revents: 0,
+        };
+        // SAFETY: the descriptor is borrowed from the supervisor-owned event
+        // reader and remains valid for the duration of this call.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_millis) };
+        if ready == 0 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::BackendFailure,
+                "isolated helper event timed out",
+            ));
+        }
+        if ready < 0 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::BackendFailure,
+                "isolated helper event poll failed",
+            ));
+        }
+        self.receive_event(runtime)
     }
 
     /// Sends the exact start byte after the helper has reported Prepared.

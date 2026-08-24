@@ -9,6 +9,7 @@ fi
 script_dir=$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd -P)
 helper_source="$script_dir/main.m"
 shared_protocol="$script_dir/../isolated-visual-guest/protocol.h"
+native_shim="$script_dir/../../../../crates/codegen/grokptah-agent-bridge/src/computer_use/macos_native_shim.m"
 configuration="$script_dir/grokptah-isolated-config-v1.json"
 work=$(mktemp -d /private/tmp/grokptah-helper-source-proof.XXXXXX)
 cleanup() {
@@ -18,6 +19,8 @@ trap cleanup EXIT HUP INT TERM
 
 sh -n "$script_dir/build-helper.sh"
 sh -n "$script_dir/package-signed-app.sh"
+xcrun clang -fobjc-arc -fblocks -fsyntax-only -mmacosx-version-min=11.0 \
+  -Wall -Wextra -Werror "$native_shim"
 plutil -lint \
   "$script_dir/isolated-visual-helper.entitlements.plist" \
   "$script_dir/grokptah-main.entitlements.plist"
@@ -65,6 +68,14 @@ for required in \
   'GPTRelayHostInputToGuest' \
   'GPTRelayGuestFrameToHost'; do
   grep -F "$required" "$helper_source" >/dev/null
+done
+for required in \
+  'gpt_macos_isolated_runtime_spawn' \
+  'GPTMacIsolatedRuntimeSpawnResult' \
+  'POSIX_SPAWN_CLOEXEC_DEFAULT' \
+  'posix_spawn_file_actions_adddup2' \
+  'GPT_CHALLENGE_FD'; do
+  grep -F "$required" "$native_shim" >/dev/null
 done
 for required in \
   'GPT_ISOLATED_HELPER_EVENT_MAGIC' \

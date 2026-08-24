@@ -27,6 +27,8 @@ mod isolated_visual_runtime;
 mod isolated_visual_stream;
 #[cfg(target_os = "macos")]
 mod macos_isolated_artifacts;
+#[cfg(target_os = "macos")]
+mod macos_isolated_runtime;
 mod macos_observation;
 mod platform;
 mod policy;
@@ -95,6 +97,8 @@ pub use isolated_visual_stream::{
     IsolatedVisualStream, ISOLATED_VISUAL_GUEST_INPUT_COMMAND, ISOLATED_VISUAL_STREAM_LENGTH_BYTES,
     ISOLATED_VISUAL_STREAM_MAX_FRAME_PACKET_BYTES,
 };
+#[cfg(target_os = "macos")]
+pub use macos_isolated_runtime::IsolatedVisualPackagedRuntime;
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
     computer_isolated_visual_status, ComputerBackgroundSafetyReceipt,
