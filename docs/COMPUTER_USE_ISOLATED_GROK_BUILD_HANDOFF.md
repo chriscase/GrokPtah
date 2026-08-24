@@ -13,6 +13,7 @@ cleanup result.
 - Bundle SHA-256: `5281f6992189d802f0bfd25027fa3eea82b23a68c6f9c6a7e6448cc6fb0bb2ed`
 - Source cutoff: `3a88fb41e29a55aeabb54defe82761b129b6ab11`
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
+- Docs-only handoff checkpoint (contains the evidence verifier): `e35318c55193f31547bd001a30c6a6eeebaf827d`
 - Main checkout must remain untouched at `6409645cb7d0fe6d75585f0610366340f808b8ec`.
 
 ## Paste this to the external build owner
@@ -77,6 +78,10 @@ before/after records, negative cases, cleanup ownership checks, and independent 
 It must explicitly state whether `launchAttempted` occurred. A report that stops before a signed VM
 launch remains **NOT QUALIFIED**.
 
-After the campaign, run `docs/verify-isolated-runtime-evidence.sh` and update `ROADMAP_TO_100.md`,
-`CAPABILITY_MATRIX.md`, and `COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md` together. Do not change an
-unsupported or planned status based on this handoff alone.
+After the campaign, run `docs/verify-isolated-runtime-evidence.sh` from the docs-only handoff
+checkpoint (`e35318c…`) or another checkout that contains that exact script. The immutable source
+bundle intentionally stops at `3a88fb4…`; the verifier is a later documentation-only aid and its
+absence from the source bundle must not be treated as a qualification failure or success. Then
+update `ROADMAP_TO_100.md`, `CAPABILITY_MATRIX.md`, and
+`COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md` together. Do not change an unsupported or planned
+status based on this handoff alone.
