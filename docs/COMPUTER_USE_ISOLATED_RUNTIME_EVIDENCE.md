@@ -217,6 +217,10 @@ The package-bundle path hardening extension is sealed at:
   `Info.plist`, `MacOS`, and `Resources` paths before installing the helper,
   guest image, configuration, or manifest, and creates the isolated resource
   directory only beneath those verified parents.
+- Assembly and signing now happen under a disposable staging directory; the
+  requested output path is published only after deep signature, identity, and
+  entitlement checks pass, so a failed attempt cannot leave a partial app at
+  the caller's output path.
 - Package assembly also requires the exact GrokPtah bundle identifier and
   matching signed team identity for the helper and outer app; a misidentified
   or cross-team artifact fails before it can be used as a runtime candidate.

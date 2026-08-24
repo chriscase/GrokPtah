@@ -93,6 +93,7 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+package_app="$work/GrokPtah-isolated-candidate.app"
 helper="$work/grokptah-isolated-visual-helper"
 staged_guest="$work/grokptah-isolated-guest-v1.img"
 staged_configuration="$work/grokptah-isolated-config-v1.json"
@@ -114,11 +115,11 @@ fi
   "$helper"
 /usr/bin/codesign --verify --strict --all-architectures "$helper"
 
-/usr/bin/ditto "$input_app" "$output_app"
-output_contents="$output_app/Contents"
+/usr/bin/ditto "$input_app" "$package_app"
+output_contents="$package_app/Contents"
 output_resources="$output_contents/Resources"
-macos_dir="$output_app/Contents/MacOS"
-resource_dir="$output_app/Contents/Resources/isolated-visual"
+macos_dir="$package_app/Contents/MacOS"
+resource_dir="$package_app/Contents/Resources/isolated-visual"
 for safe_dir in "$output_contents" "$output_resources" "$macos_dir"; do
   if [ ! -d "$safe_dir" ] || [ -L "$safe_dir" ] ||
      [ "$(realpath "$safe_dir")" != "$safe_dir" ]; then
@@ -194,11 +195,11 @@ chmod 0444 "$manifest"
   --timestamp \
   --entitlements "$script_dir/grokptah-main.entitlements.plist" \
   --sign "$signing_identity" \
-  "$output_app"
-/usr/bin/codesign --verify --deep --strict --all-architectures "$output_app"
+  "$package_app"
+/usr/bin/codesign --verify --deep --strict --all-architectures "$package_app"
 
 output_bundle_identifier=$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - \
-  "$output_app/Contents/Info.plist" 2>/dev/null || true)
+  "$package_app/Contents/Info.plist" 2>/dev/null || true)
 if [ "$output_bundle_identifier" != "com.chriscase.grokptah" ]; then
   echo "signed app has an unexpected bundle identifier" >&2
   exit 65
@@ -210,7 +211,7 @@ signed_team_identifier() {
 }
 
 helper_team_identifier=$(signed_team_identifier "$packaged_helper")
-output_team_identifier=$(signed_team_identifier "$output_app")
+output_team_identifier=$(signed_team_identifier "$package_app")
 if [ -z "$helper_team_identifier" ] ||
    [ "$helper_team_identifier" != "$output_team_identifier" ]; then
   echo "signed helper and outer app do not share one team identity" >&2
@@ -241,10 +242,15 @@ assert_entitlement_present "$packaged_helper" "com.apple.security.app-sandbox"
 assert_entitlement_present "$packaged_helper" "com.apple.security.virtualization"
 assert_entitlement_absent "$packaged_helper" "com.apple.vm.networking"
 assert_entitlement_absent "$packaged_helper" "com.apple.security.get-task-allow"
-assert_entitlement_absent "$output_app" "com.apple.security.virtualization"
-assert_entitlement_absent "$output_app" "com.apple.vm.networking"
-assert_entitlement_absent "$output_app" "com.apple.security.get-task-allow"
+assert_entitlement_absent "$package_app" "com.apple.security.virtualization"
+assert_entitlement_absent "$package_app" "com.apple.vm.networking"
+assert_entitlement_absent "$package_app" "com.apple.security.get-task-allow"
 
+if [ -e "$output_app" ] || [ -L "$output_app" ]; then
+  echo "output app appeared during staged assembly" >&2
+  exit 73
+fi
+mv "$package_app" "$output_app"
 printf 'packaged_app=%s\n' "$output_app"
 printf 'helper_content_sha256=%s\n' "$helper_sha"
 printf 'helper_signing_requirement_sha256=%s\n' "$requirement_sha"
