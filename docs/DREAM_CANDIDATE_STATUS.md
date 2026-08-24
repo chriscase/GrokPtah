@@ -184,7 +184,10 @@ is a source-level denial boundary only and is not a packaged-runtime or
 hardware qualification.
 The exact external compile/test procedure is recorded in
 [`COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md);
-no result for that follow-up has been returned yet.
+the external run is using immutable bundle
+`/private/tmp/grokptah-packaged-lease-b250b70-v2.bundle` (SHA-256
+`4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`). No
+result for that follow-up has been returned yet.
 
 Grok Build ran the focused `isolated_guest` library proof (8 passed) plus the
 committed-stop cleanup regression (1 passed) on the isolated PR head with the

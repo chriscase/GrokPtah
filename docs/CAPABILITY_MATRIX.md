@@ -51,7 +51,10 @@ cleanup while the lease is live. This remains source-only and unexposed until
 the signed package, real guest, and lifecycle campaign qualify it. The
 reproducible external compile/test procedure is
 [`COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md);
-no result is recorded yet.
+the active external run is pinned to immutable bundle
+`/private/tmp/grokptah-packaged-lease-b250b70-v2.bundle` (SHA-256
+`4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`). No
+result is recorded yet.
 
 Candidate-only UI update (2026-08-24): the Provider Readiness Center now
 surfaces provider-route configuration, the fact that provider/Grok Build

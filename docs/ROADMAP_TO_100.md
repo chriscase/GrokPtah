@@ -538,6 +538,13 @@ and emits the v2 secret-free evidence record only after a clean-head 72-hour
 run. That harness is formatted but uncompiled and unexecuted; it is not a
 retained campaign. Unbound remote bearers remain coordinator-scoped.
 
+The packaged lease-fence follow-up is now running as an external, fail-closed
+source qualification from immutable bundle
+`/private/tmp/grokptah-packaged-lease-b250b70-v2.bundle`
+(SHA-256 `4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`).
+No packaged VM, guest boot, rendered-frame, host-input, signing, or soak claim
+may be inferred until that report and the later hardware campaign return.
+
 **Exit (all required):**
 
 - A hosted `grokptah-service` instance remains the sole writer of one
