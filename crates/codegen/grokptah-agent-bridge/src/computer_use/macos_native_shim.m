@@ -804,7 +804,7 @@ GPTMacIsolatedRuntimeSpawnResult gpt_macos_isolated_runtime_spawn(void) {
             challenge[1],
             null_fd,
         };
-        int inherited_targets[] = {3, 4, 5, 6, 7, 8, 9};
+        int inherited_targets[] = {3, 4, 5, 6, 7, 8, GPT_CHALLENGE_FD};
         int standard_targets[] = {0, 1, 2};
         if (action_status == 0) {
             action_status = posix_spawn_file_actions_adddup2(
@@ -831,7 +831,10 @@ GPTMacIsolatedRuntimeSpawnResult gpt_macos_isolated_runtime_spawn(void) {
             action_status = posix_spawn_file_actions_adddup2(&actions, frames[1], 8);
         }
         if (action_status == 0) {
-            action_status = posix_spawn_file_actions_adddup2(&actions, challenge[1], 9);
+            action_status = posix_spawn_file_actions_adddup2(
+                &actions,
+                challenge[1],
+                GPT_CHALLENGE_FD);
         }
         for (size_t index = 0;
              action_status == 0 && index < sizeof(standard_targets) / sizeof(standard_targets[0]);
