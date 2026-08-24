@@ -6,7 +6,7 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Source head at evidence cutoff: `2631aa0165a1a9d5f629251da7dded71aa47d8c3`
+- Source head at evidence cutoff: `878ab78566f53a9b0f564aed55baf4c8cb7f3b23`
 - Bundle: not created for the current head; the historical stage-41 bundle is
   recorded below and does not include the later hardening commits.
 - Bundle SHA-256: not applicable to the current head.
@@ -142,6 +142,12 @@ The package-bundle path hardening extension is sealed at:
 The staged-package publication extension is sealed at:
 
 - Commit: `2631aa0165a1a9d5f629251da7dded71aa47d8c3`.
+- Bundle: not created; this remains a source-only extension pending the
+  credentialed packaged-runtime campaign.
+
+The clean isolated-resource-tree extension is sealed at:
+
+- Commit: `878ab78566f53a9b0f564aed55baf4c8cb7f3b23`.
 - Bundle: not created; this remains a source-only extension pending the
   credentialed packaged-runtime campaign.
 
