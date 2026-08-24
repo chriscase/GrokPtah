@@ -6,9 +6,9 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `eb9892e1ba5606c73b66abe60067fea5ae7eafb6`
-- Bundle: `/private/tmp/grokptah-cu-stage32-packaged-supervisor-v1.bundle`
-- Bundle SHA-256: `6c27796170c209c832fe7c6d0dc8f9c1233779ee2e6546e6704f7935a48dadb1`
+- Head: `5a51d69a57a66ad72139402fc2a2e3fd9080b9e1`
+- Bundle: `/private/tmp/grokptah-cu-stage33-contract-docs-v1.bundle`
+- Bundle SHA-256: `3611489a7263f4901e681befed1c49d86fed40a98bd83f30fd1c63b88194f29d`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
 Current sealed implementation head: `eb9892e1ba5606c73b66abe60067fea5ae7eafb6`.
@@ -60,6 +60,12 @@ The bounded packaged-supervisor source extension is sealed at:
 - Commit: `eb9892e1ba5606c73b66abe60067fea5ae7eafb6`
 - Bundle: `/private/tmp/grokptah-cu-stage32-packaged-supervisor-v1.bundle`
 - Bundle SHA-256: `6c27796170c209c832fe7c6d0dc8f9c1233779ee2e6546e6704f7935a48dadb1`
+
+The helper/guest contract-documentation synchronization is sealed at:
+
+- Commit: `5a51d69a57a66ad72139402fc2a2e3fd9080b9e1`
+- Bundle: `/private/tmp/grokptah-cu-stage33-contract-docs-v1.bundle`
+- Bundle SHA-256: `3611489a7263f4901e681befed1c49d86fed40a98bd83f30fd1c63b88194f29d`
 
 ## What this candidate proves
 
