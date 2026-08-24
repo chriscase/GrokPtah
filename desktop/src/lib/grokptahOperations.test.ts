@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { CAPABILITY_CONTRACT } from "./capabilities";
 import { GrokPtahClient } from "./grokptahClient";
-import { GrokPtahCapabilityError, GrokPtahOperations } from "./grokptahOperations";
+import {
+  GrokPtahCapabilityError,
+  GrokPtahOperations,
+  validateGrokPtahBounds,
+} from "./grokptahOperations";
 
 function response(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -44,6 +48,21 @@ const promote = {
 };
 
 describe("GrokPtahOperations", () => {
+  it("rejects malformed execution bounds before transport", () => {
+    expect(() => validateGrokPtahBounds({ maxRounds: 0 })).toThrow(
+      "maxRounds must be a positive safe integer",
+    );
+    expect(() => validateGrokPtahBounds({ maxRounds: 25 })).toThrow(
+      "maxRounds must be at most 24",
+    );
+    expect(() => validateGrokPtahBounds({ maxPromptBytes: 1.5 })).toThrow(
+      "maxPromptBytes must be a positive safe integer",
+    );
+    expect(() => validateGrokPtahBounds({ maxDurationMs: -1 })).toThrow(
+      "maxDurationMs must be a positive safe integer",
+    );
+  });
+
   it("builds a scope-fenced submit payload", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
       response({
@@ -71,6 +90,20 @@ describe("GrokPtahOperations", () => {
       execution_mode: "isolated_worktree",
       allow_queue: true,
     });
+  });
+
+  it("validates bounds before sending a submit request", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const operations = new GrokPtahOperations(clientWithCapabilities(fetcher, [execute]));
+    await expect(
+      operations.submitTask(
+        { sessionId: "session-1", workspace: "/repo" },
+        "request-1",
+        "review",
+        { bounds: { maxRounds: 0 } },
+      ),
+    ).rejects.toThrow("maxRounds must be a positive safe integer");
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it("requires an explicit gate before promotion", async () => {

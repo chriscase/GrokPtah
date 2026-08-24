@@ -976,30 +976,23 @@ async fn streamable_post_handler(
 
     // Concurrency bound after auth (auth middleware already ran).
     let Ok(permit) = state.inflight.clone().try_acquire_owned() else {
-        return (
+        return json_err(
+            None,
             StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32000,
-                    "message": "too many concurrent MCP requests",
-                    "data": {"code": "capacity_exhausted"}
-                }
-            })),
-        )
-            .into_response();
+            &OrchError::new(
+                OrchErrorCode::CapacityExhausted,
+                "too many concurrent MCP requests",
+            ),
+        );
     };
     let _permit = permit;
 
     if body.len() > 256 * 1024 {
-        return (
+        return json_err(
+            None,
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(json!({
-                "jsonrpc": "2.0",
-                "error": {"code": -32600, "message": "request body too large"}
-            })),
-        )
-            .into_response();
+            &OrchError::new(OrchErrorCode::InvalidRequest, "request body too large"),
+        );
     }
 
     let req: JsonRpcReq = match serde_json::from_slice(&body) {
@@ -1364,9 +1357,10 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
             "requestId": null
         })
     });
-    // Preserve the detailed stable transport code and only the bounded cursor
-    // range needed for recovery. Never forward arbitrary OrchError data.
-    data["code"] = Value::String(e.code.as_str().into());
+    // Keep `code` stable for cross-product consumers. The detailed server-side
+    // reason is separately named and bounded; never forward arbitrary OrchError
+    // data or overwrite the public taxonomy with an internal transport code.
+    data["reasonCode"] = Value::String(e.code.as_str().into());
     if let Some(range) = e
         .data
         .as_ref()
@@ -2883,7 +2877,8 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::GONE);
-        assert_eq!(body["error"]["data"]["code"], "cursor_expired");
+        assert_eq!(body["error"]["data"]["code"], "stale_or_recovery");
+        assert_eq!(body["error"]["data"]["reasonCode"], "cursor_expired");
         let start_seq = body["error"]["data"]["eventRange"]["startSeq"]
             .as_u64()
             .unwrap();

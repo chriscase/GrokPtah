@@ -185,7 +185,12 @@ describe("GrokPtahClient", () => {
             error: {
               code: -32000,
               message: "safe stale response",
-              data: { code: "stale_or_recovery", requestId: "req-2", secret: "drop" },
+              data: {
+                code: "stale_or_recovery",
+                reasonCode: "cursor_expired",
+                requestId: "req-2",
+                secret: "drop",
+              },
             },
           },
           409,
@@ -200,6 +205,7 @@ describe("GrokPtahClient", () => {
     await expect(client.callTool("ptah_get_run", {})).rejects.toMatchObject({
       name: "GrokPtahRemoteError",
       code: "stale_or_recovery",
+      reasonCode: "cursor_expired",
       requestId: "req-2",
     });
   });

@@ -162,8 +162,8 @@ event has been delivered.
 | Auth | `Authorization: Bearer <token>` on every `/mcp` request |
 | Auth order | Middleware authenticates **before** body work / tool dispatch |
 | Body limit | **256 KiB** (`DefaultBodyLimit` + handler check) |
-| Concurrent MCP requests | Default **32** → HTTP **429** + JSON-RPC error `data.code=capacity_exhausted` |
-| Request timeout | Default **120 s** → HTTP **504** + `data.code=timeout` |
+| Concurrent MCP requests | Default **32** → HTTP **429** + JSON-RPC error `data.code=capacity`, `data.reasonCode=capacity_exhausted` |
+| Request timeout | Default **120 s** → HTTP **504** + `data.code=internal`, `data.reasonCode=timeout` |
 | MCP sessions | Header `mcp-session-id`; hard cap **256** (LRU eviction) |
 | Protocol versions | `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`, `2024-10-07` |
 | Content | JSON responses preferred; scoped GET may open a bounded SSE run stream |
@@ -296,8 +296,9 @@ Source of truth: `orchestration::CONTROL_TOOLS` /
 `ptah_manage_plugin`, `ptah_manage_mcp`, `ptah_approve`, `ptah_pause`,
 `ptah_resume`, `ptah_create_session`, `ptah_delete_session`.
 
-Unknown / forbidden tool names return HTTP client error with
-`error.data.code = "forbidden_scope"`.
+Unknown / forbidden tool names return HTTP client error with the stable
+`error.data.code = "forbidden_scope"`. When a caller needs the more specific
+server reason, `error.data.reasonCode` is bounded and non-authoritative.
 
 ## Semantics
 
@@ -438,8 +439,9 @@ Mutating tools take `request_id`:
 coordinator wants a bounded admission queue for capacity or session contention.
 
 - The host holds at most **32** pending task runs process-wide, even when more
-  than one embedded control service shares the host. A full queue returns
-  `capacity_exhausted` (HTTP 429 at the transport boundary).
+  than one embedded control service shares the host. A full queue returns the
+  stable `capacity` category with `reasonCode=capacity_exhausted` (HTTP 429 at
+  the transport boundary).
 - A queued response has `state: "queued"` and a one-based `queuedPosition`;
   `ptah_get_capacity` reports `queuedRuns` and `queueLimit`.
 - The durable run record also exposes the current optional `queuePosition`.
@@ -503,7 +505,8 @@ coordinator wants a bounded admission queue for capacity or session contention.
   so activity from other sessions cannot advance the run cursor past relevant
   events.
 - Sequences are monotonic for a run-scoped journal page; expired cursors return
-  `cursor_expired` (HTTP 410).
+  the stable `stale_or_recovery` category with `reasonCode=cursor_expired`
+  (HTTP 410).
 
 ### Evidence-backed handoff
 
@@ -553,8 +556,8 @@ observed or when the response omits claims required by the observed work.
 ### Capacity
 
 - Orch run capacity (`max_concurrent_runs`) is separate from MCP request
-  concurrency (32). Exhausted run capacity → structured orch error
-  (`capacity_exhausted` / session busy).
+  concurrency (32). Exhausted run capacity → stable `capacity` category with
+  a bounded `reasonCode` (`capacity_exhausted` / session busy).
 - MCP request flood beyond 32 inflight → **429**.
 
 ### Computer Run reads and bounded control (#271 slices 2–3)
@@ -586,8 +589,9 @@ gate snapshots the surface so an unsafe tool cannot slip in silently.
   so no read is a run-existence oracle.
 - `ptah_get_computer_run_events` pages the bounded durable audit ring.
   `nextCursor` is present only while entries remain; a cursor below the
-  retained window is **410 `cursor_expired`** with `eventRange` on the error
-  so recovery does not require a second `ptah_get_computer_run`. Resume at
+  retained window is **410 `stale_or_recovery`** with
+  `reasonCode=cursor_expired` and `eventRange` on the error so recovery does
+  not require a second `ptah_get_computer_run`. Resume at
   `startSeq - 1`. A cursor at or past the tail is a valid empty page.
   Omitting `after_seq` reads from the retained start.
 - Unknown session, a mismatched allowlisted workspace, and an unauthorized

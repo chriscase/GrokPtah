@@ -91,6 +91,7 @@ impl CapabilitySet {
         self.capabilities.iter().all(|capability| {
             valid_capability_id(&capability.id)
                 && capability.id.len() <= 128
+                && !capability.description.is_empty()
                 && capability.description.len() <= 512
                 && (capability.availability != CapabilityAvailability::Gated
                     || capability.human_gate)
@@ -100,6 +101,9 @@ impl CapabilitySet {
 }
 
 fn valid_capability_id(id: &str) -> bool {
+    if !id.contains('.') {
+        return false;
+    }
     let mut segments = id.split('.');
     let Some(first) = segments.next() else {
         return false;
@@ -133,5 +137,24 @@ mod tests {
         let decoded: CapabilitySet =
             serde_json::from_slice(&encoded).expect("capability set parses");
         assert_eq!(decoded, set);
+    }
+
+    #[test]
+    fn malformed_ids_and_descriptions_fail_closed() {
+        let mut set = CapabilitySet {
+            contract: CONTRACT_VERSION.into(),
+            capabilities: vec![CapabilityDescriptor {
+                id: "run".into(),
+                tier: CapabilityTier::Observe,
+                mutating: false,
+                human_gate: false,
+                availability: CapabilityAvailability::Available,
+                description: "observe".into(),
+            }],
+        };
+        assert!(!set.is_current());
+        set.capabilities[0].id = "run.observe".into();
+        set.capabilities[0].description.clear();
+        assert!(!set.is_current());
     }
 }

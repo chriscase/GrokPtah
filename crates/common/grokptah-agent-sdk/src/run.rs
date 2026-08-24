@@ -2,6 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum model rounds accepted by the versioned public contract.
+pub const MAX_ROUNDS: u16 = 24;
+/// Maximum UTF-8 bytes in a public request identity.
+pub const MAX_REQUEST_ID_BYTES: usize = 256;
+/// Maximum UTF-8 bytes in a durable prompt preview.
+pub const MAX_PROMPT_PREVIEW_BYTES: usize = 512;
+/// Maximum serialized bytes in one public event update.
+pub const MAX_EVENT_UPDATE_BYTES: usize = 256 * 1024;
+/// Maximum UTF-8 bytes in a review diff projection.
+pub const MAX_REVIEW_DIFF_BYTES: usize = 2 * 1024 * 1024;
+
 /// An idempotency key for one caller intent.
 pub type IdempotencyKey = String;
 
@@ -17,6 +28,15 @@ pub struct RunScope {
     pub run_id: String,
 }
 
+impl RunScope {
+    /// Validate the identity fence before sending it across a product boundary.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_identity(&self.session_id, "session_id")?;
+        validate_identity(&self.workspace, "workspace")?;
+        validate_identity(&self.run_id, "run_id")
+    }
+}
+
 /// Prompt and execution bounds selected by the caller and policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +47,26 @@ pub struct Bounds {
     pub max_rounds: Option<u16>,
     /// Maximum wall-clock duration.
     pub max_duration_ms: Option<u64>,
+}
+
+impl Bounds {
+    /// Validate caller bounds before transport; the authority still applies its
+    /// negotiated host ceiling after this check.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.max_prompt_bytes.is_some_and(|value| value == 0) {
+            return Err("max_prompt_bytes must be greater than zero");
+        }
+        if self
+            .max_rounds
+            .is_some_and(|value| value == 0 || value > MAX_ROUNDS)
+        {
+            return Err("max_rounds must be between 1 and 24");
+        }
+        if self.max_duration_ms.is_some_and(|value| value == 0) {
+            return Err("max_duration_ms must be greater than zero");
+        }
+        Ok(())
+    }
 }
 
 /// Whether a run shares the workspace or receives an isolated worktree.
@@ -60,6 +100,29 @@ pub struct SubmitTaskRequest {
     /// Queue behind bounded admission instead of failing fast.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_queue: Option<bool>,
+}
+
+impl SubmitTaskRequest {
+    /// Validate a cross-product submit request without granting authority.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_identity(&self.request_id, "request_id")?;
+        self.session_scope().validate()?;
+        if self.prompt.trim().is_empty() {
+            return Err("prompt must not be empty");
+        }
+        if let Some(bounds) = &self.bounds {
+            bounds.validate()?;
+        }
+        Ok(())
+    }
+
+    fn session_scope(&self) -> RunScope {
+        RunScope {
+            session_id: self.session_id.clone(),
+            workspace: self.workspace.clone(),
+            run_id: "submit".into(),
+        }
+    }
 }
 
 /// Durable lifecycle state.
@@ -104,6 +167,23 @@ pub struct DurableRun {
     pub updated_at: String,
 }
 
+impl DurableRun {
+    /// Validate the share-safe durable projection before publishing it.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_identity(&self.run_id, "run_id")?;
+        validate_identity(&self.session_id, "session_id")?;
+        validate_identity(&self.workspace, "workspace")?;
+        validate_identity(&self.request_id, "request_id")?;
+        if self.prompt_preview.len() > MAX_PROMPT_PREVIEW_BYTES {
+            return Err("prompt_preview exceeds its byte bound");
+        }
+        if self.created_at.trim().is_empty() || self.updated_at.trim().is_empty() {
+            return Err("durable timestamps must not be empty");
+        }
+        Ok(())
+    }
+}
+
 /// One durable event journal entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunEvent {
@@ -113,6 +193,21 @@ pub struct RunEvent {
     pub ts: String,
     /// Redacted state update.
     pub update: serde_json::Value,
+}
+
+impl RunEvent {
+    /// Validate the bounded serialized event projection.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.ts.trim().is_empty() {
+            return Err("event timestamp must not be empty");
+        }
+        let bytes =
+            serde_json::to_vec(&self.update).map_err(|_| "event update is not serializable")?;
+        if bytes.len() > MAX_EVENT_UPDATE_BYTES {
+            return Err("event update exceeds its byte bound");
+        }
+        Ok(())
+    }
 }
 
 /// Cursor-paged durable events.
@@ -171,6 +266,44 @@ pub struct ReviewReceipt {
     pub fingerprint: String,
 }
 
+impl ReviewReceipt {
+    /// Validate the bounded, repository-relative review projection.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.fingerprint.trim().is_empty() {
+            return Err("fingerprint must not be empty");
+        }
+        if self.diff.len() > MAX_REVIEW_DIFF_BYTES {
+            return Err("review diff exceeds its byte bound");
+        }
+        for file in &self.changed_files {
+            if file.path.trim().is_empty()
+                || file.path.starts_with('/')
+                || file.path.contains("..")
+                || file.summary.len() > 512
+            {
+                return Err("changed files must be bounded repository-relative summaries");
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_identity(value: &str, field: &str) -> Result<(), &'static str> {
+    if value.trim().is_empty() {
+        return Err(match field {
+            "session_id" => "session_id must not be empty",
+            "workspace" => "workspace must not be empty",
+            "run_id" => "run_id must not be empty",
+            "request_id" => "request_id must not be empty",
+            _ => "identity must not be empty",
+        });
+    }
+    if value.len() > MAX_REQUEST_ID_BYTES {
+        return Err("identity exceeds its byte bound");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +347,33 @@ mod tests {
         assert_eq!(value["afterSeq"], 7);
         assert_eq!(value["pollTool"], "ptah_get_events");
         assert!(value.get("after_seq").is_none());
+    }
+
+    #[test]
+    fn public_contract_validators_reject_unbounded_values() {
+        assert!(Bounds {
+            max_rounds: Some(25),
+            ..Bounds::default()
+        }
+        .validate()
+        .is_err());
+        assert!(RunEvent {
+            seq: 1,
+            ts: "2026-01-01T00:00:00Z".into(),
+            update: serde_json::json!({"text": "x"}),
+        }
+        .validate()
+        .is_ok());
+        assert!(ReviewReceipt {
+            changed_files: vec![ChangedFile {
+                path: "../secret".into(),
+                summary: "x".into()
+            }],
+            diff: String::new(),
+            diff_truncated: false,
+            fingerprint: "fp".into(),
+        }
+        .validate()
+        .is_err());
     }
 }

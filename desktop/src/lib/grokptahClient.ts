@@ -19,17 +19,21 @@ export type GrokPtahSafeError = {
   code: string;
   message: string;
   requestId?: string;
+  /** Optional bounded server reason; `code` remains the stable public category. */
+  reasonCode?: string;
 };
 
 export class GrokPtahRemoteError extends Error {
   readonly code: string;
   readonly requestId?: string;
+  readonly reasonCode?: string;
 
   constructor(error: GrokPtahSafeError) {
     super(error.message);
     this.name = "GrokPtahRemoteError";
     this.code = error.code;
     this.requestId = error.requestId;
+    this.reasonCode = error.reasonCode;
   }
 }
 
@@ -445,5 +449,8 @@ function parseSafeError(value: unknown): GrokPtahSafeError | undefined {
     code: code.slice(0, 128),
     message: rawMessage.slice(0, 512),
     ...(typeof data.requestId === "string" ? { requestId: data.requestId.slice(0, 256) } : {}),
+    ...(typeof data.reasonCode === "string"
+      ? { reasonCode: data.reasonCode.slice(0, 128) }
+      : {}),
   };
 }

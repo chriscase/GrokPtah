@@ -37,6 +37,7 @@ describe("capability discovery", () => {
 
   it("fails closed for an unknown contract or malformed descriptor", () => {
     expect(parseCapabilitySet({ ...payload, contract: "grokptah.capabilities.v2" })).toBeNull();
+    expect(parseCapabilitySet({ ...payload, extra: true })).toBeNull();
     expect(
       parseCapabilitySet({
         ...payload,

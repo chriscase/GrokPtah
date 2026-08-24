@@ -21,6 +21,41 @@ export type GrokPtahBounds = {
   maxDurationMs?: number;
 };
 
+/** The public contract caps model rounds even when a host has a lower ceiling. */
+export const GROKPTAH_MAX_ROUNDS = 24;
+
+/**
+ * Validate caller-provided bounds before they cross an adapter boundary.
+ *
+ * The service performs the authoritative merge against its own ceilings; this
+ * client-side check prevents malformed values from reaching transport and
+ * keeps browser/desktop consumers aligned with the published schema.
+ */
+export function validateGrokPtahBounds(bounds: GrokPtahBounds): GrokPtahBounds {
+  const fields: Array<[keyof GrokPtahBounds, string]> = [
+    ["maxPromptBytes", "maxPromptBytes"],
+    ["maxRounds", "maxRounds"],
+    ["maxDurationMs", "maxDurationMs"],
+  ];
+  for (const [field, label] of fields) {
+    const value = bounds[field];
+    if (value === undefined) continue;
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error(`GrokPtah ${label} must be a positive safe integer`);
+    }
+  }
+  if (bounds.maxRounds !== undefined && bounds.maxRounds > GROKPTAH_MAX_ROUNDS) {
+    throw new Error(`GrokPtah maxRounds must be at most ${GROKPTAH_MAX_ROUNDS}`);
+  }
+  return bounds;
+}
+
+function optionalRounds(value: number | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  validateGrokPtahBounds({ maxRounds: value });
+  return value;
+}
+
 export type GrokPtahOperationResult<T = unknown> = {
   /** The structured result when supplied by the server, otherwise raw content. */
   value: T;
@@ -92,7 +127,7 @@ export class GrokPtahOperations {
       ...scopeArgs(scope),
       agent_id: nonEmpty(agentId, "agentId"),
       prompt: nonEmpty(prompt, "prompt"),
-      ...(maxRounds === undefined ? {} : { max_rounds: maxRounds }),
+      ...(maxRounds === undefined ? {} : { max_rounds: optionalRounds(maxRounds) }),
     });
   }
 
@@ -158,7 +193,7 @@ export class GrokPtahOperations {
       request_id: nonEmpty(requestId, "requestId"),
       ...scopeArgs(scope),
       prompt: nonEmpty(prompt, "prompt"),
-      ...(options.bounds ? { bounds: options.bounds } : {}),
+      ...(options.bounds ? { bounds: validateGrokPtahBounds(options.bounds) } : {}),
       ...(options.executionMode ? { execution_mode: options.executionMode } : {}),
       ...(options.allowQueue === undefined ? {} : { allow_queue: options.allowQueue }),
     });
@@ -179,7 +214,7 @@ export class GrokPtahOperations {
       request_id: nonEmpty(requestId, "requestId"),
       ...scopeArgs(scope),
       prompt: nonEmpty(prompt, "prompt"),
-      ...(options.bounds ? { bounds: options.bounds } : {}),
+      ...(options.bounds ? { bounds: validateGrokPtahBounds(options.bounds) } : {}),
       ...(options.executionMode ? { execution_mode: options.executionMode } : {}),
       ...(options.allowQueue === undefined ? {} : { allow_queue: options.allowQueue }),
     });

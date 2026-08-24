@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:grokptah:schema:run:v1",
   "title": "GrokPtah Run Contract v1",
-  "oneOf": [
+  "anyOf": [
     { "$ref": "#/$defs/scope" },
     { "$ref": "#/$defs/submitTask" },
     { "$ref": "#/$defs/runEventPage" },
@@ -132,7 +132,8 @@
           ]
         },
         "message": { "type": "string", "minLength": 1, "maxLength": 512 },
-        "requestId": { "type": ["string", "null"], "maxLength": 256 }
+        "requestId": { "type": ["string", "null"], "maxLength": 256 },
+        "reasonCode": { "type": ["string", "null"], "maxLength": 128 }
       }
     },
     "computerControlRequest": {

@@ -61,6 +61,7 @@ const DESCRIPTOR_KEYS = new Set([
   "availability",
   "description",
 ]);
+const CAPABILITY_SET_KEYS = new Set(["contract", "capabilities"]);
 const MAX_DESCRIPTION_LENGTH = 512;
 
 function parseDescriptor(value: unknown): CapabilityDescriptor | null {
@@ -96,6 +97,7 @@ function parseDescriptor(value: unknown): CapabilityDescriptor | null {
 /** Parse an initialize response without trusting an unknown contract version. */
 export function parseCapabilitySet(value: unknown): CapabilitySet | null {
   if (!isRecord(value) || value.contract !== CAPABILITY_CONTRACT) return null;
+  if (Object.keys(value).some((key) => !CAPABILITY_SET_KEYS.has(key))) return null;
   if (!Array.isArray(value.capabilities)) return null;
   const capabilities = value.capabilities.map(parseDescriptor);
   if (capabilities.some((capability) => capability === null)) return null;
