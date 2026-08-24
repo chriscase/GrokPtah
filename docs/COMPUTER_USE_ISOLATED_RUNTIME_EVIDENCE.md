@@ -6,12 +6,12 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Head: `784f3fff9c03ee42dcea4ae91a1c72edd3d88f41`
-- Bundle: `/private/tmp/grokptah-cu-stage23-packaged-supervisor-v1.bundle`
-- Bundle SHA-256: `bdc1b1fa4fcc7cddf71572f30edbf8d22705b98965f42a0107c63f59895b0d51`
+- Head: `6a21788c6baf17abc0c76dc67165e7b4b8a14bdf`
+- Bundle: `/private/tmp/grokptah-cu-stage24-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `f81f08c9e74e98f131c65d1fcdb38d43f9c38cf241ed2325405d0405f1aad7c6`
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current sealed implementation head: `784f3fff9c03ee42dcea4ae91a1c72edd3d88f41`.
+Current sealed implementation head: `6a21788c6baf17abc0c76dc67165e7b4b8a14bdf`.
 
 The later guest-input validation extension is sealed at:
 
@@ -57,9 +57,9 @@ The private guest-challenge channel extension is sealed at:
 
 The bounded packaged-supervisor source extension is sealed at:
 
-- Commit: `784f3fff9c03ee42dcea4ae91a1c72edd3d88f41`
-- Bundle: `/private/tmp/grokptah-cu-stage23-packaged-supervisor-v1.bundle`
-- Bundle SHA-256: `bdc1b1fa4fcc7cddf71572f30edbf8d22705b98965f42a0107c63f59895b0d51`
+- Commit: `6a21788c6baf17abc0c76dc67165e7b4b8a14bdf`
+- Bundle: `/private/tmp/grokptah-cu-stage24-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `f81f08c9e74e98f131c65d1fcdb38d43f9c38cf241ed2325405d0405f1aad7c6`
 
 ## What this candidate proves
 
@@ -108,7 +108,8 @@ The bounded packaged-supervisor source extension is sealed at:
   `POSIX_SPAWN_CLOEXEC_DEFAULT`, and routes child stdio to `/dev/null`. The
   macOS Rust supervisor owns the returned PID and descriptors, consumes FD9,
   drives the bounded Prepared → Running → Bound lifecycle, applies bounded
-  event waits, and force-cleans an unresponsive helper. This is a packaged-
+  event waits, force-cleans an unresponsive helper, and creates every runtime
+  pipe with close-on-exec set in the parent. This is a packaged-
   supervisor **source candidate**; no signed app has launched it and no VM
   boot/render/input/cleanup result is claimed.
 - Before native spawn, the Rust launch seam now opens the exact package through
