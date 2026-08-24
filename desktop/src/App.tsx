@@ -32,6 +32,13 @@ import {
 import { ComputerCockpit } from "./components/ComputerCockpit";
 import { FleetStrip } from "./components/FleetStrip";
 import { SearchPanel } from "./components/SearchPanel";
+import { HelpCenter } from "./components/HelpCenter";
+import {
+  parseHelpAssistantAnswer,
+  parseHelpSemanticAnswer,
+  type HelpAssistantRequest,
+  type HelpSemanticRequest,
+} from "./lib/helpCenter";
 import { SessionBrowser } from "./components/SessionBrowser";
 import { SessionPane } from "./components/SessionPane";
 import {
@@ -401,6 +408,7 @@ export default function App() {
   const projectCwdHintRef = useRef<string | null>(null);
   const [sessionBrowserOpen, setSessionBrowserOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   /**
    * Ordered dock slots (session ids visible as columns). Phase 14.1 multi-zone.
    * Empty or single-element = classic single-pane; up to maxDocks columns.
@@ -1149,6 +1157,35 @@ export default function App() {
   );
   const currentEffort = effortForModel(models, status?.model, status?.effort);
   const currentModelInfo = models.find((model) => model.id === status?.model);
+  const assistantProviderLabel =
+    currentModelInfo?.provider_label ??
+    currentModelInfo?.provider_id ??
+    status?.model ??
+    "selected provider";
+  const askHelpAssistant = useCallback(async (request: HelpAssistantRequest) => {
+    const session = await api.sessionNewKind("chat");
+    const prompt = [
+      "You are the optional GrokPtah product-help assistant.",
+      request.instruction,
+      "Return JSON only with exactly these keys: text (string), citations (array of exact source IDs), uncertainty (string).",
+      `Question: ${request.query}`,
+      `Cited context:\n${request.citedContext}`,
+    ].join("\n\n");
+    const reply = await api.sessionPrompt(session.id, prompt);
+    return parseHelpAssistantAnswer(reply);
+  }, []);
+  const searchHelpSemantically = useCallback(async (request: HelpSemanticRequest) => {
+    const session = await api.sessionNewKind("chat");
+    const prompt = [
+      "You are the optional GrokPtah Help Center semantic retriever.",
+      request.instruction,
+      "Return JSON only with exactly these keys: results (array of objects with articleId, score, rationale), uncertainty (string).",
+      `Query: ${request.query}`,
+      `Candidate article metadata:\n${JSON.stringify(request.candidates)}`,
+    ].join("\n\n");
+    const reply = await api.sessionPrompt(session.id, prompt);
+    return parseHelpSemanticAnswer(reply);
+  }, []);
   const activeTabKind = kindForTab(activeTab, sessions, workspaceMode);
   const activeIsBuild = activeTabKind === "build";
   const activeCwd = activeLane?.cwd || activeSummary?.cwd || activeTab?.cwd;
@@ -2534,6 +2571,18 @@ export default function App() {
       transcript: [...t.transcript, { kind: "user", text: prompt }],
     }));
     try {
+      if (!opts?.fromQueue && prompt === "/help") {
+        patchTab(id, (t) => ({
+          ...t,
+          busy: false,
+          activity: idleActivity(),
+          transcript: t.transcript.filter(
+            (x) => !(x.kind === "user" && x.text === prompt),
+          ),
+        }));
+        setHelpOpen(true);
+        return;
+      }
       if (!opts?.fromQueue && prompt === "/compact") {
         await api.sessionCompact(id);
         // Compact only shrinks the server context window — rehydrate full
@@ -3144,6 +3193,14 @@ export default function App() {
               title="Browse all Lanes"
             >
               Browse
+            </button>
+            <button
+              type="button"
+              className="sidebar-action-ghost"
+              onClick={() => setHelpOpen(true)}
+              title="Open Help Center"
+            >
+              Help
             </button>
           </div>
         </div>
@@ -4898,6 +4955,14 @@ export default function App() {
             }
           })();
         }}
+      />
+
+      <HelpCenter
+        open={helpOpen}
+        onClose={() => setHelpOpen(false)}
+        onAskAssistant={askHelpAssistant}
+        onSearchSemantic={searchHelpSemantically}
+        assistantProviderLabel={assistantProviderLabel}
       />
 
       {aboutOpen && (
