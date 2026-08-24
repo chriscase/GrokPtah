@@ -718,7 +718,8 @@ and a credentialed nested-signing assembler. The helper's closed inherited-descr
 seam is not wired into capability admission and has not been run from a signed package. No VM boot,
 signed/built helper, reviewed guest image, packaged entitlement proof, rendered frame, input,
 cleanup, or host-native dispatch evidence exists yet, so these source slices satisfy no #288
-acceptance checkbox.
+acceptance checkbox. The credentialed execution and evidence handoff is defined in
+[`COMPUTER_USE_ISOLATED_QUALIFICATION_RUNBOOK.md`](COMPUTER_USE_ISOLATED_QUALIFICATION_RUNBOOK.md).
 
 **Exit:** every [#288](https://github.com/chriscase/GrokPtah/issues/288)
 acceptance criterion. **This row cannot be marked Explicitly unsupported as

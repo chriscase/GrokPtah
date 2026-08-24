@@ -160,6 +160,11 @@ changes; any unrelated host window is visible; any host path or secret enters ev
 duplicated or resumed; cleanup is incomplete; or a missing entitlement/image/helper is shown as
 available.
 
+The credentialed handoff procedure is recorded in
+[`COMPUTER_USE_ISOLATED_QUALIFICATION_RUNBOOK.md`](COMPUTER_USE_ISOLATED_QUALIFICATION_RUNBOOK.md).
+It is intentionally a fail-closed procedure: source, image, and package checks cannot be promoted
+to a VM capability result without the complete signed-runtime campaign.
+
 ## Implementation order
 
 1. Extend the typed isolated-only input contract; keep host-native isolated proof non-dispatchable.
