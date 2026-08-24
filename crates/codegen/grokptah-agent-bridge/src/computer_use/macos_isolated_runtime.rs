@@ -240,10 +240,6 @@ impl IsolatedVisualPackagedRuntime {
         self.driver.runtime()
     }
 
-    pub fn runtime_mut(&mut self) -> &mut IsolatedVisualRuntimeSession {
-        self.driver.runtime_mut()
-    }
-
     fn wait_for_exit(&mut self) -> ComputerResult<()> {
         for _ in 0..50 {
             // SAFETY: this is the child PID owned by this supervisor.

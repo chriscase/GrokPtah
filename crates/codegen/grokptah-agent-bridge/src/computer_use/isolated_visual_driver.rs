@@ -38,10 +38,6 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
         &self.runtime
     }
 
-    pub fn runtime_mut(&mut self) -> &mut IsolatedVisualRuntimeSession {
-        &mut self.runtime
-    }
-
     pub fn start(&mut self) -> ComputerResult<()> {
         self.helper.send_start(&mut self.runtime)
     }
