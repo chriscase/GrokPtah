@@ -189,7 +189,7 @@ is a source-level denial boundary only and is not a packaged-runtime or
 hardware qualification.
 The exact external compile/test procedure is recorded in
 [`COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_EXTERNAL_HANDOFF.md);
-the external run is using immutable bundle
+the external procedure uses immutable bundle
 `/private/tmp/grokptah-packaged-lease-b250b70-v2.bundle` (SHA-256
 `4d4f46a85168b45476c1acc47ba7e289bfcb27b6ea08b173d862a038f27a2352`). A
 source-level PASS has now been returned for exact candidate
