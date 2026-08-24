@@ -65,6 +65,15 @@ active `b250b70` external campaign.
 Its future external procedure is
 [`COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md`](COMPUTER_USE_PACKAGED_LEASE_STOP_FAILURE_HANDOFF.md).
 
+A fresh immutable bundle for the later full Stage 9 campaign is also sealed at
+`/private/tmp/grokptah-cu-isolated-visual-v13.bundle` (SHA-256
+`3b3186db66477d3ab9867e1ee1a59d6071b7e0aab684b241e997cb57ae83e212`, source
+cutoff `890bb080104c24dcfb0da787e7d0b20eb875f7c3`) with its copyable
+procedure in
+[`COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V13.md`](COMPUTER_USE_ISOLATED_GROK_BUILD_HANDOFF_V13.md).
+It is queued, not running, and does not alter the active `b250b70` campaign or
+create any packaged/hardware claim.
+
 Candidate-only UI update (2026-08-24): the Provider Readiness Center now
 surfaces provider-route configuration, the fact that provider/Grok Build
 account quota is not synchronized, and the boundary between measured model
