@@ -299,9 +299,10 @@ impl From<EnterpriseReviewAdmissionError> for EnterpriseReviewPlanError {
     }
 }
 
-/// Build the exact seven-pass decomposition after the route has been admitted.
-/// The returned plan is secret-free and deterministic for the same inputs.
-pub fn build_enterprise_review_plan(
+/// Build the exact seven-pass decomposition for crate-local contract fixtures.
+/// Production callers must use [`build_enterprise_review_plan_with_trust`];
+/// the unsigned builder is deliberately not part of the public bridge API.
+pub(crate) fn build_enterprise_review_plan(
     lease: &EnterpriseReviewLease,
     policy: &EnterpriseReviewPolicy,
     now: DateTime<Utc>,
@@ -370,9 +371,8 @@ pub fn build_enterprise_review_plan(
 }
 
 /// Build a review plan only after verifying the gateway attestation against
-/// operator-configured public trust. The ordinary builder remains available
-/// for hermetic contract fixtures; this is the production-facing entry point
-/// used by the control plane so a caller cannot materialize work from
+/// operator-configured public trust. This is the production-facing entry
+/// point used by the control plane, so a caller cannot materialize work from
 /// self-asserted route metadata.
 pub fn build_enterprise_review_plan_with_trust(
     lease: &EnterpriseReviewLease,

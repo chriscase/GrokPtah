@@ -230,9 +230,11 @@ impl std::fmt::Display for EnterpriseReviewAdmissionError {
 
 impl std::error::Error for EnterpriseReviewAdmissionError {}
 
-/// Validate a broker-issued lease and return only safe evidence for the public
-/// report. No secret or endpoint URL crosses this boundary.
-pub fn admit_enterprise_review(
+/// Validate lease fields and return only safe evidence for crate-local
+/// contract fixtures. Production callers must use
+/// [`admit_enterprise_review_with_trust`]; this unsigned helper is deliberately
+/// not part of the public bridge API.
+pub(crate) fn admit_enterprise_review(
     lease: &EnterpriseReviewLease,
     policy: &EnterpriseReviewPolicy,
     now: DateTime<Utc>,
@@ -357,8 +359,7 @@ pub fn admit_enterprise_review(
 
 /// Admit an enterprise review only when the broker's gateway attestation is
 /// cryptographically bound to an operator-selected public key. This is the
-/// production-facing variant; the unsigned helper above remains available for
-/// hermetic schema tests and intentionally cannot establish live trust.
+/// production-facing public entry point.
 pub fn admit_enterprise_review_with_trust(
     lease: &EnterpriseReviewLease,
     policy: &EnterpriseReviewPolicy,
