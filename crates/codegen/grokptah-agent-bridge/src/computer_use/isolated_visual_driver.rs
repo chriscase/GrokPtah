@@ -42,6 +42,14 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
         self.helper.send_start(&mut self.runtime)
     }
 
+    pub fn start_with_timeout(&mut self, timeout: Duration) -> ComputerResult<()>
+    where
+        CW: AsRawFd,
+    {
+        self.helper
+            .send_start_with_timeout(&mut self.runtime, timeout)
+    }
+
     pub fn receive_helper_event(&mut self) -> ComputerResult<()> {
         self.helper.receive_event(&mut self.runtime)
     }
@@ -56,6 +64,14 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
 
     pub fn bind(&mut self) -> ComputerResult<()> {
         self.helper.send_binding(&mut self.runtime)
+    }
+
+    pub fn bind_with_timeout(&mut self, timeout: Duration) -> ComputerResult<()>
+    where
+        CW: AsRawFd,
+    {
+        self.helper
+            .send_binding_with_timeout(&mut self.runtime, timeout)
     }
 
     pub fn read_frame(&mut self) -> ComputerResult<Option<IsolatedVisualFrame>> {
@@ -104,6 +120,18 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
 
     pub fn stop(&mut self, disposition: IsolatedVisualTerminalDisposition) -> ComputerResult<()> {
         self.helper.send_stop(&mut self.runtime, disposition)
+    }
+
+    pub fn stop_with_timeout(
+        &mut self,
+        disposition: IsolatedVisualTerminalDisposition,
+        timeout: Duration,
+    ) -> ComputerResult<()>
+    where
+        CW: AsRawFd,
+    {
+        self.helper
+            .send_stop_with_timeout(&mut self.runtime, disposition, timeout)
     }
 
     pub(crate) fn complete_cleanup(

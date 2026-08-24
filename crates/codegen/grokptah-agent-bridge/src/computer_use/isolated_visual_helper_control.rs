@@ -115,6 +115,81 @@ impl<R: Read, W: Write> IsolatedVisualHelperControl<R, W> {
     }
 }
 
+impl<R: Read, W: Write + AsRawFd> IsolatedVisualHelperControl<R, W> {
+    pub fn send_start_with_timeout(
+        &mut self,
+        runtime: &mut IsolatedVisualRuntimeSession,
+        timeout: Duration,
+    ) -> ComputerResult<()> {
+        let control = runtime.start_control()?;
+        self.write_control_with_timeout(&[control], timeout)
+    }
+
+    pub fn send_binding_with_timeout(
+        &mut self,
+        runtime: &mut IsolatedVisualRuntimeSession,
+        timeout: Duration,
+    ) -> ComputerResult<()> {
+        let control = runtime.bind_control()?;
+        self.write_control_with_timeout(&control, timeout)
+    }
+
+    pub fn send_stop_with_timeout(
+        &mut self,
+        runtime: &mut IsolatedVisualRuntimeSession,
+        disposition: IsolatedVisualTerminalDisposition,
+        timeout: Duration,
+    ) -> ComputerResult<()> {
+        let control = runtime.stop_control(disposition)?;
+        self.write_control_with_timeout(&[control], timeout)
+    }
+
+    fn write_control_with_timeout(
+        &mut self,
+        bytes: &[u8],
+        timeout: Duration,
+    ) -> ComputerResult<()> {
+        let deadline = Instant::now() + timeout;
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout_millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let mut descriptor = libc::pollfd {
+                fd: self.control_writer.as_raw_fd(),
+                events: libc::POLLOUT | libc::POLLERR | libc::POLLHUP,
+                revents: 0,
+            };
+            // SAFETY: the descriptor is borrowed from the supervisor-owned
+            // writer and remains valid for this bounded poll/write iteration.
+            let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_millis) };
+            if ready == 0 {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::BackendFailure,
+                    "isolated helper control write timed out",
+                ));
+            }
+            if ready < 0 {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::BackendFailure,
+                    "isolated helper control write poll failed",
+                ));
+            }
+            match self.control_writer.write(&bytes[offset..]) {
+                Ok(0) => {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::TargetClosed,
+                        "isolated helper control pipe closed",
+                    ));
+                }
+                Ok(written) => offset += written,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(stream_error(error)),
+            }
+        }
+        Ok(())
+    }
+}
+
 fn read_exact<R: Read>(reader: &mut R, bytes: &mut [u8]) -> ComputerResult<()> {
     reader.read_exact(bytes).map_err(|error| {
         if error.kind() == io::ErrorKind::UnexpectedEof {

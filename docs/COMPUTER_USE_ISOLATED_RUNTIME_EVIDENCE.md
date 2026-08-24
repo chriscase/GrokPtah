@@ -146,8 +146,9 @@ The bounded guest-input write hardening is sealed at:
   macOS Rust supervisor owns the returned PID and descriptors, consumes FD9,
   drives the bounded Prepared → Running → Bound lifecycle, bounds the FD9
   challenge read as well as each helper-event wait, force-cleans an
-  unresponsive helper, bounds guest frame reads and host input writes, and
-  creates every runtime pipe with close-on-exec set in the parent. This is a packaged-
+  unresponsive helper, bounds guest frame reads, host input writes, and helper
+  control writes, and creates every runtime pipe with close-on-exec set in the
+  parent. This is a packaged-
   supervisor **source candidate**; no signed app has launched it and no VM
   boot/render/input/cleanup result is claimed.
 - The packaged supervisor exposes read-only runtime inspection while keeping

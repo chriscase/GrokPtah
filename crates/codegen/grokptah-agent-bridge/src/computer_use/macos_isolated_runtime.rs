@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::BufReader;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::time::Duration;
 
@@ -31,6 +31,7 @@ const RUNNING_EVENT_TIMEOUT: Duration = Duration::from_secs(60);
 const BOUND_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
 const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const STOPPING_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[repr(C)]
@@ -120,7 +121,7 @@ fn terminate_process(pid: libc::pid_t) {
 pub struct IsolatedVisualPackagedRuntime {
     pid: libc::pid_t,
     exited: bool,
-    driver: IsolatedVisualRuntimeDriver<BufReader<File>, BufWriter<File>, BufReader<File>, File>,
+    driver: IsolatedVisualRuntimeDriver<BufReader<File>, File, BufReader<File>, File>,
 }
 
 impl IsolatedVisualPackagedRuntime {
@@ -202,7 +203,7 @@ impl IsolatedVisualPackagedRuntime {
         // into exactly one Rust File owner.
         let helper = IsolatedVisualHelperControl::new(
             BufReader::new(unsafe { File::from_raw_fd(native.event_fd) }),
-            BufWriter::new(unsafe { File::from_raw_fd(native.control_fd) }),
+            unsafe { File::from_raw_fd(native.control_fd) },
         );
         let stream = IsolatedVisualStream::new(
             BufReader::new(unsafe { File::from_raw_fd(native.frame_fd) }),
@@ -224,7 +225,7 @@ impl IsolatedVisualPackagedRuntime {
         {
             return self.abort_with_error(error);
         }
-        if let Err(error) = self.driver.start() {
+        if let Err(error) = self.driver.start_with_timeout(CONTROL_WRITE_TIMEOUT) {
             return self.abort_with_error(error);
         }
         if let Err(error) = self
@@ -233,7 +234,7 @@ impl IsolatedVisualPackagedRuntime {
         {
             return self.abort_with_error(error);
         }
-        if let Err(error) = self.driver.bind() {
+        if let Err(error) = self.driver.bind_with_timeout(CONTROL_WRITE_TIMEOUT) {
             return self.abort_with_error(error);
         }
         if let Err(error) = self
@@ -270,7 +271,10 @@ impl IsolatedVisualPackagedRuntime {
     }
 
     pub fn stop(&mut self, disposition: IsolatedVisualTerminalDisposition) -> ComputerResult<()> {
-        if let Err(error) = self.driver.stop(disposition) {
+        if let Err(error) = self
+            .driver
+            .stop_with_timeout(disposition, CONTROL_WRITE_TIMEOUT)
+        {
             if self.driver.runtime().lifecycle_state()
                 == super::isolated_visual::IsolatedVisualLifecycleState::Stopping
             {
