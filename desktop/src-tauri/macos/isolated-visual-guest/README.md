@@ -17,8 +17,9 @@ those are not packaged VM evidence.
   identity, opens the guest framebuffer, renders a bounded deterministic fixture surface, emits
   authenticated frame chunks, and applies only validated fixture pointer/button/scroll state. It
   then accepts the fixed STOP byte, emits the authenticated shutdown acknowledgement, and powers
-  off. The zero-binding path preserves the current lifecycle smoke contract until a host supervisor
-  supplies the per-run packet.
+  off. All guest VSOCK reads and writes use a bounded poll budget; a stalled host cannot leave the
+  freestanding PID 1 in an unbounded blocking syscall. The zero-binding path preserves the current
+  lifecycle smoke contract until a host supervisor supplies the per-run packet.
 - `protocol.h` is shared by the guest and macOS helper. It contains the fixed bootstrap frame
   format, the freestanding HMAC-SHA-256 implementation, and the fixed session-binding header.
   The binding hashes Run, surface, incarnation, and isolated input-domain identities with

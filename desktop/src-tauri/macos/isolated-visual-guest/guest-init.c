@@ -32,8 +32,12 @@
 #define GPT_O_CLOEXEC 524288L
 #define GPT_SEEK_SET 0L
 #define GPT_POLLIN 1U
+#define GPT_POLLOUT 4U
 #define GPT_POLLERR 8U
 #define GPT_POLLHUP 16U
+#define GPT_POLLNVAL 32U
+#define GPT_GUEST_IO_ATTEMPTS 300U
+#define GPT_GUEST_IO_WAIT_MILLISECONDS 100L
 #define GPT_GUEST_FRAME_WIDTH GPT_ISOLATED_VISUAL_MAX_DISPLAY_WIDTH
 #define GPT_GUEST_FRAME_HEIGHT GPT_ISOLATED_VISUAL_MAX_DISPLAY_HEIGHT
 #define GPT_GUEST_FRAME_BYTES (GPT_GUEST_FRAME_WIDTH * GPT_GUEST_FRAME_HEIGHT * 4U)
@@ -94,9 +98,38 @@ static long gpt_write(int descriptor, const void *bytes, gpt_size length) {
     return gpt_syscall3(GPT_SYS_WRITE, descriptor, (long)bytes, (long)length);
 }
 
+static int gpt_wait_for_io(int descriptor, gpt_u16 events) {
+    unsigned int attempt;
+    for (attempt = 0; attempt < GPT_GUEST_IO_ATTEMPTS; ++attempt) {
+        gpt_pollfd descriptor_state = {
+            .descriptor = descriptor,
+            .events = events,
+            .revents = 0,
+        };
+        long polled = gpt_syscall3(
+            GPT_SYS_POLL,
+            (long)&descriptor_state,
+            1,
+            GPT_GUEST_IO_WAIT_MILLISECONDS);
+        if (polled == -GPT_EINTR) {
+            continue;
+        }
+        if (polled <= 0 ||
+            (descriptor_state.revents & (GPT_POLLERR | GPT_POLLHUP | GPT_POLLNVAL)) != 0 ||
+            (descriptor_state.revents & events) == 0) {
+            continue;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static int gpt_read_exact(int descriptor, gpt_u8 *bytes, gpt_size length) {
     gpt_size offset = 0;
     while (offset < length) {
+        if (!gpt_wait_for_io(descriptor, GPT_POLLIN)) {
+            return 0;
+        }
         long count = gpt_read(descriptor, bytes + offset, length - offset);
         if (count == -GPT_EINTR) {
             continue;
@@ -112,6 +145,9 @@ static int gpt_read_exact(int descriptor, gpt_u8 *bytes, gpt_size length) {
 static int gpt_write_exact(int descriptor, const gpt_u8 *bytes, gpt_size length) {
     gpt_size offset = 0;
     while (offset < length) {
+        if (!gpt_wait_for_io(descriptor, GPT_POLLOUT)) {
+            return 0;
+        }
         long count = gpt_write(descriptor, bytes + offset, length - offset);
         if (count == -GPT_EINTR) {
             continue;

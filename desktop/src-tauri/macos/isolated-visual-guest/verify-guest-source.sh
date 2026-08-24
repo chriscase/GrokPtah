@@ -60,7 +60,8 @@ done
 for required in GPT_AF_VSOCK GPT_GUEST_BOOTSTRAP_PORT GPT_GUEST_BOOTSTRAP_BIND \
   GPT_GUEST_BOOTSTRAP_INPUT GPT_GUEST_BOOTSTRAP_EVENT_BINDING_ACK GPT_SYS_REBOOT GPT_SYS_SOCKET \
   GPT_SYS_OPENAT GPT_SYS_LSEEK GPT_SYS_POLL GPT_SYS_GETRANDOM GPT_GUEST_FRAME_BYTES \
-  GPT_O_RDWR gpt_open_framebuffer gpt_render_fixture gpt_capture_frame gpt_send_frame \
+  GPT_POLLOUT GPT_POLLNVAL GPT_GUEST_IO_ATTEMPTS GPT_GUEST_IO_WAIT_MILLISECONDS \
+  gpt_wait_for_io GPT_O_RDWR gpt_open_framebuffer gpt_render_fixture gpt_capture_frame gpt_send_frame \
   gpt_apply_fixture_input; do
   grep -F "$required" "$guest_source" >/dev/null
 done

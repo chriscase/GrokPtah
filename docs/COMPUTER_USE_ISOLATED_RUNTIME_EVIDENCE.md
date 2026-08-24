@@ -208,6 +208,9 @@ The monotonic VM-deadline hardening extension is sealed at:
   private, it cannot be deserialized from a coordinator/model payload, and
   cleanup completion is crate-private until the supervisor has performed the
   exact checks.
+- Guest VSOCK reads and writes now pass through one poll-budgeted I/O helper;
+  a stalled host channel cannot leave freestanding guest PID 1 in an
+  unbounded blocking syscall.
 - The stop boundary now rejects held keyboard/button state, waits for the
   helper to exit, and leaves the lifecycle in `CleanupPending` until explicit
   per-surface process, handle, overlay, and frame-cache evidence completes it.
