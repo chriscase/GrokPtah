@@ -84,6 +84,57 @@ int main(void) {
         fputs("invalid isolated input packet was accepted\n", stderr);
         return 1;
     }
+    static const gpt_u8 frame_nonce[16] = {
+        0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
+        0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    };
+    static const gpt_u8 frame_payload[] = {1, 2, 3, 4};
+    static gpt_u8 frame_packet[GPT_ISOLATED_VISUAL_FRAME_MAX_PACKET_BYTES];
+    static gpt_u8 frame_authentication[GPT_ISOLATED_VISUAL_FRAME_AUTH_MAX_BYTES];
+    static const gpt_u8 frame_tag_expected[32] = {
+        0xc7, 0x16, 0x11, 0xfa, 0x11, 0xd7, 0x6f, 0x0e,
+        0x10, 0x09, 0x05, 0x4a, 0x18, 0x79, 0x10, 0x33,
+        0x13, 0x10, 0xc1, 0x70, 0xa7, 0xc4, 0xbb, 0xf4,
+        0xd7, 0xee, 0x93, 0x73, 0x52, 0x56, 0x08, 0x33,
+    };
+    gpt_u8 frame_digest[32] = {0};
+    gpt_u32 frame_packet_bytes = 0;
+    if (!gpt_isolated_visual_frame_seal(
+            challenge,
+            (const gpt_u8 *)"run",
+            3U,
+            (const gpt_u8 *)"surface",
+            7U,
+            (const gpt_u8 *)"incarnation",
+            11U,
+            1U,
+            frame_nonce,
+            0U,
+            1U,
+            sizeof(frame_payload),
+            0U,
+            1280U,
+            800U,
+            frame_digest,
+            frame_payload,
+            sizeof(frame_payload),
+            frame_packet,
+            sizeof(frame_packet),
+            &frame_packet_bytes,
+            frame_authentication,
+            sizeof(frame_authentication)) ||
+        frame_packet_bytes != GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES +
+                                  sizeof(frame_payload) +
+                                  GPT_ISOLATED_VISUAL_FRAME_TAG_BYTES ||
+        gpt_load_be32(frame_packet) != GPT_ISOLATED_VISUAL_FRAME_MAGIC ||
+        gpt_load_be32(frame_packet + 96U) != sizeof(frame_payload) ||
+        !require_bytes(
+            frame_packet + GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES + sizeof(frame_payload),
+            frame_tag_expected,
+            sizeof(frame_tag_expected))) {
+        fputs("isolated frame seal self-test failed\n", stderr);
+        return 1;
+    }
     gpt_u8 state_packet[GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES +
                        GPT_ISOLATED_VISUAL_INPUT_TAG_BYTES] = {0};
     gpt_u32 held_keys_mask = 0;

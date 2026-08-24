@@ -58,7 +58,8 @@ The helper performs a bounded challenge/response with the guest bootstrap agent 
 guest agent—not the host pointer or clipboard—must eventually own framebuffer capture and guest-local
 input through the authenticated protocol documented in `docs/COMPUTER_USE_ISOLATED_VISUAL.md`;
 the helper now relays bounded guest frame packets over FD8 and host-authenticated input packets over
-FD7, but the guest still has no capture source and therefore emits no valid frames. A separate
+FD7. The freestanding guest has a fixed `/dev/fb0` capture source and authenticated frame-chunk
+emitter, but it does not provide a reviewed GUI image or a packaged rendered surface yet. A separate
 host-side input gate now models guest pointer, button, scroll, key, and Unicode text edges against
 the latest frame and poisons stale or incomplete state. The source candidate also defines a
 separate authenticated 64-byte input packet header with a closed key/button code set; the helper

@@ -38,6 +38,7 @@ for required in \
   'CONFIG_VSOCKETS=y' \
   'CONFIG_VIRTIO_VSOCKETS=y' \
   'CONFIG_DRM_VIRTIO_GPU=y' \
+  'CONFIG_DRM_FBDEV_EMULATION=y' \
   'CONFIG_PCI_HOST_GENERIC=y' \
   'CONFIG_MODULES=n'; do
   grep -Fx "$required" "$fragment" >/dev/null
@@ -57,15 +58,19 @@ for forbidden in AF_INET execve '/bin/sh' mount ptrace; do
   fi
 done
 for required in GPT_AF_VSOCK GPT_GUEST_BOOTSTRAP_PORT GPT_GUEST_BOOTSTRAP_BIND \
-  GPT_GUEST_BOOTSTRAP_INPUT GPT_GUEST_BOOTSTRAP_EVENT_BINDING_ACK GPT_SYS_REBOOT GPT_SYS_SOCKET; do
+  GPT_GUEST_BOOTSTRAP_INPUT GPT_GUEST_BOOTSTRAP_EVENT_BINDING_ACK GPT_SYS_REBOOT GPT_SYS_SOCKET \
+  GPT_SYS_OPENAT GPT_SYS_POLL GPT_SYS_GETRANDOM GPT_GUEST_FRAME_BYTES \
+  gpt_open_framebuffer gpt_capture_frame gpt_send_frame; do
   grep -F "$required" "$guest_source" >/dev/null
 done
+grep -F '"/dev/fb0"' "$guest_source" >/dev/null
 for required in \
   GPT_ISOLATED_VISUAL_FRAME_MAGIC GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES \
   GPT_ISOLATED_VISUAL_FRAME_MAX_PACKET_BYTES \
   gpt_isolated_visual_frame_header GPT_ISOLATED_VISUAL_INPUT_MAGIC \
   GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES GPT_ISOLATED_VISUAL_INPUT_MAX_PACKET_BYTES \
   gpt_isolated_visual_input_header gpt_isolated_visual_input_valid \
+  gpt_isolated_visual_frame_seal \
   GPT_ISOLATED_VISUAL_BINDING_MAGIC GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES \
   gpt_isolated_visual_binding_header gpt_isolated_visual_binding_digest \
   gpt_isolated_visual_channel_secret gpt_isolated_visual_binding_valid; do

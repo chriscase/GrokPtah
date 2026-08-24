@@ -10,8 +10,12 @@
 #define GPT_VMADDR_CID_HOST 2U
 
 #define GPT_SYS_CLOSE 57L
+#define GPT_SYS_LSEEK 62L
 #define GPT_SYS_READ 63L
 #define GPT_SYS_WRITE 64L
+#define GPT_SYS_POLL 7L
+#define GPT_SYS_OPENAT 56L
+#define GPT_SYS_GETRANDOM 278L
 #define GPT_SYS_NANOSLEEP 101L
 #define GPT_SYS_REBOOT 142L
 #define GPT_SYS_SOCKET 198L
@@ -22,6 +26,22 @@
 #define GPT_REBOOT_MAGIC1 0xfee1deadL
 #define GPT_REBOOT_MAGIC2 0x28121969L
 #define GPT_REBOOT_POWER_OFF 0x4321fedcL
+#define GPT_AT_FDCWD (-100L)
+#define GPT_O_RDONLY 0L
+#define GPT_O_CLOEXEC 524288L
+#define GPT_SEEK_SET 0L
+#define GPT_POLLIN 1U
+#define GPT_POLLERR 8U
+#define GPT_POLLHUP 16U
+#define GPT_GUEST_FRAME_WIDTH GPT_ISOLATED_VISUAL_MAX_DISPLAY_WIDTH
+#define GPT_GUEST_FRAME_HEIGHT GPT_ISOLATED_VISUAL_MAX_DISPLAY_HEIGHT
+#define GPT_GUEST_FRAME_BYTES (GPT_GUEST_FRAME_WIDTH * GPT_GUEST_FRAME_HEIGHT * 4U)
+
+typedef struct {
+    int descriptor;
+    gpt_u16 events;
+    gpt_u16 revents;
+} gpt_pollfd;
 
 typedef struct {
     unsigned short family;
@@ -109,6 +129,116 @@ static void gpt_sleep_retry(void) {
     }
 }
 
+static int gpt_open_framebuffer(void) {
+    static const gpt_u8 path[] = "/dev/fb0";
+    long descriptor = gpt_syscall6(
+        GPT_SYS_OPENAT,
+        GPT_AT_FDCWD,
+        (long)path,
+        GPT_O_RDONLY | GPT_O_CLOEXEC,
+        0,
+        0,
+        0);
+    return descriptor < 0 ? -1 : (int)descriptor;
+}
+
+static int gpt_capture_frame(int framebuffer, gpt_u8 *bytes) {
+    gpt_size offset = 0;
+    if (gpt_syscall3(GPT_SYS_LSEEK, framebuffer, 0, GPT_SEEK_SET) < 0) {
+        return 0;
+    }
+    while (offset < GPT_GUEST_FRAME_BYTES) {
+        long count = gpt_read(framebuffer, bytes + offset, GPT_GUEST_FRAME_BYTES - offset);
+        if (count == -GPT_EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            return 0;
+        }
+        offset += (gpt_size)count;
+    }
+    return 1;
+}
+
+static int gpt_fill_frame_nonce(gpt_u8 nonce[16]) {
+    long count = gpt_syscall3(GPT_SYS_GETRANDOM, (long)nonce, 16, 0);
+    if (count != 16) {
+        return 0;
+    }
+    nonce[6] = (gpt_u8)((nonce[6] & 0x0fU) | 0x40U);
+    nonce[8] = (gpt_u8)((nonce[8] & 0x3fU) | 0x80U);
+    return 1;
+}
+
+static gpt_u8 gpt_frame_bytes[GPT_GUEST_FRAME_BYTES];
+static gpt_u8 gpt_frame_packet[GPT_ISOLATED_VISUAL_FRAME_MAX_PACKET_BYTES];
+static gpt_u8 gpt_frame_authentication[GPT_ISOLATED_VISUAL_FRAME_AUTH_MAX_BYTES];
+
+static int gpt_send_frame(
+    int socket,
+    int framebuffer,
+    const gpt_u8 *run_id,
+    gpt_u16 run_id_bytes,
+    const gpt_u8 *surface_id,
+    gpt_u16 surface_id_bytes,
+    const gpt_u8 *incarnation,
+    gpt_u16 incarnation_bytes,
+    const gpt_u8 channel_secret[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES],
+    gpt_u64 frame_sequence) {
+    gpt_u8 content_sha256[32];
+    gpt_u8 request_nonce[16];
+    gpt_u8 length_bytes[4];
+    gpt_u32 chunk_count =
+        (GPT_GUEST_FRAME_BYTES + GPT_ISOLATED_VISUAL_FRAME_CHUNK_BYTES - 1U) /
+        GPT_ISOLATED_VISUAL_FRAME_CHUNK_BYTES;
+    gpt_u32 chunk_index;
+    if (!gpt_capture_frame(framebuffer, gpt_frame_bytes) ||
+        !gpt_fill_frame_nonce(request_nonce)) {
+        return 0;
+    }
+    gpt_sha256(gpt_frame_bytes, GPT_GUEST_FRAME_BYTES, content_sha256);
+    for (chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+        gpt_u64 offset = (gpt_u64)chunk_index * GPT_ISOLATED_VISUAL_FRAME_CHUNK_BYTES;
+        gpt_u32 remaining = GPT_GUEST_FRAME_BYTES - (gpt_u32)offset;
+        gpt_u32 payload_bytes = remaining > GPT_ISOLATED_VISUAL_FRAME_CHUNK_BYTES
+                                    ? GPT_ISOLATED_VISUAL_FRAME_CHUNK_BYTES
+                                    : remaining;
+        gpt_u32 packet_bytes = 0;
+        if (!gpt_isolated_visual_frame_seal(
+                channel_secret,
+                run_id,
+                run_id_bytes,
+                surface_id,
+                surface_id_bytes,
+                incarnation,
+                incarnation_bytes,
+                frame_sequence,
+                request_nonce,
+                chunk_index,
+                chunk_count,
+                GPT_GUEST_FRAME_BYTES,
+                offset,
+                GPT_GUEST_FRAME_WIDTH,
+                GPT_GUEST_FRAME_HEIGHT,
+                content_sha256,
+                gpt_frame_bytes + offset,
+                payload_bytes,
+                gpt_frame_packet,
+                sizeof(gpt_frame_packet),
+                &packet_bytes,
+                gpt_frame_authentication,
+                sizeof(gpt_frame_authentication))) {
+            return 0;
+        }
+        gpt_store_be32(length_bytes, packet_bytes);
+        if (!gpt_write_exact(socket, length_bytes, sizeof(length_bytes)) ||
+            !gpt_write_exact(socket, gpt_frame_packet, packet_bytes)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int gpt_connect_to_host(void) {
     long descriptor = gpt_syscall3(
         GPT_SYS_SOCKET,
@@ -179,7 +309,40 @@ __attribute__((noreturn)) void _start(void) {
     gpt_u64 last_input_sequence = 0;
     gpt_u32 held_keys_mask = 0;
     gpt_u8 held_button = 0;
+    int framebuffer = -1;
     for (;;) {
+        if (bound) {
+            gpt_pollfd descriptor = {
+                .descriptor = socket,
+                .events = GPT_POLLIN,
+                .revents = 0,
+            };
+            long polled;
+            do {
+                polled = gpt_syscall3(GPT_SYS_POLL, (long)&descriptor, 1, 100);
+            } while (polled == -GPT_EINTR);
+            if (polled < 0 || (descriptor.revents & (GPT_POLLERR | GPT_POLLHUP)) != 0) {
+                gpt_power_off(34);
+            }
+            if (polled == 0) {
+                if (last_frame_sequence == ~0ULL ||
+                    !gpt_send_frame(
+                        socket,
+                        framebuffer,
+                        binding_payload,
+                        binding_lengths[0],
+                        binding_payload + binding_lengths[0],
+                        binding_lengths[1],
+                        binding_payload + binding_lengths[0] + binding_lengths[1],
+                        binding_lengths[2],
+                        channel_secret,
+                        last_frame_sequence + 1U)) {
+                    gpt_power_off(35);
+                }
+                last_frame_sequence += 1U;
+                continue;
+            }
+        }
         if (!gpt_read_exact(socket, &command, 1U)) {
             gpt_power_off(22);
         }
@@ -295,6 +458,10 @@ __attribute__((noreturn)) void _start(void) {
         last_input_sequence = 0;
         held_keys_mask = 0;
         held_button = 0;
+        framebuffer = gpt_open_framebuffer();
+        if (framebuffer < 0) {
+            gpt_power_off(33);
+        }
     }
     gpt_syscall3(GPT_SYS_CLOSE, socket, 0, 0);
     gpt_power_off(0);

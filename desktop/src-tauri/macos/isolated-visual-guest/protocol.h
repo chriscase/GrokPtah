@@ -51,10 +51,12 @@ typedef unsigned long gpt_size;
 #define GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES 100U
 #define GPT_ISOLATED_VISUAL_FRAME_TAG_BYTES 32U
 #define GPT_ISOLATED_VISUAL_FRAME_CHUNK_BYTES 65536U
+#define GPT_ISOLATED_VISUAL_FRAME_MAX_TOTAL_BYTES 16777216U
 #define GPT_ISOLATED_VISUAL_FRAME_MAX_PACKET_BYTES \
     (GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES + \
      GPT_ISOLATED_VISUAL_FRAME_CHUNK_BYTES + \
      GPT_ISOLATED_VISUAL_FRAME_TAG_BYTES)
+#define GPT_ISOLATED_VISUAL_FRAME_AUTH_MAX_BYTES 70000U
 
 /* Host-to-guest input packets. They never target the host input domain. */
 #define GPT_ISOLATED_VISUAL_INPUT_MAGIC 0x47505441U
@@ -186,6 +188,13 @@ static void gpt_store_be32(gpt_u8 *bytes, gpt_u32 value) {
     bytes[1] = (gpt_u8)(value >> 16U);
     bytes[2] = (gpt_u8)(value >> 8U);
     bytes[3] = (gpt_u8)value;
+}
+
+static void gpt_store_be64(gpt_u8 *bytes, gpt_u64 value) {
+    gpt_u32 index;
+    for (index = 0; index < 8U; ++index) {
+        bytes[index] = (gpt_u8)(value >> ((7U - index) * 8U));
+    }
 }
 
 static void gpt_sha256_transform(gpt_sha256_context *context, const gpt_u8 *block) {
@@ -391,6 +400,111 @@ static void gpt_hmac_sha256(
     gpt_sha256_update(&outer, pad, 64U);
     gpt_sha256_update(&outer, inner_digest, 32U);
     gpt_sha256_finish(&outer, output);
+}
+
+static GPT_GUEST_UNUSED int gpt_isolated_visual_frame_seal(
+    const gpt_u8 channel_secret[GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES],
+    const gpt_u8 *run_id,
+    gpt_u16 run_id_bytes,
+    const gpt_u8 *surface_id,
+    gpt_u16 surface_id_bytes,
+    const gpt_u8 *incarnation,
+    gpt_u16 incarnation_bytes,
+    gpt_u64 frame_sequence,
+    const gpt_u8 request_nonce[16],
+    gpt_u32 chunk_index,
+    gpt_u32 chunk_count,
+    gpt_u64 total_bytes,
+    gpt_u64 offset,
+    gpt_u32 width,
+    gpt_u32 height,
+    const gpt_u8 content_sha256[32],
+    const gpt_u8 *payload,
+    gpt_u32 payload_bytes,
+    gpt_u8 *packet,
+    gpt_u32 packet_capacity,
+    gpt_u32 *packet_bytes,
+    gpt_u8 *authentication,
+    gpt_u32 authentication_capacity) {
+    static const gpt_u8 context[] = "grokptah-isolated-visual-frame-v1";
+    const gpt_u8 *fields[] = {run_id, surface_id, incarnation};
+    const gpt_u16 lengths[] = {run_id_bytes, surface_id_bytes, incarnation_bytes};
+    gpt_u8 length_bytes[4];
+    gpt_size authentication_offset = 0;
+    gpt_size packet_without_tag;
+    gpt_u32 index;
+    gpt_u8 nonce_nonzero = 0;
+    if (channel_secret == 0 || run_id == 0 || surface_id == 0 || incarnation == 0 ||
+        content_sha256 == 0 || payload == 0 || packet == 0 || packet_bytes == 0 ||
+        authentication == 0 || frame_sequence == 0 || request_nonce == 0 ||
+        chunk_count == 0 || chunk_index >= chunk_count || total_bytes == 0 ||
+        total_bytes > GPT_ISOLATED_VISUAL_FRAME_MAX_TOTAL_BYTES || payload_bytes == 0 ||
+        payload_bytes > GPT_ISOLATED_VISUAL_FRAME_CHUNK_BYTES || offset > total_bytes ||
+        (gpt_u64)payload_bytes > total_bytes - offset || width == 0 ||
+        width > GPT_ISOLATED_VISUAL_MAX_DISPLAY_WIDTH || height == 0 ||
+        height > GPT_ISOLATED_VISUAL_MAX_DISPLAY_HEIGHT ||
+        packet_capacity < GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES +
+                              payload_bytes + GPT_ISOLATED_VISUAL_FRAME_TAG_BYTES ||
+        authentication_capacity < GPT_ISOLATED_VISUAL_FRAME_AUTH_MAX_BYTES) {
+        return 0;
+    }
+    for (index = 0; index < 16U; ++index) {
+        nonce_nonzero |= request_nonce[index];
+    }
+    if (nonce_nonzero == 0) {
+        return 0;
+    }
+    for (index = 0; index < 3U; ++index) {
+        if (lengths[index] == 0 ||
+            lengths[index] > GPT_ISOLATED_VISUAL_BINDING_MAX_FIELD_BYTES) {
+            return 0;
+        }
+    }
+    gpt_store_be32(packet, GPT_ISOLATED_VISUAL_FRAME_MAGIC);
+    gpt_store_be16(packet + 4U, GPT_ISOLATED_VISUAL_FRAME_VERSION);
+    gpt_store_be16(packet + 6U, GPT_GUEST_BOOTSTRAP_VERSION);
+    gpt_store_be64(packet + 8U, frame_sequence);
+    for (index = 0; index < 16U; ++index) {
+        packet[16U + index] = request_nonce[index];
+    }
+    gpt_store_be32(packet + 32U, chunk_index);
+    gpt_store_be32(packet + 36U, chunk_count);
+    gpt_store_be64(packet + 40U, total_bytes);
+    gpt_store_be64(packet + 48U, offset);
+    gpt_store_be32(packet + 56U, width);
+    gpt_store_be32(packet + 60U, height);
+    for (index = 0; index < 32U; ++index) {
+        packet[64U + index] = content_sha256[index];
+    }
+    gpt_store_be32(packet + 96U, payload_bytes);
+    for (index = 0; index < payload_bytes; ++index) {
+        packet[GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES + index] = payload[index];
+    }
+    packet_without_tag = GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES + payload_bytes;
+    for (index = 0; index < sizeof(context) - 1U; ++index) {
+        authentication[authentication_offset++] = context[index];
+    }
+    for (index = 0; index < 3U; ++index) {
+        gpt_store_be32(length_bytes, lengths[index]);
+        authentication[authentication_offset++] = length_bytes[0];
+        authentication[authentication_offset++] = length_bytes[1];
+        authentication[authentication_offset++] = length_bytes[2];
+        authentication[authentication_offset++] = length_bytes[3];
+        for (gpt_size field_index = 0; field_index < lengths[index]; ++field_index) {
+            authentication[authentication_offset++] = fields[index][field_index];
+        }
+    }
+    for (index = 0; index < packet_without_tag; ++index) {
+        authentication[authentication_offset++] = packet[index];
+    }
+    gpt_hmac_sha256(
+        channel_secret,
+        GPT_GUEST_BOOTSTRAP_CHALLENGE_BYTES,
+        authentication,
+        authentication_offset,
+        packet + packet_without_tag);
+    *packet_bytes = (gpt_u32)(packet_without_tag + GPT_ISOLATED_VISUAL_FRAME_TAG_BYTES);
+    return 1;
 }
 
 static void gpt_isolated_visual_channel_secret(
