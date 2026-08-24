@@ -59,10 +59,12 @@ export class GrokPtahOperations {
   }
 
   async listSessions<T = unknown>(): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("session.observe");
     return this.invoke<T>("ptah_list_sessions", {});
   }
 
   async getCapacity<T = unknown>(): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("session.observe");
     return this.invoke<T>("ptah_get_capacity", {});
   }
 
@@ -70,6 +72,7 @@ export class GrokPtahOperations {
     scope: GrokPtahScope,
     agentId: string,
   ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("agent.continuity");
     return this.invoke<T>("ptah_get_persistent_agent", {
       ...scopeArgs(scope),
       agent_id: nonEmpty(agentId, "agentId"),
@@ -94,26 +97,32 @@ export class GrokPtahOperations {
   }
 
   async getRun<T = unknown>(scope: GrokPtahRunScope): Promise<GrokPtahOperationResult<T>> {
+    scopeArgs(scope);
+    this.requireAvailable("run.review");
     return this.scoped<T>("ptah_get_run", scope);
   }
 
   async getProgress<T = unknown>(
     scope: GrokPtahRunScope,
   ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("run.review");
     return this.scoped<T>("ptah_get_progress", scope);
   }
 
   async getChanges<T = unknown>(scope: GrokPtahRunScope): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("run.review");
     return this.scoped<T>("ptah_get_changes", scope);
   }
 
   async getTestResults<T = unknown>(
     scope: GrokPtahRunScope,
   ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("run.review");
     return this.scoped<T>("ptah_get_test_results", scope);
   }
 
   async getHandoff<T = unknown>(scope: GrokPtahRunScope): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("run.review");
     return this.scoped<T>("ptah_get_handoff", scope);
   }
 
@@ -126,6 +135,7 @@ export class GrokPtahOperations {
     scope: GrokPtahRunScope,
     options: { afterSeq?: number; limit?: number } = {},
   ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("run.review");
     return this.invoke<T>("ptah_get_events", {
       ...scopeArgs(scope),
       ...(options.afterSeq === undefined ? {} : { after_seq: options.afterSeq }),
@@ -187,6 +197,7 @@ export class GrokPtahOperations {
   }
 
   async getQueue<T = unknown>(scope: GrokPtahScope): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("run.queue");
     return this.invoke<T>("ptah_get_queue", scopeArgs(scope));
   }
 

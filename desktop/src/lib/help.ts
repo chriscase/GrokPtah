@@ -57,7 +57,7 @@ export const HELP_ENTRIES: readonly HelpEntry[] = [
     keywords: ["embed", "reuse", "package", "contextdesk", "web", "api"],
     audience: ["everyone", "power_user", "operator"],
     access: "public",
-    capabilityIds: ["run.observe", "run.execute", "review.read"],
+    capabilityIds: ["session.observe", "run.execute", "run.review"],
   },
   {
     id: "durable-runs-and-recovery",
@@ -70,7 +70,7 @@ export const HELP_ENTRIES: readonly HelpEntry[] = [
     keywords: ["soak", "resume", "checkpoint", "duplicate", "replay", "uncertain"],
     audience: ["everyone", "power_user", "operator"],
     access: "public",
-    capabilityIds: ["run.observe", "run.retry"],
+    capabilityIds: ["session.observe", "run.execute", "run.review"],
   },
   {
     id: "persistent-agents",
@@ -83,7 +83,7 @@ export const HELP_ENTRIES: readonly HelpEntry[] = [
     keywords: ["long running", "always on", "worker", "supervisor", "background"],
     audience: ["power_user", "operator"],
     access: "gated",
-    capabilityIds: ["run.execute", "run.retry"],
+    capabilityIds: ["agent.continuity", "agent.resume"],
   },
   {
     id: "computer-use-safety",
@@ -122,7 +122,7 @@ export const HELP_ENTRIES: readonly HelpEntry[] = [
     keywords: ["company", "restricted", "weak model", "quota", "provider", "compliance"],
     audience: ["power_user", "operator"],
     access: "operator",
-    capabilityIds: ["review.read", "review.receipt"],
+    capabilityIds: ["run.review"],
   },
   {
     id: "help-search-and-assistant",

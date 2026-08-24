@@ -36,6 +36,7 @@ pub enum CapabilityAvailability {
 
 /// One stable capability descriptor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilityDescriptor {
     /// Stable identifier such as `run.execute`.
     pub id: String,
@@ -53,6 +54,7 @@ pub struct CapabilityDescriptor {
 
 /// Versioned capability discovery payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilitySet {
     /// Contract identifier. Must equal [`CONTRACT_VERSION`] for this module.
     pub contract: String,
@@ -78,8 +80,45 @@ impl CapabilitySet {
 
     /// Reject an unknown contract before a consumer enables any operation.
     pub fn is_current(&self) -> bool {
-        self.contract == CONTRACT_VERSION
+        self.contract == CONTRACT_VERSION && self.is_well_formed()
     }
+
+    /// Validate the stable descriptor invariants before a consumer enables a
+    /// negotiated operation. This keeps malformed/ambiguous capabilities
+    /// fail-closed even when they arrive through a Rust adapter.
+    pub fn is_well_formed(&self) -> bool {
+        let mut ids = std::collections::HashSet::new();
+        self.capabilities.iter().all(|capability| {
+            valid_capability_id(&capability.id)
+                && capability.id.len() <= 128
+                && capability.description.len() <= 512
+                && (capability.availability != CapabilityAvailability::Gated
+                    || capability.human_gate)
+                && ids.insert(capability.id.as_str())
+        })
+    }
+}
+
+fn valid_capability_id(id: &str) -> bool {
+    let mut segments = id.split('.');
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    if first.is_empty()
+        || !first.as_bytes()[0].is_ascii_lowercase()
+        || !first
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    segments.all(|segment| {
+        !segment.is_empty()
+            && segment.as_bytes()[0].is_ascii_lowercase()
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    })
 }
 
 #[cfg(test)]

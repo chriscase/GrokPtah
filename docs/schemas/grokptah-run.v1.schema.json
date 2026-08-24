@@ -2,6 +2,18 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:grokptah:schema:run:v1",
   "title": "GrokPtah Run Contract v1",
+  "oneOf": [
+    { "$ref": "#/$defs/scope" },
+    { "$ref": "#/$defs/submitTask" },
+    { "$ref": "#/$defs/runEventPage" },
+    { "$ref": "#/$defs/durableRun" },
+    { "$ref": "#/$defs/reviewReceipt" },
+    { "$ref": "#/$defs/notification" },
+    { "$ref": "#/$defs/errorEnvelope" },
+    { "$ref": "#/$defs/computerControlRequest" },
+    { "$ref": "#/$defs/computerControlResponse" },
+    { "$ref": "#/$defs/computerEventPage" }
+  ],
   "$defs": {
     "bounds": {
       "type": "object",
@@ -47,6 +59,21 @@
         "limit_reached"
       ]
     },
+    "durableRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "sessionId", "workspace", "requestId", "state", "promptPreview", "createdAt", "updatedAt"],
+      "properties": {
+        "runId": { "type": "string", "minLength": 1 },
+        "sessionId": { "type": "string", "minLength": 1 },
+        "workspace": { "type": "string", "minLength": 1 },
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "state": { "$ref": "#/$defs/runState" },
+        "promptPreview": { "type": "string", "maxLength": 512 },
+        "createdAt": { "type": "string", "minLength": 1 },
+        "updatedAt": { "type": "string", "minLength": 1 }
+      }
+    },
     "event": {
       "type": "object",
       "additionalProperties": false,
@@ -85,6 +112,70 @@
         "diff": { "type": "string" },
         "diffTruncated": { "type": "boolean" },
         "fingerprint": { "type": "string", "minLength": 1 }
+      }
+    },
+    "errorEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_request",
+            "unauthenticated",
+            "forbidden_scope",
+            "not_found",
+            "stale_or_recovery",
+            "capacity",
+            "authority_unavailable",
+            "internal"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "requestId": { "type": ["string", "null"], "maxLength": 256 }
+      }
+    },
+    "computerControlRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestId", "scope", "expectedVersion", "actionClasses", "ttlMs"],
+      "properties": {
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "scope": { "$ref": "#/$defs/scope" },
+        "expectedVersion": { "type": "integer", "minimum": 0 },
+        "actionClasses": { "type": "array", "items": { "enum": ["semantic", "text_entry"] } },
+        "ttlMs": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "computerControlResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "version", "disposition"],
+      "properties": {
+        "scope": { "$ref": "#/$defs/scope" },
+        "version": { "type": "integer", "minimum": 0 },
+        "disposition": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "computerEventPage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entries", "cursorExpired"],
+      "properties": {
+        "entries": { "type": "array", "items": { "$ref": "#/$defs/computerEvent" } },
+        "nextCursor": { "type": ["integer", "null"], "minimum": 0 },
+        "cursorExpired": { "type": "boolean" }
+      }
+    },
+    "computerEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seq", "ts", "kind", "detail"],
+      "properties": {
+        "seq": { "type": "integer", "minimum": 0 },
+        "ts": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1 },
+        "detail": {}
       }
     },
     "notification": {

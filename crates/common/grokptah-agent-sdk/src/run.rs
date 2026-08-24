@@ -138,10 +138,12 @@ pub enum RunNotification {
         /// Exact run identity that needs recovery.
         scope: RunScope,
         /// Last safe sequence observed by the authority.
+        #[serde(rename = "afterSeq")]
         after_seq: u64,
         /// Share-safe reason.
         reason: String,
         /// Authoritative polling operation.
+        #[serde(rename = "pollTool")]
         poll_tool: String,
     },
 }

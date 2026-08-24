@@ -114,6 +114,21 @@ describe("GrokPtahOperations", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("gates read operations on their negotiated capability", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const operations = new GrokPtahOperations(clientWithCapabilities(fetcher, []));
+    await expect(operations.listSessions()).rejects.toMatchObject({
+      capabilityId: "session.observe",
+    });
+    await expect(
+      operations.getRun({ sessionId: "session-1", workspace: "/repo", runId: "run-1" }),
+    ).rejects.toMatchObject({ capabilityId: "run.review" });
+    await expect(
+      operations.getPersistentAgent({ sessionId: "session-1", workspace: "/repo" }, "agent-1"),
+    ).rejects.toMatchObject({ capabilityId: "agent.continuity" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("exposes queue CAS operations through the same capability fence", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
       response({ jsonrpc: "2.0", id: 1, result: { ok: true } }),

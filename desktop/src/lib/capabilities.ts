@@ -51,19 +51,35 @@ const AVAILABILITIES: ReadonlySet<CapabilityAvailability> = new Set([
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+const CAPABILITY_ID = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9_]*)+$/;
+const DESCRIPTOR_KEYS = new Set([
+  "id",
+  "tier",
+  "mutating",
+  "human_gate",
+  "availability",
+  "description",
+]);
+const MAX_DESCRIPTION_LENGTH = 512;
+
 function parseDescriptor(value: unknown): CapabilityDescriptor | null {
   if (!isRecord(value)) return null;
+  if (Object.keys(value).some((key) => !DESCRIPTOR_KEYS.has(key))) return null;
   const { id, tier, mutating, human_gate, availability, description } = value;
   if (
     typeof id !== "string" ||
-    id.length === 0 ||
+    !CAPABILITY_ID.test(id) ||
     typeof tier !== "string" ||
     !TIERS.has(tier as CapabilityTier) ||
     typeof mutating !== "boolean" ||
     typeof human_gate !== "boolean" ||
     typeof availability !== "string" ||
     !AVAILABILITIES.has(availability as CapabilityAvailability) ||
-    typeof description !== "string"
+    typeof description !== "string" ||
+    description.length === 0 ||
+    description.length > MAX_DESCRIPTION_LENGTH ||
+    (availability === "gated" && human_gate !== true)
   ) {
     return null;
   }
@@ -83,6 +99,8 @@ export function parseCapabilitySet(value: unknown): CapabilitySet | null {
   if (!Array.isArray(value.capabilities)) return null;
   const capabilities = value.capabilities.map(parseDescriptor);
   if (capabilities.some((capability) => capability === null)) return null;
+  const ids = capabilities.map((capability) => capability!.id);
+  if (new Set(ids).size !== ids.length) return null;
   return {
     contract: CAPABILITY_CONTRACT,
     capabilities: capabilities as CapabilityDescriptor[],

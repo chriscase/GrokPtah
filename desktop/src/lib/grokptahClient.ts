@@ -61,17 +61,9 @@ export type GrokPtahRecoveryNotification = {
   pollTool: string;
 };
 
-export type GrokPtahUnknownNotification = {
-  kind: "unknown";
-  sseId: number | null;
-  method: string;
-  params: unknown;
-};
-
 export type GrokPtahRunNotification =
   | GrokPtahEventNotification
-  | GrokPtahRecoveryNotification
-  | GrokPtahUnknownNotification;
+  | GrokPtahRecoveryNotification;
 
 export type GrokPtahClientOptions = {
   baseUrl: string;
@@ -122,23 +114,28 @@ export class GrokPtahClient {
   }
 
   async initialize(): Promise<unknown> {
-    const result = await this.rpc("initialize", {
-      protocolVersion: "2025-03-26",
-      capabilities: { tools: {} },
-      clientInfo: { name: this.clientName, version: this.clientVersion },
-    });
-    if (!isRecord(result) || typeof result.protocolVersion !== "string") {
-      throw new Error("GrokPtah initialize response has no protocolVersion");
+    this.resetHandshake();
+    try {
+      const result = await this.rpc("initialize", {
+        protocolVersion: "2025-03-26",
+        capabilities: { tools: {} },
+        clientInfo: { name: this.clientName, version: this.clientVersion },
+      });
+      if (!isRecord(result) || typeof result.protocolVersion !== "string") {
+        throw new Error("GrokPtah initialize response has no protocolVersion");
+      }
+      this.protocolVersion = result.protocolVersion;
+      const serverInfo = isRecord(result.serverInfo) ? result.serverInfo : null;
+      this.capabilitySet = parseCapabilitySet(serverInfo?.capabilityContract);
+      if (!this.capabilitySet) {
+        throw new Error("GrokPtah initialize response has no valid capability contract");
+      }
+      await this.notify("notifications/initialized", {});
+      return result;
+    } catch (error) {
+      this.resetHandshake();
+      throw error;
     }
-    this.protocolVersion = result.protocolVersion;
-    const serverInfo = isRecord(result.serverInfo) ? result.serverInfo : null;
-    this.capabilitySet = parseCapabilitySet(serverInfo?.capabilityContract);
-    if (!this.capabilitySet) {
-      this.protocolVersion = null;
-      throw new Error("GrokPtah initialize response has no valid capability contract");
-    }
-    await this.notify("notifications/initialized", {});
-    return result;
   }
 
   async listTools(): Promise<GrokPtahTool[]> {
@@ -214,7 +211,7 @@ export class GrokPtahClient {
       for (;;) {
         const chunk = await reader.read();
         buffer += decoder.decode(chunk.value ?? new Uint8Array(), { stream: !chunk.done });
-        if (buffer.length > maxFrameBytes) {
+        if (new TextEncoder().encode(buffer).byteLength > maxFrameBytes) {
           throw new Error("GrokPtah event stream frame exceeds 512 KiB");
         }
         for (;;) {
@@ -276,6 +273,12 @@ export class GrokPtahClient {
     this.capabilitySet = null;
   }
 
+  private resetHandshake(): void {
+    this.sessionId = null;
+    this.protocolVersion = null;
+    this.capabilitySet = null;
+  }
+
   private requireInitialized(): void {
     if (!this.isInitialized) {
       throw new Error("GrokPtah client is not initialized");
@@ -312,9 +315,14 @@ export class GrokPtahClient {
       body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
     });
     const text = await response.text();
-    const body: unknown = text ? JSON.parse(text) : {};
-    if (!response.ok) {
-      throw new Error(`GrokPtah MCP request failed with HTTP ${response.status}`);
+    let body: unknown = {};
+    try {
+      body = text ? JSON.parse(text) : {};
+    } catch {
+      if (!response.ok) {
+        throw new Error(`GrokPtah MCP request failed with HTTP ${response.status}`);
+      }
+      throw new Error("GrokPtah MCP response is not valid JSON");
     }
     if (isRecord(body) && body.error) {
       throw new GrokPtahRemoteError(
@@ -324,8 +332,17 @@ export class GrokPtahClient {
         },
       );
     }
+    if (!isRecord(body) || body.jsonrpc !== "2.0" || body.id !== id) {
+      throw new Error("GrokPtah MCP response correlation is invalid");
+    }
+    if (!response.ok) {
+      throw new Error(`GrokPtah MCP request failed with HTTP ${response.status}`);
+    }
     if (isRecord(body) && "result" in body) {
       const sessionId = response.headers.get("mcp-session-id");
+      if (sessionId && this.sessionId && sessionId !== this.sessionId) {
+        throw new Error("GrokPtah MCP response changed the transport session");
+      }
       if (sessionId) this.sessionId = sessionId;
       return body.result;
     }

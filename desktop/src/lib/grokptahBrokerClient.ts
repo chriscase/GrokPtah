@@ -227,7 +227,9 @@ export class GrokPtahBrokerClient {
       for (;;) {
         const chunk = await reader.read();
         buffer += decoder.decode(chunk.value ?? new Uint8Array(), { stream: !chunk.done });
-        if (buffer.length > maxFrameBytes) throw new Error("Broker SSE frame exceeds 512 KiB");
+        if (new TextEncoder().encode(buffer).byteLength > maxFrameBytes) {
+          throw new Error("Broker SSE frame exceeds 512 KiB");
+        }
         for (;;) {
           const delimiter = findDelimiter(buffer);
           if (!delimiter) break;
@@ -269,15 +271,24 @@ export class GrokPtahBrokerClient {
   ): Promise<T> {
     const headers: Record<string, string> = { Accept: "application/json" };
     const method = options.method ?? "GET";
-    if (method === "POST" && !this.csrfToken) {
-      throw new GrokPtahBrokerError(
-        0,
-        "csrf_required",
-        "A broker-issued CSRF token is required for mutating requests",
-      );
+    if (method === "POST") {
+      if (!this.csrfToken) {
+        throw new GrokPtahBrokerError(
+          0,
+          "csrf_required",
+          "A broker-issued CSRF token is required for mutating requests",
+        );
+      }
+      if (!options.idempotencyKey?.trim()) {
+        throw new GrokPtahBrokerError(
+          0,
+          "idempotency_required",
+          "A non-empty idempotency key is required for mutating requests",
+        );
+      }
     }
     if (options.body !== undefined) headers["Content-Type"] = "application/json";
-    if (options.idempotencyKey) headers["Idempotency-Key"] = options.idempotencyKey;
+    if (options.idempotencyKey) headers["Idempotency-Key"] = options.idempotencyKey.trim();
     if (method === "POST" && this.csrfToken) headers["X-CSRF-Token"] = this.csrfToken;
     const response = await this.fetcher(`${this.apiUrl}${path}`, {
       method,
@@ -309,9 +320,11 @@ async function throwBrokerError(response: Response): Promise<never> {
   }
   throw new GrokPtahBrokerError(
     response.status,
-    typeof body.code === "string" ? body.code : "http_error",
-    typeof body.message === "string" ? body.message : `Broker request failed with HTTP ${response.status}`,
-    typeof body.requestId === "string" ? body.requestId : undefined,
+    typeof body.code === "string" ? body.code.slice(0, 128) : "http_error",
+    typeof body.message === "string"
+      ? body.message.slice(0, 512)
+      : `Broker request failed with HTTP ${response.status}`,
+    typeof body.requestId === "string" ? body.requestId.slice(0, 256) : undefined,
   );
 }
 
@@ -369,6 +382,9 @@ function parseNotification(frame: string, brokerRunId: string): GrokPtahBrokerNo
     typeof body.reason === "string" &&
     typeof body.pollRoute === "string"
   ) {
+    if (!isRelativeRoute(body.pollRoute)) {
+      throw new Error("Broker recovery route must be relative to the broker origin");
+    }
     return {
       kind: "recovery",
       brokerRunId,
@@ -378,6 +394,15 @@ function parseNotification(frame: string, brokerRunId: string): GrokPtahBrokerNo
     };
   }
   throw new Error("Broker SSE notification kind is unknown");
+}
+
+function isRelativeRoute(route: string): boolean {
+  if (!route.startsWith("/") || route.startsWith("//")) return false;
+  try {
+    return new URL(route, "http://grokptah.invalid").origin === "http://grokptah.invalid";
+  } catch {
+    return false;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, any> {

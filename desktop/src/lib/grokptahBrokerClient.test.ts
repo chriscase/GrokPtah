@@ -49,6 +49,19 @@ describe("GrokPtahBrokerClient", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("requires a non-empty idempotency key for every mutation", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    await expect(client.submitRun("binding-1", { prompt: "review" }, "  ")).rejects.toMatchObject({
+      code: "idempotency_required",
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("maps stable broker errors without exposing a privileged body", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
       jsonResponse(
@@ -93,5 +106,26 @@ describe("GrokPtahBrokerClient", () => {
     }
     expect(notifications.map((notification) => notification.kind)).toEqual(["event", "recovery"]);
     expect(String(fetcher.mock.calls[0][0])).toContain("/bindings/binding-1/runs/run-1/events");
+  });
+
+  it("rejects an external recovery route", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'data: {"kind":"recovery","brokerRunId":"run-1","afterSeq":4,"reason":"gap","pollRoute":"https://evil.example/recover"}\n\n',
+        ));
+        controller.close();
+      },
+    });
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    );
+    const client = new GrokPtahBrokerClient({ baseUrl: "https://contextdesk.example", fetcher });
+    const read = async () => {
+      for await (const _notification of client.streamEvents("binding-1", "run-1")) {
+        // The invalid route must fail before yielding a recovery instruction.
+      }
+    };
+    await expect(read()).rejects.toThrow("relative");
   });
 });

@@ -154,6 +154,73 @@ describe("GrokPtahClient", () => {
     });
   });
 
+  it("parses typed safe errors returned over HTTP 4xx", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        response(
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            result: {
+              protocolVersion: "2025-03-26",
+              serverInfo: {
+                capabilityContract: {
+                  contract: CAPABILITY_CONTRACT,
+                  capabilities: [],
+                },
+              },
+            },
+          },
+          200,
+          { "mcp-session-id": "transport-1" },
+        ),
+      )
+      .mockResolvedValueOnce(response(null, 202))
+      .mockResolvedValueOnce(
+        response(
+          {
+            jsonrpc: "2.0",
+            id: 2,
+            error: {
+              code: -32000,
+              message: "safe stale response",
+              data: { code: "stale_or_recovery", requestId: "req-2", secret: "drop" },
+            },
+          },
+          409,
+        ),
+      );
+    const client = new GrokPtahClient({
+      baseUrl: "http://127.0.0.1:39200/mcp",
+      token: "secret",
+      fetcher,
+    });
+    await client.initialize();
+    await expect(client.callTool("ptah_get_run", {})).rejects.toMatchObject({
+      name: "GrokPtahRemoteError",
+      code: "stale_or_recovery",
+      requestId: "req-2",
+    });
+  });
+
+  it("rejects mismatched RPC response ids", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      response({
+        jsonrpc: "2.0",
+        id: 99,
+        result: { protocolVersion: "2025-03-26" },
+      }),
+    );
+    const client = new GrokPtahClient({
+      baseUrl: "http://127.0.0.1:39200/mcp",
+      token: "secret",
+      fetcher,
+    });
+    await expect(client.initialize()).rejects.toThrow("correlation");
+    expect(client.transportSessionId).toBeNull();
+  });
+
   it("replays scoped SSE events and stops at an explicit recovery frame", async () => {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {

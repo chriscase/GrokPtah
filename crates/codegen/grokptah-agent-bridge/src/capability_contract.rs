@@ -33,7 +33,7 @@ pub fn advertised_capabilities() -> CapabilitySet {
             description: "List sessions and bounded orchestration capacity.".into(),
         });
     }
-    if has("ptah_submit_task") && has("ptah_cancel") {
+    if has("ptah_submit_task") && has("ptah_retry_run") && has("ptah_cancel") {
         capabilities.push(CapabilityDescriptor {
             id: "run.execute".into(),
             tier: CapabilityTier::Execute,
@@ -62,7 +62,11 @@ pub fn advertised_capabilities() -> CapabilitySet {
             description: "Inspect and mutate a session's versioned prompt queue.".into(),
         });
     }
-    if has("ptah_get_changes") && has("ptah_get_test_results") && has("ptah_get_handoff") {
+    if has("ptah_get_changes")
+        && has("ptah_get_test_results")
+        && has("ptah_get_handoff")
+        && has("ptah_review_run")
+    {
         capabilities.push(CapabilityDescriptor {
             id: "run.review".into(),
             tier: CapabilityTier::Review,

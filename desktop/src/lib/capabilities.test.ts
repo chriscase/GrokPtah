@@ -43,6 +43,24 @@ describe("capability discovery", () => {
         capabilities: [{ ...payload.capabilities[0], tier: "admin" }],
       }),
     ).toBeNull();
+    expect(
+      parseCapabilitySet({
+        ...payload,
+        capabilities: [{ ...payload.capabilities[0], unexpected: true }],
+      }),
+    ).toBeNull();
+    expect(
+      parseCapabilitySet({
+        ...payload,
+        capabilities: [{ ...payload.capabilities[0], id: "Run.Execute" }],
+      }),
+    ).toBeNull();
+    expect(
+      parseCapabilitySet({
+        ...payload,
+        capabilities: [payload.capabilities[0], payload.capabilities[0]],
+      }),
+    ).toBeNull();
   });
 
   it("keeps gated controls visible but disabled until approval", () => {
