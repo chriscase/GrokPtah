@@ -9,9 +9,9 @@ cleanup result.
 
 ## Exact candidate
 
-- Source bundle: `/private/tmp/grokptah-cu-isolated-visual-v1.bundle`
-- Bundle SHA-256: `5281f6992189d802f0bfd25027fa3eea82b23a68c6f9c6a7e6448cc6fb0bb2ed`
-- Source cutoff: `3a88fb41e29a55aeabb54defe82761b129b6ab11`
+- Source bundle: `/private/tmp/grokptah-cu-isolated-visual-v2.bundle`
+- Bundle SHA-256: `62ab183b23d76c60b573684d6829817c3ae1791d2b59b453f9cd8c2936db79ce`
+- Source cutoff: `4ea37f3a223f74817f629f0b844c76d4916b895c`
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
 - Docs-only handoff checkpoint (contains the evidence verifier): `e35318c55193f31547bd001a30c6a6eeebaf827d`
 - Main checkout must remain untouched at `6409645cb7d0fe6d75585f0610366340f808b8ec`.
@@ -26,9 +26,9 @@ Use only the exact source bundle and SHA below. Create a disposable checkout; do
 developer checkout, existing app sessions, Git branches, or GitHub. Do not infer a VM capability
 from source tests, a Linux image comparison, package signing, or launchAttempted=false.
 
-Bundle: /private/tmp/grokptah-cu-isolated-visual-v1.bundle
-Bundle SHA-256: 5281f6992189d802f0bfd25027fa3eea82b23a68c6f9c6a7e6448cc6fb0bb2ed
-Source cutoff: 3a88fb41e29a55aeabb54defe82761b129b6ab11
+Bundle: /private/tmp/grokptah-cu-isolated-visual-v2.bundle
+Bundle SHA-256: 62ab183b23d76c60b573684d6829817c3ae1791d2b59b453f9cd8c2936db79ce
+Source cutoff: 4ea37f3a223f74817f629f0b844c76d4916b895c
 
 Before any build, report macOS version/build, Virtualization.framework availability, signing
 identity fingerprint (never private material), free disk, active cargo/rustc processes, intended
@@ -80,8 +80,7 @@ launch remains **NOT QUALIFIED**.
 
 After the campaign, run `docs/verify-isolated-runtime-evidence.sh` from the docs-only handoff
 checkpoint (`e35318c…`) or another checkout that contains that exact script. The immutable source
-bundle intentionally stops at `3a88fb4…`; the verifier is a later documentation-only aid and its
-absence from the source bundle must not be treated as a qualification failure or success. Then
-update `ROADMAP_TO_100.md`, `CAPABILITY_MATRIX.md`, and
+bundle is the current candidate at `4ea37f3…`; the verifier is a source-level evidence aid and
+must not be treated as a VM qualification result. Then update `ROADMAP_TO_100.md`, `CAPABILITY_MATRIX.md`, and
 `COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md` together. Do not change an unsupported or planned
 status based on this handoff alone.

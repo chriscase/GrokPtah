@@ -6,13 +6,18 @@ Computer Use backend or satisfy the #288 release gate.
 ## Candidate identity
 
 - Branch: `codex/cu-isolated-guest-bootstrap-v1`
-- Source head at evidence cutoff: `3a88fb41e29a55aeabb54defe82761b129b6ab11`
-- Bundle: `/private/tmp/grokptah-cu-isolated-visual-v1.bundle`
-- Bundle SHA-256: `5281f6992189d802f0bfd25027fa3eea82b23a68c6f9c6a7e6448cc6fb0bb2ed`
+- Source head at evidence cutoff: `4ea37f3a223f74817f629f0b844c76d4916b895c`
+- Bundle: `/private/tmp/grokptah-cu-isolated-visual-v2.bundle`
+- Bundle SHA-256: `62ab183b23d76c60b573684d6829817c3ae1791d2b59b453f9cd8c2936db79ce`
 - Bundle verification: complete history; `git bundle verify` passed.
 - Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
 
-Current bundled source head: `3a88fb41e29a55aeabb54defe82761b129b6ab11`.
+Current bundled source head: `4ea37f3a223f74817f629f0b844c76d4916b895c`.
+
+The earlier v1 bundle remains retained as historical source-only evidence:
+`/private/tmp/grokptah-cu-isolated-visual-v1.bundle` (cutoff
+`3a88fb41e29a55aeabb54defe82761b129b6ab11`). It must not be used for a new
+qualification campaign now that the candidate contains later security fixes.
 
 The later guest-input validation extension is sealed at:
 
