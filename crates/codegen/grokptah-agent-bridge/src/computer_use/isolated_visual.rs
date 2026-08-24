@@ -358,10 +358,14 @@ impl IsolatedVisualLifecycle {
     /// not claim the process or handles are absent; exact cleanup evidence is
     /// still mandatory.
     pub fn require_cleanup(&mut self) -> ComputerResult<()> {
-        self.transition(
-            IsolatedVisualLifecycleState::Stopping,
-            IsolatedVisualLifecycleState::CleanupPending,
-        )
+        if self.state != IsolatedVisualLifecycleState::Stopping
+            || self.terminal_disposition.is_none()
+        {
+            return Err(invalid_transition());
+        }
+        self.state = IsolatedVisualLifecycleState::CleanupPending;
+        self.bump_revision();
+        Ok(())
     }
 
     /// Reopening a nonterminal lifecycle always interrupts it and requires
