@@ -269,6 +269,9 @@ The kernel-source download-size cap extension is sealed at:
 - Pinned kernel-source fetching now rejects non-HTTPS redirects, bounds connect
   and transfer time/size, verifies the locked digest before publication, and
   moves the verified tarball atomically into its final path.
+- Helper compilation now uses a per-build disposable Clang module cache rather
+  than a shared mutable cache, preventing concurrent qualification lanes from
+  reusing stale compiler-module state.
 - Package assembly also requires the exact GrokPtah bundle identifier and
   matching signed team identity for the helper and outer app; a misidentified
   or cross-team artifact fails before it can be used as a runtime candidate.

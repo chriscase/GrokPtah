@@ -27,12 +27,14 @@ fi
 
 script_dir=$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd -P)
 temporary=$(mktemp "$output_parent/.grokptah-isolated-helper.XXXXXX")
+module_cache=$(mktemp -d /private/tmp/grokptah-clang-module-cache.XXXXXX)
 cleanup() {
   rm -f -- "$temporary"
+  rm -rf -- "$module_cache"
 }
 trap cleanup EXIT HUP INT TERM
 
-CLANG_MODULE_CACHE_PATH=/private/tmp/grokptah-clang-module-cache
+CLANG_MODULE_CACHE_PATH="$module_cache"
 export CLANG_MODULE_CACHE_PATH
 xcrun clang \
   -fobjc-arc \
