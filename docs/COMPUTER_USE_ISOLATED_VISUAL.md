@@ -210,10 +210,13 @@ available.
    now defines the transport-independent, read-only protocol core: a non-serializable/redacted
    32-byte channel key authenticates the exact protocol version, Run, surface incarnation, message
    and frame sequences, zero input sequence, one outstanding request nonce, encoded payload length,
-   and closed observe/frame-metadata/health/failure/stop/shutdown-ack payload. Tamper, replay,
-   wrong-secret, wrong-nonce, input, oversized-frame, and unknown-field paths fail closed. The
-   helper/guest bootstrap handshake is now wired, but no carrier, frame-byte transfer, guest
-   application agent, or renderer exists yet, so this is not transport or isolation proof.
+   and closed observe/frame-metadata/health/failure/stop/shutdown-ack payload. It also defines a
+   separate authenticated binary guest-to-host frame-chunk carrier with bounded 64 KiB chunks,
+   whole-frame SHA-256, exact offsets, and strict reassembly. Tamper, replay, wrong-secret,
+   wrong-nonce, input, oversized-frame, reordered-chunk, digest-mismatch, and unknown-field paths
+   fail closed. The helper/guest bootstrap handshake and source carrier are present, but the
+   socket loop, guest application capture, and renderer are not wired yet, so this is not runtime
+   transport or isolation proof.
 5. Add guest pointer state and one-action local approval; then key/text/scroll/drag independently.
 6. Integrate app-owned cursor, focus/drag preview, timeline, persistent emergency controls, and
    accessibility states in the cockpit.

@@ -35,6 +35,13 @@ typedef unsigned long gpt_size;
 #define GPT_ISOLATED_HELPER_CONTROL_START 1U
 #define GPT_ISOLATED_HELPER_CONTROL_STOP 2U
 
+/* Authenticated guest-to-host frame chunks. Input is intentionally absent. */
+#define GPT_ISOLATED_VISUAL_FRAME_MAGIC 0x47505446U
+#define GPT_ISOLATED_VISUAL_FRAME_VERSION 1U
+#define GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES 100U
+#define GPT_ISOLATED_VISUAL_FRAME_TAG_BYTES 32U
+#define GPT_ISOLATED_VISUAL_FRAME_CHUNK_BYTES 65536U
+
 typedef struct __attribute__((packed)) {
     gpt_u32 magic;
     gpt_u16 version;
@@ -46,6 +53,26 @@ typedef struct __attribute__((packed)) {
 _Static_assert(
     sizeof(gpt_isolated_helper_event) == GPT_ISOLATED_HELPER_EVENT_BYTES,
     "unexpected isolated helper event layout");
+
+typedef struct __attribute__((packed)) {
+    gpt_u32 magic;
+    gpt_u16 version;
+    gpt_u16 protocol_version;
+    gpt_u64 frame_sequence;
+    gpt_u8 request_nonce[16];
+    gpt_u32 chunk_index;
+    gpt_u32 chunk_count;
+    gpt_u64 total_bytes;
+    gpt_u64 offset;
+    gpt_u32 width;
+    gpt_u32 height;
+    gpt_u8 content_sha256[32];
+    gpt_u32 chunk_bytes;
+} gpt_isolated_visual_frame_header;
+
+_Static_assert(
+    sizeof(gpt_isolated_visual_frame_header) == GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES,
+    "unexpected isolated visual frame header layout");
 
 typedef struct {
     gpt_u32 state[8];

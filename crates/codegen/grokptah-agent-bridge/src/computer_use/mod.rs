@@ -15,6 +15,7 @@
 mod coordination;
 mod isolated_visual;
 mod isolated_visual_artifacts;
+mod isolated_visual_frames;
 mod isolated_visual_helper;
 mod isolated_visual_protocol;
 #[cfg(target_os = "macos")]
@@ -43,6 +44,11 @@ pub use isolated_visual_artifacts::{
     IsolatedVisualPackagedArtifactReceipt, ISOLATED_VISUAL_APP_BUNDLE_IDENTIFIER,
     ISOLATED_VISUAL_HELPER_SIGNING_IDENTIFIER, ISOLATED_VISUAL_MAX_CONFIGURATION_BYTES,
     ISOLATED_VISUAL_MAX_GUEST_IMAGE_BYTES, ISOLATED_VISUAL_MAX_HELPER_BYTES,
+};
+pub use isolated_visual_frames::{
+    IsolatedVisualFrame, IsolatedVisualFrameCarrier, IsolatedVisualFrameChunk,
+    ISOLATED_VISUAL_FRAME_CHUNK_BYTES, ISOLATED_VISUAL_FRAME_HEADER_BYTES,
+    ISOLATED_VISUAL_FRAME_MAGIC, ISOLATED_VISUAL_FRAME_TAG_BYTES, ISOLATED_VISUAL_FRAME_VERSION,
 };
 pub use isolated_visual_helper::{
     IsolatedVisualHelperEvent, IsolatedVisualHelperEventCode, IsolatedVisualHelperFailure,

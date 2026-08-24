@@ -18,6 +18,12 @@ int main(void) {
         fputs("helper event ABI self-test failed\n", stderr);
         return 1;
     }
+    if (sizeof(gpt_isolated_visual_frame_header) != GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES ||
+        GPT_ISOLATED_VISUAL_FRAME_TAG_BYTES != 32U ||
+        GPT_ISOLATED_VISUAL_FRAME_CHUNK_BYTES != 65536U) {
+        fputs("isolated visual frame ABI self-test failed\n", stderr);
+        return 1;
+    }
 
     static const gpt_u8 expected_hmac[32] = {
         0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53,

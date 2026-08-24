@@ -8,6 +8,7 @@ fi
 
 script_dir=$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd -P)
 guest_source="$script_dir/guest-init.c"
+protocol_header="$script_dir/protocol.h"
 fragment="$script_dir/kernel.config.fragment"
 lock="$script_dir/guest-source.lock.json"
 work=$(mktemp -d /private/tmp/grokptah-guest-source-proof.XXXXXX)
@@ -57,5 +58,10 @@ for forbidden in AF_INET execve '/bin/sh' mount ptrace; do
 done
 for required in GPT_AF_VSOCK GPT_GUEST_BOOTSTRAP_PORT GPT_SYS_REBOOT GPT_SYS_SOCKET; do
   grep -F "$required" "$guest_source" >/dev/null
+done
+for required in \
+  GPT_ISOLATED_VISUAL_FRAME_MAGIC GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES \
+  gpt_isolated_visual_frame_header; do
+  grep -F "$required" "$protocol_header" >/dev/null
 done
 printf 'isolated guest source, protocol, and closed kernel fragment: pass\n'

@@ -55,7 +55,8 @@ The helper performs a bounded challenge/response with the guest bootstrap agent 
 `running`, and requires an authenticated shutdown acknowledgement before terminal success. The
 guest agent—not the host pointer or clipboard—must eventually own framebuffer capture and guest-local
 input through the authenticated protocol documented in `docs/COMPUTER_USE_ISOLATED_VISUAL.md`;
-those carrier and input paths are not implemented here.
+the Rust candidate now includes a bounded authenticated guest-to-host frame-chunk carrier, but the
+helper/guest socket loop does not yet feed it, and no input path is enabled.
 
 ## Build and package boundaries
 
