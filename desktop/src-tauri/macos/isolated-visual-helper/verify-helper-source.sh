@@ -55,6 +55,7 @@ for required in \
 done
 for required in input_contents input_info_plist package_app output_contents output_resources \
   'realpath "$safe_dir"' 'mkdir "$resource_dir"' \
+  'input app already contains isolated resource directory' \
   'mv "$package_app" "$output_app"'; do
   grep -F "$required" "$script_dir/package-signed-app.sh" >/dev/null
 done

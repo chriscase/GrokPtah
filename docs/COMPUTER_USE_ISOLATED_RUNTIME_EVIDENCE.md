@@ -222,7 +222,9 @@ The staged-package publication extension is sealed at:
 - The package assembler rejects symlinked or non-canonical `Contents`,
   `Info.plist`, `MacOS`, and `Resources` paths before installing the helper,
   guest image, configuration, or manifest, and creates the isolated resource
-  directory only beneath those verified parents.
+  directory only beneath those verified parents. It also rejects an input app
+  that already contains an `isolated-visual` directory, preventing unrelated
+  files from entering the signed package.
 - Assembly and signing now happen under a disposable staging directory; the
   requested output path is published only after deep signature, identity, and
   entitlement checks pass, so a failed attempt cannot leave a partial app at

@@ -127,14 +127,11 @@ for safe_dir in "$output_contents" "$output_resources" "$macos_dir"; do
     exit 65
   fi
 done
-if [ -L "$resource_dir" ] ||
-   { [ -e "$resource_dir" ] && [ ! -d "$resource_dir" ]; }; then
-  echo "isolated resource directory is not a safe directory" >&2
+if [ -e "$resource_dir" ] || [ -L "$resource_dir" ]; then
+  echo "input app already contains isolated resource directory" >&2
   exit 65
 fi
-if [ ! -e "$resource_dir" ]; then
-  mkdir "$resource_dir"
-fi
+mkdir "$resource_dir"
 chmod 0755 "$resource_dir"
 if [ -L "$resource_dir" ] || [ "$(realpath "$resource_dir")" != "$resource_dir" ]; then
   echo "isolated resource directory must not be a symlink" >&2
