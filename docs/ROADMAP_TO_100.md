@@ -518,8 +518,11 @@ coordinator/worker slices
 Those first slices are **not** the independent long-running multi-worker 100%
 exit. Grokbot is not a binary. Unattended Computer Use is Explicitly
 unsupported. Certification-lab smoke checks that managed execution is
-**disabled by default**. No 72-hour soak report exists. The dream candidate
-now accepts externally managed, Agent-bound worker credentials, scopes them to
+**disabled by default**. No 72-hour soak report exists. The v51 public-run
+campaign is **NOT QUALIFIED**; the exact v52 repair/certification handoff is
+[`ALWAYS_ON_GROKBOT_V52_HANDOFF.md`](ALWAYS_ON_GROKBOT_V52_HANDOFF.md). The
+dream candidate now accepts externally managed, Agent-bound worker credentials,
+scopes them to
 the final service workspace allowlist, rejects token reuse, and has a real
 service-process harness that holds two independent worker leases across the
 manager crash fence, rotates both credentials, rejects both retired bearers,
