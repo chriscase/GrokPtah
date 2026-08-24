@@ -21,7 +21,7 @@ ownership does not make uncertain cleanup successful. A stale or failed stop
 cannot resume input or admit a replacement agent.
 
 Create a disposable checkout from the bundle and explicitly detach at
-`f561dd8`. Do not merge, push, rebase, undraft, create a PR, modify the
+`40730e4`. Do not merge, push, rebase, undraft, create a PR, modify the
 developer checkout, or alter any existing app/session/worktree. The bundle's
 default branch may be later than the frozen source commit; the explicit
 detached checkout is mandatory.
@@ -38,10 +38,14 @@ export CARGO_TARGET_DIR=/Users/chriscase/Library/Caches/grokptah/targets/rust-1.
 Reuse that target serially. Never create an in-checkout or per-agent target;
 report target ownership, open handles, and cleanup/retention afterward.
 
-Run, in order:
+Run, in order. The first two checks are intentionally inline so the exact
+source commit remains verifiable even when the optional local verifier script
+is not present in the detached source commit:
 
 ```sh
-bash docs/verify-packaged-lease-stop-failure-fence.sh
+git bundle verify /private/tmp/grokptah-packaged-lease-stop-failure-40730e4-v1.bundle
+test "$(git rev-parse --verify '40730e4^{commit}')" = \
+  40730e48ce96d077997874acc940ce91ca6497bb
 rustfmt --edition 2021 --check \
   crates/codegen/grokptah-agent-bridge/src/computer_use/macos_isolated_runtime.rs
 cargo metadata --locked --offline --no-deps --format-version=1 >/dev/null
