@@ -707,7 +707,9 @@ and a credentialed nested-signing assembler. The helper's closed inherited-descr
    while still opening no VSOCK and dispatching no packaged runtime. `IsolatedVisualHelperControl`
    binds inherited helper control/event descriptors to the coordinator without spawning a process.
    The freestanding guest now validates the authenticated length-bounded input ABI after binding,
-   but refuses input until a real captured frame establishes a freshness fence. Its source identity and safe-check record are captured in
+   captures a fixed `/dev/fb0` surface, and emits authenticated bounded frame chunks; the helper
+   relays those chunks over the private FD8 channel. Input still refuses admission until a reviewed
+   packaged capture establishes a freshness fence. Its source identity and safe-check record are captured in
    [`COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md`](COMPUTER_USE_ISOLATED_RUNTIME_EVIDENCE.md). See
 [`COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md). No VM,
 signed/built helper, guest image, packaged entitlement proof, or host-native dispatch exists yet, so these
