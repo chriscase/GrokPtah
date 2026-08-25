@@ -21,7 +21,7 @@ enough to close a stage.
 | 7. Semantic help | Searchable in-app help with contextual guidance and an optional assistant boundary | [Local Help Center contract](../desktop/src/lib/help.ts), permission-aware panel, bounded assistant context, focus trapping, Escape close, and focus restoration are implemented; expert corpus/assistant qualification remains | In progress |
 | 8. Embeddable platform | Stable Rust DTOs, desktop adapter, browser-safe broker, reusable UI primitives | [Cross-product ADR](./ADR-003-cross-product-capability-surface.md), [embedding guide](./EMBEDDING.md), [broker protocol](./WEB_BROKER_PROTOCOL.md), [SDK](../crates/common/grokptah-agent-sdk/README.md) | Contract, response-validation, headless UI, installable Tauri-free package staging, and a consumer smoke fixture (`b8338cc9`) are verified; publication and cross-repository integration remain |
 | 9. Independent qualification | Strongest-model code/security/UI review, cross-language conformance, soak, gateway, packaged-CU, and recovery evidence | [Independent review protocol](./INDEPENDENT_REVIEW_PROTOCOL.md) | Pending exact candidate head |
-| 10. Release and adoption | Versioned packages, examples, migration docs, reproducible builds, signed artifacts, release runbook | Packaging and hosted-service work remain separate release gates | Not started |
+| 10. Release and adoption | Versioned packages, examples, migration docs, reproducible builds, signed artifacts, release runbook | Public TypeScript package staging and packaging instructions exist; signed artifacts, hosted-service release, migration/changelog, and final runbook remain | In progress |
 
 ## The 100% exit gate
 
