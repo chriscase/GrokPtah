@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokptah:schema:launch:v1",
+  "title": "GrokPtah Grok Build launch truth",
+  "description": "Fail-closed, credential-free projection of everything a host must know before admitting a durable Grok Build run. Unknown, unrecognized, unparseable, and unprobed all refuse. No property here can carry a bearer, refresh token, API key, keychain reference, credential fingerprint, endpoint URL, hostname, account email, or display name.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "schemaVersion",
+    "provider",
+    "credentialMethod",
+    "refreshability",
+    "expiry",
+    "route",
+    "base",
+    "dialect",
+    "model",
+    "capabilities",
+    "readiness",
+    "reason"
+  ],
+  "properties": {
+    "contract": { "const": "grokptah.launch.v1" },
+    "schemaVersion": { "const": 1 },
+    "provider": { "$ref": "#/$defs/providerClass" },
+    "credentialMethod": { "$ref": "#/$defs/credentialMethod" },
+    "refreshability": { "$ref": "#/$defs/refreshability" },
+    "expiry": { "$ref": "#/$defs/expiry" },
+    "accountReference": { "$ref": "#/$defs/accountReference" },
+    "route": { "$ref": "#/$defs/routeClass" },
+    "base": { "$ref": "#/$defs/baseCategory" },
+    "dialect": { "$ref": "#/$defs/requestDialect" },
+    "model": { "$ref": "#/$defs/model" },
+    "capabilities": { "$ref": "#/$defs/capabilities" },
+    "readiness": { "$ref": "#/$defs/readiness" },
+    "reason": { "$ref": "#/$defs/reason" }
+  },
+  "$defs": {
+    "providerClass": {
+      "type": "string",
+      "enum": ["xai", "openai_compatible", "unrecognized"]
+    },
+    "credentialMethod": {
+      "type": "string",
+      "enum": [
+        "absent",
+        "api_key",
+        "token_command",
+        "provider_env",
+        "provider_keychain",
+        "grok_build_oidc",
+        "grok_build_api_key",
+        "unknown"
+      ]
+    },
+    "refreshability": {
+      "type": "string",
+      "enum": ["refreshable", "not_refreshable", "unknown"]
+    },
+    "routeClass": {
+      "type": "string",
+      "enum": ["xai_first_party", "compatible_provider", "unrecognized"]
+    },
+    "baseCategory": {
+      "description": "Category of the configured base endpoint. The endpoint itself is host configuration and may embed a private hostname, a tenant name, or a path secret, so it is never published.",
+      "type": "string",
+      "enum": [
+        "xai_official",
+        "compatible_https",
+        "compatible_loopback",
+        "unset",
+        "insecure_transport",
+        "malformed"
+      ]
+    },
+    "requestDialect": {
+      "type": "string",
+      "enum": ["xai_chat_completions", "openai_chat_completions", "unrecognized"]
+    },
+    "modelStatus": {
+      "type": "string",
+      "enum": ["selected", "not_selected", "unparseable", "route_mismatch", "not_offered"]
+    },
+    "capabilityProvenance": {
+      "type": "string",
+      "enum": ["measured", "declared", "unprobed"]
+    },
+    "readiness": {
+      "description": "Only `ready` permits admission. `blocked` is positive evidence a launch cannot succeed; `indeterminate` is a required fact that was never established. Both refuse.",
+      "type": "string",
+      "enum": ["ready", "blocked", "indeterminate"]
+    },
+    "reason": {
+      "description": "Closed, actionable vocabulary. Every blocking value names something an operator can do; there is deliberately no catch-all.",
+      "type": "string",
+      "enum": [
+        "resolved_with_future_expiry",
+        "resolved_api_key_no_expiry_claim",
+        "sign_in_required",
+        "reauthentication_required",
+        "refresh_failed",
+        "credential_revoked",
+        "credential_route_unrecognized",
+        "expiry_unparseable",
+        "expiry_not_established",
+        "provider_unrecognized",
+        "route_unrecognized",
+        "route_provider_mismatch",
+        "base_endpoint_unset",
+        "base_endpoint_insecure",
+        "base_endpoint_malformed",
+        "dialect_unrecognized",
+        "model_not_selected",
+        "model_selection_unparseable",
+        "model_route_mismatch",
+        "model_not_offered",
+        "capabilities_unprobed",
+        "chat_unsupported",
+        "refreshability_unknown"
+      ]
+    },
+    "accountReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "source"],
+      "properties": {
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        },
+        "source": { "type": "string", "enum": ["user_id", "principal_id", "team_id"] }
+      }
+    },
+    "modelReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value"],
+      "properties": {
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^(?!.*\\.\\.)[A-Za-z0-9](?:[A-Za-z0-9._:/-]*[A-Za-z0-9])?$"
+        }
+      }
+    },
+    "expiry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "type": "string", "enum": ["absent", "unparseable", "valid", "expired"] },
+        "expiresAt": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "secondsRemaining": { "type": "integer" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "$ref": "#/$defs/modelStatus" },
+        "selected": { "$ref": "#/$defs/modelReference" }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provenance",
+        "chat",
+        "tools",
+        "stream",
+        "parallelToolCalls",
+        "imageInput"
+      ],
+      "properties": {
+        "provenance": { "$ref": "#/$defs/capabilityProvenance" },
+        "chat": { "type": "boolean" },
+        "tools": { "type": "boolean" },
+        "stream": { "type": "boolean" },
+        "parallelToolCalls": { "type": "boolean" },
+        "imageInput": { "type": "boolean" }
+      }
+    }
+  }
+}

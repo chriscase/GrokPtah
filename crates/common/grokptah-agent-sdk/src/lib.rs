@@ -9,6 +9,8 @@
 
 /// Versioned, credential-free Grok Build account readiness facts.
 pub mod account;
+/// One provider attempt: what it was bound to, and whether it was sent.
+pub mod attempt;
 /// Versioned capability discovery types.
 pub mod capability;
 /// Lease- and revision-fenced Computer Use types.
@@ -17,6 +19,10 @@ pub mod computer;
 pub mod error;
 /// Provider-neutral contracts for external cloud or host-owned workers.
 pub mod external_worker;
+/// Fail-closed Grok Build launch truth.
+pub mod launch;
+/// Typed terminal outcomes for runs that could not succeed.
+pub mod outcome;
 /// Durable run, review, and event types.
 pub mod run;
 
@@ -28,6 +34,11 @@ pub use account::{
     CredentialMethod, CredentialSource, ExpiryFacts, ExpiryStatus, GROK_ACCOUNT_CONTRACT_VERSION,
     GROK_ACCOUNT_SCHEMA_VERSION, GrokAccountFacts, MAX_ACCOUNT_REFERENCE_BYTES, ReadinessReason,
     RunAttribution,
+};
+pub use attempt::{
+    AttemptIntent, AttemptRoute, AttemptSubject, AuthorityRevisions, BoundedId,
+    GROK_ATTEMPT_CONTRACT_VERSION, GROK_ATTEMPT_SCHEMA_VERSION, MAX_ATTEMPT_IDENTIFIER_BYTES,
+    ProviderAttempt, ProviderReceipts, Revision, SendState, UsageReceipt,
 };
 pub use capability::{CapabilityAvailability, CapabilityDescriptor, CapabilitySet, CapabilityTier};
 pub use computer::{
@@ -41,6 +52,13 @@ pub use external_worker::{
     ExternalWorkerLaunchResult, ExternalWorkerProvider, ExternalWorkerRecord,
     ExternalWorkerRunRecord, ExternalWorkerState,
 };
+pub use launch::{
+    BaseCategory, CapabilityFacts, CapabilityProvenance, GROK_LAUNCH_CONTRACT_VERSION,
+    GROK_LAUNCH_SCHEMA_VERSION, GrokLaunchTruth, LaunchObservation, LaunchReadiness, LaunchReason,
+    LaunchRequirement, MAX_MODEL_REFERENCE_BYTES, ModelFacts, ModelReference, ModelStatus,
+    ProviderClass, Refreshability, RequestDialect, RouteClass,
+};
+pub use outcome::{RunFailureKind, RunOutcomeClass, TerminalVerdict};
 pub use run::{
     Bounds, ChangedFile, DurableRun, DurableRunState, ExecutionMode, IdempotencyKey, ReviewReceipt,
     RunEvent, RunEventPage, RunNotification, RunScope, SubmitTaskRequest,

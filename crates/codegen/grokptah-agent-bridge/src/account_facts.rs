@@ -95,6 +95,28 @@ fn project_resolved_route(
     GrokAccountFacts::project(source, &observation, now_unix)
 }
 
+/// Project account readiness facts for an already-resolved credential.
+///
+/// [`grok_account_facts`] answers for the *built-in xAI* route, which is the
+/// only one the signed-in badge describes. A launch may run against a
+/// compatible provider profile instead, and that credential is resolved from
+/// the model selection rather than from the xAI profile — so the launch
+/// projection resolves it once and hands the result here, instead of asking
+/// this module to resolve a second, possibly different, credential.
+pub(crate) fn account_facts_for_resolved_route(
+    credentials: &WireCredentials,
+    now_unix: i64,
+) -> GrokAccountFacts {
+    if credentials.method.starts_with(GROK_BUILD_METHOD_PREFIX) {
+        // Same reason as `grok_account_facts`: chrono has already folded an
+        // unparseable stamp into `None`, and "unreadable" is not "absent".
+        if let Some(document) = read_auth_json() {
+            return GrokAccountFacts::from_auth_json(&document, now_unix);
+        }
+    }
+    project_resolved_route(credentials, env_api_key_present(), now_unix)
+}
+
 /// Whether the host should permit a *new* Grok Build launch right now.
 pub fn permits_new_launch(now_unix: i64) -> bool {
     grok_account_facts(now_unix).permits_launch()

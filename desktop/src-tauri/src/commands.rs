@@ -531,11 +531,16 @@ pub fn session_set_cwd(
 }
 
 /// Set the execution policy for future Build turns in one session.
+///
+/// `acknowledge_unsafe` is optional and defaults to *not* acknowledged, so a
+/// caller that omits it can never opt into shared execution by accident on a
+/// workspace that could have been isolated.
 #[tauri::command]
 pub fn session_set_execution_mode(
     state: State<'_, AppState>,
     session_id: String,
     mode: String,
+    acknowledge_unsafe: Option<bool>,
 ) -> Result<SessionSummary, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     let mode = match mode.trim().to_ascii_lowercase().as_str() {
@@ -545,7 +550,7 @@ pub fn session_set_execution_mode(
     };
     state
         .host
-        .session_set_execution_mode(id, mode)
+        .session_set_execution_mode(id, mode, acknowledge_unsafe.unwrap_or(false))
         .map_err(map_err)
 }
 
