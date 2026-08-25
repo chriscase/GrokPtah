@@ -376,13 +376,19 @@ function validateApprovalRequest(request: GrokPtahBrokerApprovalRequest): void {
     typeof request.sourceFingerprint !== "string" ||
     typeof request.finalFingerprint !== "string" ||
     !request.sourceFingerprint.trim() ||
-    !request.finalFingerprint.trim() ||
-    !Array.isArray(request.changedFiles)
+    !request.finalFingerprint.trim()
   ) {
     throw new GrokPtahBrokerError(
       0,
       "invalid_request",
       "Approval fingerprints must not be empty",
+    );
+  }
+  if (!Array.isArray(request.changedFiles)) {
+    throw new GrokPtahBrokerError(
+      0,
+      "invalid_request",
+      "Approval changed files must be an array",
     );
   }
   if (
