@@ -6572,15 +6572,15 @@ mod tests {
         };
         for mutant in [
             AlwaysOnCardinality {
-                work: 5,
+                work: 6,
                 ..expected
             },
             AlwaysOnCardinality {
-                runs: 5,
+                runs: 6,
                 ..expected
             },
             AlwaysOnCardinality {
-                intents: 4,
+                intents: 5,
                 ..expected
             },
         ] {
