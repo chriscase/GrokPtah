@@ -1711,9 +1711,11 @@ async fn always_on_home_b(
     let pre_plan_steps = pre_plan["plan"]["steps"].clone();
     let pre_plan_hash = plan_identity_hash(&pre_plan);
     let pid0 = service.pid();
+    probe.push_trace(TraceOperationCode::Disconnect, vec![], None)?;
     drop(client);
     probe.observe_action(ProbeAction::DisconnectClient);
     probe.reconnect.attempted = true;
+    probe.push_trace(TraceOperationCode::Restart, vec![], None)?;
     probe.observe_action(ProbeAction::RestartService);
     probe.restart.attempted = true;
     probe.restart.host_owned = true;
@@ -1728,6 +1730,7 @@ async fn always_on_home_b(
     if service.pid() == pid0 {
         return Err(DiagnosticCode::RestartRecoveryFailed);
     }
+    probe.push_trace(TraceOperationCode::Reconnect, vec![], None)?;
     client = service
         .client()
         .await
@@ -1782,7 +1785,9 @@ async fn always_on_home_b(
         return Err(DiagnosticCode::RestartRecoveryFailed);
     }
     let pid1 = service.pid();
+    probe.push_trace(TraceOperationCode::Disconnect, vec![], None)?;
     drop(client);
+    probe.push_trace(TraceOperationCode::Restart, vec![], None)?;
     probe.counters.restarts = probe
         .counters
         .restarts
@@ -1794,6 +1799,7 @@ async fn always_on_home_b(
     if service.pid() == pid1 || service.pid() == pid0 {
         return Err(DiagnosticCode::RestartRecoveryFailed);
     }
+    probe.push_trace(TraceOperationCode::Reconnect, vec![], None)?;
     client = service
         .client()
         .await
@@ -6444,6 +6450,23 @@ mod tests {
         assert_eq!(
             execution.result.diagnostics,
             vec![DiagnosticCode::ProbeImplementationUnavailable]
+        );
+    }
+
+    #[test]
+    fn process_service_lifecycle_failure_remains_a_hard_failure() {
+        let diagnostic =
+            process_service_spawn_diagnostic(anyhow::anyhow!("spawn grokptah-service failed"));
+        assert_eq!(diagnostic, DiagnosticCode::RestartControlUnavailable);
+        let manifest = CampaignManifest::bundled().unwrap();
+        let definition = manifest
+            .probe("always-on-grokbot-lifecycle-v1")
+            .expect("manifest always-on probe");
+        let execution = ProbeBuilder::new(definition).finish(ProbeStatus::Failed, diagnostic);
+        assert_eq!(execution.result.status, ProbeStatus::Failed);
+        assert_eq!(
+            execution.result.failure_class,
+            crate::report::FailureClass::Oracle
         );
     }
 
