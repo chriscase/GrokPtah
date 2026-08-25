@@ -1421,14 +1421,21 @@ mod tests {
         assert_eq!(launch.run.state, ExternalWorkerState::Provisioning);
         assert_eq!(launch.run.stream, ExternalWorkerStreamState::Unsupported);
         assert_eq!(launch.run.last_seq, None);
-        {
+        let (sent_len, starting_ref, auto_create_pr, missing_env, missing_agent_id) = {
             let sent = state.launch_requests.lock().unwrap();
-            assert_eq!(sent.len(), 1);
-            assert_eq!(sent[0]["repos"][0]["startingRef"], "main");
-            assert_eq!(sent[0]["autoCreatePR"], false);
-            assert!(sent[0].get("env").is_none());
-            assert!(sent[0].get("agentId").is_none());
-        }
+            (
+                sent.len(),
+                sent[0]["repos"][0]["startingRef"].clone(),
+                sent[0]["autoCreatePR"].clone(),
+                sent[0].get("env").is_none(),
+                sent[0].get("agentId").is_none(),
+            )
+        };
+        assert_eq!(sent_len, 1);
+        assert_eq!(starting_ref, "main");
+        assert_eq!(auto_create_pr, false);
+        assert!(missing_env);
+        assert!(missing_agent_id);
 
         let worker = adapter
             .get_worker(&launch.worker.external_agent_id)
