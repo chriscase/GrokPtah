@@ -227,11 +227,12 @@ async function main() {
       tail.result?.cursorExpired === false,
   );
 
-  // Stale cursor: below the retained ring is a hard 410. eventRange rides
-  // the error so recovery does not require a second get.
+  // Stale cursor: below the retained ring is a hard 410. Public taxonomy is
+  // stale_or_recovery with reasonCode=cursor_expired; eventRange rides the
+  // error so recovery does not require a second get.
   const stale = await tool(61, "ptah_get_computer_run_events", callArgs({ run_id: runC, after_seq: 0 }), { session: sid });
   check(
-    "cursor below retention is 410 cursor_expired",
+    "cursor below retention is 410 stale_or_recovery/cursor_expired",
     stale.status === 410 &&
       stale.body?.error?.data?.code === "stale_or_recovery" &&
       stale.body?.error?.data?.reasonCode === "cursor_expired",
