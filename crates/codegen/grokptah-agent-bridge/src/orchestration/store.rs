@@ -181,6 +181,7 @@ impl OrchStore {
             .map(|record| record.run_id.clone())
             .collect();
         *store.inner.recovered_admissions.lock() = Some(recovered);
+        store.retire_lost_queued_runs(&survivors)?;
         store.mark_unfinished_interrupted_excluding(&survivors)?;
         store.fail_orphaned_idempotency_claims()?;
         // Cleanup is best-effort at the record level, but directory access
@@ -937,7 +938,15 @@ impl OrchStore {
                 OrchErrorCode::Conflict,
                 "admission already exists for this run",
             )),
-            Err(error) => Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+            Err(error) => {
+                // A short write or a failed fsync can leave a partial record
+                // on disk. The caller is about to be told the submission
+                // failed, so remove it: a half-written admission must never
+                // be something a later recovery has to reason about.
+                let _ = fs::remove_file(&path);
+                *self.inner.last_run_error.lock() = Some(error.to_string());
+                Err(OrchError::new(OrchErrorCode::Internal, error.to_string()))
+            }
         }
     }
 
@@ -1388,11 +1397,15 @@ impl OrchStore {
             }
             let parsed = fs::read_to_string(&path)
                 .ok()
-                .and_then(|text| serde_json::from_str::<AdmissionRecord>(&text).ok())
-                .filter(|record| record.integrity_ok() && record.validate().is_ok());
-            let Some(record) = parsed else {
+                .and_then(|text| serde_json::from_str::<AdmissionRecord>(&text).ok());
+            let trusted = parsed
+                .as_ref()
+                .is_some_and(|record| record.integrity_ok() && record.validate().is_ok());
+            let Some(record) = parsed.filter(|_| trusted) else {
                 // Never execute a record whose bytes cannot be trusted, and
-                // never delete the evidence either.
+                // never delete the evidence either. When the record still
+                // parses we know which run it belonged to, so that run can be
+                // told what happened instead of failing anonymously.
                 self.inner
                     .admission_integrity_failures
                     .fetch_add(1, atomic::Ordering::Relaxed);
@@ -1446,6 +1459,35 @@ impl OrchStore {
             .recovered_admissions_total
             .store(recovered.len() as u64, atomic::Ordering::Relaxed);
         Ok(recovered)
+    }
+
+    /// Retire every queued run whose executable input did not survive.
+    ///
+    /// This is the complement of the recovered queue, so it covers both
+    /// shapes at once: a record that recovery retired (uncertain, tampered,
+    /// already consumed) and a record that was never written or is simply
+    /// gone. `admission_lost` is deliberately distinct from a plain restart
+    /// `interrupted`: it is the marker the replay path checks before it is
+    /// allowed to hand a client back a `queued` result the ledger can no
+    /// longer honour.
+    fn retire_lost_queued_runs(&self, survivors: &HashSet<String>) -> anyhow::Result<usize> {
+        let mut retired = 0;
+        for mut run in self.list_runs()? {
+            if run.state != RunState::Queued || survivors.contains(&run.run_id) {
+                continue;
+            }
+            run.state = RunState::Interrupted;
+            run.queue_position = None;
+            run.terminal_result = Some("interrupted".into());
+            run.error_code = Some("admission_lost".into());
+            run.updated_at = Utc::now();
+            if let Some(execution) = run.execution.as_mut() {
+                execution.promotion_state = PromotionState::Conflicted;
+            }
+            self.save_run(&run)?;
+            retired += 1;
+        }
+        Ok(retired)
     }
 
     /// Whether the caller was durably told this request was accepted. Only a

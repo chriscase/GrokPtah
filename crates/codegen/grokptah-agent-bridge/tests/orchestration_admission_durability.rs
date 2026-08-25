@@ -1239,3 +1239,439 @@ async fn second_supervisor_on_the_same_ledger_adopts_nothing() {
     drop(second);
     drop(first);
 }
+
+// ── durable-write failure must never settle a receipt ──────────────────
+
+/// Replace the admissions directory with a regular file so every create,
+/// write and fsync under it returns a real `io::Error` — the same boundary
+/// ENOSPC, a short write, or a failed fsync would fail at.
+fn break_admissions_dir(root: &Path) {
+    let dir = root.join("admissions");
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::write(&dir, b"not a directory").unwrap();
+}
+
+fn repair_admissions_dir(root: &Path) {
+    let dir = root.join("admissions");
+    std::fs::remove_file(&dir).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+}
+
+fn admission_files(root: &Path) -> usize {
+    std::fs::read_dir(root.join("admissions"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("json"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// The core honesty invariant: if the executable input cannot be made
+/// durable, the submission fails and its receipt settles `failed`. A later
+/// retry replays that failure — it can never turn into a success.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn admission_write_failure_never_settles_the_receipt() {
+    let (home, _guard) = setup_home();
+    let root = home.path().join("orch");
+    let ws = tempdir().unwrap();
+    let host = started_host();
+    host.set_project_cwd(ws.path()).unwrap();
+    let blocker = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(blocker.id, ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    host.reserve_orchestration_turn("capacity-blocker", blocker.id)
+        .unwrap();
+
+    let store = OrchStore::open(&root).unwrap();
+    let orch = service_on(&host, store.clone(), ws.path(), 1);
+    let auth = orch.auth_header(Some(&format!("Bearer {BEARER}"))).unwrap();
+
+    break_admissions_dir(&root);
+    let refused = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "enospc-1",
+            session.id,
+            ws.path(),
+            "work that cannot be made durable".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await;
+    let error = refused.expect_err("a submission that cannot persist must not report accepted");
+
+    let receipt = store
+        .load_idempotency("enospc-1")
+        .unwrap()
+        .expect("the claim must still be settled, not left pending");
+    assert_eq!(
+        receipt.status, "failed",
+        "a receipt must never say complete for work the ledger could not persist"
+    );
+    assert_ne!(receipt.response["state"], "queued");
+
+    let run_id = receipt
+        .run_id
+        .clone()
+        .expect("the failed receipt must still name the run it created");
+    let run = store.load_run(&run_id).unwrap().expect("run record");
+    assert!(
+        run.state.is_terminal(),
+        "a run whose admission could not persist must fail closed, got {:?}",
+        run.state
+    );
+    let _ = &error;
+    assert_eq!(orch.get_capacity(&auth).unwrap()["queuedRuns"], 0);
+
+    // Even with storage healthy again, the same request replays its failure.
+    repair_admissions_dir(&root);
+    let replayed = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "enospc-1",
+            session.id,
+            ws.path(),
+            "work that cannot be made durable".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await;
+    assert!(
+        replayed.is_err(),
+        "a settled failure must replay as a failure, never as a queued success"
+    );
+    assert_eq!(admission_files(&root), 0, "no partial record may survive");
+}
+
+/// A half-written record is removed rather than left for recovery to reason
+/// about, so a failed submission leaves nothing promotable behind.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn failed_admission_write_leaves_no_promotable_record() {
+    let (home, _guard) = setup_home();
+    let root = home.path().join("orch");
+    let ws = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    {
+        let store = OrchStore::open(&root).unwrap();
+        store
+            .save_run(&queued_run("partial", session_id, ws.path(), "req-partial"))
+            .unwrap();
+        break_admissions_dir(&root);
+        let refused = store.save_admission(&sealed_admission(
+            "partial",
+            session_id,
+            ws.path(),
+            "unpersistable",
+        ));
+        assert!(refused.is_err(), "the durable write must genuinely fail");
+        repair_admissions_dir(&root);
+        assert_eq!(admission_files(&root), 0);
+    }
+    let store = reopen_store(&root).await;
+    assert!(store.take_recovered_admissions().is_empty());
+    let run = store.load_run("partial").unwrap().unwrap();
+    assert_eq!(run.state, RunState::Interrupted);
+    assert_eq!(
+        run.error_code.as_deref(),
+        Some("admission_lost"),
+        "a queued run with no durable input must be distinguishable from a plain restart"
+    );
+}
+
+/// A settled `queued` receipt must not keep affirming work whose executable
+/// input is gone. The replay fails closed and names the run, so the caller
+/// reconciles by identity instead of waiting forever.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn settled_queued_receipt_fails_closed_when_its_work_was_lost() {
+    let (home, _guard) = setup_home();
+    let root = home.path().join("orch");
+    let ws = tempdir().unwrap();
+    let session_id;
+    let run_id;
+    {
+        let host = started_host();
+        host.set_project_cwd(ws.path()).unwrap();
+        let blocker = host.session_new_kind(SessionKind::Build).unwrap();
+        host.session_set_cwd(blocker.id, ws.path()).unwrap();
+        let session = host.session_new_kind(SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, ws.path()).unwrap();
+        session_id = session.id;
+        host.reserve_orchestration_turn("capacity-blocker", blocker.id)
+            .unwrap();
+        let orch = service_on(&host, OrchStore::open(&root).unwrap(), ws.path(), 1);
+        let auth = orch.auth_header(Some(&format!("Bearer {BEARER}"))).unwrap();
+        let accepted = orch
+            .submit_task_with_execution_mode_and_queue(
+                &auth,
+                "lost-1",
+                session_id,
+                ws.path(),
+                "work whose input will be lost".into(),
+                None,
+                RunExecutionMode::Shared,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted["state"], "queued");
+        run_id = accepted["runId"].as_str().unwrap().to_string();
+        drop(orch);
+        drop(host);
+        // The durable input disappears while the process is down.
+        std::fs::remove_file(admission_file(&root, &run_id)).unwrap();
+    }
+
+    let store = reopen_store(&root).await;
+    let lost = store.load_run(&run_id).unwrap().unwrap();
+    assert_eq!(lost.state, RunState::Interrupted);
+    assert_eq!(lost.error_code.as_deref(), Some("admission_lost"));
+
+    let host = started_host();
+    let orch = service_on(&host, store.clone(), ws.path(), 1);
+    let auth = orch.auth_header(Some(&format!("Bearer {BEARER}"))).unwrap();
+    let replayed = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "lost-1",
+            session_id,
+            ws.path(),
+            "work whose input will be lost".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await;
+    let error =
+        replayed.expect_err("a queued receipt whose work was lost must not replay as success");
+    assert!(
+        error.message.contains(&run_id),
+        "the refusal must name the run so the caller can reconcile: {}",
+        error.message
+    );
+}
+
+/// One request id, one run, one durable record — however many times it is
+/// retried.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn duplicate_submit_is_exactly_once() {
+    let (home, _guard) = setup_home();
+    let root = home.path().join("orch");
+    let ws = tempdir().unwrap();
+    let host = started_host();
+    host.set_project_cwd(ws.path()).unwrap();
+    let blocker = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(blocker.id, ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    host.reserve_orchestration_turn("capacity-blocker", blocker.id)
+        .unwrap();
+
+    let store = OrchStore::open(&root).unwrap();
+    let orch = service_on(&host, store.clone(), ws.path(), 1);
+    let auth = orch.auth_header(Some(&format!("Bearer {BEARER}"))).unwrap();
+
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let accepted = orch
+            .submit_task_with_execution_mode_and_queue(
+                &auth,
+                "exactly-once",
+                session.id,
+                ws.path(),
+                "retried admission".into(),
+                None,
+                RunExecutionMode::Shared,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted["state"], "queued");
+        seen.push(accepted["runId"].as_str().unwrap().to_string());
+    }
+    assert!(
+        seen.windows(2).all(|pair| pair[0] == pair[1]),
+        "a repeated request id must resolve to one run: {seen:?}"
+    );
+    assert_eq!(admission_files(&root), 1, "exactly one durable record");
+    assert_eq!(orch.get_capacity(&auth).unwrap()["queuedRuns"], 1);
+    assert_eq!(store.list_runs().unwrap().len(), 1);
+}
+
+/// Cancelling queued work retires it durably: a restart neither recovers it
+/// nor re-admits it.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn cancel_then_restart_never_resurrects() {
+    let (home, _guard) = setup_home();
+    let root = home.path().join("orch");
+    let ws = tempdir().unwrap();
+    let run_id;
+    {
+        let host = started_host();
+        host.set_project_cwd(ws.path()).unwrap();
+        let blocker = host.session_new_kind(SessionKind::Build).unwrap();
+        host.session_set_cwd(blocker.id, ws.path()).unwrap();
+        let session = host.session_new_kind(SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, ws.path()).unwrap();
+        host.reserve_orchestration_turn("capacity-blocker", blocker.id)
+            .unwrap();
+        let orch = service_on(&host, OrchStore::open(&root).unwrap(), ws.path(), 1);
+        let auth = orch.auth_header(Some(&format!("Bearer {BEARER}"))).unwrap();
+        let accepted = orch
+            .submit_task_with_execution_mode_and_queue(
+                &auth,
+                "cancel-restart",
+                session.id,
+                ws.path(),
+                "run sh -c 'echo resurrected >> resurrection.txt'".into(),
+                None,
+                RunExecutionMode::Shared,
+                true,
+            )
+            .await
+            .unwrap();
+        run_id = accepted["runId"].as_str().unwrap().to_string();
+        orch.cancel(
+            &auth,
+            "cancel-restart-request",
+            session.id,
+            ws.path(),
+            Some(&run_id),
+        )
+        .await
+        .unwrap();
+        drop(orch);
+        drop(host);
+    }
+
+    let store = reopen_store(&root).await;
+    assert!(
+        store.take_recovered_admissions().is_empty(),
+        "cancelled work must not come back"
+    );
+    assert_eq!(
+        store.load_run(&run_id).unwrap().unwrap().state,
+        RunState::Cancelled
+    );
+
+    let host = started_host();
+    let orch = service_on(&host, store.clone(), ws.path(), 4);
+    let auth = orch.auth_header(Some(&format!("Bearer {BEARER}"))).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(orch.get_capacity(&auth).unwrap()["queuedRuns"], 0);
+    assert_eq!(
+        store.load_run(&run_id).unwrap().unwrap().state,
+        RunState::Cancelled,
+        "a full capacity window must not restart cancelled work"
+    );
+    assert!(
+        !ws.path().join("resurrection.txt").exists(),
+        "cancelled work must never execute"
+    );
+}
+
+/// Restart the ledger repeatedly, then let the queue drain: the work runs
+/// exactly once and nothing is left Running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn repeated_restart_yields_exactly_one_execution() {
+    let (home, _guard) = setup_home();
+    let root = home.path().join("orch");
+    let ws = tempdir().unwrap();
+    let log = ws.path().join("exec_log.txt");
+    let run_id;
+    {
+        let host = started_host();
+        host.set_project_cwd(ws.path()).unwrap();
+        let blocker = host.session_new_kind(SessionKind::Build).unwrap();
+        host.session_set_cwd(blocker.id, ws.path()).unwrap();
+        let session = host.session_new_kind(SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, ws.path()).unwrap();
+        host.reserve_orchestration_turn("capacity-blocker", blocker.id)
+            .unwrap();
+        let orch = service_on(&host, OrchStore::open(&root).unwrap(), ws.path(), 1);
+        let auth = orch.auth_header(Some(&format!("Bearer {BEARER}"))).unwrap();
+        let accepted = orch
+            .submit_task_with_execution_mode_and_queue(
+                &auth,
+                "replay-once",
+                session.id,
+                ws.path(),
+                "run sh -c 'echo tick >> exec_log.txt'".into(),
+                None,
+                RunExecutionMode::Shared,
+                true,
+            )
+            .await
+            .unwrap();
+        run_id = accepted["runId"].as_str().unwrap().to_string();
+        drop(orch);
+        drop(host);
+    }
+
+    // Three restarts with nobody draining the queue.
+    for round in 0..3 {
+        let store = reopen_store(&root).await;
+        let recovered = store.take_recovered_admissions();
+        assert_eq!(recovered.len(), 1, "round {round}");
+        assert_eq!(recovered[0].run_id, run_id, "round {round}");
+        assert_eq!(
+            store.load_run(&run_id).unwrap().unwrap().state,
+            RunState::Queued,
+            "round {round}"
+        );
+        assert!(!log.exists(), "nothing may execute while nothing drains");
+        drop(store);
+    }
+
+    // Fourth restart: this one drains.
+    let host = started_host();
+    host.set_project_cwd(ws.path()).unwrap();
+    let store = reopen_store(&root).await;
+    let orch = service_on(&host, store.clone(), ws.path(), 2);
+    let auth = orch.auth_header(Some(&format!("Bearer {BEARER}"))).unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let run = store.load_run(&run_id).unwrap().unwrap();
+        if run.state.is_terminal() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "recovered work must reach a terminal state, stuck in {:?}",
+            run.state
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let executions = std::fs::read_to_string(&log).unwrap_or_default();
+    let ticks = executions
+        .lines()
+        .filter(|line| line.trim() == "tick")
+        .count();
+    assert_eq!(
+        ticks, 1,
+        "four restarts must still produce exactly one execution, got {executions:?}"
+    );
+    assert!(
+        store.load_admission(&run_id).unwrap().is_none(),
+        "the durable record must be consumed exactly once"
+    );
+    let runs = store.list_runs().unwrap();
+    assert_eq!(runs.len(), 1, "no duplicate run records");
+    assert!(
+        runs.iter().all(|run| run.state != RunState::Running),
+        "no run may be left Running"
+    );
+    assert_eq!(orch.get_capacity(&auth).unwrap()["queuedRuns"], 0);
+}

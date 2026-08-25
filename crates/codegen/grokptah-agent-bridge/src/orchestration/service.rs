@@ -143,6 +143,67 @@ impl Drop for AdmissionGuard {
     }
 }
 
+/// Everything needed to own one `Running` attempt through to its end.
+///
+/// This is the whole reason capacity is released reliably: the guard lives
+/// here, on the supervisor, not inside the attempt. Whether the attempt
+/// returns, panics, or is aborted, the supervisor still runs, still finalizes
+/// the exact attempt, and still drops the guard.
+struct AttemptSupervision {
+    attempt_task: tokio::task::JoinHandle<()>,
+    heartbeat: tokio::task::JoinHandle<()>,
+    aggregator: tokio::task::AbortHandle,
+    admission_guard: AdmissionGuard,
+    store: OrchStore,
+    bus: EventBus,
+    service: Weak<OrchestrationService>,
+    run_id: String,
+    session_id: Uuid,
+    owner: String,
+    attempt: u32,
+}
+
+impl AttemptSupervision {
+    async fn supervise(self) {
+        let Self {
+            attempt_task,
+            heartbeat,
+            aggregator,
+            admission_guard,
+            store,
+            bus,
+            service,
+            run_id,
+            session_id,
+            owner,
+            attempt,
+        } = self;
+        let outcome = attempt_task.await;
+        heartbeat.abort();
+        let _ = heartbeat.await;
+        aggregator.abort();
+        if let Err(join_error) = outcome {
+            finalize_lost_attempt(
+                &store,
+                &bus,
+                &run_id,
+                session_id,
+                &owner,
+                attempt,
+                &join_error,
+            );
+        }
+        store.release_lease(&run_id, &owner, attempt);
+
+        // Release capacity before waking the scheduler, so a queued task can
+        // be promoted immediately and fairly.
+        drop(admission_guard);
+        if let Some(service) = service.upgrade() {
+            service.pump_pending();
+        }
+    }
+}
+
 enum IdempotencyStart {
     Perform(IdempotencyLease),
     Replay(serde_json::Value),
@@ -707,6 +768,20 @@ impl OrchestrationService {
                     }));
                 }
                 Ok(IdempotencyClaim::Replay(Ok(value))) => {
+                    // A receipt is immutable, but it is not allowed to keep
+                    // affirming queued work whose executable input did not
+                    // survive. Fail closed and name the run so the caller can
+                    // reconcile by identity instead of waiting forever.
+                    if let Some(error) = self.stale_queued_replay(&value) {
+                        self.audit_err(
+                            tool,
+                            Some(request_id),
+                            Some(session_id),
+                            Some(&workspace.display().to_string()),
+                            &error,
+                        );
+                        return Err(error);
+                    }
                     self.audit(
                         tool,
                         Some(request_id),
@@ -759,6 +834,26 @@ impl OrchestrationService {
                 }
             }
         }
+    }
+
+    /// Refuse to replay a settled `queued` acceptance whose durable admission
+    /// record is gone. Returns `None` for every other receipt, including
+    /// queued work that is still queued or has since started.
+    fn stale_queued_replay(&self, value: &serde_json::Value) -> Option<OrchError> {
+        if value.get("state").and_then(serde_json::Value::as_str) != Some("queued") {
+            return None;
+        }
+        let run_id = value.get("runId").and_then(serde_json::Value::as_str)?;
+        let run = self.store.load_run(run_id).ok().flatten()?;
+        if run.error_code.as_deref() != Some("admission_lost") {
+            return None;
+        }
+        Some(OrchError::new(
+            OrchErrorCode::Conflict,
+            format!(
+                "queued work for this request did not survive restart; run {run_id} is                  interrupted and must be resubmitted under a new request_id"
+            ),
+        ))
     }
 
     fn fail_claim(
@@ -3362,27 +3457,23 @@ impl OrchestrationService {
         // join result. A panicked or cancelled attempt never reaches its own
         // finalizer, so without this the record stayed `Running` until the
         // next process restart.
-        let supervisor = tokio::spawn(async move {
-            let admission_guard = AdmissionGuard {
+        let supervision = AttemptSupervision {
+            attempt_task,
+            heartbeat,
+            aggregator: agg_abort,
+            admission_guard: AdmissionGuard {
                 host,
                 run_id: rid.clone(),
-            };
-            let outcome = attempt_task.await;
-            heartbeat.abort();
-            let _ = heartbeat.await;
-            agg_abort.abort();
-            if let Err(join_error) = outcome {
-                finalize_lost_attempt(&store, &bus, &rid, session_id, &owner, attempt, &join_error);
-            }
-            store.release_lease(&rid, &owner, attempt);
-
-            // Release capacity before waking the scheduler, so a queued task
-            // can be promoted immediately and fairly.
-            drop(admission_guard);
-            if let Some(service) = service_ref.upgrade() {
-                service.pump_pending();
-            }
-        });
+            },
+            store,
+            bus,
+            service: service_ref,
+            run_id: rid,
+            session_id,
+            owner,
+            attempt,
+        };
+        let supervisor = tokio::spawn(supervision.supervise());
         self.reaping_handles();
         self.join_handles.lock().push(supervisor);
     }
@@ -4182,6 +4273,74 @@ mod tests {
             store.load_run("superseded").unwrap().unwrap().state,
             RunState::Interrupted
         );
+    }
+
+    /// The other half of the panic guarantee: capacity is owned by the
+    /// supervisor, not the attempt, so a turn that explodes still gives its
+    /// admission slot back. This drives the production supervisor directly
+    /// rather than a copy of it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_panicked_attempt_releases_admission_capacity() {
+        let _serial = crate::discover::home_override_serial();
+        let dir = tempdir().unwrap();
+        let home = dir.path().join(".grokptah");
+        std::fs::create_dir_all(&home).unwrap();
+        crate::discover::set_grokptah_home_override(Some(home));
+
+        let store = OrchStore::open(dir.path().join("orch")).unwrap();
+        let bus = EventBus::new(64);
+        let host = crate::host::AgentHost::create(crate::host::HostConfig {
+            always_approve: true,
+            ..Default::default()
+        });
+        host.start().expect("start host");
+        let session = host
+            .session_new_kind(crate::session::SessionKind::Build)
+            .expect("session");
+        let run_id = "panicky-capacity";
+        host.reserve_orchestration_turn(run_id, session.id)
+            .expect("reserve");
+        assert_eq!(host.orchestration_active_count(), 1);
+
+        store
+            .save_run(&running_run(run_id, session.id, "/ws"))
+            .unwrap();
+        let lease = store
+            .install_lease(run_id, session.id, "owner-a", chrono::Duration::seconds(30))
+            .expect("lease");
+
+        let supervision = AttemptSupervision {
+            attempt_task: tokio::spawn(async { panic!("turn exploded") }),
+            heartbeat: tokio::spawn(async {}),
+            aggregator: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+            admission_guard: AdmissionGuard {
+                host: host.clone(),
+                run_id: run_id.into(),
+            },
+            store: store.clone(),
+            bus,
+            service: Weak::new(),
+            run_id: run_id.into(),
+            session_id: session.id,
+            owner: "owner-a".into(),
+            attempt: lease.attempt,
+        };
+        supervision.supervise().await;
+
+        assert_eq!(
+            host.orchestration_active_count(),
+            0,
+            "a panicked attempt must not keep holding admission capacity"
+        );
+        let run = store.load_run(run_id).unwrap().unwrap();
+        assert_eq!(run.state, RunState::Interrupted);
+        assert_eq!(run.error_code.as_deref(), Some("worker_panic"));
+        assert!(
+            store.load_lease(run_id).is_none(),
+            "the attempt lease must be released"
+        );
+        crate::discover::set_grokptah_home_override(None);
     }
 
     /// A terminal run is never rewritten by a late attempt.

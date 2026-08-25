@@ -57,6 +57,11 @@ resolves to exactly one outcome:
 | `queued`, run `queued`, receipt **not** settled `complete` | Uncertain — deleted and counted; the caller was told the mutation failed, so this work must not run |
 | `queued`, run `queued`, receipt settled `complete` | Re-admitted in `sequence` order |
 
+Every queued run that is *not* re-admitted — because its record was retired,
+was never written, or is simply gone — is then retired as `interrupted` with
+`error_code: "admission_lost"`. That marker is deliberately distinct from a
+plain restart `interrupted`, because it is what the replay path checks.
+
 The uncertain case is the reconcile-by-request-identity rule: a crash between
 the durable record and the settled receipt leaves the client holding a *failed*
 mutation (`fail_orphaned_idempotency_claims`), so executing it anyway would run
@@ -68,6 +73,25 @@ caller only. The store root is under an exclusive advisory lock, so there is
 one store per ledger per process; single adoption is what stops a second
 embedded control service from dispatching the same work twice.
 
+### A receipt never outlives the work it accepted
+
+Two rules keep a settled receipt honest.
+
+**A write that cannot be made durable is never reported as accepted.** If the
+admission record cannot be created, written, or fsynced, `save_admission`
+removes any partial file, `submit_task` fails the claim, and the receipt
+settles `failed`. A later retry of the same request id replays that failure; it
+can never become a queued success. The run created moments earlier is failed
+closed in the same path.
+
+**A settled `queued` receipt is refused once its work is lost.** Receipts are
+immutable, so recovery cannot rewrite one — instead the replay path checks the
+run it names. If that run carries `admission_lost`, the replay returns a
+conflict naming the run rather than the stale `queued` response, so the caller
+reconciles by identity instead of waiting forever for work that will never run.
+Queued work that is still queued, or that has since started, replays exactly as
+before.
+
 ### Promotion and cancellation are exactly-once
 
 `OrchStore::promote_admission` performs the whole transition under the store
@@ -78,10 +102,14 @@ to `interrupted` — never to a second dispatch. If the run write fails after th
 admission is consumed, the run is failed closed as `admission_promotion_failed`
 rather than left queued for a promotion that can never happen.
 
-Cancellation marks the run terminal first (the authoritative fence) and then
-tombstones the admission. Promotion re-checks the run state inside the same
-lock, so a cancelled run can never be promoted even before the tombstone lands,
-and recovery deletes any leftover record.
+Cancellation marks the run terminal first (the authoritative fence), then
+writes a `tombstoned` record and unlinks it. Two things make resurrection
+impossible, and it is worth being precise about which does the work: the
+terminal run record is the durable fence — promotion re-checks it inside the
+same store lock, and recovery deletes any leftover record without re-queueing
+it. The persisted tombstone covers the narrow window between that write and the
+unlink, so even a crash mid-cancel leaves a consumed marker rather than a
+promotable one.
 
 ## P0-B — `Running` is verified and reaped
 
@@ -168,6 +196,33 @@ input:
 `stuckFinalizations` and `uncertainAdmissions` are the two that should be zero
 in a healthy soak; both were previously invisible.
 
+## Invariant map
+
+Each invariant, the mechanism that enforces it, and the test that fails if the
+mechanism is removed.
+
+| # | Invariant | Mechanism | Test |
+| --- | --- | --- | --- |
+| A1 | Accepted queued work survives restart with exact input and order | `AdmissionRecord` fsynced before the receipt settles; `sequence`-ordered recovery | `queued_admissions_survive_restart_with_exact_private_inputs_and_order` |
+| A2 | A receipt never says accepted for work that could not be persisted | Write failure removes any partial file and fails the claim | `admission_write_failure_never_settles_the_receipt`, `failed_admission_write_leaves_no_promotable_record` |
+| A3 | A settled `queued` receipt never replays work that was lost | `admission_lost` marker + replay refusal | `settled_queued_receipt_fails_closed_when_its_work_was_lost` |
+| A4 | A repeated request id yields exactly one run and one record | Existing exclusive idempotency claim + exclusive-create admission | `duplicate_submit_is_exactly_once` |
+| A5 | Every durable boundary fails closed on a crash cut | Recovery decision table | six `crash_cut_*` tests |
+| A6 | A tampered record is never executed | Integrity digest verified on read and at recovery | `tampered_admission_is_quarantined_and_fails_closed` |
+| A7 | Cancelled work never resurrects | Terminal run fence + tombstone | `cancel_then_restart_never_resurrects`, `crash_cut_after_cancellation_cannot_resurrect_queued_work` |
+| A8 | Promotion consumes the record exactly once | Compare-and-set under the store lock | `promotion_consumes_the_durable_record_exactly_once` |
+| A9 | Repeated restart causes no duplicate execution and no stuck `Running` | Single adoption + CAS promotion | `repeated_restart_yields_exactly_one_execution` |
+| A10 | Two supervisors on one ledger cannot double-admit | `take_recovered_admissions` hands off once | `second_supervisor_on_the_same_ledger_adopts_nothing` |
+| B1 | A stale or wrong owner cannot heartbeat | `(owner, attempt)` match required | `heartbeat_denies_stale_wrong_owner_and_terminal_attempts` |
+| B2 | A stale or wrong owner cannot finalize | Lease re-checked before writing | `a_superseded_attempt_cannot_finalize_the_run` |
+| B3 | A heartbeat never revives a terminal run | Terminal check precedes the lease check | `heartbeat_denies_stale_wrong_owner_and_terminal_attempts` |
+| B4 | Expiry is deterministic and reaps only dead attempts | Persisted expiry is the only input | `expired_lease_is_reaped_and_releases_capacity` |
+| B5 | A panicked or aborted worker reaches a terminal state | Supervisor inspects `JoinError` | `panicked_attempt_is_durably_interrupted_without_a_restart`, `cancelled_attempt_is_durably_interrupted` |
+| B6 | A panicked worker releases admission capacity | Guard lives on the supervisor, not the attempt | `a_panicked_attempt_releases_admission_capacity` |
+| B7 | Finalization retry is bounded and frees capacity | Attempt + wall-clock cap, then intent | `finalization_failure_releases_admission_capacity` |
+| B8 | A bounded-out finalization is preserved, not claimed | Write-ahead intent replayed at open | `finalization_failure_preserves_replay_intent_without_claiming_success` |
+| B9 | Restart resumes no uncertain attempt and leaves no zombie | All leases cleared at open; `Running` → `interrupted` | `restart_retires_every_attempt_lease` |
+
 ## Known residuals
 
 - **Dropping a control service without a process restart** releases its host
@@ -193,3 +248,15 @@ This work closes the ledger-side prerequisites for audit gates G-2
 (uncertain-send safety) and G-3 (capacity liveness). Neither gate is *met* here
 — both need the long-horizon soak campaign, which is unchanged and unrun by
 this work.
+
+Explicitly **not** established by these focused tests:
+
+- Always-On continuity or any 100% certification claim.
+- Any multi-process or real-binary restart. Restart here means dropping every
+  store handle and reopening the exclusively-locked ledger, which is faithful
+  to the lock semantics but is not a process kill.
+- True `ENOSPC`. The durable-write failures are injected by making the target
+  directory a regular file, which produces a real `io::Error` at the same
+  create/write/fsync boundary — the invariant is proven, the specific errno is
+  not.
+- Any desktop, TypeScript, packaged-app, or provider verification.

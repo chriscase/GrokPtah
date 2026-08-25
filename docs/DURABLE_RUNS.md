@@ -80,5 +80,9 @@ does not need a second event stream or a separate coordinator dashboard.
   run, event, receipt, or capacity response — those keep the same bounded,
   redacted preview as before. See
   [durable admission and leases](./DURABLE_ADMISSION_AND_LEASES.md).
+- Replaying the request ID of an accepted-but-queued run whose executable input
+  did not survive a restart now returns a conflict naming that run, instead of
+  replaying the original `queued` result. The run itself is `interrupted` with
+  `admission_lost`. Resubmit under a new request ID.
 - The existing journal, audit, idempotency, workspace allowlist, and MCP tool
   restrictions remain authoritative.
