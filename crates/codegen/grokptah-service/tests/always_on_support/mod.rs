@@ -117,7 +117,7 @@ pub struct Fixture {
     pub proposal_runs: u64,
     pub native_work_by_step: BTreeMap<String, u64>,
     pub posts_by_semantic: BTreeMap<String, u64>,
-    pub setup: SetupExpect,
+    pub setup_lane: SetupExpect,
     pub manager_plan: ManagerPlanExpect,
     pub fail_closed: BTreeMap<String, FailClosedExpect>,
     pub ceilings: ResourceCeilings,
@@ -141,7 +141,7 @@ impl Fixture {
 
     pub fn posts_for(&self, semantic: &str) -> u64 {
         if semantic == "setup" {
-            return self.setup.provider_sends;
+            return self.setup_lane.provider_sends;
         }
         *self
             .posts_by_semantic
@@ -273,7 +273,7 @@ pub fn parse_fixture(bytes: &[u8]) -> Result<Fixture, String> {
         proposal_runs,
         native_work_by_step,
         posts_by_semantic,
-        setup,
+        setup_lane: setup,
         manager_plan,
         fail_closed,
         ceilings,

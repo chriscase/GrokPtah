@@ -503,6 +503,7 @@ async fn scheduler_window_identity(
     provider: &FakeProvider,
     step_id: &str,
     semantic_id: &str,
+    expected_posts: u64,
 ) -> (String, Option<CausalJoin>) {
     let item = require_unique_step_work(work, step_id);
     let work_id = item["workId"].as_str().expect("workId").to_string();
@@ -515,6 +516,7 @@ async fn scheduler_window_identity(
         provider,
         step_id,
         semantic_id,
+        expected_posts,
     ) {
         Ok(join) => (work_id, Some(join)),
         Err(_) => (work_id, None),
@@ -1652,11 +1654,11 @@ async fn fixture_schema_is_consumed() {
     assert_eq!(fixture.posts_by_semantic.get("step-a"), Some(&1));
     assert_eq!(fixture.posts_by_semantic.get("step-b-fix"), Some(&1));
     assert_eq!(fixture.posts_by_semantic.get("manager-decision"), Some(&1));
-    assert_eq!(fixture.setup.work, 0);
-    assert_eq!(fixture.setup.attempts, 0);
-    assert_eq!(fixture.setup.runs, 1);
-    assert_eq!(fixture.setup.intents, 0);
-    assert_eq!(fixture.setup.provider_sends, 1);
+    assert_eq!(fixture.setup_lane.work, 0);
+    assert_eq!(fixture.setup_lane.attempts, 0);
+    assert_eq!(fixture.setup_lane.runs, 1);
+    assert_eq!(fixture.setup_lane.intents, 0);
+    assert_eq!(fixture.setup_lane.provider_sends, 1);
     assert_eq!(fixture.manager_plan.work, 1);
     let malformed = fixture.fail_closed_case("malformed");
     assert_eq!(malformed.run_state, "limit_reached");
@@ -1883,6 +1885,7 @@ async fn scheduler_window_restart_observations_keep_exact_identities() {
                     &campaign.provider,
                     step_id,
                     semantic,
+                    campaign.fixture.posts_for(semantic),
                 )
                 .await,
             )
