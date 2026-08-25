@@ -996,6 +996,7 @@ impl OrchestrationService {
     /// Resume one verified persistent agent through the service adapter. The
     /// host owns the idempotency receipt and checkpoint validation; this layer
     /// adds workspace/session authorization and transport bounds.
+    #[allow(clippy::too_many_arguments)]
     pub async fn resume_persistent_agent(
         &self,
         _auth: &AuthContext,
