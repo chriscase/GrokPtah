@@ -1308,6 +1308,7 @@ dependencies = [
  "dunce",
  "fs2",
  "futures",
+ "grokptah-agent-sdk",
  "http-body-util",
  "keyring",
  "libc",
@@ -1327,6 +1328,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "grokptah-agent-sdk"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "grokptah-desktop"
 version = "0.1.0"
 dependencies = [
@@ -1335,6 +1344,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "grokptah-agent-bridge",
+ "grokptah-help-authority",
  "parking_lot",
  "portable-pty",
  "serde",
@@ -1346,6 +1356,16 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "grokptah-help-authority"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

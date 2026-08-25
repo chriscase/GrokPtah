@@ -1,0 +1,1361 @@
+{
+  "schemaVersion": "grokptah.help-authority-parity.v1",
+  "note": "Executed by both the Rust authority tests and the TypeScript mirror. Both must agree on every case.",
+  "servedCorpusDigest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+  "servedIndexDigest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+  "cases": [
+    {
+      "name": "public source is allowed with the base capability",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "pub-1",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": true,
+        "deniedBecause": null,
+        "allowedSourceIds": [
+          "pub-1"
+        ],
+        "deniedSourceIds": []
+      }
+    },
+    {
+      "name": "project source is denied by default without the project capability",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "proj-a",
+            "visibility": "project",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "project_id": "proj-1"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": true,
+        "deniedBecause": null,
+        "allowedSourceIds": [],
+        "deniedSourceIds": [
+          "proj-a"
+        ]
+      },
+      "note": "action permitted; the non-public source is default-deny"
+    },
+    {
+      "name": "project source is allowed only for a member holding the capability",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "proj-a",
+            "visibility": "project",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "project_id": "proj-1"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": true,
+        "deniedBecause": null,
+        "allowedSourceIds": [
+          "proj-a"
+        ],
+        "deniedSourceIds": []
+      }
+    },
+    {
+      "name": "project source in another project is denied",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "proj-b",
+            "visibility": "project",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "project_id": "proj-9"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": true,
+        "deniedBecause": null,
+        "allowedSourceIds": [],
+        "deniedSourceIds": [
+          "proj-b"
+        ]
+      }
+    },
+    {
+      "name": "project source in another tenant is denied before scope is consulted",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "proj-c",
+            "visibility": "project",
+            "tenant_id": "tenant-z",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "project_id": "proj-1"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": true,
+        "deniedBecause": null,
+        "allowedSourceIds": [],
+        "deniedSourceIds": [
+          "proj-c"
+        ]
+      },
+      "note": "tenant is checked first so a probe cannot learn a project exists"
+    },
+    {
+      "name": "project source with no project id is malformed, not public",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "proj-d",
+            "visibility": "project",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": true,
+        "deniedBecause": null,
+        "allowedSourceIds": [],
+        "deniedSourceIds": [
+          "proj-d"
+        ]
+      }
+    },
+    {
+      "name": "private source is denied without the private capability",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "priv-a",
+            "visibility": "private",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "owner_principal_id": "alice"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": true,
+        "deniedBecause": null,
+        "allowedSourceIds": [],
+        "deniedSourceIds": [
+          "priv-a"
+        ]
+      }
+    },
+    {
+      "name": "private source is allowed only for its owner",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_private"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "priv-a",
+            "visibility": "private",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "owner_principal_id": "alice"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": true,
+        "deniedBecause": null,
+        "allowedSourceIds": [
+          "priv-a"
+        ],
+        "deniedSourceIds": []
+      }
+    },
+    {
+      "name": "private source owned by another principal is denied",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_private"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "priv-b",
+            "visibility": "private",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "owner_principal_id": "mallory"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": true,
+        "deniedBecause": null,
+        "allowedSourceIds": [],
+        "deniedSourceIds": [
+          "priv-b"
+        ]
+      }
+    },
+    {
+      "name": "private source with no owner is malformed, not public",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_private"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "priv-c",
+            "visibility": "private",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": true,
+        "deniedBecause": null,
+        "allowedSourceIds": [],
+        "deniedSourceIds": [
+          "priv-c"
+        ]
+      }
+    },
+    {
+      "name": "answer requires its own capability",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "answer",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "pub-1",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": false,
+        "deniedBecause": "missing_capability",
+        "allowedSourceIds": [],
+        "deniedSourceIds": [
+          "pub-1"
+        ]
+      }
+    },
+    {
+      "name": "answer is allowed when the capability is held",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "answer",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project",
+            "help_search_private",
+            "help_answer"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "pub-1",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": true,
+        "deniedBecause": null,
+        "allowedSourceIds": [
+          "pub-1"
+        ],
+        "deniedSourceIds": []
+      }
+    },
+    {
+      "name": "read_source fails when its only source is denied",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "read_source",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "priv-a",
+            "visibility": "private",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "owner_principal_id": "alice"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": false,
+        "deniedBecause": "missing_capability",
+        "allowedSourceIds": [],
+        "deniedSourceIds": [
+          "priv-a"
+        ]
+      }
+    },
+    {
+      "name": "a stale corpus digest denies the whole action",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project",
+            "help_search_private",
+            "help_answer"
+          ]
+        },
+        "corpus_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "pub-1",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": false,
+        "deniedBecause": "stale_index",
+        "allowedSourceIds": [],
+        "deniedSourceIds": [
+          "pub-1"
+        ]
+      }
+    },
+    {
+      "name": "a stale index digest denies the whole action",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project",
+            "help_search_private",
+            "help_answer"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+        "sources": [
+          {
+            "source_id": "pub-1",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": false,
+        "deniedBecause": "stale_index",
+        "allowedSourceIds": [],
+        "deniedSourceIds": [
+          "pub-1"
+        ]
+      }
+    },
+    {
+      "name": "an unknown schema denies",
+      "request": {
+        "schema": "grokptah.help-authority-request.v2",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project",
+            "help_search_private",
+            "help_answer"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "pub-1",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": false,
+        "deniedBecause": "unknown_schema",
+        "allowedSourceIds": [],
+        "deniedSourceIds": [
+          "pub-1"
+        ]
+      }
+    },
+    {
+      "name": "a principal with no capabilities cannot search",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "nobody",
+          "tenant_id": "tenant-a"
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "pub-1",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": false,
+        "deniedBecause": "missing_capability",
+        "allowedSourceIds": [],
+        "deniedSourceIds": [
+          "pub-1"
+        ]
+      }
+    },
+    {
+      "name": "too many sources is a bounds denial",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project",
+            "help_search_private",
+            "help_answer"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "pub-0",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-1",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-2",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-3",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-4",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-5",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-6",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-7",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-8",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-9",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-10",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-11",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-12",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-13",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-14",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-15",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-16",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-17",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-18",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-19",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-20",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-21",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-22",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-23",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-24",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-25",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-26",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-27",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-28",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-29",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-30",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-31",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-32",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-33",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-34",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-35",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-36",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-37",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-38",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-39",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-40",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-41",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-42",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-43",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-44",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-45",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-46",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-47",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-48",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-49",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-50",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-51",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-52",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-53",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-54",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-55",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-56",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-57",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-58",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-59",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-60",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-61",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-62",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-63",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          {
+            "source_id": "pub-64",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": false,
+        "deniedBecause": "bounds",
+        "allowedSourceIds": [],
+        "deniedSourceIds": [
+          "pub-0",
+          "pub-1",
+          "pub-2",
+          "pub-3",
+          "pub-4",
+          "pub-5",
+          "pub-6",
+          "pub-7",
+          "pub-8",
+          "pub-9",
+          "pub-10",
+          "pub-11",
+          "pub-12",
+          "pub-13",
+          "pub-14",
+          "pub-15",
+          "pub-16",
+          "pub-17",
+          "pub-18",
+          "pub-19",
+          "pub-20",
+          "pub-21",
+          "pub-22",
+          "pub-23",
+          "pub-24",
+          "pub-25",
+          "pub-26",
+          "pub-27",
+          "pub-28",
+          "pub-29",
+          "pub-30",
+          "pub-31",
+          "pub-32",
+          "pub-33",
+          "pub-34",
+          "pub-35",
+          "pub-36",
+          "pub-37",
+          "pub-38",
+          "pub-39",
+          "pub-40",
+          "pub-41",
+          "pub-42",
+          "pub-43",
+          "pub-44",
+          "pub-45",
+          "pub-46",
+          "pub-47",
+          "pub-48",
+          "pub-49",
+          "pub-50",
+          "pub-51",
+          "pub-52",
+          "pub-53",
+          "pub-54",
+          "pub-55",
+          "pub-56",
+          "pub-57",
+          "pub-58",
+          "pub-59",
+          "pub-60",
+          "pub-61",
+          "pub-62",
+          "pub-63"
+        ]
+      },
+      "note": "receipt is truncated to the bound; it must not grow with the request"
+    },
+    {
+      "name": "an empty principal id is a bounds denial",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "",
+          "tenant_id": "tenant-a",
+          "capabilities": [
+            "help_search"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "pub-1",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "expect": {
+        "parses": true,
+        "allowed": false,
+        "deniedBecause": "bounds",
+        "allowedSourceIds": [],
+        "deniedSourceIds": [
+          "pub-1"
+        ]
+      }
+    },
+    {
+      "name": "a search with no sources is allowed and allows nothing",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project",
+            "help_search_private",
+            "help_answer"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": []
+      },
+      "expect": {
+        "parses": true,
+        "allowed": true,
+        "deniedBecause": null,
+        "allowedSourceIds": [],
+        "deniedSourceIds": []
+      }
+    },
+    {
+      "name": "an unknown top-level field is rejected, not ignored",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project",
+            "help_search_private",
+            "help_answer"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "pub-1",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ],
+        "bypassAuthority": true
+      },
+      "expect": {
+        "parses": false
+      }
+    },
+    {
+      "name": "an unknown principal field is rejected",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project",
+            "help_search_private",
+            "help_answer"
+          ],
+          "isAdmin": true
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "pub-1",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "expect": {
+        "parses": false
+      }
+    },
+    {
+      "name": "an unknown source field is rejected",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project",
+            "help_search_private",
+            "help_answer"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "pub-1",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "visibilityOverride": "public"
+          }
+        ]
+      },
+      "expect": {
+        "parses": false
+      }
+    },
+    {
+      "name": "an unknown visibility value is rejected",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_search_project",
+            "help_search_private",
+            "help_answer"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "pub-1",
+            "visibility": "internal",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "expect": {
+        "parses": false
+      }
+    },
+    {
+      "name": "an unknown capability value is rejected",
+      "request": {
+        "schema": "grokptah.help-authority-request.v1",
+        "action": "search",
+        "principal": {
+          "principal_id": "alice",
+          "tenant_id": "tenant-a",
+          "project_ids": [
+            "proj-1"
+          ],
+          "capabilities": [
+            "help_search",
+            "help_admin"
+          ]
+        },
+        "corpus_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "index_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "sources": [
+          {
+            "source_id": "pub-1",
+            "visibility": "public",
+            "tenant_id": "tenant-a",
+            "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ]
+      },
+      "expect": {
+        "parses": false
+      }
+    }
+  ]
+}

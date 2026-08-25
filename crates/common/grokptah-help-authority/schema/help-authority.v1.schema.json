@@ -1,0 +1,242 @@
+{
+  "$defs": {
+    "action": {
+      "enum": [
+        "search",
+        "answer",
+        "read_source"
+      ]
+    },
+    "boundedId": {
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "capability": {
+      "enum": [
+        "help_search",
+        "help_search_project",
+        "help_search_private",
+        "help_answer"
+      ]
+    },
+    "decisionReceipt": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/action"
+        },
+        "allowed_source_ids": {
+          "items": {
+            "$ref": "#/$defs/boundedId"
+          },
+          "type": "array"
+        },
+        "corpus_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "denied": {
+          "items": {
+            "$ref": "#/$defs/sourceDecision"
+          },
+          "type": "array"
+        },
+        "index_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "receipt_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "schema": {
+          "const": "grokptah.help-authority-response.v1"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/boundedId"
+        }
+      },
+      "required": [
+        "schema",
+        "action",
+        "principal_id",
+        "tenant_id",
+        "corpus_digest",
+        "index_digest",
+        "allowed_source_ids",
+        "denied",
+        "receipt_digest"
+      ],
+      "type": "object"
+    },
+    "denyReason": {
+      "enum": [
+        "unknown_schema",
+        "missing_capability",
+        "tenant_mismatch",
+        "scope_mismatch",
+        "malformed_scope",
+        "stale_index",
+        "bounds"
+      ]
+    },
+    "digest": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "principal": {
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "items": {
+            "$ref": "#/$defs/capability"
+          },
+          "type": "array"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "project_ids": {
+          "items": {
+            "$ref": "#/$defs/boundedId"
+          },
+          "type": "array"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/boundedId"
+        }
+      },
+      "required": [
+        "principal_id",
+        "tenant_id"
+      ],
+      "type": "object"
+    },
+    "request": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/action"
+        },
+        "corpus_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "index_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "principal": {
+          "$ref": "#/$defs/principal"
+        },
+        "schema": {
+          "const": "grokptah.help-authority-request.v1"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/sourceDescriptor"
+          },
+          "maxItems": 64,
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema",
+        "action",
+        "principal",
+        "corpus_digest",
+        "index_digest"
+      ],
+      "type": "object"
+    },
+    "response": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed": {
+          "type": "boolean"
+        },
+        "denied_because": {
+          "$ref": "#/$defs/denyReason"
+        },
+        "receipt": {
+          "$ref": "#/$defs/decisionReceipt"
+        },
+        "schema": {
+          "const": "grokptah.help-authority-response.v1"
+        }
+      },
+      "required": [
+        "schema",
+        "allowed",
+        "receipt"
+      ],
+      "type": "object"
+    },
+    "sourceDecision": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed": {
+          "type": "boolean"
+        },
+        "denied_because": {
+          "$ref": "#/$defs/denyReason"
+        },
+        "source_id": {
+          "$ref": "#/$defs/boundedId"
+        }
+      },
+      "required": [
+        "source_id",
+        "allowed"
+      ],
+      "type": "object"
+    },
+    "sourceDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "owner_principal_id": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "project_id": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "source_id": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "tenant_id": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "visibility": {
+          "$ref": "#/$defs/visibility"
+        }
+      },
+      "required": [
+        "source_id",
+        "visibility",
+        "tenant_id",
+        "digest"
+      ],
+      "type": "object"
+    },
+    "visibility": {
+      "enum": [
+        "public",
+        "project",
+        "private"
+      ]
+    }
+  },
+  "$id": "https://grokptah.dev/schemas/help-authority.v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/request"
+    },
+    {
+      "$ref": "#/$defs/response"
+    }
+  ],
+  "title": "GrokPtah Help authority v1"
+}

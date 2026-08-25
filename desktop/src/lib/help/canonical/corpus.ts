@@ -4,7 +4,7 @@
  * Chunk IDs are derived from `articleId`, locale, kind, and ordinal, so they
  * are stable across rebuilds and can be cited verbatim by an answer contract.
  */
-import { canonicalDigest, canonicalJson } from "./digest";
+import { HELP_DIGEST_DOMAINS, canonicalDigest, canonicalJson, domainDigest } from "./digest";
 import { HELP_ARTICLE_SEEDS, HELP_SOURCE_REGISTRY } from "./data";
 import {
   HELP_CANONICAL_CONTENT_VERSION,
@@ -13,6 +13,7 @@ import {
   type HelpCanonicalCorpus,
   type HelpChunk,
   type HelpSourceAnchor,
+  type HelpSourceVisibility,
   type HelpTopic,
 } from "./types";
 
@@ -38,8 +39,21 @@ function compare(left: string, right: string): number {
  * stay under `HELP_CHUNK_MAX_CHARS`. A single over-long sentence is hard-split
  * so a chunk can never exceed the bound.
  */
+/**
+ * Normalize to NFC.
+ *
+ * Citation spans are offsets into chunk text. If the corpus mixed composed and
+ * decomposed forms, the same visible character could occupy one or two code
+ * points depending on which article it came from, and a span would land in a
+ * different place than the text it quotes. Normalizing once, here, keeps every
+ * span in one coordinate system.
+ */
+function nfc(value: string): string {
+  return value.normalize("NFC");
+}
+
 function splitIntoChunkTexts(body: string): string[] {
-  const sentences = body
+  const sentences = nfc(body)
     .split(/(?<=[.!?])\s+/u)
     .map((sentence) => sentence.trim())
     .filter((sentence) => sentence.length > 0);
@@ -69,15 +83,17 @@ function chunkId(articleId: string, locale: string, kind: HelpChunk["kind"], ord
   return `${articleId}#${locale}.${kind}.${ordinal}`;
 }
 
-function buildChunks(article: HelpCanonicalArticle): HelpChunk[] {
+type UndigestedChunk = Omit<HelpChunk, "digest">;
+
+function buildChunks(article: HelpCanonicalArticle): UndigestedChunk[] {
   const sourceIds = Object.freeze(article.sources.map((source) => source.id));
-  const chunks: HelpChunk[] = [
+  const chunks: UndigestedChunk[] = [
     {
       id: chunkId(article.id, "en", "title", 0),
       articleId: article.id,
       kind: "title",
       ordinal: 0,
-      text: article.title,
+      text: nfc(article.title),
       locale: "en",
       sourceIds,
     },
@@ -86,7 +102,7 @@ function buildChunks(article: HelpCanonicalArticle): HelpChunk[] {
       articleId: article.id,
       kind: "summary",
       ordinal: 0,
-      text: article.summary,
+      text: nfc(article.summary),
       locale: "en",
       sourceIds,
     },
@@ -110,7 +126,7 @@ function buildChunks(article: HelpCanonicalArticle): HelpChunk[] {
       articleId: article.id,
       kind: "title",
       ordinal: 0,
-      text: localization.title,
+      text: nfc(localization.title),
       locale: localization.locale,
       sourceIds,
     });
@@ -119,12 +135,32 @@ function buildChunks(article: HelpCanonicalArticle): HelpChunk[] {
       articleId: article.id,
       kind: "summary",
       ordinal: 0,
-      text: localization.summary,
+      text: nfc(localization.summary),
       locale: localization.locale,
       sourceIds,
     });
   }
   return chunks;
+}
+
+/**
+ * Resolve a citation id to an anchor carrying its own digest.
+ *
+ * Visibility defaults to `public` here only because every shipped source is
+ * public documentation; `project` and `private` sources are default-deny at
+ * the authority layer, which is where the decision belongs.
+ */
+function resolveSource(sourceId: string, articleId: string): HelpSourceAnchor {
+  const seed = HELP_SOURCE_REGISTRY[sourceId];
+  if (!seed) throw new Error(`help corpus: article ${articleId} cites unknown source ${sourceId}`);
+  const visibility: HelpSourceVisibility = seed.visibility ?? "public";
+  return Object.freeze({
+    id: seed.id,
+    path: seed.path,
+    heading: seed.heading,
+    visibility,
+    digest: domainDigest(HELP_DIGEST_DOMAINS.source, [seed.id, seed.path, seed.heading, visibility]),
+  });
 }
 
 function resolveArticle(seed: (typeof HELP_ARTICLE_SEEDS)[number]): HelpCanonicalArticle {
@@ -134,11 +170,7 @@ function resolveArticle(seed: (typeof HELP_ARTICLE_SEEDS)[number]): HelpCanonica
   if (seed.body.length > HELP_ARTICLE_MAX_BODY_CHARS) {
     throw new Error(`help corpus: article ${seed.id} body exceeds ${HELP_ARTICLE_MAX_BODY_CHARS} characters`);
   }
-  const sources = seed.sourceIds.map((sourceId) => {
-    const anchor = HELP_SOURCE_REGISTRY[sourceId];
-    if (!anchor) throw new Error(`help corpus: article ${seed.id} cites unknown source ${sourceId}`);
-    return Object.freeze({ ...anchor });
-  });
+  const sources = seed.sourceIds.map((sourceId) => resolveSource(sourceId, seed.id));
   const { sourceIds: _unused, ...rest } = seed;
   return Object.freeze({
     ...rest,
@@ -152,6 +184,19 @@ function resolveArticle(seed: (typeof HELP_ARTICLE_SEEDS)[number]): HelpCanonica
       ),
     ),
     sources: Object.freeze(sources),
+    digest: domainDigest(HELP_DIGEST_DOMAINS.article, [
+      seed.id,
+      seed.title,
+      seed.topic,
+      seed.summary,
+      seed.body,
+      seed.access,
+      ...seed.audience,
+      ...seed.capabilityIds,
+      ...seed.aliases,
+      ...seed.keywords,
+      ...sources.map((source) => source.digest),
+    ]),
   }) as HelpCanonicalArticle;
 }
 
@@ -190,7 +235,21 @@ function buildCorpus(): HelpCanonicalCorpus {
     .flatMap(buildChunks)
     .slice()
     .sort((left, right) => compare(left.id, right.id))
-    .map((chunk) => Object.freeze({ ...chunk, sourceIds: Object.freeze([...chunk.sourceIds]) }));
+    .map((chunk) =>
+      Object.freeze({
+        ...chunk,
+        sourceIds: Object.freeze([...chunk.sourceIds]),
+        digest: domainDigest(HELP_DIGEST_DOMAINS.chunk, [
+          chunk.id,
+          chunk.articleId,
+          chunk.kind,
+          String(chunk.ordinal),
+          chunk.locale,
+          chunk.text,
+          ...chunk.sourceIds,
+        ]),
+      }),
+    );
 
   const chunkIds = new Set<string>();
   for (const chunk of chunks) {
@@ -202,10 +261,13 @@ function buildCorpus(): HelpCanonicalCorpus {
     chunkIds.add(chunk.id);
   }
 
-  const usedSourceIds = new Set(articles.flatMap((article) => article.sources.map((source) => source.id)));
-  const sources: HelpSourceAnchor[] = [...usedSourceIds]
-    .sort(compare)
-    .map((sourceId) => Object.freeze({ ...HELP_SOURCE_REGISTRY[sourceId]! }));
+  // Reuse the anchors the articles already resolved, so a source and its
+  // citation can never disagree about visibility or digest.
+  const byId = new Map<string, HelpSourceAnchor>();
+  for (const article of articles) {
+    for (const source of article.sources) byId.set(source.id, source);
+  }
+  const sources: HelpSourceAnchor[] = [...byId.keys()].sort(compare).map((id) => byId.get(id)!);
 
   // Content digest covers everything a consumer can observe; the source digest
   // covers only the cited anchors so anchor drift is separately detectable.
@@ -215,8 +277,11 @@ function buildCorpus(): HelpCanonicalCorpus {
     articles,
     chunks,
   });
-  const sourceDigest = canonicalDigest(
-    sources.map((source) => `${source.id}|${source.path}#${source.heading}`),
+  // Over per-source digests. The previous form joined `id|path#heading`, which
+  // collides whenever a separator character appears inside a field.
+  const sourceDigest = domainDigest(
+    HELP_DIGEST_DOMAINS.sourceSet,
+    sources.map((source) => source.digest),
   );
 
   return Object.freeze({

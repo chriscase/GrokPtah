@@ -262,6 +262,131 @@ After editing the corpus, run `help:build-model` then
 `help:verify-corpus -- --write`; the model is bound to the corpus digest and
 throws at import if the corpus moved without a rebuild.
 
+## Authority
+
+Help is a capability with a real boundary, not a retrieval library with
+advisory filters. `crates/common/grokptah-help-authority` decides every
+search, source read, and bounded answer **at the moment of the action**,
+against the principal, tenant, project, and capability supplied with that
+action — never a cached session decision.
+
+- **Default deny.** Non-public sources require an explicit grant naming the
+  same tenant and scope. A `project` source with no project id denies as
+  `malformed_scope`; it does not fall back to public.
+- **Tenant before scope.** A cross-tenant probe cannot learn that a project id
+  exists from the difference between two denials.
+- **Closed contracts.** Every request type is `deny_unknown_fields`. A field
+  this version does not understand is a rejection, because a silently dropped
+  restriction is how default-deny becomes allow-by-omission.
+- **Non-leaking receipts.** A receipt carries ids and digests only, asserted
+  by tests that scan a serialized receipt for paths, headings, content, and
+  query text. It has no capability field at all, so there is nowhere for a
+  grant to be recorded even by accident.
+
+### Two implementations, one rule set
+
+The desktop uses the Rust crate; the browser broker and embedding consumers
+use a TypeScript mirror. Both execute the **same 25 fixtures**
+(`crates/common/grokptah-help-authority/fixtures/authority-parity.json`) and
+must agree case for case. The TypeScript bounds count UTF-8 bytes, matching
+Rust, because counting UTF-16 code units would let an oversized identifier
+through on one side only.
+
+Both transports are single delegations to `authorize_for_served`, which lives
+in the authority crate where it is tested. Neither adapter holds logic that
+could drift.
+
+The JSON Schema is emitted from the same constants as the Rust structs and
+compared by parsed equality, not bytes: other workspace crates enable
+`serde_json/preserve_order`, so key order differs between a whole-workspace
+build and a `-p` build of this crate.
+
+## Digests
+
+Domain-separated and length-prefixed. The earlier source digest joined
+`id|path#heading`, which collides whenever a separator appears inside a field
+— `["a|b","c"]` and `["a","b|c"]` produced identical input. Every article,
+chunk, and source now carries its own digest in its own domain, and the corpus
+lock records them individually so a single edited record appears in the diff
+rather than only shifting one aggregate.
+
+The **index digest** binds the corpus, model, tokenizer, and every scoring
+constant. Individually correct digests could not detect a scoring-parameter
+change; this one can, and `expectIndexDigest` fails closed on it.
+
+## Claim-level citations
+
+A citation naming only an article is not checkable. Every citation carries the
+exact quote plus offsets re-derived from the corpus during validation, so a
+consumer can verify a claim without trusting the producer.
+
+- **Two coordinate systems.** UTF-16 offsets for JavaScript slicing and code
+  points for consumers that are not UTF-16, because a naive offset splits an
+  emoji.
+- **NFC everywhere.** Corpus text is normalized at construction so spans live
+  in one coordinate system; a quote supplied as NFD still matches and is
+  stored back in the corpus's form.
+- **Mapped sanitization.** Removing zero-width and bidi characters shifts
+  every later offset, so start and end are tracked per unit. An earlier version
+  read the exclusive end from the next entry's start and swallowed collapsed
+  whitespace — a span over "runs" reported "runs ".
+- **Abstain on incomplete support.** An answer ranging far beyond what it
+  quoted is rejected as `insufficient-support` rather than shown partially
+  supported.
+
+## Task runtime
+
+Every Help task carries a deadline. Cancellation settles the caller
+immediately whether or not the work observes its signal, so work that ignores
+its signal wastes CPU but can never wedge the queue. The queue is bounded
+rather than growing with a burst of keystrokes, and shutdown drains in bounded
+time so a restart never inherits a half-finished task. One settle-once guard
+covers the timeout/cancel/completion race, and work cancelled before its first
+microtask is never invoked at all.
+
+## Help route
+
+A dedicated searchable route and palette. The background is marked `inert`,
+not merely `aria-hidden`, because `aria-hidden` alone leaves it tabbable.
+Focus returns to the opener on every close path. One polite live region
+carries counts, corrections, redaction notices, and provider state. There is
+no inline color, transition, fixed pixel sizing, `overflow: hidden`, or
+`nowrap`, so forced-colors, reduced-motion, 400% zoom, and narrow viewports
+lose no information.
+
+The offline case is stated as a fact, not an error: with no provider
+configured, search is the product rather than a degraded mode.
+
+## Gate status on this branch
+
+| Gate | Result |
+|---|---|
+| `help:verify-corpus` | PASS |
+| `help:verify-model` | PASS, byte-identical rebuild |
+| `help:eval` | PASS, every metric above threshold |
+| `typecheck` | PASS |
+| `test` | PASS, 474 tests / 59 files |
+| `build` | PASS |
+| `verify:public` | PASS, including packaged consumer smoke |
+| `cargo fmt -p grokptah-help-authority --check` | PASS |
+| `cargo clippy -p grokptah-help-authority -- -D warnings` | PASS |
+| `cargo test -p grokptah-help-authority --locked` | PASS, 22 tests |
+| `git diff --check` | PASS |
+
+### The desktop shell gate needs a pre-existing fix first
+
+`cargo test --locked` in `desktop/src-tauri` **does not build at this base**,
+for a reason unrelated to this branch: `crates/common/grokptah-agent-sdk`
+fails `#![deny(missing_docs)]` at `src/run.rs:230` under rustc 1.92.0. This
+branch never touches that crate, and the same failure reproduces from the root
+workspace on an unmodified tree.
+
+To verify the Tauri adapter anyway, that one missing doc comment was patched
+**locally and not committed**, the shell was built, and all 13 of its tests
+passed with `src/help.rs` and its handler registration compiled in. The patch
+was then reverted. The gate cannot run in CI until that pre-existing break is
+fixed separately.
+
 ## Not covered by this lane
 
 - Packaged desktop or macOS identity evidence.

@@ -6,6 +6,16 @@
  * queries it. Every function here is pure and allocation-bounded.
  */
 
+/**
+ * Tokenizer version.
+ *
+ * Bump whenever normalization, stop words, stemming, or n-gram construction
+ * change. It is hashed into the index provenance, so an index built by a
+ * different tokenizer than the one querying it is detectable rather than
+ * silently wrong.
+ */
+export const HELP_TOKENIZER_VERSION = "grokptah.help-tokenizer.v1" as const;
+
 /** Hard bounds so a hostile query cannot drive unbounded work. */
 export const HELP_QUERY_MAX_CHARS = 512;
 export const HELP_QUERY_MAX_TERMS = 64;
