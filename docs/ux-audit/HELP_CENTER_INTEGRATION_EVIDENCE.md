@@ -5,7 +5,7 @@ live provider qualification, and 100% release qualification remain open.
 
 ## Candidate
 
-- Code head: `713d68c1` (Help Center integration, public consumer package, and
+- Code head: `9527f86c` (Help Center integration, public consumer package, and
   broker-boundary follow-ups)
 - Public contract follow-up: `c7800a46` (`feat(public): expose source-cited Help Center contract`)
 - Styling correction: `f9eee072` (`fix(ui): apply Help Center surface styles`)
@@ -31,7 +31,7 @@ live provider qualification, and 100% release qualification remain open.
 
 ## Verification run
 
-- `npm test`: 47 files / 272 tests passed.
+- `npm test`: 47 files / 274 tests passed.
 - `npm run typecheck`: passed.
 - `npm run build`: passed; Vite production bundle emitted.
 - `npm run verify:public`: passed; browser-safe public bundle, authority checks,
