@@ -5,6 +5,7 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 
 use chrono::{Duration, Utc};
 use fs2::FileExt;
@@ -521,7 +522,7 @@ impl OrchStore {
         owner_instance_id: &str,
         expected_revision: Option<u64>,
         now: chrono::DateTime<Utc>,
-        lease: Duration,
+        lease: StdDuration,
     ) -> anyhow::Result<AttemptRecord> {
         let path = self
             .attempt_path(run_id)
@@ -550,7 +551,9 @@ impl OrchStore {
             owner_instance_id: owner_instance_id.into(),
             revision: next_revision,
             heartbeat_at: now,
-            expires_at: now + lease,
+            expires_at: now
+                + chrono::Duration::from_std(lease)
+                    .map_err(|error| anyhow::anyhow!("invalid attempt lease: {error}"))?,
             phase: AttemptPhase::Running,
         };
         private_atomic_write_json(&path, &attempt)?;
@@ -564,7 +567,7 @@ impl OrchStore {
         owner_instance_id: &str,
         revision: u64,
         now: chrono::DateTime<Utc>,
-        lease: Duration,
+        lease: StdDuration,
     ) -> anyhow::Result<AttemptRecord> {
         self.mutate_attempt(run_id, |current| {
             check_attempt_owner(current, attempt_id, owner_instance_id, revision, now)?;
@@ -573,7 +576,9 @@ impl OrchStore {
             }
             current.revision = current.revision.saturating_add(1);
             current.heartbeat_at = now;
-            current.expires_at = now + lease;
+            current.expires_at = now
+                + chrono::Duration::from_std(lease)
+                    .map_err(|error| anyhow::anyhow!("invalid attempt lease: {error}"))?;
             Ok(())
         })
     }
@@ -2442,7 +2447,7 @@ mod tests {
                 "owner-private",
                 None,
                 Utc::now(),
-                Duration::minutes(1),
+                StdDuration::from_secs(60),
             )
             .unwrap();
         let prompt = store
@@ -2476,7 +2481,7 @@ mod tests {
                 "owner-1",
                 None,
                 now,
-                Duration::seconds(1),
+                StdDuration::from_secs(1),
             )
             .unwrap();
         assert!(store
@@ -2486,7 +2491,7 @@ mod tests {
                 "owner-2",
                 attempt.revision,
                 now,
-                Duration::seconds(1),
+                StdDuration::from_secs(1),
             )
             .is_err());
         assert!(store
@@ -2496,7 +2501,7 @@ mod tests {
                 "owner-1",
                 attempt.revision.saturating_sub(1),
                 now,
-                Duration::seconds(1),
+                StdDuration::from_secs(1),
             )
             .is_err());
         let expired = now + Duration::seconds(2);

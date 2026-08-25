@@ -2997,7 +2997,7 @@ impl OrchestrationService {
             match self.enqueue_pending(PendingRun {
                 run_id: run_id.clone(),
                 session_id,
-                admission_id,
+                admission_id: admission_id.clone(),
                 sequence,
                 execution_mode,
             }) {
