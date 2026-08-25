@@ -5,6 +5,7 @@ import {
   GrokPtahBrokerError,
   parseBrokerApproval,
   parseBrokerBinding,
+  parseBrokerEventUpdate,
   parseBrokerRun,
   parseBrokerReviewProjection,
   parseBrokerRunProjection,
@@ -135,6 +136,20 @@ describe("GrokPtahBrokerClient", () => {
       fingerprint: "final-1",
       workspace: "/private/secret",
     })).toBeNull();
+  });
+
+  it("fails closed on unredacted broker event updates", () => {
+    expect(parseBrokerEventUpdate({
+      type: "progress",
+      round: 2,
+      maxRounds: 12,
+      detail: "Inspecting the staged diff",
+      updatedAt: "2026-08-24T00:01:00Z",
+    })).toMatchObject({ type: "progress", round: 2 });
+    expect(parseBrokerEventUpdate({ type: "progress", workspace: "/private/secret" })).toBeNull();
+    expect(parseBrokerEventUpdate({ type: "progress", detail: "Authorization: Bearer secret" })).toBeNull();
+    expect(parseBrokerEventUpdate({ type: "progress", round: 13, maxRounds: 12 })).toBeNull();
+    expect(parseBrokerEventUpdate({})).toBeNull();
   });
 
   it("rejects malformed run responses before exposing them to a consumer", async () => {
@@ -607,6 +622,27 @@ describe("GrokPtahBrokerClient", () => {
     expect(String(fetcher.mock.calls[0][0])).toContain("/bindings/binding-1/runs/run-1/events");
   });
 
+  it("rejects privileged fields hidden inside an SSE event update", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'id: 1\ndata: {"kind":"event","brokerRunId":"run-1","seq":1,"ts":"now","update":{"type":"progress","detail":"/Users/private/repo"}}\n\n',
+        ));
+        controller.close();
+      },
+    });
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    );
+    const client = new GrokPtahBrokerClient({ baseUrl: "https://contextdesk.example", fetcher });
+    const read = async () => {
+      for await (const _notification of client.streamEvents("binding-1", "run-1")) {
+        // Privileged event data must never reach a browser consumer.
+      }
+    };
+    await expect(read()).rejects.toThrow("malformed");
+  });
+
   it("rejects an external recovery route", async () => {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -632,7 +668,7 @@ describe("GrokPtahBrokerClient", () => {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         const text =
-          'id: 4\ndata: {"kind":"event","brokerRunId":"run-1","seq":4,"ts":"now","update":{}}\n\n' +
+          'id: 4\ndata: {"kind":"event","brokerRunId":"run-1","seq":4,"ts":"now","update":{"type":"progress"}}\n\n' +
           'data: {"kind":"recovery","brokerRunId":"run-1","afterSeq":3,"reason":"gap","pollRoute":"/runs/run-1"}\n\n';
         controller.enqueue(new TextEncoder().encode(text));
         controller.close();
@@ -654,7 +690,7 @@ describe("GrokPtahBrokerClient", () => {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
         controller.enqueue(new TextEncoder().encode(
-          'id: 1\ndata: {"kind":"event","brokerRunId":"run-1","seq":1.5,"ts":"now","update":{}}\n\n',
+          'id: 1\ndata: {"kind":"event","brokerRunId":"run-1","seq":1.5,"ts":"now","update":{"type":"progress"}}\n\n',
         ));
         controller.close();
       },

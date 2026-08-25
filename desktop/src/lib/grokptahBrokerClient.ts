@@ -67,6 +67,8 @@ const MAX_BROKER_ROUNDS = 24;
 const MAX_BROKER_PROMPT_BOUND_BYTES = 4 * 1_048_576;
 const MAX_BROKER_SSE_REASON_BYTES = 256;
 const MAX_BROKER_SSE_ROUTE_BYTES = 2_048;
+const MAX_BROKER_EVENT_TYPE_BYTES = 64;
+const MAX_BROKER_EVENT_DETAIL_BYTES = 2_048;
 const MAX_BROKER_ID_BYTES = 256;
 const MAX_BROKER_IDEMPOTENCY_BYTES = 256;
 const MAX_BROKER_CAPABILITIES = 64;
@@ -88,6 +90,19 @@ const BROKER_RUN_STATES: ReadonlySet<GrokPtahBrokerRunState> = new Set([
   "interrupted",
   "limit_reached",
 ]);
+const BROKER_EVENT_UPDATE_KEYS = new Set([
+  "type",
+  "detail",
+  "round",
+  "maxRounds",
+  "lastTool",
+  "state",
+  "terminalResult",
+  "errorCode",
+  "updatedAt",
+]);
+const BROKER_EVENT_TYPE = /^[a-z][a-z0-9_.-]{0,63}$/;
+const PRIVILEGED_TEXT_NEEDLE = /(?:\/(?:users|private|var|tmp|home|volumes)\/|https?:\/\/|(?:^|[\s=:])(authorization|bearer|api[_ -]?key|xai_api_key|grokptah_home|clipboard|private[_ -]?key|secret(?:[_ -]?key)?)(?:[\s=:]|$))/i;
 
 const BROKER_AVAILABILITIES: ReadonlySet<GrokPtahBrokerCapability["availability"]> = new Set([
   "available",
@@ -134,7 +149,20 @@ export type GrokPtahBrokerEvent = {
   brokerRunId: string;
   seq: number;
   ts: string;
-  update: unknown;
+  update: GrokPtahBrokerEventUpdate;
+};
+
+/** Browser-safe, bounded event data; raw command output never crosses this boundary. */
+export type GrokPtahBrokerEventUpdate = {
+  type: string;
+  detail?: string;
+  round?: number;
+  maxRounds?: number;
+  lastTool?: string | null;
+  state?: GrokPtahBrokerRunState;
+  terminalResult?: string | null;
+  errorCode?: string | null;
+  updatedAt?: string;
 };
 
 export type GrokPtahBrokerRecovery = {
@@ -182,6 +210,10 @@ function boundedString(value: unknown, maxBytes: number): value is string {
     value.trim().length > 0 &&
     new TextEncoder().encode(value).byteLength <= maxBytes
   );
+}
+
+function safePublicString(value: unknown, maxBytes: number): value is string {
+  return boundedString(value, maxBytes) && !PRIVILEGED_TEXT_NEEDLE.test(value);
 }
 
 function hasOnlyKeys(value: Record<string, unknown>, keys: ReadonlySet<string>): boolean {
@@ -293,15 +325,15 @@ function parseRunProgress(value: unknown): GrokPtahBrokerRunProjection["progress
     record.maxRounds < 1 ||
     record.maxRounds > MAX_BROKER_ROUNDS ||
     record.round > record.maxRounds ||
-    !boundedString(record.detail, 2_048) ||
-    !boundedString(record.updatedAt, 128)
+    !safePublicString(record.detail, 2_048) ||
+    !safePublicString(record.updatedAt, 128)
   ) {
     return undefined;
   }
   if (
     record.lastTool !== undefined &&
     record.lastTool !== null &&
-    !boundedString(record.lastTool, 256)
+    !safePublicString(record.lastTool, 256)
   ) {
     return undefined;
   }
@@ -337,10 +369,9 @@ export function parseBrokerRunProjection(value: unknown): GrokPtahBrokerRunProje
     !boundedString(record.bindingId, MAX_BROKER_ID_BYTES) ||
     typeof record.state !== "string" ||
     !BROKER_RUN_STATES.has(record.state as GrokPtahBrokerRunState) ||
-    typeof record.promptPreview !== "string" ||
-    new TextEncoder().encode(record.promptPreview).byteLength > 512 ||
-    !boundedString(record.createdAt, 128) ||
-    !boundedString(record.updatedAt, 128)
+    !safePublicString(record.promptPreview, 512) ||
+    !safePublicString(record.createdAt, 128) ||
+    !safePublicString(record.updatedAt, 128)
   ) {
     return null;
   }
@@ -348,7 +379,7 @@ export function parseBrokerRunProjection(value: unknown): GrokPtahBrokerRunProje
   if (record.progress !== undefined && progress === undefined) return null;
   for (const [key, maxBytes] of [["terminalResult", 512], ["errorCode", 128]] as const) {
     const field = record[key];
-    if (field !== undefined && field !== null && !boundedString(field, maxBytes)) return null;
+    if (field !== undefined && field !== null && !safePublicString(field, maxBytes)) return null;
   }
   return {
     brokerRunId: record.brokerRunId,
@@ -383,6 +414,59 @@ export function parseBrokerReviewProjection(value: unknown): GrokPtahBrokerRevie
     diff: record.diff,
     diffTruncated: record.diffTruncated,
     fingerprint: record.fingerprint,
+  };
+}
+
+/** Parse one browser-safe, bounded event update before exposing it to a UI. */
+export function parseBrokerEventUpdate(value: unknown): GrokPtahBrokerEventUpdate | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (!hasOnlyKeys(record, BROKER_EVENT_UPDATE_KEYS)) return null;
+  if (
+    !safePublicString(record.type, MAX_BROKER_EVENT_TYPE_BYTES) ||
+    !BROKER_EVENT_TYPE.test(record.type)
+  ) return null;
+  for (const [key, maxBytes] of [
+    ["detail", MAX_BROKER_EVENT_DETAIL_BYTES],
+    ["updatedAt", 128],
+  ] as const) {
+    const field = record[key];
+    if (field !== undefined && !safePublicString(field, maxBytes)) return null;
+  }
+  for (const [key, maxBytes] of [
+    ["lastTool", 256],
+    ["terminalResult", 512],
+    ["errorCode", 128],
+  ] as const) {
+    const field = record[key];
+    if (field !== undefined && field !== null && !safePublicString(field, maxBytes)) return null;
+  }
+  for (const key of ["round", "maxRounds"] as const) {
+    const field = record[key];
+    if (
+      field !== undefined &&
+      (typeof field !== "number" || !Number.isSafeInteger(field) || field < 0 || field > MAX_BROKER_ROUNDS)
+    ) return null;
+  }
+  if (
+    typeof record.round === "number" &&
+    typeof record.maxRounds === "number" &&
+    record.round > record.maxRounds
+  ) return null;
+  if (
+    record.state !== undefined &&
+    (typeof record.state !== "string" || !BROKER_RUN_STATES.has(record.state as GrokPtahBrokerRunState))
+  ) return null;
+  return {
+    type: record.type,
+    ...(record.detail === undefined ? {} : { detail: record.detail as string }),
+    ...(record.round === undefined ? {} : { round: record.round as number }),
+    ...(record.maxRounds === undefined ? {} : { maxRounds: record.maxRounds as number }),
+    ...(record.lastTool === undefined ? {} : { lastTool: record.lastTool as string | null }),
+    ...(record.state === undefined ? {} : { state: record.state as GrokPtahBrokerRunState }),
+    ...(record.terminalResult === undefined ? {} : { terminalResult: record.terminalResult as string | null }),
+    ...(record.errorCode === undefined ? {} : { errorCode: record.errorCode as string | null }),
+    ...(record.updatedAt === undefined ? {} : { updatedAt: record.updatedAt as string }),
   };
 }
 
@@ -989,13 +1073,14 @@ function parseNotification(frame: string, brokerRunId: string): GrokPtahBrokerNo
     throw new Error("Broker SSE scope is invalid");
   }
   if (body.kind === "event") {
+    const update = parseBrokerEventUpdate(body.update);
     if (
       typeof sseId !== "number" ||
       !Number.isSafeInteger(body.seq) ||
       body.seq < 1 ||
       sseId !== body.seq ||
-      !boundedString(body.ts, 128) ||
-      !("update" in body)
+      !safePublicString(body.ts, 128) ||
+      update === null
     ) {
       throw new Error("Broker event notification is malformed");
     }
@@ -1004,7 +1089,7 @@ function parseNotification(frame: string, brokerRunId: string): GrokPtahBrokerNo
       brokerRunId,
       seq: body.seq,
       ts: body.ts,
-      update: body.update,
+      update,
     };
   }
   if (

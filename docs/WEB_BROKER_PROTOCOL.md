@@ -133,6 +133,13 @@ response containing `afterSeq` and a poll route. Clients must poll the run or
 event page, then reconnect; they must never infer a completed run from a closed
 socket.
 
+The browser package validates each `update` through
+`parseBrokerEventUpdate`. It accepts only a bounded event type plus optional
+round/state/detail metadata, rejects unknown fields and impossible round
+bounds, and fails closed on path-like text, URLs, credentials, clipboard data,
+or other privileged needles. An SSE frame that cannot pass this parser is
+discarded as malformed before it reaches the War Room UI.
+
 The broker event frame is intentionally distinct from the raw MCP notification:
 
 ```text

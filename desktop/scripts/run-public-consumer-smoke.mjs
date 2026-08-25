@@ -49,6 +49,7 @@ try {
     `import {
   GrokPtahBrokerClient,
   parseBrokerApproval,
+  parseBrokerEventUpdate,
   parseBrokerRunProjection,
   parseBrokerReviewProjection,
   HELP_ARTICLES,
@@ -113,6 +114,12 @@ if (parseBrokerRunProjection({
   updatedAt: "2026-08-24T00:01:00Z",
 })?.state !== "completed") {
   throw new Error("consumer broker run projection parser was not usable");
+}
+if (parseBrokerEventUpdate({ type: "progress", round: 1, maxRounds: 12 })?.type !== "progress") {
+  throw new Error("consumer broker event update parser was not usable");
+}
+if (parseBrokerEventUpdate({ type: "progress", detail: "/private/secret" }) !== null) {
+  throw new Error("consumer broker event update parser exposed privileged text");
 }
 if (parseBrokerReviewProjection({
   changedFiles: [],

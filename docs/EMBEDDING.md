@@ -63,7 +63,10 @@ for await (const notification of grokptah.streamEvents(binding.bindingId, run.br
 The client validates opaque binding/run response envelopes and bounded run,
 queue, and steer requests, requires CSRF and idempotency headers for
 mutations, rejects external recovery URLs, and enforces monotonic event
-sequence numbers. The broker remains authoritative: it must
+sequence numbers. It also validates every streamed event update through the
+browser-safe `parseBrokerEventUpdate` contract before exposing it to a UI;
+unknown fields, impossible round bounds, path-like text, URLs, and privileged
+needles fail closed. The broker remains authoritative: it must
 re-check the user, team, workspace, capability, policy, and exact run scope.
 
 For a typed War Room status/evidence surface, prefer
