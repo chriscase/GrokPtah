@@ -442,6 +442,24 @@ impl Drop for IsolatedVisualPackagedRuntime {
     }
 }
 
+/// Keep crate-private packaged-runtime entrypoints linked in the lib artifact.
+/// `#[cfg(test)]` holds are invisible to `cargo clippy --all-targets -D warnings`
+/// on the lib target. This is not capability admission, launch, boot, or
+/// qualification. The helper source gate still requires `pub(crate)`.
+fn keep_packaged_runtime_linked_in_lib() {
+    let _launch = IsolatedVisualPackagedRuntime::launch;
+    let _start = IsolatedVisualPackagedRuntime::start;
+    let _read_frame = IsolatedVisualPackagedRuntime::read_frame;
+    let _write_input = IsolatedVisualPackagedRuntime::write_input;
+    let _stop = IsolatedVisualPackagedRuntime::stop;
+    let _complete_cleanup = IsolatedVisualPackagedRuntime::complete_cleanup;
+    let _complete_observed_cleanup = IsolatedVisualPackagedRuntime::complete_observed_cleanup;
+    let _runtime = IsolatedVisualPackagedRuntime::runtime;
+}
+
+#[used]
+static PACKAGED_RUNTIME_LIB_LINKAGE: fn() = keep_packaged_runtime_linked_in_lib;
+
 #[cfg(test)]
 mod tests {
     use super::descriptors_are_distinct;

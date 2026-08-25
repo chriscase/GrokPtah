@@ -250,7 +250,7 @@ impl IsolatedVisualInputWire {
             delta_y,
             text,
         }
-        .to_message()?;
+        .into_message()?;
         Ok(DecodedInput {
             frame_sequence,
             input_sequence,
@@ -370,7 +370,7 @@ impl WireFields {
         Ok(fields)
     }
 
-    fn to_message(self) -> ComputerResult<IsolatedVisualInputMessage> {
+    fn into_message(self) -> ComputerResult<IsolatedVisualInputMessage> {
         let Self {
             kind,
             state,
