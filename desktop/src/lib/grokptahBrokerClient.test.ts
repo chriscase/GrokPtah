@@ -62,6 +62,47 @@ describe("GrokPtahBrokerClient", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("fails closed before approval for malformed review evidence", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+
+    await expect(
+      client.approveRun(
+        "binding-1",
+        "run-1",
+        {
+          sourceFingerprint: " ",
+          finalFingerprint: "final-1",
+          changedFiles: [],
+          ttlMs: 0,
+        },
+        "approve-intent-1",
+      ),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before approval without CSRF", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+    });
+    await expect(
+      client.approveRun(
+        "binding-1",
+        "run-1",
+        { sourceFingerprint: "source-1", finalFingerprint: "final-1", changedFiles: [] },
+        "approve-intent-1",
+      ),
+    ).rejects.toMatchObject({ code: "csrf_required" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("maps stable broker errors without exposing a privileged body", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
       jsonResponse(

@@ -190,6 +190,7 @@ export class GrokPtahBrokerClient {
     request: GrokPtahBrokerApprovalRequest,
     idempotencyKey: string,
   ): Promise<T> {
+    validateApprovalRequest(request);
     return this.request<T>(`${this.runPath(bindingId, brokerRunId)}/approve`, {
       method: "POST",
       idempotencyKey,
@@ -367,6 +368,40 @@ export class GrokPtahBrokerClient {
 function segment(value: string): string {
   if (!value.trim()) throw new Error("Broker identifier must not be empty");
   return encodeURIComponent(value);
+}
+
+function validateApprovalRequest(request: GrokPtahBrokerApprovalRequest): void {
+  if (!request.sourceFingerprint.trim() || !request.finalFingerprint.trim()) {
+    throw new GrokPtahBrokerError(
+      0,
+      "invalid_request",
+      "Approval fingerprints must not be empty",
+    );
+  }
+  if (
+    request.ttlMs !== undefined &&
+    (!Number.isSafeInteger(request.ttlMs) || request.ttlMs < 1 || request.ttlMs > 900_000)
+  ) {
+    throw new GrokPtahBrokerError(
+      0,
+      "invalid_request",
+      "Approval ttlMs must be an integer between 1 and 900000",
+    );
+  }
+  for (const file of request.changedFiles) {
+    if (
+      !file.path.trim() ||
+      file.path.startsWith("/") ||
+      file.path.includes("..") ||
+      file.summary.length > 512
+    ) {
+      throw new GrokPtahBrokerError(
+        0,
+        "invalid_request",
+        "Approval changed files must be bounded repository-relative summaries",
+      );
+    }
+  }
 }
 
 async function throwBrokerError(response: Response): Promise<never> {
