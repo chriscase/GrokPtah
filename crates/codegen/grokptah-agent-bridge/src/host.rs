@@ -461,6 +461,8 @@ pub struct AgentHostHandle {
     /// It is opened lazily so library users can still construct a host for
     /// tests that provide their own orchestration store.
     orchestration_store: Arc<Mutex<Option<OrchStore>>>,
+    external_worker_host: Arc<Mutex<Option<Arc<crate::external_worker::ExternalWorkerHost>>>>,
+    external_worker_registry: Arc<crate::external_worker::ExternalWorkerRegistry>,
     /// One process-owned durable Computer Run ledger (#271). The store holds
     /// an exclusive file lock, so the desktop cockpit and the MCP control
     /// plane must share this handle instead of opening their own.
@@ -642,6 +644,10 @@ impl AgentHost {
             inner: Arc::new(Mutex::new(inner)),
             event_rx_factory: Arc::new(Mutex::new(Some(event_rx))),
             orchestration_store: Arc::new(Mutex::new(None)),
+            external_worker_host: Arc::new(Mutex::new(None)),
+            external_worker_registry: Arc::new(
+                crate::external_worker::ExternalWorkerRegistry::new(),
+            ),
             computer_store: Arc::new(Mutex::new(None)),
             computer_controller: Arc::new(Mutex::new(None)),
             computer_agent_controller: Arc::new(Mutex::new(None)),
@@ -938,6 +944,49 @@ impl AgentHostHandle {
     /// Return the already-open Computer Run ledger without filesystem work.
     pub fn computer_store(&self) -> Option<crate::computer_use::ComputerStore> {
         self.computer_store.lock().clone()
+    }
+
+    /// Open (or return) the single external-worker host for this process.
+    ///
+    /// Exactly one, for the same reason the Computer Run ledger is one: the
+    /// durable ledger under this root takes an exclusive file lock, and the
+    /// authority store beside it decides whether a caller may act on a worker
+    /// at all. A second host in one process would be a second, disagreeing
+    /// answer to that question — and the first would already hold the lock.
+    ///
+    /// The registry starts empty. A provider is not available because a
+    /// credential exists: the host installs a qualified adapter and an explicit
+    /// repository allowlist, and until it does this host refuses every launch.
+    pub fn ensure_external_worker_host(
+        &self,
+    ) -> Result<Arc<crate::external_worker::ExternalWorkerHost>> {
+        let mut current = self.external_worker_host.lock();
+        if let Some(existing) = current.as_ref() {
+            return Ok(existing.clone());
+        }
+        let registry = self.external_worker_registry.clone();
+        let opened = Arc::new(
+            crate::external_worker::ExternalWorkerHost::open(
+                registry,
+                crate::discover::grokptah_home().join("external-workers"),
+            )
+            .map_err(|error| anyhow::anyhow!("external worker host unavailable: {error}"))?,
+        );
+        *current = Some(opened.clone());
+        Ok(opened)
+    }
+
+    /// Return the already-open external-worker host without filesystem work.
+    pub fn external_worker_host(&self) -> Option<Arc<crate::external_worker::ExternalWorkerHost>> {
+        self.external_worker_host.lock().clone()
+    }
+
+    /// The process-wide provider registry the external-worker host reads.
+    ///
+    /// Exposed so bootstrap can install a qualified adapter and its repository
+    /// allowlist before any launch is attempted.
+    pub fn external_worker_registry(&self) -> Arc<crate::external_worker::ExternalWorkerRegistry> {
+        self.external_worker_registry.clone()
     }
 
     /// Register the live desktop Computer Run backend used by MCP mutation

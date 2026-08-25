@@ -278,12 +278,18 @@ impl CursorCloudAdapter {
         if let Some(model) = &request.model {
             payload["model"] = json!({ "id": model });
         }
-        // GrokPtah's durable idempotency ledger owns retries. Cursor's
-        // client-supplied agentId is accepted only for its strict bc-<uuid>
-        // shape; arbitrary request IDs must not be sent as provider IDs.
-        if is_cursor_agent_id(&request.request_id) {
-            payload["agentId"] = json!(request.request_id);
-        }
+        // Every launch carries a client-supplied identity derived
+        // deterministically from the idempotency key, so a retry of the same
+        // request presents the same agentId and Cursor answers `agent_conflict`
+        // — which reconciles to the existing worker — instead of creating a
+        // second one.
+        //
+        // Previously the identity was sent only when the caller's request_id
+        // happened to match Cursor's `bc-<uuid>` shape. GrokPtah request IDs
+        // are not in that shape, so in practice no identity was sent at all:
+        // a retry after an ambiguous failure created a duplicate worker, and
+        // the conflict-reconciliation path below could never fire.
+        payload["agentId"] = json!(deterministic_cursor_agent_id(&request.request_id));
         Ok(payload)
     }
 
@@ -298,10 +304,11 @@ impl CursorCloudAdapter {
                 code,
             });
         }
-        if !is_cursor_agent_id(&request.request_id) {
-            return Err(ExternalWorkerAdapterError::Uncertain);
-        }
-        let worker = self.get_worker(&request.request_id).await?;
+        // Read back the identity this host would have sent, not the caller's
+        // request_id: they are only ever the same by accident.
+        let worker = self
+            .get_worker(&deterministic_cursor_agent_id(&request.request_id))
+            .await?;
         let expected = repository_identity(&github_repository_url(&request.repository)?)?;
         if worker.repository != expected || !refs_equal(&worker.starting_ref, &request.starting_ref)
         {
@@ -929,6 +936,24 @@ struct CursorArtifactDownload {
     expires_at: String,
 }
 
+/// Derive the client-supplied Cursor agent identity for one idempotency key.
+///
+/// Deterministic, so every retry of one launch presents the same identity, and
+/// namespaced, so a request_id cannot be steered into colliding with an
+/// unrelated digest. The value is a well-formed RFC 4122 UUID (version 8,
+/// custom) behind Cursor's `bc-` prefix, which is the only shape the provider
+/// accepts for a client-supplied ID.
+pub(crate) fn deterministic_cursor_agent_id(request_id: &str) -> String {
+    let digest = Sha256::digest(
+        format!("grokptah.external-worker.cursor.agent-id.v1\0{request_id}").as_bytes(),
+    );
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!("bc-{}", uuid::Uuid::from_bytes(bytes).hyphenated())
+}
+
 fn is_cursor_agent_id(value: &str) -> bool {
     let Some(uuid) = value.strip_prefix("bc-") else {
         return false;
@@ -1226,6 +1251,18 @@ mod tests {
         agent
     }
 
+    /// Rewrite a run projection to belong to the agent it was fetched under.
+    fn owned_by(mut run: Value, agent_id: &str) -> Value {
+        run["agentId"] = json!(agent_id);
+        run
+    }
+
+    fn owned_all(runs: Vec<Value>, agent_id: &str) -> Vec<Value> {
+        runs.into_iter()
+            .map(|run| owned_by(run, agent_id))
+            .collect()
+    }
+
     fn fake_run(id: &str, status: &str) -> Value {
         json!({
             "id": id,
@@ -1276,12 +1313,24 @@ mod tests {
         (status, Json(payload)).into_response()
     }
 
-    async fn fake_agent_read(State(state): State<FakeCursorState>) -> Json<Value> {
+    async fn fake_agent_read(
+        State(state): State<FakeCursorState>,
+        axum::extract::Path(agent_id): axum::extract::Path<String>,
+    ) -> Json<Value> {
         let config = state.config.lock().unwrap().clone();
-        Json(fake_agent(&config))
+        // Echo the identity that was asked for. A real provider serves the
+        // agent under the client-supplied ID, which is what makes conflict
+        // reconciliation resolve to the worker a retry already created.
+        let mut agent = fake_agent(&config);
+        agent["id"] = json!(agent_id);
+        agent["url"] = json!(format!("https://cursor.com/agents/{agent_id}"));
+        Json(agent)
     }
 
-    async fn fake_run_read(State(state): State<FakeCursorState>) -> Json<Value> {
+    async fn fake_run_read(
+        State(state): State<FakeCursorState>,
+        axum::extract::Path(agent_id): axum::extract::Path<String>,
+    ) -> Json<Value> {
         let cancelled = *state.cancelled.lock().unwrap();
         let cancel_calls = *state.cancel_calls.lock().unwrap();
         let config = state.config.lock().unwrap().clone();
@@ -1290,11 +1339,12 @@ mod tests {
         } else {
             config.run_status.as_str()
         };
-        Json(fake_run(FAKE_RUN, status))
+        Json(owned_by(fake_run(FAKE_RUN, status), &agent_id))
     }
 
     async fn fake_follow_up(
         State(state): State<FakeCursorState>,
+        axum::extract::Path(agent_id): axum::extract::Path<String>,
         Json(body): Json<Value>,
     ) -> impl IntoResponse {
         state.follow_up_requests.lock().unwrap().push(body);
@@ -1308,12 +1358,18 @@ mod tests {
         (
             AxumStatus::OK,
             Json(json!({
-                "run": fake_run("run-00000000-0000-0000-0000-000000000002", "CREATING")
+                "run": owned_by(
+                    fake_run("run-00000000-0000-0000-0000-000000000002", "CREATING"),
+                    &agent_id,
+                )
             })),
         )
     }
 
-    async fn fake_runs(State(state): State<FakeCursorState>) -> Json<Value> {
+    async fn fake_runs(
+        State(state): State<FakeCursorState>,
+        axum::extract::Path(agent_id): axum::extract::Path<String>,
+    ) -> Json<Value> {
         let posted = !state.follow_up_requests.lock().unwrap().is_empty();
         let config = state.config.lock().unwrap().clone();
         let items = if config.defer_listed_runs_until_follow_up && !posted {
@@ -1321,10 +1377,15 @@ mod tests {
         } else {
             config.listed_runs
         };
-        Json(json!({ "items": items }))
+        Json(json!({ "items": owned_all(items, &agent_id) }))
     }
 
-    async fn fake_cancel(State(state): State<FakeCursorState>) -> impl IntoResponse {
+    async fn fake_cancel(
+        State(state): State<FakeCursorState>,
+        // The cancel response carries only a run id; the adapter re-reads the
+        // run under its agent afterwards, which is where ownership is checked.
+        axum::extract::Path(_agent_id): axum::extract::Path<String>,
+    ) -> impl IntoResponse {
         *state.cancel_calls.lock().unwrap() += 1;
         let config = state.config.lock().unwrap().clone();
         if config.cancel_status != 200 {
@@ -1378,25 +1439,25 @@ mod tests {
     pub async fn spawn_fake_cursor(state: FakeCursorState) -> String {
         let app = Router::new()
             .route("/v1/agents", post(fake_create))
-            .route(&format!("/v1/agents/{FAKE_AGENT}"), get(fake_agent_read))
+            .route("/v1/agents/{agent_id}", get(fake_agent_read))
+            // Agent-scoped routes take the identity as a path parameter, as a
+            // real provider does. Pinning them to one hard-coded ID hid the
+            // fact that nothing was sending a client-supplied identity at all.
             .route(
-                &format!("/v1/agents/{FAKE_AGENT}/runs/{FAKE_RUN}"),
+                &format!("/v1/agents/{{agent_id}}/runs/{FAKE_RUN}"),
                 get(fake_run_read),
             )
             .route(
-                &format!("/v1/agents/{FAKE_AGENT}/runs"),
+                "/v1/agents/{agent_id}/runs",
                 post(fake_follow_up).get(fake_runs),
             )
             .route(
-                &format!("/v1/agents/{FAKE_AGENT}/runs/{FAKE_RUN}/cancel"),
+                &format!("/v1/agents/{{agent_id}}/runs/{FAKE_RUN}/cancel"),
                 post(fake_cancel),
             )
+            .route("/v1/agents/{agent_id}/artifacts", get(fake_artifacts))
             .route(
-                &format!("/v1/agents/{FAKE_AGENT}/artifacts"),
-                get(fake_artifacts),
-            )
-            .route(
-                &format!("/v1/agents/{FAKE_AGENT}/artifacts/download"),
+                "/v1/agents/{agent_id}/artifacts/download",
                 get(fake_download),
             )
             .route("/artifact-bytes", get(fake_artifact_bytes))
@@ -1547,21 +1608,26 @@ mod tests {
         assert_eq!(launch.run.state, ExternalWorkerState::Provisioning);
         assert_eq!(launch.run.stream, ExternalWorkerStreamState::Unsupported);
         assert_eq!(launch.run.last_seq, None);
-        let (sent_len, starting_ref, auto_create_pr, missing_env, missing_agent_id) = {
+        let (sent_len, starting_ref, auto_create_pr, missing_env, sent_agent_id) = {
             let sent = state.launch_requests.lock().unwrap();
             (
                 sent.len(),
                 sent[0]["repos"][0]["startingRef"].clone(),
                 sent[0]["autoCreatePR"].clone(),
                 sent[0].get("env").is_none(),
-                sent[0].get("agentId").is_none(),
+                sent[0]["agentId"].clone(),
             )
         };
         assert_eq!(sent_len, 1);
         assert_eq!(starting_ref, "main");
         assert_eq!(auto_create_pr, false);
         assert!(missing_env);
-        assert!(missing_agent_id);
+        // Every launch carries a deterministic client-supplied identity, so a
+        // retry of the same request cannot create a second worker.
+        assert_eq!(
+            sent_agent_id,
+            json!(deterministic_cursor_agent_id("request-1")),
+        );
 
         let worker = adapter
             .get_worker(&launch.worker.external_agent_id)
@@ -1740,6 +1806,41 @@ mod tests {
         assert_eq!(state.follow_up_requests.lock().unwrap().len(), 1);
     }
 
+    /// The provider identity must be a function of the idempotency key alone,
+    /// so a retry after an ambiguous failure asks the provider for the *same*
+    /// worker rather than creating a second one. Nothing was sending a
+    /// client-supplied identity at all before, so a retry duplicated the work.
+    #[tokio::test]
+    async fn a_retried_launch_presents_the_same_provider_identity() {
+        let state = FakeCursorState::default();
+        let base = spawn_fake_cursor(state.clone()).await;
+        let adapter = CursorCloudAdapter::for_test(&base);
+
+        adapter.launch(&launch_request("request-1")).await.unwrap();
+        adapter.launch(&launch_request("request-1")).await.unwrap();
+        adapter.launch(&launch_request("request-2")).await.unwrap();
+
+        let sent = state.launch_requests.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(
+            sent[0]["agentId"], sent[1]["agentId"],
+            "a retry of one request must claim the same provider identity",
+        );
+        assert_ne!(
+            sent[0]["agentId"], sent[2]["agentId"],
+            "a different request must claim a different provider identity",
+        );
+        // Deterministic across processes, not merely within one run.
+        assert_eq!(
+            sent[0]["agentId"],
+            json!(deterministic_cursor_agent_id("request-1")),
+        );
+        // And it is a shape the provider will accept as a client-supplied ID.
+        assert!(is_cursor_agent_id(
+            sent[0]["agentId"].as_str().expect("agentId is a string")
+        ));
+    }
+
     #[tokio::test]
     async fn launch_agent_conflict_is_reconciled_with_get_without_a_second_create() {
         let state = FakeCursorState::default();
@@ -1755,7 +1856,12 @@ mod tests {
             .launch(&launch_request(FAKE_AGENT))
             .await
             .expect("conflict should reconcile via GET");
-        assert_eq!(result.worker.external_agent_id, FAKE_AGENT);
+        // Reconciliation resolves to the worker the deterministic identity
+        // names, which is the one a previous attempt would have created.
+        assert_eq!(
+            result.worker.external_agent_id,
+            deterministic_cursor_agent_id(FAKE_AGENT),
+        );
         assert_eq!(result.run.external_run_id, FAKE_RUN);
         assert_eq!(state.launch_requests.lock().unwrap().len(), 1);
     }

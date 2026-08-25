@@ -376,6 +376,23 @@ mod tests {
             .is_err());
     }
 
+    /// The registry must not hand out launch rights merely because a
+    /// credential exists. This is the state the process starts in.
+    #[test]
+    fn a_fresh_registry_grants_nothing_until_bootstrap_installs_a_provider() {
+        let registry = ExternalWorkerRegistry::new();
+        assert!(registry.providers().is_empty());
+        assert!(registry.get(ExternalWorkerProvider::CursorCloud).is_none());
+        assert!(!registry
+            .repository_allowed(ExternalWorkerProvider::CursorCloud, "chriscase/GrokPtah")
+            .unwrap());
+        // Registering an adapter alone still does not grant launch rights.
+        registry.register(Arc::new(CursorCloudAdapter::new("synthetic-key").unwrap()));
+        assert!(!registry
+            .repository_allowed(ExternalWorkerProvider::CursorCloud, "chriscase/GrokPtah")
+            .unwrap());
+    }
+
     #[test]
     fn known_conflict_codes_are_parsed_without_retaining_the_body() {
         assert_eq!(

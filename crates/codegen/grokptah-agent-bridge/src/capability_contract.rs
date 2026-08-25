@@ -141,6 +141,34 @@ pub fn advertised_capabilities() -> CapabilitySet {
     }
 }
 
+/// Advertise the external-worker capability for a given provider registry.
+///
+/// Availability is derived from the registry rather than declared, because a
+/// capability that claims to exist when no qualified adapter is installed is a
+/// promise the host cannot keep. `Unavailable` is the honest answer until
+/// bootstrap installs an adapter and its repository allowlist; `Gated` is the
+/// answer afterwards, because the authority record — not the presence of the
+/// adapter — decides every individual action.
+pub fn external_worker_capability(
+    registry: &crate::external_worker::ExternalWorkerRegistry,
+) -> CapabilityDescriptor {
+    let installed = registry.providers();
+    CapabilityDescriptor {
+        id: "external.worker".into(),
+        tier: CapabilityTier::Execute,
+        mutating: true,
+        // Launching work into a repository on a third-party provider is not
+        // something a caller should be able to reach without an explicit grant.
+        human_gate: true,
+        availability: if installed.is_empty() {
+            CapabilityAvailability::Unavailable
+        } else {
+            CapabilityAvailability::Gated
+        },
+        description: "Launch and steer isolated provider-managed coding workers under a durable authority record.".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +188,27 @@ mod tests {
                 .map(|capability| capability.human_gate),
             Some(true)
         );
+    }
+
+    /// A capability that claims to exist with no adapter installed is a
+    /// promise the host cannot keep, so availability is read from the registry.
+    #[test]
+    fn external_worker_capability_reflects_what_is_actually_installed() {
+        use crate::external_worker::{CursorCloudAdapter, ExternalWorkerRegistry};
+        use std::sync::Arc;
+
+        let registry = ExternalWorkerRegistry::new();
+        let empty = external_worker_capability(&registry);
+        assert_eq!(empty.id, "external.worker");
+        assert_eq!(empty.availability, CapabilityAvailability::Unavailable);
+
+        registry.register(Arc::new(CursorCloudAdapter::new("synthetic-key").unwrap()));
+        let installed = external_worker_capability(&registry);
+        // Installed is still only `Gated`: the durable authority record, not
+        // the presence of an adapter, decides each individual action.
+        assert_eq!(installed.availability, CapabilityAvailability::Gated);
+        assert!(installed.human_gate);
+        assert!(installed.mutating);
     }
 
     #[test]
