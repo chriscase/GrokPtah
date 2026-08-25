@@ -831,24 +831,25 @@ async fn request_timeout_returns_error() {
         .send()
         .await
         .unwrap();
-    // Timeout maps to HTTP 504. The public taxonomy collapses it to
-    // `internal`; the transport reason stays on `reasonCode`.
+    // Timeout stays HTTP 504. The public envelope uses the stable internal
+    // category with a bounded reasonCode; the internal "timed out" string is
+    // not forwarded.
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::GATEWAY_TIMEOUT,
         "expected 504 Gateway Timeout"
     );
     let body: serde_json::Value = resp.json().await.unwrap();
-    let msg = body["error"]["message"]
-        .as_str()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    assert!(
-        msg.contains("deadline") || msg.contains("timed out") || msg.contains("timeout"),
-        "expected timeout error message, got {body}"
+    assert_eq!(
+        body["error"]["message"], "The request exceeded its bounded deadline.",
+        "expected public timeout message, got {body}"
     );
     assert_eq!(body["error"]["data"]["code"], "internal");
     assert_eq!(body["error"]["data"]["reasonCode"], "timeout");
+    assert_eq!(
+        body["error"]["data"]["message"],
+        "The request exceeded its bounded deadline."
+    );
     assert_eq!(body["id"], 42);
     srv.stop();
     set_grokptah_home_override(None);
@@ -861,11 +862,12 @@ async fn unknown_and_forbidden_tools_fail_closed_over_http() {
     let srv = start_control_server(orch.clone(), 0).await.unwrap();
     let url = format!("http://{}/mcp", srv.addr);
     let http = reqwest::Client::new();
-    for (name, expect_fragment) in [
-        ("run_terminal_cmd", "not allowed"),
-        ("ptah_shell", "not allowed"),
-        ("ptah_manage_mcp", "not allowed"),
-        ("no_such_tool_xyz", "not allowed"),
+    let mut envelopes = Vec::new();
+    for name in [
+        "run_terminal_cmd",
+        "ptah_shell",
+        "ptah_manage_mcp",
+        "no_such_tool_xyz",
     ] {
         let resp = http
             .post(&url)
@@ -884,13 +886,18 @@ async fn unknown_and_forbidden_tools_fail_closed_over_http() {
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        let msg = body["error"]["message"].as_str().unwrap_or_default();
-        assert!(
-            msg.contains(expect_fragment),
-            "{name}: expected '{expect_fragment}' in {body}"
+        assert_eq!(
+            body["error"]["message"], "The requested scope is not allowed.",
+            "{name}: expected public scope message, got {body}"
         );
         assert_eq!(body["error"]["data"]["code"], "forbidden_scope");
         assert_eq!(body["error"]["data"]["reasonCode"], "forbidden_scope");
+        envelopes.push(body);
+    }
+    // Unknown and forbidden names share one public envelope so the wire
+    // response is not a tool-existence oracle.
+    for body in envelopes.iter().skip(1) {
+        assert_eq!(body, &envelopes[0]);
     }
     srv.stop();
     set_grokptah_home_override(None);
