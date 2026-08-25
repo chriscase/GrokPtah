@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HelpCenter } from "./HelpCenter";
 import { PermissionModal } from "./PermissionModal";
+import { focusableIn } from "../lib/modalFocus";
 
 afterEach(cleanup);
 
@@ -45,6 +46,64 @@ describe("HelpCenter", () => {
     expect(document.activeElement).toBe(options[options.length - 1]);
     fireEvent.keyDown(options[options.length - 1], { key: "Home" });
     expect(document.activeElement).toBe(options[0]);
+    expect(options[0]).toHaveAttribute("aria-selected", "true");
+    expect(options[0]).toHaveAttribute("tabindex", "0");
+  });
+
+  it("keeps the Tab trap on the selected option and does not re-enter tabindex=-1 results", () => {
+    render(<HelpCenter open onClose={vi.fn()} />);
+    const dialog = screen.getByRole("dialog", { name: "Help Center" });
+    const listbox = screen.getByRole("listbox", { name: "Help article results" });
+    const options = within(listbox).getAllByRole("option");
+    const selected = options.find((option) => option.getAttribute("aria-selected") === "true");
+    const hidden = options.filter((option) => option.getAttribute("tabindex") === "-1");
+    const tabStops = focusableIn(dialog);
+
+    expect(selected).toBeTruthy();
+    expect(hidden.length).toBeGreaterThan(0);
+    expect(tabStops).toContain(selected);
+    expect(tabStops.filter((stop) => options.includes(stop))).toEqual([selected]);
+    for (const option of hidden) {
+      expect(tabStops).not.toContain(option);
+    }
+
+    const close = screen.getByRole("button", { name: "Close Help Center" });
+    const last = tabStops[tabStops.length - 1];
+    last.focus();
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(document.activeElement).toBe(close);
+    expect(hidden).not.toContain(document.activeElement);
+
+    close.focus();
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(last);
+    expect(hidden).not.toContain(document.activeElement);
+    if (options.includes(document.activeElement as HTMLElement)) {
+      expect(document.activeElement).toHaveAttribute("aria-selected", "true");
+      expect(document.activeElement).toHaveAttribute("tabindex", "0");
+    }
+  });
+
+  it("gives listbox options presentation wrappers without changing search selection", () => {
+    render(<HelpCenter open onClose={vi.fn()} />);
+    const listbox = screen.getByRole("listbox", { name: "Help article results" });
+    const wrappers = Array.from(listbox.children);
+
+    expect(wrappers.length).toBeGreaterThan(1);
+    for (const wrapper of wrappers) {
+      expect(wrapper).toHaveAttribute("role", "presentation");
+    }
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Search help" }), {
+      target: { value: "provider route" },
+    });
+    const filtered = screen.getByRole("listbox", { name: "Help article results" });
+    expect(within(filtered).getByRole("option", { name: /Provider routes and gateway policy/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByRole("heading", { name: "Provider routes and gateway policy" })).toBeInTheDocument();
+    expect(Array.from(filtered.children).every((child) => child.getAttribute("role") === "presentation")).toBe(true);
   });
 
   it("closes on Escape without changing the source corpus", () => {
@@ -84,10 +143,7 @@ describe("HelpCenter", () => {
     const { unmount } = render(<HelpCenter open onClose={onClose} />);
     const dialog = screen.getByRole("dialog", { name: "Help Center" });
     const close = screen.getByRole("button", { name: "Close Help Center" });
-    const focusables = dialog.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), select:not([disabled])',
-    );
-    const last = focusables[focusables.length - 1];
+    const last = focusableIn(dialog)[focusableIn(dialog).length - 1];
 
     expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "Search help" }));
     last.focus();
@@ -239,20 +295,36 @@ describe("HelpCenter", () => {
     const alert = screen.getByRole("alertdialog", { name: "Confirm assistant request" });
     const primary = screen.getByRole("button", { name: "Send cited context" });
     const cancel = screen.getByRole("button", { name: "Cancel" });
+    const summary = within(alert).getByText("Review exact cited sources");
+    const confirmStops = focusableIn(alert);
     expect(document.activeElement).toBe(primary);
     expect(focusSpy).not.toHaveBeenCalled();
+    expect(confirmStops[0]).toBe(summary);
+    expect(confirmStops[confirmStops.length - 1]).toBe(cancel);
+    expect(confirmStops).toContain(primary);
 
     cancel.focus();
     fireEvent.keyDown(window, { key: "Tab" });
-    expect(document.activeElement).toBe(primary);
+    expect(document.activeElement).toBe(summary);
     expect(document.activeElement).not.toBe(
       screen.getByRole("button", { name: "Close Help Center", hidden: true }),
     );
 
-    primary.focus();
+    summary.focus();
     fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
     expect(document.activeElement).toBe(cancel);
     expect(alert.contains(document.activeElement)).toBe(true);
+
+    const help = document.querySelector<HTMLElement>('[data-modal-layer="help"]');
+    expect(help).toHaveAttribute("aria-modal", "false");
+    expect(help).not.toHaveAttribute("aria-hidden", "true");
+    expect(alert).toHaveAttribute("aria-modal", "true");
+    expect(alert.getAttribute("aria-describedby")?.split(/\s+/)).toEqual([
+      "help-assistant-confirm-copy",
+      "help-assistant-confirm-disclosure",
+    ]);
+    expect(document.getElementById("help-assistant-confirm-disclosure")).toHaveTextContent("product.readme");
+    expect(document.getElementById("help-assistant-confirm-disclosure")).toHaveTextContent("README.md");
 
     fireEvent.keyDown(window, { key: "Escape" });
     expect(onClose).not.toHaveBeenCalled();
@@ -342,7 +414,6 @@ describe("HelpCenter", () => {
     expect(screen.getByTestId("app-background")).toHaveAttribute("inert");
 
     const allow = screen.getByTestId("permission-allow");
-    const deny = screen.getByTestId("permission-deny");
     expect(document.activeElement).toBe(allow);
 
     fireEvent.keyDown(window, { key: "Escape" });
@@ -350,12 +421,14 @@ describe("HelpCenter", () => {
     expect(screen.getByTestId("permission-modal")).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: "Tab" });
-    expect(document.activeElement).toBe(deny);
+    const technicalDetails = screen.getByText("Technical details");
+    expect(document.activeElement).toBe(technicalDetails);
     expect(help.contains(document.activeElement)).toBe(false);
 
-    deny.focus();
+    technicalDetails.focus();
     fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
     expect(document.activeElement).toBe(allow);
+    expect(screen.getByTestId("permission-modal").contains(document.activeElement)).toBe(true);
 
     rerender(
       <div className="app-shell">
@@ -367,5 +440,44 @@ describe("HelpCenter", () => {
       expect(document.querySelector('[data-modal-layer="help"]')).not.toHaveAttribute("inert");
     });
     expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("includes source-preview summaries in confirm Tab cycles and describes disclosed ids", () => {
+    render(
+      <HelpCenter
+        open
+        onClose={vi.fn()}
+        onAskAssistant={vi.fn()}
+        onSearchSemantic={vi.fn()}
+        assistantProviderLabel="Company gateway · review-model"
+      />,
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "Search help" }), {
+      target: { value: "why is the company gateway model weak?" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Prepare meaning search" }));
+
+    const semantic = screen.getByRole("alertdialog", { name: "Confirm meaning search" });
+    const semanticSummary = within(semantic).getByText("Review exact metadata");
+    const searchByMeaning = screen.getByRole("button", { name: "Search by meaning" });
+    const cancel = within(semantic).getByRole("button", { name: "Cancel" });
+    const semanticStops = focusableIn(semantic);
+    expect(semanticStops[0]).toBe(semanticSummary);
+    expect(semanticStops).toEqual([semanticSummary, searchByMeaning, cancel]);
+    expect(document.querySelector('[data-modal-layer="help"]')).toHaveAttribute("aria-modal", "false");
+    expect(semantic).toHaveAttribute("aria-modal", "true");
+    expect(semantic.getAttribute("aria-describedby")?.split(/\s+/)).toEqual([
+      "help-semantic-confirm-copy",
+      "help-semantic-confirm-disclosure",
+    ]);
+    expect(document.getElementById("help-semantic-confirm-disclosure")).toHaveTextContent("providers.gateway");
+    expect(document.getElementById("help-semantic-confirm-ids")).toHaveTextContent("docs/PROVIDER_PROFILES.md");
+
+    cancel.focus();
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(document.activeElement).toBe(semanticSummary);
+    semanticSummary.focus();
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(cancel);
   });
 });

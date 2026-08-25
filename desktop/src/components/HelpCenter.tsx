@@ -12,6 +12,7 @@ import {
   type HelpSemanticRequest,
   type HelpTopic,
 } from "../lib/helpCenter";
+import { focusableIn } from "../lib/modalFocus";
 
 export type HelpCenterProps = {
   open: boolean;
@@ -46,16 +47,6 @@ type SemanticState =
   | { status: "error"; message: string };
 
 type ConfirmKind = "semantic" | "assistant";
-
-const FOCUSABLE_SELECTOR =
-  'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
-
-function focusableIn(root: HTMLElement | null): HTMLElement[] {
-  if (!root) return [];
-  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-    (element) => !element.closest("[inert]"),
-  );
-}
 
 function consentLayerPresent(): boolean {
   return Boolean(document.querySelector('[data-modal-layer="consent"]'));
@@ -400,7 +391,7 @@ export function HelpCenter({
       className="help-center"
       data-modal-layer="help"
       role="dialog"
-      aria-modal={consentPresent ? false : true}
+      aria-modal={consentPresent || topConfirm ? false : true}
       aria-hidden={consentPresent ? true : undefined}
       aria-labelledby="help-center-title"
       aria-describedby="help-center-subtitle"
@@ -479,7 +470,7 @@ export function HelpCenter({
           {semantic.status === "error" && <p className="help-retrieval-status" role="alert">{semantic.message}</p>}
           <ul className="help-list" role="listbox" aria-label="Help article results">
             {results.map(({ article, matchedTerms, confidence }, index) => (
-              <li key={article.id}>
+              <li key={article.id} role="presentation">
                 <button
                   type="button"
                   role="option"
@@ -491,6 +482,7 @@ export function HelpCenter({
                   className={`help-list-item ${article.id === selected?.id ? "is-selected" : ""}`}
                   aria-selected={article.id === selected?.id}
                   onClick={() => setSelectedId(article.id)}
+                  onFocus={() => setSelectedId(article.id)}
                   onKeyDown={(event) => moveArticleSelection(event, index)}
                 >
                   <span className="help-list-topic">{article.topic.replace("-", " ")}</span>
@@ -590,7 +582,7 @@ export function HelpCenter({
             role="alertdialog"
             aria-modal="true"
             aria-labelledby="help-semantic-confirm-title"
-            aria-describedby="help-semantic-confirm-copy"
+            aria-describedby="help-semantic-confirm-copy help-semantic-confirm-disclosure"
           >
             <p>
               <strong id="help-semantic-confirm-title">Confirm meaning search</strong>
@@ -598,10 +590,10 @@ export function HelpCenter({
             <p id="help-semantic-confirm-copy">
               Send this query and article metadata to {assistantProviderLabel ?? "the selected provider"} for meaning-based ranking? No article body or workspace data will be sent.
             </p>
-            <details className="help-confirm-details" open>
+            <details className="help-confirm-details" open id="help-semantic-confirm-disclosure">
               <summary>Review exact metadata</summary>
               <p>Query: <code>{semantic.request.query}</code></p>
-              <ul aria-label="Meaning search metadata">
+              <ul id="help-semantic-confirm-ids" aria-label="Meaning search metadata">
                 {semantic.request.candidates.map((candidate) => (
                   <li key={candidate.articleId}>
                     <code>{candidate.articleId}</code> · {candidate.sources.map((source) => `${source.id} · ${source.path}`).join(", ")}
@@ -626,7 +618,7 @@ export function HelpCenter({
             role="alertdialog"
             aria-modal="true"
             aria-labelledby="help-assistant-confirm-title"
-            aria-describedby="help-assistant-confirm-copy"
+            aria-describedby="help-assistant-confirm-copy help-assistant-confirm-disclosure"
           >
             <p>
               <strong id="help-assistant-confirm-title">Confirm assistant request</strong>
@@ -634,9 +626,9 @@ export function HelpCenter({
             <p id="help-assistant-confirm-copy">
               Ready to send the cited article bundle ({assistant.request.sources.length} source{assistant.request.sources.length === 1 ? "" : "s"}) via {assistantProviderLabel ?? "the selected provider"}?
             </p>
-            <details className="help-confirm-details" open>
+            <details className="help-confirm-details" open id="help-assistant-confirm-disclosure">
               <summary>Review exact cited sources</summary>
-              <ul aria-label="Assistant request sources">
+              <ul id="help-assistant-confirm-ids" aria-label="Assistant request sources">
                 {assistant.request.sources.map((source) => (
                   <li key={source.id}>
                     <code>{source.id}</code> · {source.path} · {source.heading}

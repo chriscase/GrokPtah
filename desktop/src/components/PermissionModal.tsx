@@ -6,16 +6,7 @@ import {
 } from "../lib/permissionQueue";
 import type { DenyHistoryEntry } from "../lib/denyHistory";
 import { LaneScopeLine, type LaneScope } from "./LaneScopeLine";
-
-const FOCUSABLE_SELECTOR =
-  'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
-
-function focusableIn(root: HTMLElement | null): HTMLElement[] {
-  if (!root) return [];
-  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-    (element) => !element.closest("[inert]"),
-  );
-}
+import { focusableIn } from "../lib/modalFocus";
 
 export type PermissionModalProps = {
   request: PermissionRequest;
