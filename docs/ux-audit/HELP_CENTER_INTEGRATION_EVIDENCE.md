@@ -5,7 +5,7 @@ live provider qualification, and 100% release qualification remain open.
 
 ## Candidate
 
-- Code head: `2832adef` (Help Center integration, public consumer package, and
+- Code head: `ab2efa32` (Help Center integration, public consumer package, and
   broker-boundary follow-ups)
 - Public contract follow-up: `c7800a46` (`feat(public): expose source-cited Help Center contract`)
 - Styling correction: `f9eee072` (`fix(ui): apply Help Center surface styles`)
