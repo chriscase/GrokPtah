@@ -81,6 +81,10 @@ impl SwarmError {
     pub(crate) fn capability(message: impl Into<String>) -> Self {
         Self::new(SwarmErrorCode::CapabilityNotGranted, message)
     }
+
+    pub(crate) fn corrupt(message: impl Into<String>) -> Self {
+        Self::new(SwarmErrorCode::CorruptState, message)
+    }
 }
 
 impl fmt::Display for SwarmError {

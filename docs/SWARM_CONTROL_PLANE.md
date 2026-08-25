@@ -61,11 +61,14 @@ closed set with no browser variant and no raw-host variant, so no specification
 silently dropped.
 
 **Computer Use is leased, never minted.** A task may declare that it requires
-Computer Use, and such a task is undispatchable unless the caller attaches a
-lease reference that is structurally valid, unrevoked, unspent, and live at the
-dispatch instant. The control plane validates and records leases; it never
-issues, extends, or revalidates one. A lease attached to a task that does not
-require Computer Use is also refused, so authority cannot ride along.
+Computer Use, and such a task is undispatchable unless the caller attaches an
+externally issued grant reference that is structurally valid, live at the
+dispatch instant, and bound to the exact swarm, task, dispatch, run, target,
+owner, and required action class. The durable store consumes the grant identity
+in the same compare-and-swap that records the dispatch, so a grant cannot be
+copied into another dispatch or swarm. The control plane never issues, extends,
+or revalidates the external grant. A lease attached to a task that does not
+require Computer Use is also refused.
 
 **Restart safety without guessing.** Dispatch is two-phase. Planning is a pure
 projection that writes nothing; `record_dispatch_requested` writes the durable
@@ -74,15 +77,17 @@ record, and only then may the caller spawn. Dispatch identity is derived from
 already on disk instead of minting a second one, and replaying the write returns
 the stored record without moving a counter.
 
-A crash between the write and the spawn leaves a `Requested` record with no
-acknowledgement. `recover` marks exactly those `Uncertain`; an `Acknowledged`
-dispatch carries a provider handle, can be probed, and is left running. An
-uncertain dispatch is never resent, never settled by assumption, and never
-cancelled blind. Only `reconcile_uncertain` carrying positive evidence resolves
-it, and `DispatchProbe::Unknown` deliberately resolves nothing. Because a
-possibly-running child may still hold real capacity, an uncertain task continues
-to occupy its admission slot, and the swarm will not declare a terminal outcome
-— including a completed cancellation — while one is outstanding.
+A crash between the write and the spawn leaves a `Requested` or
+`SpawnClaimed` record with no acknowledgement. `recover` marks exactly those
+`Uncertain`; an `Acknowledged` dispatch carries a provider handle, can be
+probed, and is left running. A durable spawn claim has one winner, so replaying
+the request cannot authorize a second spawn. An uncertain dispatch is never
+resent, never settled by assumption, and never cancelled blind. Only
+`reconcile_uncertain` carrying positive evidence resolves it, and
+`DispatchProbe::Unknown` deliberately resolves nothing. Because a possibly
+running child may still hold real capacity, an uncertain task continues to
+occupy its admission slot, and the swarm will not declare a terminal outcome —
+including a completed cancellation — while one is outstanding.
 
 **Cancellation at both scopes.** A task that never started is cancelled
 outright; a live task moves to `Cancelling` and settles when the caller confirms
@@ -95,10 +100,10 @@ fails fast. No replacement work is ever invented implicitly, matching the
 manager's replan rule.
 
 **Quorum and synthesis gates.** A synthesis task names reviewer tasks it also
-depends on, plus a quorum. The gate is evaluated on reviewer *verdicts*, not on
-reviewer success: a reviewer that runs to completion and rejects has done its
-job and still withholds its approval. A completed review must report a verdict,
-and only a review task may report one.
+depends on, plus a quorum, and omitting that gate is invalid. The gate is
+evaluated on reviewer *verdicts*, not on reviewer success: a reviewer that runs
+to completion and rejects has done its job and still withholds its approval. A
+completed review must report a verdict, and only a review task may report one.
 
 **Redacted, credential-free projections.** `TaskProgressRow` and `EvidenceRow`
 have no field that could carry a credential — `WorkerSpec::credential_ref` is a
@@ -126,10 +131,10 @@ and the first adapter should be a single read-only child on one provider, with
 the catalog populated from measured qualification results rather than by hand.
 
 **Manager, MCP, and desktop wiring.** Nothing imports the crate yet; the only
-integration is its workspace registration. Adoption means deciding where swarm
-state is persisted, how it is fenced against concurrent writers (the `revision`
-field is present for compare-and-swap but no store enforces it here), and which
-control operations each surface exposes.
+product integration is its workspace registration. `DurableSwarmStore` defines
+the persistence/CAS and global lease-consumption seam, but no production store
+or adapter is included. Adoption still means choosing the existing Work ledger
+as the authority boundary and qualifying the narrow task-tool adapter.
 
 **A whole-swarm live restart campaign.** Restart safety is proven by
 construction and by tests that serialize, reload, and recover. It has not been
@@ -147,8 +152,15 @@ mid-run is surfaced.
 for one, including the `needsOperatorAttention` flag that an uncertain dispatch
 raises. No surface renders them.
 
-**Continuous integration coverage.** The desktop workflow builds the nested
+**Continuous integration coverage.** A dedicated root-workspace lane now runs
+formatting, locked metadata, focused tests, full crate tests, and Clippy for
+this crate. The desktop workflow still builds the nested
 `desktop/src-tauri`, `grokptah-agent-bridge`, and certification-lab workspaces;
-the upstream-focused workflow builds two named root-workspace crates. Nothing
-currently compiles this crate in CI. Until it is wired into one of those lanes —
-or named explicitly in a root-workspace lane — its gates run only locally.
+the crate is not part of the shipped desktop binary.
+
+## Test evidence
+
+The crate currently contains 84 explicit `#[test]` functions and one
+`no_run` doctest. The tests are deterministic and provider-free; they do not
+qualify a production persistence store, task-tool adapter, or live Computer
+Use runtime.

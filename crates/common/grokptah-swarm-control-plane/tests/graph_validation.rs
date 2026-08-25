@@ -310,6 +310,7 @@ fn a_computer_use_task_validates_against_a_measured_worker() {
     spec.workers = vec![computer_use_worker()];
     spec.tasks[0].worker_id = worker_id("cu-cursor");
     spec.tasks[0].requires_computer_use = true;
+    spec.tasks[0].computer_use = Some(computer_use_requirement());
     validate_swarm_spec(&spec).expect("a leased Computer Use worker is admissible");
 }
 
@@ -364,6 +365,29 @@ fn a_task_kind_must_match_its_worker_role() {
         message.contains("cannot perform that task kind"),
         "{message}"
     );
+}
+
+#[test]
+fn review_and_synthesis_tasks_require_their_capability() {
+    let mut spec = diamond_spec(QuorumRule::Unanimous);
+    spec.workers[1]
+        .capabilities
+        .remove(&WorkerCapability::Review);
+    expect_rejected(spec, SwarmErrorCode::CapabilityNotGranted);
+
+    let mut spec = diamond_spec(QuorumRule::Unanimous);
+    spec.workers[2]
+        .capabilities
+        .remove(&WorkerCapability::Synthesize);
+    expect_rejected(spec, SwarmErrorCode::CapabilityNotGranted);
+}
+
+#[test]
+fn a_synthesis_task_must_declare_a_review_quorum() {
+    let mut spec = diamond_spec(QuorumRule::Unanimous);
+    spec.tasks[5].review_gate = None;
+    let message = expect_rejected(spec, SwarmErrorCode::InvalidSpec);
+    assert!(message.contains("review quorum"), "{message}");
 }
 
 #[test]

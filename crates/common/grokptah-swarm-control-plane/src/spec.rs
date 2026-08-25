@@ -12,14 +12,17 @@ use serde::{Deserialize, Serialize};
 use xai_tool_types::{SubagentCapabilityMode, SubagentIsolationMode};
 
 use crate::error::{SwarmError, SwarmResult};
-use crate::ids::{CredentialRef, LeaseId, ModelId, ProviderId, SwarmId, TaskId, WorkerId};
+use crate::ids::{
+    CredentialRef, DispatchId, ExternalRefId, LeaseId, ModelId, ProviderId, SwarmId, TaskId,
+    WorkerId,
+};
 use crate::policy::{
     AdmissionPolicy, BudgetPolicy, FailurePolicy, MAX_DEPENDENCIES, MAX_TASKS, MAX_WORKERS,
     ReviewGate,
 };
 
 /// Version of the durable swarm record shape.
-pub const SWARM_SCHEMA_VERSION: u32 = 1;
+pub const SWARM_SCHEMA_VERSION: u32 = 2;
 
 /// Maximum bytes in a swarm objective.
 pub const MAX_OBJECTIVE_BYTES: usize = 8 * 1024;
@@ -119,8 +122,40 @@ impl IsolationRequirement {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LeaseIssuer {
-    /// Explicit authorization made through the local operator surface.
-    LocalOperator,
+    /// Explicit authorization made through the local GrokPtah operator surface.
+    #[serde(alias = "local_operator")]
+    LocalUser,
+}
+
+/// Action class an external Computer Use grant authorizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerUseActionClass {
+    Semantic,
+    TextEntry,
+    KeyChord,
+    PointerFallback,
+}
+
+/// External Computer Use authority required by one task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerUseRequirement {
+    /// Opaque identifier of the externally owned Computer Run.
+    pub run_id: ExternalRefId,
+    /// Opaque canonical identifier of the exact Computer Use target.
+    pub target_ref: ExternalRefId,
+    /// Opaque identity of the owner/session to which the grant is bound.
+    pub owner_ref: ExternalRefId,
+    pub action_class: ComputerUseActionClass,
+}
+
+impl ComputerUseRequirement {
+    pub fn validate(&self) -> SwarmResult<()> {
+        self.run_id.validate()?;
+        self.target_ref.validate()?;
+        self.owner_ref.validate()
+    }
 }
 
 /// A reference to a Computer Use lease issued outside this crate.
@@ -129,10 +164,22 @@ pub enum LeaseIssuer {
 /// A task that requires Computer Use is undispatchable until the caller
 /// attaches a lease reference that is unexpired, unrevoked, and has uses left.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ComputerUseLeaseRef {
+    /// Existing external grant identity. This crate does not issue it.
     pub lease_id: LeaseId,
     pub issued_by: LeaseIssuer,
+    /// Exact swarm/task/dispatch binding minted by the external authority.
+    pub swarm_id: SwarmId,
+    pub task_id: TaskId,
+    pub dispatch_id: DispatchId,
+    /// Bindings corresponding to the existing ActionGrant/ComputerRun
+    /// contract. These are opaque so this crate remains independent of the
+    /// Computer Use runtime.
+    pub run_id: ExternalRefId,
+    pub target_ref: ExternalRefId,
+    pub owner_ref: ExternalRefId,
+    pub action_classes: BTreeSet<ComputerUseActionClass>,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,6 +191,17 @@ pub struct ComputerUseLeaseRef {
 impl ComputerUseLeaseRef {
     pub fn validate(&self) -> SwarmResult<()> {
         self.lease_id.validate()?;
+        self.swarm_id.validate()?;
+        self.task_id.validate()?;
+        self.dispatch_id.validate()?;
+        self.run_id.validate()?;
+        self.target_ref.validate()?;
+        self.owner_ref.validate()?;
+        if self.action_classes.is_empty() {
+            return Err(SwarmError::invalid(
+                "computer-use lease must authorize an action class",
+            ));
+        }
         if self.expires_at <= self.issued_at {
             return Err(SwarmError::invalid(
                 "computer-use lease must have a positive lifetime",
@@ -157,10 +215,48 @@ impl ComputerUseLeaseRef {
         Ok(())
     }
 
+    pub fn validate_for(
+        &self,
+        requirement: &ComputerUseRequirement,
+        swarm_id: &SwarmId,
+        task_id: &TaskId,
+        dispatch_id: &DispatchId,
+        now: DateTime<Utc>,
+    ) -> SwarmResult<()> {
+        self.validate()?;
+        requirement.validate()?;
+        if self.swarm_id != *swarm_id
+            || self.task_id != *task_id
+            || self.dispatch_id != *dispatch_id
+        {
+            return Err(SwarmError::capability(
+                "Computer Use lease is not bound to this swarm, task, and dispatch",
+            ));
+        }
+        if self.run_id != requirement.run_id
+            || self.target_ref != requirement.target_ref
+            || self.owner_ref != requirement.owner_ref
+            || !self.action_classes.contains(&requirement.action_class)
+        {
+            return Err(SwarmError::capability(
+                "Computer Use lease does not match the task's external authority binding",
+            ));
+        }
+        if !self.is_usable_at(now) {
+            return Err(SwarmError::capability(
+                "the supplied Computer Use lease is expired, revoked, spent, or not yet issued",
+            ));
+        }
+        Ok(())
+    }
+
     /// True only when the lease is structurally valid, unrevoked, and live at
     /// `now`. An absent or malformed lease is never usable.
     pub fn is_usable_at(&self, now: DateTime<Utc>) -> bool {
-        self.validate().is_ok() && self.revoked_at.is_none() && now < self.expires_at
+        self.validate().is_ok()
+            && self.revoked_at.is_none()
+            && now >= self.issued_at
+            && now < self.expires_at
     }
 }
 
@@ -310,6 +406,16 @@ impl WorkerSpec {
                 self.worker_id
             )));
         }
+        if self
+            .capabilities
+            .contains(&WorkerCapability::ComputerUseLeased)
+            && self.isolation != IsolationRequirement::Worktree
+        {
+            return Err(SwarmError::invalid(format!(
+                "worker '{}' has Computer Use authority and must require worktree isolation",
+                self.worker_id
+            )));
+        }
         Ok(())
     }
 
@@ -396,6 +502,8 @@ pub struct TaskSpec {
     #[serde(default)]
     pub requires_computer_use: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer_use: Option<ComputerUseRequirement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_gate: Option<ReviewGate>,
 }
 
@@ -431,11 +539,33 @@ impl TaskSpec {
                 )));
             }
         }
+        match (self.requires_computer_use, &self.computer_use) {
+            (true, Some(requirement)) => requirement.validate()?,
+            (true, None) => {
+                return Err(SwarmError::capability(format!(
+                    "task '{}' requires an explicit Computer Use authority binding",
+                    self.task_id
+                )));
+            }
+            (false, Some(_)) => {
+                return Err(SwarmError::invalid(format!(
+                    "task '{}' carries Computer Use authority but does not require it",
+                    self.task_id
+                )));
+            }
+            (false, None) => {}
+        }
         match (&self.review_gate, self.kind) {
             (Some(gate), TaskKind::Synthesis) => gate.validate()?,
             (Some(_), _) => {
                 return Err(SwarmError::invalid(format!(
                     "task '{}' declares a review gate but is not a synthesis task",
+                    self.task_id
+                )));
+            }
+            (None, TaskKind::Synthesis) => {
+                return Err(SwarmError::invalid(format!(
+                    "synthesis task '{}' must declare a review quorum",
                     self.task_id
                 )));
             }
@@ -450,6 +580,23 @@ impl TaskSpec {
             return Err(SwarmError::invalid(format!(
                 "task '{}' is assigned a worker whose role cannot perform that task kind",
                 self.task_id
+            )));
+        }
+        let required_capability = match self.kind {
+            TaskKind::Work => WorkerCapability::ReadWorkspace,
+            TaskKind::Review => WorkerCapability::Review,
+            TaskKind::Synthesis => WorkerCapability::Synthesize,
+        };
+        if !worker.capabilities.contains(&required_capability) {
+            return Err(SwarmError::capability(format!(
+                "task '{}' requires worker capability '{}'",
+                self.task_id,
+                match required_capability {
+                    WorkerCapability::ReadWorkspace => "read_workspace",
+                    WorkerCapability::Review => "review",
+                    WorkerCapability::Synthesize => "synthesize",
+                    _ => unreachable!("task capability mapping is closed"),
+                }
             )));
         }
         if self.requires_computer_use && !worker.allows_computer_use() {

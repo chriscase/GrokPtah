@@ -48,6 +48,9 @@ fn secrets_in_operator_and_worker_text_are_scrubbed() {
         .record_dispatch_requested(&intent, None, at(1))
         .expect("write");
     swarm
+        .claim_dispatch_spawn(&record.dispatch_id, at(1))
+        .expect("spawn claim");
+    swarm
         .record_task_outcome(
             &record.dispatch_id,
             TaskOutcome::failed(format!("auth rejected Bearer {GITHUB_TOKEN}")).with_evidence(
@@ -97,6 +100,9 @@ fn projected_text_is_bounded_on_a_character_boundary() {
     let record = swarm
         .record_dispatch_requested(&intent, None, at(1))
         .expect("write");
+    swarm
+        .claim_dispatch_spawn(&record.dispatch_id, at(1))
+        .expect("spawn claim");
 
     // Three-byte characters, so a naive byte cut would land mid-character.
     let detail = "\u{2603}".repeat(600);
@@ -176,11 +182,16 @@ fn a_row_shows_the_isolation_and_lease_a_dispatch_ran_under() {
     spec.workers = vec![computer_use_worker()];
     spec.tasks[0].worker_id = worker_id("cu-cursor");
     spec.tasks[0].requires_computer_use = true;
+    spec.tasks[0].computer_use = Some(computer_use_requirement());
     let mut swarm = SwarmController::new(spec, at(0)).expect("valid");
 
     let intent = swarm.plan_dispatches(at(1)).remove(0);
     swarm
-        .record_dispatch_requested(&intent, Some(lease("lease-visible", 0, 600)), at(1))
+        .record_dispatch_requested(
+            &intent,
+            Some(lease_for(&intent, "lease-visible", 0, 600)),
+            at(1),
+        )
         .expect("write");
 
     let projection = project_progress(swarm.state());

@@ -2,10 +2,12 @@
 
 mod support;
 
+use std::sync::Arc;
+
 use grokptah_swarm_control_plane::{
-    DispatchProbe, DispatchState, EvidenceEntry, FailurePolicy, QuorumRule, ReviewVerdict,
-    SwarmController, SwarmErrorCode, SwarmLifecycle, SwarmState, TaskOutcome, TaskState,
-    derive_dispatch_id,
+    DispatchProbe, DispatchState, EvidenceEntry, FailurePolicy, InMemorySwarmStore, QuorumRule,
+    ReviewVerdict, SwarmController, SwarmErrorCode, SwarmId, SwarmLifecycle, SwarmState,
+    TaskOutcome, TaskState, derive_dispatch_id,
 };
 use support::*;
 
@@ -170,6 +172,32 @@ fn replaying_a_recorded_dispatch_never_writes_twice() {
 }
 
 #[test]
+fn only_one_caller_wins_the_spawn_claim() {
+    let controller = SwarmController::new(single_task_spec(), at(0)).expect("valid");
+    let mut first = controller.clone();
+    let mut second = controller;
+    let intent = first.plan_dispatches(at(1)).remove(0);
+
+    let first_record = first
+        .record_dispatch_requested(&intent, None, at(1))
+        .expect("first request");
+    let second_record = second
+        .record_dispatch_requested(&intent, None, at(1))
+        .expect("same request replay");
+    assert_eq!(first_record, second_record);
+
+    let first_claim = first
+        .claim_dispatch_spawn(&intent.dispatch_id, at(2))
+        .expect("first claim");
+    let second_claim = second
+        .claim_dispatch_spawn(&intent.dispatch_id, at(2))
+        .expect("second claim replay");
+    assert!(first_claim.won);
+    assert!(!second_claim.won);
+    assert_eq!(first_claim.dispatch, second_claim.dispatch);
+}
+
+#[test]
 fn a_live_task_is_never_replanned() {
     let mut swarm = SwarmController::new(single_task_spec(), at(0)).expect("valid");
     let intent = swarm.plan_dispatches(at(1)).remove(0);
@@ -215,7 +243,7 @@ fn a_restart_turns_an_unacknowledged_dispatch_uncertain() {
     // The process dies here: the record exists, the child may or may not.
 
     let mut swarm = reload(swarm);
-    let report = swarm.recover(at(2));
+    let report = swarm.recover(at(2)).expect("recovery");
     assert_eq!(report.uncertain, vec![intent.dispatch_id.clone()]);
     assert!(!report.is_clean());
     assert_eq!(state_of(&swarm, "t-only"), TaskState::DispatchUncertain);
@@ -237,11 +265,14 @@ fn a_restart_leaves_an_acknowledged_dispatch_alone() {
         .record_dispatch_requested(&intent, None, at(1))
         .expect("write");
     swarm
+        .claim_dispatch_spawn(&intent.dispatch_id, at(1))
+        .expect("spawn claim");
+    swarm
         .record_dispatch_acknowledged(&intent.dispatch_id, external("ext-1"), at(2))
         .expect("worker acknowledged");
 
     let mut swarm = reload(swarm);
-    let report = swarm.recover(at(3));
+    let report = swarm.recover(at(3)).expect("recovery");
     assert!(
         report.is_clean(),
         "an acknowledged dispatch carries a handle and can be probed"
@@ -256,8 +287,11 @@ fn an_uncertain_dispatch_is_never_resent_or_settled_by_assumption() {
     swarm
         .record_dispatch_requested(&intent, None, at(1))
         .expect("write");
+    swarm
+        .claim_dispatch_spawn(&intent.dispatch_id, at(1))
+        .expect("spawn claim");
     let mut swarm = reload(swarm);
-    swarm.recover(at(2));
+    swarm.recover(at(2)).expect("recovery");
 
     assert!(
         swarm.plan_dispatches(at(3)).is_empty(),
@@ -283,7 +317,7 @@ fn an_unknown_probe_resolves_nothing() {
         .record_dispatch_requested(&intent, None, at(1))
         .expect("write");
     let mut swarm = reload(swarm);
-    swarm.recover(at(2));
+    swarm.recover(at(2)).expect("recovery");
 
     let resolved = swarm
         .reconcile_uncertain(&intent.dispatch_id, DispatchProbe::Unknown, at(3))
@@ -301,7 +335,7 @@ fn proof_that_a_child_never_started_permits_a_fresh_attempt() {
         .record_dispatch_requested(&first, None, at(1))
         .expect("write");
     let mut swarm = reload(swarm);
-    swarm.recover(at(2));
+    swarm.recover(at(2)).expect("recovery");
 
     let resolved = swarm
         .reconcile_uncertain(&first.dispatch_id, DispatchProbe::NotStarted, at(3))
@@ -325,7 +359,7 @@ fn proof_that_a_child_is_running_resumes_the_task() {
         .record_dispatch_requested(&intent, None, at(1))
         .expect("write");
     let mut swarm = reload(swarm);
-    swarm.recover(at(2));
+    swarm.recover(at(2)).expect("recovery");
 
     let resolved = swarm
         .reconcile_uncertain(
@@ -358,7 +392,7 @@ fn proof_that_a_child_finished_settles_the_task() {
         .record_dispatch_requested(&intent, None, at(1))
         .expect("write");
     let mut swarm = reload(swarm);
-    swarm.recover(at(2));
+    swarm.recover(at(2)).expect("recovery");
 
     let resolved = swarm
         .reconcile_uncertain(
@@ -372,6 +406,32 @@ fn proof_that_a_child_finished_settles_the_task() {
     assert!(resolved);
     assert_eq!(state_of(&swarm, "t-only"), TaskState::Succeeded);
     assert_eq!(swarm.state().lifecycle, SwarmLifecycle::Succeeded);
+}
+
+#[test]
+fn duplicate_terminal_callbacks_converge_idempotently() {
+    let mut swarm = SwarmController::new(single_task_spec(), at(0)).expect("valid");
+    let intent = swarm.plan_dispatches(at(1)).remove(0);
+    let record = swarm
+        .record_dispatch_requested(&intent, None, at(1))
+        .expect("request");
+    swarm
+        .claim_dispatch_spawn(&record.dispatch_id, at(1))
+        .expect("spawn claim");
+    swarm
+        .record_dispatch_acknowledged(&record.dispatch_id, external("ext-1"), at(1))
+        .expect("ack");
+    let outcome = TaskOutcome::succeeded()
+        .with_evidence(vec![EvidenceEntry::new("proof", "same terminal callback")]);
+    swarm
+        .record_task_outcome(&record.dispatch_id, outcome.clone(), at(2))
+        .expect("first callback");
+    let revision = swarm.state().revision;
+    swarm
+        .record_task_outcome(&record.dispatch_id, outcome, at(3))
+        .expect("duplicate callback");
+    assert_eq!(swarm.state().revision, revision);
+    assert_eq!(state_of(&swarm, "t-only"), TaskState::Succeeded);
 }
 
 #[test]
@@ -421,6 +481,9 @@ fn cancelling_a_live_task_waits_for_confirmation() {
         .record_dispatch_requested(&intent, None, at(1))
         .expect("write");
     swarm
+        .claim_dispatch_spawn(&intent.dispatch_id, at(1))
+        .expect("spawn claim");
+    swarm
         .record_dispatch_acknowledged(&intent.dispatch_id, external("ext-1"), at(2))
         .expect("ack");
 
@@ -468,6 +531,9 @@ fn cancelling_the_swarm_waits_on_a_live_child() {
         .record_dispatch_requested(&intent, None, at(1))
         .expect("write");
     swarm
+        .claim_dispatch_spawn(&intent.dispatch_id, at(1))
+        .expect("spawn claim");
+    swarm
         .record_dispatch_acknowledged(&intent.dispatch_id, external("ext-1"), at(2))
         .expect("ack");
 
@@ -479,6 +545,32 @@ fn cancelling_the_swarm_waits_on_a_live_child() {
     swarm
         .record_task_outcome(&intent.dispatch_id, TaskOutcome::cancelled(), at(4))
         .expect("the child confirmed it stopped");
+    assert_eq!(swarm.state().lifecycle, SwarmLifecycle::Cancelled);
+}
+
+#[test]
+fn a_late_acknowledgement_preserves_cancellation_intent() {
+    let mut swarm = SwarmController::new(single_task_spec(), at(0)).expect("valid");
+    let intent = swarm.plan_dispatches(at(1)).remove(0);
+    swarm
+        .record_dispatch_requested(&intent, None, at(1))
+        .expect("request");
+    swarm
+        .claim_dispatch_spawn(&intent.dispatch_id, at(1))
+        .expect("spawn claim");
+    swarm
+        .cancel_swarm("stop before provider acknowledgement", at(2))
+        .expect("cancel");
+
+    swarm
+        .record_dispatch_acknowledged(&intent.dispatch_id, external("ext-late"), at(3))
+        .expect("late acknowledgement");
+    assert_eq!(state_of(&swarm, "t-only"), TaskState::Cancelling);
+    assert_eq!(swarm.state().lifecycle, SwarmLifecycle::Cancelling);
+
+    swarm
+        .record_task_outcome(&intent.dispatch_id, TaskOutcome::cancelled(), at(4))
+        .expect("terminal cancellation");
     assert_eq!(swarm.state().lifecycle, SwarmLifecycle::Cancelled);
 }
 
@@ -655,6 +747,9 @@ fn a_review_task_must_report_a_verdict() {
     let record = swarm
         .record_dispatch_requested(&intent, None, at(4))
         .expect("write");
+    swarm
+        .claim_dispatch_spawn(&record.dispatch_id, at(4))
+        .expect("spawn claim");
     let error = swarm
         .record_task_outcome(&record.dispatch_id, TaskOutcome::succeeded(), at(5))
         .expect_err("a verdictless review must be refused");
@@ -668,6 +763,9 @@ fn only_a_review_task_may_report_a_verdict() {
     let record = swarm
         .record_dispatch_requested(&intent, None, at(1))
         .expect("write");
+    swarm
+        .claim_dispatch_spawn(&record.dispatch_id, at(1))
+        .expect("spawn claim");
     let error = swarm
         .record_task_outcome(
             &record.dispatch_id,
@@ -745,6 +843,7 @@ fn computer_use_swarm() -> SwarmController {
     spec.workers = vec![computer_use_worker()];
     spec.tasks[0].worker_id = worker_id("cu-cursor");
     spec.tasks[0].requires_computer_use = true;
+    spec.tasks[0].computer_use = Some(computer_use_requirement());
     SwarmController::new(spec, at(0)).expect("valid")
 }
 
@@ -766,13 +865,13 @@ fn an_expired_or_revoked_lease_is_refused() {
     let mut swarm = computer_use_swarm();
     let intent = swarm.plan_dispatches(at(1)).remove(0);
 
-    let expired = lease("lease-1", 0, 5);
+    let expired = lease_for(&intent, "lease-1", 0, 5);
     let error = swarm
         .record_dispatch_requested(&intent, Some(expired), at(10))
         .expect_err("an expired lease grants nothing");
     assert_eq!(error.code, SwarmErrorCode::CapabilityNotGranted);
 
-    let mut revoked = lease("lease-2", 0, 100);
+    let mut revoked = lease_for(&intent, "lease-2", 0, 100);
     revoked.revoked_at = Some(at(3));
     let error = swarm
         .record_dispatch_requested(&intent, Some(revoked), at(10))
@@ -781,11 +880,103 @@ fn an_expired_or_revoked_lease_is_refused() {
 }
 
 #[test]
+fn a_future_issued_lease_is_refused_without_writing_state() {
+    let mut swarm = computer_use_swarm();
+    let intent = swarm.plan_dispatches(at(1)).remove(0);
+    let future = lease_for(&intent, "lease-future", 5, 100);
+
+    let error = swarm
+        .record_dispatch_requested(&intent, Some(future), at(1))
+        .expect_err("a grant is not live before issuance");
+    assert_eq!(error.code, SwarmErrorCode::CapabilityNotGranted);
+    assert!(swarm.state().dispatches.is_empty());
+}
+
+#[test]
+fn a_lease_binding_must_match_the_exact_dispatch() {
+    let mut swarm = computer_use_swarm();
+    let intent = swarm.plan_dispatches(at(1)).remove(0);
+    let mut forged = lease_for(&intent, "lease-forged", 0, 100);
+    forged.task_id = task_id("another-task");
+
+    let error = swarm
+        .record_dispatch_requested(&intent, Some(forged), at(1))
+        .expect_err("a lease bound to another task must fail closed");
+    assert_eq!(error.code, SwarmErrorCode::CapabilityNotGranted);
+    assert!(swarm.state().dispatches.is_empty());
+}
+
+#[test]
+fn one_lease_cannot_be_consumed_by_two_swarms() {
+    let store = Arc::new(InMemorySwarmStore::default());
+    let first = computer_use_swarm();
+    let mut first = SwarmController::new_with_store(first.spec().clone(), at(0), store.clone())
+        .expect("first swarm");
+    let mut second_spec = single_task_spec();
+    second_spec.swarm_id = SwarmId::parse("swarm-other").expect("valid swarm id");
+    second_spec.workers = vec![computer_use_worker()];
+    second_spec.tasks[0].worker_id = worker_id("cu-cursor");
+    second_spec.tasks[0].requires_computer_use = true;
+    second_spec.tasks[0].computer_use = Some(computer_use_requirement());
+    let mut second =
+        SwarmController::new_with_store(second_spec, at(0), store).expect("second swarm");
+
+    let first_intent = first.plan_dispatches(at(1)).remove(0);
+    first
+        .record_dispatch_requested(
+            &first_intent,
+            Some(lease_for(&first_intent, "lease-once", 0, 100)),
+            at(1),
+        )
+        .expect("first swarm consumes the lease");
+
+    let second_intent = second.plan_dispatches(at(1)).remove(0);
+    let mut reused = lease_for(&second_intent, "lease-once", 0, 100);
+    reused.swarm_id = second.spec().swarm_id.clone();
+    let error = second
+        .record_dispatch_requested(&second_intent, Some(reused), at(1))
+        .expect_err("the global durable lease claim must reject reuse");
+    assert_eq!(error.code, SwarmErrorCode::CapabilityNotGranted);
+    assert!(second.state().dispatches.is_empty());
+}
+
+#[test]
+fn concurrent_plans_racing_one_lease_converge_on_one_dispatch() {
+    let store = Arc::new(InMemorySwarmStore::default());
+    let seed = computer_use_swarm();
+    let mut first =
+        SwarmController::new_with_store(seed.spec().clone(), at(0), store.clone()).expect("swarm");
+    let mut second = SwarmController::load_from_store(
+        &SwarmId::parse("swarm-single").expect("valid swarm id"),
+        store,
+    )
+    .expect("reload");
+    let first_intent = first.plan_dispatches(at(1)).remove(0);
+    let second_intent = second.plan_dispatches(at(1)).remove(0);
+    let first_record = first
+        .record_dispatch_requested(
+            &first_intent,
+            Some(lease_for(&first_intent, "lease-race", 0, 100)),
+            at(1),
+        )
+        .expect("first lease claim");
+    let second_record = second
+        .record_dispatch_requested(
+            &second_intent,
+            Some(lease_for(&second_intent, "lease-race", 0, 100)),
+            at(1),
+        )
+        .expect("same dispatch replay");
+    assert_eq!(first_record, second_record);
+    assert_eq!(second.state().dispatches.len(), 1);
+}
+
+#[test]
 fn a_usable_lease_is_recorded_with_the_dispatch() {
     let mut swarm = computer_use_swarm();
     let intent = swarm.plan_dispatches(at(1)).remove(0);
     let record = swarm
-        .record_dispatch_requested(&intent, Some(lease("lease-ok", 0, 600)), at(1))
+        .record_dispatch_requested(&intent, Some(lease_for(&intent, "lease-ok", 0, 600)), at(1))
         .expect("a live operator lease admits the dispatch");
 
     assert_eq!(
@@ -883,5 +1074,40 @@ fn a_dangling_current_dispatch_pointer_is_refused_on_reload() {
     state.dispatches.clear();
     state.total_dispatches = 0;
     let error = SwarmController::load(state).expect_err("a task must not point at nothing");
+    assert_eq!(error.code, SwarmErrorCode::CorruptState);
+}
+
+#[test]
+fn inconsistent_dispatch_worker_binding_is_refused_on_reload() {
+    let mut swarm = SwarmController::new(single_task_spec(), at(0)).expect("valid");
+    let intent = swarm.plan_dispatches(at(1)).remove(0);
+    swarm
+        .record_dispatch_requested(&intent, None, at(1))
+        .expect("write");
+    let mut state = swarm.into_state();
+    state.dispatches[0].worker_id = worker_id("forged-worker");
+    let error = SwarmController::load(state).expect_err("worker binding must be checked");
+    assert_eq!(error.code, SwarmErrorCode::CorruptState);
+}
+
+#[test]
+fn inconsistent_task_dispatch_state_is_refused_on_reload() {
+    let mut swarm = SwarmController::new(single_task_spec(), at(0)).expect("valid");
+    let intent = swarm.plan_dispatches(at(1)).remove(0);
+    swarm
+        .record_dispatch_requested(&intent, None, at(1))
+        .expect("write");
+    let mut state = swarm.into_state();
+    state.tasks[0].state = TaskState::Ready;
+    let error = SwarmController::load(state).expect_err("task state must match dispatch state");
+    assert_eq!(error.code, SwarmErrorCode::CorruptState);
+}
+
+#[test]
+fn oversized_reloaded_output_is_refused() {
+    let swarm = SwarmController::new(single_task_spec(), at(0)).expect("valid");
+    let mut state = swarm.into_state();
+    state.tasks[0].summary = Some("x".repeat(4 * 1024 + 1));
+    let error = SwarmController::load(state).expect_err("stored output must stay bounded");
     assert_eq!(error.code, SwarmErrorCode::CorruptState);
 }

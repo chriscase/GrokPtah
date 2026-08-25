@@ -17,15 +17,19 @@
 //! evidence.
 
 use chrono::{DateTime, TimeDelta, Utc};
+use std::sync::Arc;
 
 use crate::error::{SwarmError, SwarmErrorCode, SwarmResult};
 use crate::ids::{DispatchId, ExternalRefId, TaskId};
 use crate::policy::FailurePolicy;
 use crate::spec::{ComputerUseLeaseRef, SwarmSpec, TaskKind, TaskSpec, validate_text};
 use crate::state::{
-    DispatchIntent, DispatchProbe, DispatchRecord, DispatchState, MAX_REASON_BYTES, ReviewVerdict,
-    SwarmLifecycle, SwarmState, TaskOutcome, TaskResult, TaskState, derive_dispatch_id,
+    DispatchIntent, DispatchProbe, DispatchRecord, DispatchState, MAX_EVIDENCE_DETAIL_BYTES,
+    MAX_EVIDENCE_ENTRIES, MAX_EVIDENCE_LABEL_BYTES, MAX_REASON_BYTES, MAX_SUMMARY_BYTES,
+    ReviewVerdict, SwarmLifecycle, SwarmState, TaskOutcome, TaskResult, TaskState,
+    derive_dispatch_id,
 };
+use crate::store::{DurableSwarmStore, InMemorySwarmStore, LeaseClaim};
 use crate::validate::validate_swarm_spec;
 
 /// What a restart recovery pass changed.
@@ -37,6 +41,13 @@ pub struct RecoveryReport {
     pub uncertain: Vec<DispatchId>,
 }
 
+/// Result of the durable one-winner spawn claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnClaim {
+    pub dispatch: DispatchRecord,
+    pub won: bool,
+}
+
 impl RecoveryReport {
     /// True when recovery found nothing that needs operator attention.
     pub fn is_clean(&self) -> bool {
@@ -44,20 +55,365 @@ impl RecoveryReport {
     }
 }
 
+fn validate_loaded_state(state: &SwarmState) -> SwarmResult<()> {
+    let corrupt = |message: impl Into<String>| SwarmError::corrupt(message);
+
+    if state.schema_version != crate::spec::SWARM_SCHEMA_VERSION {
+        return Err(corrupt("swarm record schema version is not supported"));
+    }
+    if state.revision == 0 {
+        return Err(corrupt("swarm record revision must be positive"));
+    }
+    validate_swarm_spec(&state.spec).map_err(|error| {
+        corrupt(format!(
+            "stored swarm specification is invalid: {}",
+            error.message
+        ))
+    })?;
+    if state.updated_at < state.created_at {
+        return Err(corrupt("swarm record updated_at precedes created_at"));
+    }
+    if state
+        .stop_reason
+        .as_ref()
+        .is_some_and(|reason| validate_text(reason, "stop reason", MAX_REASON_BYTES).is_err())
+    {
+        return Err(corrupt("stored stop reason is invalid"));
+    }
+    if state.tasks.len() != state.spec.tasks.len() {
+        return Err(corrupt(
+            "swarm record does not hold one entry per specified task",
+        ));
+    }
+    for task in &state.spec.tasks {
+        if state.task(&task.task_id).is_none() {
+            return Err(corrupt("swarm record is missing a task entry"));
+        }
+    }
+    if state.total_dispatches > state.spec.budget.max_total_dispatches
+        || usize::try_from(state.total_dispatches).ok() != Some(state.dispatches.len())
+    {
+        return Err(corrupt(
+            "the recorded dispatch count is outside budget or does not match stored records",
+        ));
+    }
+
+    let mut max_attempts = std::collections::BTreeMap::<TaskId, u32>::new();
+    let mut seen_leases = std::collections::BTreeSet::new();
+    let mut seen_dispatches = std::collections::BTreeSet::new();
+    for dispatch in &state.dispatches {
+        let dispatch_corrupt = |message: impl Into<String>| {
+            corrupt(format!(
+                "stored dispatch record is invalid: {}",
+                message.into()
+            ))
+        };
+        dispatch
+            .dispatch_id
+            .validate()
+            .map_err(|error| dispatch_corrupt(error.message))?;
+        dispatch
+            .task_id
+            .validate()
+            .map_err(|error| dispatch_corrupt(error.message))?;
+        dispatch
+            .worker_id
+            .validate()
+            .map_err(|error| dispatch_corrupt(error.message))?;
+        if dispatch.attempt == 0 || dispatch.attempt > state.spec.budget.max_total_dispatches {
+            return Err(dispatch_corrupt(
+                "dispatch attempt is outside the valid range",
+            ));
+        }
+        if !seen_dispatches.insert(dispatch.dispatch_id.clone()) {
+            return Err(corrupt(
+                "swarm record holds the same dispatch identity twice",
+            ));
+        }
+        let task_spec = state
+            .spec
+            .task(&dispatch.task_id)
+            .ok_or_else(|| corrupt("swarm record holds a dispatch for an unknown task"))?;
+        let worker = state
+            .spec
+            .worker(&task_spec.worker_id)
+            .ok_or_else(|| corrupt("stored task names an unknown dispatch worker"))?;
+        if dispatch.worker_id != worker.worker_id || dispatch.isolation != worker.isolation {
+            return Err(dispatch_corrupt(
+                "dispatch worker or isolation does not match its task",
+            ));
+        }
+        let expected =
+            derive_dispatch_id(&state.spec.swarm_id, &dispatch.task_id, dispatch.attempt)?;
+        if expected != dispatch.dispatch_id {
+            return Err(corrupt(
+                "stored dispatch identity does not match its swarm, task, and attempt",
+            ));
+        }
+        if let Some(external_ref) = &dispatch.external_ref {
+            external_ref
+                .validate()
+                .map_err(|error| dispatch_corrupt(error.message))?;
+        }
+        match (&task_spec.computer_use, &dispatch.lease) {
+            (Some(requirement), Some(lease)) => lease
+                .validate_for(
+                    requirement,
+                    &state.spec.swarm_id,
+                    &dispatch.task_id,
+                    &dispatch.dispatch_id,
+                    dispatch.requested_at,
+                )
+                .map_err(|error| dispatch_corrupt(error.message))?,
+            (Some(_), None) => {
+                return Err(dispatch_corrupt(
+                    "Computer Use task dispatch has no bound lease",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(dispatch_corrupt(
+                    "non-Computer Use dispatch carries a lease",
+                ));
+            }
+            (None, None) => {}
+        }
+        if let Some(lease) = &dispatch.lease {
+            if !seen_leases.insert(lease.lease_id.clone()) {
+                return Err(corrupt(
+                    "the same Computer Use lease is attached to multiple dispatches",
+                ));
+            }
+        }
+        if dispatch.requested_at < state.created_at
+            || dispatch
+                .acknowledged_at
+                .is_some_and(|at| at < dispatch.requested_at)
+            || dispatch
+                .settled_at
+                .is_some_and(|at| at < dispatch.acknowledged_at.unwrap_or(dispatch.requested_at))
+        {
+            return Err(dispatch_corrupt(
+                "dispatch timestamps are not monotonic or precede swarm creation",
+            ));
+        }
+        match dispatch.state {
+            DispatchState::Requested | DispatchState::SpawnClaimed => {
+                if dispatch.external_ref.is_some()
+                    || dispatch.acknowledged_at.is_some()
+                    || dispatch.settled_at.is_some()
+                    || dispatch.uncertain_reason.is_some()
+                {
+                    return Err(dispatch_corrupt(
+                        "pre-acknowledgement dispatch has terminal fields",
+                    ));
+                }
+            }
+            DispatchState::Acknowledged => {
+                if dispatch.external_ref.is_none()
+                    || dispatch.acknowledged_at.is_none()
+                    || dispatch.settled_at.is_some()
+                    || dispatch.uncertain_reason.is_some()
+                {
+                    return Err(dispatch_corrupt(
+                        "acknowledged dispatch does not have exactly its acknowledgement fields",
+                    ));
+                }
+            }
+            DispatchState::Settled => {
+                if dispatch.settled_at.is_none() || dispatch.uncertain_reason.is_some() {
+                    return Err(dispatch_corrupt(
+                        "settled dispatch does not have a settlement timestamp",
+                    ));
+                }
+            }
+            DispatchState::Uncertain => {
+                if dispatch.uncertain_reason.as_ref().is_none_or(|reason| {
+                    validate_text(reason, "uncertainty reason", MAX_REASON_BYTES).is_err()
+                }) || dispatch.settled_at.is_some()
+                {
+                    return Err(dispatch_corrupt(
+                        "uncertain dispatch does not have exactly its uncertainty fields",
+                    ));
+                }
+            }
+        }
+        max_attempts
+            .entry(dispatch.task_id.clone())
+            .and_modify(|attempt| *attempt = (*attempt).max(dispatch.attempt))
+            .or_insert(dispatch.attempt);
+    }
+
+    for task in &state.tasks {
+        if task.updated_at < state.created_at
+            || task.attempts > state.spec.budget.max_total_dispatches
+        {
+            return Err(corrupt("stored task timestamp or attempt count is invalid"));
+        }
+        if task.summary.as_ref().is_some_and(|summary| {
+            validate_text(summary, "outcome summary", MAX_SUMMARY_BYTES).is_err()
+        }) || task
+            .last_error
+            .as_ref()
+            .is_some_and(|error| validate_text(error, "task error", MAX_REASON_BYTES).is_err())
+            || task.evidence.len() > MAX_EVIDENCE_ENTRIES
+        {
+            return Err(corrupt("stored task output exceeds its declared bounds"));
+        }
+        for evidence in &task.evidence {
+            evidence
+                .validate()
+                .map_err(|error| corrupt(error.message))?;
+        }
+        let task_dispatch = task
+            .current_dispatch
+            .as_ref()
+            .map(|dispatch_id| {
+                state
+                    .dispatch(dispatch_id)
+                    .ok_or_else(|| corrupt("task points at a missing dispatch"))
+            })
+            .transpose()?;
+        if let Some(dispatch) = task_dispatch {
+            if dispatch.task_id != task.task_id || dispatch.attempt != task.attempts {
+                return Err(corrupt(
+                    "task current_dispatch does not match its task and latest attempt",
+                ));
+            }
+        }
+        match task.state {
+            TaskState::Dispatching => {
+                if task_dispatch.is_none_or(|dispatch| {
+                    !matches!(
+                        dispatch.state,
+                        DispatchState::Requested | DispatchState::SpawnClaimed
+                    )
+                }) {
+                    return Err(corrupt(
+                        "dispatching task does not point at a pre-acknowledgement dispatch",
+                    ));
+                }
+            }
+            TaskState::Running => {
+                if task_dispatch
+                    .is_none_or(|dispatch| dispatch.state != DispatchState::Acknowledged)
+                {
+                    return Err(corrupt(
+                        "running task does not point at an acknowledged dispatch",
+                    ));
+                }
+            }
+            TaskState::Cancelling => {
+                if task_dispatch.is_none_or(|dispatch| {
+                    !matches!(
+                        dispatch.state,
+                        DispatchState::Requested
+                            | DispatchState::SpawnClaimed
+                            | DispatchState::Acknowledged
+                    )
+                }) {
+                    return Err(corrupt("cancelling task does not point at a live dispatch"));
+                }
+            }
+            TaskState::DispatchUncertain => {
+                if task_dispatch.is_none_or(|dispatch| dispatch.state != DispatchState::Uncertain) {
+                    return Err(corrupt(
+                        "uncertain task does not point at an uncertain dispatch",
+                    ));
+                }
+            }
+            _ if task_dispatch.is_some() => {
+                return Err(corrupt(
+                    "settled or derived task points at a current dispatch",
+                ));
+            }
+            _ => {}
+        }
+        if let Some(max_attempt) = max_attempts.get(&task.task_id) {
+            if *max_attempt != task.attempts {
+                return Err(corrupt(
+                    "task attempt counter does not match its dispatch history",
+                ));
+            }
+        } else if task.attempts != 0 {
+            return Err(corrupt(
+                "task has attempts recorded without dispatch history",
+            ));
+        }
+        let kind = state
+            .spec
+            .task(&task.task_id)
+            .ok_or_else(|| corrupt("stored task is not declared by the specification"))?
+            .kind;
+        if kind != TaskKind::Review && task.verdict.is_some() {
+            return Err(corrupt("non-review task has a verdict"));
+        }
+        if kind == TaskKind::Review && task.state == TaskState::Succeeded && task.verdict.is_none()
+        {
+            return Err(corrupt("succeeded review task has no verdict"));
+        }
+        if kind == TaskKind::Review && task.state != TaskState::Succeeded && task.verdict.is_some()
+        {
+            return Err(corrupt("non-successful review task has a verdict"));
+        }
+    }
+
+    let live = state.tasks.iter().any(|task| task.state.occupies_slot());
+    if state.lifecycle.is_terminal() && live {
+        return Err(corrupt("terminal swarm still has a live or uncertain task"));
+    }
+    if state.lifecycle == SwarmLifecycle::Succeeded
+        && state
+            .tasks
+            .iter()
+            .any(|task| task.state != TaskState::Succeeded)
+    {
+        return Err(corrupt("succeeded swarm has a non-succeeded task"));
+    }
+    if matches!(
+        state.lifecycle,
+        SwarmLifecycle::Cancelling | SwarmLifecycle::Cancelled
+    ) && state.tasks.iter().any(|task| {
+        matches!(
+            task.state,
+            TaskState::Pending | TaskState::Ready | TaskState::Blocked
+        )
+    }) {
+        return Err(corrupt("cancelling swarm has an unclassified derived task"));
+    }
+    Ok(())
+}
+
 /// Owns and advances one swarm's durable state.
 #[derive(Debug, Clone)]
 pub struct SwarmController {
     state: SwarmState,
+    store: Arc<dyn DurableSwarmStore>,
 }
 
 impl SwarmController {
     /// Validate a specification and start a swarm.
     pub fn new(spec: SwarmSpec, now: DateTime<Utc>) -> SwarmResult<Self> {
+        let store = Arc::new(InMemorySwarmStore::default());
+        Self::new_with_store(spec, now, store)
+    }
+
+    /// Validate a specification, persist it, and start a swarm using `store`.
+    ///
+    /// Production callers should provide a durable implementation. The
+    /// in-memory store used by [`Self::new`] exists only as a deterministic
+    /// convenience for local callers and tests.
+    pub fn new_with_store(
+        spec: SwarmSpec,
+        now: DateTime<Utc>,
+        store: Arc<dyn DurableSwarmStore>,
+    ) -> SwarmResult<Self> {
         validate_swarm_spec(&spec)?;
         let mut controller = Self {
             state: SwarmState::new(spec, now),
+            store,
         };
         controller.refresh(now);
+        controller.store.create(&controller.state)?;
         Ok(controller)
     }
 
@@ -66,100 +422,96 @@ impl SwarmController {
     /// A record that fails validation is refused rather than resumed: a
     /// hand-edited or corrupted swarm never gets to dispatch children.
     pub fn load(state: SwarmState) -> SwarmResult<Self> {
-        if state.schema_version != crate::spec::SWARM_SCHEMA_VERSION {
-            return Err(SwarmError::new(
-                SwarmErrorCode::CorruptState,
-                "swarm record schema version is not supported",
-            ));
-        }
-        if state.revision == 0 {
-            return Err(SwarmError::new(
-                SwarmErrorCode::CorruptState,
-                "swarm record revision must be positive",
-            ));
-        }
-        validate_swarm_spec(&state.spec).map_err(|error| {
-            SwarmError::new(
-                SwarmErrorCode::CorruptState,
-                format!("stored swarm specification is invalid: {}", error.message),
-            )
-        })?;
-        if state.tasks.len() != state.spec.tasks.len() {
-            return Err(SwarmError::new(
-                SwarmErrorCode::CorruptState,
-                "swarm record does not hold one entry per specified task",
-            ));
-        }
-        for task in &state.spec.tasks {
-            if state.task(&task.task_id).is_none() {
-                return Err(SwarmError::new(
-                    SwarmErrorCode::CorruptState,
-                    "swarm record is missing a task entry",
-                ));
-            }
-        }
-        let mut seen_dispatches = std::collections::BTreeSet::new();
-        for dispatch in &state.dispatches {
-            let corrupt = |error: SwarmError| {
-                SwarmError::new(
-                    SwarmErrorCode::CorruptState,
-                    format!("stored dispatch record is invalid: {}", error.message),
-                )
-            };
-            dispatch.dispatch_id.validate().map_err(corrupt)?;
-            dispatch.task_id.validate().map_err(corrupt)?;
-            dispatch.worker_id.validate().map_err(corrupt)?;
-            if let Some(external_ref) = &dispatch.external_ref {
-                external_ref.validate().map_err(corrupt)?;
-            }
-            if let Some(lease) = &dispatch.lease {
-                lease.validate().map_err(corrupt)?;
-            }
-            if !seen_dispatches.insert(dispatch.dispatch_id.clone()) {
-                return Err(SwarmError::new(
-                    SwarmErrorCode::CorruptState,
-                    "swarm record holds the same dispatch identity twice",
-                ));
-            }
-            if state.spec.task(&dispatch.task_id).is_none() {
-                return Err(SwarmError::new(
-                    SwarmErrorCode::CorruptState,
-                    "swarm record holds a dispatch for an unknown task",
-                ));
-            }
-            let expected =
-                derive_dispatch_id(&state.spec.swarm_id, &dispatch.task_id, dispatch.attempt)?;
-            if expected != dispatch.dispatch_id {
-                return Err(SwarmError::new(
-                    SwarmErrorCode::CorruptState,
-                    "stored dispatch identity does not match its swarm, task, and attempt",
-                ));
-            }
-        }
-        for task in &state.tasks {
-            let Some(dispatch_id) = &task.current_dispatch else {
-                continue;
-            };
-            if state.dispatch(dispatch_id).is_none() {
-                return Err(SwarmError::new(
-                    SwarmErrorCode::CorruptState,
-                    "a task points at a dispatch record the swarm does not hold",
-                ));
-            }
-        }
-        // One record is written per attempt and the counter moves with it, so a
-        // mismatch means the record was edited. Accepting it would let a swarm
-        // dispatch past its budget.
-        if usize::try_from(state.total_dispatches).ok() != Some(state.dispatches.len()) {
-            return Err(SwarmError::new(
-                SwarmErrorCode::CorruptState,
-                "the recorded dispatch count does not match the stored dispatch records",
-            ));
-        }
-        Ok(Self { state })
+        let store = Arc::new(InMemorySwarmStore::default());
+        validate_loaded_state(&state)?;
+        store.create(&state)?;
+        Ok(Self { state, store })
     }
 
-    /// Borrow the durable state for persistence or projection.
+    /// Load the latest state from an owner-provided durable store.
+    pub fn load_from_store(
+        swarm_id: &crate::ids::SwarmId,
+        store: Arc<dyn DurableSwarmStore>,
+    ) -> SwarmResult<Self> {
+        let state = store.load(swarm_id)?;
+        validate_loaded_state(&state)?;
+        Ok(Self { state, store })
+    }
+
+    fn validate_now(&self, now: DateTime<Utc>) -> SwarmResult<()> {
+        if now < self.state.created_at {
+            return Err(SwarmError::invalid(
+                "operation time must not precede swarm creation",
+            ));
+        }
+        if now < self.state.updated_at {
+            return Err(SwarmError::conflict(
+                "operation time moved backwards relative to the durable swarm state",
+            ));
+        }
+        Ok(())
+    }
+
+    fn transact<T, F>(&mut self, operation: F) -> SwarmResult<T>
+    where
+        F: Fn(&mut Self) -> SwarmResult<T>,
+    {
+        for _ in 0..=1 {
+            let latest = self.store.load(&self.state.spec.swarm_id)?;
+            if latest.revision != self.state.revision {
+                self.state = latest;
+            }
+
+            let mut next = self.clone();
+            let result = operation(&mut next)?;
+            if next.state == self.state {
+                return Ok(result);
+            }
+
+            let lease_claim = next.new_lease_claim(&self.state);
+            match self.store.compare_and_swap(
+                &self.state.spec.swarm_id,
+                self.state.revision,
+                &next.state,
+                lease_claim.as_ref(),
+            ) {
+                Ok(()) => {
+                    self.state = next.state;
+                    return Ok(result);
+                }
+                Err(error) if error.code == SwarmErrorCode::Conflict => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(SwarmError::conflict(
+            "swarm changed concurrently; retry the operation",
+        ))
+    }
+
+    fn new_lease_claim(&self, previous: &SwarmState) -> Option<LeaseClaim> {
+        self.state
+            .dispatches
+            .iter()
+            .filter(|dispatch| previous.dispatch(&dispatch.dispatch_id).is_none())
+            .find_map(|dispatch| {
+                dispatch.lease.as_ref().map(|lease| {
+                    LeaseClaim::from_dispatch(&self.state.spec.swarm_id, dispatch, lease)
+                })
+            })
+    }
+
+    fn record_dispatch_requested_local(
+        &mut self,
+        intent: &DispatchIntent,
+        lease: Option<ComputerUseLeaseRef>,
+        now: DateTime<Utc>,
+    ) -> SwarmResult<DispatchRecord> {
+        self.validate_now(now)?;
+        self.record_dispatch_requested_inner(intent, lease, now)
+    }
+
+    /// Borrow the latest durable state for persistence or projection.
     pub fn state(&self) -> &SwarmState {
         &self.state
     }
@@ -180,13 +532,23 @@ impl SwarmController {
     /// acknowledged, so the child may or may not exist. Those become
     /// `Uncertain`. An `Acknowledged` dispatch carries a provider handle and is
     /// left alone: it can be probed, so it is not uncertain.
-    pub fn recover(&mut self, now: DateTime<Utc>) -> RecoveryReport {
+    pub fn recover(&mut self, now: DateTime<Utc>) -> SwarmResult<RecoveryReport> {
+        self.transact(|next| next.recover_inner(now))
+    }
+
+    fn recover_inner(&mut self, now: DateTime<Utc>) -> SwarmResult<RecoveryReport> {
+        self.validate_now(now)?;
         let mut report = RecoveryReport::default();
         let stale: Vec<DispatchId> = self
             .state
             .dispatches
             .iter()
-            .filter(|record| record.state == DispatchState::Requested)
+            .filter(|record| {
+                matches!(
+                    record.state,
+                    DispatchState::Requested | DispatchState::SpawnClaimed
+                )
+            })
             .map(|record| record.dispatch_id.clone())
             .collect();
 
@@ -210,10 +572,10 @@ impl SwarmController {
         }
 
         if !report.is_clean() {
-            self.state.revision = self.state.revision.saturating_add(1);
+            self.bump(now);
         }
         self.refresh(now);
-        report
+        Ok(report)
     }
 
     /// Propose the dispatches admissible right now.
@@ -290,10 +652,24 @@ impl SwarmController {
         lease: Option<ComputerUseLeaseRef>,
         now: DateTime<Utc>,
     ) -> SwarmResult<DispatchRecord> {
+        self.transact(|next| next.record_dispatch_requested_local(intent, lease.clone(), now))
+    }
+
+    fn record_dispatch_requested_inner(
+        &mut self,
+        intent: &DispatchIntent,
+        lease: Option<ComputerUseLeaseRef>,
+        now: DateTime<Utc>,
+    ) -> SwarmResult<DispatchRecord> {
         if let Some(existing) = self.state.dispatch(&intent.dispatch_id) {
-            if existing.task_id != intent.task_id || existing.attempt != intent.attempt {
+            if existing.task_id != intent.task_id
+                || existing.worker_id != intent.worker_id
+                || existing.attempt != intent.attempt
+                || existing.isolation != intent.isolation
+                || existing.lease.as_ref() != lease.as_ref()
+            {
                 return Err(SwarmError::conflict(
-                    "dispatch identity is already bound to a different task or attempt",
+                    "dispatch identity is already bound to a different request",
                 ));
             }
             return Ok(existing.clone());
@@ -367,7 +743,14 @@ impl SwarmController {
             }
         }
 
-        let lease = self.authorize_computer_use(&task_spec, lease, now)?;
+        let lease = self.authorize_computer_use(
+            &task_spec,
+            &self.state.spec.swarm_id,
+            &intent.task_id,
+            &intent.dispatch_id,
+            lease,
+            now,
+        )?;
 
         self.state.dispatches.push(DispatchRecord {
             dispatch_id: intent.dispatch_id.clone(),
@@ -399,6 +782,73 @@ impl SwarmController {
             .clone())
     }
 
+    /// Atomically claim the right to perform the external spawn.
+    ///
+    /// Only the caller that observes `won == true` may invoke the provider.
+    /// Replaying the same claim returns `won == false`; it never authorizes a
+    /// second spawn.
+    pub fn claim_dispatch_spawn(
+        &mut self,
+        dispatch_id: &DispatchId,
+        now: DateTime<Utc>,
+    ) -> SwarmResult<SpawnClaim> {
+        self.transact(|next| next.claim_dispatch_spawn_inner(dispatch_id, now))
+    }
+
+    fn claim_dispatch_spawn_inner(
+        &mut self,
+        dispatch_id: &DispatchId,
+        now: DateTime<Utc>,
+    ) -> SwarmResult<SpawnClaim> {
+        self.validate_now(now)?;
+        let record = self
+            .state
+            .dispatch(dispatch_id)
+            .ok_or_else(|| SwarmError::not_found("unknown dispatch"))?;
+        match record.state {
+            DispatchState::Requested => {}
+            DispatchState::SpawnClaimed => {
+                return Ok(SpawnClaim {
+                    dispatch: record.clone(),
+                    won: false,
+                });
+            }
+            _ => {
+                return Err(SwarmError::conflict(
+                    "dispatch cannot be spawn-claimed from its current state",
+                ));
+            }
+        }
+        if self.state.lifecycle != SwarmLifecycle::Active {
+            return Err(SwarmError::conflict(
+                "swarm is not active and will not claim a spawn",
+            ));
+        }
+        let task = self
+            .state
+            .task(&record.task_id)
+            .ok_or_else(|| SwarmError::corrupt("dispatch points to an unknown task"))?;
+        if task.state != TaskState::Dispatching
+            || task.current_dispatch.as_ref() != Some(dispatch_id)
+        {
+            return Err(SwarmError::conflict(
+                "dispatch is no longer the current dispatch for its task",
+            ));
+        }
+        if let Some(record) = self.state.dispatch_mut(dispatch_id) {
+            record.state = DispatchState::SpawnClaimed;
+        }
+        self.bump(now);
+        Ok(SpawnClaim {
+            dispatch: self
+                .state
+                .dispatch(dispatch_id)
+                .expect("dispatch just updated")
+                .clone(),
+            won: true,
+        })
+    }
+
     /// Record that the worker accepted a dispatch and is running.
     pub fn record_dispatch_acknowledged(
         &mut self,
@@ -406,15 +856,28 @@ impl SwarmController {
         external_ref: ExternalRefId,
         now: DateTime<Utc>,
     ) -> SwarmResult<()> {
+        self.transact(|next| {
+            next.record_dispatch_acknowledged_inner(dispatch_id, &external_ref, now)
+        })
+    }
+
+    fn record_dispatch_acknowledged_inner(
+        &mut self,
+        dispatch_id: &DispatchId,
+        external_ref: &ExternalRefId,
+        now: DateTime<Utc>,
+    ) -> SwarmResult<()> {
+        self.validate_now(now)?;
+        external_ref.validate()?;
         let task_id = {
             let record = self
                 .state
                 .dispatch_mut(dispatch_id)
                 .ok_or_else(|| SwarmError::not_found("unknown dispatch"))?;
             match record.state {
-                DispatchState::Requested => {}
+                DispatchState::SpawnClaimed => {}
                 DispatchState::Acknowledged
-                    if record.external_ref.as_ref() == Some(&external_ref) =>
+                    if record.external_ref.as_ref() == Some(external_ref) =>
                 {
                     return Ok(());
                 }
@@ -430,7 +893,9 @@ impl SwarmController {
             record.task_id.clone()
         };
         if let Some(task) = self.state.task_mut(&task_id) {
-            task.state = TaskState::Running;
+            if task.state != TaskState::Cancelling {
+                task.state = TaskState::Running;
+            }
             task.updated_at = now;
         }
         self.bump(now);
@@ -450,7 +915,17 @@ impl SwarmController {
         now: DateTime<Utc>,
     ) -> SwarmResult<()> {
         let reason = reason.into();
-        validate_text(&reason, "uncertainty reason", MAX_REASON_BYTES)?;
+        self.transact(|next| next.record_dispatch_uncertain_inner(dispatch_id, &reason, now))
+    }
+
+    fn record_dispatch_uncertain_inner(
+        &mut self,
+        dispatch_id: &DispatchId,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> SwarmResult<()> {
+        self.validate_now(now)?;
+        validate_text(reason, "uncertainty reason", MAX_REASON_BYTES)?;
         let task_id = {
             let record = self
                 .state
@@ -465,7 +940,7 @@ impl SwarmController {
                 ));
             }
             record.state = DispatchState::Uncertain;
-            record.uncertain_reason = Some(reason);
+            record.uncertain_reason = Some(reason.to_string());
             record.task_id.clone()
         };
         if let Some(task) = self.state.task_mut(&task_id) {
@@ -488,6 +963,16 @@ impl SwarmController {
         probe: DispatchProbe,
         now: DateTime<Utc>,
     ) -> SwarmResult<bool> {
+        self.transact(|next| next.reconcile_uncertain_inner(dispatch_id, probe.clone(), now))
+    }
+
+    fn reconcile_uncertain_inner(
+        &mut self,
+        dispatch_id: &DispatchId,
+        probe: DispatchProbe,
+        now: DateTime<Utc>,
+    ) -> SwarmResult<bool> {
+        self.validate_now(now)?;
         let current = self
             .state
             .dispatch(dispatch_id)
@@ -519,6 +1004,7 @@ impl SwarmController {
                 Ok(true)
             }
             DispatchProbe::Running { external_ref } => {
+                external_ref.validate()?;
                 if let Some(record) = self.state.dispatch_mut(dispatch_id) {
                     record.state = DispatchState::Acknowledged;
                     record.external_ref = Some(external_ref);
@@ -546,12 +1032,22 @@ impl SwarmController {
         outcome: TaskOutcome,
         now: DateTime<Utc>,
     ) -> SwarmResult<()> {
+        self.transact(|next| next.record_task_outcome_inner(dispatch_id, outcome.clone(), now))
+    }
+
+    fn record_task_outcome_inner(
+        &mut self,
+        dispatch_id: &DispatchId,
+        outcome: TaskOutcome,
+        now: DateTime<Utc>,
+    ) -> SwarmResult<()> {
+        self.validate_now(now)?;
         let record = self
             .state
             .dispatch(dispatch_id)
             .ok_or_else(|| SwarmError::not_found("unknown dispatch"))?;
         match record.state {
-            DispatchState::Requested | DispatchState::Acknowledged => {}
+            DispatchState::SpawnClaimed | DispatchState::Acknowledged => {}
             DispatchState::Uncertain => {
                 return Err(SwarmError::new(
                     SwarmErrorCode::UncertainDispatch,
@@ -559,7 +1055,25 @@ impl SwarmController {
                 ));
             }
             DispatchState::Settled => {
-                return Err(SwarmError::conflict("dispatch has already settled"));
+                let task = self
+                    .state
+                    .task(&record.task_id)
+                    .ok_or_else(|| SwarmError::corrupt("dispatch points to an unknown task"))?;
+                let expected_state = match outcome.result {
+                    TaskResult::Succeeded => TaskState::Succeeded,
+                    TaskResult::Failed => TaskState::Failed,
+                    TaskResult::Cancelled => TaskState::Cancelled,
+                };
+                if task.state == expected_state
+                    && task.verdict == outcome.verdict
+                    && task.summary == outcome.summary
+                    && task.evidence == outcome.evidence
+                {
+                    return Ok(());
+                }
+                return Err(SwarmError::conflict(
+                    "dispatch has already settled with a different outcome",
+                ));
             }
         }
         self.apply_outcome(dispatch_id, outcome, now)
@@ -572,6 +1086,11 @@ impl SwarmController {
     /// An uncertain task is refused: cancelling a child that may still be
     /// running would release capacity the swarm cannot prove is free.
     pub fn cancel_task(&mut self, task_id: &TaskId, now: DateTime<Utc>) -> SwarmResult<()> {
+        self.transact(|next| next.cancel_task_inner(task_id, now))
+    }
+
+    fn cancel_task_inner(&mut self, task_id: &TaskId, now: DateTime<Utc>) -> SwarmResult<()> {
+        self.validate_now(now)?;
         let record = self
             .state
             .task(task_id)
@@ -614,14 +1133,19 @@ impl SwarmController {
         now: DateTime<Utc>,
     ) -> SwarmResult<()> {
         let reason = reason.into();
-        validate_text(&reason, "cancellation reason", MAX_REASON_BYTES)?;
+        self.transact(|next| next.cancel_swarm_inner(&reason, now))
+    }
+
+    fn cancel_swarm_inner(&mut self, reason: &str, now: DateTime<Utc>) -> SwarmResult<()> {
+        self.validate_now(now)?;
+        validate_text(reason, "cancellation reason", MAX_REASON_BYTES)?;
         if self.state.lifecycle.is_terminal() {
             return Err(SwarmError::conflict(
                 "swarm has already reached a terminal state",
             ));
         }
         self.state.lifecycle = SwarmLifecycle::Cancelling;
-        self.state.stop_reason = Some(reason);
+        self.state.stop_reason = Some(reason.to_string());
         for task in &mut self.state.tasks {
             match task.state {
                 TaskState::Pending | TaskState::Ready | TaskState::Blocked => {
@@ -678,6 +1202,9 @@ impl SwarmController {
     fn authorize_computer_use(
         &self,
         task: &TaskSpec,
+        swarm_id: &crate::ids::SwarmId,
+        task_id: &TaskId,
+        dispatch_id: &DispatchId,
         lease: Option<ComputerUseLeaseRef>,
         now: DateTime<Utc>,
     ) -> SwarmResult<Option<ComputerUseLeaseRef>> {
@@ -690,12 +1217,12 @@ impl SwarmController {
                 "this task requires an operator-issued Computer Use lease",
             )),
             (true, Some(lease)) => {
-                lease.validate()?;
-                if !lease.is_usable_at(now) {
-                    return Err(SwarmError::capability(
-                        "the supplied Computer Use lease is expired, revoked, or spent",
-                    ));
-                }
+                let requirement = task.computer_use.as_ref().ok_or_else(|| {
+                    SwarmError::corrupt(
+                        "Computer Use task is missing its validated authority requirement",
+                    )
+                })?;
+                lease.validate_for(requirement, swarm_id, task_id, dispatch_id, now)?;
                 Ok(Some(lease))
             }
         }

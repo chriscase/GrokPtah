@@ -19,11 +19,12 @@ use std::collections::BTreeSet;
 
 use chrono::{DateTime, TimeZone, Utc};
 use grokptah_swarm_control_plane::{
-    AdmissionPolicy, BudgetPolicy, ComputerUseLeaseRef, DispatchIntent, ExternalRefId,
-    FailurePolicy, IsolationRequirement, LeaseId, LeaseIssuer, ModelId, ProviderCatalog,
-    ProviderCatalogEntry, ProviderId, QuorumRule, ReviewGate, SubagentCapabilityMode,
-    SwarmController, SwarmId, SwarmSpec, TaskId, TaskKind, TaskOutcome, TaskSpec, WorkerCapability,
-    WorkerId, WorkerRole, WorkerSpec,
+    AdmissionPolicy, BudgetPolicy, ComputerUseActionClass, ComputerUseLeaseRef,
+    ComputerUseRequirement, DispatchId, DispatchIntent, ExternalRefId, FailurePolicy,
+    IsolationRequirement, LeaseId, LeaseIssuer, ModelId, ProviderCatalog, ProviderCatalogEntry,
+    ProviderId, QuorumRule, ReviewGate, SubagentCapabilityMode, SwarmController, SwarmId,
+    SwarmSpec, TaskId, TaskKind, TaskOutcome, TaskSpec, WorkerCapability, WorkerId, WorkerRole,
+    WorkerSpec,
 };
 
 /// A fixed clock. Every test passes explicit instants; the crate reads none.
@@ -189,6 +190,7 @@ pub fn work_task(id: &str, worker: &str, dependencies: &[&str], priority: i32) -
         dependencies: dependencies.iter().map(|d| task_id(d)).collect(),
         priority,
         requires_computer_use: false,
+        computer_use: None,
         review_gate: None,
     }
 }
@@ -203,6 +205,7 @@ pub fn review_task(id: &str, dependencies: &[&str]) -> TaskSpec {
         dependencies: dependencies.iter().map(|d| task_id(d)).collect(),
         priority: 0,
         requires_computer_use: false,
+        computer_use: None,
         review_gate: None,
     }
 }
@@ -217,6 +220,7 @@ pub fn synthesis_task(id: &str, reviewers: &[&str], quorum: QuorumRule) -> TaskS
         dependencies: reviewers.iter().map(|d| task_id(d)).collect(),
         priority: 0,
         requires_computer_use: false,
+        computer_use: None,
         review_gate: Some(ReviewGate {
             reviewers: reviewers.iter().map(|d| task_id(d)).collect(),
             quorum,
@@ -268,11 +272,39 @@ pub fn single_task_spec() -> SwarmSpec {
 pub fn lease(id: &str, issued: i64, expires: i64) -> ComputerUseLeaseRef {
     ComputerUseLeaseRef {
         lease_id: LeaseId::parse(id).expect("valid lease id"),
-        issued_by: LeaseIssuer::LocalOperator,
+        issued_by: LeaseIssuer::LocalUser,
+        swarm_id: SwarmId::parse("swarm-single").expect("valid swarm id"),
+        task_id: task_id("t-only"),
+        dispatch_id: DispatchId::parse("dispatch-placeholder").expect("valid dispatch id"),
+        run_id: ExternalRefId::parse("run-1").expect("valid run id"),
+        target_ref: ExternalRefId::parse("target-1").expect("valid target ref"),
+        owner_ref: ExternalRefId::parse("owner-1").expect("valid owner ref"),
+        action_classes: [ComputerUseActionClass::Semantic].into_iter().collect(),
         issued_at: at(issued),
         expires_at: at(expires),
         uses_remaining: Some(1),
         revoked_at: None,
+    }
+}
+
+pub fn lease_for(
+    intent: &DispatchIntent,
+    id: &str,
+    issued: i64,
+    expires: i64,
+) -> ComputerUseLeaseRef {
+    let mut lease = lease(id, issued, expires);
+    lease.task_id = intent.task_id.clone();
+    lease.dispatch_id = intent.dispatch_id.clone();
+    lease
+}
+
+pub fn computer_use_requirement() -> ComputerUseRequirement {
+    ComputerUseRequirement {
+        run_id: ExternalRefId::parse("run-1").expect("valid run id"),
+        target_ref: ExternalRefId::parse("target-1").expect("valid target ref"),
+        owner_ref: ExternalRefId::parse("owner-1").expect("valid owner ref"),
+        action_class: ComputerUseActionClass::Semantic,
     }
 }
 
@@ -296,6 +328,10 @@ pub fn run_task(swarm: &mut SwarmController, id: &str, outcome: TaskOutcome, now
     let record = swarm
         .record_dispatch_requested(&intent, None, now)
         .expect("dispatch is admissible");
+    let claim = swarm
+        .claim_dispatch_spawn(&record.dispatch_id, now)
+        .expect("spawn claim is admissible");
+    assert!(claim.won, "the fixture owns the first spawn claim");
     swarm
         .record_dispatch_acknowledged(&record.dispatch_id, external(&format!("ext-{id}")), now)
         .expect("acknowledgement is legal");

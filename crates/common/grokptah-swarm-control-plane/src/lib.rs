@@ -72,6 +72,7 @@ mod projection;
 mod scheduler;
 mod spec;
 mod state;
+mod store;
 mod validate;
 
 pub use error::{SwarmError, SwarmErrorCode, SwarmResult};
@@ -89,12 +90,12 @@ pub use projection::{
     MAX_PROJECTED_OBJECTIVE_BYTES, SwarmProgressProjection, TaskProgressRow, TaskStateCounts,
     project_evidence, project_progress,
 };
-pub use scheduler::{RecoveryReport, SwarmController};
+pub use scheduler::{RecoveryReport, SpawnClaim, SwarmController};
 pub use spec::{
-    ComputerUseLeaseRef, IsolationRequirement, LeaseIssuer, MAX_CATALOG_ENTRIES,
-    MAX_INSTRUCTIONS_BYTES, MAX_OBJECTIVE_BYTES, MAX_TITLE_BYTES, ProviderCatalog,
-    ProviderCatalogEntry, SWARM_SCHEMA_VERSION, SwarmSpec, TaskKind, TaskSpec, WorkerCapability,
-    WorkerRole, WorkerSpec,
+    ComputerUseActionClass, ComputerUseLeaseRef, ComputerUseRequirement, IsolationRequirement,
+    LeaseIssuer, MAX_CATALOG_ENTRIES, MAX_INSTRUCTIONS_BYTES, MAX_OBJECTIVE_BYTES, MAX_TITLE_BYTES,
+    ProviderCatalog, ProviderCatalogEntry, SWARM_SCHEMA_VERSION, SwarmSpec, TaskKind, TaskSpec,
+    WorkerCapability, WorkerRole, WorkerSpec,
 };
 pub use state::{
     DispatchIntent, DispatchProbe, DispatchRecord, DispatchState, EvidenceEntry,
@@ -102,6 +103,7 @@ pub use state::{
     MAX_SUMMARY_BYTES, ReviewVerdict, SwarmLifecycle, SwarmState, TaskOutcome, TaskRecord,
     TaskResult, TaskState, derive_dispatch_id,
 };
+pub use store::{DurableSwarmStore, InMemorySwarmStore, LeaseClaim};
 pub use validate::validate_swarm_spec;
 
 // Re-exported so a consumer can build a [`WorkerSpec`] without taking a direct

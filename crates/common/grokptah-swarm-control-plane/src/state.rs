@@ -112,6 +112,8 @@ impl TaskState {
 pub enum DispatchState {
     /// Written before the spawn. Whether the worker started is unknown.
     Requested,
+    /// One caller won the durable right to perform the external spawn.
+    SpawnClaimed,
     /// The worker acknowledged the dispatch and reported a handle.
     Acknowledged,
     /// The worker reported a terminal outcome.
