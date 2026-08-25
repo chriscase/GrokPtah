@@ -17,6 +17,9 @@ pub struct AppState {
     /// Loopback MCP control plane (#196); optional when token not configured.
     pub control: Mutex<Option<ControlServerHandle>>,
     pub computer_use: std::sync::Arc<computer_use::DesktopComputerUse>,
+    /// Read-only source inspection authority. Holds the process-unique token
+    /// key and the live authorization snapshots; never persisted.
+    pub source_view: std::sync::Arc<source_view::SourceViewService>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -34,6 +37,7 @@ pub fn run() {
             pty: pty_host::PtyHub::new(),
             control: Mutex::new(None),
             computer_use: std::sync::Arc::new(computer_use::DesktopComputerUse::new(&host)),
+            source_view: std::sync::Arc::new(source_view::SourceViewService::new()),
         })
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -149,8 +153,11 @@ pub fn run() {
             commands::auth_open_login,
             commands::file_tree,
             commands::fuzzy_open,
-            source_view::source_view_roots,
-            source_view::source_view_open,
+            source_view::source_view_snapshot,
+            source_view::source_view_read,
+            source_view::source_view_revoke,
+            source_view::source_view_sweep,
+            source_view::source_view_ttl_ms,
             commands::git_status,
             commands::git_diff,
             commands::git_stage_all,

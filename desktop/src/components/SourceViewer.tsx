@@ -2,23 +2,23 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { highlightLines } from "../lib/sourceHighlight";
 import {
   matchIndexAtOrAfter,
+  rangePosition,
   searchLines,
   searchStatus,
   segmentLine,
   stepMatch,
+  type RangeHighlight,
   type SourceMatch,
 } from "../lib/sourceSearch";
 import {
+  projectionNotice,
+  readProgress,
   rootIdentityLabel,
   sourceViewErrorSummary,
-  truncationNotice,
   type SourceDocument,
+  type SourceLine,
+  type SourceRootDescriptor,
 } from "../lib/sourceView";
-
-/** How many lines are rendered before the reader asks for more. */
-const PAGE = 400;
-/** Lines of lead-in kept above a requested line. */
-const LEAD_IN = 40;
 
 const FOCUSABLE_SELECTOR =
   'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
@@ -32,28 +32,27 @@ function focusableIn(root: HTMLElement | null): HTMLElement[] {
 
 export type SourceViewerProps = {
   open: boolean;
-  /** The loaded document, or null while loading or after a refusal. */
+  /** The most recent page. Carries identity, limits, and classification. */
   document: SourceDocument | null;
-  /** Refusal from the boundary, shown with its plain-language summary. */
+  /** Every line loaded so far, with continued lines already rejoined. */
+  lines: SourceLine[];
   error?: unknown;
   loading?: boolean;
+  loadingMore?: boolean;
+  hasMore?: boolean;
   /** 1-based line to reveal on open, from a tool, test, or diff path. */
   initialLine?: number | null;
+  /** Optional multi-line range to highlight, e.g. a diff hunk. */
+  highlightRange?: RangeHighlight | null;
+  /** Present when the request matched more than one approved root. */
+  rootChoice?: { candidates: SourceRootDescriptor[] } | null;
+  onChooseRoot?: (token: string) => void;
+  onLoadMore?: () => void;
   onClose: () => void;
   /** Copy hook, injected so tests do not need a clipboard. */
   onCopy?: (text: string) => Promise<void>;
   onRetry?: () => void;
 };
-
-function encodingNotice(document: SourceDocument): string | null {
-  if (document.encoding === "binary") {
-    return "This is a binary file. Its bytes are not shown as text.";
-  }
-  if (document.encoding === "utf8_lossy") {
-    return "Some bytes are not valid UTF-8 and are shown as the replacement character.";
-  }
-  return null;
-}
 
 async function defaultCopy(text: string): Promise<void> {
   await navigator.clipboard.writeText(text);
@@ -62,20 +61,28 @@ async function defaultCopy(text: string): Promise<void> {
 /**
  * Read-only source viewer.
  *
- * Opening a file no longer means asking a model to read it: this renders the
- * bytes the boundary returned, with real line numbers, in-file search, and an
- * identity strip naming the exact tree the file came from.
+ * Renders the bytes the boundary returned, with real line numbers, in-file
+ * search, a range highlight for the location that was opened, and an identity
+ * strip naming the exact tree — by kind, label, and digest, never by path.
  *
- * Long files are paged rather than virtualised — an explicit "show more"
- * button keeps every rendered line reachable by keyboard and by a screen
- * reader, which scroll-driven virtualisation does not.
+ * The dialog makes the rest of the app inert while it is open, contains and
+ * restores focus, and pages with an explicit control rather than
+ * scroll-driven virtualisation so every line stays reachable by keyboard and
+ * by a screen reader.
  */
 export function SourceViewer({
   open,
   document: doc,
+  lines,
   error,
   loading = false,
+  loadingMore = false,
+  hasMore = false,
   initialLine = null,
+  highlightRange = null,
+  rootChoice = null,
+  onChooseRoot,
+  onLoadMore,
   onClose,
   onCopy,
   onRetry,
@@ -91,23 +98,16 @@ export function SourceViewer({
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [wholeWord, setWholeWord] = useState(false);
   const [matchIndex, setMatchIndex] = useState(-1);
-  const [visibleTo, setVisibleTo] = useState(PAGE);
-  const [visibleFrom, setVisibleFrom] = useState(1);
   const [announcement, setAnnouncement] = useState("");
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
 
-  const lines = doc?.lines ?? [];
   const anchor = initialLine && initialLine > 0 ? initialLine : 1;
+  const documentKey = doc ? `${doc.root.token}:${doc.relativePath}:${doc.identity.digest}` : "";
 
-  // Reset the window and search whenever a different document is shown.
-  const documentKey = doc ? `${doc.rootId}:${doc.relativePath}:${doc.contentFingerprint}` : "";
   useEffect(() => {
-    const from = Math.max(1, anchor - LEAD_IN);
-    setVisibleFrom(from);
-    setVisibleTo(Math.max(from + PAGE - 1, anchor));
     setMatchIndex(-1);
     setCopyState("idle");
-  }, [documentKey, anchor]);
+  }, [documentKey]);
 
   const matches = useMemo<SourceMatch[]>(
     () => searchLines(lines, query, { caseSensitive, wholeWord }),
@@ -124,26 +124,12 @@ export function SourceViewer({
     return grouped;
   }, [matches]);
 
-  const visibleLines = useMemo(
-    () => lines.filter((line) => line.number >= visibleFrom && line.number <= visibleTo),
-    [lines, visibleFrom, visibleTo],
-  );
-
   const tokenRows = useMemo(
-    () => (doc ? highlightLines(visibleLines.map((line) => line.text), doc.language) : []),
-    [doc, visibleLines],
+    () => (doc ? highlightLines(lines.map((line) => line.text), doc.language) : []),
+    [doc, lines],
   );
 
   const activeMatch = matchIndex >= 0 ? matches[matchIndex] : undefined;
-
-  /** Bring a line into the rendered window and scroll to it. */
-  const reveal = useCallback(
-    (line: number) => {
-      setVisibleFrom((from) => Math.min(from, Math.max(1, line - LEAD_IN)));
-      setVisibleTo((to) => Math.max(to, line + LEAD_IN));
-    },
-    [],
-  );
 
   const goToMatch = useCallback(
     (delta: number) => {
@@ -156,35 +142,66 @@ export function SourceViewer({
           ? matchIndexAtOrAfter(matches, anchor)
           : stepMatch(matches.length, matchIndex, delta);
       setMatchIndex(next);
-      reveal(matches[next].line);
       setAnnouncement(searchStatus(matches.length, next, query));
+      const target = window.document.getElementById(`source-line-${matches[next].line}`);
+      target?.scrollIntoView({ block: "center", behavior: "auto" });
     },
-    [matches, matchIndex, query, anchor, reveal],
+    [matches, matchIndex, query, anchor],
   );
 
   /**
-   * Remember what had focus *before* anything inside the dialog takes it.
+   * Remember what had focus *before* anything inside the dialog takes it, and
+   * make the rest of the page inert while it is open.
    *
-   * This has to be a layout effect declared ahead of the one that moves
-   * focus: React runs layout effects in order, so capturing later would
-   * record the viewer's own code region and "restore" focus to a node that
-   * no longer exists.
+   * This has to be a layout effect declared ahead of the one that moves focus:
+   * React runs layout effects in order, so capturing later would record the
+   * viewer's own code region and "restore" focus to a node that no longer
+   * exists.
    */
   useLayoutEffect(() => {
     if (!open) return;
     const active = window.document.activeElement;
     returnFocusRef.current = active instanceof HTMLElement ? active : null;
+
+    // Everything outside the dialog becomes inert, so a screen reader cannot
+    // wander into the application behind an open modal.
+    //
+    // The walk goes up the dialog's own ancestor path and inerts the siblings
+    // at each level. Inerting the direct children of `body` instead would mark
+    // the app root inert — and the dialog lives inside it, so the modal would
+    // make itself unreachable.
+    const restored: Array<{ element: HTMLElement; inert: boolean; hidden: string | null }> = [];
+    let node: HTMLElement | null = dialogRef.current;
+    while (node && node !== window.document.body) {
+      const parent: HTMLElement | null = node.parentElement;
+      if (!parent) break;
+      for (const child of Array.from(parent.children)) {
+        if (child === node || !(child instanceof HTMLElement)) continue;
+        restored.push({
+          element: child,
+          inert: child.hasAttribute("inert"),
+          hidden: child.getAttribute("aria-hidden"),
+        });
+        child.setAttribute("inert", "");
+        child.setAttribute("aria-hidden", "true");
+      }
+      node = parent;
+    }
+
     return () => {
+      for (const entry of restored) {
+        if (!entry.inert) entry.element.removeAttribute("inert");
+        if (entry.hidden === null) entry.element.removeAttribute("aria-hidden");
+        else entry.element.setAttribute("aria-hidden", entry.hidden);
+      }
       returnFocusRef.current?.focus();
       returnFocusRef.current = null;
     };
   }, [open]);
 
-  // Keyboard handling: Escape closes, the find shortcut reaches search, Tab
-  // stays inside the dialog.
+  // Keyboard: Escape closes, the find shortcut reaches search, Tab is trapped.
   useEffect(() => {
     if (!open) return;
-
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -224,38 +241,46 @@ export function SourceViewer({
     target?.focus();
   }, [open, documentKey, loading]);
 
+  // Scroll the opened line into view once it exists.
+  useLayoutEffect(() => {
+    if (!open || !doc || anchor <= 1) return;
+    const target = window.document.getElementById(`source-line-${anchor}`);
+    target?.scrollIntoView({ block: "center", behavior: "auto" });
+  }, [open, doc, anchor, lines.length]);
+
   // Announce where the viewer landed, so a screen reader is not silent.
   useEffect(() => {
     if (!open || !doc) return;
-    const total = doc.lineCount;
     setAnnouncement(
       initialLine && initialLine > 0
-        ? `${doc.relativePath}, line ${initialLine} of ${total}`
-        : `${doc.relativePath}, ${total} line${total === 1 ? "" : "s"}`,
+        ? `${doc.relativePath}, line ${initialLine}, ${readProgress(doc, lines.length)}`
+        : `${doc.relativePath}, ${readProgress(doc, lines.length)}`,
     );
-  }, [open, doc, initialLine]);
+  }, [open, doc, initialLine, lines.length]);
 
   if (!open) return null;
 
   const hasError = error !== undefined && error !== null;
-  const notice = doc ? truncationNotice(doc) : null;
-  const encoding = doc ? encodingNotice(doc) : null;
+  const notice = doc ? projectionNotice(doc) : null;
   const title = doc ? doc.relativePath : "Source";
-  const remainingBelow = doc ? Math.max(0, Math.min(doc.lines.length, doc.lineCount) - visibleTo) : 0;
-  const remainingAbove = visibleFrom - 1;
+  const isBinary = doc?.content.verdict === "binary";
 
-  async function copyAll() {
-    if (!doc) return;
-    const text = doc.lines.map((line) => line.text).join("\n");
+  async function copyText(text: string, description: string) {
     try {
       await (onCopy ?? defaultCopy)(text);
       setCopyState("copied");
-      setAnnouncement(`Copied ${doc.lines.length} lines of ${doc.relativePath}`);
+      setAnnouncement(`Copied ${description}`);
     } catch {
       setCopyState("failed");
       setAnnouncement("Copy failed. Select the text and copy it manually.");
     }
   }
+
+  const loadedText = lines.map((line) => line.text).join("\n");
+  const rangeLines =
+    highlightRange === null
+      ? []
+      : lines.filter((line) => rangePosition(highlightRange, line.number) !== "outside");
 
   return (
     <div className="modal-backdrop source-viewer-backdrop" data-modal-layer="source-viewer">
@@ -270,7 +295,7 @@ export function SourceViewer({
       >
         <div className="source-viewer-header">
           <div className="source-viewer-heading">
-            <h2 id="source-viewer-title" className="source-viewer-title" title={title}>
+            <h2 id="source-viewer-title" className="source-viewer-title">
               {title}
             </h2>
             <p
@@ -278,19 +303,45 @@ export function SourceViewer({
               className="source-viewer-identity"
               data-testid="source-viewer-identity"
             >
-              {doc ? rootIdentityLabel(doc) : "Reading from the approved workspace"}
+              {doc ? rootIdentityLabel(doc) : "Waiting for an approved workspace"}
             </p>
           </div>
           <div className="source-viewer-actions">
             <button
               type="button"
               className="composer-chip quiet"
-              onClick={() => void copyAll()}
-              disabled={!doc || doc.encoding === "binary"}
-              data-testid="source-viewer-copy"
+              onClick={() => void copyText(loadedText, `${lines.length} loaded lines of ${title}`)}
+              disabled={!doc || isBinary || lines.length === 0}
+              data-testid="source-viewer-copy-loaded"
+              title={
+                doc && !doc.chunk.eof
+                  ? "Copies only the lines loaded so far, not the whole file"
+                  : "Copies the whole file"
+              }
             >
-              {copyState === "copied" ? "Copied" : copyState === "failed" ? "Copy failed" : "Copy"}
+              {copyState === "copied"
+                ? "Copied"
+                : copyState === "failed"
+                  ? "Copy failed"
+                  : doc && !doc.chunk.eof
+                    ? `Copy ${lines.length} loaded lines`
+                    : "Copy whole file"}
             </button>
+            {rangeLines.length > 0 && (
+              <button
+                type="button"
+                className="composer-chip quiet"
+                data-testid="source-viewer-copy-range"
+                onClick={() =>
+                  void copyText(
+                    rangeLines.map((line) => line.text).join("\n"),
+                    `lines ${rangeLines[0].number} to ${rangeLines[rangeLines.length - 1].number}`,
+                  )
+                }
+              >
+                Copy lines {rangeLines[0].number}–{rangeLines[rangeLines.length - 1].number}
+              </button>
+            )}
             <button
               type="button"
               className="icon-btn"
@@ -310,7 +361,7 @@ export function SourceViewer({
               ref={searchRef}
               type="text"
               value={query}
-              placeholder="Search in file"
+              placeholder="Search loaded lines"
               autoComplete="off"
               spellCheck={false}
               data-testid="source-viewer-search"
@@ -370,14 +421,41 @@ export function SourceViewer({
           </label>
         </div>
 
-        {(notice || encoding) && (
+        {rootChoice && rootChoice.candidates.length > 0 && (
+          <div className="source-viewer-choice" role="group" aria-label="Choose a workspace">
+            <p className="source-viewer-choice-prompt">
+              More than one approved workspace matched. Choose the one you mean.
+            </p>
+            <ul className="source-viewer-choice-list">
+              {rootChoice.candidates.map((candidate) => (
+                <li key={candidate.token}>
+                  <button
+                    type="button"
+                    className="composer-chip"
+                    data-testid={`source-viewer-choice-${candidate.pathDigest.slice(0, 12)}`}
+                    onClick={() => onChooseRoot?.(candidate.token)}
+                  >
+                    {candidate.kind === "isolated_worktree" ? "Isolated worktree" : "Workspace"} ·{" "}
+                    {candidate.label} · {candidate.pathDigest.slice(0, 12)}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {notice && (
           <div className="source-viewer-notice" role="status" data-testid="source-viewer-notice">
-            {[encoding, notice].filter(Boolean).join(" · ")}
+            {notice}
           </div>
         )}
 
         {hasError && (
-          <div className="run-error source-viewer-error" role="alert" data-testid="source-viewer-error">
+          <div
+            className="run-error source-viewer-error"
+            role="alert"
+            data-testid="source-viewer-error"
+          >
             <span>{sourceViewErrorSummary(error)}</span>
             {onRetry && (
               <button type="button" className="composer-chip quiet" onClick={onRetry}>
@@ -393,45 +471,37 @@ export function SourceViewer({
           </div>
         )}
 
-        {doc && doc.encoding === "binary" && (
+        {doc && isBinary && (
           <div className="panel-block source-viewer-binary" data-testid="source-viewer-binary">
             {doc.byteLen} bytes of binary content. Nothing is rendered as text.
           </div>
         )}
 
-        {doc && doc.encoding !== "binary" && (
+        {doc && !isBinary && (
           <>
-            {remainingAbove > 0 && (
-              <button
-                type="button"
-                className="composer-chip quiet source-viewer-more"
-                data-testid="source-viewer-show-earlier"
-                onClick={() => setVisibleFrom((from) => Math.max(1, from - PAGE))}
-              >
-                Show {Math.min(PAGE, remainingAbove)} earlier lines
-              </button>
-            )}
             <div
               className="source-viewer-code"
               ref={codeRef}
               tabIndex={0}
               role="group"
-              aria-label={`${doc.relativePath}, ${doc.lineCount} lines, read only`}
+              aria-label={`${doc.relativePath}, ${lines.length} lines loaded, read only`}
               data-testid="source-viewer-code"
             >
-              {/* `role="list"` is restated because the stylesheet removes
-                  list markers, which drops list semantics in some browsers. */}
+              {/* `role="list"` is restated because the stylesheet removes list
+                  markers, which drops list semantics in some browsers. */}
               <ol className="source-viewer-lines" role="list">
-                {visibleLines.map((line, index) => {
+                {lines.map((line, index) => {
                   const lineMatches = matchesByLine.get(line.number) ?? [];
                   const isActive = activeMatch?.line === line.number;
+                  const position = rangePosition(highlightRange, line.number);
                   return (
                     <li
                       key={line.number}
                       value={line.number}
                       id={`source-line-${line.number}`}
-                      className={`source-viewer-line${isActive ? " is-active-match" : ""}`}
+                      className={`source-viewer-line${isActive ? " is-active-match" : ""} range-${position}`}
                       data-line={line.number}
+                      data-range={position}
                       data-testid={`source-line-${line.number}`}
                     >
                       <span className="source-viewer-line-number" aria-hidden="true">
@@ -442,9 +512,12 @@ export function SourceViewer({
                             the hit is unmissable; syntax colour returns as
                             soon as the search is cleared. */}
                         {lineMatches.length > 0
-                          ? segmentLine(line.text, lineMatches).map((segment, part) =>
+                          ? segmentLine(line.text, lineMatches, activeMatch).map((segment, part) =>
                               segment.matched ? (
-                                <mark key={part} className="source-viewer-match">
+                                <mark
+                                  key={part}
+                                  className={`source-viewer-match${segment.active ? " is-active" : ""}`}
+                                >
                                   {segment.text}
                                 </mark>
                               ) : (
@@ -467,20 +540,31 @@ export function SourceViewer({
                 })}
               </ol>
             </div>
-            {remainingBelow > 0 && (
-              <button
-                type="button"
-                className="composer-chip quiet source-viewer-more"
-                data-testid="source-viewer-show-more"
-                onClick={() => setVisibleTo((to) => to + PAGE)}
-              >
-                Show {Math.min(PAGE, remainingBelow)} more lines
-              </button>
-            )}
+            <div className="source-viewer-footer">
+              <span className="source-viewer-progress" data-testid="source-viewer-progress">
+                {readProgress(doc, lines.length)}
+              </span>
+              {hasMore && (
+                <button
+                  type="button"
+                  className="composer-chip quiet source-viewer-more"
+                  data-testid="source-viewer-load-more"
+                  onClick={onLoadMore}
+                  disabled={loadingMore}
+                >
+                  {loadingMore ? "Loading…" : "Load more lines"}
+                </button>
+              )}
+            </div>
           </>
         )}
 
-        <p className="sr-only" role="status" aria-live="polite" data-testid="source-viewer-live">
+        <p
+          className="sr-only"
+          role="status"
+          aria-live="polite"
+          data-testid="source-viewer-live"
+        >
           {announcement}
         </p>
       </div>

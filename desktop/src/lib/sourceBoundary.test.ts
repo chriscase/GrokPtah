@@ -14,6 +14,7 @@ import * as uiCore from "./uiCore";
 /** Modules that must stay browser-safe. */
 const BROWSER_SAFE = [
   "sourceView.ts",
+  "sourceViewTransport.ts",
   "sourceLocator.ts",
   "sourceDiff.ts",
   "sourceHighlight.ts",
@@ -49,22 +50,38 @@ describe("source viewer browser boundary", () => {
   it("publishes the read-only inspection surface from the public core", () => {
     for (const name of [
       "parseSourceDocument",
-      "parseSourceRoots",
-      "pickSourceRoot",
+      "parseSourceRootSnapshot",
+      "parseSourceReadCursor",
+      "selectSourceRoot",
+      "appendSourceChunk",
       "sourceViewErrorSummary",
-      "truncationNotice",
+      "isAuthorizationRefusal",
+      "projectionNotice",
       "rootIdentityLabel",
       "parseSourceLocator",
       "findSourceLocatorSpans",
       "stripDiffPathPrefix",
       "parseUnifiedDiff",
+      "readDiffEvidence",
       "firstChangedLine",
       "highlightLine",
       "highlightLines",
       "searchLines",
       "segmentLine",
+      "rangePosition",
+      "validateSourceReadRequest",
+      "sourceReadPayload",
+      "assertTransportComplete",
+      "SOURCE_VIEW_OPERATIONS",
+      "SOURCE_VIEW_CONTRACT",
     ]) {
       expect(name in uiCore, `${name} must be exported from the public UI core`).toBe(true);
+    }
+  });
+
+  it("publishes no credential, path, or native surface", () => {
+    for (const name of Object.keys(uiCore)) {
+      expect(name).not.toMatch(/apiKey|token(Secret|Key)|absolutePath|invoke/i);
     }
   });
 
@@ -75,8 +92,39 @@ describe("source viewer browser boundary", () => {
       resolve(process.cwd(), "../crates/common/xai-source-view/src/error.rs"),
       "utf8",
     );
-    const codes = Array.from(rust.matchAll(/=> "([a-z_]+)",/g)).map((match) => match[1]);
-    expect(codes.length).toBeGreaterThan(10);
+    // Read the published list, not the match arms: `io_kind_label` also
+    // returns snake_case strings and would otherwise be counted as codes.
+    const published = rust.slice(rust.indexOf("pub const CODES")).split("];")[0];
+    const codes = Array.from(published.matchAll(/"([a-z_]+)"/g)).map((match) => match[1]);
+    expect(codes.length).toBeGreaterThan(20);
     expect([...uiCore.SOURCE_VIEW_ERROR_CODES].sort()).toEqual([...codes].sort());
+  });
+
+  it("keeps the reassembly rule identical on both sides of the boundary", () => {
+    // The Rust `LineAssembler` and `appendSourceChunk` implement one rule; a
+    // divergence would show as text duplicated or dropped at a chunk seam.
+    const rust = readFileSync(
+      resolve(process.cwd(), "../crates/common/xai-source-view/src/read.rs"),
+      "utf8",
+    );
+    expect(rust).toContain("continues_previous");
+    expect(rust).toContain("tail.number == head.number");
+    const typescript = read("sourceView.ts");
+    expect(typescript).toContain("chunk.continuesPrevious");
+    expect(typescript).toContain("tail.number === head.number");
+  });
+
+  it("pins the contract identifiers on both sides", () => {
+    const rust = readFileSync(
+      resolve(process.cwd(), "../crates/common/xai-source-view/src/lib.rs"),
+      "utf8",
+    );
+    expect(rust).toContain(`"${uiCore.SOURCE_VIEW_CONTRACT}"`);
+    const snapshot = readFileSync(
+      resolve(process.cwd(), "../crates/common/xai-source-view/src/snapshot.rs"),
+      "utf8",
+    );
+    expect(snapshot).toContain(`"${uiCore.SOURCE_VIEW_REPLAY_POLICY}"`);
+    expect(snapshot).toContain(`"${uiCore.SOURCE_VIEW_TOKEN_VERSION}"`);
   });
 });

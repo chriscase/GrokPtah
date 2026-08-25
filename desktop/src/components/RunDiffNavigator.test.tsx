@@ -29,6 +29,7 @@ describe("RunDiffNavigator", () => {
   it("says when the diff was capped rather than implying it is whole", () => {
     render(<RunDiffNavigator runId="run-1" diff={TWO_FILES} truncated />);
     expect(screen.getByTestId("run-diff-summary")).toHaveTextContent("diff truncated");
+    expect(screen.getByTestId("run-diff-incomplete")).toHaveTextContent(/capped the diff/);
   });
 
   it("shows one file at a time with its position in the review", () => {
@@ -129,11 +130,87 @@ describe("RunDiffNavigator", () => {
     expect(screen.getByTestId("run-diff-empty")).toHaveTextContent("No changes");
   });
 
-  it("says so when a non-empty diff yields no files", () => {
-    render(<RunDiffNavigator runId="run-1" diff="something that is not a diff" />);
-    expect(screen.getByTestId("run-diff-empty")).toHaveTextContent(
-      "No per-file changes could be read",
+  // --- authoritative fallback -------------------------------------------
+
+  it("falls back to the raw authoritative diff when nothing parses", () => {
+    const raw = "this is not a diff at all\nbut it is what the boundary returned\n";
+    render(<RunDiffNavigator runId="run-1" diff={raw} />);
+    expect(screen.getByTestId("run-diff-incomplete")).toHaveTextContent(
+      /no file could be read from the diff/,
     );
+    expect(screen.getByTestId("run-diff-raw")).toHaveTextContent("but it is what the boundary");
+    expect(screen.queryByTestId("run-diff-file-select")).not.toBeInTheDocument();
+  });
+
+  it("shows both the per-file view and the raw diff when a diff is truncated", () => {
+    render(<RunDiffNavigator runId="run-1" diff={TWO_FILES} truncated />);
+    expect(screen.getByTestId("run-diff-raw")).toBeInTheDocument();
+    expect(screen.getByTestId("run-diff-file-select")).toBeInTheDocument();
+  });
+
+  it("hides the raw diff when the evidence is complete", () => {
+    render(<RunDiffNavigator runId="run-1" diff={TWO_FILES} />);
+    expect(screen.queryByTestId("run-diff-raw")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("run-diff-incomplete")).not.toBeInTheDocument();
+  });
+
+  // --- evidence acknowledgement -----------------------------------------
+
+  it("lets a reviewer acknowledge complete evidence and reports it upward", () => {
+    const onEvidenceAcknowledged = vi.fn();
+    render(
+      <RunDiffNavigator
+        runId="run-1"
+        diff={TWO_FILES}
+        onEvidenceAcknowledged={onEvidenceAcknowledged}
+      />,
+    );
+    const box = screen.getByTestId("run-diff-acknowledge");
+    expect(box).not.toBeDisabled();
+    expect(onEvidenceAcknowledged).toHaveBeenLastCalledWith("run-1", false);
+
+    fireEvent.click(box);
+    expect(onEvidenceAcknowledged).toHaveBeenLastCalledWith("run-1", true);
+  });
+
+  it("withholds acknowledgement entirely while the evidence is incomplete", () => {
+    const onEvidenceAcknowledged = vi.fn();
+    render(
+      <RunDiffNavigator
+        runId="run-1"
+        diff={TWO_FILES}
+        truncated
+        onEvidenceAcknowledged={onEvidenceAcknowledged}
+      />,
+    );
+    const box = screen.getByTestId("run-diff-acknowledge");
+    expect(box).toBeDisabled();
+    expect(screen.getByText(/Acknowledgement is unavailable/)).toBeInTheDocument();
+    fireEvent.click(box);
+    expect(onEvidenceAcknowledged).not.toHaveBeenCalledWith("run-1", true);
+  });
+
+  it("clears an acknowledgement when a fresh review arrives", () => {
+    const onEvidenceAcknowledged = vi.fn();
+    const { rerender } = render(
+      <RunDiffNavigator
+        runId="run-1"
+        diff={TWO_FILES}
+        onEvidenceAcknowledged={onEvidenceAcknowledged}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("run-diff-acknowledge"));
+    expect(onEvidenceAcknowledged).toHaveBeenLastCalledWith("run-1", true);
+
+    rerender(
+      <RunDiffNavigator
+        runId="run-1"
+        diff={`${TWO_FILES}\n`}
+        onEvidenceAcknowledged={onEvidenceAcknowledged}
+      />,
+    );
+    expect(screen.getByTestId("run-diff-acknowledge")).not.toBeChecked();
+    expect(onEvidenceAcknowledged).toHaveBeenLastCalledWith("run-1", false);
   });
 
   it("resets to the first file when a fresh review arrives", () => {

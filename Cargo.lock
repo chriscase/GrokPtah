@@ -14270,8 +14270,12 @@ dependencies = [
 name = "xai-source-view"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "dunce",
+ "jsonschema",
+ "rustix 1.1.4",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 

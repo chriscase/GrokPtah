@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Default GrokPtah capabilities","local":true,"windows":["main"],"permissions":["core:default","dialog:default","shell:allow-open"]}}
+{"default":{"identifier":"default","description":"Default GrokPtah capabilities. Bound to the trusted `main` window and to local:// contexts only, with no remote origin permitted to invoke anything. Commands added to the handler are reachable only from that window.","remote":{"urls":[]},"local":true,"windows":["main"],"permissions":["core:default","dialog:default","shell:allow-open"]}}

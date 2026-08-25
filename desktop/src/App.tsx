@@ -3571,7 +3571,10 @@ export default function App() {
               onWatchingChange={setRunsWatching}
               onRefresh={() => void refreshRuns()}
               onOpenSource={(runId, path, line) =>
-                sourceViewer.openSource(path, line, { runId })
+                // The run's own isolated worktree, named explicitly. There is
+                // no fall back to the shared workspace: a different tree is a
+                // different review.
+                sourceViewer.openSource(path, line, { by: "run", runId })
               }
               onReview={(runId) => {
                 if (!activeSessionId) return Promise.reject(new Error("No active session"));
@@ -3919,8 +3922,14 @@ export default function App() {
       <SourceViewer
         open={sourceViewer.open}
         document={sourceViewer.document}
+        lines={sourceViewer.lines}
         error={sourceViewer.error}
         loading={sourceViewer.loading}
+        loadingMore={sourceViewer.loadingMore}
+        hasMore={sourceViewer.hasMore}
+        rootChoice={sourceViewer.choice}
+        onChooseRoot={sourceViewer.chooseRoot}
+        onLoadMore={sourceViewer.loadMore}
         initialLine={sourceViewer.request?.line ?? null}
         onClose={sourceViewer.close}
         onRetry={sourceViewer.retry}

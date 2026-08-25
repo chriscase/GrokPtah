@@ -44,4 +44,5 @@ export * from "./sourceHighlight";
 export * from "./sourceLocator";
 export * from "./sourceSearch";
 export * from "./sourceView";
+export * from "./sourceViewTransport";
 export * from "./streamApply";

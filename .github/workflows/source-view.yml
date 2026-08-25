@@ -1,0 +1,131 @@
+name: Source View
+
+# The read-only source viewer spans a Rust crate, a JSON Schema, and a
+# TypeScript parser that must agree exactly. The desktop workflow's path
+# filters do not cover the crate or the schema, so a contract change there
+# would otherwise merge untested.
+
+on:
+  push:
+    branches:
+      - main
+    paths: &source-view-paths
+      - "crates/common/xai-source-view/**"
+      - "docs/schemas/grokptah-source-view.v1.*"
+      - "desktop/src/lib/source*"
+      - "desktop/src/components/SourceViewer*"
+      - "desktop/src/components/RunDiffNavigator*"
+      - "desktop/src/components/LocatorText*"
+      - "desktop/src-tauri/src/source_view.rs"
+      - "desktop/src-tauri/capabilities/**"
+      - "desktop/src-tauri/tauri.conf.json"
+      - ".github/workflows/source-view.yml"
+  pull_request:
+    paths: *source-view-paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-view-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  contract:
+    name: Contract (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Containment behaviour differs by platform: the Unix build resolves
+        # every component with `openat` under `O_NOFOLLOW`, and the Windows
+        # naming rules are enforced by policy. Both are exercised, and the
+        # Windows path table is asserted on every platform.
+        os: [ubuntu-latest, macos-latest]
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      # --- Rust contract ------------------------------------------------
+
+      - name: Rust format
+        run: cargo fmt -p xai-source-view -- --check
+
+      - name: Rust lint
+        run: cargo clippy -p xai-source-view --locked --all-targets -- -D warnings
+
+      - name: Rust tests
+        # Containment, tokens, replay, races, bounded reads, and the golden
+        # fixtures are all in this crate's suite.
+        run: cargo test -p xai-source-view --locked --all-targets
+
+      # --- Cross-language contract --------------------------------------
+
+      - name: Install frontend deps
+        working-directory: desktop
+        run: npm ci
+
+      - name: TypeScript typecheck
+        working-directory: desktop
+        run: npm run typecheck
+
+      - name: TypeScript contract, transport, and component tests
+        working-directory: desktop
+        run: |
+          npx vitest run \
+            src/lib/sourceView.test.ts \
+            src/lib/sourceViewTransport.test.ts \
+            src/lib/sourceSchema.test.ts \
+            src/lib/sourceBoundary.test.ts \
+            src/lib/sourceSearch.test.ts \
+            src/lib/sourceDiff.test.ts \
+            src/lib/sourceLocator.test.ts \
+            src/lib/sourceHighlight.test.ts \
+            src/lib/useSourceViewer.test.ts \
+            src/components/SourceViewer.test.tsx \
+            src/components/RunDiffNavigator.test.tsx \
+            src/components/RunInspector.test.tsx \
+            src/components/LocatorText.test.tsx
+
+      - name: Public package and consumer smoke
+        # Proves the browser-safe half still builds, exports what consumers
+        # rely on, and carries no native or credential authority.
+        working-directory: desktop
+        run: npm run verify:public
+
+      # --- Desktop boundary ---------------------------------------------
+
+      - name: Desktop Tauri crate
+        # The Tauri crate needs the macOS webview toolchain; the Linux runner
+        # would need GTK and WebKit development packages, which this job does
+        # not install. The adapter's own logic lives in `xai-source-view` and
+        # is covered above on both platforms.
+        if: runner.os == 'macOS'
+        working-directory: desktop/src-tauri
+        run: |
+          # Only the module this slice owns: the crate carries pre-existing
+          # import-order drift that is not this change's to rewrite.
+          rustfmt --edition 2021 --check src/source_view.rs
+          cargo clippy --locked --all-targets
+          cargo test --locked
+
+      - name: Generated Tauri capability matches its source
+        # `tauri-build` regenerates `gen/schemas`; a capability edited without
+        # regenerating would ship a permission surface nobody reviewed.
+        if: runner.os == 'macOS'
+        run: |
+          git diff --exit-code -- desktop/src-tauri/gen/schemas/capabilities.json

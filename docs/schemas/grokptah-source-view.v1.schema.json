@@ -1,0 +1,532 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokptah:schema:source-view:v1",
+  "title": "GrokPtah Source View Contract v1",
+  "description": "Read-only source inspection. Every payload is closed (additionalProperties false) and free of absolute paths and credential material.",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/errorEnvelope"
+    },
+    {
+      "$ref": "#/$defs/rootDescriptor"
+    },
+    {
+      "$ref": "#/$defs/rootSnapshot"
+    },
+    {
+      "$ref": "#/$defs/readCursor"
+    },
+    {
+      "$ref": "#/$defs/sourceDocument"
+    }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "snapshotId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "rootToken": {
+      "type": "string",
+      "pattern": "^sv1\\.[0-9a-f]{32}\\.(0|[1-9][0-9]{0,3})\\.[0-9a-f]{32}$"
+    },
+    "epochMs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "byteCount": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "lineNumber": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "segment": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "errorCode": {
+      "type": "string",
+      "enum": [
+        "no_approved_root",
+        "snapshot_unknown",
+        "token_malformed",
+        "token_signature_invalid",
+        "token_expired",
+        "token_revoked",
+        "principal_mismatch",
+        "policy_drift",
+        "unknown_root",
+        "empty_path",
+        "nul_byte",
+        "absolute_path_outside_root",
+        "parent_escape",
+        "invalid_component",
+        "reserved_device_name",
+        "alternate_data_stream",
+        "unsupported_path_form",
+        "symlink_rejected",
+        "reparse_point_rejected",
+        "not_found",
+        "not_a_file",
+        "outside_root",
+        "root_identity_changed",
+        "document_changed",
+        "too_large",
+        "range_invalid",
+        "cursor_invalid",
+        "root_unavailable",
+        "io"
+      ]
+    },
+    "errorEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/errorCode"
+        },
+        "segment": {
+          "$ref": "#/$defs/segment"
+        },
+        "detail": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "byteLen": {
+          "$ref": "#/$defs/byteCount"
+        },
+        "maxBytes": {
+          "$ref": "#/$defs/byteCount"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "too_large"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "byteLen",
+              "maxBytes"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "io"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "detail"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "invalid_component",
+                  "reserved_device_name",
+                  "alternate_data_stream",
+                  "symlink_rejected",
+                  "reparse_point_rejected",
+                  "not_found",
+                  "not_a_file"
+                ]
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "segment"
+            ]
+          }
+        }
+      ]
+    },
+    "rootDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "token",
+        "kind",
+        "label",
+        "pathDigest",
+        "identityDigest",
+        "runId"
+      ],
+      "properties": {
+        "token": {
+          "$ref": "#/$defs/rootToken"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "workspace",
+            "isolated_worktree"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "pathDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "identityDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "runId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "rootSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "snapshotId",
+        "revision",
+        "issuedAtMs",
+        "expiresAtMs",
+        "principalFingerprint",
+        "policyFingerprint",
+        "replayPolicy",
+        "roots"
+      ],
+      "properties": {
+        "snapshotId": {
+          "$ref": "#/$defs/snapshotId"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "issuedAtMs": {
+          "$ref": "#/$defs/epochMs"
+        },
+        "expiresAtMs": {
+          "$ref": "#/$defs/epochMs"
+        },
+        "principalFingerprint": {
+          "$ref": "#/$defs/digest"
+        },
+        "policyFingerprint": {
+          "$ref": "#/$defs/digest"
+        },
+        "replayPolicy": {
+          "const": "idempotent-within-validity"
+        },
+        "roots": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/rootDescriptor"
+          }
+        }
+      }
+    },
+    "readCursor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "byteOffset",
+        "nextLineNumber",
+        "carryHex",
+        "continuesLine",
+        "documentDigest"
+      ],
+      "properties": {
+        "byteOffset": {
+          "$ref": "#/$defs/byteCount"
+        },
+        "nextLineNumber": {
+          "$ref": "#/$defs/lineNumber"
+        },
+        "carryHex": {
+          "type": "string",
+          "pattern": "^([0-9a-f]{2}){0,3}$"
+        },
+        "documentDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "continuesLine": {
+          "type": "boolean"
+        }
+      }
+    },
+    "contentClass": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verdict",
+        "scannedBytes",
+        "completeScan"
+      ],
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "text",
+            "text_lossy",
+            "binary"
+          ]
+        },
+        "scannedBytes": {
+          "$ref": "#/$defs/byteCount"
+        },
+        "completeScan": {
+          "type": "boolean"
+        }
+      }
+    },
+    "documentIdentity": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "digest"
+          ],
+          "properties": {
+            "kind": {
+              "const": "content"
+            },
+            "digest": {
+              "$ref": "#/$defs/digest"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "digest",
+            "stability"
+          ],
+          "properties": {
+            "kind": {
+              "const": "pinned"
+            },
+            "digest": {
+              "$ref": "#/$defs/digest"
+            },
+            "stability": {
+              "type": "string",
+              "enum": [
+                "exact",
+                "heuristic"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "effectiveLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maxBytes",
+        "maxLines",
+        "maxLineChars"
+      ],
+      "properties": {
+        "maxBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4194304
+        },
+        "maxLines": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5000
+        },
+        "maxLineChars": {
+          "type": "integer",
+          "minimum": 16,
+          "maximum": 10000
+        }
+      }
+    },
+    "sourceLine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "number",
+        "text",
+        "truncated"
+      ],
+      "properties": {
+        "number": {
+          "$ref": "#/$defs/lineNumber"
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 10000
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "sourceChunk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lines",
+        "startByte",
+        "bytesConsumed",
+        "lossyReplacements",
+        "eol",
+        "continuesPrevious",
+        "continuesNext",
+        "nextCursor",
+        "eof"
+      ],
+      "properties": {
+        "lines": {
+          "type": "array",
+          "maxItems": 5000,
+          "items": {
+            "$ref": "#/$defs/sourceLine"
+          }
+        },
+        "startByte": {
+          "$ref": "#/$defs/byteCount"
+        },
+        "bytesConsumed": {
+          "$ref": "#/$defs/byteCount"
+        },
+        "lossyReplacements": {
+          "$ref": "#/$defs/byteCount"
+        },
+        "eol": {
+          "type": "string",
+          "enum": [
+            "none",
+            "lf",
+            "crlf",
+            "mixed"
+          ]
+        },
+        "nextCursor": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/readCursor"
+            }
+          ]
+        },
+        "eof": {
+          "type": "boolean"
+        },
+        "continuesPrevious": {
+          "type": "boolean"
+        },
+        "continuesNext": {
+          "type": "boolean"
+        }
+      }
+    },
+    "sourceDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "root",
+        "snapshotId",
+        "revision",
+        "relativePath",
+        "language",
+        "byteLen",
+        "content",
+        "identity",
+        "limits",
+        "chunk"
+      ],
+      "properties": {
+        "contract": {
+          "const": "grokptah.source-view.v1"
+        },
+        "root": {
+          "$ref": "#/$defs/rootDescriptor"
+        },
+        "snapshotId": {
+          "$ref": "#/$defs/snapshotId"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "relativePath": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "language": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "byteLen": {
+          "$ref": "#/$defs/byteCount"
+        },
+        "content": {
+          "$ref": "#/$defs/contentClass"
+        },
+        "identity": {
+          "$ref": "#/$defs/documentIdentity"
+        },
+        "limits": {
+          "$ref": "#/$defs/effectiveLimits"
+        },
+        "chunk": {
+          "$ref": "#/$defs/sourceChunk"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,902 @@
+{
+  "contract": "grokptah.source-view.v1",
+  "note": "Golden wire forms shared by the Rust crate, the TypeScript parser, and the JSON Schema. Regenerate only with a deliberate contract change.",
+  "errors": [
+    {
+      "code": "no_approved_root"
+    },
+    {
+      "code": "snapshot_unknown"
+    },
+    {
+      "code": "token_malformed"
+    },
+    {
+      "code": "token_signature_invalid"
+    },
+    {
+      "code": "token_expired"
+    },
+    {
+      "code": "token_revoked"
+    },
+    {
+      "code": "principal_mismatch"
+    },
+    {
+      "code": "policy_drift"
+    },
+    {
+      "code": "unknown_root"
+    },
+    {
+      "code": "empty_path"
+    },
+    {
+      "code": "nul_byte"
+    },
+    {
+      "code": "absolute_path_outside_root"
+    },
+    {
+      "code": "parent_escape"
+    },
+    {
+      "code": "invalid_component",
+      "segment": "we*rd"
+    },
+    {
+      "code": "reserved_device_name",
+      "segment": "NUL"
+    },
+    {
+      "code": "alternate_data_stream",
+      "segment": "notes.txt:hidden"
+    },
+    {
+      "code": "unsupported_path_form"
+    },
+    {
+      "code": "symlink_rejected",
+      "segment": "src/link"
+    },
+    {
+      "code": "reparse_point_rejected",
+      "segment": "src/junction"
+    },
+    {
+      "code": "not_found",
+      "segment": "src/absent.rs"
+    },
+    {
+      "code": "not_a_file",
+      "segment": "src"
+    },
+    {
+      "code": "outside_root"
+    },
+    {
+      "code": "root_identity_changed"
+    },
+    {
+      "code": "document_changed"
+    },
+    {
+      "code": "too_large",
+      "byteLen": 99,
+      "maxBytes": 64
+    },
+    {
+      "code": "range_invalid"
+    },
+    {
+      "code": "cursor_invalid"
+    },
+    {
+      "code": "root_unavailable"
+    },
+    {
+      "code": "io",
+      "detail": "permission_denied"
+    }
+  ],
+  "valid": {
+    "rootDescriptor": [
+      {
+        "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+        "kind": "workspace",
+        "label": "repo/project",
+        "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+        "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        "runId": null
+      },
+      {
+        "token": "sv1.0123456789abcdef0123456789abcdef.1.ffeeddccbbaa99887766554433221100",
+        "kind": "isolated_worktree",
+        "label": "runs/run-7",
+        "pathDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        "identityDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+        "runId": "run-7"
+      }
+    ],
+    "rootSnapshot": [
+      {
+        "snapshotId": "0123456789abcdef0123456789abcdef",
+        "revision": 1,
+        "issuedAtMs": 1700000000000,
+        "expiresAtMs": 1700000900000,
+        "principalFingerprint": "0000000000000000000000000000000000000000000000000000000000000001",
+        "policyFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        "replayPolicy": "idempotent-within-validity",
+        "roots": [
+          {
+            "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+            "kind": "workspace",
+            "label": "repo/project",
+            "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+            "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+            "runId": null
+          },
+          {
+            "token": "sv1.0123456789abcdef0123456789abcdef.1.ffeeddccbbaa99887766554433221100",
+            "kind": "isolated_worktree",
+            "label": "runs/run-7",
+            "pathDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+            "identityDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+            "runId": "run-7"
+          }
+        ]
+      },
+      {
+        "snapshotId": "0123456789abcdef0123456789abcdef",
+        "revision": 1,
+        "issuedAtMs": 1700000000000,
+        "expiresAtMs": 1700000900000,
+        "principalFingerprint": "0000000000000000000000000000000000000000000000000000000000000001",
+        "policyFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+        "replayPolicy": "idempotent-within-validity",
+        "roots": []
+      }
+    ],
+    "readCursor": [
+      {
+        "byteOffset": 512,
+        "nextLineNumber": 21,
+        "carryHex": "f09f8e",
+        "documentDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+        "continuesLine": false
+      },
+      {
+        "byteOffset": 512,
+        "nextLineNumber": 21,
+        "carryHex": "",
+        "documentDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+        "continuesLine": false
+      }
+    ],
+    "sourceDocument": [
+      {
+        "contract": "grokptah.source-view.v1",
+        "root": {
+          "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+          "kind": "workspace",
+          "label": "repo/project",
+          "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+          "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+          "runId": null
+        },
+        "snapshotId": "0123456789abcdef0123456789abcdef",
+        "revision": 1,
+        "relativePath": "src/main.rs",
+        "language": "rust",
+        "byteLen": 13,
+        "content": {
+          "verdict": "text",
+          "scannedBytes": 13,
+          "completeScan": true
+        },
+        "identity": {
+          "kind": "content",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000001"
+        },
+        "limits": {
+          "maxBytes": 524288,
+          "maxLines": 1200,
+          "maxLineChars": 2000
+        },
+        "chunk": {
+          "lines": [
+            {
+              "number": 1,
+              "text": "fn main() {}",
+              "truncated": false
+            }
+          ],
+          "startByte": 0,
+          "bytesConsumed": 13,
+          "lossyReplacements": 0,
+          "eol": "lf",
+          "nextCursor": null,
+          "eof": true,
+          "continuesPrevious": false,
+          "continuesNext": false
+        }
+      },
+      {
+        "contract": "grokptah.source-view.v1",
+        "root": {
+          "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+          "kind": "workspace",
+          "label": "repo/project",
+          "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+          "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+          "runId": null
+        },
+        "snapshotId": "0123456789abcdef0123456789abcdef",
+        "revision": 1,
+        "relativePath": "assets/icon.png",
+        "language": "plain",
+        "byteLen": 13,
+        "content": {
+          "verdict": "binary",
+          "scannedBytes": 2048,
+          "completeScan": true
+        },
+        "identity": {
+          "kind": "pinned",
+          "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+          "stability": "heuristic"
+        },
+        "limits": {
+          "maxBytes": 524288,
+          "maxLines": 1200,
+          "maxLineChars": 2000
+        },
+        "chunk": {
+          "lines": [],
+          "startByte": 0,
+          "bytesConsumed": 0,
+          "lossyReplacements": 0,
+          "eol": "none",
+          "nextCursor": null,
+          "eof": true,
+          "continuesPrevious": false,
+          "continuesNext": false
+        }
+      },
+      {
+        "contract": "grokptah.source-view.v1",
+        "root": {
+          "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+          "kind": "workspace",
+          "label": "repo/project",
+          "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+          "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+          "runId": null
+        },
+        "snapshotId": "0123456789abcdef0123456789abcdef",
+        "revision": 1,
+        "relativePath": "src/main.rs",
+        "language": "rust",
+        "byteLen": 13,
+        "content": {
+          "verdict": "text",
+          "scannedBytes": 13,
+          "completeScan": true
+        },
+        "identity": {
+          "kind": "content",
+          "digest": "0000000000000000000000000000000000000000000000000000000000000001"
+        },
+        "limits": {
+          "maxBytes": 524288,
+          "maxLines": 1200,
+          "maxLineChars": 2000
+        },
+        "chunk": {
+          "lines": [
+            {
+              "number": 1,
+              "text": "fn main() {}",
+              "truncated": false
+            }
+          ],
+          "startByte": 0,
+          "bytesConsumed": 13,
+          "lossyReplacements": 0,
+          "eol": "lf",
+          "nextCursor": {
+            "byteOffset": 512,
+            "nextLineNumber": 21,
+            "carryHex": "f09f8e",
+            "documentDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+            "continuesLine": true
+          },
+          "eof": false,
+          "continuesPrevious": false,
+          "continuesNext": true
+        }
+      }
+    ]
+  },
+  "invalid": {
+    "rootDescriptor": [
+      {
+        "reason": "token is not a source-view token",
+        "value": {
+          "token": "nope",
+          "kind": "workspace",
+          "label": "repo/project",
+          "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+          "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+          "runId": null
+        }
+      },
+      {
+        "reason": "token index carries a leading zero",
+        "value": {
+          "token": "sv1.0123456789abcdef0123456789abcdef.01.00112233445566778899aabbccddeeff",
+          "kind": "workspace",
+          "label": "repo/project",
+          "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+          "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+          "runId": null
+        }
+      },
+      {
+        "reason": "digest is not 32 bytes of hex",
+        "value": {
+          "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+          "kind": "workspace",
+          "label": "repo/project",
+          "pathDigest": "abc",
+          "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+          "runId": null
+        }
+      },
+      {
+        "reason": "kind is outside the closed set",
+        "value": {
+          "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+          "kind": "anywhere",
+          "label": "repo/project",
+          "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+          "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+          "runId": null
+        }
+      },
+      {
+        "reason": "an absolute path is not part of the contract",
+        "value": {
+          "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+          "kind": "workspace",
+          "label": "repo/project",
+          "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+          "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+          "runId": null,
+          "path": "/approved/repo"
+        }
+      },
+      {
+        "reason": "runId is required, even as null",
+        "value": {
+          "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+          "kind": "workspace",
+          "label": "repo/project",
+          "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+          "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+        }
+      }
+    ],
+    "rootSnapshot": [
+      {
+        "reason": "replay policy is fixed by the contract",
+        "value": {
+          "snapshotId": "0123456789abcdef0123456789abcdef",
+          "revision": 1,
+          "issuedAtMs": 1700000000000,
+          "expiresAtMs": 1700000900000,
+          "principalFingerprint": "0000000000000000000000000000000000000000000000000000000000000001",
+          "policyFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+          "replayPolicy": "anything-goes",
+          "roots": [
+            {
+              "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+              "kind": "workspace",
+              "label": "repo/project",
+              "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+              "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+              "runId": null
+            },
+            {
+              "token": "sv1.0123456789abcdef0123456789abcdef.1.ffeeddccbbaa99887766554433221100",
+              "kind": "isolated_worktree",
+              "label": "runs/run-7",
+              "pathDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+              "identityDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+              "runId": "run-7"
+            }
+          ]
+        }
+      },
+      {
+        "reason": "revision starts at one",
+        "value": {
+          "snapshotId": "0123456789abcdef0123456789abcdef",
+          "revision": 0,
+          "issuedAtMs": 1700000000000,
+          "expiresAtMs": 1700000900000,
+          "principalFingerprint": "0000000000000000000000000000000000000000000000000000000000000001",
+          "policyFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+          "replayPolicy": "idempotent-within-validity",
+          "roots": [
+            {
+              "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+              "kind": "workspace",
+              "label": "repo/project",
+              "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+              "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+              "runId": null
+            },
+            {
+              "token": "sv1.0123456789abcdef0123456789abcdef.1.ffeeddccbbaa99887766554433221100",
+              "kind": "isolated_worktree",
+              "label": "runs/run-7",
+              "pathDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+              "identityDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+              "runId": "run-7"
+            }
+          ]
+        }
+      },
+      {
+        "reason": "timestamps must be integers",
+        "value": {
+          "snapshotId": "0123456789abcdef0123456789abcdef",
+          "revision": 1,
+          "issuedAtMs": 1.5,
+          "expiresAtMs": 1700000900000,
+          "principalFingerprint": "0000000000000000000000000000000000000000000000000000000000000001",
+          "policyFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+          "replayPolicy": "idempotent-within-validity",
+          "roots": [
+            {
+              "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+              "kind": "workspace",
+              "label": "repo/project",
+              "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+              "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+              "runId": null
+            },
+            {
+              "token": "sv1.0123456789abcdef0123456789abcdef.1.ffeeddccbbaa99887766554433221100",
+              "kind": "isolated_worktree",
+              "label": "runs/run-7",
+              "pathDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+              "identityDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+              "runId": "run-7"
+            }
+          ]
+        }
+      },
+      {
+        "reason": "unknown fields are refused",
+        "value": {
+          "snapshotId": "0123456789abcdef0123456789abcdef",
+          "revision": 1,
+          "issuedAtMs": 1700000000000,
+          "expiresAtMs": 1700000900000,
+          "principalFingerprint": "0000000000000000000000000000000000000000000000000000000000000001",
+          "policyFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+          "replayPolicy": "idempotent-within-validity",
+          "roots": [
+            {
+              "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+              "kind": "workspace",
+              "label": "repo/project",
+              "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+              "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+              "runId": null
+            },
+            {
+              "token": "sv1.0123456789abcdef0123456789abcdef.1.ffeeddccbbaa99887766554433221100",
+              "kind": "isolated_worktree",
+              "label": "runs/run-7",
+              "pathDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+              "identityDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+              "runId": "run-7"
+            }
+          ],
+          "workspacePath": "/approved/repo"
+        }
+      }
+    ],
+    "readCursor": [
+      {
+        "reason": "a carry is at most three bytes",
+        "value": {
+          "byteOffset": 512,
+          "nextLineNumber": 21,
+          "carryHex": "f09f8eaf",
+          "documentDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+          "continuesLine": false
+        }
+      },
+      {
+        "reason": "a carry is lowercase hex",
+        "value": {
+          "byteOffset": 512,
+          "nextLineNumber": 21,
+          "carryHex": "F0",
+          "documentDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+          "continuesLine": false
+        }
+      },
+      {
+        "reason": "line numbers are one-based",
+        "value": {
+          "byteOffset": 512,
+          "nextLineNumber": 0,
+          "carryHex": "f09f8e",
+          "documentDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+          "continuesLine": false
+        }
+      },
+      {
+        "reason": "byte offsets are non-negative",
+        "value": {
+          "byteOffset": -1,
+          "nextLineNumber": 21,
+          "carryHex": "f09f8e",
+          "documentDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+          "continuesLine": false
+        }
+      },
+      {
+        "reason": "continuation must be stated, not inferred",
+        "value": {
+          "byteOffset": 512,
+          "nextLineNumber": 21,
+          "carryHex": "f09f8e",
+          "documentDigest": "0000000000000000000000000000000000000000000000000000000000000001"
+        }
+      }
+    ],
+    "sourceDocument": [
+      {
+        "reason": "contract id is fixed",
+        "value": {
+          "contract": "grokptah.source-view.v2",
+          "root": {
+            "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+            "kind": "workspace",
+            "label": "repo/project",
+            "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+            "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+            "runId": null
+          },
+          "snapshotId": "0123456789abcdef0123456789abcdef",
+          "revision": 1,
+          "relativePath": "src/main.rs",
+          "language": "rust",
+          "byteLen": 13,
+          "content": {
+            "verdict": "text",
+            "scannedBytes": 13,
+            "completeScan": true
+          },
+          "identity": {
+            "kind": "content",
+            "digest": "0000000000000000000000000000000000000000000000000000000000000001"
+          },
+          "limits": {
+            "maxBytes": 524288,
+            "maxLines": 1200,
+            "maxLineChars": 2000
+          },
+          "chunk": {
+            "lines": [
+              {
+                "number": 1,
+                "text": "fn main() {}",
+                "truncated": false
+              }
+            ],
+            "startByte": 0,
+            "bytesConsumed": 13,
+            "lossyReplacements": 0,
+            "eol": "lf",
+            "nextCursor": null,
+            "eof": true,
+            "continuesPrevious": false,
+            "continuesNext": false
+          }
+        }
+      },
+      {
+        "reason": "chunk limits above the ceiling are refused",
+        "value": {
+          "contract": "grokptah.source-view.v1",
+          "root": {
+            "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+            "kind": "workspace",
+            "label": "repo/project",
+            "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+            "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+            "runId": null
+          },
+          "snapshotId": "0123456789abcdef0123456789abcdef",
+          "revision": 1,
+          "relativePath": "src/main.rs",
+          "language": "rust",
+          "byteLen": 13,
+          "content": {
+            "verdict": "text",
+            "scannedBytes": 13,
+            "completeScan": true
+          },
+          "identity": {
+            "kind": "content",
+            "digest": "0000000000000000000000000000000000000000000000000000000000000001"
+          },
+          "limits": {
+            "maxBytes": 999999999,
+            "maxLines": 1200,
+            "maxLineChars": 2000
+          },
+          "chunk": {
+            "lines": [
+              {
+                "number": 1,
+                "text": "fn main() {}",
+                "truncated": false
+              }
+            ],
+            "startByte": 0,
+            "bytesConsumed": 13,
+            "lossyReplacements": 0,
+            "eol": "lf",
+            "nextCursor": null,
+            "eof": true,
+            "continuesPrevious": false,
+            "continuesNext": false
+          }
+        }
+      },
+      {
+        "reason": "line numbers are one-based",
+        "value": {
+          "contract": "grokptah.source-view.v1",
+          "root": {
+            "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+            "kind": "workspace",
+            "label": "repo/project",
+            "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+            "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+            "runId": null
+          },
+          "snapshotId": "0123456789abcdef0123456789abcdef",
+          "revision": 1,
+          "relativePath": "src/main.rs",
+          "language": "rust",
+          "byteLen": 13,
+          "content": {
+            "verdict": "text",
+            "scannedBytes": 13,
+            "completeScan": true
+          },
+          "identity": {
+            "kind": "content",
+            "digest": "0000000000000000000000000000000000000000000000000000000000000001"
+          },
+          "limits": {
+            "maxBytes": 524288,
+            "maxLines": 1200,
+            "maxLineChars": 2000
+          },
+          "chunk": {
+            "lines": [
+              {
+                "number": 0,
+                "text": "x",
+                "truncated": false
+              }
+            ],
+            "startByte": 0,
+            "bytesConsumed": 13,
+            "lossyReplacements": 0,
+            "eol": "lf",
+            "nextCursor": null,
+            "eof": true,
+            "continuesPrevious": false,
+            "continuesNext": false
+          }
+        }
+      },
+      {
+        "reason": "an absolute path is not part of the contract",
+        "value": {
+          "contract": "grokptah.source-view.v1",
+          "root": {
+            "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+            "kind": "workspace",
+            "label": "repo/project",
+            "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+            "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+            "runId": null
+          },
+          "snapshotId": "0123456789abcdef0123456789abcdef",
+          "revision": 1,
+          "relativePath": "src/main.rs",
+          "language": "rust",
+          "byteLen": 13,
+          "content": {
+            "verdict": "text",
+            "scannedBytes": 13,
+            "completeScan": true
+          },
+          "identity": {
+            "kind": "content",
+            "digest": "0000000000000000000000000000000000000000000000000000000000000001"
+          },
+          "limits": {
+            "maxBytes": 524288,
+            "maxLines": 1200,
+            "maxLineChars": 2000
+          },
+          "chunk": {
+            "lines": [
+              {
+                "number": 1,
+                "text": "fn main() {}",
+                "truncated": false
+              }
+            ],
+            "startByte": 0,
+            "bytesConsumed": 13,
+            "lossyReplacements": 0,
+            "eol": "lf",
+            "nextCursor": null,
+            "eof": true,
+            "continuesPrevious": false,
+            "continuesNext": false
+          },
+          "absolutePath": "/approved/repo/src/main.rs"
+        }
+      },
+      {
+        "reason": "identity must name its kind",
+        "value": {
+          "contract": "grokptah.source-view.v1",
+          "root": {
+            "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+            "kind": "workspace",
+            "label": "repo/project",
+            "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+            "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+            "runId": null
+          },
+          "snapshotId": "0123456789abcdef0123456789abcdef",
+          "revision": 1,
+          "relativePath": "src/main.rs",
+          "language": "rust",
+          "byteLen": 13,
+          "content": {
+            "verdict": "text",
+            "scannedBytes": 13,
+            "completeScan": true
+          },
+          "identity": {
+            "digest": "0000000000000000000000000000000000000000000000000000000000000001"
+          },
+          "limits": {
+            "maxBytes": 524288,
+            "maxLines": 1200,
+            "maxLineChars": 2000
+          },
+          "chunk": {
+            "lines": [
+              {
+                "number": 1,
+                "text": "fn main() {}",
+                "truncated": false
+              }
+            ],
+            "startByte": 0,
+            "bytesConsumed": 13,
+            "lossyReplacements": 0,
+            "eol": "lf",
+            "nextCursor": null,
+            "eof": true,
+            "continuesPrevious": false,
+            "continuesNext": false
+          }
+        }
+      },
+      {
+        "reason": "content verdict is a closed set",
+        "value": {
+          "contract": "grokptah.source-view.v1",
+          "root": {
+            "token": "sv1.0123456789abcdef0123456789abcdef.0.00112233445566778899aabbccddeeff",
+            "kind": "workspace",
+            "label": "repo/project",
+            "pathDigest": "0000000000000000000000000000000000000000000000000000000000000001",
+            "identityDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+            "runId": null
+          },
+          "snapshotId": "0123456789abcdef0123456789abcdef",
+          "revision": 1,
+          "relativePath": "src/main.rs",
+          "language": "rust",
+          "byteLen": 13,
+          "content": {
+            "verdict": "maybe",
+            "scannedBytes": 1,
+            "completeScan": true
+          },
+          "identity": {
+            "kind": "content",
+            "digest": "0000000000000000000000000000000000000000000000000000000000000001"
+          },
+          "limits": {
+            "maxBytes": 524288,
+            "maxLines": 1200,
+            "maxLineChars": 2000
+          },
+          "chunk": {
+            "lines": [
+              {
+                "number": 1,
+                "text": "fn main() {}",
+                "truncated": false
+              }
+            ],
+            "startByte": 0,
+            "bytesConsumed": 13,
+            "lossyReplacements": 0,
+            "eol": "lf",
+            "nextCursor": null,
+            "eof": true,
+            "continuesPrevious": false,
+            "continuesNext": false
+          }
+        }
+      }
+    ],
+    "errorEnvelope": [
+      {
+        "reason": "code is a closed set",
+        "value": {
+          "code": "made_up"
+        }
+      },
+      {
+        "reason": "too_large must carry its numbers",
+        "value": {
+          "code": "too_large"
+        }
+      },
+      {
+        "reason": "io must carry a bounded detail",
+        "value": {
+          "code": "io"
+        }
+      },
+      {
+        "reason": "a segment-bearing code must carry its segment",
+        "value": {
+          "code": "not_found"
+        }
+      },
+      {
+        "reason": "an absolute path is never part of a refusal",
+        "value": {
+          "code": "not_found",
+          "segment": "x",
+          "path": "/approved/repo/x"
+        }
+      }
+    ]
+  }
+}

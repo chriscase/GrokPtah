@@ -1,11 +1,17 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "identifier": "default",
-  "description": "Default GrokPtah capabilities",
-  "windows": ["main"],
+  "description": "Default GrokPtah capabilities. Bound to the trusted `main` window and to local:// contexts only, with no remote origin permitted to invoke anything. Commands added to the handler are reachable only from that window.",
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "dialog:default",
     "shell:allow-open"
-  ]
+  ],
+  "local": true,
+  "remote": {
+    "urls": []
+  }
 }

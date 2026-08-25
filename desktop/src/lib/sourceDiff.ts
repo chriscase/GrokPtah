@@ -82,14 +82,71 @@ function finalise(file: DiffFile): DiffFile {
 }
 
 /**
+ * Evidence a reviewer is being asked to promote on.
+ *
+ * The parsed per-file view is a convenience. The raw diff is the authority,
+ * and it is always carried: when parsing is incomplete for any reason the
+ * reviewer sees the bytes the boundary actually returned rather than a
+ * confident-looking summary of them.
+ */
+export interface DiffEvidence {
+  files: DiffFile[];
+  /** The authoritative text, exactly as received. */
+  raw: string;
+  /** True only when the parse accounted for every line of a whole diff. */
+  complete: boolean;
+  /** Why the evidence is incomplete, in the order a reader should hear it. */
+  reasons: string[];
+  /** Lines the parser could not attribute to any file. */
+  unrecognizedLines: number;
+}
+
+/**
+ * Read a diff into evidence, never claiming more than it can show.
+ *
+ * `truncated` comes from the review itself: a capped diff is incomplete even
+ * if every byte that arrived parsed perfectly.
+ */
+export function readDiffEvidence(diff: string, truncated: boolean): DiffEvidence {
+  const raw = typeof diff === "string" ? diff : "";
+  const { files, unrecognizedLines } = parseUnifiedDiffInternal(raw);
+  const reasons: string[] = [];
+  if (truncated) reasons.push("the run review capped the diff before it ended");
+  if (raw.trim().length > 0 && files.length === 0) {
+    reasons.push("no file could be read from the diff");
+  }
+  if (unrecognizedLines > 0) {
+    reasons.push(
+      `${unrecognizedLines} line${unrecognizedLines === 1 ? "" : "s"} could not be attributed to a file`,
+    );
+  }
+  return {
+    files,
+    raw,
+    complete: reasons.length === 0 && raw.trim().length > 0,
+    reasons,
+    unrecognizedLines,
+  };
+}
+
+/**
  * Parse a unified diff into files.
  *
  * Tolerant by design: a truncated diff (the run review caps its size) still
- * yields every complete file that preceded the cut.
+ * yields every complete file that preceded the cut. Use `readDiffEvidence`
+ * when the result will gate a decision — it reports what this dropped.
  */
 export function parseUnifiedDiff(diff: string): DiffFile[] {
-  if (typeof diff !== "string" || !diff.trim()) return [];
+  return parseUnifiedDiffInternal(typeof diff === "string" ? diff : "").files;
+}
+
+function parseUnifiedDiffInternal(diff: string): {
+  files: DiffFile[];
+  unrecognizedLines: number;
+} {
+  if (!diff.trim()) return { files: [], unrecognizedLines: 0 };
   const files: DiffFile[] = [];
+  let unrecognizedLines = 0;
   let file: DiffFile | null = null;
   let hunk: DiffHunk | null = null;
   let oldCursor = 0;
@@ -127,6 +184,7 @@ export function parseUnifiedDiff(diff: string): DiffFile[] {
       if (line.startsWith("--- ")) {
         file = blankFile();
       } else {
+        if (line.trim().length > 0) unrecognizedLines += 1;
         continue;
       }
     }
@@ -175,7 +233,18 @@ export function parseUnifiedDiff(diff: string): DiffFile[] {
       continue;
     }
 
-    if (!hunk) continue;
+    if (!hunk) {
+      // Metadata Git emits between a file header and its first hunk.
+      if (
+        line.trim().length > 0 &&
+        !/^(index |old mode |new mode |new file mode |deleted file mode |similarity index |dissimilarity index |copy from |copy to |Binary files |GIT binary patch)/.test(
+          line,
+        )
+      ) {
+        unrecognizedLines += 1;
+      }
+      continue;
+    }
     // "\ No newline at end of file" annotates the previous line, not a change.
     if (line.startsWith("\\")) continue;
 
@@ -198,11 +267,16 @@ export function parseUnifiedDiff(diff: string): DiffFile[] {
       });
       oldCursor += 1;
       newCursor += 1;
+    } else {
+      unrecognizedLines += 1;
     }
   }
 
   closeFile();
-  return files.filter((entry) => entry.path !== "");
+  return {
+    files: files.filter((entry) => entry.path !== ""),
+    unrecognizedLines,
+  };
 }
 
 /**

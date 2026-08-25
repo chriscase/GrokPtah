@@ -5,6 +5,7 @@ import {
   firstChangedLine,
   isOpenable,
   parseUnifiedDiff,
+  readDiffEvidence,
 } from "./sourceDiff";
 
 const MODIFIED = [
@@ -230,5 +231,71 @@ describe("changeSummary", () => {
   it("renders counts with a real minus sign", () => {
     const [file] = parseUnifiedDiff(MODIFIED);
     expect(changeSummary(file)).toBe("+2 −1");
+  });
+});
+
+describe("readDiffEvidence", () => {
+  it("reports complete evidence for a whole, fully parsed diff", () => {
+    const evidence = readDiffEvidence(MODIFIED, false);
+    expect(evidence.complete).toBe(true);
+    expect(evidence.reasons).toEqual([]);
+    expect(evidence.unrecognizedLines).toBe(0);
+    expect(evidence.files).toHaveLength(1);
+    expect(evidence.raw).toBe(MODIFIED);
+  });
+
+  it("is incomplete when the review capped the diff, however well it parsed", () => {
+    const evidence = readDiffEvidence(MODIFIED, true);
+    expect(evidence.complete).toBe(false);
+    expect(evidence.reasons[0]).toMatch(/capped the diff/);
+    expect(evidence.files).toHaveLength(1);
+  });
+
+  it("is incomplete and carries the raw text when nothing parses", () => {
+    const evidence = readDiffEvidence("this is not a diff at all\nsecond line\n", false);
+    expect(evidence.complete).toBe(false);
+    expect(evidence.files).toEqual([]);
+    expect(evidence.reasons).toContain("no file could be read from the diff");
+    expect(evidence.raw).toContain("this is not a diff at all");
+  });
+
+  it("counts lines it could not attribute to a file", () => {
+    const evidence = readDiffEvidence(
+      ["--- a/x.ts", "+++ b/x.ts", "@@ -1 +1 @@", "-a", "+b", "?? stray marker"].join("\n"),
+      false,
+    );
+    expect(evidence.unrecognizedLines).toBe(1);
+    expect(evidence.complete).toBe(false);
+    expect(evidence.reasons.join(" ")).toMatch(/could not be attributed/);
+  });
+
+  it("does not count ordinary Git metadata as unattributed", () => {
+    const evidence = readDiffEvidence(
+      [
+        "diff --git a/src/new.ts b/src/new.ts",
+        "new file mode 100644",
+        "index 0000000..1111111",
+        "--- /dev/null",
+        "+++ b/src/new.ts",
+        "@@ -0,0 +1 @@",
+        "+export const a = 1;",
+      ].join("\n"),
+      false,
+    );
+    expect(evidence.unrecognizedLines).toBe(0);
+    expect(evidence.complete).toBe(true);
+  });
+
+  it("treats an empty diff as incomplete evidence rather than complete emptiness", () => {
+    const evidence = readDiffEvidence("", false);
+    expect(evidence.complete).toBe(false);
+    expect(evidence.files).toEqual([]);
+  });
+
+  it("tolerates a non-string diff without throwing", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const evidence = readDiffEvidence(null as any, false);
+    expect(evidence.raw).toBe("");
+    expect(evidence.complete).toBe(false);
   });
 });

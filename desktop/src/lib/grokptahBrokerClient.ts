@@ -20,6 +20,18 @@ import {
   type ExternalWorkerRecord,
   type ExternalWorkerRunRecord,
 } from "./externalWorker";
+import type { SourceDocument, SourceRootSnapshot } from "./sourceView";
+import {
+  assertTransportComplete,
+  parseDocumentResponse,
+  parseRevokeResponse,
+  parseSnapshotResponse,
+  sourceReadPayload,
+  validateSnapshotId,
+  type SourceReadRequest,
+  type SourceSnapshotRequest,
+  type SourceViewTransport,
+} from "./sourceViewTransport";
 
 export type GrokPtahBrokerCapability = {
   id: string;
@@ -903,6 +915,61 @@ export class GrokPtahBrokerClient {
     return `/bindings/${segment(bindingId)}/runs/${segment(brokerRunId)}`;
   }
 
+  /**
+   * Issue a non-mutating source-inspection snapshot for a binding.
+   *
+   * `GET` because issuing a snapshot changes nothing durable: it reads live
+   * authorization state and returns opaque tokens. The broker, not this
+   * client, decides which roots the binding may see.
+   */
+  async sourceViewSnapshot(
+    bindingId: string,
+    sessionId?: string | null,
+  ): Promise<SourceRootSnapshot> {
+    validateOpaqueText(bindingId, "Binding id", MAX_BROKER_ID_BYTES);
+    const query = sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : "";
+    const value = await this.request<unknown>(
+      `/bindings/${segment(bindingId)}/source-view/snapshot${query}`,
+    );
+    return parseSnapshotResponse(value);
+  }
+
+  /**
+   * Read one bounded slice of one file.
+   *
+   * `POST` because the request carries a token, a path, and a continuation
+   * cursor, which do not fit a URL — and because retrieving file content is
+   * worth the broker's CSRF protection even though the read itself changes
+   * nothing.
+   */
+  async sourceViewRead(
+    bindingId: string,
+    request: SourceReadRequest,
+    idempotencyKey: string,
+  ): Promise<SourceDocument> {
+    validateOpaqueText(bindingId, "Binding id", MAX_BROKER_ID_BYTES);
+    const body = sourceReadPayload(request);
+    const value = await this.request<unknown>(
+      `/bindings/${segment(bindingId)}/source-view/read`,
+      { method: "POST", idempotencyKey, body },
+    );
+    return parseDocumentResponse(value);
+  }
+
+  /** Refuse every token derived from one snapshot. */
+  async sourceViewRevoke(
+    bindingId: string,
+    snapshotId: string,
+    idempotencyKey: string,
+  ): Promise<boolean> {
+    validateOpaqueText(bindingId, "Binding id", MAX_BROKER_ID_BYTES);
+    const value = await this.request<unknown>(
+      `/bindings/${segment(bindingId)}/source-view/revoke`,
+      { method: "POST", idempotencyKey, body: { snapshotId: validateSnapshotId(snapshotId) } },
+    );
+    return parseRevokeResponse(value);
+  }
+
   private async request<T>(
     path: string,
     options: {
@@ -1249,4 +1316,30 @@ function isRelativeRoute(route: string): boolean {
 
 function isRecord(value: unknown): value is Record<string, any> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A browser source-view transport backed by an authenticated broker binding.
+ *
+ * Parity with the desktop adapter is structural: both are built from
+ * `assertTransportComplete`, both send `sourceReadPayload`, and both parse
+ * with the shared parsers, so a contract change that breaks one breaks both.
+ *
+ * `nextIdempotencyKey` is supplied by the host because a browser has no
+ * ambient source of unique keys this module is willing to assume.
+ */
+export function createBrokerSourceViewTransport(
+  client: GrokPtahBrokerClient,
+  bindingId: string,
+  nextIdempotencyKey: () => string,
+): SourceViewTransport {
+  return assertTransportComplete({
+    channel: "broker",
+    snapshot: (request: SourceSnapshotRequest) =>
+      client.sourceViewSnapshot(bindingId, request.sessionId ?? null),
+    read: (request: SourceReadRequest) =>
+      client.sourceViewRead(bindingId, request, nextIdempotencyKey()),
+    revoke: (snapshotId: string) =>
+      client.sourceViewRevoke(bindingId, snapshotId, nextIdempotencyKey()),
+  });
 }

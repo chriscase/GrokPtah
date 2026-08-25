@@ -225,6 +225,13 @@ The web broker should initially expose only `computer.observe`. Add
 `computer.control` after packaged helper/VM evidence, lease soak, and a human
 acceptance run are green.
 
+## Read-only source inspection
+
+The source viewer's broker routes, their methods, and the reason each one is a
+`GET` or a `POST` are specified in
+[`SOURCE_VIEW.md`](./SOURCE_VIEW.md#broker-parity). They carry opaque root
+tokens and never an absolute path: the browser identifies a tree by digest.
+
 ## Error mapping
 
 The broker keeps a stable public taxonomy while retaining the GrokPtah error in

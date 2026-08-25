@@ -288,7 +288,6 @@ describe("RunInspector", () => {
     expect(screen.queryByText("Promote reviewed changes")).toBeNull();
     fireEvent.click(screen.getByText("Review diff"));
     expect(await screen.findByText(/1 changed files/)).toBeTruthy();
-    expect(screen.getByText("Promote reviewed changes")).toBeTruthy();
     // The review is now per file, so a reviewer steps through the change
     // rather than scanning one wall of diff text before promoting.
     expect(screen.getByTestId("run-diff-position")).toHaveTextContent(
@@ -296,6 +295,126 @@ describe("RunInspector", () => {
     );
     expect(screen.getByTestId("run-diff-hunks")).toHaveTextContent("fn added() {}");
     expect(screen.queryByTestId("run-diff-open")).toBeNull();
+  });
+
+  it("blocks promotion until complete evidence is acknowledged", async () => {
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    render(<RunInspector runs={[isolated]} onRefresh={vi.fn()} {...actions} />);
+
+    fireEvent.click(screen.getByText("Review diff"));
+    const promote = await screen.findByTestId(`run-promote-${isolated.runId}`);
+    expect(promote).toBeDisabled();
+    expect(promote).toHaveAttribute(
+      "title",
+      "Blocked until complete diff evidence is reviewed and acknowledged",
+    );
+  });
+
+  it("enables promotion once complete evidence is acknowledged", async () => {
+    const onPromote = vi.fn();
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    render(
+      <RunInspector runs={[isolated]} onRefresh={vi.fn()} {...actions} onPromote={onPromote} />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    fireEvent.click(await screen.findByTestId("run-diff-acknowledge"));
+
+    const promote = screen.getByTestId(`run-promote-${isolated.runId}`);
+    expect(promote).not.toBeDisabled();
+    expect(promote).toHaveAttribute(
+      "title",
+      "Apply the reviewed changes to the source workspace",
+    );
+    fireEvent.click(promote);
+    await waitFor(() => expect(onPromote).toHaveBeenCalledWith(isolated.runId));
+  });
+
+  it("keeps promotion blocked when the diff evidence is incomplete", async () => {
+    const onReview = vi.fn(async () => ({ ...review, diffTruncated: true }));
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    render(
+      <RunInspector runs={[isolated]} onRefresh={vi.fn()} {...actions} onReview={onReview} />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    expect(await screen.findByTestId("run-diff-incomplete")).toBeInTheDocument();
+    expect(screen.getByTestId("run-diff-acknowledge")).toBeDisabled();
+    expect(screen.getByTestId(`run-promote-${isolated.runId}`)).toBeDisabled();
+  });
+
+  it("a source viewer failure does not change what may be promoted", async () => {
+    // The real handler routes failures into the viewer's own state; the
+    // inspector never learns about them. What matters is that opening a file —
+    // successfully or not — leaves the review, the acknowledgement, and the
+    // promotion gate exactly as they were.
+    const onOpenSource = vi.fn();
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    render(
+      <RunInspector
+        runs={[isolated]}
+        onRefresh={vi.fn()}
+        {...actions}
+        onOpenSource={onOpenSource}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    fireEvent.click(await screen.findByTestId("run-diff-acknowledge"));
+    expect(screen.getByTestId(`run-promote-${isolated.runId}`)).not.toBeDisabled();
+
+    fireEvent.click(screen.getByTestId("run-diff-open"));
+    expect(onOpenSource).toHaveBeenCalledOnce();
+
+    // The review, the acknowledgement, and the promotion gate are untouched:
+    // a viewer failure is not a change in authorization.
+    expect(screen.getByText(/1 changed files/)).toBeTruthy();
+    expect(screen.getByTestId("run-diff-acknowledge")).toBeChecked();
+    expect(screen.getByTestId(`run-promote-${isolated.runId}`)).not.toBeDisabled();
   });
 
   it("opens a reviewed file in that run's own isolated worktree", async () => {
@@ -325,6 +444,8 @@ describe("RunInspector", () => {
     fireEvent.click(await screen.findByTestId("run-diff-open"));
 
     expect(onOpenSource).toHaveBeenCalledWith(isolated.runId, "src/lib.rs", 5);
+    // Opening a file for reading never enables promotion by itself.
+    expect(screen.getByTestId(`run-promote-${isolated.runId}`)).toBeDisabled();
   });
 
   it("shows durable MCP approval state before allowing promotion", async () => {

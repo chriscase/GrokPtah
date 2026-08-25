@@ -1,260 +1,536 @@
 import { describe, expect, it } from "vitest";
 import {
+  SOURCE_VIEW_CONTRACT,
   SOURCE_VIEW_ERROR_CODES,
+  SOURCE_VIEW_REPLAY_POLICY,
+  appendSourceChunk,
+  digestLabel,
+  isAuthorizationRefusal,
+  isSnapshotLive,
+  parseSourceChunk,
   parseSourceDocument,
-  parseSourceRoot,
-  parseSourceRoots,
+  parseSourceReadCursor,
+  parseSourceRootDescriptor,
+  parseSourceRootSnapshot,
   parseSourceViewErrorCode,
-  pickSourceRoot,
+  projectionNotice,
+  readProgress,
   rootIdentityLabel,
+  selectSourceRoot,
+  shouldRefreshSnapshot,
   sourceViewErrorSummary,
-  truncationNotice,
+  type SourceChunk,
   type SourceDocument,
+  type SourceLine,
+  type SourceRootDescriptor,
+  type SourceRootSnapshot,
 } from "./sourceView";
 
-const ROOT = {
-  id: "ws-0123456789abcdef",
-  kind: "workspace",
-  label: "repo/project",
-  path: "/approved/repo/project",
-  runId: null,
-};
+const SNAP = "0123456789abcdef0123456789abcdef";
+const DIGEST_A = `${"0".repeat(63)}1`;
+const DIGEST_B = `${"a".repeat(63)}b`;
+const DIGEST_C = `${"c".repeat(63)}d`;
+const TOKEN_0 = `sv1.${SNAP}.0.00112233445566778899aabbccddeeff`;
+const TOKEN_1 = `sv1.${SNAP}.1.ffeeddccbbaa99887766554433221100`;
 
-const DOCUMENT: Record<string, unknown> = {
-  rootId: ROOT.id,
-  rootKind: "workspace",
-  rootPath: ROOT.path,
-  rootLabel: ROOT.label,
-  runId: null,
-  relativePath: "src/main.rs",
-  absolutePath: "/approved/repo/project/src/main.rs",
-  language: "rust",
-  encoding: "utf8",
-  byteLen: 13,
-  bytesRead: 13,
-  lines: [{ number: 1, text: "fn main() {}", truncated: false }],
-  lineCount: 1,
-  truncatedBytes: false,
-  truncatedLines: false,
-  lossyReplacements: 0,
-  eol: "lf",
-  contentFingerprint: "fnv1a64:0123456789abcdef",
-};
-
-function doc(overrides: Record<string, unknown> = {}): SourceDocument {
-  return parseSourceDocument({ ...DOCUMENT, ...overrides });
+function workspaceRoot(overrides: Partial<SourceRootDescriptor> = {}): SourceRootDescriptor {
+  return {
+    token: TOKEN_0,
+    kind: "workspace",
+    label: "repo/project",
+    pathDigest: DIGEST_A,
+    identityDigest: DIGEST_B,
+    runId: null,
+    ...overrides,
+  };
 }
 
-describe("parseSourceRoot", () => {
+function worktreeRoot(overrides: Partial<SourceRootDescriptor> = {}): SourceRootDescriptor {
+  return {
+    token: TOKEN_1,
+    kind: "isolated_worktree",
+    label: "runs/run-7",
+    pathDigest: DIGEST_C,
+    identityDigest: DIGEST_A,
+    runId: "run-7",
+    ...overrides,
+  };
+}
+
+function snapshot(overrides: Partial<SourceRootSnapshot> = {}): SourceRootSnapshot {
+  return {
+    snapshotId: SNAP,
+    revision: 1,
+    issuedAtMs: 1_700_000_000_000,
+    expiresAtMs: 1_700_000_900_000,
+    principalFingerprint: DIGEST_A,
+    policyFingerprint: DIGEST_B,
+    replayPolicy: SOURCE_VIEW_REPLAY_POLICY,
+    roots: [workspaceRoot(), worktreeRoot()],
+    ...overrides,
+  };
+}
+
+function chunk(overrides: Partial<SourceChunk> = {}): SourceChunk {
+  return {
+    lines: [{ number: 1, text: "fn main() {}", truncated: false }],
+    startByte: 0,
+    bytesConsumed: 13,
+    lossyReplacements: 0,
+    eol: "lf",
+    continuesPrevious: false,
+    continuesNext: false,
+    nextCursor: null,
+    eof: true,
+    ...overrides,
+  };
+}
+
+function document(overrides: Partial<SourceDocument> = {}): SourceDocument {
+  return {
+    contract: SOURCE_VIEW_CONTRACT,
+    root: workspaceRoot(),
+    snapshotId: SNAP,
+    revision: 1,
+    relativePath: "src/main.rs",
+    language: "rust",
+    byteLen: 13,
+    content: { verdict: "text", scannedBytes: 13, completeScan: true },
+    identity: { kind: "content", digest: DIGEST_A },
+    limits: { maxBytes: 524_288, maxLines: 1_200, maxLineChars: 2_000 },
+    chunk: chunk(),
+    ...overrides,
+  };
+}
+
+describe("parseSourceRootDescriptor", () => {
   it("accepts a well-formed root", () => {
-    expect(parseSourceRoot(ROOT)).toEqual(ROOT);
+    expect(parseSourceRootDescriptor(workspaceRoot())).toEqual(workspaceRoot());
+    expect(parseSourceRootDescriptor(worktreeRoot()).runId).toBe("run-7");
   });
 
-  it("accepts an isolated worktree with its run", () => {
-    const worktree = { ...ROOT, kind: "isolated_worktree", runId: "run-9" };
-    expect(parseSourceRoot(worktree).runId).toBe("run-9");
+  it("refuses a token that is not a source-view token", () => {
+    for (const token of [
+      "nope",
+      `sv0.${SNAP}.0.00112233445566778899aabbccddeeff`,
+      `sv1.${SNAP}.01.00112233445566778899aabbccddeeff`,
+      `sv1.${SNAP}.0.tooshort`,
+      `sv1.SHORT.0.00112233445566778899aabbccddeeff`,
+    ]) {
+      expect(() => parseSourceRootDescriptor(workspaceRoot({ token }))).toThrow(/token is malformed/);
+    }
   });
 
-  it("treats a missing runId as absent rather than failing", () => {
-    const { runId: _runId, ...withoutRun } = ROOT;
-    expect(parseSourceRoot(withoutRun).runId).toBeNull();
+  it("refuses digests that are not 32 bytes of hex", () => {
+    expect(() => parseSourceRootDescriptor(workspaceRoot({ pathDigest: "abc" }))).toThrow(
+      /pathDigest is malformed/,
+    );
+    expect(() =>
+      parseSourceRootDescriptor(workspaceRoot({ identityDigest: DIGEST_B.toUpperCase() })),
+    ).toThrow(/identityDigest is malformed/);
   });
 
   it("refuses an unknown kind", () => {
-    expect(() => parseSourceRoot({ ...ROOT, kind: "anywhere" })).toThrow(/kind must be one of/);
+    expect(() => parseSourceRootDescriptor({ ...workspaceRoot(), kind: "anywhere" })).toThrow(
+      /kind must be one of/,
+    );
   });
 
-  it("refuses non-objects and missing fields", () => {
-    expect(() => parseSourceRoot(null)).toThrow(/must be an object/);
-    expect(() => parseSourceRoot([ROOT])).toThrow(/must be an object/);
-    expect(() => parseSourceRoot({ ...ROOT, path: 7 })).toThrow(/path must be a string/);
+  it("requires runId to be present, even as null", () => {
+    const { runId: _runId, ...withoutRun } = workspaceRoot();
+    expect(() => parseSourceRootDescriptor(withoutRun)).toThrow(/runId is required/);
+  });
+
+  it("refuses a payload that carries a location", () => {
+    for (const key of ["path", "absolutePath", "rootPath", "workspacePath", "cwd"]) {
+      expect(() =>
+        parseSourceRootDescriptor({ ...workspaceRoot(), [key]: "/approved/repo" }),
+      ).toThrow(new RegExp(`must not carry \`${key}\``));
+    }
+  });
+
+  it("refuses any unexpected field", () => {
+    expect(() => parseSourceRootDescriptor({ ...workspaceRoot(), extra: 1 })).toThrow(
+      /unexpected field `extra`/,
+    );
   });
 });
 
-describe("parseSourceRoots", () => {
-  it("accepts a list", () => {
-    expect(parseSourceRoots([ROOT])).toHaveLength(1);
+describe("parseSourceRootSnapshot", () => {
+  it("accepts a well-formed snapshot, including an empty one", () => {
+    expect(parseSourceRootSnapshot(snapshot()).roots).toHaveLength(2);
+    expect(parseSourceRootSnapshot(snapshot({ roots: [] })).roots).toEqual([]);
   });
 
-  it("refuses the whole list when one entry is malformed", () => {
-    expect(() => parseSourceRoots([ROOT, { ...ROOT, id: 1 }])).toThrow(/id must be a string/);
+  it("pins the replay policy", () => {
+    expect(() =>
+      parseSourceRootSnapshot({ ...snapshot(), replayPolicy: "anything-goes" }),
+    ).toThrow(/unexpected replay policy/);
   });
 
-  it("refuses a non-array", () => {
-    expect(() => parseSourceRoots({})).toThrow(/must be an array/);
+  it("refuses a repeated root token", () => {
+    expect(() =>
+      parseSourceRootSnapshot(snapshot({ roots: [workspaceRoot(), workspaceRoot()] })),
+    ).toThrow(/repeats a root token/);
+  });
+
+  it("refuses a revision below one and a non-integer timestamp", () => {
+    expect(() => parseSourceRootSnapshot(snapshot({ revision: 0 }))).toThrow(/revision/);
+    expect(() =>
+      parseSourceRootSnapshot({ ...snapshot(), issuedAtMs: 1.5 }),
+    ).toThrow(/issuedAtMs must be a safe integer/);
+  });
+});
+
+describe("parseSourceReadCursor", () => {
+  const cursor = {
+    byteOffset: 512,
+    nextLineNumber: 21,
+    carryHex: "f09f8e",
+    continuesLine: true,
+    documentDigest: DIGEST_A,
+  };
+
+  it("accepts a well-formed cursor and an empty carry", () => {
+    expect(parseSourceReadCursor(cursor)).toEqual(cursor);
+    expect(parseSourceReadCursor({ ...cursor, carryHex: "" }).carryHex).toBe("");
+  });
+
+  it("refuses a carry longer than three bytes or not lowercase hex", () => {
+    expect(() => parseSourceReadCursor({ ...cursor, carryHex: "f09f8eaf" })).toThrow(/carryHex/);
+    expect(() => parseSourceReadCursor({ ...cursor, carryHex: "F0" })).toThrow(/carryHex/);
+    expect(() => parseSourceReadCursor({ ...cursor, carryHex: "f" })).toThrow(/carryHex/);
+  });
+
+  it("refuses a zero line number and a negative offset", () => {
+    expect(() => parseSourceReadCursor({ ...cursor, nextLineNumber: 0 })).toThrow(/nextLineNumber/);
+    expect(() => parseSourceReadCursor({ ...cursor, byteOffset: -1 })).toThrow(/byteOffset/);
+  });
+
+  it("requires the continuation flag to be stated", () => {
+    const { continuesLine: _flag, ...without } = cursor;
+    expect(() => parseSourceReadCursor(without)).toThrow(/continuesLine must be a boolean/);
+  });
+});
+
+describe("parseSourceChunk", () => {
+  it("refuses non-consecutive line numbers", () => {
+    expect(() =>
+      parseSourceChunk(
+        chunk({
+          lines: [
+            { number: 1, text: "a", truncated: false },
+            { number: 3, text: "c", truncated: false },
+          ],
+        }),
+      ),
+    ).toThrow(/consecutive/);
+  });
+
+  it("refuses a finished chunk that still carries a cursor", () => {
+    expect(() =>
+      parseSourceChunk(
+        chunk({
+          eof: true,
+          nextCursor: {
+            byteOffset: 1,
+            nextLineNumber: 1,
+            carryHex: "",
+            continuesLine: false,
+            documentDigest: DIGEST_A,
+          },
+        }),
+      ),
+    ).toThrow(/must not carry a continuation cursor/);
+  });
+
+  it("refuses a continued chunk with no cursor", () => {
+    expect(() => parseSourceChunk(chunk({ continuesNext: true, eof: false }))).toThrow(
+      /must carry a continuation cursor/,
+    );
+  });
+
+  it("refuses a chunk whose cursor disagrees about continuation", () => {
+    expect(() =>
+      parseSourceChunk(
+        chunk({
+          eof: false,
+          continuesNext: true,
+          nextCursor: {
+            byteOffset: 4,
+            nextLineNumber: 1,
+            carryHex: "",
+            continuesLine: false,
+            documentDigest: DIGEST_A,
+          },
+        }),
+      ),
+    ).toThrow(/disagree about line continuation/);
   });
 });
 
 describe("parseSourceDocument", () => {
   it("accepts a well-formed document", () => {
-    expect(doc().lines[0].text).toBe("fn main() {}");
-    expect(doc().relativePath).toBe("src/main.rs");
+    expect(parseSourceDocument(document()).relativePath).toBe("src/main.rs");
   });
 
-  it("refuses an unknown encoding or line ending", () => {
-    expect(() => doc({ encoding: "utf16" })).toThrow(/encoding must be one of/);
-    expect(() => doc({ eol: "cr" })).toThrow(/eol must be one of/);
+  it("pins the contract id", () => {
+    expect(() => parseSourceDocument({ ...document(), contract: "grokptah.source-view.v2" })).toThrow(
+      /unexpected contract/,
+    );
   });
 
   it("refuses a binary document that still carries text", () => {
-    expect(() => doc({ encoding: "binary" })).toThrow(/must not carry rendered lines/);
+    expect(() =>
+      parseSourceDocument(
+        document({ content: { verdict: "binary", scannedBytes: 5, completeScan: true } }),
+      ),
+    ).toThrow(/must not carry rendered lines/);
   });
 
   it("accepts a binary document with no lines", () => {
-    const binary = doc({ encoding: "binary", lines: [], lineCount: 0 });
-    expect(binary.encoding).toBe("binary");
-    expect(binary.lines).toEqual([]);
-  });
-
-  it("refuses a zero or fractional line number", () => {
-    expect(() => doc({ lines: [{ number: 0, text: "x", truncated: false }] })).toThrow(
-      /1-based integer/,
+    const binary = parseSourceDocument(
+      document({
+        content: { verdict: "binary", scannedBytes: 5, completeScan: true },
+        chunk: chunk({ lines: [], bytesConsumed: 0, eol: "none" }),
+      }),
     );
-    expect(() => doc({ lines: [{ number: 1.5, text: "x", truncated: false }] })).toThrow(
-      /1-based integer/,
+    expect(binary.chunk.lines).toEqual([]);
+  });
+
+  it("refuses a relativePath that is not root-relative", () => {
+    for (const relativePath of ["/etc/passwd", "C:\\repo\\x.rs"]) {
+      expect(() => parseSourceDocument(document({ relativePath }))).toThrow(/root-relative/);
+    }
+  });
+
+  it("refuses limits above the published ceilings", () => {
+    expect(() =>
+      parseSourceDocument(
+        document({ limits: { maxBytes: 999_999_999, maxLines: 1_200, maxLineChars: 2_000 } }),
+      ),
+    ).toThrow(/maxBytes/);
+  });
+
+  it("refuses an identity that does not name its kind", () => {
+    expect(() =>
+      parseSourceDocument({ ...document(), identity: { digest: DIGEST_A } }),
+    ).toThrow(/kind must be one of/);
+  });
+
+  it("accepts a pinned identity with its stability", () => {
+    const pinned = parseSourceDocument(
+      document({ identity: { kind: "pinned", digest: DIGEST_A, stability: "heuristic" } }),
     );
-  });
-
-  it("refuses negative counts", () => {
-    expect(() => doc({ byteLen: -1 })).toThrow(/non-negative/);
-    expect(() => doc({ lossyReplacements: -2 })).toThrow(/non-negative/);
-  });
-
-  it("refuses a non-boolean truncation flag", () => {
-    expect(() => doc({ truncatedBytes: "yes" })).toThrow(/must be a boolean/);
-  });
-
-  it("refuses a non-array lines field", () => {
-    expect(() => doc({ lines: "text" })).toThrow(/lines must be an array/);
+    expect(pinned.identity).toEqual({ kind: "pinned", digest: DIGEST_A, stability: "heuristic" });
   });
 });
 
-describe("parseSourceViewErrorCode", () => {
+describe("selectSourceRoot", () => {
+  it("resolves a token to exactly that root", () => {
+    expect(selectSourceRoot(snapshot(), { by: "token", token: TOKEN_1 })).toEqual({
+      kind: "resolved",
+      root: worktreeRoot(),
+    });
+  });
+
+  it("resolves a run to its own worktree", () => {
+    expect(selectSourceRoot(snapshot(), { by: "run", runId: "run-7" })).toEqual({
+      kind: "resolved",
+      root: worktreeRoot(),
+    });
+  });
+
+  it("refuses rather than falling back for an unknown run", () => {
+    expect(selectSourceRoot(snapshot(), { by: "run", runId: "run-absent" })).toEqual({
+      kind: "absent",
+    });
+  });
+
+  it("never picks the first workspace when several match", () => {
+    const second = workspaceRoot({ token: TOKEN_1, pathDigest: DIGEST_C, label: "other/tree" });
+    const selection = selectSourceRoot(snapshot({ roots: [workspaceRoot(), second] }), {
+      by: "workspace",
+    });
+    expect(selection.kind).toBe("ambiguous");
+    expect(selection.kind === "ambiguous" && selection.candidates).toHaveLength(2);
+  });
+
+  it("reports absent for an empty or missing snapshot", () => {
+    expect(selectSourceRoot(snapshot({ roots: [] }), { by: "workspace" })).toEqual({
+      kind: "absent",
+    });
+    expect(selectSourceRoot(null, { by: "workspace" })).toEqual({ kind: "absent" });
+  });
+
+  it("resolves a lone worktree only through a run or token, never as the workspace", () => {
+    const only = snapshot({ roots: [worktreeRoot()] });
+    expect(selectSourceRoot(only, { by: "workspace" })).toEqual({ kind: "absent" });
+    expect(selectSourceRoot(only, { by: "run", runId: "run-7" }).kind).toBe("resolved");
+  });
+});
+
+describe("snapshot freshness", () => {
+  it("knows when a snapshot is live", () => {
+    expect(isSnapshotLive(snapshot(), 1_700_000_500_000)).toBe(true);
+    expect(isSnapshotLive(snapshot(), 1_700_000_900_000)).toBe(false);
+    expect(isSnapshotLive(null, 0)).toBe(false);
+  });
+
+  it("refreshes ahead of expiry rather than at it", () => {
+    expect(shouldRefreshSnapshot(snapshot(), 1_700_000_500_000)).toBe(false);
+    expect(shouldRefreshSnapshot(snapshot(), 1_700_000_880_000)).toBe(true);
+    expect(shouldRefreshSnapshot(null, 0)).toBe(true);
+  });
+});
+
+describe("appendSourceChunk", () => {
+  const line = (number: number, text: string): SourceLine => ({ number, text, truncated: false });
+
+  it("appends ordinary chunks", () => {
+    const first = appendSourceChunk([], chunk({ lines: [line(1, "a"), line(2, "b")] }));
+    const second = appendSourceChunk(
+      first,
+      chunk({ lines: [line(3, "c")], continuesPrevious: false }),
+    );
+    expect(second.map((entry) => entry.text)).toEqual(["a", "b", "c"]);
+  });
+
+  it("rejoins a line the previous chunk left unfinished", () => {
+    const first = appendSourceChunk([], chunk({ lines: [line(1, "abcd")] }));
+    const second = appendSourceChunk(
+      first,
+      chunk({ lines: [line(1, "efgh"), line(2, "second")], continuesPrevious: true }),
+    );
+    expect(second.map((entry) => [entry.number, entry.text])).toEqual([
+      [1, "abcdefgh"],
+      [2, "second"],
+    ]);
+  });
+
+  it("does not rejoin when the numbers disagree", () => {
+    const first = appendSourceChunk([], chunk({ lines: [line(1, "abcd")] }));
+    const second = appendSourceChunk(
+      first,
+      chunk({ lines: [line(2, "efgh")], continuesPrevious: true }),
+    );
+    expect(second).toHaveLength(2);
+  });
+
+  it("carries a truncation flag through a rejoin", () => {
+    const first = appendSourceChunk([], chunk({ lines: [{ number: 1, text: "ab", truncated: false }] }));
+    const second = appendSourceChunk(
+      first,
+      chunk({ lines: [{ number: 1, text: "cd", truncated: true }], continuesPrevious: true }),
+    );
+    expect(second[0]).toEqual({ number: 1, text: "abcd", truncated: true });
+  });
+
+  it("leaves the input untouched", () => {
+    const original = [line(1, "a")];
+    appendSourceChunk(original, chunk({ lines: [line(2, "b")] }));
+    expect(original).toEqual([line(1, "a")]);
+  });
+});
+
+describe("refusals", () => {
   it("reads the code from a boundary refusal", () => {
     expect(parseSourceViewErrorCode(new Error("parent_escape: walks above the root"))).toBe(
       "parent_escape",
     );
-    expect(parseSourceViewErrorCode("symlink_rejected: `link` is a symbolic link")).toBe(
-      "symlink_rejected",
-    );
-  });
-
-  it("returns null for anything it does not recognise", () => {
-    expect(parseSourceViewErrorCode("boom")).toBeNull();
     expect(parseSourceViewErrorCode("made_up_code: nope")).toBeNull();
     expect(parseSourceViewErrorCode(null)).toBeNull();
-    expect(parseSourceViewErrorCode(": leading colon")).toBeNull();
   });
 
-  it("covers every published code", () => {
+  it("explains every published code without leaving one generic", () => {
     for (const code of SOURCE_VIEW_ERROR_CODES) {
-      expect(parseSourceViewErrorCode(`${code}: detail`)).toBe(code);
-      expect(sourceViewErrorSummary(`${code}: detail`)).not.toBe("");
+      const summary = sourceViewErrorSummary(`${code}: detail`);
+      expect(summary).not.toBe("The file could not be opened.");
+      expect(summary.length).toBeGreaterThan(0);
+    }
+    expect(sourceViewErrorSummary("kernel panic")).toBe("The file could not be opened.");
+  });
+
+  it("classifies authorization refusals so a caller knows to re-snapshot", () => {
+    for (const code of [
+      "token_expired",
+      "token_revoked",
+      "policy_drift",
+      "principal_mismatch",
+      "snapshot_unknown",
+    ]) {
+      expect(isAuthorizationRefusal(`${code}: detail`)).toBe(true);
+    }
+    for (const code of ["parent_escape", "not_found", "range_invalid", "document_changed"]) {
+      expect(isAuthorizationRefusal(`${code}: detail`)).toBe(false);
     }
   });
 });
 
-describe("sourceViewErrorSummary", () => {
-  it("explains containment refusals without blaming the reader", () => {
-    expect(sourceViewErrorSummary("parent_escape: x")).toMatch(/outside the approved workspace/);
-    expect(sourceViewErrorSummary("symlink_rejected: x")).toMatch(/never followed/);
-    expect(sourceViewErrorSummary("too_large: x")).toMatch(/larger than/);
-  });
-
-  it("falls back to a plain sentence for an unknown failure", () => {
-    expect(sourceViewErrorSummary("kernel panic")).toBe("The file could not be opened.");
-  });
-});
-
-describe("truncationNotice", () => {
-  it("is null for a complete document", () => {
-    expect(truncationNotice(doc())).toBeNull();
-  });
-
-  it("reports byte truncation with both numbers", () => {
-    expect(truncationNotice(doc({ truncatedBytes: true, bytesRead: 100, byteLen: 900 }))).toBe(
-      "showing the first 100 of 900 bytes",
+describe("display", () => {
+  it("names the exact tree by kind, label, and digest, never by path", () => {
+    expect(rootIdentityLabel(document())).toBe(
+      `Workspace · repo/project · ${digestLabel(DIGEST_A)}`,
+    );
+    expect(rootIdentityLabel(document({ root: worktreeRoot() }))).toBe(
+      `Isolated worktree · run run-7 · runs/run-7 · ${digestLabel(DIGEST_C)}`,
     );
   });
 
-  it("reports line truncation with both numbers", () => {
-    expect(truncationNotice(doc({ truncatedLines: true, lineCount: 40 }))).toBe(
-      "showing the first 1 of 40 lines",
-    );
+  it("says nothing when a projection is complete", () => {
+    expect(projectionNotice(document())).toBeNull();
   });
 
-  it("reports lossy decoding, singular and plural", () => {
-    expect(truncationNotice(doc({ encoding: "utf8_lossy", lossyReplacements: 1 }))).toMatch(
-      /1 byte could not be decoded/,
-    );
-    expect(truncationNotice(doc({ encoding: "utf8_lossy", lossyReplacements: 3 }))).toMatch(
-      /3 bytes could not be decoded/,
-    );
+  it("reports a prefix-only classification honestly", () => {
+    expect(
+      projectionNotice(
+        document({ content: { verdict: "text", scannedBytes: 1_048_576, completeScan: false } }),
+      ),
+    ).toBe("classified from the first 1048576 bytes");
   });
 
-  it("joins several notices", () => {
-    const notice = truncationNotice(
-      doc({ truncatedBytes: true, truncatedLines: true, bytesRead: 5, byteLen: 50, lineCount: 9 }),
+  it("reports lossy decoding and pinned identity", () => {
+    const notice = projectionNotice(
+      document({
+        content: { verdict: "text_lossy", scannedBytes: 10, completeScan: true },
+        identity: { kind: "pinned", digest: DIGEST_A, stability: "heuristic" },
+        chunk: chunk({ lossyReplacements: 2 }),
+      }),
     );
-    expect(notice).toBe("showing the first 5 of 50 bytes · showing the first 1 of 9 lines");
-  });
-});
-
-describe("rootIdentityLabel", () => {
-  it("names the workspace and its exact path", () => {
-    expect(rootIdentityLabel(doc())).toBe("Workspace · /approved/repo/project");
+    expect(notice).toMatch(/not valid UTF-8/);
+    expect(notice).toMatch(/2 undecodable bytes/);
+    expect(notice).toMatch(/a replaced file may not be detected/);
   });
 
-  it("names an isolated worktree and its run", () => {
-    const worktree = doc({
-      rootKind: "isolated_worktree",
-      runId: "run-9",
-      rootPath: "/approved/repo/project/.grokptah/worktrees/runs/run-9",
+  it("reports binary content without rendering it", () => {
+    expect(
+      projectionNotice(
+        document({
+          byteLen: 2048,
+          content: { verdict: "binary", scannedBytes: 2048, completeScan: true },
+          chunk: chunk({ lines: [], bytesConsumed: 0 }),
+        }),
+      ),
+    ).toMatch(/binary content, 2048 bytes, not rendered as text/);
+  });
+
+  it("reports progress through a paged document", () => {
+    expect(readProgress(document(), 1)).toBe("1 line · complete");
+    const paged = document({
+      byteLen: 1_000,
+      chunk: chunk({
+        eof: false,
+        continuesNext: true,
+        bytesConsumed: 250,
+        nextCursor: {
+          byteOffset: 250,
+          nextLineNumber: 1,
+          carryHex: "",
+          continuesLine: true,
+          documentDigest: DIGEST_A,
+        },
+      }),
     });
-    expect(rootIdentityLabel(worktree)).toBe(
-      "Isolated worktree · run run-9 · /approved/repo/project/.grokptah/worktrees/runs/run-9",
-    );
-  });
-});
-
-describe("pickSourceRoot", () => {
-  const workspace = { ...ROOT };
-  const worktree = {
-    id: "wt-aaaaaaaaaaaaaaaa",
-    kind: "isolated_worktree" as const,
-    label: "run run-7 worktree",
-    path: "/approved/repo/project/.grokptah/worktrees/runs/run-7",
-    runId: "run-7",
-  };
-  const roots = [workspace, worktree];
-
-  it("defaults to the shared workspace", () => {
-    expect(pickSourceRoot(roots)).toBe(workspace);
-  });
-
-  it("honours an exact root id", () => {
-    expect(pickSourceRoot(roots, { rootId: worktree.id })).toBe(worktree);
-  });
-
-  it("returns null for a root id that is no longer approved", () => {
-    expect(pickSourceRoot(roots, { rootId: "ws-deadbeefdeadbeef" })).toBeNull();
-  });
-
-  it("prefers a run's own worktree when a run is named", () => {
-    expect(pickSourceRoot(roots, { runId: "run-7" })).toBe(worktree);
-  });
-
-  it("refuses rather than falling back to the workspace for an unknown run", () => {
-    expect(pickSourceRoot(roots, { runId: "run-absent" })).toBeNull();
-  });
-
-  it("falls back to the first root when none is a workspace", () => {
-    expect(pickSourceRoot([worktree])).toBe(worktree);
-  });
-
-  it("returns null when nothing is approved", () => {
-    expect(pickSourceRoot([])).toBeNull();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect(pickSourceRoot(null as any)).toBeNull();
+    expect(readProgress(paged, 40)).toBe("40 lines · 25% of 1000 bytes");
   });
 });

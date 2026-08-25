@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { RunDiffNavigator } from "./RunDiffNavigator";
 import type {
   DurableRun,
@@ -152,7 +152,24 @@ export function RunInspector({
   const [eventErrors, setEventErrors] = useState<Record<string, string>>({});
   const [retryPrompts, setRetryPrompts] = useState<Record<string, string>>({});
   const [steerPrompts, setSteerPrompts] = useState<Record<string, string>>({});
+  /**
+   * Per-run acknowledgement that the reviewer saw complete diff evidence.
+   *
+   * Promotion is gated on this in addition to review and approval. It is held
+   * here, next to the review, and is cleared whenever a fresh review arrives —
+   * never by anything the source viewer does, so a viewer failure cannot
+   * change what may be promoted.
+   */
+  const [evidenceAcknowledged, setEvidenceAcknowledged] = useState<Record<string, boolean>>({});
   const watchValue = watching ?? localWatching;
+
+  /**
+   * Stable across renders, so the diff navigator receives one identity rather
+   * than a fresh closure each time this component re-renders.
+   */
+  const acknowledgeEvidence = useCallback((runId: string, acknowledged: boolean) => {
+    setEvidenceAcknowledged((current) => ({ ...current, [runId]: acknowledged }));
+  }, []);
 
   function setWatchValue(next: boolean) {
     setLocalWatching(next);
@@ -172,6 +189,9 @@ export function RunInspector({
     try {
       const result = await onReview(runId);
       setReviews((current) => ({ ...current, [runId]: result }));
+      // A new review is new evidence; the previous acknowledgement does not
+      // carry over to it.
+      setEvidenceAcknowledged((current) => ({ ...current, [runId]: false }));
     } catch (error) {
       setActionError(String(error));
     } finally {
@@ -180,11 +200,25 @@ export function RunInspector({
   }
 
   async function promote(runId: string) {
+    // Guarded as well as disabled. Promotion is the one irreversible action
+    // here, so the gate is enforced where the work happens rather than only
+    // where the button is drawn.
+    if (!reviews[runId] || !evidenceAcknowledged[runId]) {
+      setActionError(
+        "Promotion is blocked until the complete diff evidence is reviewed and acknowledged.",
+      );
+      return;
+    }
     setReviewing(runId);
     setActionError(null);
     try {
       await onPromote(runId);
       setReviews((current) => {
+        const next = { ...current };
+        delete next[runId];
+        return next;
+      });
+      setEvidenceAcknowledged((current) => {
         const next = { ...current };
         delete next[runId];
         return next;
@@ -615,7 +649,15 @@ export function RunInspector({
                               type="button"
                               className="composer-chip on"
                               onClick={() => void promote(run.runId)}
-                              disabled={reviewing === run.runId}
+                              data-testid={`run-promote-${run.runId}`}
+                              disabled={
+                                reviewing === run.runId || !evidenceAcknowledged[run.runId]
+                              }
+                              title={
+                                evidenceAcknowledged[run.runId]
+                                  ? "Apply the reviewed changes to the source workspace"
+                                  : "Blocked until complete diff evidence is reviewed and acknowledged"
+                              }
                             >
                               Promote reviewed changes
                             </button>
@@ -642,6 +684,7 @@ export function RunInspector({
                             runId={run.runId}
                             diff={reviews[run.runId].diff}
                             truncated={reviews[run.runId].diffTruncated}
+                            onEvidenceAcknowledged={acknowledgeEvidence}
                             onOpenFile={
                               onOpenSource
                                 ? (path, line) => onOpenSource(run.runId, path, line)

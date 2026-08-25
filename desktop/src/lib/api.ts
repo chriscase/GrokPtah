@@ -33,11 +33,18 @@ import type {
   SteeringReceipt,
 } from "./promptQueue";
 import type { CapabilitySet } from "./capabilities";
+import type { SourceDocument, SourceRootSnapshot } from "./sourceView";
 import {
-  parseSourceDocument,
-  parseSourceRoots,
-  type SourceDocument,
-} from "./sourceView";
+  assertTransportComplete,
+  parseDocumentResponse,
+  parseRevokeResponse,
+  parseSnapshotResponse,
+  sourceReadPayload,
+  validateSnapshotId,
+  type SourceReadRequest,
+  type SourceSnapshotRequest,
+  type SourceViewTransport,
+} from "./sourceViewTransport";
 
 export const api = {
   agentStart: () => invoke<void>("agent_start"),
@@ -430,31 +437,35 @@ export const api = {
     invoke<AuthState>("auth_set_api_key", { apiKey, displayName }),
   authOpenLogin: () => invoke<string>("auth_open_login"),
   fileTree: () => invoke<string[]>("file_tree"),
-  /** Boundaries this session may inspect: its workspace and run worktrees. */
-  sourceViewRoots: (sessionId?: string | null) =>
-    invoke<unknown>("source_view_roots", { sessionId: sessionId ?? null }).then(parseSourceRoots),
   /**
-   * Read one file inside one approved boundary. The backend refuses anything
-   * outside it, so the frontend never needs to police the path itself.
+   * Issue a non-mutating authorization snapshot naming every inspectable
+   * boundary by opaque token. This is the only way to obtain a token, and a
+   * token is the only way to name a root.
    */
-  sourceViewOpen: (
-    rootId: string,
-    path: string,
-    options: {
-      sessionId?: string | null;
-      maxBytes?: number;
-      maxLines?: number;
-      maxLineChars?: number;
-    } = {},
-  ): Promise<SourceDocument> =>
-    invoke<unknown>("source_view_open", {
-      rootId,
-      path,
-      sessionId: options.sessionId ?? null,
-      maxBytes: options.maxBytes ?? null,
-      maxLines: options.maxLines ?? null,
-      maxLineChars: options.maxLineChars ?? null,
-    }).then(parseSourceDocument),
+  sourceViewSnapshot: (sessionId?: string | null): Promise<SourceRootSnapshot> =>
+    invoke<unknown>("source_view_snapshot", { sessionId: sessionId ?? null }).then(
+      parseSnapshotResponse,
+    ),
+  /**
+   * Read one bounded slice of one file inside one authorized boundary.
+   *
+   * `async` so a validation failure surfaces as a rejection rather than a
+   * synchronous throw: the broker adapter rejects, and parity between the two
+   * channels is part of the contract.
+   */
+  sourceViewRead: async (request: SourceReadRequest): Promise<SourceDocument> =>
+    parseDocumentResponse(await invoke<unknown>("source_view_read", sourceReadPayload(request))),
+  /** Refuse every token derived from one snapshot. */
+  sourceViewRevoke: async (snapshotId: string): Promise<boolean> =>
+    parseRevokeResponse(
+      await invoke<unknown>("source_view_revoke", {
+        snapshotId: validateSnapshotId(snapshotId),
+      }),
+    ),
+  /** Release expired snapshots and their held directory handles. */
+  sourceViewSweep: () => invoke<number>("source_view_sweep"),
+  /** How long a freshly issued snapshot stays valid. */
+  sourceViewTtlMs: () => invoke<number>("source_view_ttl_ms"),
   fuzzyOpen: (query: string) => invoke<string[]>("fuzzy_open", { query }),
   gitStatus: () => invoke<string>("git_status"),
   gitDiff: () => invoke<string>("git_diff"),
@@ -594,3 +605,16 @@ export type PtyBacklog = {
   data: string;
   upToSeq: number;
 };
+
+/**
+ * The desktop's source-view transport.
+ *
+ * Kept beside the broker adapter's shape so the two can be compared directly:
+ * same operations, same validation, same parsers, different wire.
+ */
+export const tauriSourceViewTransport: SourceViewTransport = assertTransportComplete({
+  channel: "tauri",
+  snapshot: (request: SourceSnapshotRequest) => api.sourceViewSnapshot(request.sessionId ?? null),
+  read: (request: SourceReadRequest) => api.sourceViewRead(request),
+  revoke: (snapshotId: string) => api.sourceViewRevoke(snapshotId),
+});

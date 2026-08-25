@@ -7497,3 +7497,119 @@ html[data-accent="violet"] {
     color: CanvasText;
   }
 }
+
+/* --- Source viewer: authorization choice, paging, and range highlights --- */
+
+.source-viewer-choice {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.source-viewer-choice-prompt {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.source-viewer-choice-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.source-viewer-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+}
+
+.source-viewer-progress {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+/* The opened range is marked with a left rule as well as a tint, so it stays
+   visible in forced-colors and for readers who cannot rely on hue. */
+.source-viewer-line[data-range="only"],
+.source-viewer-line[data-range="first"],
+.source-viewer-line[data-range="middle"],
+.source-viewer-line[data-range="last"] {
+  background: var(--overlay-mid);
+  box-shadow: inset 3px 0 0 0 var(--accent);
+}
+
+.source-viewer-line[data-range="first"] {
+  border-top: 1px solid var(--accent-dim);
+}
+
+.source-viewer-line[data-range="last"] {
+  border-bottom: 1px solid var(--accent-dim);
+}
+
+.source-viewer-line[data-range="only"] {
+  border-top: 1px solid var(--accent-dim);
+  border-bottom: 1px solid var(--accent-dim);
+}
+
+.source-viewer-match.is-active {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* --- Promotion evidence --- */
+
+.run-diff-incomplete {
+  display: block;
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+.run-diff-raw-text {
+  max-height: 22rem;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  white-space: pre;
+  margin: 0.3rem 0 0;
+}
+
+.run-diff-acknowledge {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  padding: 0.35rem 0;
+}
+
+.run-diff-acknowledge input {
+  margin-top: 0.2rem;
+}
+
+@media (forced-colors: active) {
+  .source-viewer-line[data-range="only"],
+  .source-viewer-line[data-range="first"],
+  .source-viewer-line[data-range="middle"],
+  .source-viewer-line[data-range="last"] {
+    background: Canvas;
+    box-shadow: inset 3px 0 0 0 CanvasText;
+  }
+
+  .source-viewer-match.is-active {
+    outline-color: Highlight;
+  }
+
+  .source-viewer-choice,
+  .run-diff-raw-text {
+    border-color: CanvasText;
+  }
+}
