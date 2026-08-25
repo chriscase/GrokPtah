@@ -26,6 +26,19 @@ cd crates/codegen/grokptah-agent-bridge
 cargo test --locked --test reliability_eval -- --test-threads=1
 ```
 
+The offline enterprise-gateway evidence contract is a supported focused check.
+It uses a loopback fake gateway and does **not** contact a company route,
+spend quota, or exercise a Cursor account:
+
+```sh
+cd crates/codegen/grokptah-agent-bridge
+cargo test --locked --lib enterprise_gateway_campaign -- --test-threads=1
+cargo test --locked --test enterprise_gateway_campaign -- --test-threads=1
+```
+
+See [ENTERPRISE_GATEWAY_CAMPAIGN.md](./ENTERPRISE_GATEWAY_CAMPAIGN.md). A
+passing fixture is not live proof and does not qualify a release.
+
 For the report-producing operator command and scenario matrix, see
 [RELIABILITY_EVALS.md](RELIABILITY_EVALS.md).
 
