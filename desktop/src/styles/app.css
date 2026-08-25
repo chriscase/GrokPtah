@@ -1696,6 +1696,13 @@ button:disabled {
   font-size: 13px;
 }
 
+.hp-query:focus-visible,
+.hp-header button:focus-visible,
+.hp-result:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .hp-body {
   min-height: 0;
   display: grid;
