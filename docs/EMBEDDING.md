@@ -66,6 +66,16 @@ mutations, rejects external recovery URLs, and enforces monotonic event
 sequence numbers. The broker remains authoritative: it must
 re-check the user, team, workspace, capability, policy, and exact run scope.
 
+For a typed War Room status/evidence surface, prefer
+`getRunProjection(bindingId, brokerRunId)` and
+`getReviewProjection(bindingId, brokerRunId)`. These opt-in methods accept only
+the redacted run state/progress envelope and bounded review receipt shape;
+unknown fields, path-like data, oversized diffs, invalid state transitions, and
+scope mismatches fail closed. The older generic `getRun<T>` and `getReview<T>`
+methods remain available for forward-compatible integrations, but they should
+not be used as authority-bearing UI data without an equivalent server-side
+parser.
+
 ## Trusted desktop adapter example
 
 The trusted path may use the direct MCP client or the typed operation facade,

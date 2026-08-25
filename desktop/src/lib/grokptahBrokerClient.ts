@@ -23,6 +23,34 @@ export type GrokPtahBrokerRun = {
   bindingId: string;
 };
 
+export type GrokPtahBrokerRunState =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted"
+  | "limit_reached";
+
+/** Redacted, browser-safe status projection for a bound run. */
+export type GrokPtahBrokerRunProjection = {
+  brokerRunId: string;
+  bindingId: string;
+  state: GrokPtahBrokerRunState;
+  promptPreview: string;
+  createdAt: string;
+  updatedAt: string;
+  progress?: {
+    round: number;
+    maxRounds: number;
+    lastTool?: string | null;
+    detail: string;
+    updatedAt: string;
+  } | null;
+  terminalResult?: string | null;
+  errorCode?: string | null;
+};
+
 export type GrokPtahBrokerRunRequest = {
   prompt: string;
   executionMode?: "shared" | "isolated_worktree";
@@ -46,10 +74,20 @@ const MAX_BROKER_CAPABILITY_ID_BYTES = 128;
 const MAX_BROKER_CHANGED_FILES = 256;
 const MAX_BROKER_FINGERPRINT_BYTES = 256;
 const MAX_BROKER_PATH_BYTES = 512;
+const MAX_BROKER_DIFF_BYTES = 1 * 1_048_576;
 const MAX_BROKER_JSON_RESPONSE_BYTES = 4 * 1_048_576;
 const MAX_BROKER_ERROR_RESPONSE_BYTES = 64 * 1_024;
 const MAX_BROKER_CSRF_BYTES = 256;
 const BROKER_CAPABILITY_ID = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9_]*)+$/;
+const BROKER_RUN_STATES: ReadonlySet<GrokPtahBrokerRunState> = new Set([
+  "queued",
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+  "limit_reached",
+]);
 
 const BROKER_AVAILABILITIES: ReadonlySet<GrokPtahBrokerCapability["availability"]> = new Set([
   "available",
@@ -81,6 +119,14 @@ export type GrokPtahBrokerApproval = {
   finalFingerprint: string;
   changedFiles: GrokPtahBrokerChangedFile[];
   expiresAt: string;
+};
+
+/** Redacted review evidence that is safe for a browser approval screen. */
+export type GrokPtahBrokerReviewProjection = {
+  changedFiles: GrokPtahBrokerChangedFile[];
+  diff: string;
+  diffTruncated: boolean;
+  fingerprint: string;
 };
 
 export type GrokPtahBrokerEvent = {
@@ -231,6 +277,115 @@ export function parseBrokerRun(value: unknown): GrokPtahBrokerRun | null {
   return { brokerRunId: record.brokerRunId, bindingId: record.bindingId };
 }
 
+function parseRunProgress(value: unknown): GrokPtahBrokerRunProjection["progress"] | null | undefined {
+  if (value === null || value === undefined) return value;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (!hasOnlyKeys(record, new Set(["round", "maxRounds", "lastTool", "detail", "updatedAt"]))) {
+    return undefined;
+  }
+  if (
+    typeof record.round !== "number" ||
+    !Number.isSafeInteger(record.round) ||
+    record.round < 0 ||
+    typeof record.maxRounds !== "number" ||
+    !Number.isSafeInteger(record.maxRounds) ||
+    record.maxRounds < 1 ||
+    record.maxRounds > MAX_BROKER_ROUNDS ||
+    record.round > record.maxRounds ||
+    !boundedString(record.detail, 2_048) ||
+    !boundedString(record.updatedAt, 128)
+  ) {
+    return undefined;
+  }
+  if (
+    record.lastTool !== undefined &&
+    record.lastTool !== null &&
+    !boundedString(record.lastTool, 256)
+  ) {
+    return undefined;
+  }
+  return {
+    round: record.round,
+    maxRounds: record.maxRounds,
+    lastTool: record.lastTool as string | null | undefined,
+    detail: record.detail,
+    updatedAt: record.updatedAt,
+  };
+}
+
+/** Parse the minimal redacted run projection exposed to browser consumers. */
+export function parseBrokerRunProjection(value: unknown): GrokPtahBrokerRunProjection | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (
+    !hasOnlyKeys(
+      record,
+      new Set([
+        "brokerRunId",
+        "bindingId",
+        "state",
+        "promptPreview",
+        "createdAt",
+        "updatedAt",
+        "progress",
+        "terminalResult",
+        "errorCode",
+      ]),
+    ) ||
+    !boundedString(record.brokerRunId, MAX_BROKER_ID_BYTES) ||
+    !boundedString(record.bindingId, MAX_BROKER_ID_BYTES) ||
+    typeof record.state !== "string" ||
+    !BROKER_RUN_STATES.has(record.state as GrokPtahBrokerRunState) ||
+    typeof record.promptPreview !== "string" ||
+    new TextEncoder().encode(record.promptPreview).byteLength > 512 ||
+    !boundedString(record.createdAt, 128) ||
+    !boundedString(record.updatedAt, 128)
+  ) {
+    return null;
+  }
+  const progress = parseRunProgress(record.progress);
+  if (record.progress !== undefined && progress === undefined) return null;
+  for (const [key, maxBytes] of [["terminalResult", 512], ["errorCode", 128]] as const) {
+    const field = record[key];
+    if (field !== undefined && field !== null && !boundedString(field, maxBytes)) return null;
+  }
+  return {
+    brokerRunId: record.brokerRunId,
+    bindingId: record.bindingId,
+    state: record.state as GrokPtahBrokerRunState,
+    promptPreview: record.promptPreview,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    ...(record.progress === undefined ? {} : { progress }),
+    ...(record.terminalResult === undefined ? {} : { terminalResult: record.terminalResult as string | null }),
+    ...(record.errorCode === undefined ? {} : { errorCode: record.errorCode as string | null }),
+  };
+}
+
+/** Parse review evidence without exposing unbounded diffs or privileged fields. */
+export function parseBrokerReviewProjection(value: unknown): GrokPtahBrokerReviewProjection | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (
+    !hasOnlyKeys(record, new Set(["changedFiles", "diff", "diffTruncated", "fingerprint"])) ||
+    typeof record.diff !== "string" ||
+    new TextEncoder().encode(record.diff).byteLength > MAX_BROKER_DIFF_BYTES ||
+    typeof record.diffTruncated !== "boolean" ||
+    !boundedString(record.fingerprint, MAX_BROKER_FINGERPRINT_BYTES)
+  ) {
+    return null;
+  }
+  const changedFiles = parseChangedFiles(record.changedFiles);
+  if (changedFiles === null) return null;
+  return {
+    changedFiles,
+    diff: record.diff,
+    diffTruncated: record.diffTruncated,
+    fingerprint: record.fingerprint,
+  };
+}
+
 export class GrokPtahBrokerError extends Error {
   readonly status: number;
   readonly code: string;
@@ -323,6 +478,26 @@ export class GrokPtahBrokerClient {
     return this.request<T>(this.runPath(bindingId, brokerRunId));
   }
 
+  /**
+   * Fetch the strict redacted run projection. Consumers that need an
+   * evidence-bearing status view should prefer this over the legacy generic
+   * `getRun<T>` method.
+   */
+  async getRunProjection(
+    bindingId: string,
+    brokerRunId: string,
+  ): Promise<GrokPtahBrokerRunProjection> {
+    const projection = await this.requestValidated(
+      this.runPath(bindingId, brokerRunId),
+      parseBrokerRunProjection,
+      {},
+    );
+    if (projection.bindingId !== bindingId || projection.brokerRunId !== brokerRunId) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "Broker run projection scope does not match the request");
+    }
+    return projection;
+  }
+
   async getProgress<T = unknown>(bindingId: string, brokerRunId: string): Promise<T> {
     return this.request<T>(`${this.runPath(bindingId, brokerRunId)}/progress`);
   }
@@ -341,6 +516,18 @@ export class GrokPtahBrokerClient {
 
   async getReview<T = unknown>(bindingId: string, brokerRunId: string): Promise<T> {
     return this.request<T>(`${this.runPath(bindingId, brokerRunId)}/review`);
+  }
+
+  /** Fetch bounded review evidence suitable for a browser approval surface. */
+  async getReviewProjection(
+    bindingId: string,
+    brokerRunId: string,
+  ): Promise<GrokPtahBrokerReviewProjection> {
+    return this.requestValidated(
+      `${this.runPath(bindingId, brokerRunId)}/review`,
+      parseBrokerReviewProjection,
+      {},
+    );
   }
 
   /**

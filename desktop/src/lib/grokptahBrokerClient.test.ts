@@ -6,6 +6,8 @@ import {
   parseBrokerApproval,
   parseBrokerBinding,
   parseBrokerRun,
+  parseBrokerReviewProjection,
+  parseBrokerRunProjection,
 } from "./grokptahBrokerClient";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -81,6 +83,60 @@ describe("GrokPtahBrokerClient", () => {
     })).toBeNull();
   });
 
+  it("parses only bounded redacted run and review projections", async () => {
+    const projection = parseBrokerRunProjection({
+      brokerRunId: "run-1",
+      bindingId: "binding-1",
+      state: "running",
+      promptPreview: "Review the staged change",
+      createdAt: "2026-08-24T00:00:00Z",
+      updatedAt: "2026-08-24T00:01:00Z",
+      progress: {
+        round: 2,
+        maxRounds: 12,
+        lastTool: "search",
+        detail: "Inspecting the diff",
+        updatedAt: "2026-08-24T00:01:00Z",
+      },
+      terminalResult: null,
+      errorCode: null,
+    });
+    expect(projection?.progress?.round).toBe(2);
+    expect(parseBrokerRunProjection({
+      brokerRunId: "run-1",
+      bindingId: "binding-1",
+      state: "running",
+      promptPreview: "Review",
+      createdAt: "now",
+      updatedAt: "now",
+      workspace: "/private/secret",
+    })).toBeNull();
+    expect(parseBrokerRunProjection({
+      brokerRunId: "run-1",
+      bindingId: "binding-1",
+      state: "running",
+      promptPreview: "Review",
+      createdAt: "now",
+      updatedAt: "now",
+      progress: { round: 25, maxRounds: 24, detail: "too far", updatedAt: "now" },
+    })).toBeNull();
+
+    const review = parseBrokerReviewProjection({
+      changedFiles: [{ path: "src/lib.ts", summary: "bounded" }],
+      diff: "@@ -1 +1 @@",
+      diffTruncated: false,
+      fingerprint: "final-1",
+    });
+    expect(review?.changedFiles[0]?.path).toBe("src/lib.ts");
+    expect(parseBrokerReviewProjection({
+      changedFiles: [],
+      diff: "diff",
+      diffTruncated: false,
+      fingerprint: "final-1",
+      workspace: "/private/secret",
+    })).toBeNull();
+  });
+
   it("rejects malformed run responses before exposing them to a consumer", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ brokerRunId: "run-1" }));
     const client = new GrokPtahBrokerClient({
@@ -102,6 +158,39 @@ describe("GrokPtahBrokerClient", () => {
       csrfToken: "csrf-1",
     });
     await expect(client.submitRun("binding-1", { prompt: "review" }, "intent-1"))
+      .rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  it("binds typed run and review projections to the requested opaque scope", async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({
+        brokerRunId: "run-1",
+        bindingId: "binding-1",
+        state: "completed",
+        promptPreview: "Review",
+        createdAt: "now",
+        updatedAt: "now",
+        progress: null,
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        changedFiles: [{ path: "src/lib.ts", summary: "bounded" }],
+        diff: "diff",
+        diffTruncated: false,
+        fingerprint: "final-1",
+      }));
+    const client = new GrokPtahBrokerClient({ baseUrl: "https://contextdesk.example", fetcher });
+    expect((await client.getRunProjection("binding-1", "run-1")).state).toBe("completed");
+    expect((await client.getReviewProjection("binding-1", "run-1")).fingerprint).toBe("final-1");
+
+    fetcher.mockResolvedValueOnce(jsonResponse({
+      brokerRunId: "other-run",
+      bindingId: "binding-1",
+      state: "running",
+      promptPreview: "Review",
+      createdAt: "now",
+      updatedAt: "now",
+    }));
+    await expect(client.getRunProjection("binding-1", "run-1"))
       .rejects.toMatchObject({ code: "invalid_response" });
   });
 

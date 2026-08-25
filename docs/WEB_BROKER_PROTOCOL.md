@@ -102,6 +102,21 @@ investigation audit context, and forwards only an allowlisted execution mode
 and bounds. It must reject empty prompts, out-of-policy workspaces, and bounds
 above the team maximum before calling GrokPtah.
 
+### Typed redacted projections
+
+The browser package exposes opt-in `getRunProjection` and
+`getReviewProjection` methods for War Room status and approval views. The run
+projection contains only the opaque broker/run ids, bounded prompt preview,
+state, timestamps, bounded progress, and non-privileged terminal/error labels.
+The review projection contains only repository-relative changed-file summaries,
+a bounded diff, its truncation flag, and a fingerprint. Neither projection
+contains a workspace path, provider credential, raw command output, clipboard,
+or native Computer Use data. Unknown fields, invalid state/progress bounds,
+oversized diffs, and binding/run mismatches are rejected before the consumer
+sees the value. Generic read helpers remain for forward-compatible callers,
+but a consumer must not treat an unparsed response as authority-bearing UI
+evidence.
+
 ## Event streaming and recovery
 
 The browser receives redacted broker events, not the raw MCP stream:

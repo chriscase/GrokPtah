@@ -21,6 +21,8 @@ try {
     `import {
   GrokPtahBrokerClient,
   parseBrokerApproval,
+  parseBrokerRunProjection,
+  parseBrokerReviewProjection,
   HELP_ARTICLES,
   HELP_ENTRIES,
   applyAssistantStreamChunk,
@@ -73,6 +75,24 @@ if (parseBrokerApproval({
   expiresAt: "2026-08-24T23:00:00Z",
 })?.approvalId !== "approval-1") {
   throw new Error("consumer broker approval parser was not usable");
+}
+if (parseBrokerRunProjection({
+  brokerRunId: "run-1",
+  bindingId: "binding-1",
+  state: "completed",
+  promptPreview: "Review",
+  createdAt: "2026-08-24T00:00:00Z",
+  updatedAt: "2026-08-24T00:01:00Z",
+})?.state !== "completed") {
+  throw new Error("consumer broker run projection parser was not usable");
+}
+if (parseBrokerReviewProjection({
+  changedFiles: [],
+  diff: "diff",
+  diffTruncated: false,
+  fingerprint: "final-1",
+})?.fingerprint !== "final-1") {
+  throw new Error("consumer broker review projection parser was not usable");
 }
 console.log("external consumer fixture passed");
 `,

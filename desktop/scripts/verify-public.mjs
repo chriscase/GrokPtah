@@ -40,6 +40,8 @@ const uiCoreApi = await import(uiCoreBundlePath.href);
 const requiredExports = [
   "GrokPtahBrokerClient",
   "parseBrokerApproval",
+  "parseBrokerRunProjection",
+  "parseBrokerReviewProjection",
   "searchHelp",
   "searchHelpArticles",
   "HELP_ARTICLES",
