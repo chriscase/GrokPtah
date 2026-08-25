@@ -478,6 +478,15 @@ impl SwarmController {
             }
 
             let lease_claim = next.new_lease_claim(&self.state);
+            if let Some(claim) = &lease_claim {
+                let dispatch = next.state.dispatch(&claim.dispatch_id).ok_or_else(|| {
+                    SwarmError::corrupt("new Computer Use dispatch has no lease payload")
+                })?;
+                let lease = dispatch.lease.as_ref().ok_or_else(|| {
+                    SwarmError::corrupt("new Computer Use dispatch has no lease payload")
+                })?;
+                self.store.verify_lease(lease, dispatch.requested_at)?;
+            }
             match self.store.compare_and_swap(
                 &self.state.spec.swarm_id,
                 self.state.revision,

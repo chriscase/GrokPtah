@@ -53,6 +53,16 @@ pub trait DurableSwarmStore: Send + Sync + std::fmt::Debug {
     /// Read the latest durable record for one swarm.
     fn load(&self, swarm_id: &SwarmId) -> SwarmResult<SwarmState>;
 
+    /// Verify the externally issued lease against the authoritative Computer
+    /// Use runtime before the state transaction commits. A production store
+    /// must perform this check against the existing ActionGrant/run contract;
+    /// structural validation alone is only suitable for offline tests.
+    fn verify_lease(
+        &self,
+        lease: &ComputerUseLeaseRef,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> SwarmResult<()>;
+
     /// Atomically persist a revision and, optionally, consume one lease.
     fn compare_and_swap(
         &self,
@@ -138,6 +148,19 @@ impl DurableSwarmStore for InMemorySwarmStore {
             .get(swarm_id)
             .cloned()
             .ok_or_else(|| SwarmError::not_found("swarm is not present in the durable store"))
+    }
+
+    fn verify_lease(
+        &self,
+        lease: &ComputerUseLeaseRef,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> SwarmResult<()> {
+        if !lease.is_usable_at(now) {
+            return Err(SwarmError::capability(
+                "Computer Use lease is not live at the durable admission instant",
+            ));
+        }
+        Ok(())
     }
 
     fn compare_and_swap(
