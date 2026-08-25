@@ -3,15 +3,15 @@
 GrokPtah is designed to be consumed by more than its own Tauri desktop. The
 stable direction is one capability-scoped contract with separate adapters for
 trusted desktop hosts and browser-facing brokers. The examples below use the
-current in-tree staging surfaces; they are not a claim that a public npm or
-crates.io package has been released yet.
+current in-tree staging surfaces or their generated package equivalents; they
+are not a claim that a public npm or crates.io package has been released yet.
 
 ## Choose the trust boundary first
 
 | Consumer | Import surface | Credential boundary | Allowed default |
 | --- | --- | --- | --- |
 | Desktop host or trusted local adapter | `desktop/src/lib/trusted.ts` | Host keeps the loopback/MCP credential | Observe, execute, review; promotion and Computer Use remain human-gated |
-| Browser or War Room UI | `desktop/src/lib/public.ts` | Cookie/session broker; no GrokPtah bearer token | Observe, review, and broker-approved bounded runs |
+| Browser or War Room UI | `@grokptah/client` (generated from `desktop/src/lib/public.ts`) | Cookie/session broker; no GrokPtah bearer token | Observe, review, and broker-approved bounded runs |
 | Rust desktop/server adapter | `crates/common/grokptah-agent-sdk` | Host adapter owns credentials and policy | Versioned DTOs, validation, replay, review, and lease contracts |
 
 Never import `trusted.ts` into a browser bundle. A browser must not connect to
@@ -23,7 +23,8 @@ paths and Computer Use details.
 The browser receives only an authenticated broker session and opaque ids:
 
 ```ts
-import { GrokPtahBrokerClient } from "./desktop/src/lib/public";
+// After `npm run verify:public`, import from the generated package root.
+import { GrokPtahBrokerClient } from "@grokptah/client";
 
 const grokptah = new GrokPtahBrokerClient({
   baseUrl: "https://contextdesk.example",
@@ -80,7 +81,7 @@ explicit session/workspace/run identity. A desktop adapter should:
 ## Headless UI primitives
 
 Products that want their own visual language can use the Tauri-free
-`desktop/src/lib/uiCore.ts` staging barrel. It exposes capability negotiation,
+`@grokptah/client/ui-core` entry (generated from `desktop/src/lib/uiCore.ts`). It exposes capability negotiation,
 the source-cited Help Center corpus (`searchHelpArticles`), prompt-queue
 reducers, and stream application helpers, but
 no React components, native APIs, credentials, or desktop state:
@@ -90,7 +91,7 @@ import {
   applyAssistantStreamChunk,
   promptQueueReducer,
   searchHelpArticles,
-} from "./desktop/src/lib/uiCore";
+} from "@grokptah/client/ui-core";
 ```
 
 The reducer inputs and stream cursors remain host-neutral. A consumer owns its
