@@ -111,6 +111,51 @@ describe("GrokPtahBrokerClient", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("validates approval TTL independently", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+
+    await expect(
+      client.approveRun(
+        "binding-1",
+        "run-1",
+        { sourceFingerprint: "source-1", finalFingerprint: "final-1", changedFiles: [], ttlMs: 0 },
+        "approve-intent-1",
+      ),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("fails closed for malformed changed-file runtime shapes", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    const base = { sourceFingerprint: "source-1", finalFingerprint: "final-1", ttlMs: 30_000 };
+
+    for (const changedFiles of [
+      null,
+      [{ path: 42, summary: "bounded" }],
+      [{ path: "src/file.ts", summary: null }],
+    ]) {
+      await expect(
+        client.approveRun(
+          "binding-1",
+          "run-1",
+          { ...base, changedFiles } as unknown as GrokPtahBrokerApprovalRequest,
+          "approve-intent-1",
+        ),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+    }
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("fails closed before approval without CSRF", async () => {
     const fetcher = vi.fn<typeof fetch>();
     const client = new GrokPtahBrokerClient({

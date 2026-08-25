@@ -171,6 +171,19 @@ Content-Type: application/json
 }
 ```
 
+The approval is consumed by a separate promote request; it must carry a new
+idempotency key and the same broker session/CSRF headers:
+
+```http
+POST /api/grokptah/v1/bindings/{bindingId}/runs/{runId}/promote
+Cookie: contextdesk_session=<ContextDesk user session>
+X-CSRF-Token: csrf-01J...
+Idempotency-Key: promote-01J...
+Content-Type: application/json
+
+{"approvalId":"approval-01J..."}
+```
+
 The browser-facing client may carry these two routes as typed calls, but the
 client is not the authority: the broker must recompute or verify the review
 receipt, bind the approval to the same opaque run and fingerprints, enforce a
