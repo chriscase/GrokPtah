@@ -179,7 +179,9 @@ fn terminate_process(pid: libc::pid_t) -> bool {
 /// private channels. It is deliberately not wired into capability admission:
 /// callers must still provide a reviewed package manifest and independently
 /// prove boot, rendering, input, and cleanup before exposing this backend.
-pub struct IsolatedVisualPackagedRuntime {
+/// The helper source gate requires this type to remain `pub(crate)` until
+/// qualification; a crate-root re-export is forbidden.
+pub(crate) struct IsolatedVisualPackagedRuntime {
     pid: libc::pid_t,
     exited: bool,
     driver: IsolatedVisualRuntimeDriver<File, File, File, File>,
@@ -443,11 +445,27 @@ impl Drop for IsolatedVisualPackagedRuntime {
 #[cfg(test)]
 mod tests {
     use super::descriptors_are_distinct;
+    use super::IsolatedVisualPackagedRuntime;
 
     #[test]
     fn native_launch_descriptor_set_must_be_complete_and_unique() {
         assert!(descriptors_are_distinct(&[3, 4, 5, 6, 7]));
         assert!(!descriptors_are_distinct(&[3, 4, 4, 6, 7]));
         assert!(!descriptors_are_distinct(&[3, -1, 5, 6, 7]));
+    }
+
+    #[test]
+    fn packaged_runtime_crate_private_entrypoint_stays_linked() {
+        // Keep the supervisor reachable inside the crate so macOS `-D warnings`
+        // does not treat it as dead code, without crate-root re-export or
+        // capability admission. This is not launch, boot, or qualification proof.
+        let _launch = IsolatedVisualPackagedRuntime::launch;
+        let _start = IsolatedVisualPackagedRuntime::start;
+        let _read_frame = IsolatedVisualPackagedRuntime::read_frame;
+        let _write_input = IsolatedVisualPackagedRuntime::write_input;
+        let _stop = IsolatedVisualPackagedRuntime::stop;
+        let _complete_cleanup = IsolatedVisualPackagedRuntime::complete_cleanup;
+        let _complete_observed_cleanup = IsolatedVisualPackagedRuntime::complete_observed_cleanup;
+        let _runtime = IsolatedVisualPackagedRuntime::runtime;
     }
 }

@@ -128,13 +128,19 @@ touch -d '@0' "$work/initramfs/init"
 (cd "$work/initramfs" && printf './init\n' | cpio --quiet --create --format=newc --owner=0:0 --reproducible > "$initramfs")
 
 make -C "$kernel" ARCH=arm64 LLVM=1 KCONFIG_NOTIMESTAMP=1 defconfig
-"$kernel/scripts/kconfig/merge_config.sh" -m -r "$kernel/.config" \
+# merge_config.sh writes KCONFIG_CONFIG relative to CWD unless -O is set.
+# Hosted CI CWD is the repository root, so a CWD merge left the kernel
+# tree's .config as stock defconfig and olddefconfig reported no change
+# while CONFIG_INITRAMFS_SOURCE never reached require_config.
+"$kernel/scripts/kconfig/merge_config.sh" -m -r -O "$kernel" "$kernel/.config" \
   "$script_dir/kernel.config.fragment"
 make -C "$kernel" ARCH=arm64 LLVM=1 KCONFIG_NOTIMESTAMP=1 olddefconfig
 
 require_config() {
   grep -Fx "$1" "$kernel/.config" >/dev/null || {
     echo "kernel configuration lost required setting: $1" >&2
+    echo "observed INITRAMFS/INITRD lines:" >&2
+    grep -E 'CONFIG_(BLK_DEV_INITRD|INITRAMFS_)' "$kernel/.config" >&2 || true
     exit 65
   }
 }
