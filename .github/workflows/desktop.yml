@@ -7,12 +7,14 @@ on:
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
+      - "crates/common/grokptah-agent-sdk/**"
       - "evals/**"
       - ".github/workflows/desktop.yml"
   pull_request:
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
+      - "crates/common/grokptah-agent-sdk/**"
       - "evals/**"
       - ".github/workflows/desktop.yml"
 

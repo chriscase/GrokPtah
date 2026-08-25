@@ -28,10 +28,11 @@ pub use computer::{
 };
 pub use error::{ErrorCode, ErrorEnvelope, ErrorEventRange};
 pub use external_worker::{
-    ExternalWorkerArtifact, ExternalWorkerEvent, ExternalWorkerExecutionMode,
-    ExternalWorkerFollowUpRequest, ExternalWorkerLaunchRequest, ExternalWorkerLaunchResult,
+    EXTERNAL_WORKER_CONTRACT_VERSION, ExternalWorkerArtifact, ExternalWorkerEvent,
+    ExternalWorkerExecutionMode, ExternalWorkerFollowUpRequest, ExternalWorkerLaunchRequest,
+    ExternalWorkerLaunchResult, ExternalWorkerListPage, ExternalWorkerListQuery,
     ExternalWorkerProvider, ExternalWorkerRecord, ExternalWorkerRunRecord, ExternalWorkerState,
-    EXTERNAL_WORKER_CONTRACT_VERSION,
+    ExternalWorkerSummary, MAX_EXTERNAL_WORKER_LIST_LIMIT,
 };
 pub use run::{
     Bounds, ChangedFile, DurableRun, DurableRunState, ExecutionMode, IdempotencyKey, ReviewReceipt,

@@ -14,10 +14,14 @@ The crate covers:
 - bounded submit requests and durable run projections;
 - cursor-paged events and explicit recovery notifications;
 - isolated-run review receipts and stable error categories;
-- lease- and revision-fenced Computer Use control requests.
+- lease- and revision-fenced Computer Use control requests;
 - provider-neutral external-worker launch, lifecycle, event, and artifact
   projections for cloud coding agents, including explicitly idempotent
-  follow-up requests.
+  follow-up requests;
+- identity-only external-worker list query, summary, and page DTOs plus the
+  bounded list-limit constant, re-exported from the crate root for public
+  consumers (`ExternalWorkerListQuery`, `ExternalWorkerSummary`,
+  `ExternalWorkerListPage`, `MAX_EXTERNAL_WORKER_LIST_LIMIT`).
 
 The boundary DTOs that accept caller-controlled data expose a `validate()`
 method. Consumers should call those validators before crossing a process or

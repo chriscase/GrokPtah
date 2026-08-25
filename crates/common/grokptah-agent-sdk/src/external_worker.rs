@@ -5,6 +5,10 @@
 //! credentials, network client, filesystem path, or execution policy. A
 //! trusted adapter owns those concerns and maps provider responses into these
 //! bounded projections.
+//!
+//! Public list/query/summary/page DTOs and [`MAX_EXTERNAL_WORKER_LIST_LIMIT`]
+//! are also re-exported from the crate root so another repository can depend
+//! on the documented SDK surface without reaching into this module path.
 
 use serde::{Deserialize, Serialize};
 
