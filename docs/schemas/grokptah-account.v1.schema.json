@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokptah:schema:account:v1",
+  "title": "GrokPtah Grok Build Account Readiness Contract v1",
+  "description": "Credential-free projection of local Grok Build account state. Structurally carries no bearer, refresh token, API key, credential reference, credential fingerprint, or free-form auth mode. Makes no claim about account balance, quota, entitlement, or live provider certification.",
+  "anyOf": [
+    { "$ref": "#/$defs/grokAccountFacts" },
+    { "$ref": "#/$defs/runAttribution" }
+  ],
+  "$defs": {
+    "credentialMethod": {
+      "description": "Closed vocabulary for how a run authenticates. An unrecognized auth mode collapses to `unknown` rather than being echoed.",
+      "enum": [
+        "absent",
+        "api_key",
+        "token_command",
+        "provider_env",
+        "provider_keychain",
+        "grok_build_oidc",
+        "grok_build_api_key",
+        "unknown"
+      ]
+    },
+    "accountReferenceSource": {
+      "description": "Which durable, non-secret identity field produced the account reference.",
+      "enum": ["user_id", "principal_id", "team_id"]
+    },
+    "expiryStatus": {
+      "description": "What could be established about credential expiry.",
+      "enum": ["absent", "unparseable", "valid", "expired"]
+    },
+    "accountReadiness": {
+      "description": "Whether a new run may launch. Only `unusable` blocks.",
+      "enum": ["usable", "unknown", "unusable"]
+    },
+    "readinessReason": {
+      "description": "Why the readiness verdict holds.",
+      "enum": [
+        "no_credential",
+        "credential_expired",
+        "expiry_in_future",
+        "expiry_not_provided",
+        "expiry_unparseable",
+        "method_unrecognized"
+      ]
+    },
+    "accountReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "source"],
+      "properties": {
+        "value": {
+          "description": "Opaque durable account identifier. Never derived from credential material and never an email address or display name.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        },
+        "source": { "$ref": "#/$defs/accountReferenceSource" }
+      }
+    },
+    "expiryFacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "$ref": "#/$defs/expiryStatus" },
+        "expiresAt": {
+          "description": "Normalized UTC instant re-serialized from parsed components. Absent whenever expiry is absent or unparseable, so observed text is never echoed.",
+          "type": ["string", "null"],
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "secondsRemaining": {
+          "description": "Whole seconds until expiry; negative once elapsed.",
+          "type": ["integer", "null"]
+        }
+      }
+    },
+    "grokAccountFacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract", "schemaVersion", "credentialMethod", "expiry", "readiness", "readinessReason"],
+      "properties": {
+        "contract": { "const": "grokptah.account.v1" },
+        "schemaVersion": { "type": "integer", "const": 1 },
+        "credentialMethod": { "$ref": "#/$defs/credentialMethod" },
+        "accountReference": {
+          "oneOf": [{ "$ref": "#/$defs/accountReference" }, { "type": "null" }]
+        },
+        "expiry": { "$ref": "#/$defs/expiryFacts" },
+        "readiness": { "$ref": "#/$defs/accountReadiness" },
+        "readinessReason": { "$ref": "#/$defs/readinessReason" }
+      }
+    },
+    "runAttribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credentialMethod"],
+      "properties": {
+        "credentialMethod": { "$ref": "#/$defs/credentialMethod" },
+        "accountReference": {
+          "oneOf": [{ "$ref": "#/$defs/accountReference" }, { "type": "null" }]
+        }
+      }
+    }
+  }
+}

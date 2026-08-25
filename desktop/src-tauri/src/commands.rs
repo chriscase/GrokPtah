@@ -9,6 +9,7 @@ use grokptah_agent_bridge::{
     SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo,
     SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
 };
+use grokptah_agent_bridge::account_facts::{self, GrokAccountFacts};
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
@@ -1164,6 +1165,19 @@ pub fn set_always_approve(state: State<'_, AppState>, value: bool) {
 #[tauri::command]
 pub fn auth_state(state: State<'_, AppState>) -> AuthState {
     state.host.auth_state()
+}
+
+/// Bounded, credential-free Grok Build account readiness for the editor.
+///
+/// The projection itself lives in `grokptah-agent-sdk` and carries no bearer,
+/// refresh token, API key, credential reference, or raw auth mode, so this
+/// command is safe to expose to the webview.
+#[tauri::command]
+pub fn grok_account_facts() -> GrokAccountFacts {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64);
+    account_facts::grok_account_facts(now_unix)
 }
 
 #[tauri::command]

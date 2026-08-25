@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+/// Versioned, credential-free Grok Build account readiness facts.
+pub mod account;
 /// Versioned capability discovery types.
 pub mod capability;
 /// Lease- and revision-fenced Computer Use types.
@@ -21,6 +23,12 @@ pub mod run;
 /// Stable contract identifier advertised during MCP initialization.
 pub const CONTRACT_VERSION: &str = "grokptah.capabilities.v1";
 
+pub use account::{
+    AccountObservation, AccountReadiness, AccountReference, AccountReferenceSource,
+    CredentialMethod, CredentialSource, ExpiryFacts, ExpiryStatus, GROK_ACCOUNT_CONTRACT_VERSION,
+    GROK_ACCOUNT_SCHEMA_VERSION, GrokAccountFacts, MAX_ACCOUNT_REFERENCE_BYTES, ReadinessReason,
+    RunAttribution,
+};
 pub use capability::{CapabilityAvailability, CapabilityDescriptor, CapabilitySet, CapabilityTier};
 pub use computer::{
     ComputerActionClass, ComputerControlRequest, ComputerControlResponse, ComputerEvent,
@@ -28,10 +36,10 @@ pub use computer::{
 };
 pub use error::{ErrorCode, ErrorEnvelope, ErrorEventRange};
 pub use external_worker::{
-    ExternalWorkerArtifact, ExternalWorkerEvent, ExternalWorkerExecutionMode,
-    ExternalWorkerFollowUpRequest, ExternalWorkerLaunchRequest, ExternalWorkerLaunchResult,
-    ExternalWorkerProvider, ExternalWorkerRecord, ExternalWorkerRunRecord, ExternalWorkerState,
-    EXTERNAL_WORKER_CONTRACT_VERSION,
+    EXTERNAL_WORKER_CONTRACT_VERSION, ExternalWorkerArtifact, ExternalWorkerEvent,
+    ExternalWorkerExecutionMode, ExternalWorkerFollowUpRequest, ExternalWorkerLaunchRequest,
+    ExternalWorkerLaunchResult, ExternalWorkerProvider, ExternalWorkerRecord,
+    ExternalWorkerRunRecord, ExternalWorkerState,
 };
 pub use run::{
     Bounds, ChangedFile, DurableRun, DurableRunState, ExecutionMode, IdempotencyKey, ReviewReceipt,
