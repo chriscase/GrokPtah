@@ -167,6 +167,6 @@ the crate is not part of the shipped desktop binary.
 
 Before the first repair the source contained 84 explicit `#[test]` functions
 and one `no_run` doctest, not the 83 claimed by the candidate commit. The
-current repaired crate contains 105 explicit tests plus that doctest. The tests
+current repaired crate contains 107 explicit tests plus that doctest. The tests
 are deterministic and provider-free; they do not qualify a production
 persistence store, task-tool adapter, or live Computer Use runtime.
