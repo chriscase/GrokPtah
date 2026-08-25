@@ -102,10 +102,11 @@ To produce a reviewable, Tauri-free consumer artifact from an exact checkout,
 run `npm run verify:public` in `desktop/`. This builds and verifies a bundled
 `desktop/dist/public/grokptah-public.js` plus declaration files under
 `desktop/dist/public/types/` and a package manifest for `@grokptah/client`.
-The generated artifact contains the browser-safe
-broker client and headless primitives only; it does not contain `trusted.ts`,
-Tauri APIs, bearer tokens, or native Computer Use authority. Publication still
-requires the compatibility and release gates in the roadmap.
+The generated artifact contains the browser-safe broker client and headless
+primitives only; it does not contain `trusted.ts`, Tauri APIs, bearer tokens,
+provider API-key markers, absolute host paths, `GROKPTAH_HOME`, or native
+Computer Use authority. Publication still requires the compatibility and
+release gates in the roadmap.
 
 ## ContextDesk integration checklist
 

@@ -12,7 +12,16 @@ if (
 ) {
   throw new Error("public package manifest does not expose the expected safe entry point");
 }
-const forbidden = ["@tauri-apps", "trusted.ts", "Authorization: Bearer"];
+const forbidden = [
+  "@tauri-apps",
+  "trusted.ts",
+  "Authorization: Bearer",
+  "XAI_API_KEY",
+  "/Users/",
+  "/private/",
+  "GROKPTAH_HOME",
+  "apiKey",
+];
 const leaked = forbidden.filter((needle) => bundle.includes(needle));
 if (leaked.length > 0) {
   throw new Error(`public bundle contains forbidden authority markers: ${leaked.join(", ")}`);
