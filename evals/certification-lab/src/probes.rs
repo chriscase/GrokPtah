@@ -129,12 +129,44 @@ impl<'a> ProbeBuilder<'a> {
         arguments: Value,
         argument_fields: Vec<ArgumentFieldCode>,
     ) -> Result<Value, DiagnosticCode> {
-        self.push_trace(operation, argument_fields, None)?;
-        self.counters.tool_calls = self
-            .counters
-            .tool_calls
-            .checked_add(1)
-            .ok_or(DiagnosticCode::BoundExceeded)?;
+        self.invoke(client, operation, tool, arguments, argument_fields, true)
+            .await
+    }
+
+    /// Same public MCP invocation as [`Self::call`], without a structural-trace
+    /// record. Always-on identity snapshots poll on a 50ms bound; tracing every
+    /// poll exceeds the serialized trace byte bound. Oracle-significant reads
+    /// still go through [`Self::call`]. Home A's plan wait already uses this
+    /// silent pattern via `client.call_tool`.
+    async fn poll(
+        &mut self,
+        client: &mut McpControlClient,
+        operation: TraceOperationCode,
+        tool: &str,
+        arguments: Value,
+        argument_fields: Vec<ArgumentFieldCode>,
+    ) -> Result<Value, DiagnosticCode> {
+        self.invoke(client, operation, tool, arguments, argument_fields, false)
+            .await
+    }
+
+    async fn invoke(
+        &mut self,
+        client: &mut McpControlClient,
+        operation: TraceOperationCode,
+        tool: &str,
+        arguments: Value,
+        argument_fields: Vec<ArgumentFieldCode>,
+        record_trace: bool,
+    ) -> Result<Value, DiagnosticCode> {
+        if record_trace {
+            self.push_trace(operation, argument_fields, None)?;
+            self.counters.tool_calls = self
+                .counters
+                .tool_calls
+                .checked_add(1)
+                .ok_or(DiagnosticCode::BoundExceeded)?;
+        }
         match client.call_tool(tool, arguments).await {
             Ok(result) if !result.is_error => {
                 if matches!(
@@ -161,9 +193,11 @@ impl<'a> ProbeBuilder<'a> {
                         return Err(DiagnosticCode::McpResultMalformed);
                     }
                 }
-                if let Some(last) = self.records.last_mut() {
-                    last.result_digest = Some(hash_payload(&result.structured));
-                    last.opaque_entity_id = opaque_from_value(&result.structured);
+                if record_trace {
+                    if let Some(last) = self.records.last_mut() {
+                        last.result_digest = Some(hash_payload(&result.structured));
+                        last.opaque_entity_id = opaque_from_value(&result.structured);
+                    }
                 }
                 Ok(result.structured)
             }
@@ -810,37 +844,63 @@ async fn always_on_snapshot(
     session_id: &str,
     workspace: &str,
 ) -> Result<AlwaysOnSnapshot, DiagnosticCode> {
+    always_on_read_snapshot(probe, client, session_id, workspace, true).await
+}
+
+/// Same identity snapshot as [`always_on_snapshot`], without structural-trace
+/// records. Used only inside bounded poll loops; the settled observation is
+/// then re-read through [`always_on_snapshot`] so the trace still carries the
+/// oracle-significant capture.
+async fn always_on_poll_snapshot(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    session_id: &str,
+    workspace: &str,
+) -> Result<AlwaysOnSnapshot, DiagnosticCode> {
+    always_on_read_snapshot(probe, client, session_id, workspace, false).await
+}
+
+async fn always_on_read_snapshot(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    session_id: &str,
+    workspace: &str,
+    record_trace: bool,
+) -> Result<AlwaysOnSnapshot, DiagnosticCode> {
     let scope = json!({ "session_id": session_id, "workspace": workspace });
     let fields = vec![ArgumentFieldCode::SessionId, ArgumentFieldCode::Workspace];
-    let work = probe
-        .call(
-            client,
-            TraceOperationCode::ListWork,
-            "ptah_list_work",
-            scope.clone(),
-            fields.clone(),
-        )
-        .await?;
+    let work = always_on_invoke(
+        probe,
+        client,
+        TraceOperationCode::ListWork,
+        "ptah_list_work",
+        scope.clone(),
+        fields.clone(),
+        record_trace,
+    )
+    .await?;
     always_on_scan(&work)?;
-    let runs = probe
-        .call(
-            client,
-            TraceOperationCode::ListRuns,
-            "ptah_list_runs",
-            scope.clone(),
-            fields.clone(),
-        )
-        .await?;
+    let runs = always_on_invoke(
+        probe,
+        client,
+        TraceOperationCode::ListRuns,
+        "ptah_list_runs",
+        scope.clone(),
+        fields.clone(),
+        record_trace,
+    )
+    .await?;
     always_on_scan(&runs)?;
-    let intents = probe
-        .call(
-            client,
-            TraceOperationCode::ListExecutionIntents,
-            "ptah_list_execution_intents",
-            scope,
-            fields,
-        )
-        .await?;
+    let intents = always_on_invoke(
+        probe,
+        client,
+        TraceOperationCode::ListExecutionIntents,
+        "ptah_list_execution_intents",
+        scope,
+        fields,
+        record_trace,
+    )
+    .await?;
     always_on_scan(&intents)?;
     let mut details = BTreeMap::new();
     let work_ids = work_items(&work)
@@ -848,29 +908,50 @@ async fn always_on_snapshot(
         .map(|item| required_string(item, &["workId"]))
         .collect::<Result<Vec<String>, DiagnosticCode>>()?;
     for work_id in work_ids {
-        let detailed = probe
-            .call(
-                client,
-                TraceOperationCode::GetWork,
-                "ptah_get_work",
-                json!({
-                    "session_id": session_id,
-                    "workspace": workspace,
-                    "work_id": work_id
-                }),
-                vec![
-                    ArgumentFieldCode::SessionId,
-                    ArgumentFieldCode::Workspace,
-                    ArgumentFieldCode::WorkId,
-                ],
-            )
-            .await?;
+        let detailed = always_on_invoke(
+            probe,
+            client,
+            TraceOperationCode::GetWork,
+            "ptah_get_work",
+            json!({
+                "session_id": session_id,
+                "workspace": workspace,
+                "work_id": work_id
+            }),
+            vec![
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::WorkId,
+            ],
+            record_trace,
+        )
+        .await?;
         always_on_scan(&detailed)?;
         if details.insert(work_id, detailed).is_some() {
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
     }
     AlwaysOnSnapshot::build(&work, &details, &intents, &runs)
+}
+
+async fn always_on_invoke(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    operation: TraceOperationCode,
+    tool: &str,
+    arguments: Value,
+    argument_fields: Vec<ArgumentFieldCode>,
+    record_trace: bool,
+) -> Result<Value, DiagnosticCode> {
+    if record_trace {
+        probe
+            .call(client, operation, tool, arguments, argument_fields)
+            .await
+    } else {
+        probe
+            .poll(client, operation, tool, arguments, argument_fields)
+            .await
+    }
 }
 /// Assert the completed Home-A happy path against the fixture: the exact
 /// fixture-derived identity shape, the provider POST budget, and no terminal
@@ -921,7 +1002,7 @@ async fn always_on_find_in_flight(
 ) -> Result<AlwaysOnHeldJoin, DiagnosticCode> {
     for _ in 0..1_800 {
         let work = probe
-            .call(
+            .poll(
                 client,
                 TraceOperationCode::ListWork,
                 "ptah_list_work",
@@ -940,7 +1021,7 @@ async fn always_on_find_in_flight(
                 continue;
             }
             let detailed = probe
-                .call(
+                .poll(
                     client,
                     TraceOperationCode::GetWork,
                     "ptah_get_work",
@@ -966,7 +1047,7 @@ async fn always_on_find_in_flight(
             let attempt_id = required_string(&attempts[0], &["attemptId"])?;
             let run_id = exact_single_linked_run(&attempts[0], None)?;
             let intents = probe
-                .call(
+                .poll(
                     client,
                     TraceOperationCode::ListExecutionIntents,
                     "ptah_list_execution_intents",
@@ -987,7 +1068,7 @@ async fn always_on_find_in_flight(
                 return Err(DiagnosticCode::StateTransitionMismatch);
             }
             let runs = probe
-                .call(
+                .poll(
                     client,
                     TraceOperationCode::ListRuns,
                     "ptah_list_runs",
@@ -1136,10 +1217,15 @@ async fn always_on_baseline(
     let deadline = Instant::now() + BASELINE_SETTLE_TIMEOUT;
     let mut last = Err(DiagnosticCode::Timeout);
     while Instant::now() < deadline {
-        let snapshot = always_on_snapshot(probe, client, session_id, workspace).await?;
+        let snapshot = always_on_poll_snapshot(probe, client, session_id, workspace).await?;
         last = assert_bootstrap_baseline(&snapshot, fixture, setup_run).map(|()| snapshot);
         if last.as_ref().is_ok_and(baseline_is_settled) {
-            return last;
+            let traced = always_on_snapshot(probe, client, session_id, workspace).await?;
+            if assert_bootstrap_baseline(&traced, fixture, setup_run).is_ok()
+                && baseline_is_settled(&traced)
+            {
+                return Ok(traced);
+            }
         }
         tokio::time::sleep(BASELINE_SETTLE_POLL).await;
     }
@@ -2030,11 +2116,17 @@ async fn always_on_assert_interrupted_recovery(
     let mut settled = None;
     let mut last = DiagnosticCode::Timeout;
     while Instant::now() < deadline {
-        let snapshot = always_on_snapshot(probe, client, session_id, workspace).await?;
+        let snapshot = always_on_poll_snapshot(probe, client, session_id, workspace).await?;
         match assert_post_restart_shape(pre_restart, &snapshot, work_id, run_id) {
             Ok(_) => {
-                settled = Some(snapshot);
-                break;
+                let traced = always_on_snapshot(probe, client, session_id, workspace).await?;
+                match assert_post_restart_shape(pre_restart, &traced, work_id, run_id) {
+                    Ok(_) => {
+                        settled = Some(traced);
+                        break;
+                    }
+                    Err(code) => last = code,
+                }
             }
             Err(code) => last = code,
         }
