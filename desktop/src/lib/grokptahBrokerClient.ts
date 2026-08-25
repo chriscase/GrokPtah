@@ -37,6 +37,8 @@ export type GrokPtahBrokerRunRequest = {
 const MAX_BROKER_PROMPT_BYTES = 1_048_576;
 const MAX_BROKER_ROUNDS = 24;
 const MAX_BROKER_PROMPT_BOUND_BYTES = 4 * 1_048_576;
+const MAX_BROKER_SSE_REASON_BYTES = 256;
+const MAX_BROKER_SSE_ROUTE_BYTES = 2_048;
 
 const BROKER_AVAILABILITIES: ReadonlySet<GrokPtahBrokerCapability["availability"]> = new Set([
   "available",
@@ -435,7 +437,15 @@ export class GrokPtahBrokerClient {
     if (!response.ok) await throwBrokerError(response);
     const text = await response.text();
     if (!text) return undefined as T;
-    return JSON.parse(text) as T;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new GrokPtahBrokerError(
+        response.status,
+        "invalid_response",
+        "Broker response was not valid JSON",
+      );
+    }
   }
 
   private async requestValidated<T>(
@@ -624,9 +634,10 @@ function parseNotification(frame: string, brokerRunId: string): GrokPtahBrokerNo
   if (body.kind === "event") {
     if (
       typeof sseId !== "number" ||
-      typeof body.seq !== "number" ||
+      !Number.isSafeInteger(body.seq) ||
+      body.seq < 1 ||
       sseId !== body.seq ||
-      typeof body.ts !== "string" ||
+      !boundedString(body.ts, 128) ||
       !("update" in body)
     ) {
       throw new Error("Broker event notification is malformed");
@@ -641,9 +652,10 @@ function parseNotification(frame: string, brokerRunId: string): GrokPtahBrokerNo
   }
   if (
     body.kind === "recovery" &&
-    typeof body.afterSeq === "number" &&
-    typeof body.reason === "string" &&
-    typeof body.pollRoute === "string"
+    Number.isSafeInteger(body.afterSeq) &&
+    body.afterSeq >= 0 &&
+    boundedString(body.reason, MAX_BROKER_SSE_REASON_BYTES) &&
+    boundedString(body.pollRoute, MAX_BROKER_SSE_ROUTE_BYTES)
   ) {
     if (!isRelativeRoute(body.pollRoute)) {
       throw new Error("Broker recovery route must be relative to the broker origin");

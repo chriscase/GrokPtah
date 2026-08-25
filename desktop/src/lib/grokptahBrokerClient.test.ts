@@ -385,4 +385,39 @@ describe("GrokPtahBrokerClient", () => {
     };
     await expect(read()).rejects.toThrow("relative");
   });
+
+  it("rejects malformed event sequence and timestamp metadata", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'id: 1\ndata: {"kind":"event","brokerRunId":"run-1","seq":1.5,"ts":"now","update":{}}\n\n',
+        ));
+        controller.close();
+      },
+    });
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    );
+    const client = new GrokPtahBrokerClient({ baseUrl: "https://contextdesk.example", fetcher });
+    const read = async () => {
+      for await (const _notification of client.streamEvents("binding-1", "run-1")) {
+        // Malformed sequence metadata must never reach a consumer.
+      }
+    };
+    await expect(read()).rejects.toThrow("malformed");
+  });
+
+  it("wraps non-JSON broker responses as safe invalid-response errors", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response("<html>proxy failure</html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      }),
+    );
+    const client = new GrokPtahBrokerClient({ baseUrl: "https://contextdesk.example", fetcher });
+    await expect(client.getRun("binding-1", "run-1")).rejects.toMatchObject({
+      code: "invalid_response",
+      status: 200,
+    });
+  });
 });
