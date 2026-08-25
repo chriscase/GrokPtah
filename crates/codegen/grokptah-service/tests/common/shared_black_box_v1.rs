@@ -2885,11 +2885,10 @@ fn repo_root() -> PathBuf {
         .expect("canonicalize repo root")
 }
 
-fn git_stdout(args: &[&str]) -> Result<String, String> {
-    let root = repo_root();
+fn git_stdout_at(root: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(&root)
+        .arg(root)
         .args(args)
         .output()
         .map_err(|error| format!("git {}: {error}", args.join(" ")))?;
@@ -2930,19 +2929,32 @@ fn allowlisted(path: &str) -> bool {
     })
 }
 
-fn commit_changed_files(sha: &str) -> Result<Vec<String>, String> {
-    let parent = git_stdout(&["rev-parse", &format!("{sha}^")]);
-    let diff = if parent.is_ok() {
-        git_stdout(&["diff", "--name-only", &format!("{sha}^"), sha])?
-    } else {
-        git_stdout(&[
-            "diff-tree",
-            "--no-commit-id",
-            "--name-only",
-            "--root",
-            "-r",
-            sha,
-        ])?
+/// Files a commit changed against its first parent.
+///
+/// Root-ness is decided by the parent list, never by whether `rev-parse
+/// {sha}^` happened to succeed. An absent parent object makes that lookup fail
+/// exactly like a real root commit does, and treating it as one would diff the
+/// whole tree against nothing -- reporting every path as changed and naming a
+/// revision on the strength of a missing object. A parent that is named must
+/// therefore also be present.
+fn commit_changed_files_at(root: &Path, sha: &str) -> Result<Vec<String>, String> {
+    let parents = parent_shas(root, sha)?;
+    let diff = match parents.first() {
+        None => git_stdout_at(
+            root,
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "--root",
+                "-r",
+                sha,
+            ],
+        )?,
+        Some(first_parent) => {
+            require_present_commit(root, first_parent)?;
+            git_stdout_at(root, &["diff", "--name-only", first_parent, sha])?
+        }
     };
     Ok(diff
         .lines()
@@ -2951,24 +2963,228 @@ fn commit_changed_files(sha: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn detect_audited_source_revision() -> String {
-    let status = git_stdout(&["status", "--porcelain"]).expect("git status");
+/// Resolve the audited host revision, or explain why it cannot be resolved.
+///
+/// Every failure is terminal. The resolver never falls back to `HEAD`: on a
+/// pull-request run `HEAD` is an ephemeral synthetic merge that exists only for
+/// that run, so naming it would key an immutable golden to an identity nobody
+/// can check out again. Refusing is always correct; guessing never is.
+fn resolve_audited_source_revision_at(root: &Path) -> Result<String, String> {
+    require_unrewritten_history(root)?;
+    require_complete_history(root)?;
+    require_clean_worktree(root)?;
+    let head = git_stdout_at(root, &["rev-parse", "HEAD"])?;
+    let candidate = audited_walk_start(root, &head)?;
+    // Validated here, before a single step is taken, so unwrapping the
+    // synthetic head can never hand the walk a merge to first-parent through.
+    require_present_commit(root, &candidate)?;
+    require_ordinary_or_root(root, &candidate)?;
+    walk_to_audited_commit(root, &candidate)
+}
+
+/// Replace refs and the legacy graft file both rewrite the parentage that
+/// `git rev-list` reports without altering a single commit object, so a
+/// resolver that trusts that output can be walked down a forged history and
+/// made to name a revision that never had those parents. Their presence is
+/// disqualifying on its own. Reading around them with `--no-replace-objects`
+/// would hide the tampering instead of surfacing it.
+fn require_unrewritten_history(root: &Path) -> Result<(), String> {
+    let replaced = git_stdout_at(
+        root,
+        &["for-each-ref", "--format=%(refname)", "refs/replace/"],
+    )?;
+    let replaced = replaced.split_whitespace().collect::<Vec<_>>();
+    if !replaced.is_empty() {
+        return Err(format!(
+            "refusing to resolve against rewritten history: {} replace ref(s) present ({}) \
+             (fail closed)",
+            replaced.len(),
+            replaced.join(", ")
+        ));
+    }
+    // Checked as a file rather than by observing its effect, so the refusal
+    // holds on Git versions that have already dropped graft support.
+    let grafts = git_stdout_at(root, &["rev-parse", "--git-path", "info/grafts"])?;
+    let grafts = root.join(grafts.trim());
+    if std::fs::metadata(&grafts).is_ok_and(|meta| meta.len() > 0) {
+        return Err(format!(
+            "refusing to resolve against rewritten history: legacy graft file {} (fail closed)",
+            grafts.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse to resolve inside a shallow clone. A truncated history stops the
+/// audited walk at whatever commit happens to be the oldest object present,
+/// which silently names the wrong revision.
+fn require_complete_history(root: &Path) -> Result<(), String> {
+    let shallow = git_stdout_at(root, &["rev-parse", "--is-shallow-repository"])?;
+    if shallow.trim() != "false" {
+        return Err(
+            "shallow checkout cannot identify the audited source revision; \
+             check out full history (fail closed)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn require_clean_worktree(root: &Path) -> Result<(), String> {
+    let status = git_stdout_at(root, &["status", "--porcelain"])?;
     for path in porcelain_paths(&status) {
         if !allowlisted(&path) {
-            panic!("unexpected dirty path outside fixture allowlist: {path}");
+            return Err(format!(
+                "unexpected dirty path outside fixture allowlist: {path}"
+            ));
         }
     }
-    let mut sha = git_stdout(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    Ok(())
+}
+
+/// Parents of `sha`, with the identity `rev-list` echoed back checked against
+/// the commit we asked about.
+fn parent_shas(root: &Path, sha: &str) -> Result<Vec<String>, String> {
+    // Reading parents requires traversing to them, so this is also where an
+    // absent parent object surfaces. Name that plainly instead of leaking a
+    // raw Git failure, and never treat it as "no parents".
+    let line =
+        git_stdout_at(root, &["rev-list", "--parents", "-n", "1", sha]).map_err(|error| {
+            format!(
+                "cannot read the parents of {sha}; this checkout's object store is incomplete \
+             (fail closed): {error}"
+            )
+        })?;
+    let mut fields = line.split_whitespace();
+    let listed = fields.next().unwrap_or_default();
+    if listed != sha {
+        return Err(format!(
+            "rev-list named {listed} for {sha}; refusing to resolve an ambiguous commit"
+        ));
+    }
+    Ok(fields.map(str::to_string).collect())
+}
+
+/// Pick the commit the audited walk starts from.
+///
+/// Only two shapes are accepted at the checked-out head:
+/// * an ordinary (or root) commit, which is its own candidate; and
+/// * a two-parent merge whose tree is identical to exactly its second parent,
+///   which is how a hosted pull-request checkout wraps the revision under test.
+///
+/// An ordinary commit is never unwrapped to its parent: that would name a
+/// revision the runner never checked out.
+fn audited_walk_start(root: &Path, head: &str) -> Result<String, String> {
+    let parents = parent_shas(root, head)?;
+    match parents.len() {
+        0 | 1 => Ok(head.to_string()),
+        2 => matching_tree_parent(root, head, &parents[0], &parents[1]),
+        count => Err(format!(
+            "HEAD {head} is an octopus merge with {count} parents; only a unique two-parent \
+             matching-tree merge can be resolved (fail closed)"
+        )),
+    }
+}
+
+/// A hosted pull-request checkout is a synthetic merge of the base branch into
+/// the revision under test, so its tree is byte-identical to that revision's
+/// tree and the revision can be recovered exactly. That recovery is only sound
+/// when the second parent is the *only* tree that matches: if the base side
+/// matches too the merge is empty and either parent would fit, and if neither
+/// matches the merge resolved real content that exists in no single commit.
+/// Both are unrecoverable, and both fail closed.
+fn matching_tree_parent(
+    root: &Path,
+    head: &str,
+    first_parent: &str,
+    second_parent: &str,
+) -> Result<String, String> {
+    require_present_commit(root, first_parent)?;
+    require_present_commit(root, second_parent)?;
+    let head_tree = tree_of(root, head)?;
+    let first_matches = tree_of(root, first_parent)? == head_tree;
+    let second_matches = tree_of(root, second_parent)? == head_tree;
+    match (first_matches, second_matches) {
+        (false, true) => Ok(second_parent.to_string()),
+        (true, true) => Err(format!(
+            "merge {head} shares its tree with both parents ({first_parent}, {second_parent}); \
+             refusing to guess the audited source (fail closed)"
+        )),
+        (true, false) => Err(format!(
+            "merge {head} shares its tree only with its base parent {first_parent}; the audited \
+             revision contributed nothing and cannot be named (fail closed)"
+        )),
+        (false, false) => Err(format!(
+            "merge {head} shares its tree with neither parent; the audited source is not \
+             recoverable (fail closed)"
+        )),
+    }
+}
+
+/// A commit named in the graph but absent from the object store is the
+/// signature of a truncated clone. Naming a revision from it would be a guess.
+fn require_present_commit(root: &Path, sha: &str) -> Result<(), String> {
+    git_stdout_at(root, &["cat-file", "-e", &format!("{sha}^{{commit}}")])
+        .map(|_| ())
+        .map_err(|_| format!("commit {sha} is missing from this checkout (fail closed)"))
+}
+
+/// Commits the audited walk stands on must have at most one parent. Unwrapping
+/// the synthetic head can land on a merge, and walking one from its first
+/// parent would silently ignore everything the other side contributed --
+/// naming a revision whose tree the audited run never built.
+fn require_ordinary_or_root(root: &Path, sha: &str) -> Result<(), String> {
+    require_ordinary_topology(sha, &parent_shas(root, sha)?)
+}
+
+fn require_ordinary_topology(sha: &str, parents: &[String]) -> Result<(), String> {
+    if parents.len() > 1 {
+        return Err(format!(
+            "audited candidate {sha} has {} parents; an audited revision must be an ordinary \
+             commit, not a merge (fail closed)",
+            parents.len()
+        ));
+    }
+    Ok(())
+}
+
+fn tree_of(root: &Path, sha: &str) -> Result<String, String> {
+    git_stdout_at(root, &["rev-parse", &format!("{sha}^{{tree}}")])
+}
+
+/// Walk first-parent history from the candidate until a commit changes
+/// something outside the fixture allowlist. That commit is the audited host
+/// revision: the newest revision whose behaviour a golden may describe. Every
+/// commit stood on is checked for presence and for ordinary topology first, so
+/// the walk can never traverse a merge or a missing object. Running off the end
+/// of history means no such commit exists here, which is a failure, not a
+/// reason to fall back to the head.
+fn walk_to_audited_commit(root: &Path, candidate: &str) -> Result<String, String> {
+    let mut sha = candidate.to_string();
     loop {
-        let files = commit_changed_files(&sha).expect("commit files");
+        require_present_commit(root, &sha)?;
+        let parents = parent_shas(root, &sha)?;
+        require_ordinary_topology(&sha, &parents)?;
+        let files = commit_changed_files_at(root, &sha)?;
         if files.iter().any(|path| !allowlisted(path)) {
-            return sha;
+            return Ok(sha);
         }
-        match git_stdout(&["rev-parse", &format!("{sha}^")]) {
-            Ok(parent) => sha = parent,
-            Err(_) => panic!("could not identify audited host revision (fail closed)"),
+        match parents.first() {
+            Some(parent) => sha = parent.clone(),
+            None => {
+                return Err("could not identify audited host revision (fail closed)".to_string())
+            }
         }
     }
+}
+
+fn detect_audited_source_revision_at(root: &Path) -> String {
+    resolve_audited_source_revision_at(root)
+        .unwrap_or_else(|error| panic!("audited source revision: {error}"))
+}
+
+fn detect_audited_source_revision() -> String {
+    detect_audited_source_revision_at(&repo_root())
 }
 
 fn write_golden_document(result: &Value, source: &str) -> Value {
@@ -3369,4 +3585,493 @@ fn expected_main_golden_is_immutable_for_audited_revision() {
         loaded["overlay"]["mcpError"]["code"],
         json!("invalid_request")
     );
+}
+
+// --- Audited-source resolver: adversarial topology coverage -----------------
+//
+// Each test builds a real repository whose shape the resolver must either name
+// exactly or refuse outright. The refusals matter as much as the successes: a
+// resolver that fell back to HEAD would key an immutable golden to an ephemeral
+// synthetic merge, and one that trusted rewritten parentage or first-parent
+// walked a merge would name a revision the audited run never built.
+
+fn detector_git(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("run detector git command");
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string()
+}
+
+fn detector_write(repo: &Path, path: &str, contents: &str) {
+    let path = repo.join(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("detector fixture parent");
+    }
+    std::fs::write(path, contents).expect("detector fixture file");
+}
+
+fn detector_commit(repo: &Path, message: &str) -> String {
+    detector_git(repo, &["add", "--all"]);
+    detector_git(repo, &["commit", "--quiet", "-m", message]);
+    detector_git(repo, &["rev-parse", "HEAD"])
+}
+
+/// A repository whose only commit touches an allowlisted fixture path, so the
+/// audited walk must keep walking past it.
+fn detector_repo() -> TempDir {
+    let repo = tempfile::tempdir().expect("detector repo");
+    detector_git(repo.path(), &["init", "--quiet", "-b", "main"]);
+    detector_git(
+        repo.path(),
+        &["config", "user.email", "detector-tests@example.invalid"],
+    );
+    detector_git(repo.path(), &["config", "user.name", "detector tests"]);
+    detector_git(repo.path(), &["config", "commit.gpgsign", "false"]);
+    detector_git(
+        repo.path(),
+        &["config", "advice.graftFileDeprecated", "false"],
+    );
+    detector_write(
+        repo.path(),
+        "crates/codegen/grokptah-service/tests/shared_black_box_v1.rs",
+        "fixture-only base\n",
+    );
+    detector_commit(repo.path(), "allowlisted base");
+    repo
+}
+
+/// Branch `name` off the current head with one commit outside the allowlist.
+fn detector_side_branch(repo: &Path, name: &str) -> String {
+    detector_git(repo, &["checkout", "--quiet", "-b", name]);
+    detector_write(repo, &format!("{name}-only.txt"), name);
+    detector_commit(repo, name)
+}
+
+/// `main` merged with a branch it is already up to date with: the merge tree
+/// equals the second parent's tree exactly, which is the hosted pull-request
+/// shape.
+fn matching_tree_repo() -> (TempDir, String, String) {
+    let repo = detector_repo();
+    let candidate = detector_side_branch(repo.path(), "candidate");
+    detector_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_git(
+        repo.path(),
+        &["merge", "--quiet", "--no-ff", "--no-edit", "candidate"],
+    );
+    let merge = detector_git(repo.path(), &["rev-parse", "HEAD"]);
+    (repo, candidate, merge)
+}
+
+#[test]
+fn direct_candidate_resolves_to_the_checked_out_commit() {
+    let repo = detector_repo();
+    detector_write(repo.path(), "direct-only.txt", "direct\n");
+    let head = detector_commit(repo.path(), "ordinary commit outside fixture allowlist");
+    assert_eq!(
+        detector_git(repo.path(), &["rev-list", "--parents", "-n", "1", "HEAD"])
+            .split_whitespace()
+            .count(),
+        2,
+        "ordinary commit"
+    );
+    assert_eq!(
+        resolve_audited_source_revision_at(repo.path()).expect("direct candidate"),
+        head
+    );
+}
+
+#[test]
+fn direct_candidate_walks_past_allowlisted_only_commits() {
+    let repo = detector_repo();
+    detector_write(repo.path(), "audited-only.txt", "audited\n");
+    let audited = detector_commit(repo.path(), "audited change");
+    detector_write(
+        repo.path(),
+        "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/scenario.json",
+        "{}\n",
+    );
+    let head = detector_commit(repo.path(), "allowlisted fixture-only change");
+    assert_ne!(head, audited);
+    assert_eq!(
+        resolve_audited_source_revision_at(repo.path()).expect("walk past fixture commits"),
+        audited,
+        "a fixture-only commit must not become the audited revision"
+    );
+}
+
+#[test]
+fn matching_tree_two_parent_merge_resolves_to_the_second_parent() {
+    let (repo, candidate, merge) = matching_tree_repo();
+    assert_ne!(candidate, merge);
+    let resolved = resolve_audited_source_revision_at(repo.path()).expect("matching-tree merge");
+    assert_eq!(resolved, candidate);
+    assert_ne!(
+        resolved, merge,
+        "the ephemeral synthetic merge must never be named"
+    );
+}
+
+#[test]
+fn merge_whose_tree_matches_neither_parent_fails_closed() {
+    let repo = detector_repo();
+    detector_side_branch(repo.path(), "candidate");
+    detector_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_write(repo.path(), "base-only.txt", "base branch\n");
+    detector_commit(repo.path(), "base branch change");
+    detector_git(
+        repo.path(),
+        &["merge", "--quiet", "--no-ff", "--no-edit", "candidate"],
+    );
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("a real merge is not a recoverable audited source");
+    assert!(error.contains("neither parent"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+}
+
+#[test]
+fn merge_whose_tree_matches_both_parents_is_ambiguous_and_fails_closed() {
+    let repo = detector_repo();
+    detector_write(repo.path(), "shared.txt", "shared\n");
+    detector_commit(repo.path(), "shared content outside fixture allowlist");
+    detector_git(repo.path(), &["checkout", "--quiet", "-b", "candidate"]);
+    // Change a file and change it straight back: a distinct commit whose tree
+    // is identical to the base branch's tree.
+    detector_write(repo.path(), "shared.txt", "diverged\n");
+    detector_commit(repo.path(), "diverge");
+    detector_write(repo.path(), "shared.txt", "shared\n");
+    detector_commit(repo.path(), "converge back onto the base tree");
+    detector_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_git(
+        repo.path(),
+        &["merge", "--quiet", "--no-ff", "--no-edit", "candidate"],
+    );
+    let head = detector_git(repo.path(), &["rev-parse", "HEAD"]);
+    let head_tree = detector_git(repo.path(), &["rev-parse", &format!("{head}^{{tree}}")]);
+    let parents = detector_git(repo.path(), &["rev-list", "--parents", "-n", "1", "HEAD"]);
+    let parents = parents.split_whitespace().skip(1).collect::<Vec<_>>();
+    assert_eq!(parents.len(), 2);
+    for parent in &parents {
+        assert_eq!(
+            detector_git(repo.path(), &["rev-parse", &format!("{parent}^{{tree}}")]),
+            head_tree,
+            "both parents must share the merge tree for this case"
+        );
+    }
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("an ambiguous merge tree must not resolve");
+    assert!(error.contains("both parents"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+}
+
+#[test]
+fn merge_whose_tree_matches_only_the_base_parent_fails_closed() {
+    // A merge that discards the candidate side entirely: two real parents, but
+    // the merge tree is the base tree. Naming the base here would attribute the
+    // run to a revision that contributed nothing under test.
+    let repo = detector_repo();
+    detector_write(repo.path(), "base-only.txt", "base\n");
+    detector_commit(repo.path(), "base outside fixture allowlist");
+    let candidate = detector_side_branch(repo.path(), "candidate");
+    detector_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_write(repo.path(), "base-advance.txt", "advance\n");
+    let base = detector_commit(repo.path(), "base advances past the candidate");
+    detector_git(
+        repo.path(),
+        &[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "--no-edit",
+            "-s",
+            "ours",
+            "candidate",
+        ],
+    );
+    let head = detector_git(repo.path(), &["rev-parse", "HEAD"]);
+    let parents = detector_git(repo.path(), &["rev-list", "--parents", "-n", "1", "HEAD"]);
+    let parents = parents.split_whitespace().skip(1).collect::<Vec<_>>();
+    assert_eq!(parents, vec![base.as_str(), candidate.as_str()]);
+    let head_tree = detector_git(repo.path(), &["rev-parse", &format!("{head}^{{tree}}")]);
+    assert_eq!(
+        head_tree,
+        detector_git(repo.path(), &["rev-parse", &format!("{base}^{{tree}}")]),
+        "the merge must carry the base tree"
+    );
+    assert_ne!(
+        head_tree,
+        detector_git(
+            repo.path(),
+            &["rev-parse", &format!("{candidate}^{{tree}}")]
+        ),
+        "the merge must not carry the candidate tree"
+    );
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("an empty candidate must not resolve to the base parent");
+    assert!(error.contains("base parent"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+}
+
+#[test]
+fn octopus_merge_fails_closed() {
+    let repo = detector_repo();
+    for name in ["one", "two", "three"] {
+        detector_git(repo.path(), &["checkout", "--quiet", "main"]);
+        detector_side_branch(repo.path(), name);
+    }
+    detector_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_git(
+        repo.path(),
+        &[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "--no-edit",
+            "one",
+            "two",
+            "three",
+        ],
+    );
+    assert_eq!(
+        detector_git(repo.path(), &["rev-list", "--parents", "-n", "1", "HEAD"])
+            .split_whitespace()
+            .count(),
+        5,
+        "octopus with three sides"
+    );
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("an octopus merge must not resolve");
+    assert!(error.contains("octopus merge"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+}
+
+/// Wrap `branch` in a synthetic two-parent merge on `main` whose tree matches
+/// the branch tip exactly, mirroring a hosted pull-request checkout.
+fn synthetic_pull_request_merge(repo: &Path, branch: &str) -> String {
+    detector_git(repo, &["checkout", "--quiet", "main"]);
+    detector_git(repo, &["merge", "--quiet", "--no-ff", "--no-edit", branch]);
+    let merge = detector_git(repo, &["rev-parse", "HEAD"]);
+    let merge_tree = detector_git(repo, &["rev-parse", &format!("{merge}^{{tree}}")]);
+    let branch_tree = detector_git(repo, &["rev-parse", &format!("{branch}^{{tree}}")]);
+    assert_eq!(
+        merge_tree, branch_tree,
+        "synthetic merge must match the tip"
+    );
+    merge
+}
+
+#[test]
+fn candidate_merge_below_the_synthetic_head_fails_closed() {
+    // The head unwraps cleanly, but the revision it unwraps to is itself a
+    // merge. First-parent walking it would hide the second side entirely.
+    let repo = detector_repo();
+    detector_side_branch(repo.path(), "feature");
+    detector_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_side_branch(repo.path(), "candidate");
+    detector_git(
+        repo.path(),
+        &["merge", "--quiet", "--no-ff", "--no-edit", "feature"],
+    );
+    let candidate = detector_git(repo.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(
+        detector_git(
+            repo.path(),
+            &["rev-list", "--parents", "-n", "1", &candidate]
+        )
+        .split_whitespace()
+        .count(),
+        3,
+        "candidate must itself be a two-parent merge"
+    );
+    let merge = synthetic_pull_request_merge(repo.path(), "candidate");
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("a merge candidate must not be first-parent walked");
+    assert!(error.contains(&candidate), "{error}");
+    assert!(error.contains("has 2 parents"), "{error}");
+    assert!(error.contains("not a merge"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+    assert!(!error.contains(&merge), "must not name the synthetic merge");
+}
+
+#[test]
+fn candidate_octopus_below_the_synthetic_head_fails_closed() {
+    let repo = detector_repo();
+    for name in ["alpha", "beta"] {
+        detector_git(repo.path(), &["checkout", "--quiet", "main"]);
+        detector_side_branch(repo.path(), name);
+    }
+    detector_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_side_branch(repo.path(), "candidate");
+    detector_git(
+        repo.path(),
+        &["merge", "--quiet", "--no-ff", "--no-edit", "alpha", "beta"],
+    );
+    let candidate = detector_git(repo.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(
+        detector_git(
+            repo.path(),
+            &["rev-list", "--parents", "-n", "1", &candidate]
+        )
+        .split_whitespace()
+        .count(),
+        4,
+        "candidate must itself be an octopus merge"
+    );
+    let merge = synthetic_pull_request_merge(repo.path(), "candidate");
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("an octopus candidate must not be first-parent walked");
+    assert!(error.contains(&candidate), "{error}");
+    assert!(error.contains("has 3 parents"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+    assert!(!error.contains(&merge), "must not name the synthetic merge");
+}
+
+#[test]
+fn replace_ref_fails_closed() {
+    // A replace ref rewrites the parentage `rev-list` reports without touching
+    // a single commit object, so the walk would follow a forged history.
+    let repo = detector_repo();
+    detector_write(repo.path(), "audited-only.txt", "audited\n");
+    detector_commit(repo.path(), "audited change");
+    detector_write(repo.path(), "later.txt", "later\n");
+    let head = detector_commit(repo.path(), "later change");
+    assert!(resolve_audited_source_revision_at(repo.path()).is_ok());
+
+    let root = detector_git(repo.path(), &["rev-list", "--max-parents=0", "HEAD"]);
+    detector_git(repo.path(), &["replace", "--graft", &head, &root]);
+    assert!(
+        !detector_git(
+            repo.path(),
+            &["for-each-ref", "--format=%(refname)", "refs/replace/"]
+        )
+        .is_empty(),
+        "the replace ref must exist for this case"
+    );
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("replace refs must not be resolved against");
+    assert!(error.contains("rewritten history"), "{error}");
+    assert!(error.contains("replace ref"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+}
+
+#[test]
+fn legacy_graft_file_fails_closed() {
+    // Checked as a file, so the refusal holds whether or not this Git still
+    // honours grafts.
+    let repo = detector_repo();
+    detector_write(repo.path(), "audited-only.txt", "audited\n");
+    detector_commit(repo.path(), "audited change");
+    detector_write(repo.path(), "later.txt", "later\n");
+    let head = detector_commit(repo.path(), "later change");
+    assert!(resolve_audited_source_revision_at(repo.path()).is_ok());
+
+    let root = detector_git(repo.path(), &["rev-list", "--max-parents=0", "HEAD"]);
+    let grafts = repo.path().join(".git/info/grafts");
+    std::fs::create_dir_all(grafts.parent().expect("grafts parent")).expect("grafts dir");
+    std::fs::write(&grafts, format!("{head} {root}\n")).expect("write graft file");
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("a graft file must not be resolved against");
+    assert!(error.contains("rewritten history"), "{error}");
+    assert!(error.contains("graft file"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+}
+
+#[test]
+fn shallow_history_fails_closed_instead_of_naming_the_merge() {
+    let (repo, candidate, merge) = matching_tree_repo();
+    let parent = tempfile::tempdir().expect("shallow clone parent");
+    let clone = parent.path().join("clone");
+    let output = Command::new("git")
+        .args(["clone", "--quiet", "--depth", "1", "--branch", "main"])
+        .arg(format!("file://{}", repo.path().display()))
+        .arg(&clone)
+        .output()
+        .expect("clone shallow detector repo");
+    assert!(
+        output.status.success(),
+        "git clone failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(detector_git(&clone, &["rev-parse", "HEAD"]), merge);
+    let error = resolve_audited_source_revision_at(&clone)
+        .expect_err("a shallow checkout must not resolve an audited revision");
+    assert!(error.contains("shallow checkout"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+    assert!(!error.contains(&merge), "{error}");
+    assert!(!error.contains(&candidate), "{error}");
+}
+
+#[test]
+fn missing_commit_object_fails_closed() {
+    let repo = detector_repo();
+    detector_write(repo.path(), "audited-only.txt", "audited\n");
+    let audited = detector_commit(repo.path(), "audited change");
+    detector_write(
+        repo.path(),
+        "crates/codegen/grokptah-service/tests/common/mod.rs",
+        "// fixture-only\n",
+    );
+    detector_commit(repo.path(), "allowlisted fixture-only change");
+    assert_eq!(
+        resolve_audited_source_revision_at(repo.path()).expect("resolves while intact"),
+        audited
+    );
+
+    // Drop the audited commit's loose object: the graph still names it, but the
+    // object store no longer holds it.
+    let object = repo
+        .path()
+        .join(".git/objects")
+        .join(&audited[..2])
+        .join(&audited[2..]);
+    std::fs::remove_file(&object).expect("remove loose commit object");
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("a missing commit object must fail closed");
+    assert!(error.contains("object store is incomplete"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+    assert!(
+        !error.contains("could not identify audited host revision"),
+        "an absent object must not be reported as an exhausted history: {error}"
+    );
+}
+
+#[test]
+fn history_without_an_audited_commit_fails_closed() {
+    // Every commit touches only allowlisted fixture paths, so the walk runs off
+    // the end of history. That is a failure, not a fallback to HEAD.
+    let repo = detector_repo();
+    detector_write(
+        repo.path(),
+        "crates/codegen/grokptah-service/tests/common/mod.rs",
+        "// fixture-only\n",
+    );
+    detector_commit(repo.path(), "another allowlisted change");
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("history with no audited commit must fail closed");
+    assert!(
+        error.contains("could not identify audited host revision"),
+        "{error}"
+    );
+    assert!(error.contains("fail closed"), "{error}");
+}
+
+#[test]
+fn dirty_path_outside_the_fixture_allowlist_fails_closed() {
+    let repo = detector_repo();
+    detector_write(repo.path(), "audited-only.txt", "audited\n");
+    detector_commit(repo.path(), "audited change");
+    detector_write(repo.path(), "uncommitted-source.rs", "fn main() {}\n");
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("a dirty non-fixture path must fail closed");
+    assert!(error.contains("unexpected dirty path"), "{error}");
 }
