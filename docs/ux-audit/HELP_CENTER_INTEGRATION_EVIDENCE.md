@@ -22,7 +22,8 @@ live provider qualification, and 100% release qualification remain open.
   weighted fields support power-user paraphrases.
 - Meaning search and assistant requests require explicit confirmation, send
   only bounded metadata/cited context, preserve corpus IDs, validate strict
-  JSON answers, and delete their helper chat session after completion.
+  JSON answers, cap provider answer/ranking sizes and scores, and delete their
+  helper chat session after completion.
 - The full-screen dialog traps focus, restores focus on close, handles Escape,
   supports narrow layouts, reduced motion, forced colors, and visible focus.
 
@@ -31,9 +32,10 @@ live provider qualification, and 100% release qualification remain open.
 - `npm test`: 47 files / 261 tests passed.
 - `npm run typecheck`: passed.
 - `npm run build`: passed; Vite production bundle emitted.
-- `npm run verify:public`: passed; browser-safe public bundle and consumer
-  authority checks remained green, including `searchHelpArticles` and the
-  exported `HELP_ARTICLES` corpus.
+- `npm run verify:public`: passed; browser-safe public bundle, authority checks,
+  and a disposable external-consumer import through normal `node_modules`
+  resolution remained green, including `searchHelpArticles` and the exported
+  `HELP_ARTICLES` corpus.
 - `git diff --check`: passed.
 
 ## Remaining gates

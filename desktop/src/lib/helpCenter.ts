@@ -228,8 +228,22 @@ export type HelpAssistantAnswer = {
 
 export type HelpAssistantValidation = {
   accepted: boolean;
-  reason: "accepted" | "empty-answer" | "missing-citation" | "unknown-citation" | "missing-uncertainty";
+  reason:
+    | "accepted"
+    | "empty-answer"
+    | "missing-citation"
+    | "unknown-citation"
+    | "missing-uncertainty"
+    | "answer-too-large"
+    | "too-many-citations";
 };
+
+/** Hard ceilings keep an untrusted provider response from becoming UI state. */
+export const HELP_MAX_ANSWER_CHARS = 12_000;
+export const HELP_MAX_UNCERTAINTY_CHARS = 2_000;
+export const HELP_MAX_CITATIONS = 16;
+export const HELP_MAX_SEMANTIC_RESULTS = 24;
+export const HELP_MAX_SEMANTIC_FIELD_CHARS = 2_000;
 
 /** Parse only the small structured answer envelope accepted by the UI. */
 export function parseHelpAssistantAnswer(reply: string): HelpAssistantAnswer {
@@ -407,6 +421,15 @@ export function validateHelpAssistantAnswer(
   answer: HelpAssistantAnswer,
   allowedSourceIds: string[],
 ): HelpAssistantValidation {
+  if (
+    answer.text.length > HELP_MAX_ANSWER_CHARS ||
+    answer.uncertainty.length > HELP_MAX_UNCERTAINTY_CHARS
+  ) {
+    return { accepted: false, reason: "answer-too-large" };
+  }
+  if (answer.citations.length > HELP_MAX_CITATIONS) {
+    return { accepted: false, reason: "too-many-citations" };
+  }
   if (!answer.text.trim()) return { accepted: false, reason: "empty-answer" };
   if (answer.citations.length === 0) {
     return { accepted: false, reason: "missing-citation" };
@@ -429,6 +452,8 @@ export type HelpSemanticValidation = {
     | "duplicate-article"
     | "invalid-score"
     | "missing-rationale"
+    | "oversized-field"
+    | "too-many-results"
     | "missing-uncertainty";
 };
 
@@ -438,13 +463,26 @@ export function validateHelpSemanticAnswer(
   allowedArticleIds: string[],
 ): HelpSemanticValidation {
   if (answer.results.length === 0) return { accepted: false, reason: "empty-results" };
+  if (answer.results.length > HELP_MAX_SEMANTIC_RESULTS) {
+    return { accepted: false, reason: "too-many-results" };
+  }
+  if (
+    answer.uncertainty.length > HELP_MAX_SEMANTIC_FIELD_CHARS ||
+    answer.results.some((result) => result.rationale.length > HELP_MAX_SEMANTIC_FIELD_CHARS)
+  ) {
+    return { accepted: false, reason: "oversized-field" };
+  }
   if (answer.results.some((result) => !allowedArticleIds.includes(result.articleId))) {
     return { accepted: false, reason: "unknown-article" };
   }
   if (new Set(answer.results.map((result) => result.articleId)).size !== answer.results.length) {
     return { accepted: false, reason: "duplicate-article" };
   }
-  if (answer.results.some((result) => result.score < 0 || result.score > 1)) {
+  if (
+    answer.results.some(
+      (result) => !Number.isFinite(result.score) || result.score < 0 || result.score > 1,
+    )
+  ) {
     return { accepted: false, reason: "invalid-score" };
   }
   if (answer.results.some((result) => !result.rationale.trim())) {

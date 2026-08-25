@@ -139,6 +139,14 @@ describe("offline Help Center corpus", () => {
       { text: "The route is configured.", citations: ["provider.profiles"], uncertainty: "Live evidence is separate." },
       sourceIds,
     )).toEqual({ accepted: true, reason: "accepted" });
+    expect(validateHelpAssistantAnswer(
+      { text: "x".repeat(12_001), citations: ["provider.profiles"], uncertainty: "bounded" },
+      sourceIds,
+    ).reason).toBe("answer-too-large");
+    expect(validateHelpAssistantAnswer(
+      { text: "bounded", citations: Array.from({ length: 17 }, () => "provider.profiles"), uncertainty: "bounded" },
+      sourceIds,
+    ).reason).toBe("too-many-citations");
   });
 
   it("parses only the strict assistant envelope and fails closed", () => {
@@ -194,6 +202,22 @@ describe("offline Help Center corpus", () => {
       { results: [{ articleId: "providers.gateway", score: 0.8, rationale: "bounded" }], uncertainty: "  " },
       HELP_ARTICLES.map((article) => article.id),
     ).reason).toBe("missing-uncertainty");
+    expect(validateHelpSemanticAnswer(
+      { results: [{ articleId: "providers.gateway", score: Number.NaN, rationale: "bounded" }], uncertainty: "bounded" },
+      HELP_ARTICLES.map((article) => article.id),
+    ).reason).toBe("invalid-score");
+    expect(validateHelpSemanticAnswer(
+      { results: [{ articleId: "providers.gateway", score: 0.8, rationale: "x".repeat(2_001) }], uncertainty: "bounded" },
+      HELP_ARTICLES.map((article) => article.id),
+    ).reason).toBe("oversized-field");
+    expect(validateHelpSemanticAnswer(
+      { results: Array.from({ length: 25 }, (_, index) => ({
+        articleId: HELP_ARTICLES[index % HELP_ARTICLES.length].id,
+        score: 0.5,
+        rationale: "bounded",
+      })), uncertainty: "bounded" },
+      HELP_ARTICLES.map((article) => article.id),
+    ).reason).toBe("too-many-results");
     expect(parseHelpSemanticAnswer("not JSON").results).toEqual([]);
   });
 
