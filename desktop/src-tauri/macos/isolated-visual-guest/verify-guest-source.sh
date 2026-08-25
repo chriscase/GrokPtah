@@ -36,7 +36,9 @@ for required in staged_output_image staged_output_manifest \
   -fuse-ld=lld -nostdlib -static -fno-builtin -fno-pie -O2 \
   '-Wl,-e,_start' '-Wl,--build-id=none' '-Wl,-z,noexecstack' \
   '-O "$kernel"' \
-  'CONFIG_BLK_DEV_INITRD=y'; do
+  'CONFIG_BLK_DEV_INITRD=y' \
+  'CONFIG_*=n)' \
+  '# ${name} is not set'; do
   grep -F -- "$required" "$script_dir/build-guest-image.sh" >/dev/null
 done
 jq -e '
