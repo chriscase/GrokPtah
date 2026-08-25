@@ -2041,14 +2041,18 @@ async fn accepted_queued_prompt_restarts_from_private_intent_exactly_once() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let full_prompt = "private queued prompt must survive service replacement";
+    let full_prompt = format!(
+        "{} SECRET-QUEUED-PROMPT-MUST-NOT-LEAK",
+        "private queued prompt ".repeat(12)
+    );
+    let private_marker = "SECRET-QUEUED-PROMPT-MUST-NOT-LEAK";
     let accepted = primary
         .submit_task_with_execution_mode_and_queue(
             &auth,
             "durability-queued",
             queued.id,
             ws.path(),
-            full_prompt.into(),
+            full_prompt.clone(),
             None,
             RunExecutionMode::Shared,
             true,
@@ -2060,7 +2064,7 @@ async fn accepted_queued_prompt_restarts_from_private_intent_exactly_once() {
     let public = primary.get_run(&auth, &run_id).unwrap();
     assert!(!serde_json::to_string(&public)
         .unwrap()
-        .contains(full_prompt));
+        .contains(private_marker));
     let private_entries = std::fs::read_dir(primary.store().root().join("acceptance"))
         .unwrap()
         .flatten()
@@ -2072,7 +2076,7 @@ async fn accepted_queued_prompt_restarts_from_private_intent_exactly_once() {
     assert_eq!(private_entries.len(), 1);
     assert!(std::fs::read_to_string(private_entries[0].path())
         .unwrap()
-        .contains(full_prompt));
+        .contains(private_marker));
 
     let store = primary.store().clone();
     drop(primary);
@@ -2116,7 +2120,7 @@ async fn accepted_queued_prompt_restarts_from_private_intent_exactly_once() {
             "durability-queued",
             queued.id,
             ws.path(),
-            full_prompt.into(),
+            full_prompt.clone(),
             None,
             RunExecutionMode::Shared,
             true,
