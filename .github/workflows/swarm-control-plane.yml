@@ -48,7 +48,7 @@ jobs:
       - name: Format and verify locked metadata
         run: |
           cargo fmt -p grokptah-swarm-control-plane -- --check
-          cargo metadata --locked --no-deps --format-version 1 --package grokptah-swarm-control-plane
+          cargo metadata --locked --no-deps --format-version 1
       - name: Focused graph and projection tests
         run: |
           cargo test -p grokptah-swarm-control-plane --locked --test graph_validation
