@@ -227,7 +227,12 @@ pub struct RunEventPage {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum RunNotification {
     /// A scoped event journal update.
-    Event { scope: RunScope, event: RunEvent },
+    Event {
+        /// Run identity for the event.
+        scope: RunScope,
+        /// Durable event payload.
+        event: RunEvent,
+    },
     /// The client must poll before reconnecting.
     Recovery {
         /// Exact run identity that needs recovery.
