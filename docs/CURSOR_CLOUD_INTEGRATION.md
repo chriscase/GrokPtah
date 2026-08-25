@@ -120,8 +120,9 @@ path is qualified.
    desktop and browser-safe broker, with explicit user-visible provider and
    cost/usage labels. The staged browser client now has typed launch, status,
    list, archive/unarchive, artifact, and cancellation calls; the trusted native
-   lifecycle adapter is staged, while server routes and live qualification
-   remain to be completed.
+   lifecycle adapter is staged. Published schema, embedding, and web-broker
+   protocol now document the list/archive/unarchive seam; ContextDesk HTTP
+   handlers and live qualification remain to be completed.
 5. **Release gate:** independently review the adapter, run a retry/restart
    soak, and prove that approval, promotion, and Computer Use remain separate.
 

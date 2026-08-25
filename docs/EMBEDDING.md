@@ -24,21 +24,28 @@ Products that want GrokPtah to launch and monitor an external coding agent
 should import the `external_worker` contracts from `grokptah-agent-sdk` rather
 than inventing provider-specific DTOs. The contract covers an exact-ref,
 isolated launch request, opaque worker/run identities, redacted event updates,
-and bounded relative artifact references. The provider adapter keeps its API
-key and network client in the trusted service; the desktop and War Room UI
-receive only the redacted projections and existing review/approval receipts.
+bounded relative artifact references, identity-only list pages, and explicit
+archive/unarchive. The provider adapter keeps its API key and network client in
+the trusted service; the desktop and War Room UI receive only the redacted
+projections and existing review/approval receipts.
 
 The JSON representation is versioned at
 [`grokptah-external-worker.v1.schema.json`](./schemas/grokptah-external-worker.v1.schema.json).
-The initial Cursor Cloud adapter remains a qualification task; the contract is
-already reusable by ContextDesk, another Rust service, or a future TypeScript
-broker adapter.
+List uses `$defs.listQuery`, `$defs.summary`, and `$defs.listPage`: `limit` is
+1..=100, `cursor` is an opaque identity, summaries omit repository and starting
+ref, and `includeArchived` omitted means false. Brokers must send that flag
+explicitly so a provider default of true is never inherited. Archive and
+unarchive are reversible worker-lifecycle POSTs; they are not cancel, and
+cancel never archives. The initial Cursor Cloud adapter remains a qualification
+task; the contract is already reusable by ContextDesk, another Rust service, or
+a future TypeScript broker adapter.
 
 The Rust SDK and Tauri-free TypeScript parser enforce the same safety floor:
 external launches keep `autoCreatePr` false, worker URLs are credential-free
-HTTPS references (with Cursor URLs restricted to `cursor.com`), and redacted
-event/detail projections reject control characters, host paths, URLs, and
-credential-like needles. Recovery snapshots are bounded to the retained
+HTTPS references (with Cursor URLs restricted to `cursor.com`), list pages fail
+closed on unknown fields, duplicates, oversized pages, and privileged URLs, and
+redacted event/detail projections reject control characters, host paths, URLs,
+and credential-like needles. Recovery snapshots are bounded to the retained
 256-event window and must be contiguous before they can clear a recovery
 fence. These are validation boundaries, not proof that a provider account or
 live broker route has been qualified.

@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   GrokPtahBrokerClient,
+  GROKPTAH_BROKER_EXTERNAL_WORKER_ROUTES,
   HELP_CONTRACT,
   EXTERNAL_WORKER_CONTRACT,
   createExternalWorkerMonitor,
+  parseExternalWorkerListPage,
+  parseExternalWorkerListQuery,
+  parseExternalWorkerSummary,
   replaceExternalWorkerMonitor,
   parseCapabilitySet,
   promptQueueReducer,
@@ -16,6 +20,11 @@ describe("public integration barrel", () => {
     expect(typeof parseCapabilitySet).toBe("function");
     expect(typeof promptQueueReducer).toBe("function");
     expect(EXTERNAL_WORKER_CONTRACT).toBe("grokptah.external-workers.v1");
+    expect(typeof parseExternalWorkerListQuery).toBe("function");
+    expect(typeof parseExternalWorkerListPage).toBe("function");
+    expect(typeof parseExternalWorkerSummary).toBe("function");
+    expect(GROKPTAH_BROKER_EXTERNAL_WORKER_ROUTES.some((route) => route.id === "list")).toBe(true);
+    expect(GROKPTAH_BROKER_EXTERNAL_WORKER_ROUTES.some((route) => route.id === "archive")).toBe(true);
     expect(createExternalWorkerMonitor().lastSeq).toBe(-1);
     expect(typeof replaceExternalWorkerMonitor).toBe("function");
   });

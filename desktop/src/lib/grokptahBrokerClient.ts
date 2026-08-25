@@ -24,6 +24,29 @@ import {
   type ExternalWorkerRecord,
   type ExternalWorkerRunRecord,
 } from "./externalWorker";
+import {
+  grokptahBrokerExternalWorkerArchivePath,
+  grokptahBrokerExternalWorkerCollectionPath,
+  grokptahBrokerExternalWorkerListPath,
+  grokptahBrokerExternalWorkerUnarchivePath,
+} from "./grokptahBrokerRoutes";
+
+export {
+  EXTERNAL_WORKER_LIST_DEFAULT_LIMIT,
+  EXTERNAL_WORKER_LIST_INCLUDE_ARCHIVED_DEFAULT,
+  EXTERNAL_WORKER_LIST_MAX_LIMIT,
+  GROKPTAH_BROKER_EXTERNAL_WORKER_ROUTES,
+  grokptahBrokerExternalWorkerArchivePath,
+  grokptahBrokerExternalWorkerCollectionPath,
+  grokptahBrokerExternalWorkerListPath,
+  grokptahBrokerExternalWorkerRoute,
+  grokptahBrokerExternalWorkerUnarchivePath,
+} from "./grokptahBrokerRoutes";
+export type {
+  GrokPtahBrokerExternalWorkerRoute,
+  GrokPtahBrokerExternalWorkerRouteId,
+  GrokPtahBrokerRouteClass,
+} from "./grokptahBrokerRoutes";
 
 export type GrokPtahBrokerCapability = {
   id: string;
@@ -590,7 +613,7 @@ export class GrokPtahBrokerClient {
       throw new GrokPtahBrokerError(0, "invalid_request", "External worker requestId must match Idempotency-Key");
     }
     const result = await this.requestValidated(
-      `/bindings/${segment(bindingId)}/external-workers`,
+      grokptahBrokerExternalWorkerCollectionPath(segment(bindingId)),
       parseExternalWorkerLaunchResult,
       { method: "POST", idempotencyKey, body: request },
     );
@@ -656,12 +679,8 @@ export class GrokPtahBrokerClient {
     if (parsed === null) {
       throw new GrokPtahBrokerError(0, "invalid_request", "External worker list query is invalid");
     }
-    const params = new URLSearchParams();
-    if (parsed.limit !== undefined) params.set("limit", String(parsed.limit));
-    if (parsed.cursor !== undefined) params.set("cursor", parsed.cursor);
-    params.set("includeArchived", parsed.includeArchived === true ? "true" : "false");
     const page = await this.requestValidated(
-      `/bindings/${segment(bindingId)}/external-workers?${params.toString()}`,
+      grokptahBrokerExternalWorkerListPath(segment(bindingId), parsed),
       parseExternalWorkerListPage,
       {},
     );
@@ -681,7 +700,7 @@ export class GrokPtahBrokerClient {
     idempotencyKey: string,
   ): Promise<ExternalWorkerRecord> {
     const worker = await this.requestValidated(
-      `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/archive`,
+      grokptahBrokerExternalWorkerArchivePath(segment(bindingId), segment(externalAgentId)),
       parseExternalWorkerRecord,
       { method: "POST", idempotencyKey },
     );
@@ -698,7 +717,7 @@ export class GrokPtahBrokerClient {
     idempotencyKey: string,
   ): Promise<ExternalWorkerRecord> {
     const worker = await this.requestValidated(
-      `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/unarchive`,
+      grokptahBrokerExternalWorkerUnarchivePath(segment(bindingId), segment(externalAgentId)),
       parseExternalWorkerRecord,
       { method: "POST", idempotencyKey },
     );

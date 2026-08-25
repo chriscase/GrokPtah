@@ -1251,7 +1251,10 @@ mod tests {
             fake_list_item(AGENT_2, archived.contains(AGENT_2), "2026-08-24T00:00:05Z"),
             fake_list_item(AGENT_1, archived.contains(AGENT_1), "2026-08-24T00:00:01Z"),
         ];
-        if query.include_archived != Some(true) {
+        // Cursor REST defaults includeArchived to true. GrokPtah adapters must
+        // send the flag explicitly so omitted never inherits that default.
+        let include_archived = query.include_archived.unwrap_or(true);
+        if !include_archived {
             items.retain(|item| item["status"] != "ARCHIVED");
         }
         if let Some(cursor) = &query.cursor {
@@ -1662,6 +1665,36 @@ mod tests {
             missing,
             Err(ExternalWorkerAdapterError::Provider { status }) if status.as_u16() == 404
         ));
+    }
+
+    #[tokio::test]
+    async fn fake_cursor_api_refuses_follow_up_after_archive_and_does_not_archive_on_cancel() {
+        let state = FakeCursorState::default();
+        let address = spawn_app(lifecycle_router(state.clone())).await;
+        let adapter = CursorCloudAdapter::for_test(&address);
+
+        let cancelled = adapter.cancel(AGENT_1, RUN_1).await.unwrap();
+        assert_eq!(cancelled.state, ExternalWorkerState::Cancelled);
+        assert!(state.archive_posts.lock().unwrap().is_empty());
+
+        let archived = adapter.archive(AGENT_1).await.unwrap();
+        assert_eq!(archived.state, ExternalWorkerState::Archived);
+        let refused = adapter
+            .follow_up(
+                AGENT_1,
+                &ExternalWorkerFollowUpRequest {
+                    request_id: "follow-up-archived".into(),
+                    prompt: "Must not run after archive".into(),
+                    bounds: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            refused,
+            ExternalWorkerAdapterError::InvalidRequest(_)
+        ));
+        assert_eq!(state.unarchive_posts.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]
