@@ -88,8 +88,8 @@ pub struct ExternalWorkerLaunchRequest {
     pub model: Option<String>,
     /// External work is isolated by contract.
     pub execution_mode: ExternalWorkerExecutionMode,
-    /// Whether the provider may create a draft PR. Promotion/merge is never
-    /// implied by this field and remains a separate approval action.
+    /// Reserved for wire compatibility; external launches must keep this
+    /// false. Promotion/merge is a separate approval action.
     #[serde(default)]
     pub auto_create_pr: bool,
     /// Optional host/provider ceilings for the initial run.
@@ -105,6 +105,9 @@ impl ExternalWorkerLaunchRequest {
         validate_ref(&self.starting_ref, "starting_ref")?;
         if self.prompt.trim().is_empty() || self.prompt.len() > MAX_EXTERNAL_WORKER_PROMPT_BYTES {
             return Err("prompt must be non-empty and bounded");
+        }
+        if self.auto_create_pr {
+            return Err("external worker launches must not create pull requests");
         }
         if let Some(provider_id) = &self.provider_id {
             validate_identity(provider_id, "provider_id")?;
@@ -194,15 +197,7 @@ impl ExternalWorkerRecord {
             validate_ref(branch, "branch")?;
         }
         if let Some(url) = &self.worker_url {
-            if url.trim().is_empty()
-                || url.len() > MAX_EXTERNAL_WORKER_REF_BYTES
-                || !url.starts_with("https://")
-                || url
-                    .chars()
-                    .any(|character| matches!(character, '\n' | '\r' | '\0'))
-            {
-                return Err("worker_url must be a bounded https URL");
-            }
+            validate_worker_url(url, self.provider)?;
         }
         if self.created_at.trim().is_empty() || self.updated_at.trim().is_empty() {
             return Err("worker timestamps must not be empty");
@@ -349,6 +344,38 @@ fn validate_identity(value: &str, field: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn validate_worker_url(value: &str, provider: ExternalWorkerProvider) -> Result<(), &'static str> {
+    if value.trim().is_empty()
+        || value.len() > MAX_EXTERNAL_WORKER_REF_BYTES
+        || !value.starts_with("https://")
+        || value
+            .chars()
+            .any(|character| character.is_control() || character == '\u{7f}')
+        || value.contains('?')
+        || value.contains('#')
+    {
+        return Err("worker_url must be a bounded credential-free https URL");
+    }
+    let authority = value["https://".len()..]
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err("worker_url must not contain userinfo");
+    }
+    if provider == ExternalWorkerProvider::CursorCloud {
+        let host = authority
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if host != "cursor.com" && !host.ends_with(".cursor.com") {
+            return Err("cursor worker_url must use cursor.com");
+        }
+    }
+    Ok(())
+}
+
 fn validate_ref(value: &str, field: &str) -> Result<(), &'static str> {
     if value.trim().is_empty() {
         return Err(match field {
@@ -380,6 +407,37 @@ fn validate_detail(value: &str, field: &str) -> Result<(), &'static str> {
             "terminal_result" => "terminal_result exceeds its byte bound",
             _ => "worker detail exceeds its byte bound",
         });
+    }
+    let lower = value.to_ascii_lowercase();
+    if value
+        .chars()
+        .any(|character| character.is_control() || character == '\u{7f}')
+        || [
+            "/users/",
+            "/private/",
+            "/var/",
+            "/tmp/",
+            "/home/",
+            "/volumes/",
+            "\\users\\",
+            "http://",
+            "https://",
+            "authorization",
+            "bearer ",
+            "api_key",
+            "xai_api_key",
+            "grokptah_home",
+            "clipboard",
+            "private_key",
+            "password",
+            "cookie",
+            "session_token",
+            "secret",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return Err("worker detail contains privileged data");
     }
     Ok(())
 }
@@ -415,6 +473,16 @@ mod tests {
         assert_eq!(value["startingRef"], "refs/heads/codex/review");
         assert_eq!(value["executionMode"], "isolated");
         assert_eq!(value["autoCreatePr"], false);
+    }
+
+    #[test]
+    fn launch_rejects_pull_request_creation() {
+        let mut request = launch();
+        request.auto_create_pr = true;
+        assert_eq!(
+            request.validate(),
+            Err("external worker launches must not create pull requests")
+        );
     }
 
     #[test]
@@ -465,5 +533,51 @@ mod tests {
             detail: "checking tests".into(),
         };
         assert!(event.validate().is_ok());
+        let mut privileged = event.clone();
+        privileged.detail = "Authorization: secret".into();
+        assert_eq!(
+            privileged.validate(),
+            Err("worker detail contains privileged data")
+        );
+        privileged.detail = "https://example.test/report".into();
+        assert_eq!(
+            privileged.validate(),
+            Err("worker detail contains privileged data")
+        );
+        privileged.detail = "bounded".into();
+        privileged.seq = u64::MAX;
+        assert!(privileged.validate().is_ok());
+    }
+
+    #[test]
+    fn worker_urls_are_credential_free_and_provider_scoped() {
+        let mut worker = ExternalWorkerRecord {
+            provider: ExternalWorkerProvider::CursorCloud,
+            provider_id: None,
+            external_agent_id: "agent-1".into(),
+            repository: "org/repo".into(),
+            starting_ref: "main".into(),
+            state: ExternalWorkerState::Running,
+            branch: None,
+            worker_url: Some("https://cursor.com/agents/agent-1".into()),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        };
+        assert!(worker.validate().is_ok());
+        worker.worker_url = Some("https://cursor.com/agents/agent-1?token=secret".into());
+        assert_eq!(
+            worker.validate(),
+            Err("worker_url must be a bounded credential-free https URL")
+        );
+        worker.worker_url = Some("https://user:secret@cursor.com/agents/agent-1".into());
+        assert_eq!(
+            worker.validate(),
+            Err("worker_url must not contain userinfo")
+        );
+        worker.worker_url = Some("https://evil.example/agents/agent-1".into());
+        assert_eq!(
+            worker.validate(),
+            Err("cursor worker_url must use cursor.com")
+        );
     }
 }
