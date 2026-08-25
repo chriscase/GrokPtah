@@ -1324,8 +1324,13 @@ impl OrchestrationService {
             cancellation_reason: None,
             completed_at: Utc::now(),
         };
+        // The coding loop converts provider/transport errors into a completed
+        // turn whose summary starts with "Agent failed:". Managed native Work
+        // must still fail-closed so Always-On replacement (GROKBOT_FORCE_FAIL)
+        // can run. Direct operator submit_task terminals are unchanged.
+        let agent_loop_failed = result.summary.starts_with("Agent failed:");
         let outcome = match run.state {
-            RunState::Completed => {
+            RunState::Completed if !agent_loop_failed => {
                 let outcome = if self
                     .store
                     .load_work_item(&intent.work_id)
@@ -1364,7 +1369,11 @@ impl OrchestrationService {
                         &intent.intent_id,
                         retry_eligible,
                         ManagedRetryCause::Failed,
-                        result.failure.as_deref().unwrap_or("managed run failed"),
+                        result.failure.as_deref().unwrap_or(if agent_loop_failed {
+                            "managed run completed with an agent-loop failure"
+                        } else {
+                            "managed run failed"
+                        }),
                         Utc::now(),
                     )
                     .map(|_| ())

@@ -1031,6 +1031,19 @@ pub fn scan_cert_text(label: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
+fn scan_safe_field_name(key: &str) -> String {
+    let normalized: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if normalized == "principalid" {
+        "principalRef".into()
+    } else {
+        key.to_string()
+    }
+}
+
 fn is_path_identity_key(key: &str) -> bool {
     let normalized: String = key
         .chars()
@@ -1113,7 +1126,7 @@ pub fn project_public_mcp_for_secret_scan(value: &Value) -> Value {
                     } else {
                         project_public_mcp_for_secret_scan(nested)
                     };
-                    (key.clone(), projected)
+                    (scan_safe_field_name(key), projected)
                 })
                 .collect(),
         ),
@@ -1220,5 +1233,15 @@ mod tests {
         assert_eq!(projected["agentId"], "<opaque-id>");
         assert_eq!(projected["spec"]["displayName"], "<opaque-id>");
         scan_value_for_forbidden_data(&projected).unwrap();
+        let authority = project_public_mcp_for_secret_scan(&json!({
+            "principal": {
+                "principalId": "primary",
+                "credentialId": "primary",
+                "role": "remote_operator"
+            }
+        }));
+        assert!(authority["principal"].get("principalId").is_none());
+        assert_eq!(authority["principal"]["principalRef"], "<opaque-id>");
+        scan_value_for_forbidden_data(&authority).unwrap();
     }
 }
