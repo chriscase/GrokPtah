@@ -23,6 +23,8 @@ pub mod external_worker;
 pub mod launch;
 /// Typed terminal outcomes for runs that could not succeed.
 pub mod outcome;
+/// The immutable carrier that authorises exactly one physical provider request.
+pub mod resolved;
 /// Durable run, review, and event types.
 pub mod run;
 
@@ -59,6 +61,10 @@ pub use launch::{
     ProviderClass, Refreshability, RequestDialect, RouteClass,
 };
 pub use outcome::{RunFailureKind, RunOutcomeClass, TerminalVerdict};
+pub use resolved::{
+    EndpointIdentity, GROK_RESOLVED_CONTRACT_VERSION, GROK_RESOLVED_SCHEMA_VERSION, RequestBinding,
+    RequestDigest, ResolvedRequest, ResolvedRequestParts,
+};
 pub use run::{
     Bounds, ChangedFile, DurableRun, DurableRunState, ExecutionMode, IdempotencyKey, ReviewReceipt,
     RunEvent, RunEventPage, RunNotification, RunScope, SubmitTaskRequest,

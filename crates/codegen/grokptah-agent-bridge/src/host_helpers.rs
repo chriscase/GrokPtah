@@ -1238,7 +1238,7 @@ pub(crate) fn parse_effort_arg(raw: &str) -> EffortLevel {
 
 /// Ask the model for a short numbered plan (no tools).
 pub(crate) async fn propose_plan_with_model(
-    creds: &crate::auth_store::WireCredentials,
+    session_id: uuid::Uuid,
     model: &str,
     cwd: &Path,
     goal: &str,
@@ -1253,7 +1253,7 @@ pub(crate) async fn propose_plan_with_model(
         cwd.display()
     );
     let text = call_xai_chat(
-        creds,
+        session_id,
         model,
         &[("user".into(), prompt)],
         None,
@@ -1531,7 +1531,7 @@ pub(crate) fn resolve_model_target(
     })
 }
 
-fn apply_effort_to_agent_body(
+pub(crate) fn apply_effort_to_agent_body(
     body: &mut serde_json::Value,
     target: &ResolvedModelTarget,
     effort: EffortLevel,
@@ -1708,9 +1708,31 @@ fn ensure_stream_completed(saw_data: bool, stream_completed: bool) -> Result<()>
 /// Stream one chat/completions step (tools + tokens).
 /// Content → `on_delta`; reasoning_content → `on_thought` (#149).
 /// Cancel aborts the HTTP body read within ~one chunk.
+/// The shape of one agent request.
+///
+/// A compatible gateway may accept native tools but reject `tool_choice`, or
+/// accept tools but not streaming. Narrowing either produces a *different*
+/// request, so it is re-admitted and re-sealed under its own digest rather
+/// than edited in place — which is what the previous revision did, leaving the
+/// ledger describing a body that was never sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentRequestShape {
+    stream: bool,
+    tool_choice: bool,
+}
+
+/// Stream one chat/completions step (tools + tokens).
+///
+/// Content → `on_delta`; reasoning_content → `on_thought` (#149).
+/// Cancel aborts the HTTP body read within ~one chunk.
+///
+/// Takes a session rather than a credential: everything the request depends on
+/// is resolved once inside admission, and each physical request — including
+/// every retry and every post-refresh resend — is separately admitted,
+/// separately sealed, and separately recorded.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_xai_agent_step<F, G>(
-    creds: &crate::auth_store::WireCredentials,
+    session_id: uuid::Uuid,
     model: &str,
     effort: EffortLevel,
     messages: &[serde_json::Value],
@@ -1723,102 +1745,85 @@ where
     F: FnMut(&str),
     G: FnMut(&str),
 {
-    let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
-    let target = resolve_model_target(&creds, model)?;
-    if !target.capabilities.tools {
-        bail!(
-            "provider model `{}` is not qualified for coding tools; use Chat or qualify native tool calling first",
-            target.wire_model
-        );
-    }
-    let base = target.base_url.clone();
-    let model_id = target.wire_model.clone();
-    let request_timeout = target.deadline_class.agent_timeout();
-    let client = reqwest::Client::builder()
-        .timeout(request_timeout)
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(format!(
-            "grok/{} (GrokPtah)",
-            crate::auth_store::client_version_header()
-        ))
-        .build()
-        .map_err(|e| anyhow!(e))?;
+    let mut shape = AgentRequestShape {
+        stream: true,
+        tool_choice: true,
+    };
+    let mut last_err: Option<String> = None;
 
-    let mut body = serde_json::json!({
-        "model": model_id,
-        "messages": messages,
-        "tools": tools,
-        "tool_choice": "auto",
-        "stream": target.capabilities.stream
-    });
-    apply_effort_to_agent_body(&mut body, &target, effort)?;
-    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
-
-    let mut last_err = None::<String>;
     for attempt in 0..4u32 {
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
-        let send_once = |c: &crate::auth_store::WireCredentials| {
-            let mut req = client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream");
-            if target.dialect == crate::gateway_config::ProviderDialect::XaiChatCompletions {
-                req = req.header("x-grok-effort", effort.as_str());
-            }
-            let req = crate::auth_store::apply_auth_headers(req, c, &base);
-            req.json(&body)
-        };
 
-        let resp_result = tokio::select! {
-            r = send_once(&creds).send() => r,
-            _ = cancel.cancelled() => bail!("cancelled"),
+        // One admission per physical request. A retry is a new request with a
+        // new digest, a new ordinal, and a new idempotency key.
+        let mut call = crate::request_admission::admit_for_session(
+            session_id,
+            crate::request_admission::CallIntent {
+                model_selection: model,
+                effort,
+                messages,
+                tools: Some(tools),
+                stream: shape.stream,
+                tool_choice: shape.tool_choice,
+            },
+        )
+        .await
+        .map_err(|reason| {
+            let verdict = crate::launch_truth::refusal_verdict(reason);
+            anyhow!(
+                "launch refused before the request was built: {} ({}/{})",
+                reason.as_str(),
+                verdict.terminal_result(),
+                verdict.error_code_str()
+            )
+        })?;
+
+        let accept = if shape.stream {
+            "text/event-stream"
+        } else {
+            "application/json"
         };
-        let mut resp = match resp_result {
-            Ok(r) => r,
-            Err(e) => {
-                last_err = Some(
-                    if target.dialect
-                        == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
-                    {
-                        if e.is_timeout() {
-                            "configured provider request timed out".into()
-                        } else if e.is_connect() {
-                            "configured provider could not connect".into()
-                        } else {
-                            "configured provider request failed".into()
-                        }
-                    } else {
-                        format!("request error: {e}")
-                    },
-                );
-                if attempt < 3 {
+        let sent = match crate::provider_transport::send_admitted(&mut call, accept, cancel).await {
+            Ok(sent) => sent,
+            Err(error) => {
+                // The ledger has already recorded this request's outcome. It
+                // decides whether another may be issued: a request that may
+                // have executed is never repeated on our own initiative.
+                last_err = Some(error.to_string());
+                if attempt < 3 && call.permits_another_request().unwrap_or(false) {
                     tokio::time::sleep(std::time::Duration::from_millis(400 * (1 << attempt)))
                         .await;
                     continue;
                 }
-                bail!("{}", last_err.unwrap());
+                bail!("{}", last_err.unwrap_or_else(|| error.to_string()));
             }
         };
+        let mut resp = sent.response;
+        let attempt_id = sent.attempt_id.clone();
+        let target_dialect = call.target().dialect;
+        let compatible =
+            target_dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions;
 
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
-            match crate::auth_store::force_refresh(&creds).await {
+        // An expired access token is common. The refresh yields a different
+        // credential, so the resend is a new physical request with its own
+        // attempt, recorded at the advanced credential revision.
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED && call.credentials().oidc_token_auth
+        {
+            match crate::auth_store::force_refresh(call.credentials()).await {
                 Ok(fresh) => {
-                    creds = fresh;
-                    resp = tokio::select! {
-                        r = send_once(&creds).send() => r
-                            .map_err(|e| anyhow!("request error after refresh: {e}"))?,
-                        _ = cancel.cancelled() => bail!("cancelled"),
-                    };
+                    call.rotate_credentials(fresh)?;
+                    resp = crate::provider_transport::send_admitted(&mut call, accept, cancel)
+                        .await?
+                        .response;
                 }
-                Err(e) => {
+                Err(error) => {
                     let text = read_bounded_response_body(resp, cancel)
                         .await
                         .unwrap_or_default();
                     bail!(
-                        "HTTP 401 (refresh failed: {e}): {}",
+                        "HTTP 401 (refresh failed: {error}): {}",
                         text.chars().take(400).collect::<String>()
                     );
                 }
@@ -1834,8 +1839,6 @@ where
                 .await
                 .unwrap_or_default();
             let clipped: String = text.chars().take(400).collect();
-            let compatible =
-                target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions;
             last_err = Some(if status.as_u16() == 429 {
                 if compatible {
                     "configured provider rate limited the request (HTTP 429)".into()
@@ -1858,32 +1861,23 @@ where
             let text = read_bounded_response_body(resp, cancel)
                 .await
                 .unwrap_or_default();
-            // Some compatible gateways support native tools but reject the
-            // optional tool_choice field. Retry once without that foreign
-            // field before changing the streaming contract.
-            if status.as_u16() == 400
-                && target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
-                && body.get("tool_choice").is_some()
-            {
-                if let Some(object) = body.as_object_mut() {
-                    object.remove("tool_choice");
-                }
-                last_err = Some("HTTP 400 (will retry without tool_choice)".into());
+            // Narrowing the request is a different request, so the loop
+            // re-admits rather than editing a body already described by a
+            // recorded attempt.
+            if status.as_u16() == 400 && compatible && shape.tool_choice {
+                shape.tool_choice = false;
+                last_err = Some("HTTP 400 (will re-admit without tool_choice)".into());
                 continue;
             }
-            // Some proxies reject stream+tools — fall back to non-stream once.
-            if attempt < 2
-                && status.as_u16() == 400
-                && body.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
-            {
-                body["stream"] = serde_json::Value::Bool(false);
+            if attempt < 2 && status.as_u16() == 400 && shape.stream {
+                shape.stream = false;
                 last_err = Some(format!(
-                    "HTTP {status} (will retry non-stream): {}",
+                    "HTTP {status} (will re-admit non-stream): {}",
                     text.chars().take(200).collect::<String>()
                 ));
                 continue;
             }
-            if target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions {
+            if compatible {
                 bail!("configured provider returned HTTP {status}");
             }
             bail!(
@@ -1892,31 +1886,23 @@ where
             );
         }
 
-        // Non-stream JSON body (fallback path). Some compatible gateways also
-        // return this shape despite accepting `stream=true`.
         let content_type = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if body.get("stream").and_then(|s| s.as_bool()) == Some(false) {
-            let raw = read_bounded_response_body(resp, cancel).await?;
-            let v: serde_json::Value =
-                serde_json::from_str(&raw).map_err(|e| anyhow!("provider JSON: {e}"))?;
-            // Note: session usage is accumulated in the turn loop when available.
-            let _ = v.get("usage"); // kept for future wire-through of session_id
-            return parse_agent_step_from_message(
-                &v["choices"][0]["message"],
-                false,
-                &mut on_delta,
-                &mut on_thought,
-            );
-        }
-        if content_type.contains("application/json") {
+
+        if !shape.stream || content_type.contains("application/json") {
             let raw = read_bounded_response_body(resp, cancel).await?;
             let value: serde_json::Value =
-                serde_json::from_str(&raw).map_err(|e| anyhow!("provider JSON: {e}"))?;
+                serde_json::from_str(&raw).map_err(|error| anyhow!("provider JSON: {error}"))?;
+            let _ = crate::provider_transport::record_usage(
+                &call,
+                &attempt_id,
+                value["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+                value["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+            );
             return parse_agent_step_from_message(
                 &value["choices"][0]["message"],
                 false,
@@ -1943,7 +1929,7 @@ where
             let Some(chunk) = chunk else {
                 break;
             };
-            let bytes = chunk.map_err(|e| anyhow!("stream: {e}"))?;
+            let bytes = chunk.map_err(|error| anyhow!("stream: {error}"))?;
             if !acc.saw_data {
                 full_body.push(&bytes)?;
             }
@@ -2006,17 +1992,17 @@ where
                 reasoning: reasoning_opt,
             });
         }
-        if let Some(r) = reasoning_opt {
+        if let Some(reasoning) = reasoning_opt {
             // Reasoning-only: already streamed via on_thought; no assistant text.
             return Ok(AgentStep::Final {
                 text: String::new(),
                 streamed: true,
-                reasoning: Some(r),
+                reasoning: Some(reasoning),
             });
         }
         last_err = Some("empty stream response".into());
         if attempt < 3 {
-            body["stream"] = serde_json::Value::Bool(false);
+            shape.stream = false;
             continue;
         }
         bail!("{}", last_err.unwrap());
@@ -2059,24 +2045,21 @@ mod compatible_stream_tests {
         }
     }
 
+    /// Install a compatible provider the *real* resolver can read.
+    ///
+    /// Admission resolves the credential, profile, endpoint, and model itself
+    /// now, so a fixture that handed a synthetic `WireCredentials` straight to
+    /// the transport would no longer exercise the path under test. The
+    /// environment gateway is the one compatible profile whose base URL and
+    /// key are both settable without an OS keychain, and it declares any model
+    /// asked of it.
     fn install_compatible_profile(home: &std::path::Path, base_url: &str) -> String {
         crate::discover::set_grokptah_home_override(Some(home.to_path_buf()));
-        let mut config = crate::gateway_config::GatewayConfig::default();
-        let mut profile = crate::gateway_config::ProviderProfile::openai_compatible(
-            "cancel-test",
-            "Cancellation test",
-            base_url,
-        );
-        let mut model = crate::gateway_config::ProviderModel::unqualified("test-model");
-        model.capabilities.tools = true;
-        model.capabilities.stream = true;
-        model.capabilities.source = crate::gateway_config::CapabilitySource::Measured;
-        model.capabilities.qualification_schema =
-            Some(crate::gateway_config::CAPABILITY_QUALIFICATION_SCHEMA.into());
-        profile.upsert_model(model);
-        config.upsert_profile(profile).unwrap();
-        crate::gateway_config::save(&config).unwrap();
-        crate::gateway_config::model_selection_key("cancel-test", "test-model")
+        unsafe {
+            std::env::set_var("GROKPTAH_API_BASE", base_url);
+            std::env::set_var("GROKPTAH_API_KEY", "synthetic-test-key");
+        }
+        crate::gateway_config::model_selection_key("env-grokptah", "test-model")
     }
 
     #[test]
@@ -2191,13 +2174,16 @@ mod compatible_stream_tests {
                 let temp = tempfile::tempdir().unwrap();
                 let model =
                     install_compatible_profile(temp.path(), &format!("http://{address}/v1"));
-                let credentials = compatible_credentials("cancel-test");
+                let _credentials = compatible_credentials("cancel-test");
+                let session_id = uuid::Uuid::new_v4();
+                let (_ledger, _provenance) =
+                    test_provenance(temp.path(), session_id, "run-cancel-test");
                 let cancel = CancellationToken::new();
                 let cancel_after_delta = cancel.clone();
                 let result = tokio::time::timeout(
                     Duration::from_secs(1),
                     call_xai_agent_step(
-                        &credentials,
+                        session_id,
                         &model,
                         EffortLevel::None,
                         &[serde_json::json!({"role": "user", "content": "synthetic"})],
@@ -2213,10 +2199,40 @@ mod compatible_stream_tests {
                     Ok(_) => panic!("cancelled stalled response unexpectedly succeeded"),
                     Err(error) => error,
                 };
-                assert!(error.to_string().contains("cancelled"));
+                assert!(
+                    error.to_string().contains("cancelled"),
+                    "unexpected error: {error}"
+                );
                 server.abort();
             });
         crate::discover::set_grokptah_home_override(None);
+    }
+
+    /// Register provenance backed by a real on-disk ledger, so a test that
+    /// sends actually records attempts the way production does.
+    fn test_provenance(
+        home: &std::path::Path,
+        session_id: uuid::Uuid,
+        run_id: &str,
+    ) -> (
+        crate::orchestration::OrchStore,
+        crate::request_admission::registry::Guard,
+    ) {
+        let ledger = crate::orchestration::OrchStore::open(home.join("orch"))
+            .expect("open the attempt ledger");
+        let guard = crate::request_admission::registry::register(
+            session_id,
+            crate::request_admission::CallProvenance {
+                run_id: run_id.to_string(),
+                session_id,
+                workspace: home.display().to_string(),
+                tenant: None,
+                project: None,
+                ledger: ledger.clone(),
+                authority: crate::attempt_binding::initial_authority(),
+            },
+        );
+        (ledger, guard)
     }
 
     #[test]
@@ -2233,8 +2249,12 @@ mod compatible_stream_tests {
                 let temp = tempfile::tempdir().unwrap();
                 let model =
                     install_compatible_profile(temp.path(), &format!("http://{address}/v1"));
+                let _credentials = compatible_credentials("cancel-test");
+                let session_id = uuid::Uuid::new_v4();
+                let (_ledger, _provenance) =
+                    test_provenance(temp.path(), session_id, "run-redaction-test");
                 let result = call_xai_chat(
-                    &compatible_credentials("cancel-test"),
+                    session_id,
                     &model,
                     &[("user".into(), "synthetic".into())],
                     None,
@@ -2246,7 +2266,10 @@ mod compatible_stream_tests {
                     Ok(_) => panic!("closed compatible endpoint unexpectedly responded"),
                     Err(error) => error.to_string(),
                 };
-                assert!(error.contains("configured provider"));
+                assert!(
+                    error.contains("configured provider"),
+                    "unexpected error: {error}"
+                );
                 assert!(!error.contains(&address.to_string()));
             });
         crate::discover::set_grokptah_home_override(None);
@@ -2435,27 +2458,143 @@ pub(crate) fn api_context_messages(session: &Session) -> Vec<(String, String)> {
 /// `history` is already windowed (post-`api_context_start`); last entry is
 /// typically the current user prompt. `compacted_summary` is the extractive
 /// stand-in for local-only prefix that left the context window.
+/// One non-streaming chat completion, through the admitted send boundary.
+///
+/// Takes a session rather than a credential: the credential, the provider
+/// profile, the base endpoint, and the wire model are all resolved once inside
+/// [`crate::request_admission::admit_for_session`], and the exact bytes it
+/// seals are what go out. Nothing is re-resolved here.
 pub(crate) async fn call_xai_chat(
-    creds: &crate::auth_store::WireCredentials,
+    session_id: uuid::Uuid,
     model: &str,
     history: &[(String, String)],
     compacted_summary: Option<&str>,
     cwd: &Path,
     kind: SessionKind,
 ) -> Result<String> {
-    // Prefer a non-expired / refreshed OIDC access token before the first call.
-    let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
+    let messages = chat_messages(kind, cwd, compacted_summary, history);
+    let mut call = crate::request_admission::admit_for_session(
+        session_id,
+        crate::request_admission::CallIntent {
+            model_selection: model,
+            effort: crate::types::EffortLevel::None,
+            messages: &messages,
+            tools: None,
+            stream: false,
+            tool_choice: false,
+        },
+    )
+    .await
+    .map_err(|reason| {
+        let verdict = crate::launch_truth::refusal_verdict(reason);
+        anyhow!(
+            "launch refused before the request was built: {} ({}/{})",
+            reason.as_str(),
+            verdict.terminal_result(),
+            verdict.error_code_str()
+        )
+    })?;
 
-    // Shared base resolution (#169 gateway envs + OIDC default path).
-    let target = resolve_model_target(&creds, model)?;
-    if !target.capabilities.chat {
-        bail!("provider model `{}` is not chat-capable", target.wire_model);
+    if !call.target().capabilities.chat {
+        bail!(
+            "provider model `{}` is not chat-capable",
+            call.binding().model.value
+        );
     }
-    let base = target.base_url;
-    let model_id = target.wire_model;
-    let request_timeout = target.deadline_class.chat_timeout();
     let is_compatible =
-        target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions;
+        call.target().dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions;
+    let cancel = CancellationToken::new();
+
+    let mut sent =
+        crate::provider_transport::send_admitted(&mut call, "application/json", &cancel).await?;
+
+    // An expired access token is common. A refresh produces a *different*
+    // credential, so the retry is a new physical request with its own attempt
+    // and its own idempotency key rather than a silent resend of the first.
+    if sent.response.status() == reqwest::StatusCode::UNAUTHORIZED
+        && call.credentials().oidc_token_auth
+    {
+        match crate::auth_store::force_refresh(call.credentials()).await {
+            Ok(fresh) => {
+                call.rotate_credentials(fresh)?;
+                sent = crate::provider_transport::send_admitted(
+                    &mut call,
+                    "application/json",
+                    &cancel,
+                )
+                .await?;
+            }
+            Err(error) => {
+                let text = read_bounded_response_body(sent.response, &cancel)
+                    .await
+                    .unwrap_or_default();
+                let clipped: String = text.chars().take(400).collect();
+                bail!(
+                    "HTTP 401 Unauthorized (refresh also failed: {error}). \
+                     Server said: {clipped}. Run `grok login` to re-authenticate."
+                );
+            }
+        }
+    }
+
+    let attempt_id = sent.attempt_id.clone();
+    if !sent.response.status().is_success() {
+        let status = sent.response.status();
+        if is_compatible {
+            bail!("configured provider returned HTTP {status}");
+        }
+        let text = read_bounded_response_body(sent.response, &cancel)
+            .await
+            .unwrap_or_default();
+        let clipped: String = text.chars().take(800).collect();
+        bail!("HTTP {status}: {clipped}");
+    }
+    let raw = read_bounded_response_body(sent.response, &cancel).await?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| anyhow!("provider JSON: {error}"))?;
+
+    // Usage is only knowable once the body is read, so it attaches to the
+    // exact attempt that carried this request.
+    let _ = crate::provider_transport::record_usage(
+        &call,
+        &attempt_id,
+        value["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+        value["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+    );
+
+    if let Some(content) = value["choices"][0]["message"]["content"].as_str() {
+        if !content.is_empty() {
+            return Ok(content.to_string());
+        }
+    }
+    if let Some(content) = value["output_text"].as_str() {
+        if !content.is_empty() {
+            return Ok(content.to_string());
+        }
+    }
+    if let Some(items) = value["output"].as_array() {
+        let parts: Vec<String> = items
+            .iter()
+            .filter_map(|item| item["content"][0]["text"].as_str().map(str::to_string))
+            .collect();
+        if !parts.is_empty() {
+            return Ok(parts.join(""));
+        }
+    }
+    bail!("empty model response")
+}
+
+/// Build the exact message list a chat completion carries.
+///
+/// Split out so the admitted body is assembled in one place and the digest
+/// therefore covers the system preamble and the history, not only the last
+/// user turn.
+fn chat_messages(
+    kind: SessionKind,
+    cwd: &Path,
+    compacted_summary: Option<&str>,
+    history: &[(String, String)],
+) -> Vec<serde_json::Value> {
     let system = match kind {
         SessionKind::Chat => "You are Grok, a helpful, witty AI assistant in GrokPtah. \
              This is a regular conversation — not a coding-agent build session. \
@@ -2467,150 +2606,21 @@ pub(crate) async fn call_xai_chat(
             cwd.display()
         ),
     };
-    let client = reqwest::Client::builder()
-        .timeout(request_timeout)
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(format!(
-            "grok/{} (GrokPtah)",
-            crate::auth_store::client_version_header()
-        ))
-        .build()
-        .map_err(|e| anyhow!(e))?;
-
-    let mut messages = Vec::with_capacity(history.len() + 2);
-    messages.push(serde_json::json!({
-        "role": "system",
-        "content": system
-    }));
-    if let Some(summary) = compacted_summary.filter(|s| !s.is_empty()) {
-        // Carry condensed prior context on the wire without re-sending full local log.
-        messages.push(serde_json::json!({
-            "role": "system",
-            "content": format!(
-                "The conversation was compacted for context limits. \
-                 Full history is retained only on the user's machine.\n\n{summary}"
-            )
-        }));
-    }
-    if history.is_empty() {
-        // Fallback: should not happen once the user turn is on the transcript.
-        messages.push(serde_json::json!({
-            "role": "user",
-            "content": "(empty)"
-        }));
-    } else {
-        for (role, content) in history {
-            let role = match role.as_str() {
-                "assistant" => "assistant",
-                "system" => "system",
-                _ => "user",
-            };
+    let mut messages = vec![serde_json::json!({"role": "system", "content": system})];
+    if let Some(summary) = compacted_summary {
+        if !summary.trim().is_empty() {
             messages.push(serde_json::json!({
-                "role": role,
-                "content": content
+                "role": "system",
+                "content": format!("Earlier conversation summary:\n{summary}")
             }));
         }
     }
-
-    let body = serde_json::json!({
-        "model": model_id,
-        "messages": messages,
-        "stream": false
-    });
-    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
-
-    let send_once = |c: &crate::auth_store::WireCredentials| {
-        let req = client.post(&url).header("Content-Type", "application/json");
-        let req = crate::auth_store::apply_auth_headers(req, c, &base);
-        req.json(&body)
-    };
-
-    let mut resp = send_once(&creds).send().await.map_err(|e| {
-        // Surface classify-able transport failures (DNS, TLS, timeout) so the
-        // UI is not a vague "error sending request".
-        let kind = if e.is_timeout() {
-            "timeout"
-        } else if e.is_connect() {
-            "connect"
-        } else if e.is_request() {
-            "request"
-        } else {
-            "network"
-        };
-        if is_compatible {
-            anyhow!(
-                "configured provider request failed ({kind}); check its connection and request budget"
-            )
-        } else {
-            anyhow!(
-                "request error ({kind}) for {url}: {e}. \
-                 Check network, VPN, and that cli-chat-proxy is reachable."
-            )
-        }
-    })?;
-
-    // One retry after OIDC refresh on 401 (expired access token is common).
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
-        match crate::auth_store::force_refresh(&creds).await {
-            Ok(fresh) => {
-                creds = fresh;
-                resp = send_once(&creds)
-                    .send()
-                    .await
-                    .map_err(|e| anyhow!("request error after refresh for {url}: {e}"))?;
-            }
-            Err(e) => {
-                let text = read_bounded_response_body(resp, &CancellationToken::new())
-                    .await
-                    .unwrap_or_default();
-                let clipped: String = text.chars().take(400).collect();
-                bail!(
-                    "HTTP 401 Unauthorized (refresh also failed: {e}). \
-                     Server said: {clipped}. Run `grok login` to re-authenticate."
-                );
-            }
-        }
-    }
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        if is_compatible {
-            bail!("configured provider returned HTTP {status}");
-        }
-        let text = read_bounded_response_body(resp, &CancellationToken::new())
-            .await
-            .unwrap_or_default();
-        let clipped: String = text.chars().take(800).collect();
-        bail!("HTTP {status}: {clipped}");
-    }
-    let raw = read_bounded_response_body(resp, &CancellationToken::new()).await?;
-    let v: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|error| anyhow!("provider JSON: {error}"))?;
-    // chat/completions shape
-    if let Some(content) = v["choices"][0]["message"]["content"].as_str() {
+    for (role, content) in history {
         if !content.is_empty() {
-            return Ok(content.to_string());
+            messages.push(serde_json::json!({"role": role, "content": content}));
         }
     }
-    // responses API fallback (some catalog models use this backend)
-    if let Some(content) = v["output_text"].as_str() {
-        if !content.is_empty() {
-            return Ok(content.to_string());
-        }
-    }
-    if let Some(arr) = v["output"].as_array() {
-        let mut parts = Vec::new();
-        for item in arr {
-            if let Some(t) = item["content"][0]["text"].as_str() {
-                parts.push(t.to_string());
-            }
-        }
-        if !parts.is_empty() {
-            return Ok(parts.join(""));
-        }
-    }
-    bail!("empty model response: {v}");
+    messages
 }
 
 #[cfg(test)]

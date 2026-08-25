@@ -783,7 +783,11 @@ impl AgentHostHandle {
         if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
             return Ok(resolved.eligibility);
         }
-        qualify_semantic_model(&credentials, &model, effort, &cancel)
+        // A qualification probe is a real provider request, so it is admitted
+        // and recorded against this session's run like any other.
+        let cwd = self.session_cwd(session_id)?;
+        let _provenance = self.register_call_provenance(session_id, &cwd)?;
+        qualify_semantic_model(session_id, &model, effort, &cancel)
             .await
             .context("selected model did not pass bounded Computer qualification")?;
         if cancel.is_cancelled() {
@@ -838,16 +842,12 @@ impl AgentHostHandle {
         if !durable_authority && !session_authority {
             bail!("selected model is not qualified for semantic Computer actions");
         }
-        let proposal = propose_semantic_action(
-            &credentials,
-            &model,
-            effort,
-            objective,
-            observation,
-            &cancel,
-        )
-        .await
-        .context("selected model did not return a valid bounded Computer proposal")?;
+        let cwd = self.session_cwd(session_id)?;
+        let _provenance = self.register_call_provenance(session_id, &cwd)?;
+        let proposal =
+            propose_semantic_action(session_id, &model, effort, objective, observation, &cancel)
+                .await
+                .context("selected model did not return a valid bounded Computer proposal")?;
         if cancel.is_cancelled() {
             bail!("Computer model proposal was cancelled");
         }
@@ -947,6 +947,65 @@ impl AgentHostHandle {
     }
 
     /// Open the single process-owned durable run ledger on first use.
+    /// The approved workspace for one session.
+    fn session_cwd(&self, session_id: Uuid) -> Result<PathBuf> {
+        let guard = self.inner.lock();
+        guard
+            .sessions
+            .get(&session_id)
+            .map(|session| PathBuf::from(&session.cwd))
+            .ok_or_else(|| anyhow!("unknown session"))
+    }
+
+    /// Register where this session's provider calls are attributed and
+    /// recorded, for as long as the returned guard lives.
+    ///
+    /// Every physical provider request made under this session — the turn
+    /// itself, a subagent, a qualification probe, a compaction summary —
+    /// finds this provenance and records an attempt against it. A call made
+    /// with no registration is refused rather than sent unrecorded, so
+    /// forgetting to register fails closed.
+    ///
+    /// The ledger is opened here, not lazily at send time: a host that cannot
+    /// record attempts must not begin a turn that will make them.
+    pub(crate) fn register_call_provenance(
+        &self,
+        session_id: Uuid,
+        cwd: &Path,
+    ) -> Result<crate::request_admission::registry::Guard> {
+        let ledger = self.ensure_orchestration_store()?;
+        self.register_call_provenance_for_run(
+            session_id,
+            cwd,
+            &format!("desktop-{session_id}"),
+            ledger,
+        )
+    }
+
+    /// Register provenance against an explicit durable run.
+    pub(crate) fn register_call_provenance_for_run(
+        &self,
+        session_id: Uuid,
+        cwd: &Path,
+        run_id: &str,
+        ledger: OrchStore,
+    ) -> Result<crate::request_admission::registry::Guard> {
+        Ok(crate::request_admission::registry::register(
+            session_id,
+            crate::request_admission::CallProvenance {
+                run_id: run_id.to_string(),
+                session_id,
+                workspace: cwd.display().to_string(),
+                // No versioned tenant or project store exists yet; recording
+                // "none established" is honest where inventing one is not.
+                tenant: None,
+                project: None,
+                ledger,
+                authority: crate::attempt_binding::initial_authority(),
+            },
+        ))
+    }
+
     pub fn ensure_orchestration_store(&self) -> Result<OrchStore> {
         let mut store = self.orchestration_store.lock();
         if let Some(existing) = store.as_ref() {
@@ -1510,14 +1569,13 @@ impl AgentHostHandle {
         agent_id: Option<String>,
         parent_run_id: Option<String>,
         admission: &crate::launch_truth::Admission,
-    ) -> Option<(String, OrchStore)> {
-        let store = match self.ensure_orchestration_store() {
-            Ok(store) => store,
-            Err(error) => {
-                eprintln!("[grokptah] desktop run ledger unavailable: {error:#}");
-                return None;
-            }
-        };
+    ) -> Result<(String, OrchStore)> {
+        // Fail closed. The previous revision logged a ledger failure and let
+        // the turn proceed unrecorded, which is the one outcome that makes a
+        // spent credential unreconcilable afterwards.
+        let store = self.ensure_orchestration_store().map_err(|error| {
+            anyhow!("cannot start a provider-bound turn without a run ledger: {error:#}")
+        })?;
         let run_id = format!("desktop-{turn_id}");
         let mut bounds = RunBounds::default();
         if let Some(rounds) = max_rounds {
@@ -1564,12 +1622,13 @@ impl AgentHostHandle {
                 agent.current_run_id = Some(run_id.clone());
                 Ok(())
             }) {
-                eprintln!("[grokptah] persistent agent {agent_id} activation failed: {error:#}");
-                return None;
+                return Err(anyhow!(
+                    "cannot start a provider-bound turn: persistent agent {agent_id} \
+                     activation failed: {error:#}"
+                ));
             }
         }
         if let Err(error) = store.save_run(&run) {
-            eprintln!("[grokptah] desktop run {run_id} start persistence failed: {error:#}");
             if let Some(agent_id) = agent_id.as_deref() {
                 let _ = store.update_agent(agent_id, |agent| {
                     if agent.current_run_id.as_deref() == Some(run_id.as_str()) {
@@ -1579,9 +1638,11 @@ impl AgentHostHandle {
                     Ok(())
                 });
             }
-            return None;
+            return Err(anyhow!(
+                "cannot start a provider-bound turn: run {run_id} could not be recorded: {error:#}"
+            ));
         }
-        Some((run_id, store))
+        Ok((run_id, store))
     }
 
     fn start_desktop_run_aggregator(
@@ -2856,24 +2917,23 @@ impl AgentHostHandle {
             (s.cwd.clone(), leaving, g.model.clone())
         };
 
-        // Compaction spends a credential like any other turn, so it passes the
-        // same gate. A refusal is not fatal here: compaction has a
+        // Compaction spends a credential like any other turn, so it goes
+        // through the same admitted boundary and is recorded as its own
+        // provider attempt. A refusal is not fatal here: compaction has a
         // deterministic local fallback, and degrading to it is better than
         // failing the operator's compaction outright.
-        let gated = self.launch_gate.admit(None).await.is_ok();
-        let quality = if !gated || std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
+        let quality = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
             None
-        } else if let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(&model)
-            .map_err(anyhow::Error::msg)?
-        {
+        } else {
             let blob = build_compact_summary(&leaving);
             let prompt = format!(
                 "Summarize this coding-agent conversation for future turns. \
                  Preserve: user goals, decisions, file paths touched, failing tests, open TODOs. \
                  Be dense (≤600 words). Do not invent facts.\n\n{blob}"
             );
+            let _provenance = self.register_call_provenance(id, &cwd)?;
             match call_xai_chat(
-                &creds,
+                id,
                 &model,
                 &[("user".into(), prompt)],
                 None,
@@ -2882,11 +2942,11 @@ impl AgentHostHandle {
             )
             .await
             {
-                Ok(t) if !t.trim().is_empty() => Some(format!("LLM compact summary:\n{t}")),
+                Ok(text) if !text.trim().is_empty() => {
+                    Some(format!("LLM compact summary:\n{text}"))
+                }
                 _ => None,
             }
-        } else {
-            None
         };
 
         self.compact_session_with_summary(id, quality)
@@ -5488,11 +5548,14 @@ impl AgentHostHandle {
             .as_ref()
             .map(|execution| PathBuf::from(&execution.execution_workspace))
             .unwrap_or_else(|| cwd.clone());
-        let desktop_run = if external_run.is_none() && kind == SessionKind::Build {
+        // Every provider-bound turn gets a durable run, Chat included. The
+        // previous revision gave one only to Build turns, so a Chat turn spent
+        // a credential with nothing to attribute it to.
+        let desktop_run = if external_run.is_none() {
             let admission = admission
                 .as_ref()
                 .expect("every gated turn resolves an admission above");
-            self.begin_desktop_run(
+            Some(self.begin_desktop_run(
                 session_id,
                 &cwd,
                 &prompt,
@@ -5503,9 +5566,21 @@ impl AgentHostHandle {
                 agent.as_ref().map(|agent| agent.agent_id.clone()),
                 resume.as_ref().map(|plan| plan.parent_run_id.clone()),
                 admission,
-            )
+            )?)
         } else {
             None
+        };
+        // Register where this turn's provider calls are recorded. Held for the
+        // whole turn: every call made under this session, including subagents
+        // and probes, finds it, and a call made without it is refused.
+        let _call_provenance = match desktop_run.as_ref() {
+            Some((run_id, store)) => Some(self.register_call_provenance_for_run(
+                session_id,
+                &execution_cwd,
+                run_id,
+                store.clone(),
+            )?),
+            None => None,
         };
         let mut desktop_aggregator = desktop_run.as_ref().map(|(run_id, store)| {
             self.start_desktop_run_aggregator(run_id, session_id, store.clone())
@@ -5810,29 +5885,20 @@ impl AgentHostHandle {
                     .ok_or_else(|| anyhow!("unknown session"))?;
                 (api_context_messages(s), s.compacted_summary.clone())
             };
-            let reply = if let Some(creds) =
-                crate::auth_store::resolve_wire_credentials_for_model(model)
-                    .map_err(anyhow::Error::msg)?
-            {
-                match call_xai_chat(
-                    &creds,
-                    model,
-                    &wire_messages,
-                    compacted_summary.as_deref(),
-                    cwd,
-                    SessionKind::Chat,
-                )
-                .await
-                {
-                    Ok(text) => text,
-                    Err(e) => format!(
-                        "Model call failed: {e}\n\nAuth: {} ({})\nRun `grok login` if needed.",
-                        creds.display_name, creds.method
-                    ),
-                }
-            } else {
-                "No credentials. Run `grok login` or save an API key to chat.".into()
-            };
+            // A provider, auth, or transport failure is not an answer. The
+            // previous revision formatted it as assistant text, which made a
+            // failed Chat turn indistinguishable from a successful one in the
+            // transcript, the run state, and the UI. It now propagates, so the
+            // turn is recorded as failed or indeterminate.
+            let reply = call_xai_chat(
+                session_id,
+                model,
+                &wire_messages,
+                compacted_summary.as_deref(),
+                cwd,
+                SessionKind::Chat,
+            )
+            .await?;
             // One message event for live UI; invoke return is the finalize
             // source of truth (SessionPane strips streamed assistants).
             emit_message(&event_tx, session_id, &reply);
@@ -5852,10 +5918,8 @@ impl AgentHostHandle {
                 .to_string();
             let steps = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
                 offline_plan_steps(&goal)
-            } else if let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(model)
-                .map_err(anyhow::Error::msg)?
-            {
-                match propose_plan_with_model(&creds, model, cwd, &goal, &cancel).await {
+            } else {
+                match propose_plan_with_model(session_id, model, cwd, &goal, &cancel).await {
                     Ok(s) if !s.is_empty() => s,
                     Ok(_) => offline_plan_steps(&goal),
                     Err(e) => {
@@ -5864,8 +5928,6 @@ impl AgentHostHandle {
                         s
                     }
                 }
-            } else {
-                offline_plan_steps(&goal)
             };
 
             {
@@ -6811,7 +6873,7 @@ impl AgentHostHandle {
             });
 
             let step = match call_xai_agent_step(
-                creds,
+                session_id,
                 model,
                 effort,
                 &messages,
@@ -8071,26 +8133,24 @@ impl AgentHostHandle {
         let mut summary = parts.join("\n\n");
         if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_none() {
             let model = self.inner.lock().model.clone();
-            if let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(&model)
-                .map_err(anyhow::Error::msg)?
+            let ask = format!(
+                "You are a read-only explore agent. Summarize findings for the parent agent.\n\
+                 Query: {query}\n\nFindings:\n{}",
+                summary.chars().take(8_000).collect::<String>()
+            );
+            // Runs inside a turn, so it is admitted and recorded against the
+            // parent's run rather than sending unattributed.
+            if let Ok(text) = call_xai_chat(
+                session_id,
+                &model,
+                &[("user".into(), ask)],
+                None,
+                cwd,
+                SessionKind::Build,
+            )
+            .await
             {
-                let ask = format!(
-                    "You are a read-only explore agent. Summarize findings for the parent agent.\n\
-                     Query: {query}\n\nFindings:\n{}",
-                    summary.chars().take(8_000).collect::<String>()
-                );
-                if let Ok(text) = call_xai_chat(
-                    &creds,
-                    &model,
-                    &[("user".into(), ask)],
-                    None,
-                    cwd,
-                    SessionKind::Build,
-                )
-                .await
-                {
-                    summary = format!("{summary}\n\n### Explorer summary\n{text}");
-                }
+                summary = format!("{summary}\n\n### Explorer summary\n{text}");
             }
         }
 
@@ -8350,21 +8410,10 @@ impl AgentHostHandle {
             return;
         }
 
-        // Online: short multi-tool agent loop under child cancel.
-        let creds = match crate::auth_store::resolve_wire_credentials_for_model(
-            &self.inner.lock().model.clone(),
-        ) {
-            Err(error) => {
-                self.finish_subagent(sub_id, "failed", &event_tx, session_id, Some(error));
-                return;
-            }
-            Ok(None) => {
-                let msg = "GP subagent: no credentials";
-                self.finish_subagent(sub_id, "failed", &event_tx, session_id, Some(msg.into()));
-                return;
-            }
-            Ok(Some(c)) => c,
-        };
+        // Online: short multi-tool agent loop under child cancel. The
+        // credential, route, and model are resolved once inside admission, so
+        // there is deliberately no separate pre-resolution here to disagree
+        // with what is actually sent.
         let model = self.inner.lock().model.clone();
         let effort = self.inner.lock().effort;
         let (tools, mcp_index) = coding_agent_tools(&[]);
@@ -8396,7 +8445,7 @@ impl AgentHostHandle {
                 return;
             }
             let step = call_xai_agent_step(
-                &creds,
+                session_id,
                 &model,
                 effort,
                 &messages,

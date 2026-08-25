@@ -115,38 +115,90 @@ true. The state is the lie that is prevented, not the explanation.
 
 ## 6. The send boundary
 
-`ProviderAttempt` records what each request was bound to and whether it left:
+### What the previous revision actually did
 
+The independent review was right, and the code agreed with it:
+
+- The gate was a **turn-level precheck**. It ran once, recorded the session's
+  model and effort at that instant, and then the transport re-resolved
+  credentials, provider profile, base endpoint, and model again just before
+  sending — and again on every retry and after every 401 refresh. Three
+  readings, no guarantee any two agreed, and the record described the first.
+- `call_xai_agent_step` contained a four-iteration retry loop **and** a
+  401-refresh resend, so one `ProviderAttempt` could stand for five physical
+  requests, each independently capable of having executed.
+- The idempotency key was derived and recorded but **never transmitted**.
+- The intent digest covered the **prompt only** — not the system preamble, the
+  history, the tool declarations, the model, or the effort.
+- The retry path **mutated the request body in place** (dropping `tool_choice`,
+  disabling `stream`), so the ledger described a body that was never sent.
+- Desktop run persistence was best-effort: a ledger failure was printed and
+  the turn continued unrecorded. Chat turns had no run at all.
+- A provider, auth, or transport failure in a Chat turn was formatted as
+  **ordinary assistant text**, making a failed turn indistinguishable from a
+  successful one.
+
+### What replaces it
+
+`grokptah_agent_sdk::resolved::ResolvedRequest` is an immutable carrier for
+**one physical request**. It holds the exact bytes that will be transmitted
+alongside the complete binding they were resolved under, and it is:
+
+- **not `Serialize`** — it holds request bytes, which contain user content.
+  Only its `RequestBinding` is persistable, and that carries a digest.
+- **self-digesting** — `seal` computes the digest from the bytes it is handed.
+  A caller never supplies a digest, so bytes paired with some other request's
+  digest is not expressible.
+- **complete** — the digest covers the whole canonical body: system preamble,
+  history, tools, model, effort, and every other field.
+
+The binding carries principal, tenant, project, workspace, and session; the
+provider, the **exact selected profile** (not one inferred from the family),
+an `EndpointIdentity` that pins the exact base URL by fingerprint without
+publishing it, the route, the dialect, the exact wire model, the exact effort,
+the credential method **and its revision**, the decision revisions, the
+digest, the body length, and the source revision.
+
+`request_admission::admit_call` is the only thing that mints one. It resolves
+the credential, enforces launch truth, resolves the route, builds the body, and
+seals — once, in that order, with nothing re-resolved afterwards.
+
+`provider_transport::send_admitted` is the only place a provider request
+physically leaves. It takes an `AdmittedCall` and has no other way to learn a
+URL, a credential, or a body, so an unadmitted send does not typecheck. Its
+ordering is:
+
+```text
+verify bytes match the sealed digest
+persist attempt as known_not_sent   ── crash here: safe to retry
+persist attempt as sending          ── crash here: never auto-retried
+.send()  (with Idempotency-Key)     ── the request may now exist
+settle sent / uncertain
 ```
-KnownNotSent ──► Sending ──► Sent
-                       └───► Uncertain
-```
 
-**Only `KnownNotSent` may auto-retry.** An interrupted `Sending` is
-indistinguishable from a delivered request without asking the provider, so it
-is not auto-retryable however much it looks like one that never left. The
-lattice is strictly forward; nothing rewinds into a retryable state, and the
-durable store enforces that independently of the in-memory type.
+Every one of those ledger writes **fails closed**. A request that cannot be
+recorded is not sent.
 
-Bound into every attempt, write-once:
+One call to `send_admitted` is exactly one HTTP request. A retry is a new
+admission with a new digest, a new ordinal, and a new key, and it only happens
+when the ledger says the previous request provably never left. Narrowing a
+request (dropping `tool_choice`, disabling streaming) **re-admits and re-seals**
+rather than editing a recorded body. A 401 refresh rotates the credential,
+advancing `credential_revision`, and resends as a separate recorded request.
 
-- **subject** — principal (or an explicit "none published" for a bare API-key
-  route), tenant, project, workspace, session. All opaque and bounded; the
-  workspace is a digest, never a path.
-- **authority revisions** — auth, policy, capability, credential. Recorded so
-  a superseded decision is detectable after the fact.
-- **route** — provider, profile, credential method, route class, base
-  category, dialect, model, effort, account reference.
-- **intent** — an opaque digest of the request (never the text), the caller
-  request id, and the **provider idempotency key**, derived from run and
-  ordinal so a restarted host reproduces it exactly.
-- **receipts** — provider request id, run id, token counts, and whether a
-  complete parseable reply arrived.
+### Coverage
 
-Cancel and restart **reconcile the exact attempt**: cancelling moves an
-in-flight attempt to `uncertain` rather than un-sending it, and `retry_run`
-refuses while any attempt is unreconciled, naming the idempotency keys the
-operator needs to settle it.
+Every provider call site now goes through it, enforced by the compiler:
+`run_turn` (Build and Chat), the coding-agent loop, plan proposal, compaction,
+the explore subagent, the GP subagent, and Computer qualification and
+proposal. `call_xai_chat` and `call_xai_agent_step` take a session id rather
+than a credential, and a session with no registered provenance is refused —
+so forgetting to register fails closed rather than sending unrecorded.
+
+Every provider-bound turn now gets a durable run, **Chat included**, and
+`begin_desktop_run` returns an error rather than `None` when the ledger is
+unavailable. A Chat provider failure now propagates instead of becoming
+assistant text.
 
 ## 7. What is never claimed
 
@@ -192,25 +244,61 @@ and model-id patterns are asserted to accept and refuse exactly what the Rust
 constructors do. That check already caught one real drift (the schema pattern
 allowed `..` where Rust refused it).
 
-## 10. Known gaps
+## 10. Residual risks
 
-These are listed rather than papered over.
+Stated plainly, because a review that has to find these itself is a review
+that cannot trust anything else here.
 
-- **TypeScript peer and the account badge.** The desktop `App`, components,
-  and source viewer are out of scope for this branch, so the TS strict peer
-  for `grokptah.launch.v1` / `grokptah.attempt.v1`, and the DOM/accessibility
-  work for opaque account ids and live blocking announcements, are not done
-  here.
-- **Authenticated browser broker parity.** The MCP control plane is gated
-  through the shared host gate, but no separate broker production-parity
-  suite exists in this branch.
-- **Live provider evidence.** No live credential was used. Readiness, send,
-  cancel, and restart are proven against the fake compatible gateway and the
-  durable ledger, not against a live sandbox.
-- **Authority revisions are recorded, not yet sourced.** There is no versioned
-  auth/policy/capability decision store to read from, so attempts record the
-  initial revision. The binding and the comparison are in place; wiring real
-  revisions is a follow-up.
-- **Provider request/run ids.** The host does not yet surface them, so an
-  acknowledged attempt records `providerReplied` plus token counts. The
-  receipt fields exist and validate.
+### Still bypassing the send boundary
+
+- **`provider_qualification.rs` is not admitted.** It posts to
+  `chat/completions` directly and can issue up to five physical requests per
+  probe against a live credential, with no run, no attempt, no transmitted
+  key, and no fail-closed ledger. It has a real ordering problem the rest of
+  the boundary does not: admission refuses a model whose capabilities are
+  unprobed, and this *is* the probe that establishes them. Fixing it needs a
+  distinct qualification admission. The `no_unadmitted_provider_calls` test
+  asserts this list matches the tree **exactly**, so the gap cannot widen
+  silently, but it is open today.
+
+### Bound but not yet sourced
+
+- **Authority revisions are placeholders.** `auth`, `policy`, and `capability`
+  all record the initial revision, because no versioned decision store exists
+  to read from. The binding and the comparison are real; the values are not
+  yet meaningful.
+- **`credential_revision` is process-local.** It advances when the bearer
+  changes, which answers "did the credential rotate between admitting and
+  sending this request". It restarts at zero and is not a durable rotation
+  count.
+- **Tenant and project are always `None`.** There is no store to resolve them
+  from, so the binding records "none established" rather than inventing one.
+- **Provider run ids are not captured.** Only a request id from response
+  headers, plus token counts. `receipts.run` is always `None`.
+
+### Not attempted in this branch
+
+- **TypeScript, Tauri, broker, and public-package conformance.** The strict
+  peer suite covers Rust against the published JSON Schemas with a real Draft
+  2020-12 validator. There is no TS peer, no Tauri-command conformance, no
+  authenticated-broker production-parity suite, and no public-package check.
+- **Action-time accessible UI truth.** No work on keeping opaque account ids
+  out of the DOM and accessibility tree, and none on announcing live blocking
+  transitions.
+- **Promotion and ledger TOCTOU.** Pathname-based checks remain; no no-follow
+  or handle-based hardening was done.
+- **Dirty and non-Git workspaces still fall back to Shared silently.** The
+  fallback is deliberate — isolation cannot be prepared there — but it is not
+  surfaced to the operator as a high-risk choice at action time.
+- **Live provider evidence.** No live Grok Build sandbox credential was used.
+  Readiness, send, cancel, and restart are proven against a real local HTTP
+  server and the real durable ledger, not against a live provider.
+
+### Environment caveats for the evidence below
+
+This branch was built and tested on **Linux x86_64**, not macOS. `sccache` is
+not installed in that container and was not used; builds ran against a
+lane-namespaced external target directory. Two `clippy` findings in
+`computer_use/macos_observation.rs` are dead-code false positives on Linux —
+the code is consumed under `#[cfg(target_os = "macos")]` — and do not fire on
+the macOS CI runner.

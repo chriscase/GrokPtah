@@ -113,7 +113,7 @@ pub(crate) fn resolve_computer_eligibility(
 }
 
 pub(crate) async fn qualify_semantic_model(
-    credentials: &crate::auth_store::WireCredentials,
+    session_id: uuid::Uuid,
     model: &str,
     effort: EffortLevel,
     cancel: &CancellationToken,
@@ -138,7 +138,7 @@ pub(crate) async fn qualify_semantic_model(
     ];
     let first_call = one_tool_call(
         call_xai_agent_step(
-            credentials,
+            session_id,
             model,
             effort,
             &first_messages,
@@ -185,7 +185,7 @@ pub(crate) async fn qualify_semantic_model(
     ];
     let recovery_call = one_tool_call(
         call_xai_agent_step(
-            credentials,
+            session_id,
             model,
             effort,
             &recovery_messages,
@@ -205,7 +205,7 @@ pub(crate) async fn qualify_semantic_model(
 }
 
 pub(crate) async fn propose_semantic_action(
-    credentials: &crate::auth_store::WireCredentials,
+    session_id: uuid::Uuid,
     model: &str,
     effort: EffortLevel,
     objective: &str,
@@ -227,7 +227,7 @@ pub(crate) async fn propose_semantic_action(
     ];
     let call = one_tool_call(
         call_xai_agent_step(
-            credentials,
+            session_id,
             model,
             effort,
             &messages,

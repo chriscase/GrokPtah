@@ -6,6 +6,8 @@
 pub mod account_facts;
 mod agents_personas;
 mod attempt_binding;
+mod provider_transport;
+mod request_admission;
 
 /// Attempt-binding helpers exposed for the crash-cut integration suite.
 ///
@@ -178,3 +180,63 @@ pub use worktree_gc::{
 };
 
 pub use host_helpers::is_rate_limit_error;
+
+/// Seams the admitted-send-boundary suite needs, and nothing more.
+///
+/// These exist so an integration test can exercise the *real* admission,
+/// transport, and ledger against a real socket. They deliberately expose no
+/// way to construct a request that bypasses admission: `chat_once` goes
+/// through exactly the path a Chat turn does, and `register_provenance` is the
+/// same registration the host performs when it opens a turn.
+#[doc(hidden)]
+pub mod test_support {
+    use std::path::Path;
+
+    use uuid::Uuid;
+
+    use crate::orchestration::OrchStore;
+    use crate::session::SessionKind;
+
+    /// Keeps a session's provenance registered until it is dropped.
+    pub type ProvenanceGuard = crate::request_admission::registry::Guard;
+
+    /// The model-selection key for one provider profile and model.
+    pub fn model_selection_key(profile_id: &str, model_id: &str) -> String {
+        crate::gateway_config::model_selection_key(profile_id, model_id)
+    }
+
+    /// Register where a session's provider calls are recorded, as the host
+    /// does when it opens a turn.
+    pub fn register_provenance(
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        ledger: OrchStore,
+    ) -> ProvenanceGuard {
+        crate::request_admission::registry::register(
+            session_id,
+            crate::request_admission::CallProvenance {
+                run_id: run_id.to_string(),
+                session_id,
+                workspace: workspace.display().to_string(),
+                tenant: None,
+                project: None,
+                ledger,
+                authority: crate::attempt_binding::initial_authority(),
+            },
+        )
+    }
+
+    /// One chat completion, through the same path a Chat turn takes.
+    pub async fn chat_once(session_id: Uuid, model: &str, prompt: &str) -> anyhow::Result<String> {
+        crate::host_helpers::call_xai_chat(
+            session_id,
+            model,
+            &[("user".to_string(), prompt.to_string())],
+            None,
+            Path::new("."),
+            SessionKind::Chat,
+        )
+        .await
+    }
+}

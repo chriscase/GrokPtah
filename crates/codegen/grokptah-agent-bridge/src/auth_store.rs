@@ -97,6 +97,83 @@ fn detect_installed_grok_version() -> Option<String> {
     Some(rest.to_string())
 }
 
+/// Monotonic revision of the credential material currently in use.
+///
+/// A turn-level precheck cannot see a credential rotate underneath it: the
+/// bearer that was admitted and the bearer that was sent look identical in
+/// every field the record keeps. Binding a revision to each request makes that
+/// difference visible after the fact.
+///
+/// The revision is derived by *observing* the material rather than by hooking
+/// every refresh path, so a rotation performed anywhere — background refresh,
+/// forced 401 refresh, an operator re-authenticating — advances it without
+/// that code having to remember to say so.
+///
+/// Scope: this counter is process-local and restarts at zero. It answers "did
+/// the credential change between admitting this request and sending it", which
+/// is a within-process question. It is deliberately not presented as a durable
+/// rotation count, because this host cannot observe rotations it was not
+/// running for.
+mod credential_revisions {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    #[allow(clippy::type_complexity)]
+    static SEEN: OnceLock<Mutex<HashMap<String, (u64, u64)>>> = OnceLock::new();
+
+    /// A non-reversible short digest of the bearer, used only to notice that
+    /// it changed. Never logged, never persisted, never compared across
+    /// processes.
+    fn material_marker(bearer: &str) -> u64 {
+        // FNV-1a: adequate for change detection, and keeps this module free of
+        // a hashing dependency it would otherwise only use here.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bearer.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+        hash
+    }
+
+    /// The revision for one credential scope, advancing when the material
+    /// behind it changes.
+    pub(super) fn current(scope: &str, bearer: &str) -> u64 {
+        let marker = material_marker(bearer);
+        let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = match seen.lock() {
+            Ok(guard) => guard,
+            // A poisoned lock means another thread panicked mid-update. The
+            // safe reading is "we cannot establish the revision", and the
+            // caller treats a fresh revision as a rotation rather than
+            // claiming continuity it cannot prove.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard.get(scope) {
+            Some((revision, recorded)) if *recorded == marker => *revision,
+            _ => {
+                let revision = NEXT.fetch_add(1, Ordering::SeqCst);
+                guard.insert(scope.to_string(), (revision, marker));
+                revision
+            }
+        }
+    }
+}
+
+/// The revision of the credential material this request will be sent under.
+///
+/// Advances whenever the underlying bearer changes, so a request admitted
+/// under one credential and sent under a refreshed one is distinguishable in
+/// the durable record.
+pub fn credential_revision(credentials: &WireCredentials) -> u64 {
+    let scope = credentials
+        .auth_scope
+        .clone()
+        .unwrap_or_else(|| credentials.provider_id.clone());
+    credential_revisions::current(&scope, &credentials.bearer)
+}
+
 #[derive(Clone)]
 pub struct WireCredentials {
     /// Provider profile that owns this credential. Request routing must match it.

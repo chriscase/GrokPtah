@@ -49,6 +49,16 @@ pub fn workspace_handle(workspace: &str) -> BoundedId {
 }
 
 /// Reduce arbitrary text to a bounded opaque handle.
+pub fn opaque_handle(prefix: &str, value: &str) -> BoundedId {
+    digest_handle(prefix, value)
+}
+
+/// The attempt identity for one run and ordinal.
+pub fn attempt_id(run_id: &str, ordinal: u32) -> BoundedId {
+    digest_handle("att", &format!("{run_id}#{ordinal}"))
+}
+
+/// Reduce arbitrary text to a bounded opaque handle.
 fn digest_handle(prefix: &str, value: &str) -> BoundedId {
     let digest = Sha256::digest(value.as_bytes());
     let hex: String = digest
@@ -179,14 +189,14 @@ pub(crate) fn replied(usage: Option<UsageReceipt>) -> ProviderReceipts {
 ///
 /// The durable form of the auto-retry rule: false while any recorded attempt
 /// still needs provider-side reconciliation.
-pub(crate) fn permits_new_request(attempts: &[ProviderAttempt]) -> bool {
+pub fn permits_new_request(attempts: &[ProviderAttempt]) -> bool {
     attempts
         .iter()
         .all(ProviderAttempt::permits_equivalent_retry)
 }
 
 /// The next ordinal for a run, one-based and gap-free.
-pub(crate) fn next_ordinal(attempts: &[ProviderAttempt]) -> u32 {
+pub fn next_ordinal(attempts: &[ProviderAttempt]) -> u32 {
     attempts
         .iter()
         .map(|attempt| attempt.ordinal)
