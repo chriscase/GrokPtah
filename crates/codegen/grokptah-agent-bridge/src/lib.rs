@@ -10,6 +10,7 @@ mod completion;
 mod computer_agent;
 pub mod computer_use;
 mod discover;
+pub mod enterprise_gateway_campaign;
 pub mod eval_oracle;
 pub mod eval_report;
 pub mod event_bus;
@@ -111,6 +112,12 @@ pub use computer_use::{
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,
     set_grokptah_home_override, set_project_mcp_trusted,
+};
+pub use enterprise_gateway_campaign::{
+    bounded_provider_error, campaign_payload_hash, verify_campaign, AttemptOutcome, AttemptReceipt,
+    CampaignBundle, CampaignCheck, CampaignVerdict, CursorAccountEvidence, EvidenceKind,
+    FakeQuotaMode, FakeRestrictedGateway, GatewayClass, GatewayIdentityRecord, QuotaReceipt,
+    QuotaTruth, ReleasePromotionEvidence, ENTERPRISE_GATEWAY_CAMPAIGN_SCHEMA,
 };
 pub use event_bus::{EventBus, EventReceiver, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
