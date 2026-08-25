@@ -19,7 +19,7 @@ enough to close a stage.
 | 5. Safe Computer Use | Redacted observation, semantic action, isolation, leases, stale-frame rejection, coordination | [Computer Use design](./COMPUTER_USE.md); source proof exists, packaged VM/hardware proof remains | In progress |
 | 6. Operator UX | Fast power-user workflows, keyboard/screen-reader correctness, understandable approvals and recovery | Help Center keyboard/focus coverage and visible focus styling are verified on candidate `3c956307`; full desktop suite is 45 files / 233 tests; independent expert acceptance remains | In progress |
 | 7. Semantic help | Searchable in-app help with contextual guidance and an optional assistant boundary | [Local Help Center contract](../desktop/src/lib/help.ts), permission-aware panel, bounded assistant context, focus trapping, Escape close, and focus restoration are implemented; expert corpus/assistant qualification remains | In progress |
-| 8. Embeddable platform | Stable Rust DTOs, desktop adapter, browser-safe broker, reusable UI primitives | [Cross-product ADR](./ADR-003-cross-product-capability-surface.md), [embedding guide](./EMBEDDING.md), [broker protocol](./WEB_BROKER_PROTOCOL.md), [SDK](../crates/common/grokptah-agent-sdk/README.md) | Contract, response-validation, headless UI, and reproducible Tauri-free library build (`ff9f96bb`) are verified; publication and consumer integration remain |
+| 8. Embeddable platform | Stable Rust DTOs, desktop adapter, browser-safe broker, reusable UI primitives | [Cross-product ADR](./ADR-003-cross-product-capability-surface.md), [embedding guide](./EMBEDDING.md), [broker protocol](./WEB_BROKER_PROTOCOL.md), [SDK](../crates/common/grokptah-agent-sdk/README.md) | Contract, response-validation, headless UI, and installable Tauri-free package staging (`34e73dc7`) are verified; publication and consumer integration remain |
 | 9. Independent qualification | Strongest-model code/security/UI review, cross-language conformance, soak, gateway, packaged-CU, and recovery evidence | [Independent review protocol](./INDEPENDENT_REVIEW_PROTOCOL.md) | Pending exact candidate head |
 | 10. Release and adoption | Versioned packages, examples, migration docs, reproducible builds, signed artifacts, release runbook | Packaging and hosted-service work remain separate release gates | Not started |
 
@@ -52,9 +52,10 @@ the same candidate release:
   start another Cargo build wave on its shared target.
 - Keep the current TypeScript/desktop verification attached to the same reviewable
   candidate: `3c956307` passes 45 test files / 233 tests, typecheck, and the
-  production Vite build; `ff9f96bb` additionally passes `npm run verify:public`
-  and its generated-export/authority-boundary check. The public barrel remains a staging source
-  until package publication and a real consumer fixture are green.
+  production Vite build; `34e73dc7` additionally passes `npm run verify:public`
+  and `npm pack --dry-run` with generated export/authority-boundary checks. The
+  package remains a release candidate until publication and a real consumer fixture
+  are green.
 - Put the current integration changes on an exact reviewable candidate, then
   run the independent strongest-model review protocol with Fast off.
 - Integrate ContextDesk's server broker and desktop adapter against the SDK and
