@@ -251,7 +251,7 @@ describe("offline Help Center corpus", () => {
     expect(chrome.tabIds).not.toContain("helper");
   });
 
-  it("restores Help chrome after session_prompt success, failure, and cleanup", async () => {
+  it("restores Help chrome after session_prompt success, failure, parse failure, and cleanup", async () => {
     const original: HelpLaneChrome = { tabIds: ["lane-a", "lane-b"], activeId: "lane-a" };
     const accepted = JSON.stringify({
       text: "Use the cited article.",
@@ -259,7 +259,7 @@ describe("offline Help Center corpus", () => {
       uncertainty: "Not certification.",
     });
 
-    const run = async (mode: "success" | "prompt-failure" | "create-failure") => {
+    const run = async (mode: "success" | "prompt-failure" | "create-failure" | "parse-failure") => {
       const events: string[] = [];
       let chrome: HelpLaneChrome = {
         tabIds: [...original.tabIds],
@@ -294,20 +294,32 @@ describe("offline Help Center corpus", () => {
           };
         },
       };
+      const parse =
+        mode === "parse-failure"
+          ? () => {
+              throw new Error("assistant-answer parse failed");
+            }
+          : parseHelpAssistantAnswer;
 
       if (mode === "success") {
-        const answer = await runHelpProviderTurn(host, "bounded help prompt", parseHelpAssistantAnswer);
+        const answer = await runHelpProviderTurn(host, "bounded help prompt", parse);
         expect(answer.citations).toEqual(["product.readme"]);
         expect(events).toEqual(["create", "restore", "prompt", "restore", "delete", "restore"]);
         expect(chromeAtDelete).toEqual(original);
       } else if (mode === "prompt-failure") {
-        await expect(runHelpProviderTurn(host, "bounded help prompt", parseHelpAssistantAnswer)).rejects.toThrow(
+        await expect(runHelpProviderTurn(host, "bounded help prompt", parse)).rejects.toThrow(
           "session_prompt failed",
         );
         expect(events).toEqual(["create", "restore", "prompt", "restore", "delete", "restore"]);
         expect(chromeAtDelete).toEqual(original);
+      } else if (mode === "parse-failure") {
+        await expect(runHelpProviderTurn(host, "bounded help prompt", parse)).rejects.toThrow(
+          "assistant-answer parse failed",
+        );
+        expect(events).toEqual(["create", "restore", "prompt", "restore", "delete", "restore"]);
+        expect(chromeAtDelete).toEqual(original);
       } else {
-        await expect(runHelpProviderTurn(host, "bounded help prompt", parseHelpAssistantAnswer)).rejects.toThrow(
+        await expect(runHelpProviderTurn(host, "bounded help prompt", parse)).rejects.toThrow(
           "session_new_kind failed",
         );
         expect(events).toEqual(["create", "restore"]);
@@ -321,5 +333,6 @@ describe("offline Help Center corpus", () => {
     await run("success");
     await run("prompt-failure");
     await run("create-failure");
+    await run("parse-failure");
   });
 });
