@@ -469,6 +469,35 @@ fn cancelling_a_task_that_never_started_is_immediate() {
 }
 
 #[test]
+fn cancelling_after_request_before_spawn_claim_settles_convergently() {
+    let mut swarm = SwarmController::new(single_task_spec(), at(0)).expect("valid");
+    let intent = swarm.plan_dispatches(at(1)).remove(0);
+    let record = swarm
+        .record_dispatch_requested(&intent, None, at(1))
+        .expect("request");
+
+    swarm
+        .cancel_task(&task_id("t-only"), at(2))
+        .expect("pre-spawn cancellation");
+    assert_eq!(state_of(&swarm, "t-only"), TaskState::Cancelled);
+    assert_eq!(
+        swarm
+            .state()
+            .dispatch(&record.dispatch_id)
+            .expect("dispatch")
+            .state,
+        DispatchState::Settled
+    );
+    assert_eq!(
+        swarm
+            .claim_dispatch_spawn(&record.dispatch_id, at(3))
+            .unwrap_err()
+            .code,
+        SwarmErrorCode::Conflict
+    );
+}
+
+#[test]
 fn cancelling_a_live_task_waits_for_confirmation() {
     let mut swarm = SwarmController::new(single_task_spec(), at(0)).expect("valid");
     let intent = swarm.plan_dispatches(at(1)).remove(0);
@@ -839,6 +868,9 @@ fn computer_use_swarm() -> SwarmController {
     spec.tasks[0].worker_id = worker_id("cu-cursor");
     spec.tasks[0].requires_computer_use = true;
     spec.tasks[0].computer_use = Some(computer_use_requirement());
+    spec.tasks[0]
+        .capabilities
+        .insert(grokptah_swarm_control_plane::WorkerCapability::ComputerUseLeased);
     SwarmController::new_with_store(spec, at(0), Arc::new(InMemorySwarmStore::for_tests()))
         .expect("valid")
 }
@@ -914,6 +946,9 @@ fn one_lease_cannot_be_consumed_by_two_swarms() {
     second_spec.tasks[0].worker_id = worker_id("cu-cursor");
     second_spec.tasks[0].requires_computer_use = true;
     second_spec.tasks[0].computer_use = Some(computer_use_requirement());
+    second_spec.tasks[0]
+        .capabilities
+        .insert(grokptah_swarm_control_plane::WorkerCapability::ComputerUseLeased);
     let mut second =
         SwarmController::new_with_store(second_spec, at(0), store).expect("second swarm");
 
@@ -1111,6 +1146,50 @@ fn a_live_dispatch_without_a_current_task_pointer_is_refused_on_reload() {
     state.tasks[0].current_dispatch = None;
     let error = SwarmController::load(state).expect_err("live dispatch must remain attached");
     assert_eq!(error.code, SwarmErrorCode::CorruptState);
+}
+
+#[test]
+fn forged_derived_ready_state_is_refused_on_reload() {
+    let swarm = SwarmController::new(diamond_spec(QuorumRule::Unanimous), at(0)).expect("valid");
+    let mut state = swarm.into_state();
+    state.tasks[5].state = TaskState::Ready;
+    let error = SwarmController::load(state).expect_err("synthesis is not quorum-ready");
+    assert_eq!(error.code, SwarmErrorCode::CorruptState);
+}
+
+#[test]
+fn forged_quorum_ready_state_is_refused_after_a_rejection() {
+    let mut swarm =
+        SwarmController::new(diamond_spec(QuorumRule::Unanimous), at(0)).expect("valid");
+    run_to_reviews(&mut swarm);
+    run_task(
+        &mut swarm,
+        "t-review-a",
+        TaskOutcome::succeeded().with_verdict(ReviewVerdict::Approve),
+        at(4),
+    );
+    run_task(
+        &mut swarm,
+        "t-review-b",
+        TaskOutcome::succeeded().with_verdict(ReviewVerdict::Reject),
+        at(5),
+    );
+    let mut state = swarm.into_state();
+    state.tasks[5].state = TaskState::Ready;
+    let error = SwarmController::load(state).expect_err("rejected quorum must remain blocked");
+    assert_eq!(error.code, SwarmErrorCode::CorruptState);
+}
+
+#[test]
+fn forged_pending_or_blocked_root_state_is_refused_on_reload() {
+    for forged in [TaskState::Pending, TaskState::Blocked] {
+        let swarm =
+            SwarmController::new(diamond_spec(QuorumRule::Unanimous), at(0)).expect("valid");
+        let mut state = swarm.into_state();
+        state.tasks[0].state = forged;
+        let error = SwarmController::load(state).expect_err("root must be ready");
+        assert_eq!(error.code, SwarmErrorCode::CorruptState);
+    }
 }
 
 #[test]

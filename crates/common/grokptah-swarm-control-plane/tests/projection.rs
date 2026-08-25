@@ -183,6 +183,9 @@ fn a_row_shows_the_isolation_and_lease_a_dispatch_ran_under() {
     spec.tasks[0].worker_id = worker_id("cu-cursor");
     spec.tasks[0].requires_computer_use = true;
     spec.tasks[0].computer_use = Some(computer_use_requirement());
+    spec.tasks[0]
+        .capabilities
+        .insert(grokptah_swarm_control_plane::WorkerCapability::ComputerUseLeased);
     let mut swarm = SwarmController::new_with_store(
         spec,
         at(0),

@@ -141,6 +141,17 @@ impl InMemorySwarmStore {
         consumed_leases.insert(claim.lease_id.clone(), claim.clone());
         Ok(())
     }
+
+    fn checked_claims(
+        consumed_leases: &BTreeMap<LeaseId, LeaseClaim>,
+        claims: impl IntoIterator<Item = LeaseClaim>,
+    ) -> SwarmResult<BTreeMap<LeaseId, LeaseClaim>> {
+        let mut next = consumed_leases.clone();
+        for claim in claims {
+            Self::check_claim(&mut next, &claim)?;
+        }
+        Ok(next)
+    }
 }
 
 impl DurableSwarmStore for InMemorySwarmStore {
@@ -151,11 +162,12 @@ impl DurableSwarmStore for InMemorySwarmStore {
                 "swarm already exists in the durable store",
             ));
         }
-        for dispatch in &state.dispatches {
-            if let Some(claim) = Self::claim_for_dispatch(&state.spec.swarm_id, dispatch) {
-                Self::check_claim(&mut store.consumed_leases, &claim)?;
-            }
-        }
+        let claims = state
+            .dispatches
+            .iter()
+            .filter_map(|dispatch| Self::claim_for_dispatch(&state.spec.swarm_id, dispatch));
+        let consumed_leases = Self::checked_claims(&store.consumed_leases, claims)?;
+        store.consumed_leases = consumed_leases;
         store
             .swarms
             .insert(state.spec.swarm_id.clone(), state.clone());
@@ -216,6 +228,7 @@ impl DurableSwarmStore for InMemorySwarmStore {
             .iter()
             .map(|dispatch| (&dispatch.dispatch_id, dispatch))
             .collect();
+        let mut new_claims = Vec::new();
         for dispatch in &next.dispatches {
             if let Some(previous) = current_dispatches.get(&dispatch.dispatch_id) {
                 if previous.lease != dispatch.lease {
@@ -233,9 +246,11 @@ impl DurableSwarmStore for InMemorySwarmStore {
                     "a new Computer Use dispatch is missing its durable lease claim",
                 ));
             }
-            Self::check_claim(&mut store.consumed_leases, &claim)?;
+            new_claims.push(claim);
         }
 
+        let consumed_leases = Self::checked_claims(&store.consumed_leases, new_claims)?;
+        store.consumed_leases = consumed_leases;
         store.swarms.insert(swarm_id.clone(), next.clone());
         Ok(())
     }

@@ -51,6 +51,19 @@ pub fn validate_swarm_spec(spec: &SwarmSpec) -> SwarmResult<()> {
             )));
         };
         task.validate_against_worker(worker)?;
+        let Some(entry) = spec.catalog.entry(&worker.provider, &worker.model) else {
+            return Err(SwarmError::capability(format!(
+                "task '{}' names a worker whose provider/model is not cataloged",
+                task.task_id
+            )));
+        };
+        if !entry.allows_mode(task.capability_mode) {
+            return Err(SwarmError::capability(format!(
+                "task '{}' requests an unmeasured capability mode '{}'",
+                task.task_id,
+                task.capability_mode.as_str()
+            )));
+        }
     }
 
     let mut fan_out: BTreeMap<&TaskId, u32> = BTreeMap::new();

@@ -315,6 +315,9 @@ fn a_computer_use_task_validates_against_a_measured_worker() {
     spec.tasks[0].worker_id = worker_id("cu-cursor");
     spec.tasks[0].requires_computer_use = true;
     spec.tasks[0].computer_use = Some(computer_use_requirement());
+    spec.tasks[0]
+        .capabilities
+        .insert(WorkerCapability::ComputerUseLeased);
     validate_swarm_spec(&spec).expect("a leased Computer Use worker is admissible");
 }
 
@@ -388,6 +391,24 @@ fn review_and_synthesis_tasks_require_their_capability() {
     let mut spec = diamond_spec(QuorumRule::Unanimous);
     spec.workers[0].capability_mode = SubagentCapabilityMode::All;
     expect_rejected(spec, SwarmErrorCode::CapabilityNotGranted);
+}
+
+#[test]
+fn dispatch_intent_uses_the_task_capability_set() {
+    let mut spec = single_task_spec();
+    spec.tasks[0].capabilities = [WorkerCapability::ReadWorkspace].into_iter().collect();
+    spec.tasks[0].capability_mode = SubagentCapabilityMode::ReadOnly;
+    let swarm = SwarmController::new(spec, at(0)).expect("least-privilege task is valid");
+    let intent = swarm
+        .plan_dispatches(at(1))
+        .into_iter()
+        .next()
+        .expect("root is ready");
+    assert_eq!(
+        intent.capabilities,
+        [WorkerCapability::ReadWorkspace].into_iter().collect()
+    );
+    assert_eq!(intent.capability_mode, SubagentCapabilityMode::ReadOnly);
 }
 
 #[test]

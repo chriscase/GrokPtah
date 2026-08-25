@@ -42,6 +42,95 @@ fn corrupt_dispatch(message: impl Into<String>) -> SwarmError {
     ))
 }
 
+fn derive_state_from_state(
+    state: &SwarmState,
+    task_id: &TaskId,
+    derived: &std::collections::BTreeMap<TaskId, TaskState>,
+) -> TaskState {
+    let Some(spec) = state.spec.task(task_id) else {
+        return TaskState::Blocked;
+    };
+    let dependency_state = |dependency: &TaskId| {
+        derived
+            .get(dependency)
+            .copied()
+            .or_else(|| state.task(dependency).map(|record| record.state))
+            .unwrap_or(TaskState::Blocked)
+    };
+    let mut all_succeeded = true;
+    for dependency in &spec.dependencies {
+        match dependency_state(dependency) {
+            TaskState::Succeeded => {}
+            TaskState::Failed
+            | TaskState::Blocked
+            | TaskState::Cancelled
+            | TaskState::Cancelling
+            | TaskState::DispatchUncertain => return TaskState::Blocked,
+            _ => all_succeeded = false,
+        }
+    }
+    if !all_succeeded {
+        return TaskState::Pending;
+    }
+    let Some(gate) = &spec.review_gate else {
+        return TaskState::Ready;
+    };
+    let Ok(reviewer_count) = u32::try_from(gate.reviewers.len()) else {
+        return TaskState::Blocked;
+    };
+    let required = gate.quorum.required_approvals(reviewer_count);
+    let approvals = gate
+        .reviewers
+        .iter()
+        .filter(|reviewer| {
+            dependency_state(reviewer) == TaskState::Succeeded
+                && state
+                    .task(reviewer)
+                    .is_some_and(|record| record.verdict == Some(ReviewVerdict::Approve))
+        })
+        .count();
+    if u32::try_from(approvals).unwrap_or(0) >= required {
+        TaskState::Ready
+    } else {
+        TaskState::Blocked
+    }
+}
+
+fn validate_derived_task_states(state: &SwarmState) -> SwarmResult<()> {
+    let mut derived = std::collections::BTreeMap::new();
+    for task in &state.tasks {
+        if task.state.is_derived() {
+            derived.insert(task.task_id.clone(), TaskState::Pending);
+        }
+    }
+    for _ in 0..=state.tasks.len() {
+        let mut changed = false;
+        for task in &state.spec.tasks {
+            if !derived.contains_key(&task.task_id) {
+                continue;
+            }
+            let next = derive_state_from_state(state, &task.task_id, &derived);
+            if derived.get(&task.task_id).copied() != Some(next) {
+                derived.insert(task.task_id.clone(), next);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for task in &state.tasks {
+        if let Some(expected) = derived.get(&task.task_id)
+            && task.state != *expected
+        {
+            return Err(corrupt(
+                "stored derived task state does not match dependencies and quorum",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// What a restart recovery pass changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
@@ -370,6 +459,7 @@ fn validate_loaded_state(state: &SwarmState) -> SwarmResult<()> {
             ));
         }
     }
+    validate_derived_task_states(state)?;
 
     let live = state.tasks.iter().any(|task| task.state.occupies_slot());
     if state.lifecycle.is_terminal() && live {
@@ -637,9 +727,10 @@ impl SwarmController {
             .tasks
             .iter()
             .filter(|task| {
-                self.state
-                    .task(&task.task_id)
-                    .is_some_and(|record| record.state == TaskState::Ready)
+                self.state.task(&task.task_id).is_some_and(|record| {
+                    record.state == TaskState::Ready
+                        && self.derive_state(&task.task_id) == TaskState::Ready
+                })
             })
             .collect();
         ready.sort_by(|a, b| {
@@ -665,8 +756,8 @@ impl SwarmController {
                     provider: worker.provider.clone(),
                     model: worker.model.clone(),
                     role: worker.role,
-                    capability_mode: worker.capability_mode,
-                    capabilities: worker.capabilities.clone(),
+                    capability_mode: task.capability_mode,
+                    capabilities: task.capabilities.clone(),
                     isolation: worker.isolation,
                     requires_computer_use: task.requires_computer_use,
                 })
@@ -734,8 +825,8 @@ impl SwarmController {
         if worker.provider != intent.provider
             || worker.model != intent.model
             || worker.role != intent.role
-            || worker.capability_mode != intent.capability_mode
-            || worker.capabilities != intent.capabilities
+            || task_spec.capability_mode != intent.capability_mode
+            || task_spec.capabilities != intent.capabilities
         {
             return Err(SwarmError::conflict(
                 "dispatch worker capabilities do not match the recorded worker",
@@ -1158,6 +1249,30 @@ impl SwarmController {
             }
             _ => {}
         }
+        if record.state == TaskState::Dispatching
+            && record.current_dispatch.as_ref().is_some_and(|dispatch_id| {
+                self.state
+                    .dispatch(dispatch_id)
+                    .is_some_and(|dispatch| dispatch.state == DispatchState::Requested)
+            })
+        {
+            let dispatch_id = record
+                .current_dispatch
+                .clone()
+                .expect("the pre-spawn check found a dispatch");
+            if let Some(dispatch) = self.state.dispatch_mut(&dispatch_id) {
+                dispatch.state = DispatchState::Settled;
+                dispatch.settled_at = Some(now);
+            }
+            if let Some(task) = self.state.task_mut(task_id) {
+                task.state = TaskState::Cancelled;
+                task.current_dispatch = None;
+                task.updated_at = now;
+            }
+            self.bump(now);
+            self.refresh(now);
+            return Ok(());
+        }
         let next = if record.state.occupies_slot() {
             TaskState::Cancelling
         } else {
@@ -1197,13 +1312,47 @@ impl SwarmController {
         }
         self.state.lifecycle = SwarmLifecycle::Cancelling;
         self.state.stop_reason = Some(reason.to_string());
+        let pre_spawn_dispatches: std::collections::BTreeSet<DispatchId> = self
+            .state
+            .tasks
+            .iter()
+            .filter_map(|task| {
+                if task.state != TaskState::Dispatching {
+                    return None;
+                }
+                let dispatch_id = task.current_dispatch.as_ref()?;
+                self.state
+                    .dispatch(dispatch_id)
+                    .is_some_and(|dispatch| dispatch.state == DispatchState::Requested)
+                    .then(|| dispatch_id.clone())
+            })
+            .collect();
+        for dispatch_id in &pre_spawn_dispatches {
+            if let Some(dispatch) = self.state.dispatch_mut(dispatch_id) {
+                dispatch.state = DispatchState::Settled;
+                dispatch.settled_at = Some(now);
+            }
+        }
         for task in &mut self.state.tasks {
             match task.state {
                 TaskState::Pending | TaskState::Ready | TaskState::Blocked => {
                     task.state = TaskState::Cancelled;
                     task.updated_at = now;
                 }
-                TaskState::Dispatching | TaskState::Running => {
+                TaskState::Dispatching => {
+                    if task
+                        .current_dispatch
+                        .as_ref()
+                        .is_some_and(|dispatch_id| pre_spawn_dispatches.contains(dispatch_id))
+                    {
+                        task.state = TaskState::Cancelled;
+                        task.current_dispatch = None;
+                    } else {
+                        task.state = TaskState::Cancelling;
+                    }
+                    task.updated_at = now;
+                }
+                TaskState::Running => {
                     task.state = TaskState::Cancelling;
                     task.updated_at = now;
                 }
@@ -1399,56 +1548,7 @@ impl SwarmController {
 
     /// Derive one task's state from its dependencies and review gate.
     fn derive_state(&self, task_id: &TaskId) -> TaskState {
-        let Some(spec) = self.state.spec.task(task_id) else {
-            return TaskState::Blocked;
-        };
-
-        let mut all_succeeded = true;
-        for dependency in &spec.dependencies {
-            let Some(record) = self.state.task(dependency) else {
-                return TaskState::Blocked;
-            };
-            match record.state {
-                TaskState::Succeeded => {}
-                // An upstream result that can never become success blocks this
-                // node. Uncertainty blocks too: the control plane will not
-                // build on a result it cannot prove.
-                TaskState::Failed
-                | TaskState::Blocked
-                | TaskState::Cancelled
-                | TaskState::Cancelling
-                | TaskState::DispatchUncertain => return TaskState::Blocked,
-                _ => all_succeeded = false,
-            }
-        }
-        if !all_succeeded {
-            return TaskState::Pending;
-        }
-
-        let Some(gate) = &spec.review_gate else {
-            return TaskState::Ready;
-        };
-        let Ok(reviewer_count) = u32::try_from(gate.reviewers.len()) else {
-            return TaskState::Blocked;
-        };
-        let required = gate.quorum.required_approvals(reviewer_count);
-        let approvals = gate
-            .reviewers
-            .iter()
-            .filter(|reviewer| {
-                self.state
-                    .task(reviewer)
-                    .is_some_and(|record| record.verdict == Some(ReviewVerdict::Approve))
-            })
-            .count();
-        let approvals = u32::try_from(approvals).unwrap_or(0);
-        // Every reviewer is also a dependency, so all of them have already
-        // succeeded here. The approval count can no longer improve.
-        if approvals >= required {
-            TaskState::Ready
-        } else {
-            TaskState::Blocked
-        }
+        derive_state_from_state(&self.state, task_id, &std::collections::BTreeMap::new())
     }
 
     fn refresh_lifecycle(&mut self, now: DateTime<Utc>) {

@@ -6,6 +6,8 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/common/grokptah-swarm-control-plane/**"
+      - "crates/codegen/xai-grok-secrets/**"
+      - "crates/common/xai-tool-types/**"
       - ".github/workflows/swarm-control-plane.yml"
   pull_request:
     types: [opened, synchronize, reopened]
@@ -13,6 +15,8 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/common/grokptah-swarm-control-plane/**"
+      - "crates/codegen/xai-grok-secrets/**"
+      - "crates/common/xai-tool-types/**"
       - ".github/workflows/swarm-control-plane.yml"
   workflow_dispatch:
 

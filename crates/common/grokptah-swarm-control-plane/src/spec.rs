@@ -305,7 +305,7 @@ impl ProviderCatalogEntry {
         Ok(())
     }
 
-    fn allows_mode(&self, mode: SubagentCapabilityMode) -> bool {
+    pub(crate) fn allows_mode(&self, mode: SubagentCapabilityMode) -> bool {
         self.capability_modes.contains(&mode)
     }
 }
@@ -529,6 +529,15 @@ pub struct TaskSpec {
     pub title: String,
     pub instructions: String,
     pub worker_id: WorkerId,
+    /// Exact capabilities the dispatch adapter may grant to this task.
+    ///
+    /// This is intentionally narrower than the worker's measured capability
+    /// set: a worker may be qualified for several task kinds while one task
+    /// receives only the least privilege it needs.
+    pub capabilities: BTreeSet<WorkerCapability>,
+    /// Tool-access mode for this task, which may be narrower than the worker's
+    /// measured mode.
+    pub capability_mode: SubagentCapabilityMode,
     #[serde(default)]
     pub dependencies: Vec<TaskId>,
     /// Higher runs first when several tasks are ready at once. Ties break on
@@ -555,6 +564,30 @@ impl TaskSpec {
             "task instructions",
             MAX_INSTRUCTIONS_BYTES,
         )?;
+        if self.capabilities.is_empty() {
+            return Err(SwarmError::invalid(format!(
+                "task '{}' must declare an exact capability set",
+                self.task_id
+            )));
+        }
+        if self.capability_mode == SubagentCapabilityMode::All {
+            return Err(SwarmError::capability(
+                "the unrestricted task capability mode is not admissible",
+            ));
+        }
+        if self.capability_mode == SubagentCapabilityMode::ReadOnly
+            && self.capabilities.iter().any(|capability| {
+                matches!(
+                    capability,
+                    WorkerCapability::WriteWorkspace | WorkerCapability::ExecuteInWorktree
+                )
+            })
+        {
+            return Err(SwarmError::invalid(format!(
+                "read-only task '{}' declares mutating capabilities",
+                self.task_id
+            )));
+        }
         if self.dependencies.len() > MAX_DEPENDENCIES {
             return Err(SwarmError::bound(format!(
                 "task '{}' declares more than {MAX_DEPENDENCIES} dependencies",
@@ -637,9 +670,39 @@ impl TaskSpec {
                 }
             )));
         }
+        if !self
+            .capabilities
+            .iter()
+            .all(|capability| worker.capabilities.contains(capability))
+        {
+            return Err(SwarmError::capability(format!(
+                "task '{}' requests a capability its worker does not hold",
+                self.task_id
+            )));
+        }
         if self.requires_computer_use && !worker.allows_computer_use() {
             return Err(SwarmError::capability(format!(
                 "task '{}' requires Computer Use but its worker holds no leased Computer Use capability",
+                self.task_id
+            )));
+        }
+        if self.requires_computer_use
+            && !self
+                .capabilities
+                .contains(&WorkerCapability::ComputerUseLeased)
+        {
+            return Err(SwarmError::capability(format!(
+                "task '{}' requires Computer Use but its task capability set omits it",
+                self.task_id
+            )));
+        }
+        if !self.requires_computer_use
+            && self
+                .capabilities
+                .contains(&WorkerCapability::ComputerUseLeased)
+        {
+            return Err(SwarmError::invalid(format!(
+                "task '{}' carries Computer Use capability without requiring it",
                 self.task_id
             )));
         }
