@@ -6000,7 +6000,10 @@ mod tests {
         let execution =
             ProbeBuilder::new(definition).finish(ProbeStatus::Indeterminate, diagnostic);
         assert_eq!(execution.result.status, ProbeStatus::Indeterminate);
-        assert_eq!(execution.result.failure_class, crate::report::FailureClass::Configuration);
+        assert_eq!(
+            execution.result.failure_class,
+            crate::report::FailureClass::Configuration
+        );
         assert_eq!(
             execution.result.diagnostics,
             vec![DiagnosticCode::ProbeImplementationUnavailable]
