@@ -104,6 +104,32 @@ for required in \
   'CONFIG_MODULES=n'; do
   grep -Fx "$required" "$fragment" >/dev/null
 done
+# Post-olddefconfig matcher must accept both canonical disabled spellings and
+# must not treat an absent key as disabled or weaken required =y settings.
+kconfig_has_disabled() {
+  grep -Fx "$2=n" "$1" >/dev/null || grep -Fx "# $2 is not set" "$1" >/dev/null
+}
+kconfig_probe="$work/kconfig-disabled-spellings.config"
+printf '%s\n' \
+  'CONFIG_BLK_DEV_INITRD=y' \
+  'CONFIG_INITRAMFS_SOURCE="grokptah-initramfs.cpio"' \
+  'CONFIG_VSOCKETS=y' \
+  '# CONFIG_MODULES is not set' \
+  'CONFIG_INET=n' \
+  >"$kconfig_probe"
+kconfig_has_disabled "$kconfig_probe" CONFIG_MODULES
+kconfig_has_disabled "$kconfig_probe" CONFIG_INET
+grep -Fx 'CONFIG_BLK_DEV_INITRD=y' "$kconfig_probe" >/dev/null
+grep -Fx 'CONFIG_INITRAMFS_SOURCE="grokptah-initramfs.cpio"' "$kconfig_probe" >/dev/null
+grep -Fx 'CONFIG_VSOCKETS=y' "$kconfig_probe" >/dev/null
+if kconfig_has_disabled "$kconfig_probe" CONFIG_SOUND; then
+  echo "absent kconfig key must not count as disabled" >&2
+  exit 1
+fi
+if kconfig_has_disabled "$kconfig_probe" CONFIG_VSOCKETS; then
+  echo "required enabled kconfig setting must not match a disabled spelling" >&2
+  exit 1
+fi
 for forbidden in \
   CONFIG_INET=y CONFIG_IPV6=y CONFIG_VIRTIO_NET=y CONFIG_USB_SUPPORT=y \
   CONFIG_SOUND=y CONFIG_SCSI=y CONFIG_ATA=y CONFIG_VIRTIO_BLK=y CONFIG_VIRTIO_FS=y; do

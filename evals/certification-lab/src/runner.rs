@@ -1315,6 +1315,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn always_on_grokbot_lifecycle_probe_stays_unimplemented_configuration_indeterminate() {
+        // Hosted Always-On certification-lab selects this probe. It is a real
+        // manifest entry with no implementation_tools allowlist, so the runner
+        // must stay ProbeImplementationUnavailable / Configuration /
+        // indeterminate / uncertified. Do not stub implementation_tools and do
+        // not convert this indeterminate into a pass.
+        let manifest = CampaignManifest::bundled().unwrap();
+        let probe = manifest.probe("always-on-grokbot-lifecycle-v1").unwrap();
+        assert!(crate::probes::implementation_tools(&probe.id).is_none());
+        assert!(!has_implementation(&probe.id));
+
+        let result = ProbeResult::indeterminate(
+            probe.id.clone(),
+            probe.catalog_scenario_ids.clone(),
+            DiagnosticCode::ProbeImplementationUnavailable,
+        );
+        assert_eq!(result.status, ProbeStatus::Indeterminate);
+        assert!(result.supported);
+        assert_eq!(result.failure_class, FailureClass::Configuration);
+        assert_eq!(
+            result.diagnostics,
+            vec![DiagnosticCode::ProbeImplementationUnavailable]
+        );
+        assert_ne!(result.status, ProbeStatus::Passed);
+
+        let summary = ReportSummary {
+            probes: 1,
+            supported: 1,
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            indeterminate: 1,
+        };
+        let certified = summary.probes > 0
+            && summary.passed == summary.probes
+            && summary.failed == 0
+            && summary.skipped == 0
+            && summary.indeterminate == 0;
+        assert!(!certified);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.passed, 0);
+        assert_eq!(summary.indeterminate, 1);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn merged_native_capability_runs_implemented_policy_probe() {
         if !crate::local_service::loopback_test_available() {

@@ -990,6 +990,27 @@ mod tests {
     }
 
     #[test]
+    fn unimplemented_lifecycle_probe_configuration_stays_indeterminate_exit() {
+        let summary = ReportSummary {
+            probes: 1,
+            supported: 1,
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            indeterminate: 1,
+        };
+        assert_eq!(
+            exit_for_evidence(&summary, false, &[FailureClass::Configuration]),
+            ExitClass::Indeterminate
+        );
+        assert_ne!(
+            exit_for_evidence(&summary, false, &[FailureClass::Configuration]),
+            ExitClass::Passed
+        );
+        assert_eq!(ExitClass::Indeterminate as i32, 3);
+    }
+
+    #[test]
     fn all_skipped_is_never_success() {
         let summary = ReportSummary {
             probes: 2,

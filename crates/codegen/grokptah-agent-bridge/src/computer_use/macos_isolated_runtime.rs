@@ -442,48 +442,37 @@ impl Drop for IsolatedVisualPackagedRuntime {
     }
 }
 
-/// Keep crate-private packaged-runtime entrypoints linked in the lib artifact.
-/// `#[cfg(test)]` holds are invisible to `cargo clippy --all-targets -D warnings`
-/// on the lib target. This is not capability admission, launch, boot, or
-/// qualification. The helper source gate still requires `pub(crate)`.
-fn keep_packaged_runtime_linked_in_lib() {
-    let _launch = IsolatedVisualPackagedRuntime::launch;
-    let _start = IsolatedVisualPackagedRuntime::start;
-    let _read_frame = IsolatedVisualPackagedRuntime::read_frame;
-    let _write_input = IsolatedVisualPackagedRuntime::write_input;
-    let _stop = IsolatedVisualPackagedRuntime::stop;
-    let _complete_cleanup = IsolatedVisualPackagedRuntime::complete_cleanup;
-    let _complete_observed_cleanup = IsolatedVisualPackagedRuntime::complete_observed_cleanup;
-    let _runtime = IsolatedVisualPackagedRuntime::runtime;
+/// Bind the crate-private packaged supervisor entrypoints to every validated
+/// launch contract. This does not spawn a helper or claim a VM.
+pub(super) fn bind_packaged_supervisor_entrypoints() {
+    let launch = IsolatedVisualPackagedRuntime::launch;
+    let start = IsolatedVisualPackagedRuntime::start;
+    let read_frame = IsolatedVisualPackagedRuntime::read_frame;
+    let write_input = IsolatedVisualPackagedRuntime::write_input;
+    let stop = IsolatedVisualPackagedRuntime::stop;
+    let complete_cleanup = IsolatedVisualPackagedRuntime::complete_cleanup;
+    let complete_observed_cleanup = IsolatedVisualPackagedRuntime::complete_observed_cleanup;
+    let runtime = IsolatedVisualPackagedRuntime::runtime;
+    let _ = (
+        launch,
+        start,
+        read_frame,
+        write_input,
+        stop,
+        complete_cleanup,
+        complete_observed_cleanup,
+        runtime,
+    );
 }
-
-#[used]
-static PACKAGED_RUNTIME_LIB_LINKAGE: fn() = keep_packaged_runtime_linked_in_lib;
 
 #[cfg(test)]
 mod tests {
     use super::descriptors_are_distinct;
-    use super::IsolatedVisualPackagedRuntime;
 
     #[test]
     fn native_launch_descriptor_set_must_be_complete_and_unique() {
         assert!(descriptors_are_distinct(&[3, 4, 5, 6, 7]));
         assert!(!descriptors_are_distinct(&[3, 4, 4, 6, 7]));
         assert!(!descriptors_are_distinct(&[3, -1, 5, 6, 7]));
-    }
-
-    #[test]
-    fn packaged_runtime_crate_private_entrypoint_stays_linked() {
-        // Keep the supervisor reachable inside the crate so macOS `-D warnings`
-        // does not treat it as dead code, without crate-root re-export or
-        // capability admission. This is not launch, boot, or qualification proof.
-        let _launch = IsolatedVisualPackagedRuntime::launch;
-        let _start = IsolatedVisualPackagedRuntime::start;
-        let _read_frame = IsolatedVisualPackagedRuntime::read_frame;
-        let _write_input = IsolatedVisualPackagedRuntime::write_input;
-        let _stop = IsolatedVisualPackagedRuntime::stop;
-        let _complete_cleanup = IsolatedVisualPackagedRuntime::complete_cleanup;
-        let _complete_observed_cleanup = IsolatedVisualPackagedRuntime::complete_observed_cleanup;
-        let _runtime = IsolatedVisualPackagedRuntime::runtime;
     }
 }
