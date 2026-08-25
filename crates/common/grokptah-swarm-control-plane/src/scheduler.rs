@@ -179,12 +179,12 @@ fn validate_loaded_state(state: &SwarmState) -> SwarmResult<()> {
             }
             (None, None) => {}
         }
-        if let Some(lease) = &dispatch.lease {
-            if !seen_leases.insert(lease.lease_id.clone()) {
-                return Err(corrupt(
-                    "the same Computer Use lease is attached to multiple dispatches",
-                ));
-            }
+        if let Some(lease) = &dispatch.lease
+            && !seen_leases.insert(lease.lease_id.clone())
+        {
+            return Err(corrupt(
+                "the same Computer Use lease is attached to multiple dispatches",
+            ));
         }
         if dispatch.requested_at < state.created_at
             || dispatch
@@ -275,12 +275,12 @@ fn validate_loaded_state(state: &SwarmState) -> SwarmResult<()> {
                     .ok_or_else(|| corrupt("task points at a missing dispatch"))
             })
             .transpose()?;
-        if let Some(dispatch) = task_dispatch {
-            if dispatch.task_id != task.task_id || dispatch.attempt != task.attempts {
-                return Err(corrupt(
-                    "task current_dispatch does not match its task and latest attempt",
-                ));
-            }
+        if let Some(dispatch) = task_dispatch
+            && (dispatch.task_id != task.task_id || dispatch.attempt != task.attempts)
+        {
+            return Err(corrupt(
+                "task current_dispatch does not match its task and latest attempt",
+            ));
         }
         match task.state {
             TaskState::Dispatching => {
