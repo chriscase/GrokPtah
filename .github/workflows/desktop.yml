@@ -56,10 +56,15 @@ jobs:
           version: "v0.16.0"
       - name: Install frontend deps
         run: npm ci
+      - name: Public package and consumer smoke
+        run: npm run verify:public
       - name: Typecheck + unit tests
         run: |
           npm run typecheck
           npm test
+      - name: Host-neutral Agent SDK tests
+        working-directory: .
+        run: cargo test --locked -p grokptah-agent-sdk
       - name: Cargo tests (desktop)
         working-directory: desktop/src-tauri
         # cargo test compiles the library, binary, and test targets.

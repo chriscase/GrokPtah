@@ -15,11 +15,6 @@ jobs:
     name: Unsigned macOS bundle
     runs-on: macos-latest
     timeout-minutes: 45
-    env:
-      # Keep every restored cache private to this job's disposable runner.
-      CARGO_HOME: ${{ runner.temp }}/grokptah-cargo-home
-      CARGO_TARGET_DIR: ${{ runner.temp }}/grokptah-target
-      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -53,14 +48,45 @@ jobs:
         working-directory: desktop
         run: npm ci
 
+      - name: Verify public package and consumer smoke
+        working-directory: desktop
+        run: npm run verify:public
+
+      - name: Test host-neutral Agent SDK
+        run: cargo test --locked -p grokptah-agent-sdk
+
       - name: Build unsigned desktop bundle
         working-directory: desktop
         run: npm run tauri:build
+        env:
+          # runner.temp is available on steps, not in job-level env.
+          CARGO_HOME: ${{ runner.temp }}/grokptah-cargo-home
+          CARGO_TARGET_DIR: ${{ runner.temp }}/grokptah-target
+          CARGO_INCREMENTAL: "0"
+
+      - name: Generate and verify bundle checksums
+        env:
+          BUNDLE_DIR: ${{ runner.temp }}/grokptah-target/release/bundle
+          CHECKSUM_FILE: ${{ runner.temp }}/grokptah-macos-unsigned-${{ github.sha }}-SHA256SUMS
+        run: |
+          set -euo pipefail
+          (
+            cd "$BUNDLE_DIR"
+            find . -type f -print0 | sort -z | while IFS= read -r -d '' path; do
+              shasum -a 256 "$path"
+            done
+          ) > "$CHECKSUM_FILE"
+          (
+            cd "$BUNDLE_DIR"
+            shasum -a 256 -c "$CHECKSUM_FILE"
+          )
 
       - name: Upload unsigned bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: grokptah-macos-unsigned-${{ github.sha }}
-          path: ${{ runner.temp }}/grokptah-target/release/bundle
+          path: |
+            ${{ runner.temp }}/grokptah-target/release/bundle
+            ${{ runner.temp }}/grokptah-macos-unsigned-${{ github.sha }}-SHA256SUMS
           if-no-files-found: error
           retention-days: 7
