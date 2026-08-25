@@ -3,6 +3,7 @@ import {
   GrokPtahBrokerClient,
   HELP_CONTRACT,
   EXTERNAL_WORKER_CONTRACT,
+  EXTERNAL_WORKER_STREAMING_SUPPORTED,
   createExternalWorkerMonitor,
   parseCapabilitySet,
   promptQueueReducer,
@@ -15,6 +16,7 @@ describe("public integration barrel", () => {
     expect(typeof parseCapabilitySet).toBe("function");
     expect(typeof promptQueueReducer).toBe("function");
     expect(EXTERNAL_WORKER_CONTRACT).toBe("grokptah.external-workers.v1");
+    expect(EXTERNAL_WORKER_STREAMING_SUPPORTED).toBe(false);
     expect(createExternalWorkerMonitor().lastSeq).toBe(-1);
   });
 });

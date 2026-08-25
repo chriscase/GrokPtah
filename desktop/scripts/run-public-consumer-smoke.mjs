@@ -53,6 +53,7 @@ try {
   parseBrokerRunProjection,
   parseBrokerReviewProjection,
   EXTERNAL_WORKER_CONTRACT,
+  parseExternalWorkerArtifact,
   parseExternalWorkerLaunchRequest,
   parseExternalWorkerFollowUpRequest,
   parseExternalWorkerLaunchResult,
@@ -139,6 +140,9 @@ if (parseBrokerReviewProjection({
 if (EXTERNAL_WORKER_CONTRACT !== "grokptah.external-workers.v1") {
   throw new Error("consumer external-worker contract version was not usable");
 }
+if (typeof parseExternalWorkerArtifact !== "function") {
+  throw new Error("consumer external-worker artifact parser was not exported");
+}
 const launch = parseExternalWorkerLaunchRequest({
   requestId: "consumer-request",
   provider: "cursor_cloud",
@@ -159,8 +163,95 @@ const followUp = parseExternalWorkerFollowUpRequest({
 if (followUp?.requestId !== "consumer-follow-up") {
   throw new Error("consumer external-worker follow-up parser was not usable");
 }
+const launchResult = parseExternalWorkerLaunchResult({
+  worker: {
+    provider: "cursor_cloud",
+    externalAgentId: "agent-1",
+    repository: "org/repo",
+    startingRef: "main",
+    state: "running",
+    createdAt: "2026-08-24T00:00:00Z",
+    updatedAt: "2026-08-24T00:00:00Z",
+  },
+  run: {
+    externalAgentId: "agent-1",
+    externalRunId: "run-1",
+    state: "running",
+    stream: "unsupported",
+    lastSeq: null,
+    createdAt: "2026-08-24T00:00:00Z",
+    updatedAt: "2026-08-24T00:00:00Z",
+  },
+});
+if (launchResult?.run.lastSeq !== null || launchResult.run.stream !== "unsupported") {
+  throw new Error("consumer external-worker launch result must not synthesize a stream cursor");
+}
 if (parseExternalWorkerLaunchResult({ worker: {}, run: {} }) !== null) {
   throw new Error("consumer external-worker launch result parser failed closed");
+}
+if (parseExternalWorkerLaunchResult({
+  worker: launchResult.worker,
+  run: { ...launchResult.run, lastSeq: 0 },
+}) !== null) {
+  throw new Error("consumer external-worker parser accepted a fake lastSeq cursor");
+}
+if (parseExternalWorkerLaunchRequest({ ...launch, repository: "org/repo\\n" }) !== null) {
+  throw new Error("consumer external-worker parser accepted a newline repository");
+}
+if (parseExternalWorkerArtifact({
+  path: "artifacts/handoff.md",
+  digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  runId: "run-1",
+})?.runId !== "run-1") {
+  throw new Error("consumer external-worker artifact parser was not usable");
+}
+if (parseExternalWorkerArtifact({
+  path: "artifacts/handoff.md",
+  digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+}) !== null) {
+  throw new Error("consumer external-worker artifact parser accepted a missing runId");
+}
+if (parseExternalWorkerArtifact({
+  path: "artifacts/handoff.md",
+  digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  runId: "run-1",
+  url: "https://secret.example/file",
+}) !== null) {
+  throw new Error("consumer external-worker artifact parser accepted a raw URL");
+}
+const worker = launchResult.worker;
+const run = launchResult.run;
+const artifact = { path: "artifacts/handoff.md", digest: "sha256:abc", runId: "run-1" };
+const mutatingBroker = new GrokPtahBrokerClient({
+  baseUrl: "https://contextdesk.example",
+  csrfToken: "csrf-1",
+  fetcher: async (input, init) => {
+    const url = String(input);
+    const method = init?.method ?? "GET";
+    let body = null;
+    if (method === "POST" && url.endsWith("/external-workers")) body = { worker, run };
+    else if (method === "GET" && url.endsWith("/external-workers/agent-1")) body = worker;
+    else if (method === "POST" && url.endsWith("/external-workers/agent-1/runs")) body = run;
+    else if (method === "POST" && url.endsWith("/runs/run-1/cancel")) body = { ...run, state: "cancelled" };
+    else if (method === "GET" && url.endsWith("/runs/run-1/artifacts")) body = [artifact];
+    if (!body) return new Response(null, { status: 404 });
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  },
+});
+if ((await mutatingBroker.launchExternalWorker("binding-1", launch, "consumer-request")).run.lastSeq !== null) {
+  throw new Error("consumer launch client synthesized a stream cursor");
+}
+if ((await mutatingBroker.followUpExternalWorker("binding-1", "agent-1", followUp, "consumer-follow-up")).externalRunId !== "run-1") {
+  throw new Error("consumer follow-up client was not usable");
+}
+if ((await mutatingBroker.cancelExternalWorker("binding-1", "agent-1", "run-1", "consumer-cancel")).state !== "cancelled") {
+  throw new Error("consumer cancel client was not terminal");
+}
+if ((await mutatingBroker.getExternalWorkerArtifacts("binding-1", "agent-1", "run-1"))[0]?.runId !== "run-1") {
+  throw new Error("consumer artifacts client was not run-attributed");
 }
 const externalNotification = parseExternalWorkerNotification({
   type: "event",

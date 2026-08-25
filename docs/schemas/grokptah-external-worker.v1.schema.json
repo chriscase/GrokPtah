@@ -78,12 +78,13 @@
     "run": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["externalAgentId", "externalRunId", "state", "lastSeq", "createdAt", "updatedAt"],
+      "required": ["externalAgentId", "externalRunId", "state", "stream", "lastSeq", "createdAt", "updatedAt"],
       "properties": {
         "externalAgentId": { "$ref": "#/$defs/identity" },
         "externalRunId": { "$ref": "#/$defs/identity" },
         "state": { "$ref": "#/$defs/state" },
-        "lastSeq": { "type": "integer", "minimum": 0 },
+        "stream": { "const": "unsupported" },
+        "lastSeq": { "type": "null" },
         "terminalResult": { "type": "string", "maxLength": 4096 },
         "createdAt": { "type": "string", "minLength": 1 },
         "updatedAt": { "type": "string", "minLength": 1 }
@@ -103,10 +104,11 @@
     "artifact": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "digest"],
+      "required": ["path", "digest", "runId"],
       "properties": {
         "path": { "$ref": "#/$defs/ref" },
         "digest": { "$ref": "#/$defs/identity" },
+        "runId": { "$ref": "#/$defs/identity" },
         "sizeBytes": { "type": "integer", "minimum": 0 }
       }
     }

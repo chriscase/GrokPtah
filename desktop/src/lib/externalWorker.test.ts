@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyExternalWorkerNotification,
   createExternalWorkerMonitor,
+  EXTERNAL_WORKER_STREAMING_SUPPORTED,
   parseExternalWorkerArtifact,
   parseExternalWorkerEvent,
   parseExternalWorkerFollowUpRequest,
@@ -12,6 +13,10 @@ import {
 } from "./externalWorker";
 
 describe("external worker UI contract", () => {
+  it("does not claim a sequenced provider stream", () => {
+    expect(EXTERNAL_WORKER_STREAMING_SUPPORTED).toBe(false);
+  });
+
   it("accepts exact isolated launches and rejects privileged or host-bound data", () => {
     expect(parseExternalWorkerLaunchRequest({
       requestId: "req-1",
@@ -46,10 +51,10 @@ describe("external worker UI contract", () => {
       requestId: "req-1",
       provider: "cursor_cloud",
       repository: "org/repo",
-      startingRef: "main",
+      startingRef: "main\n",
       prompt: "Review",
       executionMode: "isolated",
-      autoCreatePr: true,
+      autoCreatePr: false,
     })).toBeNull();
   });
 
@@ -84,8 +89,15 @@ describe("external worker UI contract", () => {
       createdAt: "now",
       updatedAt: "now",
     })).toBeNull();
-    expect(parseExternalWorkerArtifact({ path: "reports/review.json", digest: "sha256:abc" })).not.toBeNull();
-    expect(parseExternalWorkerArtifact({ path: "../secret", digest: "sha256:abc" })).toBeNull();
+    expect(parseExternalWorkerArtifact({ path: "reports/review.json", digest: "sha256:abc", runId: "run-1" })).not.toBeNull();
+    expect(parseExternalWorkerArtifact({ path: "../secret", digest: "sha256:abc", runId: "run-1" })).toBeNull();
+    expect(parseExternalWorkerArtifact({ path: "reports/review.json", digest: "sha256:abc" })).toBeNull();
+    expect(parseExternalWorkerArtifact({
+      path: "reports/review.json",
+      digest: "sha256:abc",
+      runId: "run-1",
+      url: "https://secret.example/file",
+    })).toBeNull();
   });
 
   it("accepts bounded follow-ups but rejects empty prompts and unknown fields", () => {
@@ -120,12 +132,19 @@ describe("external worker UI contract", () => {
         externalAgentId: "agent-1",
         externalRunId: "run-1",
         state: "running",
-        lastSeq: 0,
+        lastSeq: null,
+        stream: "unsupported",
         createdAt: "now",
         updatedAt: "now",
       },
     });
     expect(result?.run.externalRunId).toBe("run-1");
+    expect(result?.run.stream).toBe("unsupported");
+    expect(result?.run.lastSeq).toBeNull();
+    expect(parseExternalWorkerLaunchResult({
+      worker: result?.worker,
+      run: { ...result?.run, lastSeq: 0 },
+    })).toBeNull();
     expect(parseExternalWorkerLaunchResult({ worker: result?.worker, run: { state: "running" } })).toBeNull();
     expect(parseExternalWorkerLaunchResult({
       worker: result?.worker,

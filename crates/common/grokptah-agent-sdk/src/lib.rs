@@ -31,7 +31,8 @@ pub use external_worker::{
     ExternalWorkerArtifact, ExternalWorkerEvent, ExternalWorkerExecutionMode,
     ExternalWorkerFollowUpRequest, ExternalWorkerLaunchRequest, ExternalWorkerLaunchResult,
     ExternalWorkerProvider, ExternalWorkerRecord, ExternalWorkerRunRecord, ExternalWorkerState,
-    EXTERNAL_WORKER_CONTRACT_VERSION,
+    ExternalWorkerStreamState, EXTERNAL_WORKER_CONTRACT_VERSION,
+    EXTERNAL_WORKER_STREAMING_SUPPORTED,
 };
 pub use run::{
     Bounds, ChangedFile, DurableRun, DurableRunState, ExecutionMode, IdempotencyKey, ReviewReceipt,

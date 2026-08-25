@@ -549,6 +549,55 @@ impl EventBus {
         Ok(out)
     }
 
+    /// Page a session-filtered range until `limit` matching entries.
+    ///
+    /// Unlike [`read_range_all`], a durable gap after a non-empty prefix is
+    /// not turned into `CursorExpiredError`. Callers that only need one page
+    /// (MCP `ptah_get_events`) can return that prefix; the next page then
+    /// fails closed. Complete-range readers should keep using `read_range_all`.
+    pub fn read_range_page(
+        &self,
+        after_exclusive: u64,
+        end_inclusive: Option<u64>,
+        session_filter: Option<uuid::Uuid>,
+        limit: usize,
+    ) -> Result<Vec<JournalEntry>, CursorExpiredError> {
+        let limit = limit.clamp(1, 500);
+        let mut after = after_exclusive;
+        let mut out = Vec::new();
+        loop {
+            let page = self.read_after(after, 500);
+            if page.cursor_expired {
+                if out.is_empty() {
+                    return Err(CursorExpiredError);
+                }
+                return Ok(out);
+            }
+            if page.entries.is_empty() {
+                break;
+            }
+            for e in page.entries {
+                if let Some(end) = end_inclusive {
+                    if e.seq > end {
+                        return Ok(out);
+                    }
+                }
+                if let Some(sid) = session_filter {
+                    if session_id_of(&e.update) != Some(sid) {
+                        after = e.seq;
+                        continue;
+                    }
+                }
+                after = e.seq;
+                out.push(e);
+                if out.len() >= limit {
+                    return Ok(out);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn current_seq(&self) -> u64 {
         self.inner.lock().last_seq
     }
@@ -1599,6 +1648,32 @@ mod tests {
 
         let reopened = EventBus::new(8).with_persist_dir(dir.path());
         assert!(reopened.read_after(6, 8).cursor_expired);
+    }
+
+    #[test]
+    fn read_range_page_returns_prefix_before_durable_gap() {
+        let bus = EventBus::new(64);
+        let sid = Uuid::new_v4();
+        for index in 0..10 {
+            bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: sid,
+                text: format!("before-{index}"),
+            });
+        }
+        record_journal_gap(&bus.journal_gap, 12);
+        record_journal_gap(&bus.journal_gap, 20);
+        for index in 0..10 {
+            bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: sid,
+                text: format!("after-{index}"),
+            });
+        }
+        let page = bus
+            .read_range_page(0, None, Some(sid), 500)
+            .expect("prefix before the durable gap");
+        assert!(!page.is_empty());
+        assert!(page.iter().all(|entry| entry.seq < 12));
+        assert!(bus.read_range_all(0, None, Some(sid)).is_err());
     }
 
     #[test]
