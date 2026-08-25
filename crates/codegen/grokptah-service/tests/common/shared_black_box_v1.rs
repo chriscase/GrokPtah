@@ -97,6 +97,21 @@ const GOLDEN_UPDATE_ENV_VARS: &[&str] = &[
 /// only long enough to dump `/tmp` JSON; it must be true before push.
 const PRELOAD_IMMUTABLE_GOLDEN: bool = true;
 
+/// Revision the workflow that compiled this test binary declares it is
+/// certifying, as a full commit sha.
+///
+/// `option_env!` is resolved by rustc while the workflow builds the test, so
+/// the value is sealed into the binary. A `std::env::var` read would let
+/// anyone who can start the already-built test name any revision they liked;
+/// this cannot be redirected by an ordinary runtime caller.
+///
+/// A declaration is never trusted on its own. It only survives
+/// [`verify_declared_source_revision`], which re-derives the claim from the
+/// repository, so a stale or wrong declaration fails closed rather than
+/// selecting someone else's golden.
+const DECLARED_SOURCE_REVISION: Option<&str> =
+    option_env!("GROKPTAH_SHARED_BLACK_BOX_SOURCE_REVISION");
+
 /// Serializes process-global environment mutations for this test binary.
 pub struct ProcessEnvGuard {
     _lock: MutexGuard<'static, ()>,
@@ -314,7 +329,7 @@ struct GatewayScript {
 pub async fn run_fixture() {
     let scenario = Scenario::load();
     reject_golden_mutation_env();
-    let source = detect_audited_source_revision();
+    let source = resolve_audited_source_revision();
     let golden_name = select_golden_file(&source, &scenario);
     let golden_path = PathBuf::from(GOLDEN_DIR).join(golden_name);
     let golden_before = snapshot_path(&golden_path);
@@ -2951,14 +2966,69 @@ fn commit_changed_files(sha: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn detect_audited_source_revision() -> String {
-    let status = git_stdout(&["status", "--porcelain"]).expect("git status");
-    for path in porcelain_paths(&status) {
-        if !allowlisted(&path) {
-            panic!("unexpected dirty path outside fixture allowlist: {path}");
-        }
+fn is_full_commit_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parent_count(sha: &str) -> usize {
+    git_stdout(&["rev-list", "--parents", "-n", "1", sha])
+        .map(|line| line.split_whitespace().count().saturating_sub(1))
+        .unwrap_or(0)
+}
+
+/// Non-fixture paths that differ between two trees. Empty means the two
+/// revisions are the same host under test, so one's golden describes the
+/// other. Fixture-only differences are the same exemption the history walk
+/// already applies, not a new one.
+fn host_source_differences(from: &str, to: &str) -> Vec<String> {
+    git_stdout(&["diff", "--name-only", from, to])
+        .unwrap_or_else(|error| panic!("git diff {from} {to}: {error}"))
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty() && !allowlisted(path))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Re-derives a workflow's declaration from the repository. Every branch here
+/// panics rather than returning a fallback: an unverifiable declaration must
+/// never reach [`select_golden_file`], because that is where a revision starts
+/// being treated as audited.
+fn verify_declared_source_revision(declared: &str) -> String {
+    if !is_full_commit_sha(declared) {
+        panic!(
+            "declared source revision {declared:?} is not a full 40-character lowercase commit sha; fail closed"
+        );
     }
-    let mut sha = git_stdout(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    let resolved = git_stdout(&["rev-parse", "--verify", "--quiet", &format!("{declared}^{{commit}}")])
+        .unwrap_or_else(|error| {
+            panic!("declared source revision {declared} is not a commit in this checkout ({error}); fail closed")
+        });
+    if resolved != declared {
+        panic!("declared source revision {declared} resolved to {resolved}; fail closed");
+    }
+    let head = git_stdout(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    if git_stdout(&["merge-base", "--is-ancestor", declared, &head]).is_err() {
+        panic!(
+            "declared source revision {declared} is not an ancestor of the checked-out HEAD {head}; fail closed"
+        );
+    }
+    let differences = host_source_differences(declared, &head);
+    if !differences.is_empty() {
+        panic!(
+            "checked-out HEAD {head} differs from declared source revision {declared} outside the fixture allowlist ({differences:?}); fail closed (a merge that changes the host is not the declared revision)"
+        );
+    }
+    declared.to_string()
+}
+
+/// Walks back over commits that only touch fixture files to name the revision
+/// whose host source is actually under test.
+fn walk_back_to_host_revision(head: &str) -> String {
+    let mut sha = head.to_string();
     loop {
         let files = commit_changed_files(&sha).expect("commit files");
         if files.iter().any(|path| !allowlisted(path)) {
@@ -2969,6 +3039,46 @@ fn detect_audited_source_revision() -> String {
             Err(_) => panic!("could not identify audited host revision (fail closed)"),
         }
     }
+}
+
+/// Names the revision whose golden may be selected.
+///
+/// A pull-request checkout is an ephemeral merge of the head into the base.
+/// That merge sha is created per run and can never appear in a compile-time
+/// audited table, so inferring a golden from it would mean inferring one for a
+/// tree nobody audited. The workflow therefore declares which revision it is
+/// certifying, and the declaration is verified against this checkout before it
+/// is used. With no declaration the historical walk still applies, but a merge
+/// commit is refused by name instead of failing later as an "unexpected source
+/// revision" that hides why it was unexpected.
+fn resolve_audited_source_revision() -> String {
+    let status = git_stdout(&["status", "--porcelain"]).expect("git status");
+    for path in porcelain_paths(&status) {
+        if !allowlisted(&path) {
+            panic!("unexpected dirty path outside fixture allowlist: {path}");
+        }
+    }
+    if let Some(declared) = DECLARED_SOURCE_REVISION {
+        return verify_declared_source_revision(declared.trim());
+    }
+    let head = git_stdout(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    let resolved = walk_back_to_host_revision(&head);
+    if let Some(message) = merge_refusal_message(&resolved, parent_count(&resolved)) {
+        panic!("{message}");
+    }
+    resolved
+}
+
+/// A merge commit is refused by name rather than left to fail later as an
+/// anonymous "unexpected source revision". Pull-request CI checks out a merge
+/// that is minted per run, so the operator needs to be told to declare the
+/// revision, not merely told the sha was not recognised.
+fn merge_refusal_message(resolved: &str, parents: usize) -> Option<String> {
+    (parents > 1).then(|| {
+        format!(
+            "checked-out HEAD resolves to merge commit {resolved}; fail closed (build this test with GROKPTAH_SHARED_BLACK_BOX_SOURCE_REVISION set to the exact revision under test)"
+        )
+    })
 }
 
 fn write_golden_document(result: &Value, source: &str) -> Value {
@@ -3189,6 +3299,96 @@ fn unknown_source_revision_fails_closed() {
         select_golden_file("ffffffffffffffffffffffffffffffffffffffff", &scenario)
     }))
     .expect_err("unknown revision must fail closed");
+    let text = panic_text(message);
+    assert!(text.contains("unexpected source revision"), "{text}");
+}
+
+#[test]
+fn declared_source_revision_rejects_non_sha_forms() {
+    for declared in [
+        "",
+        "94e9437",
+        "refs/pull/399/merge",
+        "HEAD",
+        "94E9437E2C45022FF442092866B5EEA881D2396D",
+        "94e9437e2c45022ff442092866b5eea881d2396",
+        "94e9437e2c45022ff442092866b5eea881d2396dd",
+        "94e9437e2c45022ff442092866b5eea881d2396g",
+    ] {
+        let message = catch_unwind(AssertUnwindSafe(|| {
+            verify_declared_source_revision(declared)
+        }))
+        .expect_err("a non-sha declaration must fail closed");
+        let text = panic_text(message);
+        assert!(
+            text.contains("is not a full 40-character lowercase commit sha"),
+            "{declared}: {text}"
+        );
+    }
+}
+
+#[test]
+fn declared_source_revision_rejects_a_commit_absent_from_this_checkout() {
+    let message = catch_unwind(AssertUnwindSafe(|| {
+        verify_declared_source_revision(&"f".repeat(40))
+    }))
+    .expect_err("an absent commit must fail closed");
+    let text = panic_text(message);
+    assert!(text.contains("is not a commit in this checkout"), "{text}");
+}
+
+#[test]
+fn declared_source_revision_accepts_the_verified_checked_out_head() {
+    let head = git_stdout(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    assert_eq!(verify_declared_source_revision(&head), head);
+    assert!(host_source_differences(&head, &head).is_empty());
+}
+
+#[test]
+fn host_source_differences_never_silently_absorbs_a_host_path() {
+    for allowed in FIXTURE_ALLOWLIST {
+        assert!(allowlisted(allowed), "{allowed}");
+    }
+    for host_path in [
+        "crates/codegen/grokptah-service/src/lib.rs",
+        "crates/codegen/grokptah-agent-bridge/src/lib.rs",
+        "crates/codegen/grokptah-service/Cargo.lock.other",
+        ".github/workflows/hosted-service.yml",
+    ] {
+        assert!(!allowlisted(host_path), "{host_path}");
+    }
+}
+
+#[test]
+fn an_undeclared_merge_head_is_refused_by_name() {
+    assert!(merge_refusal_message("a".repeat(40).as_str(), 1).is_none());
+    assert!(merge_refusal_message("a".repeat(40).as_str(), 0).is_none());
+    let message = merge_refusal_message("f16f5d7fe66199a1d13326e7f659592ef439d7ee", 2)
+        .expect("a merge head must be refused");
+    assert!(
+        message.contains("merge commit f16f5d7fe66199a1d13326e7f659592ef439d7ee"),
+        "{message}"
+    );
+    assert!(
+        message.contains("GROKPTAH_SHARED_BLACK_BOX_SOURCE_REVISION"),
+        "{message}"
+    );
+}
+
+#[test]
+fn an_unverified_declaration_never_reaches_golden_selection() {
+    // The declaration channel does not widen the audited table: a revision
+    // that survives verification is still refused unless it was audited.
+    let scenario = Scenario::load();
+    let head = git_stdout(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    let verified = verify_declared_source_revision(&head);
+    if AUDITED_GOLDENS.iter().any(|(sha, _)| *sha == verified) {
+        return;
+    }
+    let message = catch_unwind(AssertUnwindSafe(|| {
+        select_golden_file(&verified, &scenario)
+    }))
+    .expect_err("a verified but unaudited revision must still fail closed");
     let text = panic_text(message);
     assert!(text.contains("unexpected source revision"), "{text}");
 }

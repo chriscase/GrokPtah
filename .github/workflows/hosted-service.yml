@@ -40,6 +40,36 @@ jobs:
         working-directory: crates/codegen/grokptah-service
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The shared black-box fixture re-derives the declared revision from
+          # git, which needs the merge commit's parents and their history.
+          fetch-depth: 0
+      - name: Declare the source revision under test
+        # A pull_request checkout is an ephemeral merge commit minted per run,
+        # so it can never appear in the fixture's compile-time audited table.
+        # The workflow states which revision it is certifying instead of
+        # letting the fixture guess from whatever HEAD happens to be. This is
+        # compile-time metadata: the fixture reads it with option_env! and then
+        # verifies it against this checkout before any golden is selected, so
+        # it cannot be used as a runtime override to claim an audited revision.
+        working-directory: .
+        env:
+          DECLARED_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$DECLARED_REVISION" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "declared revision is not a full commit sha: $DECLARED_REVISION" >&2
+            exit 1
+          fi
+          if ! git rev-parse --verify --quiet "$DECLARED_REVISION^{commit}" >/dev/null; then
+            echo "declared revision $DECLARED_REVISION is absent from this checkout" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$DECLARED_REVISION" HEAD; then
+            echo "declared revision $DECLARED_REVISION is not an ancestor of HEAD" >&2
+            exit 1
+          fi
+          echo "GROKPTAH_SHARED_BLACK_BOX_SOURCE_REVISION=$DECLARED_REVISION" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: "1.92.0"
