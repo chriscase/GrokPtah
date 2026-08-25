@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  type GrokPtahBrokerApprovalRequest,
   GrokPtahBrokerClient,
   GrokPtahBrokerError,
 } from "./grokptahBrokerClient";
