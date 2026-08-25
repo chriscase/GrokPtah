@@ -202,7 +202,7 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
         if index % 100 == 99 {
             // Keep the persistence writer ahead of its small queue while the
             // unread HTTP body still forces the broadcast receiver to lag.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
