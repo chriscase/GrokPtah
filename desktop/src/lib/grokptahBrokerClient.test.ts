@@ -90,6 +90,36 @@ describe("GrokPtahBrokerClient", () => {
     expect(fetcher.mock.calls[0][1]?.headers).not.toHaveProperty("Authorization");
   });
 
+  it("rejects external worker responses whose identities do not match the route", async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({
+        provider: "cursor_cloud",
+        externalAgentId: "other-agent",
+        repository: "org/repo",
+        startingRef: "main",
+        state: "running",
+        createdAt: "now",
+        updatedAt: "now",
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        externalAgentId: "agent-1",
+        externalRunId: "other-run",
+        state: "running",
+        lastSeq: 0,
+        createdAt: "now",
+        updatedAt: "now",
+      }));
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+    });
+
+    await expect(client.getExternalWorker("binding-1", "agent-1"))
+      .rejects.toMatchObject({ code: "invalid_response" });
+    await expect(client.getExternalWorkerRun("binding-1", "agent-1", "run-1"))
+      .rejects.toMatchObject({ code: "invalid_response" });
+  });
+
   it("fails closed when a typed binding or run envelope is malformed", async () => {
     expect(parseBrokerBinding({
       bindingId: "binding-1",
