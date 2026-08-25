@@ -2885,11 +2885,10 @@ fn repo_root() -> PathBuf {
         .expect("canonicalize repo root")
 }
 
-fn git_stdout(args: &[&str]) -> Result<String, String> {
-    let root = repo_root();
+fn git_stdout_at(root: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(&root)
+        .arg(root)
         .args(args)
         .output()
         .map_err(|error| format!("git {}: {error}", args.join(" ")))?;
@@ -2930,19 +2929,22 @@ fn allowlisted(path: &str) -> bool {
     })
 }
 
-fn commit_changed_files(sha: &str) -> Result<Vec<String>, String> {
-    let parent = git_stdout(&["rev-parse", &format!("{sha}^")]);
+fn commit_changed_files_at(root: &Path, sha: &str) -> Result<Vec<String>, String> {
+    let parent = git_stdout_at(root, &["rev-parse", &format!("{sha}^")]);
     let diff = if parent.is_ok() {
-        git_stdout(&["diff", "--name-only", &format!("{sha}^"), sha])?
+        git_stdout_at(root, &["diff", "--name-only", &format!("{sha}^"), sha])?
     } else {
-        git_stdout(&[
-            "diff-tree",
-            "--no-commit-id",
-            "--name-only",
-            "--root",
-            "-r",
-            sha,
-        ])?
+        git_stdout_at(
+            root,
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "--root",
+                "-r",
+                sha,
+            ],
+        )?
     };
     Ok(diff
         .lines()
@@ -2952,21 +2954,64 @@ fn commit_changed_files(sha: &str) -> Result<Vec<String>, String> {
 }
 
 fn detect_audited_source_revision() -> String {
-    let status = git_stdout(&["status", "--porcelain"]).expect("git status");
+    detect_audited_source_revision_at(&repo_root())
+}
+
+enum AuditedWalkStart {
+    Direct,
+    SecondParent(String),
+    RetainHead,
+}
+
+fn audited_walk_start(root: &Path, head: &str) -> AuditedWalkStart {
+    let Ok(parent_line) = git_stdout_at(root, &["rev-list", "--parents", "-n", "1", head]) else {
+        return AuditedWalkStart::RetainHead;
+    };
+    let parents: Vec<_> = parent_line.split_whitespace().collect();
+    if parents.first().copied() != Some(head) {
+        return AuditedWalkStart::RetainHead;
+    }
+    match parents.len() {
+        1 => AuditedWalkStart::Direct,
+        2 => {
+            let merge_tree = git_stdout_at(root, &["rev-parse", &format!("{head}^{{tree}}")]);
+            let second_parent_tree =
+                git_stdout_at(root, &["rev-parse", &format!("{}^{{tree}}", parents[1])]);
+            match (merge_tree, second_parent_tree) {
+                (Ok(merge_tree), Ok(second_parent_tree)) if merge_tree == second_parent_tree => {
+                    AuditedWalkStart::SecondParent(parents[1].to_string())
+                }
+                _ => AuditedWalkStart::RetainHead,
+            }
+        }
+        _ => AuditedWalkStart::RetainHead,
+    }
+}
+
+fn detect_audited_source_revision_at(root: &Path) -> String {
+    let status = git_stdout_at(root, &["status", "--porcelain"]).expect("git status");
     for path in porcelain_paths(&status) {
         if !allowlisted(&path) {
             panic!("unexpected dirty path outside fixture allowlist: {path}");
         }
     }
-    let mut sha = git_stdout(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    let head = git_stdout_at(root, &["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    let mut sha = match audited_walk_start(root, &head) {
+        AuditedWalkStart::Direct => head.clone(),
+        AuditedWalkStart::SecondParent(parent) => parent,
+        AuditedWalkStart::RetainHead => return head,
+    };
     loop {
-        let files = commit_changed_files(&sha).expect("commit files");
+        let files = match commit_changed_files_at(root, &sha) {
+            Ok(files) => files,
+            Err(_) => return head,
+        };
         if files.iter().any(|path| !allowlisted(path)) {
             return sha;
         }
-        match git_stdout(&["rev-parse", &format!("{sha}^")]) {
+        match git_stdout_at(root, &["rev-parse", &format!("{sha}^")]) {
             Ok(parent) => sha = parent,
-            Err(_) => panic!("could not identify audited host revision (fail closed)"),
+            Err(_) => return head,
         }
     }
 }
@@ -3369,4 +3414,163 @@ fn expected_main_golden_is_immutable_for_audited_revision() {
         loaded["overlay"]["mcpError"]["code"],
         json!("invalid_request")
     );
+}
+
+fn detector_test_git(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("run detector test git command");
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string()
+}
+
+fn detector_test_repo() -> TempDir {
+    let repo = tempfile::tempdir().expect("detector test repo");
+    detector_test_git(repo.path(), &["init", "--quiet", "-b", "main"]);
+    detector_test_git(
+        repo.path(),
+        &["config", "user.email", "detector-tests@example.invalid"],
+    );
+    detector_test_git(repo.path(), &["config", "user.name", "detector tests"]);
+    detector_test_write(
+        repo.path(),
+        "crates/codegen/grokptah-service/tests/shared_black_box_v1.rs",
+        "fixture-only base\n",
+    );
+    detector_test_commit(repo.path(), "base").expect("detector test base commit");
+    repo
+}
+
+fn detector_test_write(repo: &Path, path: &str, contents: &str) {
+    let path = repo.join(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("detector test parent");
+    }
+    std::fs::write(path, contents).expect("detector test file");
+}
+
+fn detector_test_commit(repo: &Path, message: &str) -> Result<String, String> {
+    let add = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["add", "--all"])
+        .output()
+        .map_err(|error| format!("git add: {error}"))?;
+    if !add.status.success() {
+        return Err(String::from_utf8_lossy(&add.stderr).to_string());
+    }
+    let commit = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["commit", "--quiet", "-m", message])
+        .output()
+        .map_err(|error| format!("git commit: {error}"))?;
+    if !commit.status.success() {
+        return Err(String::from_utf8_lossy(&commit.stderr).to_string());
+    }
+    Ok(detector_test_git(repo, &["rev-parse", "HEAD"]))
+}
+
+fn matching_tree_detector_test_repo() -> (TempDir, String, String) {
+    let repo = detector_test_repo();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "-b", "candidate"]);
+    detector_test_write(repo.path(), "candidate-only.txt", "candidate\n");
+    let candidate =
+        detector_test_commit(repo.path(), "candidate outside fixture allowlist").unwrap();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_test_git(
+        repo.path(),
+        &["merge", "--quiet", "--no-ff", "--no-edit", "candidate"],
+    );
+    let merge = detector_test_git(repo.path(), &["rev-parse", "HEAD"]);
+    (repo, candidate, merge)
+}
+
+#[test]
+fn matching_tree_merge_starts_audited_walk_at_second_parent() {
+    let (repo, candidate, merge) = matching_tree_detector_test_repo();
+    assert_ne!(candidate, merge);
+    assert_eq!(detect_audited_source_revision_at(repo.path()), candidate);
+}
+
+#[test]
+fn unique_tree_merge_retains_merge_sha() {
+    let repo = detector_test_repo();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "-b", "candidate"]);
+    detector_test_write(repo.path(), "candidate-only.txt", "candidate\n");
+    detector_test_commit(repo.path(), "candidate change").unwrap();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_test_write(repo.path(), "base-only.txt", "base branch\n");
+    detector_test_commit(repo.path(), "base branch change").unwrap();
+    detector_test_git(
+        repo.path(),
+        &["merge", "--quiet", "--no-ff", "--no-edit", "candidate"],
+    );
+    let merge = detector_test_git(repo.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(detect_audited_source_revision_at(repo.path()), merge);
+}
+
+#[test]
+fn octopus_merge_retains_merge_sha() {
+    let repo = detector_test_repo();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "-b", "one"]);
+    detector_test_write(repo.path(), "one-only.txt", "one\n");
+    detector_test_commit(repo.path(), "one").unwrap();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_test_git(repo.path(), &["checkout", "--quiet", "-b", "two"]);
+    detector_test_write(repo.path(), "two-only.txt", "two\n");
+    detector_test_commit(repo.path(), "two").unwrap();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_test_git(repo.path(), &["checkout", "--quiet", "-b", "three"]);
+    detector_test_write(repo.path(), "three-only.txt", "three\n");
+    detector_test_commit(repo.path(), "three").unwrap();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_test_git(
+        repo.path(),
+        &[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "--no-edit",
+            "one",
+            "two",
+            "three",
+        ],
+    );
+    let merge = detector_test_git(repo.path(), &["rev-parse", "HEAD"]);
+    let parents = detector_test_git(repo.path(), &["rev-list", "--parents", "-n", "1", "HEAD"]);
+    assert_eq!(parents.split_whitespace().count(), 4);
+    assert_eq!(detect_audited_source_revision_at(repo.path()), merge);
+}
+
+#[test]
+fn shallow_matching_tree_merge_retains_merge_sha() {
+    let (repo, _candidate, merge) = matching_tree_detector_test_repo();
+    let clone_parent = tempfile::tempdir().expect("shallow clone parent");
+    let clone = clone_parent.path().join("clone");
+    let source = format!("file://{}", repo.path().display());
+    let output = Command::new("git")
+        .args(["clone", "--quiet", "--depth", "1", "--branch", "main"])
+        .arg(source)
+        .arg(&clone)
+        .output()
+        .expect("clone shallow detector test repo");
+    assert!(
+        output.status.success(),
+        "git clone failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let shallow_head = detector_test_git(&clone, &["rev-parse", "HEAD"]);
+    assert_eq!(shallow_head, merge);
+    assert_eq!(detect_audited_source_revision_at(&clone), merge);
 }
