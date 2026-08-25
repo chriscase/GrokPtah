@@ -3027,28 +3027,57 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_transport_code_projects_to_public_invalid_request() {
-        // `json_err` keeps `data.code` on the public taxonomy. Unsupported is
-        // HTTP 405 with `invalid_request` plus bounded `reasonCode=unsupported`.
-        let error = OrchError::new(
-            OrchErrorCode::Unsupported,
-            "computer use is unavailable on this host",
-        );
-        assert_eq!(status_for(&error), StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(
-            public_error_code(&error.code),
-            PublicErrorCode::InvalidRequest
-        );
-        assert_eq!(error.code.as_str(), "unsupported");
-        assert_eq!(
-            public_error_message(&error.code),
-            "The operation is unsupported."
-        );
-        assert_ne!(
-            public_error_message(&error.code),
-            error.message.as_str(),
-            "lock/store detail must not become the public message"
-        );
+    fn public_error_taxonomy_keeps_transport_codes_on_reason_code() {
+        // `json_err` keeps `data.code` on the public taxonomy. Internal
+        // OrchError codes stay on bounded `reasonCode` and must not leak as
+        // the public message.
+        let cases = [
+            (
+                OrchErrorCode::Unsupported,
+                "computer use is unavailable on this host",
+                StatusCode::METHOD_NOT_ALLOWED,
+                PublicErrorCode::InvalidRequest,
+                "unsupported",
+                "The operation is unsupported.",
+            ),
+            (
+                OrchErrorCode::Timeout,
+                "request timed out",
+                StatusCode::GATEWAY_TIMEOUT,
+                PublicErrorCode::Internal,
+                "timeout",
+                "The request exceeded its bounded deadline.",
+            ),
+            (
+                OrchErrorCode::ForbiddenScope,
+                "tool run_terminal_cmd is not available",
+                StatusCode::FORBIDDEN,
+                PublicErrorCode::ForbiddenScope,
+                "forbidden_scope",
+                "The requested scope is not allowed.",
+            ),
+            (
+                OrchErrorCode::CursorExpired,
+                "computer run event cursor is below the retained window",
+                StatusCode::GONE,
+                PublicErrorCode::StaleOrRecovery,
+                "cursor_expired",
+                "The requested state is stale or requires recovery.",
+            ),
+        ];
+        for (code, internal, status, public, reason, message) in cases {
+            let error = OrchError::new(code, internal);
+            assert_eq!(status_for(&error), status, "{}", error.code.as_str());
+            assert_eq!(public_error_code(&error.code), public);
+            assert_eq!(error.code.as_str(), reason);
+            assert_eq!(public_error_message(&error.code), message);
+            assert_ne!(
+                public_error_message(&error.code),
+                error.message.as_str(),
+                "{} must not publish the internal transport message",
+                error.code.as_str()
+            );
+        }
     }
 
     #[tokio::test]
