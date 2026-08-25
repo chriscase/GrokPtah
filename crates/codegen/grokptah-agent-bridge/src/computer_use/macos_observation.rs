@@ -115,7 +115,6 @@ pub(crate) struct RawMacObservation {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Consumed by the macOS native dispatch path and tests.
 pub(crate) struct RawMacActionRequest {
     pub target_frame: ObservationGeometry,
     pub element_index: Option<usize>,
@@ -164,7 +163,6 @@ pub struct MacOsObservationPlatform {
 }
 
 impl MacOsObservationPlatform {
-    #[allow(dead_code)] // Used by new_native on macOS and by observation tests.
     pub(crate) fn with_source(source: Arc<dyn MacObservationSource>) -> Self {
         Self {
             source,
