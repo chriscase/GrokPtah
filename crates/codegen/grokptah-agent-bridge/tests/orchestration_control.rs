@@ -2271,7 +2271,7 @@ async fn thirty_two_queued_admissions_recover_fifo_and_dispatch_once() {
         )
         .await
         .unwrap();
-    assert_eq!(replay["runId"], run_id);
+    assert_eq!(replay["runId"], run_id.as_str());
     assert_eq!(
         std::fs::read_dir(replacement.store().root().join("acceptance"))
             .unwrap()
