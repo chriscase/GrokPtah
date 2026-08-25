@@ -2512,7 +2512,7 @@ mod tests {
                 "owner-1",
                 attempt.revision,
                 expired,
-                Duration::seconds(1),
+                StdDuration::from_secs(1),
             )
             .is_err());
         assert!(store
