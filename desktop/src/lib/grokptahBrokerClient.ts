@@ -308,11 +308,15 @@ export class GrokPtahBrokerClient {
     idempotencyKey: string,
   ): Promise<GrokPtahBrokerRun> {
     validateRunRequest(request);
-    return this.requestValidated(`/bindings/${segment(bindingId)}/runs`, parseBrokerRun, {
+    const run = await this.requestValidated(`/bindings/${segment(bindingId)}/runs`, parseBrokerRun, {
       method: "POST",
       idempotencyKey,
       body: request,
     });
+    if (run.bindingId !== bindingId) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "Broker run binding does not match the request");
+    }
+    return run;
   }
 
   async getRun<T = unknown>(bindingId: string, brokerRunId: string): Promise<T> {
@@ -359,6 +363,9 @@ export class GrokPtahBrokerClient {
         body: request,
       },
     );
+    if (approval.bindingId !== bindingId || approval.brokerRunId !== brokerRunId) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "Broker approval scope does not match the request");
+    }
     return approval as T;
   }
 
@@ -373,6 +380,7 @@ export class GrokPtahBrokerClient {
     approvalId: string,
     idempotencyKey: string,
   ): Promise<T> {
+    validateOpaqueText(approvalId, "Approval id", MAX_BROKER_ID_BYTES);
     return this.request<T>(`${this.runPath(bindingId, brokerRunId)}/promote`, {
       method: "POST",
       idempotencyKey,

@@ -92,6 +92,19 @@ describe("GrokPtahBrokerClient", () => {
       .rejects.toMatchObject({ code: "invalid_response" });
   });
 
+  it("rejects a well-formed run response bound to a different workspace", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse({ brokerRunId: "run-1", bindingId: "other-binding" }),
+    );
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    await expect(client.submitRun("binding-1", { prompt: "review" }, "intent-1"))
+      .rejects.toMatchObject({ code: "invalid_response" });
+  });
+
   it("rejects oversized broker JSON responses before exposing them", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(JSON.stringify("x".repeat(4 * 1_048_576)), {
@@ -181,6 +194,8 @@ describe("GrokPtahBrokerClient", () => {
     await expect(client.submitRun("binding-1", { prompt: "review" }, "  ")).rejects.toMatchObject({
       code: "idempotency_required",
     });
+    await expect(client.promoteRun("binding-1", "run-1", " ", "promote-intent-1"))
+      .rejects.toMatchObject({ code: "invalid_request" });
     expect(fetcher).not.toHaveBeenCalled();
   });
 
@@ -307,6 +322,24 @@ describe("GrokPtahBrokerClient", () => {
         "run-1",
         { sourceFingerprint: "source-1", finalFingerprint: "final-1", changedFiles: [] },
         "approve-intent-2",
+      ),
+    ).rejects.toMatchObject({ code: "invalid_response" });
+
+    fetcher.mockResolvedValueOnce(jsonResponse({
+      approvalId: "approval-1",
+      bindingId: "other-binding",
+      brokerRunId: "run-1",
+      sourceFingerprint: "source-1",
+      finalFingerprint: "final-1",
+      changedFiles: [],
+      expiresAt: "2026-08-24T23:00:00Z",
+    }));
+    await expect(
+      client.approveRun(
+        "binding-1",
+        "run-1",
+        { sourceFingerprint: "source-1", finalFingerprint: "final-1", changedFiles: [] },
+        "approve-intent-3",
       ),
     ).rejects.toMatchObject({ code: "invalid_response" });
   });
