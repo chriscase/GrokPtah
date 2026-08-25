@@ -98,6 +98,35 @@ export type GrokPtahBrokerRecovery = {
 
 export type GrokPtahBrokerNotification = GrokPtahBrokerEvent | GrokPtahBrokerRecovery;
 
+function parseChangedFiles(value: unknown): GrokPtahBrokerChangedFile[] | null {
+  if (!Array.isArray(value) || value.length > MAX_BROKER_CHANGED_FILES) return null;
+  const changedFiles: GrokPtahBrokerChangedFile[] = [];
+  for (const file of value) {
+    if (
+      typeof file !== "object" ||
+      file === null ||
+      Array.isArray(file) ||
+      !hasOnlyKeys(file as Record<string, unknown>, new Set(["path", "summary"]))
+    ) {
+      return null;
+    }
+    const record = file as Record<string, unknown>;
+    if (
+      typeof record.path !== "string" ||
+      typeof record.summary !== "string" ||
+      !boundedString(record.path, MAX_BROKER_PATH_BYTES) ||
+      !boundedString(record.summary, 512) ||
+      record.path.startsWith("/") ||
+      record.path.includes("\\") ||
+      record.path.includes("..")
+    ) {
+      return null;
+    }
+    changedFiles.push({ path: record.path, summary: record.summary });
+  }
+  return changedFiles;
+}
+
 function boundedString(value: unknown, maxBytes: number): value is string {
   return (
     typeof value === "string" &&
@@ -129,6 +158,7 @@ export function parseBrokerBinding(value: unknown): GrokPtahBrokerBinding | null
     if (!hasOnlyKeys(capability, new Set(["id", "availability"]))) return null;
     if (
       !boundedString(capability.id, 128) ||
+      !BROKER_CAPABILITY_ID.test(capability.id) ||
       typeof capability.availability !== "string" ||
       !BROKER_AVAILABILITIES.has(capability.availability as GrokPtahBrokerCapability["availability"])
     ) return null;
@@ -144,6 +174,45 @@ export function parseBrokerBinding(value: unknown): GrokPtahBrokerBinding | null
     contract: record.contract,
     expiresAt: record.expiresAt,
     capabilities,
+  };
+}
+
+/** Parse an approval envelope without trusting broker response contents. */
+export function parseBrokerApproval(value: unknown): GrokPtahBrokerApproval | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (
+    !hasOnlyKeys(
+      record,
+      new Set([
+        "approvalId",
+        "bindingId",
+        "brokerRunId",
+        "sourceFingerprint",
+        "finalFingerprint",
+        "changedFiles",
+        "expiresAt",
+      ]),
+    ) ||
+    !boundedString(record.approvalId, MAX_BROKER_ID_BYTES) ||
+    !boundedString(record.bindingId, MAX_BROKER_ID_BYTES) ||
+    !boundedString(record.brokerRunId, MAX_BROKER_ID_BYTES) ||
+    !boundedString(record.sourceFingerprint, MAX_BROKER_FINGERPRINT_BYTES) ||
+    !boundedString(record.finalFingerprint, MAX_BROKER_FINGERPRINT_BYTES) ||
+    !boundedString(record.expiresAt, 128)
+  ) {
+    return null;
+  }
+  const changedFiles = parseChangedFiles(record.changedFiles);
+  if (changedFiles === null) return null;
+  return {
+    approvalId: record.approvalId,
+    bindingId: record.bindingId,
+    brokerRunId: record.brokerRunId,
+    sourceFingerprint: record.sourceFingerprint,
+    finalFingerprint: record.finalFingerprint,
+    changedFiles,
+    expiresAt: record.expiresAt,
   };
 }
 
@@ -275,11 +344,16 @@ export class GrokPtahBrokerClient {
     idempotencyKey: string,
   ): Promise<T> {
     validateApprovalRequest(request);
-    return this.request<T>(`${this.runPath(bindingId, brokerRunId)}/approve`, {
-      method: "POST",
-      idempotencyKey,
-      body: request,
-    });
+    const approval = await this.requestValidated(
+      `${this.runPath(bindingId, brokerRunId)}/approve`,
+      parseBrokerApproval,
+      {
+        method: "POST",
+        idempotencyKey,
+        body: request,
+      },
+    );
+    return approval as T;
   }
 
   /**
@@ -579,6 +653,7 @@ function validateApprovalRequest(request: GrokPtahBrokerApprovalRequest): void {
       typeof file.summary !== "string" ||
       !file.path.trim() ||
       file.path.startsWith("/") ||
+      file.path.includes("\\") ||
       file.path.includes("..") ||
       new TextEncoder().encode(file.path).byteLength > MAX_BROKER_PATH_BYTES ||
       new TextEncoder().encode(file.summary).byteLength > 512

@@ -3,6 +3,7 @@ import {
   type GrokPtahBrokerApprovalRequest,
   GrokPtahBrokerClient,
   GrokPtahBrokerError,
+  parseBrokerApproval,
   parseBrokerBinding,
   parseBrokerRun,
 } from "./grokptahBrokerClient";
@@ -60,6 +61,24 @@ describe("GrokPtahBrokerClient", () => {
     })).toBeNull();
     expect(parseBrokerRun({ brokerRunId: "run-1", bindingId: "binding-1" })).not.toBeNull();
     expect(parseBrokerRun({ brokerRunId: "run-1", bindingId: "binding-1", workspace: "/secret" })).toBeNull();
+    expect(parseBrokerApproval({
+      approvalId: "approval-1",
+      bindingId: "binding-1",
+      brokerRunId: "run-1",
+      sourceFingerprint: "source-1",
+      finalFingerprint: "final-1",
+      changedFiles: [{ path: "src/file.ts", summary: "bounded" }],
+      expiresAt: "2026-08-24T23:00:00Z",
+    })).not.toBeNull();
+    expect(parseBrokerApproval({
+      approvalId: "approval-1",
+      bindingId: "binding-1",
+      brokerRunId: "run-1",
+      sourceFingerprint: "source-1",
+      finalFingerprint: "final-1",
+      changedFiles: [{ path: "..\\secret", summary: "bounded" }],
+      expiresAt: "2026-08-24T23:00:00Z",
+    })).toBeNull();
   });
 
   it("rejects malformed run responses before exposing them to a consumer", async () => {
@@ -213,6 +232,7 @@ describe("GrokPtahBrokerClient", () => {
     for (const changedFiles of [
       [{ path: "../secret", summary: "bounded" }],
       [{ path: "/absolute", summary: "bounded" }],
+      [{ path: "..\\secret", summary: "bounded" }],
       [{ path: "src/file.ts", summary: "é".repeat(257) }],
       [{ path: "src/file.ts", summary: "bounded", extra: true }],
     ]) {
@@ -221,6 +241,48 @@ describe("GrokPtahBrokerClient", () => {
       ).rejects.toMatchObject({ code: "invalid_request" });
     }
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("validates approval responses before exposing promotion evidence", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
+      approvalId: "approval-1",
+      bindingId: "binding-1",
+      brokerRunId: "run-1",
+      sourceFingerprint: "source-1",
+      finalFingerprint: "final-1",
+      changedFiles: [{ path: "src/file.ts", summary: "bounded" }],
+      expiresAt: "2026-08-24T23:00:00Z",
+    }));
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    const approval = await client.approveRun(
+      "binding-1",
+      "run-1",
+      { sourceFingerprint: "source-1", finalFingerprint: "final-1", changedFiles: [] },
+      "approve-intent-1",
+    );
+    expect(approval.changedFiles[0]?.path).toBe("src/file.ts");
+
+    fetcher.mockResolvedValueOnce(jsonResponse({
+      approvalId: "approval-1",
+      bindingId: "binding-1",
+      brokerRunId: "run-1",
+      sourceFingerprint: "source-1",
+      finalFingerprint: "final-1",
+      changedFiles: [{ path: "src/file.ts", summary: "bounded", extra: true }],
+      expiresAt: "2026-08-24T23:00:00Z",
+    }));
+    await expect(
+      client.approveRun(
+        "binding-1",
+        "run-1",
+        { sourceFingerprint: "source-1", finalFingerprint: "final-1", changedFiles: [] },
+        "approve-intent-2",
+      ),
+    ).rejects.toMatchObject({ code: "invalid_response" });
   });
 
   it("validates approval TTL independently", async () => {
@@ -324,7 +386,15 @@ describe("GrokPtahBrokerClient", () => {
 
   it("binds approval and promotion to opaque ids and broker CSRF", async () => {
     const fetcher = vi.fn<typeof fetch>()
-      .mockResolvedValueOnce(jsonResponse({ approvalId: "approval-1" }))
+      .mockResolvedValueOnce(jsonResponse({
+        approvalId: "approval-1",
+        bindingId: "binding/1",
+        brokerRunId: "run/1",
+        sourceFingerprint: "source-1",
+        finalFingerprint: "final-1",
+        changedFiles: [{ path: "src/lib.ts", summary: "Updated broker client contract" }],
+        expiresAt: "2026-08-24T23:00:00Z",
+      }))
       .mockResolvedValueOnce(jsonResponse({ promoted: true }));
     const client = new GrokPtahBrokerClient({
       baseUrl: "https://contextdesk.example",
