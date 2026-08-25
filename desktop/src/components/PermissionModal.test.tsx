@@ -2,6 +2,7 @@ import { describe, expect, it, vi, afterEach } from "vitest";
 import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { PermissionModal } from "./PermissionModal";
+import { focusableIn } from "../lib/modalFocus";
 import {
   dequeuePermission,
   enqueuePermission,
@@ -213,13 +214,21 @@ describe("PermissionModal (#141)", () => {
     );
     const allow = screen.getByTestId("permission-allow");
     const deny = screen.getByTestId("permission-deny");
+    const always = screen.getByTestId("permission-always");
+    const technicalDetails = screen.getByText("Technical details");
     expect(document.activeElement).toBe(allow);
 
     fireEvent.keyDown(window, { key: "Tab" });
-    expect(document.activeElement).toBe(deny);
-    deny.focus();
+    expect(document.activeElement).toBe(technicalDetails);
+    technicalDetails.focus();
     fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
     expect(document.activeElement).toBe(allow);
     expect(screen.getByTestId("permission-modal").contains(document.activeElement)).toBe(true);
+    expect(focusableIn(screen.getByTestId("permission-modal"))).toEqual([
+      technicalDetails,
+      deny,
+      always,
+      allow,
+    ]);
   });
 });
