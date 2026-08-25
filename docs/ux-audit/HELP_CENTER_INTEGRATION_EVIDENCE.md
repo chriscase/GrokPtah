@@ -7,6 +7,7 @@ live provider qualification, and 100% release qualification remain open.
 
 - Code head: `45441d1f` (`feat(desktop): integrate evidence-backed Help Center`)
 - Public contract follow-up: `c7800a46` (`feat(public): expose source-cited Help Center contract`)
+- Styling correction: `f9eee072` (`fix(ui): apply Help Center surface styles`)
 - Base: current GrokPtah `main` at integration time
 - Scope: Help Center UI, deterministic source-cited corpus, provider-semantic
   retrieval contract, bounded assistant contract, validation, and cleanup
