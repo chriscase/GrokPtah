@@ -1,6 +1,6 @@
 //! Orchestration service: reads + bounded mutations over AgentHostHandle (#196).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -94,9 +94,18 @@ impl Drop for OrchestrationService {
         if let Some(watcher) = self.scheduler_watcher.get_mut().take() {
             watcher.abort();
         }
-        // Durable acceptance intents remain authoritative after one service
-        // instance drops. A replacement service reconstructs these slots from
-        // the store instead of losing accepted work in a Drop path.
+        let pending = self
+            .pending_admissions
+            .get_mut()
+            .pending
+            .iter()
+            .map(|run| run.run_id.clone())
+            .collect::<Vec<_>>();
+        for run_id in pending {
+            // Do not delete the private intent. A surviving service (or a
+            // replacement after restart) reconstructs the host slot from it.
+            self.host.release_orchestration_queue_slot(&run_id);
+        }
     }
 }
 
@@ -242,6 +251,7 @@ impl OrchestrationService {
                         let Some(service) = service_ref.upgrade() else {
                             break;
                         };
+                        service.recover_pending_admissions();
                         service.reap_expired_attempts();
                     }
                     update = events.recv() => {
@@ -280,7 +290,14 @@ impl OrchestrationService {
                 return;
             }
         };
+        let valid_ids: HashSet<&str> = intents
+            .iter()
+            .map(|intent| intent.run_id.as_str())
+            .collect();
         let mut queue = self.pending_admissions.lock();
+        queue
+            .pending
+            .retain(|pending| valid_ids.contains(pending.run_id.as_str()));
         for intent in intents {
             if intent.phase != AcceptancePhase::Queued
                 || intent.prompt.is_none()
@@ -293,6 +310,19 @@ impl OrchestrationService {
                 .iter()
                 .any(|pending| pending.run_id == intent.run_id)
             {
+                if self
+                    .host
+                    .orchestration_pending_position(&intent.run_id)
+                    .is_none()
+                    && !self.host.orchestration_run_is_active(&intent.run_id)
+                {
+                    let _ = self.host.reserve_orchestration_queue_slot_with_identity(
+                        &intent.run_id,
+                        intent.session_id,
+                        &intent.admission_id,
+                        intent.sequence,
+                    );
+                }
                 continue;
             }
             if queue.pending.len() >= MAX_PENDING_ADMISSIONS {

@@ -2177,6 +2177,13 @@ impl AgentHostHandle {
         self.inner.lock().orchestration_pending_admissions.len()
     }
 
+    pub fn orchestration_run_is_active(&self, run_id: &str) -> bool {
+        self.inner
+            .lock()
+            .orchestration_admissions
+            .contains_key(run_id)
+    }
+
     /// Return the current one-based global arrival position for a queued run.
     /// This is computed from the host ledger rather than a service-local
     /// queue, so it stays truthful when another embedded service enqueues or
