@@ -118,18 +118,47 @@ typedef struct {
     CGPoint pointer_location;
 } GPTMacUserInteractionState;
 
+// Read the physical pointer through AppKit's observation-only accessor. The
+// event-tap APIs can create and post input, so they stay banned outright even
+// for a read; NSEvent.mouseLocation has no injecting counterpart.
+// AppKit reports screen coordinates with the origin at the bottom-left of the
+// menu-bar screen, while the rest of this shim (CGWindowListCopyWindowInfo
+// bounds, AX frames) uses Quartz global coordinates with the origin at the
+// top-left. Flip across the menu-bar screen so pointer_location keeps exactly
+// the top-left-origin meaning the takeover comparison was built on.
+// Fails closed: with no window server there is no screen to flip against, so
+// the pointer is reported unobservable rather than assumed unmoved.
+static BOOL GPTCopyPointerLocation(CGPoint *location) {
+    if (location == NULL) {
+        return NO;
+    }
+    NSArray<NSScreen *> *screens = NSScreen.screens;
+    if (screens.count == 0) {
+        return NO;
+    }
+    NSPoint cocoa = NSEvent.mouseLocation;
+    if (isnan(cocoa.x) || isnan(cocoa.y) || isinf(cocoa.x) || isinf(cocoa.y)) {
+        return NO;
+    }
+    CGFloat flipAxis = NSMaxY(screens.firstObject.frame);
+    if (isnan(flipAxis) || isinf(flipAxis)) {
+        return NO;
+    }
+    *location = CGPointMake(cocoa.x, flipAxis - cocoa.y);
+    return YES;
+}
+
 static GPTMacUserInteractionState GPTCaptureUserInteractionState(void) {
     GPTMacUserInteractionState state = {0};
     NSRunningApplication *frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
     if (frontmost == nil || frontmost.processIdentifier <= 0) {
         return state;
     }
-    CGEventRef event = CGEventCreate(NULL);
-    if (event == NULL) {
+    CGPoint pointer = CGPointZero;
+    if (!GPTCopyPointerLocation(&pointer)) {
         return state;
     }
-    state.pointer_location = CGEventGetLocation(event);
-    CFRelease(event);
+    state.pointer_location = pointer;
     state.frontmost_process_id = frontmost.processIdentifier;
 
     CFArrayRef windowInfo = CGWindowListCopyWindowInfo(

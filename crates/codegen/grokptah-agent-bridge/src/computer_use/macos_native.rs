@@ -703,7 +703,10 @@ mod tests {
     fn native_shim_exposes_semantic_accessibility_without_raw_input() {
         let shim = include_str!("macos_native_shim.m");
         for forbidden in [
-            "CGEventPost",
+            // The whole CGEvent family is banned, not just the posting calls:
+            // the same header that reads a location also creates and posts
+            // synthetic input, so the shim must not reach for it at all.
+            "CGEvent",
             "CGWarpMouseCursorPosition",
             "CGAssociateMouseAndMouseCursorPosition",
             "NSPasteboard",
@@ -721,7 +724,24 @@ mod tests {
         assert!(shim.contains("GPT_MAC_INTERRUPTED"));
         assert!(shim.contains("GPT_MAC_UNCERTAIN_OUTCOME"));
         assert!(shim.contains("GPTCaptureUserInteractionState"));
-        assert!(shim.contains("CGEventGetLocation"));
+        // The pointer half of takeover detection reads AppKit's
+        // observation-only accessor, flips AppKit's bottom-left origin onto the
+        // top-left Quartz origin the rest of the shim uses, and reports the
+        // pointer unobservable when there is no screen to flip against.
+        assert!(shim.contains("static BOOL GPTCopyPointerLocation(CGPoint *location)"));
+        assert!(shim.contains("NSEvent.mouseLocation"));
+        assert!(shim.contains("CGFloat flipAxis = NSMaxY(screens.firstObject.frame);"));
+        assert!(shim.contains("*location = CGPointMake(cocoa.x, flipAxis - cocoa.y);"));
+        assert!(shim.contains("if (screens.count == 0) {\n        return NO;"));
+        // An unobservable pointer leaves the state invalid, which both the
+        // pre-dispatch background proof and the post-dispatch comparison treat
+        // as a takeover rather than as "did not move".
+        assert!(shim.contains("if (!GPTCopyPointerLocation(&pointer)) {\n        return state;"));
+        assert!(
+            shim.contains("CGPointEqualToPoint(before.pointer_location, after.pointer_location)")
+        );
+        assert!(shim.contains("return before.valid && after.valid &&"));
+        assert!(shim.contains("!GPTUserInteractionStateEqual(interactionBefore, interactionAfter)"));
         assert!(shim.contains("measured_background"));
         assert!(shim.contains("AXUIElementPerformAction"));
         assert!(shim.contains("AXUIElementSetAttributeValue"));
