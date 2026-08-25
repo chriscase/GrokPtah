@@ -1,6 +1,6 @@
 //! Orchestration service: reads + bounded mutations over AgentHostHandle (#196).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -16,12 +16,18 @@ use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
 use crate::session::{SessionKind, WorkspaceStatus};
 
 use super::authz::{canonical_workspace, require_workspace_match, AuthContext, WorkspaceAllowlist};
-use super::store::{IdempotencyClaim, OrchStore};
+use super::store::{
+    AcceptanceIntent, AcceptancePhase, AttemptPhase, AttemptRecord, IdempotencyClaim, OrchStore,
+};
 use super::types::*;
 
 /// Admission is deliberately bounded so an untrusted coordinator cannot turn
 /// queued submissions into an unbounded in-memory prompt store.
 const MAX_PENDING_ADMISSIONS: usize = 32;
+const ATTEMPT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
+const ATTEMPT_LEASE: Duration = Duration::from_millis(500);
+const FINALIZATION_DEADLINE: Duration = Duration::from_secs(2);
+const FINALIZATION_RETRY_LIMIT: u32 = 8;
 
 #[derive(Default)]
 struct AdmissionQueueState {
@@ -31,8 +37,14 @@ struct AdmissionQueueState {
 struct PendingRun {
     run_id: String,
     session_id: Uuid,
-    prompt: String,
+    admission_id: String,
+    sequence: u64,
     execution_mode: RunExecutionMode,
+}
+
+struct LiveAttempt {
+    attempt_id: String,
+    model_abort: tokio::task::AbortHandle,
 }
 
 #[derive(Clone)]
@@ -62,6 +74,8 @@ pub struct OrchestrationService {
     self_ref: Weak<OrchestrationService>,
     pending_admissions: Mutex<AdmissionQueueState>,
     scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    instance_id: String,
+    live_attempts: Mutex<HashMap<String, LiveAttempt>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -80,16 +94,9 @@ impl Drop for OrchestrationService {
         if let Some(watcher) = self.scheduler_watcher.get_mut().take() {
             watcher.abort();
         }
-        let pending = self
-            .pending_admissions
-            .get_mut()
-            .pending
-            .iter()
-            .map(|run| run.run_id.clone())
-            .collect::<Vec<_>>();
-        for run_id in pending {
-            self.host.release_orchestration_queue_slot(&run_id);
-        }
+        // Durable acceptance intents remain authoritative after one service
+        // instance drops. A replacement service reconstructs these slots from
+        // the store instead of losing accepted work in a Drop path.
     }
 }
 
@@ -149,6 +156,14 @@ impl IdempotencyLease {
             Err(store_error) => store_error,
         }
     }
+
+    fn defer_to_recovery(&mut self) {
+        // The acceptance intent contains the response needed to settle this
+        // pending receipt on restart. Do not convert an accepted mutation into
+        // a failed receipt merely because the receipt write itself hit a
+        // transient/full-disk failure.
+        self.settled = true;
+    }
 }
 
 impl Drop for IdempotencyLease {
@@ -203,8 +218,12 @@ impl OrchestrationService {
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
             scheduler_watcher: Mutex::new(None),
             join_handles: Mutex::new(Vec::new()),
+            instance_id: Uuid::new_v4().to_string(),
+            live_attempts: Mutex::new(HashMap::new()),
         });
+        service.recover_pending_admissions();
         service.start_scheduler_watcher();
+        service.pump_pending();
         service
     }
 
@@ -216,8 +235,15 @@ impl OrchestrationService {
         let wakeup = self.host.orchestration_wakeup();
         let service_ref = self.self_ref.clone();
         let watcher = runtime.spawn(async move {
+            let mut reaper = tokio::time::interval(ATTEMPT_HEARTBEAT_INTERVAL);
             loop {
                 tokio::select! {
+                    _ = reaper.tick() => {
+                        let Some(service) = service_ref.upgrade() else {
+                            break;
+                        };
+                        service.reap_expired_attempts();
+                    }
                     update = events.recv() => {
                         let Some(update) = update else {
                             break;
@@ -243,6 +269,59 @@ impl OrchestrationService {
             }
         });
         *self.scheduler_watcher.lock() = Some(watcher);
+    }
+
+    fn recover_pending_admissions(&self) {
+        let intents = match self.store.list_acceptance_intents() {
+            Ok(intents) => intents,
+            Err(error) => {
+                self.store
+                    .mark_health_degraded(&format!("pending admission recovery failed: {error}"));
+                return;
+            }
+        };
+        let mut queue = self.pending_admissions.lock();
+        for intent in intents {
+            if intent.phase != AcceptancePhase::Queued
+                || intent.prompt.is_none()
+                || intent.run.state != RunState::Queued
+            {
+                continue;
+            }
+            if queue
+                .pending
+                .iter()
+                .any(|pending| pending.run_id == intent.run_id)
+            {
+                continue;
+            }
+            if queue.pending.len() >= MAX_PENDING_ADMISSIONS {
+                self.store
+                    .mark_health_degraded("durable acceptance queue exceeded local recovery bound");
+                break;
+            }
+            if let Err(error) = self.host.reserve_orchestration_queue_slot_with_identity(
+                &intent.run_id,
+                intent.session_id,
+                &intent.admission_id,
+                intent.sequence,
+            ) {
+                self.store.mark_health_degraded(&format!(
+                    "pending admission {} could not be reconstructed: {error}",
+                    intent.run_id
+                ));
+                continue;
+            }
+            queue.pending.push_back(PendingRun {
+                run_id: intent.run_id,
+                session_id: intent.session_id,
+                admission_id: intent.admission_id,
+                sequence: intent.sequence,
+                execution_mode: intent.execution_mode,
+            });
+        }
+        drop(queue);
+        self.sync_pending_positions();
     }
 
     pub fn bus(&self) -> &EventBus {
@@ -360,9 +439,8 @@ impl OrchestrationService {
         self.pump_pending();
     }
 
-    /// Keep the durable records aligned with the host-global scheduler. The
-    /// prompt itself remains in memory by design; this metadata is only for
-    /// honest operator/coordinator visibility while the run is pending.
+    /// Keep the durable records aligned with the host-global scheduler. Full
+    /// prompt input is deliberately absent from this process-local queue.
     fn sync_pending_positions(&self) {
         let run_ids: Vec<String> = {
             let queue = self.pending_admissions.lock();
@@ -409,7 +487,12 @@ impl OrchestrationService {
         }
         let run_id = pending.run_id.clone();
         self.host
-            .reserve_orchestration_queue_slot(&run_id, pending.session_id)
+            .reserve_orchestration_queue_slot_with_identity(
+                &run_id,
+                pending.session_id,
+                &pending.admission_id,
+                pending.sequence,
+            )
             .map_err(|error| OrchError::new(OrchErrorCode::CapacityExhausted, error.to_string()))?;
         queue.pending.push_back(pending);
         drop(queue);
@@ -431,6 +514,26 @@ impl OrchestrationService {
             self.sync_pending_positions();
         }
         removed
+    }
+
+    fn requeue_pending(&self, pending: PendingRun) -> anyhow::Result<()> {
+        self.host.reserve_orchestration_queue_slot_with_identity(
+            &pending.run_id,
+            pending.session_id,
+            &pending.admission_id,
+            pending.sequence,
+        )?;
+        let mut queue = self.pending_admissions.lock();
+        if !queue
+            .pending
+            .iter()
+            .any(|existing| existing.run_id == pending.run_id)
+        {
+            queue.pending.push_front(pending);
+        }
+        drop(queue);
+        self.sync_pending_positions();
+        Ok(())
     }
 
     /// Promote as many queued tasks as the shared host capacity allows. The
@@ -479,35 +582,183 @@ impl OrchestrationService {
                 continue;
             }
 
-            let start_seq = self.bus.next_seq();
-            let transitioned = self.store.update_run(&pending.run_id, |run| {
-                if run.state != RunState::Queued {
-                    anyhow::bail!("queued run is no longer pending");
+            match self.claim_and_start_queued(&pending) {
+                Ok(Some((run, prompt, attempt, execution_mode))) => {
+                    self.spawn_run(run, prompt, execution_mode, attempt)
                 }
-                run.state = RunState::Running;
-                run.queue_position = None;
-                run.start_seq = Some(start_seq);
-                run.updated_at = Utc::now();
-                Ok(())
-            });
-            match transitioned {
-                Ok(Some(run)) => self.spawn_run(run, pending.prompt, pending.execution_mode),
-                Ok(None) | Err(_) => {
+                Ok(None) => self.host.release_orchestration_turn(&pending.run_id),
+                Err(error) => {
                     self.host.release_orchestration_turn(&pending.run_id);
-                    if let Err(error) = self
-                        .host
-                        .reserve_orchestration_queue_slot(&pending.run_id, pending.session_id)
-                    {
-                        eprintln!("[grokptah] queued run could not be re-registered: {error}");
-                    } else {
-                        let mut queue = self.pending_admissions.lock();
-                        queue.pending.push_front(pending);
-                        drop(queue);
-                        self.sync_pending_positions();
-                        return;
+                    if let Err(requeue_error) = self.requeue_pending(pending) {
+                        self.store.mark_health_degraded(&format!(
+                            "queued run could not be requeued after start failure: {requeue_error}"
+                        ));
                     }
+                    eprintln!("[grokptah] queued run start deferred: {error}");
+                    return;
                 }
             }
+        }
+    }
+
+    fn claim_and_start_queued(
+        &self,
+        pending: &PendingRun,
+    ) -> anyhow::Result<Option<(RunRecord, String, AttemptRecord, RunExecutionMode)>> {
+        let Some(current) = self.store.load_run(&pending.run_id)? else {
+            return Ok(None);
+        };
+        if current.state != RunState::Queued {
+            return Ok(None);
+        }
+        let Some(intent) = self.store.load_acceptance_intent(&pending.run_id)? else {
+            anyhow::bail!("queued run has no private acceptance intent");
+        };
+        let Some(prompt) = intent.prompt.as_ref() else {
+            anyhow::bail!("queued run has no private prompt input");
+        };
+        let expected_revision = self
+            .store
+            .load_attempt(&pending.run_id)?
+            .filter(|attempt| !attempt.phase.is_active())
+            .map(|attempt| attempt.revision);
+        let attempt_id = Uuid::new_v4().to_string();
+        let attempt = self.store.claim_attempt(
+            &pending.run_id,
+            &attempt_id,
+            &self.instance_id,
+            expected_revision,
+            Utc::now(),
+            ATTEMPT_LEASE,
+        )?;
+        let start_seq = self.bus.next_seq();
+        let transitioned = self.store.update_run(&pending.run_id, |run| {
+            if run.state != RunState::Queued {
+                anyhow::bail!("queued run is no longer pending");
+            }
+            run.state = RunState::Running;
+            run.queue_position = None;
+            run.start_seq = Some(start_seq);
+            run.updated_at = Utc::now();
+            Ok(())
+        });
+        let run = match transitioned {
+            Ok(Some(run)) => run,
+            Ok(None) => anyhow::bail!("queued run disappeared before dispatch"),
+            Err(error) => {
+                let _ = self.store.finalize_attempt(
+                    &pending.run_id,
+                    &attempt.attempt_id,
+                    &attempt.owner_instance_id,
+                    attempt.revision,
+                    AttemptPhase::Interrupted,
+                    Utc::now(),
+                );
+                return Err(error);
+            }
+        };
+        let response = json!({
+            "runId": run.run_id,
+            "sessionId": run.session_id,
+            "state": run.state,
+            "requestId": run.request_id,
+            "executionMode": intent.execution_mode,
+            "queuedPosition": serde_json::Value::Null,
+        });
+        let prompt = match self.store.claim_acceptance_input(
+            &pending.run_id,
+            &attempt.attempt_id,
+            &run,
+            response,
+        ) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                let _ = self.interrupt_run_after_start_failure(
+                    &run.run_id,
+                    &attempt,
+                    "accepted prompt could not be claimed",
+                );
+                return Err(error);
+            }
+        };
+        Ok(Some((run, prompt, attempt, intent.execution_mode)))
+    }
+
+    fn interrupt_run_after_start_failure(
+        &self,
+        run_id: &str,
+        attempt: &AttemptRecord,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let _ = self.store.update_run(run_id, |run| {
+            if !run.state.is_terminal() {
+                run.state = RunState::Interrupted;
+                run.queue_position = None;
+                run.terminal_result = Some("interrupted".into());
+                run.error_code = Some("interrupted".into());
+                run.final_response = Some(reason.into());
+                run.updated_at = Utc::now();
+            }
+            Ok(())
+        })?;
+        let _ = self.store.finalize_attempt(
+            run_id,
+            &attempt.attempt_id,
+            &attempt.owner_instance_id,
+            attempt.revision,
+            AttemptPhase::Interrupted,
+            Utc::now(),
+        );
+        self.store.mark_health_degraded(reason);
+        Ok(())
+    }
+
+    fn reap_expired_attempts(&self) {
+        let now = Utc::now();
+        let attempts = match self.store.list_attempts() {
+            Ok(attempts) => attempts,
+            Err(error) => {
+                self.store.mark_health_degraded(&format!(
+                    "attempt reaper could not list attempts: {error}"
+                ));
+                return;
+            }
+        };
+        for (run_id, attempt) in attempts {
+            if attempt.owner_instance_id != self.instance_id
+                || attempt.phase != AttemptPhase::Running
+                || now < attempt.expires_at
+            {
+                continue;
+            }
+            let Ok(Some(_)) =
+                self.store
+                    .reap_attempt(&run_id, &attempt.attempt_id, attempt.revision, now)
+            else {
+                continue;
+            };
+            if let Some(live) = self.live_attempts.lock().remove(&run_id) {
+                if live.attempt_id == attempt.attempt_id {
+                    live.model_abort.abort();
+                }
+            }
+            if let Err(error) = self.store.update_run(&run_id, |run| {
+                if !run.state.is_terminal() {
+                    run.state = RunState::Interrupted;
+                    run.queue_position = None;
+                    run.terminal_result = Some("interrupted".into());
+                    run.error_code = Some("attempt_expired".into());
+                    run.final_response = Some("model attempt heartbeat expired".into());
+                    run.updated_at = Utc::now();
+                }
+                Ok(())
+            }) {
+                self.store
+                    .mark_health_degraded(&format!("expired attempt run update failed: {error}"));
+            }
+            // The outer supervisor's guard may race this release. The host
+            // admission map makes both calls one logical release.
+            self.release_capacity(&run_id);
         }
     }
 
@@ -842,6 +1093,7 @@ impl OrchestrationService {
             .store
             .last_run_error()
             .map(|error| self.bus.redact_text(&error, 500));
+        let durability = self.store.durability_health();
         Ok(json!({
             "maxConcurrentRuns": max,
             "activeRuns": active,
@@ -853,6 +1105,7 @@ impl OrchestrationService {
                 "eventJournalPersistenceError": event_error,
                 "auditPersistenceError": audit_error,
                 "runPersistenceError": run_error,
+                "durability": durability,
             },
         }))
     }
@@ -2651,7 +2904,21 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, e));
             }
         }
-        let start_seq = (!queued).then(|| self.bus.next_seq());
+        let (admission_id, sequence) = match self.store.allocate_admission_identity() {
+            Ok(identity) => identity,
+            Err(error) => {
+                if !queued {
+                    self.host.release_turn_reservation(session_id, &run_id);
+                    self.release_capacity(&run_id);
+                }
+                let error = OrchError::new(OrchErrorCode::Internal, error.to_string());
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+            }
+        };
+        // Persist every accepted run as queued first. An immediate admission
+        // is promoted only after this private intent and the public record are
+        // both durable, so a crash cannot leave a receipt without dispatch
+        // input or queue identity.
         let run = RunRecord {
             run_id: run_id.clone(),
             session_id,
@@ -2661,18 +2928,14 @@ impl OrchestrationService {
             // desktop can surface external activity without guessing from
             // transport timing.
             client_id: Some("mcp".into()),
-            state: if queued {
-                RunState::Queued
-            } else {
-                RunState::Running
-            },
+            state: RunState::Queued,
             agent_id: None,
             retry_of: retry_of.map(str::to_string),
             parent_run_id: None,
             queue_position: None,
             bounds: bounds.clone(),
             prompt_preview: self.bus.redact_text(&prompt_preview(&prompt), 500),
-            start_seq,
+            start_seq: None,
             end_seq: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -2684,20 +2947,58 @@ impl OrchestrationService {
             execution: None,
             approval: None,
         };
+        let provisional_response = json!({
+            "runId": run_id,
+            "sessionId": session_id,
+            "state": RunState::Queued,
+            "requestId": request_id,
+            "executionMode": execution_mode,
+            "queuedPosition": serde_json::Value::Null,
+        });
+        let intent = AcceptanceIntent {
+            admission_id: admission_id.clone(),
+            sequence,
+            run_id: run.run_id.clone(),
+            request_id: request_id.into(),
+            payload_hash: phash.clone(),
+            tool: tool.into(),
+            session_id,
+            workspace: run.workspace.clone(),
+            execution_mode,
+            attempt_id: None,
+            prompt: Some(prompt.clone()),
+            run: run.clone(),
+            response: provisional_response,
+            phase: AcceptancePhase::Queued,
+            created_at: run.created_at,
+            updated_at: run.updated_at,
+        };
+        if let Err(error) = self.store.save_acceptance_intent(&intent) {
+            if !queued {
+                self.host.release_turn_reservation(session_id, &run_id);
+                self.release_capacity(&run_id);
+            }
+            let error = OrchError::new(OrchErrorCode::Internal, error.to_string());
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
         if let Err(e) = self.store.save_run(&run) {
             if !queued {
                 self.host.release_turn_reservation(session_id, &run_id);
                 self.release_capacity(&run_id);
             }
+            self.store
+                .mark_health_degraded(&format!("accepted run awaiting recovery: {e}"));
+            lease.defer_to_recovery();
             let e = OrchError::new(OrchErrorCode::Internal, e.to_string());
-            return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
+            return Err(e);
         }
 
         let queued_position = if queued {
             match self.enqueue_pending(PendingRun {
                 run_id: run_id.clone(),
                 session_id,
-                prompt: prompt.clone(),
+                admission_id,
+                sequence,
                 execution_mode,
             }) {
                 Ok(position) => Some(position),
@@ -2723,28 +3024,108 @@ impl OrchestrationService {
             None
         };
 
-        let response = json!({
-            "runId": run_id,
-            "sessionId": session_id,
-            "state": run.state,
-            "requestId": request_id,
-            "executionMode": execution_mode,
-            "queuedPosition": queued_position,
-        });
-        if let Err(e) = lease.complete(Some(run_id.clone()), response.clone()) {
-            let _ = self.store.update_run(&run_id, |r| {
-                r.state = RunState::Failed;
-                r.terminal_result = Some("failed".into());
-                r.error_code = Some("receipt_persistence_failed".into());
-                r.updated_at = Utc::now();
-                Ok(())
+        let response = if queued {
+            let queued_run = self
+                .store
+                .load_run(&run_id)
+                .ok()
+                .flatten()
+                .unwrap_or(run.clone());
+            let response = json!({
+                "runId": run_id,
+                "sessionId": session_id,
+                "state": RunState::Queued,
+                "requestId": request_id,
+                "executionMode": execution_mode,
+                "queuedPosition": queued_position,
             });
-            self.remove_pending(&run_id);
-            if !queued {
-                self.host.release_turn_reservation(session_id, &run_id);
-                self.release_capacity(&run_id);
+            if let Err(error) =
+                self.store
+                    .update_acceptance_intent(&run_id, queued_run, response.clone())
+            {
+                self.store
+                    .mark_health_degraded(&format!("accepted queue response not updated: {error}"));
+                lease.defer_to_recovery();
+                return Err(OrchError::new(OrchErrorCode::Internal, error.to_string()));
             }
-            return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
+            response
+        } else {
+            let pending = PendingRun {
+                run_id: run_id.clone(),
+                session_id,
+                admission_id,
+                sequence,
+                execution_mode,
+            };
+            let (run, prompt, attempt, execution_mode) = match self.claim_and_start_queued(&pending)
+            {
+                Ok(Some(result)) => result,
+                Ok(None) => {
+                    self.host.release_orchestration_turn(&run_id);
+                    lease.defer_to_recovery();
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "accepted run was not queueable",
+                    ));
+                }
+                Err(error) => {
+                    self.release_capacity(&run_id);
+                    if self
+                        .store
+                        .load_acceptance_intent(&run_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|intent| intent.prompt.is_some())
+                    {
+                        let _ = self.requeue_pending(pending);
+                    } else {
+                        self.store.mark_health_degraded(&format!(
+                            "accepted run could not start: {error}"
+                        ));
+                    }
+                    lease.defer_to_recovery();
+                    return Err(OrchError::new(OrchErrorCode::Internal, error.to_string()));
+                }
+            };
+            let response = json!({
+                "runId": run_id,
+                "sessionId": session_id,
+                "state": run.state,
+                "requestId": request_id,
+                "executionMode": execution_mode,
+                "queuedPosition": serde_json::Value::Null,
+            });
+            if let Err(error) = lease.complete(Some(run_id.clone()), response.clone()) {
+                lease.defer_to_recovery();
+                self.store.mark_health_degraded(&format!(
+                    "accepted run receipt awaiting recovery: {error}"
+                ));
+                self.spawn_run(run, prompt, execution_mode, attempt);
+                return Err(error);
+            }
+            self.audit(
+                tool,
+                Some(request_id),
+                Some(session_id),
+                Some(&claimed.display().to_string()),
+                "accepted",
+                None,
+                "run started",
+            );
+            if let Err(error) = self.store.settle_acceptance_intent(&run_id) {
+                self.store.mark_health_degraded(&format!(
+                    "claimed acceptance tombstone failed for {run_id}: {error}"
+                ));
+            }
+            self.spawn_run(run, prompt, execution_mode, attempt);
+            return Ok(response);
+        };
+        if let Err(error) = lease.complete(Some(run_id.clone()), response.clone()) {
+            lease.defer_to_recovery();
+            self.store.mark_health_degraded(&format!(
+                "accepted queue receipt awaiting recovery: {error}"
+            ));
+            return Err(error);
         }
         self.audit(
             tool,
@@ -2755,13 +3136,9 @@ impl OrchestrationService {
             None,
             if queued { "run queued" } else { "run started" },
         );
-        if !queued {
-            self.spawn_run(run, prompt, execution_mode);
-        } else {
-            // A capacity release can race the enqueue; this also makes an
-            // immediately available slot visible without requiring polling.
-            self.pump_pending();
-        }
+        // A capacity release can race the enqueue; this also makes an
+        // immediately available slot visible without requiring polling.
+        self.pump_pending();
 
         Ok(response)
     }
@@ -2894,8 +3271,16 @@ impl OrchestrationService {
         Ok(response)
     }
 
-    /// Start a run whose host admission has already been reserved.
-    fn spawn_run(&self, run: RunRecord, prompt: String, execution_mode: RunExecutionMode) {
+    /// Start a run whose host admission and private attempt have already been
+    /// reserved. The model future is nested so its JoinError is terminal
+    /// evidence rather than an unobserved task failure.
+    fn spawn_run(
+        &self,
+        run: RunRecord,
+        prompt: String,
+        execution_mode: RunExecutionMode,
+        attempt: AttemptRecord,
+    ) {
         let host = self.host.clone();
         let store = self.store.clone();
         let bus = self.bus.clone();
@@ -2904,6 +3289,8 @@ impl OrchestrationService {
         let rid = run.run_id.clone();
         let max_ms = run.bounds.max_duration_ms;
         let max_rounds = run.bounds.max_rounds;
+        let attempt_id = attempt.attempt_id.clone();
+        let owner_instance_id = attempt.owner_instance_id.clone();
 
         // Dedicated aggregator task: must not share a biased select with the
         // duration deadline (chatty ShellOutput must not starve max_duration_ms).
@@ -2916,45 +3303,107 @@ impl OrchestrationService {
             }
         });
 
+        let model_host = host.clone();
+        let model_run_id = rid.clone();
+        let model_task = tokio::spawn(async move {
+            model_host
+                .session_prompt_reserved_with_max_rounds_for_run(
+                    session_id,
+                    prompt,
+                    Some(max_rounds.max(1)),
+                    &model_run_id,
+                    &model_run_id,
+                    execution_mode,
+                )
+                .await
+        });
+        let model_abort = model_task.abort_handle();
+        self.live_attempts.lock().insert(
+            rid.clone(),
+            LiveAttempt {
+                attempt_id: attempt_id.clone(),
+                model_abort,
+            },
+        );
+
         let join = tokio::spawn(async move {
             let admission_guard = AdmissionGuard {
                 host: host.clone(),
                 run_id: rid.clone(),
             };
-            let prompt_fut = host.session_prompt_reserved_with_max_rounds_for_run(
-                session_id,
-                prompt,
-                Some(max_rounds.max(1)),
-                &rid,
-                &rid,
-                execution_mode,
-            );
-            tokio::pin!(prompt_fut);
             let deadline = tokio::time::sleep(Duration::from_millis(max_ms.max(1)));
             tokio::pin!(deadline);
+            let mut heartbeat = tokio::time::interval(ATTEMPT_HEARTBEAT_INTERVAL);
+            let mut model_task = model_task;
+            let mut revision = attempt.revision;
+            let mut nested_result = None;
+            let mut supervisory_error = None;
+            let mut timed_out = false;
 
             // Cancellation and teardown are bounded. A backend that ignores its
             // token cannot hold admission capacity forever.
-            let (timed_out, result): (bool, Result<String, anyhow::Error>) = tokio::select! {
-                biased;
-                _ = &mut deadline => {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        host.cancel_turn_and_await(Some(session_id)),
-                    ).await;
-                    let settled = tokio::time::timeout(
-                        Duration::from_secs(1),
-                        &mut prompt_fut,
-                    ).await;
-                    let result = match settled {
-                        Ok(result) => result,
-                        Err(_) => Err(anyhow::anyhow!(
-                            "turn did not stop within the teardown deadline"
-                        )),
-                    };
-                    (true, result)
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut deadline => {
+                        timed_out = true;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            host.cancel_turn_and_await(Some(session_id)),
+                        ).await;
+                        match tokio::time::timeout(
+                            Duration::from_secs(1),
+                            &mut model_task,
+                        ).await {
+                            Ok(result) => nested_result = Some(result),
+                            Err(_) => {
+                                model_task.abort();
+                                let _ = model_task.await;
+                                supervisory_error = Some(anyhow::anyhow!(
+                                    "turn did not stop within the teardown deadline"
+                                ));
+                            }
+                        }
+                        break;
+                    }
+                    _ = heartbeat.tick() => {
+                        match store.heartbeat_attempt(
+                            &rid,
+                            &attempt_id,
+                            &owner_instance_id,
+                            revision,
+                            Utc::now(),
+                            ATTEMPT_LEASE,
+                        ) {
+                            Ok(next) => revision = next.revision,
+                            Err(error) => {
+                                let _ = host.cancel_turn_and_await(Some(session_id)).await;
+                                model_task.abort();
+                                let _ = model_task.await;
+                                supervisory_error = Some(anyhow::anyhow!(
+                                    "attempt heartbeat failed: {error}"
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    result = &mut model_task => {
+                        nested_result = Some(result);
+                        break;
+                    }
                 }
-                r = &mut prompt_fut => (false, r),
+            }
+            let result: Result<String, anyhow::Error> = if let Some(error) = supervisory_error {
+                Err(error)
+            } else {
+                match nested_result {
+                    Some(Ok(result)) => result,
+                    Some(Err(error)) if error.is_cancelled() => {
+                        Err(anyhow::anyhow!("nested model task was cancelled"))
+                    }
+                    Some(Err(error)) => Err(anyhow::anyhow!("nested model task failed: {error}")),
+                    None => Err(anyhow::anyhow!("supervisor stopped without model result")),
+                }
             };
 
             // Stop aggregator; then reconcile aggregates from the journal range
@@ -2972,13 +3421,25 @@ impl OrchestrationService {
                 .as_ref()
                 .is_ok_and(|text| crate::host_helpers::is_incomplete_stop_message(text));
             let mut candidate = store.load_run(&rid).ok().flatten().unwrap_or(run);
+            let reaped = store
+                .load_attempt(&rid)
+                .ok()
+                .flatten()
+                .is_some_and(|current| {
+                    current.attempt_id == attempt_id && current.phase == AttemptPhase::Reaped
+                });
             for update in &reconciliation {
                 fold_run_update(&mut candidate, update);
             }
             candidate.end_seq = candidate.end_seq.or(Some(end_seq));
             candidate.updated_at = Utc::now();
             if !candidate.state.is_terminal() {
-                if timed_out {
+                if reaped {
+                    candidate.state = RunState::Interrupted;
+                    candidate.terminal_result = Some("interrupted".into());
+                    candidate.error_code = Some("attempt_expired".into());
+                    candidate.final_response = Some("model attempt heartbeat expired".into());
+                } else if timed_out {
                     candidate.state = RunState::LimitReached;
                     candidate.terminal_result = Some("limit_reached".into());
                     candidate.error_code = Some("limit_reached".into());
@@ -3006,6 +3467,12 @@ impl OrchestrationService {
                         }
                     }
                 }
+            }
+            if reaped && candidate.state != RunState::Cancelled {
+                candidate.state = RunState::Interrupted;
+                candidate.terminal_result = Some("interrupted".into());
+                candidate.error_code = Some("attempt_expired".into());
+                candidate.final_response = Some("model attempt heartbeat expired".into());
             }
             if candidate.aggregates.verification.is_none() {
                 let observations = crate::completion::observations_from_run(
@@ -3063,13 +3530,57 @@ impl OrchestrationService {
                     }
                 }
             }
-            let mut attempt = 0u32;
-            loop {
-                let error = match store.persist_finalization(&candidate) {
-                    Ok(_) => break,
-                    Err(error) => error.to_string(),
-                };
-                if attempt == 0 {
+            if let Some(current) = store.load_attempt(&rid).ok().flatten() {
+                if current.attempt_id == attempt_id
+                    && current.owner_instance_id == owner_instance_id
+                    && current.phase == AttemptPhase::Running
+                {
+                    let _ = store.begin_attempt_finalization(
+                        &rid,
+                        &attempt_id,
+                        &owner_instance_id,
+                        current.revision,
+                        Utc::now(),
+                    );
+                }
+            }
+            let finalization_deadline = tokio::time::Instant::now() + FINALIZATION_DEADLINE;
+            let mut persisted = false;
+            for retry in 0..FINALIZATION_RETRY_LIMIT {
+                match store.persist_finalization(&candidate) {
+                    Ok(_) => {
+                        persisted = true;
+                        break;
+                    }
+                    Err(error) => {
+                        if retry == 0 {
+                            let entry = AuditEntry {
+                                ts: Utc::now(),
+                                tool: "run_finalization".into(),
+                                request_id: None,
+                                session_id: Some(session_id),
+                                workspace: None,
+                                outcome: "retrying".into(),
+                                error_code: Some("run_persistence_failed".into()),
+                                detail: bus.redact_text(&error.to_string(), 500),
+                            };
+                            let _ = store.enqueue_audit(entry);
+                            eprintln!("[grokptah] run {rid} finalization retrying: {error}");
+                        }
+                        if tokio::time::Instant::now() >= finalization_deadline {
+                            break;
+                        }
+                        let shift = retry.min(6);
+                        let backoff_ms = 25u64.saturating_mul(1u64 << shift).min(1_000);
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                }
+            }
+            if !persisted {
+                store.mark_health_degraded(&format!(
+                    "run {rid} finalization moved to bounded recovery"
+                ));
+                if let Err(error) = store.ensure_finalization_intent(&candidate) {
                     let entry = AuditEntry {
                         ts: Utc::now(),
                         tool: "run_finalization".into(),
@@ -3078,21 +3589,48 @@ impl OrchestrationService {
                         workspace: None,
                         outcome: "retrying".into(),
                         error_code: Some("run_persistence_failed".into()),
-                        detail: bus.redact_text(&error, 500),
+                        detail: bus.redact_text(&error.to_string(), 500),
                     };
                     let _ = store.enqueue_audit(entry);
-                    eprintln!("[grokptah] run {rid} finalization retrying: {error}");
+                    store.mark_health_degraded(&format!(
+                        "run {rid} finalization recovery unavailable: {error}"
+                    ));
                 }
-                attempt = attempt.saturating_add(1);
-                let shift = attempt.min(6);
-                let backoff_ms = 25u64.saturating_mul(1u64 << shift).min(1_000);
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
 
+            if persisted {
+                let terminal_phase = match candidate.state {
+                    RunState::Completed | RunState::LimitReached => AttemptPhase::Completed,
+                    RunState::Cancelled => AttemptPhase::Cancelled,
+                    RunState::Interrupted => AttemptPhase::Interrupted,
+                    _ => AttemptPhase::Failed,
+                };
+                if let Some(current) = store.load_attempt(&rid).ok().flatten() {
+                    if current.attempt_id == attempt_id
+                        && current.owner_instance_id == owner_instance_id
+                        && current.phase == AttemptPhase::Finalizing
+                    {
+                        let _ = store.finalize_attempt(
+                            &rid,
+                            &attempt_id,
+                            &owner_instance_id,
+                            current.revision,
+                            terminal_phase,
+                            Utc::now(),
+                        );
+                    }
+                }
+            }
+            if let Err(error) = store.settle_acceptance_intent(&rid) {
+                store.mark_health_degraded(&format!(
+                    "acceptance intent cleanup failed for {rid}: {error}"
+                ));
+            }
             // Release capacity before waking the scheduler, so a queued task
             // can be promoted immediately and fairly.
             drop(admission_guard);
             if let Some(service) = service_ref.upgrade() {
+                service.live_attempts.lock().remove(&rid);
                 service.pump_pending();
             }
         });
@@ -3444,6 +3982,10 @@ impl OrchestrationService {
         }
 
         let was_pending = self.remove_pending(rid);
+        if let Err(error) = self.store.cancel_acceptance_input(rid) {
+            self.store
+                .mark_health_degraded(&format!("cancel input tombstone failed: {error}"));
+        }
         let reservation_released = self.host.release_turn_reservation(session_id, rid);
         let teardown_complete = if was_pending || reservation_released {
             true

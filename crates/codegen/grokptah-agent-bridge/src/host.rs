@@ -115,14 +115,14 @@ struct PendingPermission {
     tx: oneshot::Sender<PermissionDecision>,
 }
 
-/// Host-global admission metadata. The prompt remains owned by the
-/// orchestration service that accepted it, but scheduling order and the
-/// active-turn reservation are decided under this host lock so embedded
-/// control services cannot make conflicting choices.
-#[derive(Debug, Clone, Copy)]
+/// Host-global admission metadata. Full input lives in the durable
+/// orchestration acceptance ledger; this process-local record contains only
+/// scheduling identity and order.
+#[derive(Debug, Clone)]
 struct OrchestrationPendingAdmission {
     session_id: Uuid,
     sequence: u64,
+    admission_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2118,6 +2118,48 @@ impl AgentHostHandle {
             OrchestrationPendingAdmission {
                 session_id,
                 sequence,
+                admission_id: format!("legacy:{run_id}"),
+            },
+        );
+        Ok(())
+    }
+
+    /// Re-register a durable acceptance after restart. The service may call
+    /// this from more than one embedded instance; the run/admission identity
+    /// makes the operation idempotent and preserves the store's FIFO order.
+    pub fn reserve_orchestration_queue_slot_with_identity(
+        &self,
+        run_id: &str,
+        session_id: Uuid,
+        admission_id: &str,
+        sequence: u64,
+    ) -> Result<()> {
+        const MAX_PENDING_ADMISSIONS: usize = 32;
+        let mut g = self.inner.lock();
+        if let Some(existing) = g.orchestration_pending_admissions.get(run_id) {
+            if existing.session_id != session_id
+                || existing.admission_id != admission_id
+                || existing.sequence != sequence
+            {
+                bail!("pending admission identity changed");
+            }
+            return Ok(());
+        }
+        if g.orchestration_pending_admissions.len() >= MAX_PENDING_ADMISSIONS {
+            bail!("bounded admission queue is full ({MAX_PENDING_ADMISSIONS} pending runs)");
+        }
+        if g.orchestration_pending_admissions
+            .values()
+            .any(|pending| pending.sequence == sequence && pending.admission_id != admission_id)
+        {
+            bail!("pending admission sequence is already owned");
+        }
+        g.orchestration_pending_admissions.insert(
+            run_id.to_string(),
+            OrchestrationPendingAdmission {
+                session_id,
+                sequence,
+                admission_id: admission_id.to_string(),
             },
         );
         Ok(())
@@ -2155,7 +2197,7 @@ impl AgentHostHandle {
     /// untouched; another embedded service may own the globally eligible run.
     pub fn claim_orchestration_pending(&self, run_id: &str, session_id: Uuid) -> bool {
         let mut g = self.inner.lock();
-        let Some(requested) = g.orchestration_pending_admissions.get(run_id).copied() else {
+        let Some(requested) = g.orchestration_pending_admissions.get(run_id).cloned() else {
             return false;
         };
         if requested.session_id != session_id

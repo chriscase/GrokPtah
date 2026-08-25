@@ -14,7 +14,10 @@ The persistent-agent contract is split into four replaceable concerns:
 3. `AgentHostHandle` is the current desktop runtime adapter. It binds a Build
    session to an agent, records run lineage, creates redacted checkpoints, and
    exposes an explicit resume operation.
-4. Tauri commands are only an IPC adapter over the host seam. They do not own
+4. Accepted orchestration admission intents own queued input and host FIFO
+   identity until the existing scheduler claims them. They are private
+   recovery state, not another public run projection or scheduler.
+5. Tauri commands are only an IPC adapter over the host seam. They do not own
    identity, checkpoint validation, or lifecycle policy.
 
 A future VM/service adapter can implement the same domain contract with a
@@ -39,14 +42,22 @@ transcript.
 
 ## Lifecycle rules
 
-- Opening the store converts queued/running runs to `interrupted` and marks
-  their bound agents interrupted. The latest verified checkpoint is retained.
+- Opening the store recovers accepted `queued` admission intents before
+  idempotency receipts, reconstructs their host slots in FIFO order, and lets
+  the existing scheduler dispatch each run exactly once. The full prompt is
+  loaded by `run_id`, never from a service-local queue.
+- Opening the store converts model work that had reached `running` to
+  `interrupted` and marks its bound agents interrupted. The latest verified
+  checkpoint is retained. Running model work never resumes implicitly.
 - A terminal desktop Build run emits one new checkpoint and returns its agent
   to `waiting` (or `failed` for a failed run).
 - Resume is manual. The caller supplies a fresh prompt. The host validates
   agent/session/workspace/checkpoint identity, injects the bounded checkpoint
   context as auditable system context, and links the new run with
   `parent_run_id`.
+- An accepted queued run resumes dispatch after restart. A claimed/running
+  model attempt does not resume after restart; it must be explicitly retried
+  with a fresh prompt.
 - An optional request id is protected by the existing durable idempotency
   ledger. Exact retries replay the response; changed payloads cannot create a
   second run.

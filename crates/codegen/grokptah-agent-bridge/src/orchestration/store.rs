@@ -9,6 +9,7 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
+use uuid::Uuid;
 
 use super::types::{
     safe_id_filename, AgentRecord, AgentState, AuditEntry, ContinuationCheckpoint,
@@ -39,6 +40,95 @@ pub const DEFAULT_MAX_TERMINAL_RUNS: usize = 500;
 pub const DEFAULT_MAX_IDEMPOTENCY_RECEIPTS: usize = 1_000;
 pub const DEFAULT_TERMINAL_RUN_AGE: Duration = Duration::days(30);
 pub const DEFAULT_IDEMPOTENCY_RECEIPT_AGE: Duration = Duration::days(7);
+pub const MAX_FINALIZATION_RECOVERY_INTENTS: usize = 32;
+
+const ACTIVE_ATTEMPT_PHASES: &[&str] = &["claimed", "running", "finalizing"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AcceptancePhase {
+    Queued,
+    Claimed,
+    Cancelled,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AcceptanceIntent {
+    pub admission_id: String,
+    pub sequence: u64,
+    pub run_id: String,
+    pub request_id: String,
+    pub payload_hash: String,
+    pub tool: String,
+    pub session_id: uuid::Uuid,
+    pub workspace: String,
+    pub execution_mode: super::types::RunExecutionMode,
+    #[serde(default)]
+    pub attempt_id: Option<String>,
+    /// Full input exists only in this private acceptance ledger. It is
+    /// removed before a claimed model attempt is dispatched.
+    pub prompt: Option<String>,
+    pub run: RunRecord,
+    pub response: serde_json::Value,
+    pub phase: AcceptancePhase,
+    pub created_at: chrono::DateTime<Utc>,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptPhase {
+    Claimed,
+    Running,
+    Finalizing,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+    Reaped,
+}
+
+impl AttemptPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Claimed => "claimed",
+            Self::Running => "running",
+            Self::Finalizing => "finalizing",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+            Self::Reaped => "reaped",
+        }
+    }
+
+    pub(crate) fn is_active(self) -> bool {
+        ACTIVE_ATTEMPT_PHASES.contains(&self.as_str())
+    }
+}
+
+/// Private lease record for one model attempt. The file name carries the
+/// run_id so the public record never needs to grow a provider/task handle.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttemptRecord {
+    pub attempt_id: String,
+    pub owner_instance_id: String,
+    pub revision: u64,
+    pub heartbeat_at: chrono::DateTime<Utc>,
+    pub expires_at: chrono::DateTime<Utc>,
+    pub phase: AttemptPhase,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DurabilityHealth {
+    degraded: bool,
+    detail: Option<String>,
+    updated_at: chrono::DateTime<Utc>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
@@ -93,6 +183,9 @@ impl OrchStore {
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
+        ensure_private_dir(&root.join("acceptance"))?;
+        ensure_private_dir(&root.join("attempts"))?;
+        fs::create_dir_all(root.join("health"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -138,8 +231,19 @@ impl OrchStore {
                 },
             }),
         };
-        store.recover_finalization_intents()?;
+        // Acceptance is the admission authority. It is intentionally
+        // reconstructed before receipts so a completed receipt can never
+        // advertise a queued run whose private input was lost.
+        if let Err(error) = store.recover_acceptance_intents() {
+            store.mark_health_degraded(&format!("acceptance recovery failed: {error}"));
+        }
+        if let Err(error) = store.recover_finalization_intents() {
+            store.mark_health_degraded(&format!("finalization recovery failed: {error}"));
+        }
         store.mark_unfinished_interrupted()?;
+        if let Err(error) = store.recover_attempts() {
+            store.mark_health_degraded(&format!("attempt recovery failed: {error}"));
+        }
         store.fail_orphaned_idempotency_claims()?;
         // Cleanup is best-effort at the record level, but directory access
         // failures still surface so a broken ledger cannot look healthy.
@@ -172,6 +276,32 @@ impl OrchStore {
             .root
             .join("finalization")
             .join(format!("{safe}.json")))
+    }
+
+    fn acceptance_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(run_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("acceptance")
+            .join(format!("{safe}.json")))
+    }
+
+    fn attempt_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(run_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("attempts")
+            .join(format!("{safe}.json")))
+    }
+
+    fn admission_sequence_path(&self) -> PathBuf {
+        self.inner.root.join("acceptance").join("sequence.json")
+    }
+
+    fn health_path(&self) -> PathBuf {
+        self.inner.root.join("health").join("orchestration.json")
     }
 
     fn agent_path(&self, agent_id: &str) -> Result<PathBuf, OrchError> {
@@ -213,6 +343,400 @@ impl OrchStore {
         }
         let text = fs::read_to_string(&path)?;
         Ok(Some(serde_json::from_str(&text)?))
+    }
+
+    /// Allocate a durable host-admission identity. Gaps are harmless after a
+    /// crash; reusing an order number is not.
+    pub(crate) fn allocate_admission_identity(&self) -> anyhow::Result<(String, u64)> {
+        let _g = self.inner.lock.lock();
+        let sequence_path = self.admission_sequence_path();
+        let persisted = fs::read_to_string(&sequence_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|value| value["next"].as_u64())
+            .unwrap_or(0);
+        let mut highest = persisted;
+        let dir = self.inner.root.join("acceptance");
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json")
+                || path.file_name().and_then(|s| s.to_str()) == Some("sequence.json")
+            {
+                continue;
+            }
+            if let Ok(text) = fs::read_to_string(path) {
+                if let Ok(intent) = serde_json::from_str::<AcceptanceIntent>(&text) {
+                    highest = highest.max(intent.sequence);
+                }
+            }
+        }
+        let sequence = highest.saturating_add(1);
+        private_atomic_write_json(&sequence_path, &serde_json::json!({ "next": sequence }))?;
+        Ok((Uuid::new_v4().to_string(), sequence))
+    }
+
+    /// Persist the full acceptance intent before a public run or receipt can
+    /// claim that admission succeeded.
+    pub(crate) fn save_acceptance_intent(&self, intent: &AcceptanceIntent) -> anyhow::Result<()> {
+        if intent
+            .prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.is_empty())
+        {
+            anyhow::bail!("accepted prompt must not be empty");
+        }
+        let path = self
+            .acceptance_path(&intent.run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let _g = self.inner.lock.lock();
+        private_atomic_write_json(&path, intent)
+    }
+
+    pub(crate) fn load_acceptance_intent(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<AcceptanceIntent>> {
+        let path = match self.acceptance_path(run_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let _g = self.inner.lock.lock();
+        load_acceptance_intent_path(&path)
+    }
+
+    pub(crate) fn list_acceptance_intents(&self) -> anyhow::Result<Vec<AcceptanceIntent>> {
+        let _g = self.inner.lock.lock();
+        let mut intents = Vec::new();
+        for entry in fs::read_dir(self.inner.root.join("acceptance"))? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json")
+                || path.file_name().and_then(|s| s.to_str()) == Some("sequence.json")
+            {
+                continue;
+            }
+            if let Some(intent) = load_acceptance_intent_path(&path)? {
+                intents.push(intent);
+            }
+        }
+        intents.sort_by_key(|intent| intent.sequence);
+        Ok(intents)
+    }
+
+    /// Update the private coupling after an admission becomes a claimed
+    /// attempt. The prompt is removed from the serialized value before the
+    /// intent is retained as a no-prompt receipt-recovery tombstone.
+    pub(crate) fn claim_acceptance_input(
+        &self,
+        run_id: &str,
+        attempt_id: &str,
+        run: &RunRecord,
+        response: serde_json::Value,
+    ) -> anyhow::Result<String> {
+        let path = self
+            .acceptance_path(run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let _g = self.inner.lock.lock();
+        let mut intent = load_acceptance_intent_path(&path)?
+            .ok_or_else(|| anyhow::anyhow!("acceptance intent is missing"))?;
+        if intent.run_id != run_id
+            || intent.run.run_id != run_id
+            || intent.phase != AcceptancePhase::Queued
+        {
+            anyhow::bail!("acceptance intent is no longer claimable");
+        }
+        let prompt = intent
+            .prompt
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("accepted prompt is missing"))?;
+        intent.attempt_id = Some(attempt_id.to_string());
+        intent.phase = AcceptancePhase::Claimed;
+        intent.run = run.clone();
+        intent.response = response;
+        intent.updated_at = Utc::now();
+        // The no-prompt intent is itself private and mode-checked. Keeping it
+        // until receipt settlement closes the claim/receipt crash cut.
+        private_atomic_write_json(&path, &intent)?;
+        Ok(prompt)
+    }
+
+    pub(crate) fn settle_acceptance_intent(&self, run_id: &str) -> anyhow::Result<()> {
+        self.tombstone_acceptance_intent(run_id)
+    }
+
+    pub(crate) fn update_acceptance_intent(
+        &self,
+        run_id: &str,
+        run: RunRecord,
+        response: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let path = self
+            .acceptance_path(run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let _g = self.inner.lock.lock();
+        let Some(mut intent) = load_acceptance_intent_path(&path)? else {
+            return Ok(());
+        };
+        intent.run = run;
+        intent.response = response;
+        intent.updated_at = Utc::now();
+        private_atomic_write_json(&path, &intent)
+    }
+
+    pub(crate) fn cancel_acceptance_input(&self, run_id: &str) -> anyhow::Result<()> {
+        let path = self
+            .acceptance_path(run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let _g = self.inner.lock.lock();
+        let Some(mut intent) = load_acceptance_intent_path(&path)? else {
+            return Ok(());
+        };
+        intent.prompt = None;
+        intent.phase = AcceptancePhase::Cancelled;
+        intent.updated_at = Utc::now();
+        private_atomic_write_json(&path, &intent)?;
+        fs::remove_file(&path)?;
+        sync_parent_dir(&path)?;
+        Ok(())
+    }
+
+    pub fn load_attempt(&self, run_id: &str) -> anyhow::Result<Option<AttemptRecord>> {
+        let path = match self.attempt_path(run_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let _g = self.inner.lock.lock();
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
+    }
+
+    /// CAS-create the one attempt allowed for a durable run. `None` is the
+    /// compare value for an absent record; an existing record is never
+    /// silently replaced, even when it is stale.
+    pub(crate) fn claim_attempt(
+        &self,
+        run_id: &str,
+        attempt_id: &str,
+        owner_instance_id: &str,
+        expected_revision: Option<u64>,
+        now: chrono::DateTime<Utc>,
+        lease: Duration,
+    ) -> anyhow::Result<AttemptRecord> {
+        let path = self
+            .attempt_path(run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let _g = self.inner.lock.lock();
+        let current = if path.is_file() {
+            Some(serde_json::from_str::<AttemptRecord>(&fs::read_to_string(
+                &path,
+            )?)?)
+        } else {
+            None
+        };
+        let next_revision = match (current, expected_revision) {
+            (Some(current), Some(expected)) if current.revision != expected => {
+                anyhow::bail!("stale attempt revision")
+            }
+            (Some(current), Some(_)) if !current.phase.is_active() => {
+                current.revision.saturating_add(1)
+            }
+            (Some(_), _) => anyhow::bail!("attempt is already claimed"),
+            (None, Some(_)) => anyhow::bail!("stale attempt revision"),
+            (None, None) => 1,
+        };
+        let attempt = AttemptRecord {
+            attempt_id: attempt_id.into(),
+            owner_instance_id: owner_instance_id.into(),
+            revision: next_revision,
+            heartbeat_at: now,
+            expires_at: now + lease,
+            phase: AttemptPhase::Running,
+        };
+        private_atomic_write_json(&path, &attempt)?;
+        Ok(attempt)
+    }
+
+    pub(crate) fn heartbeat_attempt(
+        &self,
+        run_id: &str,
+        attempt_id: &str,
+        owner_instance_id: &str,
+        revision: u64,
+        now: chrono::DateTime<Utc>,
+        lease: Duration,
+    ) -> anyhow::Result<AttemptRecord> {
+        self.mutate_attempt(run_id, |current| {
+            check_attempt_owner(current, attempt_id, owner_instance_id, revision, now)?;
+            if current.phase != AttemptPhase::Running {
+                anyhow::bail!("attempt is not running");
+            }
+            current.revision = current.revision.saturating_add(1);
+            current.heartbeat_at = now;
+            current.expires_at = now + lease;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn finalize_attempt(
+        &self,
+        run_id: &str,
+        attempt_id: &str,
+        owner_instance_id: &str,
+        revision: u64,
+        phase: AttemptPhase,
+        now: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<AttemptRecord> {
+        if !matches!(
+            phase,
+            AttemptPhase::Completed
+                | AttemptPhase::Failed
+                | AttemptPhase::Cancelled
+                | AttemptPhase::Interrupted
+                | AttemptPhase::Reaped
+        ) {
+            anyhow::bail!("attempt finalization must be terminal");
+        }
+        self.mutate_attempt(run_id, |current| {
+            check_attempt_owner(current, attempt_id, owner_instance_id, revision, now)?;
+            if current.phase != AttemptPhase::Running && current.phase != AttemptPhase::Finalizing {
+                anyhow::bail!("attempt is no longer finalizable");
+            }
+            current.revision = current.revision.saturating_add(1);
+            current.phase = phase;
+            current.heartbeat_at = now;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn begin_attempt_finalization(
+        &self,
+        run_id: &str,
+        attempt_id: &str,
+        owner_instance_id: &str,
+        revision: u64,
+        now: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<AttemptRecord> {
+        self.mutate_attempt(run_id, |current| {
+            check_attempt_owner(current, attempt_id, owner_instance_id, revision, now)?;
+            if current.phase != AttemptPhase::Running {
+                anyhow::bail!("attempt is no longer running");
+            }
+            current.revision = current.revision.saturating_add(1);
+            current.phase = AttemptPhase::Finalizing;
+            current.heartbeat_at = now;
+            Ok(())
+        })
+    }
+
+    /// Reap only the exact expired revision. This is deliberately owner
+    /// agnostic: the service that owns the in-memory task supplies the exact
+    /// attempt id and abort handle, while stale/wrong revisions fail closed.
+    pub(crate) fn reap_attempt(
+        &self,
+        run_id: &str,
+        attempt_id: &str,
+        revision: u64,
+        now: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<Option<AttemptRecord>> {
+        let path = self
+            .attempt_path(run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let _g = self.inner.lock.lock();
+        let Some(mut current) = self.read_attempt_path(&path)? else {
+            return Ok(None);
+        };
+        if current.attempt_id != attempt_id
+            || current.revision != revision
+            || current.phase != AttemptPhase::Running
+            || now < current.expires_at
+        {
+            return Ok(None);
+        }
+        current.revision = current.revision.saturating_add(1);
+        current.phase = AttemptPhase::Reaped;
+        current.heartbeat_at = now;
+        private_atomic_write_json(&path, &current)?;
+        Ok(Some(current))
+    }
+
+    pub(crate) fn list_attempts(&self) -> anyhow::Result<Vec<(String, AttemptRecord)>> {
+        let _g = self.inner.lock.lock();
+        let mut out = Vec::new();
+        let mut report = RetentionReport::default();
+        for (_, run) in self.read_run_entries_unlocked(&mut report)? {
+            let path = self
+                .attempt_path(&run.run_id)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            if let Some(attempt) = self.read_attempt_path(&path)? {
+                out.push((run.run_id, attempt));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn finalization_recovery_count(&self) -> usize {
+        fs::read_dir(self.inner.root.join("finalization"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry.path().extension().and_then(|s| s.to_str()) == Some("json")
+                    })
+                    .count()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn durability_health(&self) -> serde_json::Value {
+        let degraded = fs::read_to_string(self.health_path())
+            .ok()
+            .and_then(|text| serde_json::from_str::<DurabilityHealth>(&text).ok())
+            .unwrap_or(DurabilityHealth {
+                degraded: false,
+                detail: None,
+                updated_at: Utc::now(),
+            });
+        serde_json::json!({
+            "degraded": degraded.degraded || self.finalization_recovery_count() > 0,
+            "detail": degraded.detail,
+            "finalizationRecoveryPending": self.finalization_recovery_count(),
+            "finalizationRecoveryLimit": MAX_FINALIZATION_RECOVERY_INTENTS,
+        })
+    }
+
+    pub(crate) fn mark_health_degraded(&self, detail: &str) {
+        let health = DurabilityHealth {
+            degraded: true,
+            detail: Some(detail.chars().take(500).collect()),
+            updated_at: Utc::now(),
+        };
+        if let Err(error) = atomic_write_json(&self.health_path(), &health) {
+            *self.inner.last_run_error.lock() = Some(error.to_string());
+        }
+    }
+
+    fn mutate_attempt<F>(&self, run_id: &str, update: F) -> anyhow::Result<AttemptRecord>
+    where
+        F: FnOnce(&mut AttemptRecord) -> anyhow::Result<()>,
+    {
+        let path = self
+            .attempt_path(run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let _g = self.inner.lock.lock();
+        let mut attempt = self
+            .read_attempt_path(&path)?
+            .ok_or_else(|| anyhow::anyhow!("attempt is missing"))?;
+        update(&mut attempt)?;
+        private_atomic_write_json(&path, &attempt)?;
+        Ok(attempt)
+    }
+
+    fn read_attempt_path(&self, path: &Path) -> anyhow::Result<Option<AttemptRecord>> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
     }
 
     /// Atomically read, mutate, and replace a run record.
@@ -565,6 +1089,11 @@ impl OrchStore {
         let intent_path = self
             .finalization_path(&candidate.run_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if !intent_path.is_file()
+            && self.finalization_recovery_count() >= MAX_FINALIZATION_RECOVERY_INTENTS
+        {
+            anyhow::bail!("finalization recovery queue is full");
+        }
         let result = (|| -> anyhow::Result<()> {
             atomic_write_json(&intent_path, &final_run)?;
             if let Some(corrupt) = &corrupt_target {
@@ -576,6 +1105,26 @@ impl OrchStore {
         })();
         *self.inner.last_run_error.lock() = result.as_ref().err().map(ToString::to_string);
         result.map(|_| final_run)
+    }
+
+    /// Keep a terminal candidate in the bounded recovery queue when the
+    /// synchronous install deadline has elapsed. The candidate is already
+    /// evidence-backed; this method never promotes a non-terminal run.
+    pub(crate) fn ensure_finalization_intent(&self, candidate: &RunRecord) -> anyhow::Result<()> {
+        if !candidate.state.is_terminal() {
+            anyhow::bail!("finalization candidate must be terminal");
+        }
+        let path = self
+            .finalization_path(&candidate.run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let _g = self.inner.lock.lock();
+        if path.is_file() {
+            return Ok(());
+        }
+        if self.finalization_recovery_count() >= MAX_FINALIZATION_RECOVERY_INTENTS {
+            anyhow::bail!("finalization recovery queue is full");
+        }
+        atomic_write_json(&path, candidate)
     }
 
     pub fn save_idempotency(&self, receipt: &IdempotencyReceipt) -> anyhow::Result<()> {
@@ -781,7 +1330,14 @@ impl OrchStore {
         let mut n = 0;
         let mut interrupted_agents = Vec::new();
         for mut run in self.list_runs()? {
-            if matches!(run.state, RunState::Queued | RunState::Running) {
+            let accepted_queued = run.state == RunState::Queued
+                && self
+                    .load_acceptance_intent(&run.run_id)?
+                    .is_some_and(|intent| {
+                        intent.phase == AcceptancePhase::Queued && intent.prompt.is_some()
+                    });
+            if run.state == RunState::Running || (run.state == RunState::Queued && !accepted_queued)
+            {
                 run.state = RunState::Interrupted;
                 run.queue_position = None;
                 run.updated_at = Utc::now();
@@ -826,6 +1382,153 @@ impl OrchStore {
             })?;
         }
         Ok(n)
+    }
+
+    fn recover_acceptance_intents(&self) -> anyhow::Result<usize> {
+        let intents = self.list_acceptance_intents()?;
+        let mut recovered = 0;
+        for intent in intents {
+            let run = match self.load_run(&intent.run_id)? {
+                Some(run) => run,
+                None => {
+                    self.save_run(&intent.run)?;
+                    intent.run.clone()
+                }
+            };
+            if run.run_id != intent.run_id
+                || run.session_id != intent.session_id
+                || run.request_id != intent.request_id
+                || run.workspace != intent.workspace
+            {
+                self.mark_health_degraded(&format!(
+                    "acceptance intent {} does not match its run",
+                    intent.run_id
+                ));
+                continue;
+            }
+
+            // The intent carries the completed response, so a crash before
+            // receipt settlement is repaired from the authoritative admission
+            // rather than failing the request and losing its input.
+            if let Err(error) = self.recover_acceptance_receipt(&intent) {
+                self.mark_health_degraded(&format!(
+                    "acceptance receipt recovery failed for {}: {error}",
+                    intent.run_id
+                ));
+                continue;
+            }
+
+            // A run that had reached Running before the crash is never
+            // reconstructed as queueable work. Its input is no longer needed
+            // for implicit recovery and is tombstoned below.
+            if run.state == RunState::Running || intent.phase == AcceptancePhase::Claimed {
+                let _ = self.update_run(&run.run_id, |current| {
+                    if !current.state.is_terminal() {
+                        current.state = RunState::Interrupted;
+                        current.queue_position = None;
+                        current.terminal_result = Some("interrupted".into());
+                        current.error_code = Some("interrupted".into());
+                        current.updated_at = Utc::now();
+                    }
+                    Ok(())
+                })?;
+                self.tombstone_acceptance_intent(&intent.run_id)?;
+                recovered += 1;
+                continue;
+            }
+
+            if run.state != RunState::Queued
+                || intent.phase != AcceptancePhase::Queued
+                || intent.prompt.is_none()
+            {
+                self.tombstone_acceptance_intent(&intent.run_id)?;
+                continue;
+            }
+            recovered += 1;
+        }
+        Ok(recovered)
+    }
+
+    fn recover_acceptance_receipt(&self, intent: &AcceptanceIntent) -> anyhow::Result<()> {
+        let receipt_path = self
+            .idemp_path(&intent.request_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        match fs::read_to_string(&receipt_path) {
+            Ok(text) => {
+                let receipt: IdempotencyReceipt = serde_json::from_str(&text)?;
+                if receipt.request_id != intent.request_id
+                    || receipt.payload_hash != intent.payload_hash
+                    || receipt.run_id.as_deref() != Some(intent.run_id.as_str())
+                    || receipt.tool != intent.tool
+                {
+                    anyhow::bail!("acceptance intent conflicts with idempotency receipt");
+                }
+                if receipt.status != "pending" {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let receipt = IdempotencyReceipt {
+            request_id: intent.request_id.clone(),
+            payload_hash: intent.payload_hash.clone(),
+            run_id: Some(intent.run_id.clone()),
+            tool: intent.tool.clone(),
+            response: intent.response.clone(),
+            error: None,
+            created_at: Utc::now(),
+            status: "complete".into(),
+        };
+        let _g = self.inner.lock.lock();
+        atomic_write_json(&receipt_path, &receipt)?;
+        Ok(())
+    }
+
+    fn tombstone_acceptance_intent(&self, run_id: &str) -> anyhow::Result<()> {
+        let path = self
+            .acceptance_path(run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let _g = self.inner.lock.lock();
+        if !path.is_file() {
+            return Ok(());
+        }
+        // Replace the full DTO with a valid no-prompt intent first. This
+        // avoids retaining prompt bytes in a failed delete path and makes the
+        // delete itself idempotent across restart.
+        let mut intent: AcceptanceIntent = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        intent.prompt = None;
+        intent.phase = AcceptancePhase::Interrupted;
+        intent.updated_at = Utc::now();
+        private_atomic_write_json(&path, &intent)?;
+        fs::remove_file(&path)?;
+        sync_parent_dir(&path)?;
+        Ok(())
+    }
+
+    fn recover_attempts(&self) -> anyhow::Result<usize> {
+        let mut changed = 0;
+        for (run_id, mut attempt) in self.list_attempts()? {
+            if !attempt.phase.is_active() {
+                continue;
+            }
+            let run = self.load_run(&run_id)?;
+            attempt.revision = attempt.revision.saturating_add(1);
+            attempt.phase = match run {
+                Some(run) if run.state == RunState::Cancelled => AttemptPhase::Cancelled,
+                Some(run) if run.state == RunState::Completed => AttemptPhase::Completed,
+                Some(run) if run.state == RunState::Failed => AttemptPhase::Failed,
+                _ => AttemptPhase::Interrupted,
+            };
+            attempt.heartbeat_at = Utc::now();
+            let path = self
+                .attempt_path(&run_id)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let _g = self.inner.lock.lock();
+            private_atomic_write_json(&path, &attempt)?;
+            changed += 1;
+        }
+        Ok(changed)
     }
 
     fn recover_finalization_intents(&self) -> anyhow::Result<usize> {
@@ -882,6 +1585,119 @@ fn safe_to_expire_run(run: &RunRecord) -> bool {
         .as_ref()
         .map(|execution| !Path::new(&execution.execution_workspace).exists())
         .unwrap_or(true)
+}
+
+fn check_attempt_owner(
+    current: &AttemptRecord,
+    attempt_id: &str,
+    owner_instance_id: &str,
+    revision: u64,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<()> {
+    if current.attempt_id != attempt_id {
+        anyhow::bail!("attempt identity mismatch");
+    }
+    if current.owner_instance_id != owner_instance_id {
+        anyhow::bail!("attempt owner mismatch");
+    }
+    if current.revision != revision {
+        anyhow::bail!("stale attempt revision");
+    }
+    if now >= current.expires_at {
+        anyhow::bail!("attempt heartbeat expired");
+    }
+    Ok(())
+}
+
+fn load_acceptance_intent_path(path: &Path) -> anyhow::Result<Option<AcceptanceIntent>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let metadata = fs::metadata(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            anyhow::bail!("private acceptance intent has unsafe permissions");
+        }
+    }
+    Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
+}
+
+fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            anyhow::bail!(
+                "private directory {} has unsafe permissions",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn sync_parent_dir(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Dedicated writer for the acceptance and attempt security boundary.
+///
+/// `File::create` inherits the process umask and can leave a readable temp
+/// file. This writer creates a unique 0600 file, validates the mode before
+/// writing, reapplies it after rename, and fsyncs the containing directory.
+fn private_atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_private_dir(parent)?;
+    }
+    let tmp = path.with_extension(format!("json.tmp-{}", Uuid::new_v4()));
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = options.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            let mode = file.metadata()?.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                anyhow::bail!("private temp file has unsafe permissions");
+            }
+        }
+        use std::io::Write;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                anyhow::bail!("private file has unsafe permissions");
+            }
+        }
+        sync_parent_dir(path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn merge_run_observations(target: &mut RunRecord, current: &RunRecord) {
@@ -1510,5 +2326,304 @@ mod tests {
             RunState::Completed
         );
         assert!(!intent.exists());
+    }
+
+    fn queued_run(run_id: &str, sequence: u64) -> (RunRecord, AcceptanceIntent) {
+        let mut run = terminal_run(run_id);
+        run.state = RunState::Queued;
+        run.start_seq = None;
+        run.end_seq = None;
+        run.terminal_result = None;
+        run.final_response = None;
+        run.error_code = None;
+        run.prompt_preview = "redacted preview".into();
+        run.request_id = format!("request-{run_id}");
+        let response = serde_json::json!({
+            "runId": run_id,
+            "state": RunState::Queued,
+        });
+        let intent = AcceptanceIntent {
+            admission_id: format!("admission-{run_id}"),
+            sequence,
+            run_id: run_id.into(),
+            request_id: run.request_id.clone(),
+            payload_hash: format!("hash-{run_id}"),
+            tool: "ptah_submit_task".into(),
+            session_id: run.session_id,
+            workspace: run.workspace.clone(),
+            execution_mode: super::super::types::RunExecutionMode::Shared,
+            attempt_id: None,
+            prompt: Some(format!("private full prompt {run_id}")),
+            run: run.clone(),
+            response,
+            phase: AcceptancePhase::Queued,
+            created_at: run.created_at,
+            updated_at: run.updated_at,
+        };
+        (run, intent)
+    }
+
+    #[test]
+    fn acceptance_crash_cuts_rebuild_run_and_receipt_in_fifo_order() {
+        for cut in 0..=3 {
+            let d = tempdir().unwrap();
+            let store = OrchStore::open(d.path()).unwrap();
+            let (run, intent) = queued_run("crash-cut", 1);
+            if cut >= 1 {
+                store.save_acceptance_intent(&intent).unwrap();
+            }
+            if cut >= 2 {
+                store.save_run(&run).unwrap();
+            }
+            if cut >= 3 {
+                store
+                    .save_idempotency(&IdempotencyReceipt {
+                        request_id: intent.request_id.clone(),
+                        payload_hash: intent.payload_hash.clone(),
+                        run_id: Some(intent.run_id.clone()),
+                        tool: intent.tool.clone(),
+                        response: serde_json::Value::Null,
+                        error: None,
+                        created_at: Utc::now(),
+                        status: "pending".into(),
+                    })
+                    .unwrap();
+            }
+            drop(store);
+            let reopened = OrchStore::open(d.path()).unwrap();
+            if cut == 0 {
+                assert!(reopened.load_run("crash-cut").unwrap().is_none());
+                continue;
+            }
+            assert_eq!(
+                reopened.load_run("crash-cut").unwrap().unwrap().state,
+                RunState::Queued
+            );
+            let receipt = reopened
+                .load_idempotency(&intent.request_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.status, "complete");
+            assert_eq!(receipt.run_id.as_deref(), Some("crash-cut"));
+            assert_eq!(
+                reopened
+                    .list_acceptance_intents()
+                    .unwrap()
+                    .iter()
+                    .map(|intent| intent.sequence)
+                    .collect::<Vec<_>>(),
+                vec![1]
+            );
+        }
+    }
+
+    #[test]
+    fn private_acceptance_input_is_0600_and_disappears_after_claim() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let (run, intent) = queued_run("private-input", 1);
+        store.save_run(&run).unwrap();
+        store.save_acceptance_intent(&intent).unwrap();
+        let path = store.acceptance_path(&run.run_id).unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains("private full prompt"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let attempt = store
+            .claim_attempt(
+                &run.run_id,
+                "attempt-private",
+                "owner-private",
+                None,
+                Utc::now(),
+                Duration::minutes(1),
+            )
+            .unwrap();
+        let prompt = store
+            .claim_acceptance_input(
+                &run.run_id,
+                &attempt.attempt_id,
+                &RunRecord {
+                    state: RunState::Running,
+                    ..run.clone()
+                },
+                serde_json::json!({"runId": run.run_id, "state": "running"}),
+            )
+            .unwrap();
+        assert_eq!(prompt, "private full prompt private-input");
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(!body.contains("private full prompt"));
+        assert!(body.contains("\"prompt\": null"));
+        store.settle_acceptance_intent(&run.run_id).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn attempt_cas_rejects_stale_owner_and_expired_mutations() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let now = Utc::now();
+        let attempt = store
+            .claim_attempt(
+                "attempt-run",
+                "attempt-1",
+                "owner-1",
+                None,
+                now,
+                Duration::seconds(1),
+            )
+            .unwrap();
+        assert!(store
+            .heartbeat_attempt(
+                "attempt-run",
+                "attempt-1",
+                "owner-2",
+                attempt.revision,
+                now,
+                Duration::seconds(1),
+            )
+            .is_err());
+        assert!(store
+            .heartbeat_attempt(
+                "attempt-run",
+                "attempt-1",
+                "owner-1",
+                attempt.revision.saturating_sub(1),
+                now,
+                Duration::seconds(1),
+            )
+            .is_err());
+        let expired = now + Duration::seconds(2);
+        assert!(store
+            .heartbeat_attempt(
+                "attempt-run",
+                "attempt-1",
+                "owner-1",
+                attempt.revision,
+                expired,
+                Duration::seconds(1),
+            )
+            .is_err());
+        assert!(store
+            .reap_attempt("attempt-run", "attempt-1", attempt.revision, now)
+            .unwrap()
+            .is_none());
+        let reaped = store
+            .reap_attempt("attempt-run", "attempt-1", attempt.revision, expired)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reaped.phase, AttemptPhase::Reaped);
+        assert!(store
+            .reap_attempt("attempt-run", "attempt-1", attempt.revision, expired)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn restart_rebuilds_thirty_two_acceptances_in_exact_fifo_order() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        for sequence in 1..=32 {
+            let run_id = format!("fifo-{sequence}");
+            let (run, intent) = queued_run(&run_id, sequence);
+            store.save_run(&run).unwrap();
+            store.save_acceptance_intent(&intent).unwrap();
+        }
+        drop(store);
+        let reopened = OrchStore::open(d.path()).unwrap();
+        let intents = reopened.list_acceptance_intents().unwrap();
+        assert_eq!(intents.len(), 32);
+        assert_eq!(
+            intents
+                .iter()
+                .map(|intent| intent.run_id.as_str())
+                .collect::<Vec<_>>(),
+            (1..=32)
+                .map(|sequence| format!("fifo-{sequence}"))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reopened
+                .list_acceptance_intents()
+                .unwrap()
+                .iter()
+                .filter(|intent| intent.prompt.is_some())
+                .count(),
+            32
+        );
+    }
+
+    #[test]
+    fn already_running_acceptance_is_interrupted_and_never_requeued() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let (mut run, mut intent) = queued_run("running-restart", 1);
+        run.state = RunState::Running;
+        run.start_seq = Some(1);
+        intent.run = run.clone();
+        intent.phase = AcceptancePhase::Claimed;
+        intent.prompt = None;
+        store.save_run(&run).unwrap();
+        store.save_acceptance_intent(&intent).unwrap();
+        drop(store);
+        let reopened = OrchStore::open(d.path()).unwrap();
+        assert_eq!(
+            reopened.load_run("running-restart").unwrap().unwrap().state,
+            RunState::Interrupted
+        );
+        assert!(reopened.list_acceptance_intents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn injected_acceptance_write_failure_leaves_no_prompt_temp_file() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let (_run, intent) = queued_run("write-failure", 1);
+        let target = store.acceptance_path(&intent.run_id).unwrap();
+        fs::create_dir(&target).unwrap();
+        assert!(store.save_acceptance_intent(&intent).is_err());
+        fs::remove_dir(&target).unwrap();
+        let leftovers = fs::read_dir(d.path().join("acceptance"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name() != "sequence.json")
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "failed private write left temporary input files: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn finalization_recovery_queue_is_bounded_and_projects_degraded_health() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        for index in 0..MAX_FINALIZATION_RECOVERY_INTENTS {
+            store
+                .ensure_finalization_intent(&terminal_run(&format!("recovery-{index}")))
+                .unwrap();
+        }
+        assert_eq!(
+            store.finalization_recovery_count(),
+            MAX_FINALIZATION_RECOVERY_INTENTS
+        );
+        assert!(store
+            .ensure_finalization_intent(&terminal_run("recovery-overflow"))
+            .is_err());
+        let health = store.durability_health();
+        assert_eq!(health["degraded"], true);
+        assert_eq!(
+            health["finalizationRecoveryPending"],
+            MAX_FINALIZATION_RECOVERY_INTENTS
+        );
     }
 }

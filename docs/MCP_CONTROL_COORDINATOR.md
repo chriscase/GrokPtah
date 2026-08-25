@@ -69,12 +69,20 @@ cargo test --test mcp_soak_hardening -- --nocapture --test-threads=1
 # Optional: GROKPTAH_SOAK_SECONDS (default 25), GROKPTAH_SOAK_CONCURRENCY (default 6)
 ```
 
-Crash recovery contract: reopening `OrchStore` marks unfinished runs
-**`interrupted`**; session prompt queues reload from the GrokPtah home.
-MCP transport sessions are **not** durable across process restart (re-`initialize`).
-No model turn resumes automatically. A coordinator may use `ptah_retry_run`
-with a fresh prompt to create one explicit, linked replacement after checking
-the interrupted handoff.
+Crash recovery contract: an accepted orchestration run whose state is
+**`queued`** is backed by a private acceptance intent containing its full
+prompt, FIFO/order identity, host admission identity, `RunRecord`, and
+completed idempotency response. Reopening `OrchStore` recovers those intents
+before receipts and reconstructs the existing host-global scheduler queue;
+each accepted queued run resumes dispatch exactly once. The full input is
+loaded by `run_id`, and never owned solely by a service-local `VecDeque`.
+
+Model work whose attempt had reached **`running`** is different: reopening
+marks it **`interrupted`**, tombstones its private input, and never resumes it
+implicitly. A coordinator must inspect the interrupted handoff and use
+`ptah_retry_run` with a fresh prompt to create one explicit, linked
+replacement. MCP transport sessions are **not** durable across process restart
+(re-`initialize`).
 
 The desktop bootstrap soak also proves a **fresh-host restart** path: it stops
 the first control server, drops the original `AgentHost`, creates a new host
@@ -454,6 +462,13 @@ coordinator wants a bounded admission queue for capacity or session contention.
   authoritative if a race is observed.
 - Queued runs have durable `RunState::Queued` records and remain visible through
   `ptah_get_run`, `ptah_get_progress`, and the handoff/read tools.
+- The full queued prompt is private acceptance state with a 0600 file mode; it
+  is not in the public `RunRecord` or any `ptah_get_run` serialization.
+- Each claimed model attempt has a private compare-and-set lease with
+  `attemptId`, `ownerInstanceId`, `revision`, `heartbeatAt`, `expiresAt`, and
+  `phase`. A stale revision, wrong owner, or expired heartbeat cannot mutate
+  it. The reaper aborts only the exact expired task, marks the run interrupted,
+  and releases admission idempotently.
 - Admission uses one host-global scheduler across embedded control services.
   It preserves FIFO order for each session and prefers a different eligible
   session after a session starts, preventing one session from monopolizing the

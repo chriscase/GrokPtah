@@ -7,6 +7,8 @@ plane read the same records.
 ## Lifecycle
 
 ```text
+accepted -> queued -> running
+                    |
 running -> completed
         -> failed
         -> cancelled
@@ -21,9 +23,18 @@ verification evidence, a bounded final response, and the terminal reason.
 
 Build turns create a run before model work begins. Typed bridge events are
 aggregated while the turn runs and reconciled from the journal at finalization.
-The store atomically installs terminal records and marks queued or running
-runs `interrupted` when it is reopened. An interrupted run is inspectable but
-is never resumed automatically.
+The store atomically installs terminal records. Accepted `queued` runs retain
+their full input and host admission identity in the private acceptance ledger;
+reopening reconstructs their FIFO/host slots and resumes dispatch exactly once.
+Model work that had reached `running` is marked `interrupted` when it is
+reopened. An interrupted run is inspectable but is never resumed automatically:
+it requires an explicit retry with a fresh prompt.
+
+Each running model attempt also has a private CAS lease with an owner,
+revision, heartbeat, expiry, and phase. A periodic reaper can interrupt only
+the exact expired attempt. Finalization retries are bounded; an unresolved
+terminal write remains in the bounded recovery queue and projects degraded
+durability health rather than wedging capacity.
 
 The desktop inspector is read-only for shared runs. Build sessions may opt into
 strict isolated execution. An isolated run starts from a clean Git workspace in
@@ -65,7 +76,9 @@ does not need a second event stream or a separate coordinator dashboard.
 - Desktop queries are scoped to one session ID.
 - Prompt previews, handoffs, progress, and errors are truncated and redacted
   through the shared event bus before persistence.
-- Run records do not store credentials, full prompts, full transcripts, or
-  unrestricted terminal output.
+- Public run records do not store credentials, full prompts, full transcripts,
+  or unrestricted terminal output. Full accepted input exists only in the
+  bridge-owned private 0600 acceptance ledger and is tombstoned before a model
+  attempt is dispatched or a queued run is cancelled.
 - The existing journal, audit, idempotency, workspace allowlist, and MCP tool
   restrictions remain authoritative.
