@@ -30,4 +30,23 @@ if (missing.length > 0) {
   throw new Error(`public bundle is missing required exports: ${missing.join(", ")}`);
 }
 
+const helpHits = publicApi.searchHelp("restricted gateway", {
+  audience: "operator",
+  includeRestricted: true,
+});
+if (!helpHits.some(({ entry }) => entry.id === "enterprise-gateway-review")) {
+  throw new Error("public Help Center search did not return the enterprise gateway entry");
+}
+const streamResult = publicApi.applyAssistantStreamChunk("", "consumer");
+if (streamResult.kind !== "replace" || streamResult.text !== "consumer") {
+  throw new Error("public stream helper did not apply a consumer update");
+}
+const broker = new publicApi.GrokPtahBrokerClient({
+  baseUrl: "https://contextdesk.example",
+  fetcher: async () => new Response(null, { status: 204 }),
+});
+if (!(broker instanceof publicApi.GrokPtahBrokerClient)) {
+  throw new Error("public broker client could not be constructed by a consumer");
+}
+
 console.log(`public bundle verified: ${requiredExports.join(", ")}`);
