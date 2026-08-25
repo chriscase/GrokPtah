@@ -93,6 +93,28 @@ export type ExternalWorkerLaunchResult = {
   run: ExternalWorkerRunRecord;
 };
 
+export type ExternalWorkerListQuery = {
+  limit?: number;
+  cursor?: string;
+  includeArchived?: boolean;
+};
+
+export type ExternalWorkerSummary = {
+  provider: ExternalWorkerProvider;
+  providerId?: string;
+  externalAgentId: string;
+  state: ExternalWorkerState;
+  workerUrl?: string;
+  latestRunId?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ExternalWorkerListPage = {
+  items: ExternalWorkerSummary[];
+  nextCursor?: string;
+};
+
 export type ExternalWorkerNotification =
   | { type: "event"; event: ExternalWorkerEvent }
   | { type: "recovery"; afterSeq: number; reason: string; pollRoute: string };
@@ -108,6 +130,7 @@ const MAX_REF_BYTES = 512;
 const MAX_PROMPT_BYTES = 1_048_576;
 const MAX_DETAIL_BYTES = 4_096;
 const MAX_EVENTS = 256;
+const MAX_LIST_LIMIT = 100;
 const PROVIDERS = new Set<ExternalWorkerProvider>([
   "cursor_cloud",
   "claude_code_cloud",
@@ -291,6 +314,58 @@ export function parseExternalWorkerLaunchResult(value: unknown): ExternalWorkerL
   const run = parseExternalWorkerRunRecord(value.run);
   if (!worker || !run || worker.externalAgentId !== run.externalAgentId) return null;
   return { worker, run };
+}
+
+/** Parse a bounded list query before sending it to a broker. */
+export function parseExternalWorkerListQuery(value: unknown): ExternalWorkerListQuery | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(["limit", "cursor", "includeArchived"]))) return null;
+  if (
+    (value.limit !== undefined && (!Number.isInteger(value.limit) || (value.limit as number) < 1 || (value.limit as number) > MAX_LIST_LIMIT)) ||
+    (value.cursor !== undefined && !identity(value.cursor)) ||
+    (value.includeArchived !== undefined && typeof value.includeArchived !== "boolean")
+  ) return null;
+  return value as ExternalWorkerListQuery;
+}
+
+/** Parse a redacted identity-only worker summary from a list page. */
+export function parseExternalWorkerSummary(value: unknown): ExternalWorkerSummary | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set([
+    "provider", "providerId", "externalAgentId", "state", "workerUrl", "latestRunId", "createdAt", "updatedAt",
+  ]))) return null;
+  if (
+    typeof value.provider !== "string" ||
+    !PROVIDERS.has(value.provider as ExternalWorkerProvider) ||
+    (value.providerId !== undefined && !identity(value.providerId)) ||
+    !identity(value.externalAgentId) ||
+    typeof value.state !== "string" ||
+    !STATES.has(value.state as ExternalWorkerState) ||
+    (value.workerUrl !== undefined && !safeWorkerUrl(value.workerUrl, value.provider as ExternalWorkerProvider)) ||
+    (value.latestRunId !== undefined && !identity(value.latestRunId)) ||
+    !boundedString(value.createdAt, 128) ||
+    !boundedString(value.updatedAt, 128) ||
+    (value.provider === "custom" && value.providerId === undefined)
+  ) return null;
+  return value as ExternalWorkerSummary;
+}
+
+/** Parse a redacted worker list page. A malformed item fails the whole page. */
+export function parseExternalWorkerListPage(value: unknown): ExternalWorkerListPage | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(["items", "nextCursor"]))) return null;
+  if (!Array.isArray(value.items) || value.items.length > MAX_LIST_LIMIT) return null;
+  if (value.nextCursor !== undefined && !identity(value.nextCursor)) return null;
+  if (value.items.length === 0 && value.nextCursor !== undefined) return null;
+  const items = value.items.map(parseExternalWorkerSummary);
+  if (items.some((item) => item === null)) return null;
+  const parsed = items as ExternalWorkerSummary[];
+  const seen = new Set<string>();
+  for (const item of parsed) {
+    if (seen.has(item.externalAgentId)) return null;
+    seen.add(item.externalAgentId);
+  }
+  return {
+    items: parsed,
+    ...(value.nextCursor === undefined ? {} : { nextCursor: value.nextCursor }),
+  };
 }
 
 /** Parse a redacted event without exposing provider tool output. */

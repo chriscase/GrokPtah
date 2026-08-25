@@ -57,6 +57,9 @@ try {
   parseExternalWorkerFollowUpRequest,
   parseExternalWorkerLaunchResult,
   parseExternalWorkerNotification,
+  parseExternalWorkerListQuery,
+  parseExternalWorkerListPage,
+  parseExternalWorkerSummary,
   applyExternalWorkerNotification,
   createExternalWorkerMonitor,
   HELP_ARTICLES,
@@ -161,6 +164,34 @@ if (followUp?.requestId !== "consumer-follow-up") {
 }
 if (parseExternalWorkerLaunchResult({ worker: {}, run: {} }) !== null) {
   throw new Error("consumer external-worker launch result parser failed closed");
+}
+if (parseExternalWorkerListQuery({ limit: 0 }) !== null) {
+  throw new Error("consumer external-worker list query parser failed closed");
+}
+if (parseExternalWorkerListQuery({ includeArchived: false })?.includeArchived !== false) {
+  throw new Error("consumer external-worker list query parser was not usable");
+}
+if (parseExternalWorkerSummary({
+  provider: "cursor_cloud",
+  externalAgentId: "agent-1",
+  repository: "org/repo",
+  startingRef: "main",
+  state: "ready",
+  createdAt: "now",
+  updatedAt: "now",
+}) !== null) {
+  throw new Error("consumer external-worker summary parser leaked repository fields");
+}
+if (parseExternalWorkerListPage({
+  items: [{
+    provider: "cursor_cloud",
+    externalAgentId: "agent-1",
+    state: "ready",
+    createdAt: "now",
+    updatedAt: "now",
+  }],
+})?.items[0]?.externalAgentId !== "agent-1") {
+  throw new Error("consumer external-worker list page parser was not usable");
 }
 const externalNotification = parseExternalWorkerNotification({
   type: "event",

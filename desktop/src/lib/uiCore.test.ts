@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   applyAssistantStreamChunk,
   emptyPromptQueueState,
+  parseExternalWorkerListPage,
+  parseExternalWorkerListQuery,
+  parseExternalWorkerSummary,
   promptQueueReducer,
   queueKind,
   searchHelpArticles,
@@ -35,5 +38,26 @@ describe("headless UI integration barrel", () => {
     const hits = searchHelpArticles("restricted company gateway");
     expect(hits[0]?.article.id).toBe("providers.restricted-gateway-review");
     expect(hits[0]?.retrievalMode).toBe("offline-lexical");
+  });
+
+  it("requires identity-only external-worker list parsers on the headless barrel", () => {
+    expect(parseExternalWorkerListQuery({ includeArchived: false })?.includeArchived).toBe(false);
+    expect(parseExternalWorkerSummary({
+      provider: "cursor_cloud",
+      externalAgentId: "agent-1",
+      repository: "org/repo",
+      state: "ready",
+      createdAt: "now",
+      updatedAt: "now",
+    })).toBeNull();
+    expect(parseExternalWorkerListPage({
+      items: [{
+        provider: "cursor_cloud",
+        externalAgentId: "agent-1",
+        state: "ready",
+        createdAt: "now",
+        updatedAt: "now",
+      }],
+    })?.items).toHaveLength(1);
   });
 });

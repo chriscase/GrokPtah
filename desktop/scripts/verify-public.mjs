@@ -48,6 +48,10 @@ const requiredExports = [
   "parseExternalWorkerFollowUpRequest",
   "parseExternalWorkerLaunchResult",
   "parseExternalWorkerNotification",
+  "parseExternalWorkerListQuery",
+  "parseExternalWorkerListPage",
+  "parseExternalWorkerSummary",
+  "GROKPTAH_BROKER_EXTERNAL_WORKER_ROUTES",
   "applyExternalWorkerNotification",
   "searchHelp",
   "searchHelpArticles",
@@ -67,6 +71,9 @@ for (const name of [
   "EXTERNAL_WORKER_CONTRACT",
   "parseExternalWorkerFollowUpRequest",
   "parseExternalWorkerNotification",
+  "parseExternalWorkerListQuery",
+  "parseExternalWorkerListPage",
+  "parseExternalWorkerSummary",
   "applyExternalWorkerNotification",
 ]) {
   if (!(name in uiCoreApi)) throw new Error(`ui-core bundle is missing required export: ${name}`);

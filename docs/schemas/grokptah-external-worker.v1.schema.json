@@ -10,6 +10,9 @@
     "launchRequest": { "$ref": "#/$defs/launchRequest" },
     "worker": { "$ref": "#/$defs/worker" },
     "run": { "$ref": "#/$defs/run" },
+    "listQuery": { "$ref": "#/$defs/listQuery" },
+    "summary": { "$ref": "#/$defs/summary" },
+    "listPage": { "$ref": "#/$defs/listPage" },
     "events": { "type": "array", "items": { "$ref": "#/$defs/event" } },
     "artifacts": { "type": "array", "items": { "$ref": "#/$defs/artifact" } }
   },
@@ -116,6 +119,50 @@
         "path": { "$ref": "#/$defs/ref" },
         "digest": { "$ref": "#/$defs/identity" },
         "sizeBytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "listQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Bounded identity-only list query. Brokers must send includeArchived explicitly; omitted means false and must not inherit a provider default.",
+      "properties": {
+        "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "cursor": { "$ref": "#/$defs/identity" },
+        "includeArchived": { "type": "boolean", "default": false }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Identity-only list item. Repository, startingRef, and write/PR flags are omitted because provider list pages do not include them.",
+      "required": ["provider", "externalAgentId", "state", "createdAt", "updatedAt"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/provider" },
+        "providerId": { "$ref": "#/$defs/identity" },
+        "externalAgentId": { "$ref": "#/$defs/identity" },
+        "state": { "$ref": "#/$defs/state" },
+        "workerUrl": {
+          "type": "string",
+          "maxLength": 512,
+          "pattern": "^https://[^/?#@]+(?:/[^?#]*)?$"
+        },
+        "latestRunId": { "$ref": "#/$defs/identity" },
+        "createdAt": { "type": "string", "minLength": 1 },
+        "updatedAt": { "type": "string", "minLength": 1 }
+      }
+    },
+    "listPage": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One page of identity summaries. nextCursor is omitted when no further page exists and must not be published for an empty page.",
+      "required": ["items"],
+      "properties": {
+        "items": {
+          "type": "array",
+          "maxItems": 100,
+          "items": { "$ref": "#/$defs/summary" }
+        },
+        "nextCursor": { "$ref": "#/$defs/identity" }
       }
     }
   }

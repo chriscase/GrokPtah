@@ -831,7 +831,8 @@ async fn request_timeout_returns_error() {
         .send()
         .await
         .unwrap();
-    // Timeout maps to HTTP 504 + structured data.code=timeout.
+    // Timeout maps to HTTP 504. The public taxonomy collapses it to
+    // `internal`; the transport reason stays on `reasonCode`.
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::GATEWAY_TIMEOUT,
@@ -843,10 +844,11 @@ async fn request_timeout_returns_error() {
         .unwrap_or_default()
         .to_ascii_lowercase();
     assert!(
-        msg.contains("timed out") || msg.contains("timeout"),
+        msg.contains("deadline") || msg.contains("timed out") || msg.contains("timeout"),
         "expected timeout error message, got {body}"
     );
-    assert_eq!(body["error"]["data"]["code"], "timeout");
+    assert_eq!(body["error"]["data"]["code"], "internal");
+    assert_eq!(body["error"]["data"]["reasonCode"], "timeout");
     assert_eq!(body["id"], 42);
     srv.stop();
     set_grokptah_home_override(None);
@@ -860,10 +862,10 @@ async fn unknown_and_forbidden_tools_fail_closed_over_http() {
     let url = format!("http://{}/mcp", srv.addr);
     let http = reqwest::Client::new();
     for (name, expect_fragment) in [
-        ("run_terminal_cmd", "not available"),
-        ("ptah_shell", "not available"),
-        ("ptah_manage_mcp", "not available"),
-        ("no_such_tool_xyz", "not available"),
+        ("run_terminal_cmd", "not allowed"),
+        ("ptah_shell", "not allowed"),
+        ("ptah_manage_mcp", "not allowed"),
+        ("no_such_tool_xyz", "not allowed"),
     ] {
         let resp = http
             .post(&url)
@@ -888,6 +890,7 @@ async fn unknown_and_forbidden_tools_fail_closed_over_http() {
             "{name}: expected '{expect_fragment}' in {body}"
         );
         assert_eq!(body["error"]["data"]["code"], "forbidden_scope");
+        assert_eq!(body["error"]["data"]["reasonCode"], "forbidden_scope");
     }
     srv.stop();
     set_grokptah_home_override(None);

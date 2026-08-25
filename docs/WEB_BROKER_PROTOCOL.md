@@ -80,17 +80,41 @@ binding and run ids to the exact GrokPtah `session_id`, `workspace`, and
 | `GET /bindings/{bindingId}/runs/{runId}/handoff` | `ptah_get_handoff` | read-only | Bounded final handoff. |
 | `GET /bindings/{bindingId}/runs/{runId}/review` | `ptah_review_run` | read-only | Isolated-run diff/fingerprint. |
 | `POST /bindings/{bindingId}/external-workers` | external worker adapter | execute | Launches an isolated exact-ref cloud worker; requires idempotency and CSRF. |
+| `GET /bindings/{bindingId}/external-workers` | external worker adapter | read-only | Identity-only summaries; bounded `limit`/`cursor`; `includeArchived` omitted=false and always sent explicitly. |
 | `GET /bindings/{bindingId}/external-workers/{agentId}` | external worker adapter | read-only | Redacted provider worker identity and lifecycle. |
 | `POST /bindings/{bindingId}/external-workers/{agentId}/runs` | external worker adapter | execute | Queues one bounded follow-up run; only one active provider run is allowed; requires idempotency and CSRF. |
 | `GET /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}` | external worker adapter | read-only | Redacted provider run status and cursor. |
 | `GET /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/artifacts` | external worker adapter | read-only | Bounded relative artifact references only. |
-| `POST /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/cancel` | external worker adapter | execute | Explicit terminal cancellation; requires idempotency and CSRF. |
+| `POST /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/cancel` | external worker adapter | execute | Explicit terminal cancellation; requires idempotency and CSRF. Archive is never implied by cancel. |
+| `POST /bindings/{bindingId}/external-workers/{agentId}/archive` | external worker adapter | execute | Reversible archive; CSRF, idempotency, empty body; post-mutation identity/state verification. |
+| `POST /bindings/{bindingId}/external-workers/{agentId}/unarchive` | external worker adapter | execute | Restore an archived worker; CSRF, idempotency, empty body; verify provider identity and non-archived state. |
 | `POST /bindings/{bindingId}/runs/{runId}/approve` | broker approval | execute | Binds exact review fingerprints to a short-lived approval. |
 | `POST /bindings/{bindingId}/runs/{runId}/promote` | promotion authority | promote | Requires the short-lived approval and desktop human gate. |
 | `POST /bindings/{bindingId}/runs/{runId}/cancel` | `ptah_cancel` | execute | Explicit user action; idempotent request id. |
 | `GET /bindings/{bindingId}/queue` | `ptah_get_queue` | read-only | Includes queue revision. |
 | `POST /bindings/{bindingId}/queue` | `ptah_queue_prompt` | execute | Server adds request id and policy bounds. |
 | `POST /bindings/{bindingId}/steer` | `ptah_steer` | execute | Non-cancelling steer only. |
+
+### External worker list, archive, and unarchive
+
+List, archive, and unarchive share the launch/get adapter, not a parallel
+authority. Launch remains `POST /bindings/{bindingId}/external-workers`; list is
+the same collection path with `GET` and an explicit query. The GrokPtah list
+query is identity-only: `limit` is 1..=100 (adapters send 20 when omitted),
+`cursor` is an opaque identity, and `includeArchived` omitted means false. A
+broker must send `includeArchived=true|false` to the provider and must not
+inherit Cursor REST's default `true`. List items are summaries; they omit
+repository, starting ref, and write/PR flags. Full safety-checked records come
+from the existing item GET.
+
+Archive and unarchive are empty-body `POST` mutations. They require the
+broker's normal CSRF token, a non-empty `Idempotency-Key` bound by the durable
+ledger to this binding and agent, execute-class capability, preserved provider
+identity, and a post-mutation identity/state read. Archive is explicit and
+reversible. Cancel, run completion, and a closed stream never imply archive.
+Follow-up on an archived worker is rejected. Unknown fields, oversized pages,
+archived rows without `includeArchived=true`, and credential-bearing URLs fail
+closed before they reach a browser.
 
 The run creation body is intentionally narrower than MCP:
 

@@ -11,15 +11,42 @@ import {
   parseExternalWorkerFollowUpRequest,
   parseExternalWorkerLaunchRequest,
   parseExternalWorkerLaunchResult,
+  parseExternalWorkerListPage,
+  parseExternalWorkerListQuery,
   parseExternalWorkerRecord,
   parseExternalWorkerRunRecord,
   type ExternalWorkerArtifact,
   type ExternalWorkerFollowUpRequest,
   type ExternalWorkerLaunchRequest,
   type ExternalWorkerLaunchResult,
+  type ExternalWorkerListPage,
+  type ExternalWorkerListQuery,
   type ExternalWorkerRecord,
   type ExternalWorkerRunRecord,
 } from "./externalWorker";
+import {
+  grokptahBrokerExternalWorkerArchivePath,
+  grokptahBrokerExternalWorkerCollectionPath,
+  grokptahBrokerExternalWorkerListPath,
+  grokptahBrokerExternalWorkerUnarchivePath,
+} from "./grokptahBrokerRoutes";
+
+export {
+  EXTERNAL_WORKER_LIST_DEFAULT_LIMIT,
+  EXTERNAL_WORKER_LIST_INCLUDE_ARCHIVED_DEFAULT,
+  EXTERNAL_WORKER_LIST_MAX_LIMIT,
+  GROKPTAH_BROKER_EXTERNAL_WORKER_ROUTES,
+  grokptahBrokerExternalWorkerArchivePath,
+  grokptahBrokerExternalWorkerCollectionPath,
+  grokptahBrokerExternalWorkerListPath,
+  grokptahBrokerExternalWorkerRoute,
+  grokptahBrokerExternalWorkerUnarchivePath,
+} from "./grokptahBrokerRoutes";
+export type {
+  GrokPtahBrokerExternalWorkerRoute,
+  GrokPtahBrokerExternalWorkerRouteId,
+  GrokPtahBrokerRouteClass,
+} from "./grokptahBrokerRoutes";
 
 export type GrokPtahBrokerCapability = {
   id: string;
@@ -586,7 +613,7 @@ export class GrokPtahBrokerClient {
       throw new GrokPtahBrokerError(0, "invalid_request", "External worker requestId must match Idempotency-Key");
     }
     const result = await this.requestValidated(
-      `/bindings/${segment(bindingId)}/external-workers`,
+      grokptahBrokerExternalWorkerCollectionPath(segment(bindingId)),
       parseExternalWorkerLaunchResult,
       { method: "POST", idempotencyKey, body: request },
     );
@@ -639,6 +666,68 @@ export class GrokPtahBrokerClient {
     );
     if (worker.externalAgentId !== externalAgentId) {
       throw new GrokPtahBrokerError(0, "invalid_response", "External worker identity does not match the request");
+    }
+    return worker;
+  }
+
+  /** List redacted external-worker identity summaries. */
+  async listExternalWorkers(
+    bindingId: string,
+    query: ExternalWorkerListQuery = {},
+  ): Promise<ExternalWorkerListPage> {
+    const parsed = parseExternalWorkerListQuery(query);
+    if (parsed === null) {
+      throw new GrokPtahBrokerError(0, "invalid_request", "External worker list query is invalid");
+    }
+    const page = await this.requestValidated(
+      grokptahBrokerExternalWorkerListPath(segment(bindingId), parsed),
+      parseExternalWorkerListPage,
+      {},
+    );
+    if (parsed.includeArchived !== true && page.items.some((item) => item.state === "archived")) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker list included archived workers without includeArchived");
+    }
+    if (parsed.limit !== undefined && page.items.length > parsed.limit) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker list exceeded the requested page size");
+    }
+    return page;
+  }
+
+  /** Archive an external worker; archive is explicit and reversible. */
+  async archiveExternalWorker(
+    bindingId: string,
+    externalAgentId: string,
+    idempotencyKey: string,
+  ): Promise<ExternalWorkerRecord> {
+    const worker = await this.requestValidated(
+      grokptahBrokerExternalWorkerArchivePath(segment(bindingId), segment(externalAgentId)),
+      parseExternalWorkerRecord,
+      { method: "POST", idempotencyKey },
+    );
+    if (worker.externalAgentId !== externalAgentId || worker.state !== "archived") {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker archive did not return an archived identity");
+    }
+    return worker;
+  }
+
+  /** Restore an archived external worker so it can accept new runs. */
+  async unarchiveExternalWorker(
+    bindingId: string,
+    externalAgentId: string,
+    idempotencyKey: string,
+  ): Promise<ExternalWorkerRecord> {
+    const worker = await this.requestValidated(
+      grokptahBrokerExternalWorkerUnarchivePath(segment(bindingId), segment(externalAgentId)),
+      parseExternalWorkerRecord,
+      { method: "POST", idempotencyKey },
+    );
+    if (
+      worker.externalAgentId !== externalAgentId ||
+      worker.state === "archived" ||
+      worker.state === "unknown" ||
+      worker.state === "failed"
+    ) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker unarchive did not restore an active identity");
     }
     return worker;
   }

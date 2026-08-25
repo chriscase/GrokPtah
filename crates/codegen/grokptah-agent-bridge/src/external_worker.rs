@@ -7,10 +7,11 @@
 //! Computer Use authority.
 
 use async_trait::async_trait;
-use grokptah_agent_sdk::{
+use grokptah_agent_sdk::external_worker::{
     ExternalWorkerArtifact, ExternalWorkerExecutionMode, ExternalWorkerFollowUpRequest,
-    ExternalWorkerLaunchRequest, ExternalWorkerLaunchResult, ExternalWorkerProvider,
-    ExternalWorkerRecord, ExternalWorkerRunRecord, ExternalWorkerState,
+    ExternalWorkerLaunchRequest, ExternalWorkerLaunchResult, ExternalWorkerListPage,
+    ExternalWorkerListQuery, ExternalWorkerProvider, ExternalWorkerRecord, ExternalWorkerRunRecord,
+    ExternalWorkerState, ExternalWorkerSummary, MAX_EXTERNAL_WORKER_LIST_LIMIT,
 };
 use parking_lot::RwLock;
 use reqwest::{Client, Method, StatusCode, Url};
@@ -92,6 +93,37 @@ pub trait ExternalWorkerAdapter: Send + Sync {
         external_agent_id: &str,
         external_run_id: &str,
     ) -> Result<ExternalWorkerRunRecord, ExternalWorkerAdapterError>;
+
+    /// List redacted worker identity summaries.
+    ///
+    /// Default implementations fail closed. List pages must not invent
+    /// repository or starting-ref fields omitted by the provider.
+    async fn list_workers(
+        &self,
+        query: &ExternalWorkerListQuery,
+    ) -> Result<ExternalWorkerListPage, ExternalWorkerAdapterError> {
+        let _ = query;
+        Err(ExternalWorkerAdapterError::UnsupportedProvider)
+    }
+
+    /// Archive a worker. Archive is explicit and reversible via `unarchive`.
+    /// Cancellation or completion must not imply archive.
+    async fn archive(
+        &self,
+        external_agent_id: &str,
+    ) -> Result<ExternalWorkerRecord, ExternalWorkerAdapterError> {
+        let _ = external_agent_id;
+        Err(ExternalWorkerAdapterError::UnsupportedProvider)
+    }
+
+    /// Restore an archived worker so it can accept new runs.
+    async fn unarchive(
+        &self,
+        external_agent_id: &str,
+    ) -> Result<ExternalWorkerRecord, ExternalWorkerAdapterError> {
+        let _ = external_agent_id;
+        Err(ExternalWorkerAdapterError::UnsupportedProvider)
+    }
 }
 
 /// Process-local registry for qualified external-worker providers.
@@ -236,10 +268,26 @@ impl CursorCloudAdapter {
         path: &str,
         body: Option<Value>,
     ) -> Result<T, ExternalWorkerAdapterError> {
-        let url = self
+        self.request_with_query(method, path, &[], body).await
+    }
+
+    async fn request_with_query<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<Value>,
+    ) -> Result<T, ExternalWorkerAdapterError> {
+        let mut url = self
             .base_url
             .join(path)
             .map_err(|_| ExternalWorkerAdapterError::InvalidResponse("provider URL is invalid"))?;
+        if !query.is_empty() {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in query {
+                pairs.append_pair(key, value);
+            }
+        }
         let mut request = self
             .http
             .request(method, url)
@@ -256,19 +304,39 @@ impl CursorCloudAdapter {
             // credential-bearing diagnostics and would enter our error log.
             return Err(ExternalWorkerAdapterError::Provider { status });
         }
-        Ok(response.json().await?)
+        let bytes = response.bytes().await?;
+        serde_json::from_slice(&bytes).map_err(|_| {
+            ExternalWorkerAdapterError::InvalidResponse("provider response is malformed")
+        })
     }
 
     fn checked_id(value: &str) -> Result<&str, ExternalWorkerAdapterError> {
+        Self::checked_opaque(value, false)
+    }
+
+    fn checked_cursor(
+        value: &str,
+        from_provider: bool,
+    ) -> Result<&str, ExternalWorkerAdapterError> {
+        Self::checked_opaque(value, from_provider)
+    }
+
+    fn checked_opaque(
+        value: &str,
+        from_provider: bool,
+    ) -> Result<&str, ExternalWorkerAdapterError> {
         if value.is_empty()
             || value.len() > 256
             || value
                 .chars()
-                .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+                .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '=')))
         {
-            return Err(ExternalWorkerAdapterError::InvalidRequest(
-                "provider identity is not a safe opaque ID",
-            ));
+            let message = "provider identity is not a safe opaque ID";
+            return Err(if from_provider {
+                ExternalWorkerAdapterError::InvalidResponse(message)
+            } else {
+                ExternalWorkerAdapterError::InvalidRequest(message)
+            });
         }
         Ok(value)
     }
@@ -282,6 +350,73 @@ impl CursorCloudAdapter {
             .request(Method::GET, &format!("/v1/agents/{id}/runs"), None)
             .await?;
         Ok(response.items)
+    }
+
+    async fn set_archived(
+        &self,
+        external_agent_id: &str,
+        archived: bool,
+    ) -> Result<ExternalWorkerRecord, ExternalWorkerAdapterError> {
+        let agent_id = Self::checked_id(external_agent_id)?;
+        let before = self.get_worker(agent_id).await?;
+        if archived {
+            if before.state == ExternalWorkerState::Archived {
+                return Ok(before);
+            }
+            if before.state != ExternalWorkerState::Ready {
+                return Err(ExternalWorkerAdapterError::InvalidRequest(
+                    "Cursor worker is not eligible for archive",
+                ));
+            }
+        } else if before.state != ExternalWorkerState::Archived {
+            if matches!(
+                before.state,
+                ExternalWorkerState::Unknown | ExternalWorkerState::Failed
+            ) {
+                return Err(ExternalWorkerAdapterError::InvalidRequest(
+                    "Cursor worker is not eligible for unarchive",
+                ));
+            }
+            return Ok(before);
+        }
+        let path = if archived {
+            format!("/v1/agents/{agent_id}/archive")
+        } else {
+            format!("/v1/agents/{agent_id}/unarchive")
+        };
+        let response: CursorIdResponse = self.request(Method::POST, &path, None).await?;
+        if response.id != agent_id {
+            return Err(ExternalWorkerAdapterError::InvalidResponse(
+                "Cursor archive identity does not match the request",
+            ));
+        }
+        let after = self.get_worker(agent_id).await?;
+        if after.external_agent_id != agent_id
+            || after.provider != ExternalWorkerProvider::CursorCloud
+            || after.repository != before.repository
+            || after.starting_ref != before.starting_ref
+        {
+            return Err(ExternalWorkerAdapterError::InvalidResponse(
+                "Cursor archive identity does not match the request",
+            ));
+        }
+        if archived {
+            if after.state != ExternalWorkerState::Archived {
+                return Err(ExternalWorkerAdapterError::InvalidResponse(
+                    "Cursor archive did not return an archived worker",
+                ));
+            }
+        } else if matches!(
+            after.state,
+            ExternalWorkerState::Archived
+                | ExternalWorkerState::Unknown
+                | ExternalWorkerState::Failed
+        ) {
+            return Err(ExternalWorkerAdapterError::InvalidResponse(
+                "Cursor unarchive did not restore an active worker",
+            ));
+        }
+        Ok(after)
     }
 }
 
@@ -517,6 +652,81 @@ impl ExternalWorkerAdapter for CursorCloudAdapter {
         }
         Ok(run)
     }
+
+    async fn list_workers(
+        &self,
+        query: &ExternalWorkerListQuery,
+    ) -> Result<ExternalWorkerListPage, ExternalWorkerAdapterError> {
+        query
+            .validate()
+            .map_err(ExternalWorkerAdapterError::InvalidRequest)?;
+        let limit = query.limit.unwrap_or(20);
+        if limit > MAX_EXTERNAL_WORKER_LIST_LIMIT {
+            return Err(ExternalWorkerAdapterError::InvalidRequest(
+                "list limit must be between 1 and 100",
+            ));
+        }
+        let limit_value = limit.to_string();
+        let include_archived = if query.include_archived {
+            "true"
+        } else {
+            "false"
+        };
+        let mut pairs = vec![
+            ("limit", limit_value.as_str()),
+            ("includeArchived", include_archived),
+        ];
+        if let Some(cursor) = &query.cursor {
+            let cursor = Self::checked_cursor(cursor, false)?;
+            pairs.push(("cursor", cursor));
+        }
+        let response: CursorAgentList = self
+            .request_with_query(Method::GET, "/v1/agents", &pairs, None)
+            .await?;
+        if response.items.len() > limit as usize {
+            return Err(ExternalWorkerAdapterError::InvalidResponse(
+                "Cursor list exceeded the requested page size",
+            ));
+        }
+        let items = response
+            .items
+            .iter()
+            .map(worker_summary)
+            .collect::<Result<Vec<_>, _>>()?;
+        if !query.include_archived
+            && items
+                .iter()
+                .any(|item| item.state == ExternalWorkerState::Archived)
+        {
+            return Err(ExternalWorkerAdapterError::InvalidResponse(
+                "Cursor list included archived workers without includeArchived",
+            ));
+        }
+        if let Some(next_cursor) = &response.next_cursor {
+            Self::checked_cursor(next_cursor, true)?;
+        }
+        let page = ExternalWorkerListPage {
+            items,
+            next_cursor: response.next_cursor,
+        };
+        page.validate()
+            .map_err(ExternalWorkerAdapterError::InvalidResponse)?;
+        Ok(page)
+    }
+
+    async fn archive(
+        &self,
+        external_agent_id: &str,
+    ) -> Result<ExternalWorkerRecord, ExternalWorkerAdapterError> {
+        self.set_archived(external_agent_id, true).await
+    }
+
+    async fn unarchive(
+        &self,
+        external_agent_id: &str,
+    ) -> Result<ExternalWorkerRecord, ExternalWorkerAdapterError> {
+        self.set_archived(external_agent_id, false).await
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -539,7 +749,7 @@ struct CursorAgent {
     status: String,
     #[serde(default)]
     repos: Vec<CursorRepo>,
-    #[serde(default)]
+    #[serde(default, rename = "autoCreatePR")]
     auto_create_pr: Option<bool>,
     #[serde(default)]
     work_on_current_branch: Option<bool>,
@@ -577,8 +787,30 @@ struct CursorRun {
 
 #[derive(Debug, Deserialize)]
 struct CursorIdResponse {
-    #[allow(dead_code)]
     id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CursorAgentList {
+    items: Vec<CursorAgentListItem>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CursorAgentListItem {
+    id: String,
+    #[serde(default)]
+    url: Option<String>,
+    status: String,
+    #[serde(default)]
+    env: Option<CursorEnvironment>,
+    created_at: String,
+    updated_at: String,
+    #[serde(default)]
+    latest_run_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -606,11 +838,11 @@ struct CursorArtifact {
 }
 
 fn github_repository_url(repository: &str) -> Result<String, ExternalWorkerAdapterError> {
-    if repository.starts_with("https://github.com/") {
+    if let Some(path) = repository.strip_prefix("https://github.com/") {
         if repository.contains('?')
             || repository.contains('#')
             || repository.ends_with('/')
-            || repository[19..].split('/').count() != 2
+            || path.split('/').count() != 2
         {
             return Err(ExternalWorkerAdapterError::InvalidRequest(
                 "repository must identify exactly one GitHub repository",
@@ -657,6 +889,11 @@ fn worker_record(
     expected_repository: Option<&str>,
     expected_ref: Option<&str>,
 ) -> Result<ExternalWorkerRecord, ExternalWorkerAdapterError> {
+    if agent.status.trim().is_empty() {
+        return Err(ExternalWorkerAdapterError::InvalidResponse(
+            "Cursor worker status is missing",
+        ));
+    }
     if agent.auto_create_pr != Some(false) || agent.work_on_current_branch != Some(false) {
         return Err(ExternalWorkerAdapterError::InvalidResponse(
             "Cursor response did not prove PR creation and current-branch writes are disabled",
@@ -713,6 +950,41 @@ fn worker_record(
     Ok(worker)
 }
 
+fn worker_summary(
+    agent: &CursorAgentListItem,
+) -> Result<ExternalWorkerSummary, ExternalWorkerAdapterError> {
+    if agent.status.trim().is_empty() {
+        return Err(ExternalWorkerAdapterError::InvalidResponse(
+            "Cursor worker status is missing",
+        ));
+    }
+    if let Some(env) = &agent.env {
+        if env.kind != "cloud" {
+            return Err(ExternalWorkerAdapterError::InvalidResponse(
+                "Cursor response environment is not hosted cloud",
+            ));
+        }
+    }
+    if let Some(latest_run_id) = &agent.latest_run_id {
+        CursorCloudAdapter::checked_opaque(latest_run_id, true)?;
+    }
+    CursorCloudAdapter::checked_opaque(&agent.id, true)?;
+    let summary = ExternalWorkerSummary {
+        provider: ExternalWorkerProvider::CursorCloud,
+        provider_id: None,
+        external_agent_id: agent.id.clone(),
+        state: agent_state(&agent.status),
+        worker_url: agent.url.clone(),
+        latest_run_id: agent.latest_run_id.clone(),
+        created_at: agent.created_at.clone(),
+        updated_at: agent.updated_at.clone(),
+    };
+    summary
+        .validate()
+        .map_err(ExternalWorkerAdapterError::InvalidResponse)?;
+    Ok(summary)
+}
+
 fn run_record(
     run: &CursorRun,
     expected_agent_id: &str,
@@ -745,7 +1017,7 @@ fn safe_terminal_result(value: &str) -> Option<String> {
     }
     // Preserve readable multi-line final replies without allowing control
     // characters to cross the browser projection.
-    let value = value.replace('\r', " ").replace('\n', " ");
+    let value = value.replace(['\r', '\n'], " ");
     let lower = value.to_ascii_lowercase();
     if value.trim().is_empty()
         || value.len() > 4_096
@@ -817,22 +1089,60 @@ fn run_state(status: &str) -> ExternalWorkerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::State;
+    use axum::extract::{Path, Query, State};
+    use axum::http::{HeaderMap, StatusCode, Uri};
     use axum::routing::{get, post};
     use axum::{Json, Router};
+    use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
+
+    const AGENT_1: &str = "bc-00000000-0000-0000-0000-000000000001";
+    const AGENT_2: &str = "bc-00000000-0000-0000-0000-000000000002";
+    const RUN_1: &str = "run-00000000-0000-0000-0000-000000000001";
 
     #[derive(Clone, Default)]
     struct FakeCursorState {
         launch_requests: Arc<Mutex<Vec<Value>>>,
         cancelled: Arc<Mutex<bool>>,
+        archived: Arc<Mutex<BTreeSet<String>>>,
+        list_queries: Arc<Mutex<Vec<Value>>>,
+        request_urls: Arc<Mutex<Vec<String>>>,
+        authorization_headers: Arc<Mutex<Vec<Option<String>>>>,
+        archive_posts: Arc<Mutex<Vec<String>>>,
+        unarchive_posts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Debug, Deserialize, Default)]
+    struct FakeListQuery {
+        limit: Option<u32>,
+        cursor: Option<String>,
+        #[serde(rename = "includeArchived")]
+        include_archived: Option<bool>,
+    }
+
+    fn capture(state: &FakeCursorState, uri: &Uri, headers: &HeaderMap) {
+        state.request_urls.lock().unwrap().push(uri.to_string());
+        state.authorization_headers.lock().unwrap().push(
+            headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+        );
+    }
+
+    fn known_agent(id: &str) -> bool {
+        id == AGENT_1 || id == AGENT_2
     }
 
     fn fake_agent() -> Value {
+        fake_agent_record(AGENT_1, false)
+    }
+
+    fn fake_agent_record(id: &str, archived: bool) -> Value {
         json!({
-            "id": "bc-00000000-0000-0000-0000-000000000001",
-            "url": "https://cursor.com/agents/bc-00000000-0000-0000-0000-000000000001",
-            "status": "ACTIVE",
+            "id": id,
+            "url": format!("https://cursor.com/agents/{id}"),
+            "status": if archived { "ARCHIVED" } else { "ACTIVE" },
             "repos": [{"url": "https://github.com/chriscase/GrokPtah", "startingRef": "main"}],
             "autoCreatePR": false,
             "workOnCurrentBranch": false,
@@ -842,16 +1152,81 @@ mod tests {
         })
     }
 
+    fn fake_list_item(id: &str, archived: bool, updated: &str) -> Value {
+        json!({
+            "id": id,
+            "name": "bounded fixture",
+            "status": if archived { "ARCHIVED" } else { "ACTIVE" },
+            "env": {"type": "cloud"},
+            "url": format!("https://cursor.com/agents/{id}"),
+            "createdAt": "2026-08-24T00:00:00Z",
+            "updatedAt": updated,
+            "latestRunId": RUN_1
+        })
+    }
+
+    fn launch_request() -> ExternalWorkerLaunchRequest {
+        ExternalWorkerLaunchRequest {
+            request_id: "request-1".into(),
+            provider: ExternalWorkerProvider::CursorCloud,
+            provider_id: None,
+            repository: "chriscase/GrokPtah".into(),
+            starting_ref: "main".into(),
+            prompt: "Run the bounded fixture".into(),
+            model: Some("composer-2".into()),
+            execution_mode: ExternalWorkerExecutionMode::Isolated,
+            auto_create_pr: false,
+            bounds: None,
+        }
+    }
+
+    async fn spawn_app(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    fn lifecycle_router(state: FakeCursorState) -> Router {
+        Router::new()
+            .route("/v1/agents", post(fake_create).get(fake_list))
+            .route("/v1/agents/{id}", get(fake_agent_read))
+            .route("/v1/agents/{id}/archive", post(fake_archive))
+            .route("/v1/agents/{id}/unarchive", post(fake_unarchive))
+            .route(
+                "/v1/agents/bc-00000000-0000-0000-0000-000000000001/runs/run-00000000-0000-0000-0000-000000000001",
+                get(fake_run_read),
+            )
+            .route(
+                "/v1/agents/bc-00000000-0000-0000-0000-000000000001/runs",
+                post(fake_follow_up).get(fake_runs),
+            )
+            .route(
+                "/v1/agents/bc-00000000-0000-0000-0000-000000000001/runs/run-00000000-0000-0000-0000-000000000001/cancel",
+                post(fake_cancel),
+            )
+            .route(
+                "/v1/agents/bc-00000000-0000-0000-0000-000000000001/artifacts",
+                get(fake_artifacts),
+            )
+            .with_state(state)
+    }
+
     async fn fake_create(
         State(state): State<FakeCursorState>,
+        uri: Uri,
+        headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> Json<Value> {
+        capture(&state, &uri, &headers);
         state.launch_requests.lock().unwrap().push(body);
         Json(json!({
             "agent": fake_agent(),
             "run": {
-                "id": "run-00000000-0000-0000-0000-000000000001",
-                "agentId": "bc-00000000-0000-0000-0000-000000000001",
+                "id": RUN_1,
+                "agentId": AGENT_1,
                 "status": "CREATING",
                 "createdAt": "2026-08-24T00:00:00Z",
                 "updatedAt": "2026-08-24T00:00:01Z"
@@ -859,15 +1234,98 @@ mod tests {
         }))
     }
 
-    async fn fake_agent_read(State(_state): State<FakeCursorState>) -> Json<Value> {
-        Json(fake_agent())
+    async fn fake_list(
+        State(state): State<FakeCursorState>,
+        uri: Uri,
+        headers: HeaderMap,
+        Query(query): Query<FakeListQuery>,
+    ) -> Json<Value> {
+        capture(&state, &uri, &headers);
+        state.list_queries.lock().unwrap().push(json!({
+            "limit": query.limit,
+            "cursor": query.cursor,
+            "includeArchived": query.include_archived,
+        }));
+        let archived = state.archived.lock().unwrap().clone();
+        let mut items = vec![
+            fake_list_item(AGENT_2, archived.contains(AGENT_2), "2026-08-24T00:00:05Z"),
+            fake_list_item(AGENT_1, archived.contains(AGENT_1), "2026-08-24T00:00:01Z"),
+        ];
+        // Cursor REST defaults includeArchived to true. GrokPtah adapters must
+        // send the flag explicitly so omitted never inherits that default.
+        let include_archived = query.include_archived.unwrap_or(true);
+        if !include_archived {
+            items.retain(|item| item["status"] != "ARCHIVED");
+        }
+        if let Some(cursor) = &query.cursor {
+            if let Some(start) = items.iter().position(|item| item["id"] == *cursor) {
+                items = items[start..].to_vec();
+            } else {
+                items.clear();
+            }
+        }
+        let limit = query.limit.unwrap_or(20) as usize;
+        let next_cursor = items
+            .get(limit)
+            .and_then(|item| item["id"].as_str())
+            .map(str::to_owned);
+        items.truncate(limit);
+        let mut page = json!({ "items": items });
+        if let Some(next_cursor) = next_cursor {
+            page["nextCursor"] = json!(next_cursor);
+        }
+        Json(page)
+    }
+
+    async fn fake_agent_read(
+        State(state): State<FakeCursorState>,
+        Path(id): Path<String>,
+        uri: Uri,
+        headers: HeaderMap,
+    ) -> Result<Json<Value>, StatusCode> {
+        capture(&state, &uri, &headers);
+        if !known_agent(&id) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let archived = state.archived.lock().unwrap().contains(&id);
+        Ok(Json(fake_agent_record(&id, archived)))
+    }
+
+    async fn fake_archive(
+        State(state): State<FakeCursorState>,
+        Path(id): Path<String>,
+        uri: Uri,
+        headers: HeaderMap,
+    ) -> Result<Json<Value>, StatusCode> {
+        capture(&state, &uri, &headers);
+        if !known_agent(&id) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        state.archive_posts.lock().unwrap().push(id.clone());
+        state.archived.lock().unwrap().insert(id.clone());
+        Ok(Json(json!({ "id": id })))
+    }
+
+    async fn fake_unarchive(
+        State(state): State<FakeCursorState>,
+        Path(id): Path<String>,
+        uri: Uri,
+        headers: HeaderMap,
+    ) -> Result<Json<Value>, StatusCode> {
+        capture(&state, &uri, &headers);
+        if !known_agent(&id) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        state.unarchive_posts.lock().unwrap().push(id.clone());
+        state.archived.lock().unwrap().remove(&id);
+        Ok(Json(json!({ "id": id })))
     }
 
     async fn fake_run_read(State(state): State<FakeCursorState>) -> Json<Value> {
         let cancelled = *state.cancelled.lock().unwrap();
         Json(json!({
-            "id": "run-00000000-0000-0000-0000-000000000001",
-            "agentId": "bc-00000000-0000-0000-0000-000000000001",
+            "id": RUN_1,
+            "agentId": AGENT_1,
             "status": if cancelled { "CANCELLED" } else { "RUNNING" },
             "createdAt": "2026-08-24T00:00:00Z",
             "updatedAt": "2026-08-24T00:00:02Z",
@@ -882,7 +1340,7 @@ mod tests {
         Json(json!({
             "run": {
                 "id": "run-00000000-0000-0000-0000-000000000002",
-                "agentId": "bc-00000000-0000-0000-0000-000000000001",
+                "agentId": AGENT_1,
                 "status": "CREATING",
                 "createdAt": "2026-08-24T00:00:03Z",
                 "updatedAt": "2026-08-24T00:00:03Z"
@@ -896,14 +1354,14 @@ mod tests {
 
     async fn fake_cancel(State(state): State<FakeCursorState>) -> Json<Value> {
         *state.cancelled.lock().unwrap() = true;
-        Json(json!({"id": "run-00000000-0000-0000-0000-000000000001"}))
+        Json(json!({"id": RUN_1}))
     }
 
     async fn fake_artifacts(State(_state): State<FakeCursorState>) -> Json<Value> {
         Json(json!({
             "items": [{
                 "path": "artifacts/report.md",
-                "runId": "run-00000000-0000-0000-0000-000000000001",
+                "runId": RUN_1,
                 "digest": "sha256:abc",
                 "sizeBytes": 12
             }]
@@ -969,11 +1427,36 @@ mod tests {
     }
 
     #[test]
+    fn documented_auto_create_pr_field_is_required_to_prove_write_safety() {
+        let agent: CursorAgent = serde_json::from_value(fake_agent()).unwrap();
+        assert_eq!(agent.auto_create_pr, Some(false));
+        assert_eq!(agent.work_on_current_branch, Some(false));
+        let camel_pr = json!({
+            "id": AGENT_1,
+            "status": "ACTIVE",
+            "repos": [{"url": "https://github.com/chriscase/GrokPtah", "startingRef": "main"}],
+            "autoCreatePr": false,
+            "workOnCurrentBranch": false,
+            "createdAt": "2026-08-24T00:00:00Z",
+            "updatedAt": "2026-08-24T00:00:01Z"
+        });
+        let undocumented: CursorAgent = serde_json::from_value(camel_pr).unwrap();
+        assert_eq!(undocumented.auto_create_pr, None);
+        assert!(worker_record(&undocumented, None, None).is_err());
+    }
+
+    #[test]
     fn provider_statuses_fail_closed() {
         assert_eq!(run_state("RUNNING"), ExternalWorkerState::Running);
         assert_eq!(run_state("CANCELLED"), ExternalWorkerState::Cancelled);
+        assert_eq!(agent_state("ACTIVE"), ExternalWorkerState::Ready);
+        assert_eq!(agent_state("ARCHIVED"), ExternalWorkerState::Archived);
         assert_eq!(
             run_state("future-provider-state"),
+            ExternalWorkerState::Unknown
+        );
+        assert_eq!(
+            agent_state("future-provider-state"),
             ExternalWorkerState::Unknown
         );
     }
@@ -1000,57 +1483,18 @@ mod tests {
     #[tokio::test]
     async fn fake_cursor_api_covers_launch_poll_artifacts_and_terminal_cancel() {
         let state = FakeCursorState::default();
-        let app = Router::new()
-            .route("/v1/agents", post(fake_create))
-            .route("/v1/agents/bc-00000000-0000-0000-0000-000000000001", get(fake_agent_read))
-            .route(
-                "/v1/agents/bc-00000000-0000-0000-0000-000000000001/runs/run-00000000-0000-0000-0000-000000000001",
-                get(fake_run_read),
-            )
-            .route(
-                "/v1/agents/bc-00000000-0000-0000-0000-000000000001/runs",
-                post(fake_follow_up).get(fake_runs),
-            )
-            .route(
-                "/v1/agents/bc-00000000-0000-0000-0000-000000000001/runs/run-00000000-0000-0000-0000-000000000001/cancel",
-                post(fake_cancel),
-            )
-            .route(
-                "/v1/agents/bc-00000000-0000-0000-0000-000000000001/artifacts",
-                get(fake_artifacts),
-            )
-            .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let adapter = CursorCloudAdapter::for_test(&format!("http://{address}"));
-        let request = ExternalWorkerLaunchRequest {
-            request_id: "request-1".into(),
-            provider: ExternalWorkerProvider::CursorCloud,
-            provider_id: None,
-            repository: "chriscase/GrokPtah".into(),
-            starting_ref: "main".into(),
-            prompt: "Run the bounded fixture".into(),
-            model: Some("composer-2".into()),
-            execution_mode: ExternalWorkerExecutionMode::Isolated,
-            auto_create_pr: false,
-            bounds: None,
-        };
-        let launch = adapter.launch(&request).await.unwrap();
-        assert_eq!(
-            launch.worker.external_agent_id,
-            "bc-00000000-0000-0000-0000-000000000001"
-        );
+        let address = spawn_app(lifecycle_router(state.clone())).await;
+        let adapter = CursorCloudAdapter::for_test(&address);
+        let launch = adapter.launch(&launch_request()).await.unwrap();
+        assert_eq!(launch.worker.external_agent_id, AGENT_1);
         assert_eq!(launch.run.state, ExternalWorkerState::Provisioning);
-        let sent = state.launch_requests.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0]["repos"][0]["startingRef"], "main");
-        assert_eq!(sent[0]["autoCreatePR"], false);
-        assert!(sent[0].get("env").is_none());
-        drop(sent);
+        {
+            let sent = state.launch_requests.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0]["repos"][0]["startingRef"], "main");
+            assert_eq!(sent[0]["autoCreatePR"], false);
+            assert!(sent[0].get("env").is_none());
+        }
 
         let worker = adapter
             .get_worker(&launch.worker.external_agent_id)
@@ -1101,5 +1545,308 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cancelled.state, ExternalWorkerState::Cancelled);
+        assert!(state.archive_posts.lock().unwrap().is_empty());
+        assert!(state.archived.lock().unwrap().is_empty());
+        let worker = adapter.get_worker(AGENT_1).await.unwrap();
+        assert_eq!(worker.state, ExternalWorkerState::Ready);
+        assert_ne!(worker.state, ExternalWorkerState::Archived);
+        let serialized = serde_json::to_string(&worker).unwrap();
+        assert!(!serialized.contains("synthetic-cursor-key"));
+        assert!(state
+            .request_urls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|url| !url.contains("synthetic-cursor-key") && !url.contains('@')));
+        assert!(state
+            .authorization_headers
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|header| header.as_deref().unwrap_or_default().starts_with("Basic ")));
+    }
+
+    #[tokio::test]
+    async fn fake_cursor_api_lists_with_pagination_and_include_archived() {
+        let state = FakeCursorState::default();
+        state.archived.lock().unwrap().insert(AGENT_2.to_string());
+        let address = spawn_app(lifecycle_router(state.clone())).await;
+        let adapter = CursorCloudAdapter::for_test(&address);
+
+        let active = adapter
+            .list_workers(&ExternalWorkerListQuery {
+                limit: Some(20),
+                ..ExternalWorkerListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(active.items.len(), 1);
+        assert_eq!(active.items[0].external_agent_id, AGENT_1);
+        assert_eq!(active.items[0].state, ExternalWorkerState::Ready);
+        assert_eq!(active.items[0].latest_run_id.as_deref(), Some(RUN_1));
+        assert!(active.next_cursor.is_none());
+        let active_json = serde_json::to_value(&active).unwrap();
+        assert!(active_json["items"][0].get("repository").is_none());
+        assert!(active_json["items"][0].get("startingRef").is_none());
+        assert!(!active_json.to_string().contains("synthetic-cursor-key"));
+
+        let first = adapter
+            .list_workers(&ExternalWorkerListQuery {
+                limit: Some(1),
+                include_archived: true,
+                ..ExternalWorkerListQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].external_agent_id, AGENT_2);
+        assert_eq!(first.items[0].state, ExternalWorkerState::Archived);
+        assert_eq!(first.next_cursor.as_deref(), Some(AGENT_1));
+
+        let second = adapter
+            .list_workers(&ExternalWorkerListQuery {
+                limit: Some(1),
+                cursor: first.next_cursor.clone(),
+                include_archived: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].external_agent_id, AGENT_1);
+        assert!(second.next_cursor.is_none());
+
+        {
+            let queries = state.list_queries.lock().unwrap();
+            assert_eq!(queries[0]["includeArchived"], false);
+            assert_eq!(queries[0]["limit"], 20);
+            assert_eq!(queries[1]["includeArchived"], true);
+            assert_eq!(queries[1]["limit"], 1);
+            assert_eq!(queries[2]["cursor"], AGENT_1);
+        }
+        assert!(state
+            .request_urls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|url| !url.contains("synthetic-cursor-key")));
+    }
+
+    #[tokio::test]
+    async fn fake_cursor_api_archive_and_unarchive_are_explicit_and_reversible() {
+        let state = FakeCursorState::default();
+        let address = spawn_app(lifecycle_router(state.clone())).await;
+        let adapter = CursorCloudAdapter::for_test(&address);
+
+        let archived = adapter.archive(AGENT_1).await.unwrap();
+        assert_eq!(archived.external_agent_id, AGENT_1);
+        assert_eq!(archived.state, ExternalWorkerState::Archived);
+        assert_eq!(archived.repository, "chriscase/GrokPtah");
+        assert_eq!(archived.starting_ref, "main");
+        assert_eq!(state.archive_posts.lock().unwrap().as_slice(), [AGENT_1]);
+
+        let archived_again = adapter.archive(AGENT_1).await.unwrap();
+        assert_eq!(archived_again.state, ExternalWorkerState::Archived);
+        assert_eq!(state.archive_posts.lock().unwrap().len(), 1);
+
+        let restored = adapter.unarchive(AGENT_1).await.unwrap();
+        assert_eq!(restored.external_agent_id, AGENT_1);
+        assert_eq!(restored.state, ExternalWorkerState::Ready);
+        assert_ne!(restored.state, ExternalWorkerState::Archived);
+        assert_eq!(state.unarchive_posts.lock().unwrap().as_slice(), [AGENT_1]);
+
+        let restored_again = adapter.unarchive(AGENT_1).await.unwrap();
+        assert_eq!(restored_again.state, ExternalWorkerState::Ready);
+        assert_eq!(state.unarchive_posts.lock().unwrap().len(), 1);
+
+        let missing = adapter
+            .archive("bc-00000000-0000-0000-0000-000000000099")
+            .await;
+        assert!(matches!(
+            missing,
+            Err(ExternalWorkerAdapterError::Provider { status }) if status.as_u16() == 404
+        ));
+    }
+
+    #[tokio::test]
+    async fn fake_cursor_api_refuses_follow_up_after_archive_and_does_not_archive_on_cancel() {
+        let state = FakeCursorState::default();
+        let address = spawn_app(lifecycle_router(state.clone())).await;
+        let adapter = CursorCloudAdapter::for_test(&address);
+
+        let cancelled = adapter.cancel(AGENT_1, RUN_1).await.unwrap();
+        assert_eq!(cancelled.state, ExternalWorkerState::Cancelled);
+        assert!(state.archive_posts.lock().unwrap().is_empty());
+
+        let archived = adapter.archive(AGENT_1).await.unwrap();
+        assert_eq!(archived.state, ExternalWorkerState::Archived);
+        let refused = adapter
+            .follow_up(
+                AGENT_1,
+                &ExternalWorkerFollowUpRequest {
+                    request_id: "follow-up-archived".into(),
+                    prompt: "Must not run after archive".into(),
+                    bounds: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            refused,
+            ExternalWorkerAdapterError::InvalidRequest(_)
+        ));
+        assert_eq!(state.unarchive_posts.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_query_is_rejected_before_provider_io() {
+        let adapter = CursorCloudAdapter::for_test("http://127.0.0.1:1");
+        let error = adapter
+            .list_workers(&ExternalWorkerListQuery {
+                limit: Some(0),
+                ..ExternalWorkerListQuery::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalWorkerAdapterError::InvalidRequest(_)
+        ));
+        let unsafe_cursor = adapter
+            .list_workers(&ExternalWorkerListQuery {
+                cursor: Some("page/../secret".into()),
+                ..ExternalWorkerListQuery::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            unsafe_cursor,
+            ExternalWorkerAdapterError::InvalidRequest(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn fake_cursor_api_fails_closed_on_http_and_malformed_list_responses() {
+        let unauthorized = spawn_app(Router::new().route(
+            "/v1/agents",
+            get(|| async {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [("content-type", "application/json")],
+                    r#"{"error":"synthetic-cursor-key"}"#,
+                )
+            }),
+        ))
+        .await;
+        let adapter = CursorCloudAdapter::for_test(&unauthorized);
+        let error = adapter
+            .list_workers(&ExternalWorkerListQuery::default())
+            .await
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(matches!(
+            error,
+            ExternalWorkerAdapterError::Provider { status } if status.as_u16() == 401
+        ));
+        assert!(!rendered.contains("synthetic-cursor-key"));
+        assert!(!rendered.contains("Bearer"));
+
+        let malformed = spawn_app(Router::new().route(
+            "/v1/agents",
+            get(|| async { Json(json!({ "items": [{ "id": 1, "status": "ACTIVE" }] })) }),
+        ))
+        .await;
+        let adapter = CursorCloudAdapter::for_test(&malformed);
+        assert!(matches!(
+            adapter
+                .list_workers(&ExternalWorkerListQuery::default())
+                .await
+                .unwrap_err(),
+            ExternalWorkerAdapterError::InvalidResponse(_)
+        ));
+
+        let leaked_url = spawn_app(Router::new().route(
+            "/v1/agents",
+            get(|| async {
+                Json(json!({
+                    "items": [{
+                        "id": AGENT_1,
+                        "status": "ACTIVE",
+                        "url": "https://cursor.com/agents/agent-1?token=secret",
+                        "createdAt": "2026-08-24T00:00:00Z",
+                        "updatedAt": "2026-08-24T00:00:01Z"
+                    }]
+                }))
+            }),
+        ))
+        .await;
+        let adapter = CursorCloudAdapter::for_test(&leaked_url);
+        assert!(matches!(
+            adapter
+                .list_workers(&ExternalWorkerListQuery::default())
+                .await
+                .unwrap_err(),
+            ExternalWorkerAdapterError::InvalidResponse(_)
+        ));
+
+        let pool_env = spawn_app(Router::new().route(
+            "/v1/agents",
+            get(|| async {
+                Json(json!({
+                    "items": [{
+                        "id": AGENT_1,
+                        "status": "ACTIVE",
+                        "env": {"type": "pool"},
+                        "url": format!("https://cursor.com/agents/{AGENT_1}"),
+                        "createdAt": "2026-08-24T00:00:00Z",
+                        "updatedAt": "2026-08-24T00:00:01Z"
+                    }]
+                }))
+            }),
+        ))
+        .await;
+        let adapter = CursorCloudAdapter::for_test(&pool_env);
+        assert!(matches!(
+            adapter
+                .list_workers(&ExternalWorkerListQuery::default())
+                .await
+                .unwrap_err(),
+            ExternalWorkerAdapterError::InvalidResponse(_)
+        ));
+
+        let unexpected_archived = spawn_app(Router::new().route(
+            "/v1/agents",
+            get(|| async {
+                Json(json!({
+                    "items": [fake_list_item(AGENT_1, true, "2026-08-24T00:00:01Z")]
+                }))
+            }),
+        ))
+        .await;
+        let adapter = CursorCloudAdapter::for_test(&unexpected_archived);
+        assert!(matches!(
+            adapter
+                .list_workers(&ExternalWorkerListQuery::default())
+                .await
+                .unwrap_err(),
+            ExternalWorkerAdapterError::InvalidResponse(_)
+        ));
+
+        let wrong_archive_id = spawn_app(
+            Router::new()
+                .route(
+                    "/v1/agents/{id}",
+                    get(|| async { Json(fake_agent_record(AGENT_1, false)) }),
+                )
+                .route(
+                    "/v1/agents/{id}/archive",
+                    post(|| async { Json(json!({ "id": AGENT_2 })) }),
+                ),
+        )
+        .await;
+        let adapter = CursorCloudAdapter::for_test(&wrong_archive_id);
+        assert!(matches!(
+            adapter.archive(AGENT_1).await.unwrap_err(),
+            ExternalWorkerAdapterError::InvalidResponse(_)
+        ));
     }
 }

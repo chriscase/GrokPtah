@@ -60,9 +60,16 @@ only an isolated exact-repository/ref request, verifies the returned agent/run
 identity and write/PR safety flags, polls status, rejects unknown or busy
 follow-up targets, enforces terminal cancellation, and refuses to publish
 provider artifact listings without both a content digest and run attribution.
-Its in-tree fake API fixture covers the bounded checks without credentials.
-This is an implementation seam and contract fixture, not evidence that a live
-Cursor account has been exercised.
+List and archive are first-class trait methods: `GET /v1/agents` is projected
+into identity-only summaries with explicit `limit`/`cursor`/`includeArchived`
+query parameters, and `POST /v1/agents/{id}/archive` plus
+`POST /v1/agents/{id}/unarchive` are verified against a subsequent full agent
+read. Cancellation or run completion never implies archive. List items do not
+include repository, starting ref, or write/PR flags in the official v1 list
+shape, so those checks remain on `get_worker` and `launch` rather than being
+invented from a list page. Its in-tree fake API fixture covers the bounded
+checks without credentials. This is an implementation seam and contract
+fixture, not evidence that a live Cursor account has been exercised.
 
 For the v1 request shape, an explicit `repos` entry selects the hosted cloud
 environment; a named `env` is not sent alongside `repos` because Cursor treats
@@ -98,10 +105,12 @@ path is qualified.
 1. **Contract fixture:** the native fake Cursor API fixture now proves
    isolated create, explicit allowlist and response-safety checks, exact source
    projection, status polling, busy/unknown follow-up rejection, redacted
-   terminal text, terminal cancellation, and run-attributed digest-bearing
-   artifacts without network credentials. Provider list/archive, stream
+   terminal text, terminal cancellation, identity-only list pagination with an
+   explicit `includeArchived` flag, reversible archive/unarchive with identity
+   and state verification, malformed/unknown list responses failing closed, and
+   run-attributed digest-bearing artifacts without network credentials. Stream
    reconnect/expiry, durable idempotent retry, and a real artifact download/hash
-   path remain to be added.
+   path remain to be added. Live Cursor qualification is still an open gate.
 2. **Read-only live probe:** list models/repositories and read an existing
    disposable agent; record API version, limits, retention, and redaction.
 3. **Disposable create:** create one agent from an exact public test ref with
@@ -110,8 +119,10 @@ path is qualified.
 4. **Manager integration:** expose Cursor as a provider-neutral lane in the
    desktop and browser-safe broker, with explicit user-visible provider and
    cost/usage labels. The staged browser client now has typed launch, status,
-   artifact, and cancellation calls; the trusted native lifecycle adapter is
-   staged, while server routes and live qualification remain to be completed.
+   list, archive/unarchive, artifact, and cancellation calls; the trusted native
+   lifecycle adapter is staged. Published schema, embedding, and web-broker
+   protocol now document the list/archive/unarchive seam; ContextDesk HTTP
+   handlers and live qualification remain to be completed.
 5. **Release gate:** independently review the adapter, run a retry/restart
    soak, and prove that approval, promotion, and Computer Use remain separate.
 
