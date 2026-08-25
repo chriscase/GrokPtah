@@ -6,6 +6,7 @@ live provider qualification, and 100% release qualification remain open.
 ## Candidate
 
 - Code head: `45441d1f` (`feat(desktop): integrate evidence-backed Help Center`)
+- Public contract follow-up: `c7800a46` (`feat(public): expose source-cited Help Center contract`)
 - Base: current GrokPtah `main` at integration time
 - Scope: Help Center UI, deterministic source-cited corpus, provider-semantic
   retrieval contract, bounded assistant contract, validation, and cleanup
@@ -29,7 +30,8 @@ live provider qualification, and 100% release qualification remain open.
 - `npm run typecheck`: passed.
 - `npm run build`: passed; Vite production bundle emitted.
 - `npm run verify:public`: passed; browser-safe public bundle and consumer
-  authority checks remained green.
+  authority checks remained green, including `searchHelpArticles` and the
+  exported `HELP_ARTICLES` corpus.
 - `git diff --check`: passed.
 
 ## Remaining gates
