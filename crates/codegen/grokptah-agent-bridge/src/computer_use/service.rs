@@ -177,6 +177,7 @@ impl ComputerUseService {
                     "evidence is not attached to the current observation",
                 )
             })?;
+        self.require_attested_dispatch(&run)?;
         let bytes = self
             .backend
             .read_evidence(run_id, asset_id)
@@ -952,9 +953,34 @@ impl ComputerUseService {
                 }),
             _ => {
                 let run = run.ok_or_else(unknown_run)?;
-                self.require_caller(run, caller)
+                self.require_caller(run, caller)?;
+                if matches!(
+                    operation,
+                    "observe" | "act" | "cancel" | "pause" | "take_over"
+                ) {
+                    self.require_attested_dispatch(run)?;
+                }
+                Ok(())
             }
         }
+    }
+
+    /// Existing-run observe/act/cancel (and equivalent backend dispatch) may
+    /// proceed only when this service's crate-owned attestation matches the
+    /// run's stamped proof and interned physical domain.
+    fn require_attested_dispatch(&self, run: &ComputerRun) -> ComputerResult<()> {
+        self.backend_attestation
+            .require_matching_run_proof(&run.capability_proof)?;
+        let interned = self
+            .store
+            .intern_physical_domain(self.backend_attestation.physical_domain())?;
+        if run.surface != interned.binding {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "backend physical domain does not match the computer run surface",
+            ));
+        }
+        Ok(())
     }
 
     fn finish_mutation<T: Serialize>(
@@ -1014,7 +1040,11 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::computer_use::{ActionClass, ComputerCapabilities, EvidenceRef, SimulatorBackend};
+    use crate::computer_use::{
+        macos_native_capability_proof, macos_native_physical_input_domain, ActionClass,
+        ComputerCapabilities, ComputerCapabilityTier, EvidenceRef, SimulatorBackend,
+        MACOS_NATIVE_BACKEND_ID,
+    };
 
     #[derive(Debug, Default)]
     struct BlockingBackend {
@@ -2899,12 +2929,19 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct UnprovenBackend;
+    #[derive(Debug, Default)]
+    struct UnprovenBackend {
+        observes: AtomicUsize,
+        acts: AtomicUsize,
+        cancels: AtomicUsize,
+    }
 
     #[derive(Debug)]
     struct ForgedIsolatedBackend {
         claimed_domain: crate::computer_use::PhysicalInputDomain,
+        observes: AtomicUsize,
+        acts: AtomicUsize,
+        cancels: AtomicUsize,
     }
 
     impl ForgedIsolatedBackend {
@@ -2914,6 +2951,28 @@ mod tests {
                     "attacker", domain,
                 )
                 .expect("forged fixture domain is syntactically valid"),
+                observes: AtomicUsize::new(0),
+                acts: AtomicUsize::new(0),
+                cancels: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct NativeForegroundFixture {
+        inner: SimulatorBackend,
+        observes: AtomicUsize,
+        acts: AtomicUsize,
+        cancels: AtomicUsize,
+    }
+
+    impl NativeForegroundFixture {
+        fn new() -> Self {
+            Self {
+                inner: SimulatorBackend::new(),
+                observes: AtomicUsize::new(0),
+                acts: AtomicUsize::new(0),
+                cancels: AtomicUsize::new(0),
             }
         }
     }
@@ -2935,6 +2994,7 @@ mod tests {
             _target: &ComputerTarget,
             _limits: &ComputerUseLimits,
         ) -> ComputerResult<ComputerObservation> {
+            self.observes.fetch_add(1, Ordering::SeqCst);
             panic!("an unattested backend must never receive observation dispatch")
         }
 
@@ -2944,11 +3004,73 @@ mod tests {
             _observation: &ComputerObservation,
             _action: &ComputerAction,
         ) -> ComputerResult<ActionOutcome> {
+            self.acts.fetch_add(1, Ordering::SeqCst);
+            panic!("an unattested backend must never receive action dispatch")
+        }
+
+        async fn act_if_current(
+            &self,
+            _run_id: &str,
+            _observation: &ComputerObservation,
+            _action: &ComputerAction,
+        ) -> ComputerResult<ActionOutcome> {
+            self.acts.fetch_add(1, Ordering::SeqCst);
             panic!("an unattested backend must never receive action dispatch")
         }
 
         async fn cancel(&self, _run_id: &str) -> ComputerResult<()> {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
             panic!("an unattested backend must never receive cancellation dispatch")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ComputerBackend for NativeForegroundFixture {
+        fn capabilities(&self) -> ComputerCapabilities {
+            ComputerCapabilities::from_proof(macos_native_capability_proof())
+                .expect("native foreground fixture proof is valid")
+        }
+
+        fn physical_input_domain(&self) -> crate::computer_use::PhysicalInputDomain {
+            macos_native_physical_input_domain()
+        }
+
+        async fn observe(
+            &self,
+            run_id: &str,
+            observation_id: &str,
+            target: &ComputerTarget,
+            limits: &ComputerUseLimits,
+        ) -> ComputerResult<ComputerObservation> {
+            self.observes.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .observe(run_id, observation_id, target, limits)
+                .await
+        }
+
+        async fn act(
+            &self,
+            run_id: &str,
+            observation: &ComputerObservation,
+            action: &ComputerAction,
+        ) -> ComputerResult<ActionOutcome> {
+            self.acts.fetch_add(1, Ordering::SeqCst);
+            self.inner.act(run_id, observation, action).await
+        }
+
+        async fn act_if_current(
+            &self,
+            run_id: &str,
+            observation: &ComputerObservation,
+            action: &ComputerAction,
+        ) -> ComputerResult<ActionOutcome> {
+            self.acts.fetch_add(1, Ordering::SeqCst);
+            self.inner.act_if_current(run_id, observation, action).await
+        }
+
+        async fn cancel(&self, run_id: &str) -> ComputerResult<()> {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+            self.inner.cancel(run_id).await
         }
     }
 
@@ -2970,6 +3092,7 @@ mod tests {
             _target: &ComputerTarget,
             _limits: &ComputerUseLimits,
         ) -> ComputerResult<ComputerObservation> {
+            self.observes.fetch_add(1, Ordering::SeqCst);
             Err(ComputerError::new(
                 ComputerErrorCode::ForbiddenAction,
                 "unproven backend must not observe",
@@ -2982,6 +3105,20 @@ mod tests {
             _observation: &ComputerObservation,
             _action: &ComputerAction,
         ) -> ComputerResult<ActionOutcome> {
+            self.acts.fetch_add(1, Ordering::SeqCst);
+            Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "unproven backend must not act",
+            ))
+        }
+
+        async fn act_if_current(
+            &self,
+            _run_id: &str,
+            _observation: &ComputerObservation,
+            _action: &ComputerAction,
+        ) -> ComputerResult<ActionOutcome> {
+            self.acts.fetch_add(1, Ordering::SeqCst);
             Err(ComputerError::new(
                 ComputerErrorCode::ForbiddenAction,
                 "unproven backend must not act",
@@ -2989,6 +3126,7 @@ mod tests {
         }
 
         async fn cancel(&self, _run_id: &str) -> ComputerResult<()> {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -2997,7 +3135,7 @@ mod tests {
     async fn unproven_backend_cannot_create_or_observe() {
         let dir = tempdir().unwrap();
         let service = ComputerUseService::new(
-            Arc::new(UnprovenBackend),
+            Arc::new(UnprovenBackend::default()),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         );
         let error = service
@@ -3049,6 +3187,122 @@ mod tests {
             );
         }
         assert!(store.list_runs().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forged_or_unproven_backend_cannot_dispatch_against_an_existing_native_run() {
+        let dir = tempdir().unwrap();
+        let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
+        let native_backend = Arc::new(NativeForegroundFixture::new());
+        let native = trusted_fixture_service(native_backend.clone(), store.clone());
+        let matching = trusted_fixture_service(native_backend.clone(), store.clone());
+        let (run, observation) = authorized_ready(&native, "native-dispatch", Some(8)).await;
+        assert_eq!(run.capability_proof.backend_id(), MACOS_NATIVE_BACKEND_ID);
+        assert_eq!(
+            run.capability_proof.tier(),
+            ComputerCapabilityTier::ForegroundSemantic
+        );
+        let before = native.get_run(&run.run_id).unwrap().unwrap();
+        let forged = Arc::new(ForgedIsolatedBackend::new("forged-piggyback"));
+        let unproven = Arc::new(UnprovenBackend::default());
+        let forged_service = ComputerUseService::new(forged.clone(), store.clone());
+        let unproven_service = ComputerUseService::new(unproven.clone(), store);
+
+        let action = ComputerAction::SetValue {
+            element_id: format!("{}-name", observation.observation_id),
+            text: "Ada".into(),
+        };
+        for (label, attacker) in [("forged", &forged_service), ("unproven", &unproven_service)] {
+            assert_eq!(
+                attacker
+                    .observe(
+                        &format!("{label}-observe"),
+                        &caller(&before, attacker),
+                        &before.run_id,
+                        before.version,
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
+                ComputerErrorCode::ForbiddenAction,
+                "{label} observe must fail closed"
+            );
+            assert_eq!(
+                attacker
+                    .act(
+                        &format!("{label}-act"),
+                        &caller(&before, attacker),
+                        &before.run_id,
+                        before.version,
+                        &observation.observation_id,
+                        action.clone(),
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
+                ComputerErrorCode::ForbiddenAction,
+                "{label} act must fail closed"
+            );
+            assert_eq!(
+                attacker
+                    .cancel(
+                        &format!("{label}-cancel"),
+                        &caller(&before, attacker),
+                        &before.run_id,
+                    )
+                    .await
+                    .unwrap_err()
+                    .code,
+                ComputerErrorCode::ForbiddenAction,
+                "{label} cancel must fail closed"
+            );
+        }
+
+        let after_attack = native.get_run(&before.run_id).unwrap().unwrap();
+        assert_eq!(after_attack.version, before.version);
+        assert_eq!(after_attack.state, before.state);
+        assert_eq!(after_attack.action_count, before.action_count);
+        assert_eq!(after_attack.control_epoch, before.control_epoch);
+        assert_eq!(after_attack.authority_epoch, before.authority_epoch);
+        assert_eq!(after_attack.current_observation, before.current_observation);
+        assert_eq!(after_attack.last_error, before.last_error);
+        assert_eq!(after_attack.audit, before.audit);
+        assert_eq!(forged.observes.load(Ordering::SeqCst), 0);
+        assert_eq!(forged.acts.load(Ordering::SeqCst), 0);
+        assert_eq!(forged.cancels.load(Ordering::SeqCst), 0);
+        assert_eq!(unproven.observes.load(Ordering::SeqCst), 0);
+        assert_eq!(unproven.acts.load(Ordering::SeqCst), 0);
+        assert_eq!(unproven.cancels.load(Ordering::SeqCst), 0);
+        assert_eq!(native_backend.observes.load(Ordering::SeqCst), 1);
+        assert_eq!(native_backend.acts.load(Ordering::SeqCst), 0);
+        assert_eq!(native_backend.cancels.load(Ordering::SeqCst), 0);
+
+        matching
+            .act(
+                "matching-act",
+                &caller(&before, &matching),
+                &before.run_id,
+                before.version,
+                &observation.observation_id,
+                action,
+            )
+            .await
+            .unwrap();
+        assert_eq!(native_backend.acts.load(Ordering::SeqCst), 1);
+        let after_act = matching.get_run(&before.run_id).unwrap().unwrap();
+        matching
+            .cancel(
+                "matching-cancel",
+                &caller(&after_act, &matching),
+                &after_act.run_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(native_backend.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            matching.get_run(&before.run_id).unwrap().unwrap().state,
+            ComputerRunState::Cancelled
+        );
     }
 
     async fn authorized_ready(
