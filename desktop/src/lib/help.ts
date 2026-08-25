@@ -13,15 +13,15 @@ export type HelpAudience = "everyone" | "power_user" | "operator";
 export type HelpAccess = "public" | "gated" | "operator";
 
 export type HelpEntry = {
-  id: string;
-  title: string;
-  summary: string;
-  body: string;
-  tags: string[];
-  keywords: string[];
-  audience: HelpAudience[];
-  access: HelpAccess;
-  capabilityIds: string[];
+  readonly id: string;
+  readonly title: string;
+  readonly summary: string;
+  readonly body: string;
+  readonly tags: readonly string[];
+  readonly keywords: readonly string[];
+  readonly audience: readonly HelpAudience[];
+  readonly access: HelpAccess;
+  readonly capabilityIds: readonly string[];
 };
 
 export type HelpSearchOptions = {
@@ -60,7 +60,7 @@ const HELP_ASSISTANT_INSTRUCTION =
   "Explain only the supplied help entries. Do not claim live capability, approval, lease, quota, or authority state; require a fresh scoped check before suggesting an operation.";
 
 /** The shipped corpus is intentionally small, explicit, and reviewable. */
-export const HELP_ENTRIES: readonly HelpEntry[] = [
+const HELP_ENTRY_DATA: HelpEntry[] = [
   {
     id: "capabilities-and-integrations",
     title: "Use GrokPtah from another project",
@@ -192,6 +192,21 @@ export const HELP_ENTRIES: readonly HelpEntry[] = [
     capabilityIds: [],
   },
 ];
+
+function freezeHelpEntry(entry: HelpEntry): HelpEntry {
+  return Object.freeze({
+    ...entry,
+    tags: Object.freeze([...entry.tags]),
+    keywords: Object.freeze([...entry.keywords]),
+    audience: Object.freeze([...entry.audience]),
+    capabilityIds: Object.freeze([...entry.capabilityIds]),
+  });
+}
+
+/** Immutable capability-aware corpus for desktop and external consumers. */
+export const HELP_ENTRIES: readonly HelpEntry[] = Object.freeze(
+  HELP_ENTRY_DATA.map(freezeHelpEntry),
+);
 
 const SYNONYMS: Record<string, string[]> = {
   agent: ["agents", "worker", "persistent"],

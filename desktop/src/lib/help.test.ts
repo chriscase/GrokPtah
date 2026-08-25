@@ -4,9 +4,20 @@ import {
   HELP_ENTRIES,
   buildHelpAssistantContext,
   searchHelp,
+  type HelpEntry,
 } from "./help";
 
 describe("Help Center index", () => {
+  it("freezes capability metadata exported to consumers", () => {
+    expect(Object.isFrozen(HELP_ENTRIES)).toBe(true);
+    expect(Object.isFrozen(HELP_ENTRIES[0])).toBe(true);
+    expect(Object.isFrozen(HELP_ENTRIES[0]?.tags)).toBe(true);
+    expect(Object.isFrozen(HELP_ENTRIES[0]?.keywords)).toBe(true);
+    expect(Object.isFrozen(HELP_ENTRIES[0]?.audience)).toBe(true);
+    expect(Object.isFrozen(HELP_ENTRIES[0]?.capabilityIds)).toBe(true);
+    expect(() => (HELP_ENTRIES as HelpEntry[]).push(HELP_ENTRIES[0]!)).toThrow();
+  });
+
   it("ranks a natural-language recovery query", () => {
     const hits = searchHelp("why did my long running agent duplicate after restart?");
     expect(hits[0]?.entry.id).toBe("durable-runs-and-recovery");
