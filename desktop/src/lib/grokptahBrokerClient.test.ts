@@ -386,6 +386,28 @@ describe("GrokPtahBrokerClient", () => {
     await expect(read()).rejects.toThrow("relative");
   });
 
+  it("rejects a recovery cursor that moves behind observed events", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const text =
+          'id: 4\ndata: {"kind":"event","brokerRunId":"run-1","seq":4,"ts":"now","update":{}}\n\n' +
+          'data: {"kind":"recovery","brokerRunId":"run-1","afterSeq":3,"reason":"gap","pollRoute":"/runs/run-1"}\n\n';
+        controller.enqueue(new TextEncoder().encode(text));
+        controller.close();
+      },
+    });
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } }),
+    );
+    const client = new GrokPtahBrokerClient({ baseUrl: "https://contextdesk.example", fetcher });
+    const read = async () => {
+      for await (const _notification of client.streamEvents("binding-1", "run-1")) {
+        // A backwards recovery cursor must never reach a consumer.
+      }
+    };
+    await expect(read()).rejects.toThrow("behind");
+  });
+
   it("rejects malformed event sequence and timestamp metadata", async () => {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {

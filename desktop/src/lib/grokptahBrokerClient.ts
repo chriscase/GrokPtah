@@ -361,6 +361,7 @@ export class GrokPtahBrokerClient {
     const maxFrameBytes = 512 * 1024;
     let buffer = "";
     let lastSeq = afterSeq ?? 0;
+    let sequenceInitialized = afterSeq !== undefined;
     try {
       for (;;) {
         const chunk = await reader.read();
@@ -376,9 +377,15 @@ export class GrokPtahBrokerClient {
           const notification = parseNotification(frame, brokerRunId);
           if (!notification) continue;
           if (notification.kind === "event") {
-            if (notification.seq <= lastSeq) throw new Error("Broker event sequence is not increasing");
+            if (sequenceInitialized && notification.seq !== lastSeq + 1) {
+              throw new Error("Broker event sequence has a gap or is not increasing");
+            }
             lastSeq = notification.seq;
+            sequenceInitialized = true;
           } else {
+            if (notification.afterSeq < (sequenceInitialized ? lastSeq : afterSeq ?? 0)) {
+              throw new Error("Broker recovery sequence is behind the observed cursor");
+            }
             yield notification;
             return;
           }
