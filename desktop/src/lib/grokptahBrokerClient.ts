@@ -34,6 +34,10 @@ export type GrokPtahBrokerRunRequest = {
   allowQueue?: boolean;
 };
 
+const MAX_BROKER_PROMPT_BYTES = 1_048_576;
+const MAX_BROKER_ROUNDS = 24;
+const MAX_BROKER_PROMPT_BOUND_BYTES = 4 * 1_048_576;
+
 const BROKER_AVAILABILITIES: ReadonlySet<GrokPtahBrokerCapability["availability"]> = new Set([
   "available",
   "gated",
@@ -213,6 +217,7 @@ export class GrokPtahBrokerClient {
     request: GrokPtahBrokerRunRequest,
     idempotencyKey: string,
   ): Promise<GrokPtahBrokerRun> {
+    validateRunRequest(request);
     return this.requestValidated(`/bindings/${segment(bindingId)}/runs`, parseBrokerRun, {
       method: "POST",
       idempotencyKey,
@@ -297,6 +302,10 @@ export class GrokPtahBrokerClient {
     idempotencyKey: string,
     priority?: boolean,
   ): Promise<T> {
+    validateBoundedText(prompt, "Queue prompt");
+    if (priority !== undefined && typeof priority !== "boolean") {
+      throw new GrokPtahBrokerError(0, "invalid_request", "Queue priority must be boolean");
+    }
     return this.request<T>(`/bindings/${segment(bindingId)}/queue`, {
       method: "POST",
       idempotencyKey,
@@ -309,6 +318,7 @@ export class GrokPtahBrokerClient {
     text: string,
     idempotencyKey: string,
   ): Promise<T> {
+    validateBoundedText(text, "Steer text");
     return this.request<T>(`/bindings/${segment(bindingId)}/steer`, {
       method: "POST",
       idempotencyKey,
@@ -498,6 +508,66 @@ function validateApprovalRequest(request: GrokPtahBrokerApprovalRequest): void {
         "Approval changed files must be bounded repository-relative summaries",
       );
     }
+  }
+}
+
+function validateRunRequest(request: GrokPtahBrokerRunRequest): void {
+  if (request === null || typeof request !== "object" || Array.isArray(request)) {
+    throw new GrokPtahBrokerError(0, "invalid_request", "Run request must be an object");
+  }
+  const value = request as Record<string, unknown>;
+  if (!hasOnlyKeys(value, new Set(["prompt", "executionMode", "bounds", "allowQueue"]))) {
+    throw new GrokPtahBrokerError(0, "invalid_request", "Run request contains unknown fields");
+  }
+  validateBoundedText(value.prompt, "Run prompt");
+  if (
+    value.executionMode !== undefined &&
+    value.executionMode !== "shared" &&
+    value.executionMode !== "isolated_worktree"
+  ) {
+    throw new GrokPtahBrokerError(0, "invalid_request", "Run execution mode is invalid");
+  }
+  if (value.allowQueue !== undefined && typeof value.allowQueue !== "boolean") {
+    throw new GrokPtahBrokerError(0, "invalid_request", "Run allowQueue must be boolean");
+  }
+  if (value.bounds === undefined) return;
+  if (typeof value.bounds !== "object" || value.bounds === null || Array.isArray(value.bounds)) {
+    throw new GrokPtahBrokerError(0, "invalid_request", "Run bounds must be an object");
+  }
+  const bounds = value.bounds as Record<string, unknown>;
+  if (!hasOnlyKeys(bounds, new Set(["maxRounds", "maxDurationMs", "maxPromptBytes"]))) {
+    throw new GrokPtahBrokerError(0, "invalid_request", "Run bounds contain unknown fields");
+  }
+  const positiveFields: Array<[string, unknown]> = [
+    ["maxRounds", bounds.maxRounds],
+    ["maxDurationMs", bounds.maxDurationMs],
+    ["maxPromptBytes", bounds.maxPromptBytes],
+  ];
+  for (const [name, field] of positiveFields) {
+    if (
+      field !== undefined &&
+      (typeof field !== "number" || !Number.isSafeInteger(field) || field <= 0)
+    ) {
+      throw new GrokPtahBrokerError(0, "invalid_request", `Run ${name} must be a positive safe integer`);
+    }
+  }
+  if (typeof bounds.maxRounds === "number" && bounds.maxRounds > MAX_BROKER_ROUNDS) {
+    throw new GrokPtahBrokerError(0, "invalid_request", `Run maxRounds must be at most ${MAX_BROKER_ROUNDS}`);
+  }
+  if (
+    typeof bounds.maxPromptBytes === "number" &&
+    bounds.maxPromptBytes > MAX_BROKER_PROMPT_BOUND_BYTES
+  ) {
+    throw new GrokPtahBrokerError(0, "invalid_request", "Run maxPromptBytes exceeds the broker ceiling");
+  }
+}
+
+function validateBoundedText(value: unknown, label: string): asserts value is string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new GrokPtahBrokerError(0, "invalid_request", `${label} must not be empty`);
+  }
+  if (new TextEncoder().encode(value).byteLength > MAX_BROKER_PROMPT_BYTES) {
+    throw new GrokPtahBrokerError(0, "invalid_request", `${label} exceeds the broker byte ceiling`);
   }
 }
 

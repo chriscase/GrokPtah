@@ -116,6 +116,40 @@ describe("GrokPtahBrokerClient", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("rejects malformed run bounds and prompts before transmission", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    for (const request of [
+      { prompt: "  " },
+      { prompt: "review", executionMode: "desktop" },
+      { prompt: "review", bounds: { maxRounds: 25 } },
+      { prompt: "review", bounds: { maxDurationMs: 1.5 } },
+      { prompt: "review", allowQueue: "yes" },
+    ]) {
+      await expect(client.submitRun("binding-1", request as never, "intent-1"))
+        .rejects.toMatchObject({ code: "invalid_request" });
+    }
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("rejects empty queue and steer text before transmission", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    await expect(client.queuePrompt("binding-1", "  ", "queue-1"))
+      .rejects.toMatchObject({ code: "invalid_request" });
+    await expect(client.steer("binding-1", "", "steer-1"))
+      .rejects.toMatchObject({ code: "invalid_request" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("fails closed before approval for malformed review evidence", async () => {
     const fetcher = vi.fn<typeof fetch>();
     const client = new GrokPtahBrokerClient({
