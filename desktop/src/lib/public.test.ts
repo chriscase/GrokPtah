@@ -3,6 +3,7 @@ import {
   GrokPtahBrokerClient,
   HELP_CONTRACT,
   parseCapabilitySet,
+  promptQueueReducer,
 } from "./public";
 
 describe("public integration barrel", () => {
@@ -10,5 +11,6 @@ describe("public integration barrel", () => {
     expect(typeof GrokPtahBrokerClient).toBe("function");
     expect(HELP_CONTRACT).toBe("grokptah.help.v1");
     expect(typeof parseCapabilitySet).toBe("function");
+    expect(typeof promptQueueReducer).toBe("function");
   });
 });
