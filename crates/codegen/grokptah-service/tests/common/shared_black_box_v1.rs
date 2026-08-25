@@ -2885,7 +2885,7 @@ fn repo_root() -> PathBuf {
         .expect("canonicalize repo root")
 }
 
-fn git_stdout_at(root: &Path, args: &[&str]) -> Result<String, String> {
+fn git_output_at(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -2899,24 +2899,100 @@ fn git_stdout_at(root: &Path, args: &[&str]) -> Result<String, String> {
             String::from_utf8_lossy(&output.stderr)
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .trim_end()
-        .to_string())
+    Ok(output.stdout)
 }
 
-fn porcelain_paths(status: &str) -> Vec<String> {
-    status
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let rest = if line.len() >= 3 && line.as_bytes().get(2) == Some(&b' ') {
-                &line[3..]
-            } else {
-                line.trim()
-            };
-            rest.split(" -> ").last().unwrap_or(rest).trim().to_string()
-        })
-        .collect()
+/// Text output from Git: object ids, ref names, and configuration values, all
+/// of which are ASCII. Paths never travel this way. They are read as bytes,
+/// because deciding on a lossy decode would let a byte sequence that merely
+/// renders like an allowlisted path pass for one.
+fn git_stdout_at(root: &Path, args: &[&str]) -> Result<String, String> {
+    let bytes = git_output_at(root, args)?;
+    let text = String::from_utf8(bytes)
+        .map_err(|_| format!("git {} produced non-UTF-8 output", args.join(" ")))?;
+    Ok(text.trim_end().to_string())
+}
+
+/// Paths named by `git status --porcelain=v1 -z`.
+///
+/// Records are NUL-terminated, so a path is taken verbatim: never split on
+/// newlines, never unquoted, never trimmed. Rename and copy entries carry the
+/// original path as a second field, and both sides are returned. A rename out
+/// of the audited tree into an allowlisted destination changes that tree
+/// exactly as much as a plain deletion does, so keeping only the destination
+/// would hide it. A field that does not parse as a record is an error, never
+/// something to skip.
+fn porcelain_paths(status: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let mut paths = Vec::new();
+    let mut fields = status.split(|byte| *byte == 0);
+    while let Some(record) = fields.next() {
+        if record.is_empty() {
+            // The stream ends with the final record's terminator; anything
+            // after it means the output was not the shape we asked for.
+            if fields.any(|rest| !rest.is_empty()) {
+                return Err("trailing data after the final git status record".to_string());
+            }
+            break;
+        }
+        if record.len() < 4 || record[2] != b' ' {
+            return Err(format!(
+                "malformed git status record: {}",
+                String::from_utf8_lossy(record)
+            ));
+        }
+        paths.push(record[3..].to_vec());
+        if matches!(record[0], b'R' | b'C') || matches!(record[1], b'R' | b'C') {
+            let original = fields
+                .next()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "git status rename record is missing its original path: {}",
+                        String::from_utf8_lossy(record)
+                    )
+                })?;
+            paths.push(original.to_vec());
+        }
+    }
+    Ok(paths)
+}
+
+/// Paths named by `git diff-tree -z --raw`.
+///
+/// Each entry is a metadata field beginning with `:`, followed by one path
+/// field, or two when the status is a rename or a copy. Both sides are
+/// returned, so a build of Git that ignores `--no-renames` still cannot
+/// under-report a move.
+fn raw_diff_paths(raw: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let mut paths = Vec::new();
+    let mut fields = raw.split(|byte| *byte == 0);
+    while let Some(field) = fields.next() {
+        if field.is_empty() {
+            if fields.any(|rest| !rest.is_empty()) {
+                return Err("trailing data after the final git diff record".to_string());
+            }
+            break;
+        }
+        let metadata = std::str::from_utf8(field)
+            .map_err(|_| "git diff metadata field is not valid UTF-8".to_string())?;
+        if !metadata.starts_with(':') {
+            return Err(format!("malformed git diff metadata field: {metadata}"));
+        }
+        let status = metadata
+            .split_whitespace()
+            .next_back()
+            .filter(|status| !status.is_empty())
+            .ok_or_else(|| format!("git diff metadata field has no status: {metadata}"))?;
+        let sides = if status.starts_with(['R', 'C']) { 2 } else { 1 };
+        for _ in 0..sides {
+            let path = fields
+                .next()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| format!("git diff record is missing a path: {metadata}"))?;
+            paths.push(path.to_vec());
+        }
+    }
+    Ok(paths)
 }
 
 fn allowlisted(path: &str) -> bool {
@@ -2929,7 +3005,16 @@ fn allowlisted(path: &str) -> bool {
     })
 }
 
-/// Files a commit changed against its first parent.
+/// Paths a commit changed against its first parent.
+///
+/// Read from `--raw` records with rename detection off, so a rename or a copy
+/// surfaces as a deletion of the source and an addition of the destination
+/// rather than as the destination alone. `git diff --name-only` reports only
+/// the destination of an exact rename, which lets a commit that moved a file
+/// out of the audited tree and into the fixture allowlist read as fixture-only
+/// -- and the walk would step straight past a revision whose tree it never
+/// built. `--no-renames` also overrides any `diff.renames` the repository
+/// itself sets, and `-z` keeps every path verbatim.
 ///
 /// Root-ness is decided by the parent list, never by whether `rev-parse
 /// {sha}^` happened to succeed. An absent parent object makes that lookup fail
@@ -2937,30 +3022,48 @@ fn allowlisted(path: &str) -> bool {
 /// whole tree against nothing -- reporting every path as changed and naming a
 /// revision on the strength of a missing object. A parent that is named must
 /// therefore also be present.
-fn commit_changed_files_at(root: &Path, sha: &str) -> Result<Vec<String>, String> {
+/// A path is allowlisted only when it is valid UTF-8 and matches the fixture
+/// allowlist. A path that is not valid UTF-8 is never allowlisted, so it is
+/// treated as a real change rather than decoded into something that resembles
+/// a fixture path.
+fn allowlisted_path(path: &[u8]) -> bool {
+    std::str::from_utf8(path).is_ok_and(allowlisted)
+}
+
+fn commit_changed_files_at(root: &Path, sha: &str) -> Result<Vec<Vec<u8>>, String> {
     let parents = parent_shas(root, sha)?;
-    let diff = match parents.first() {
-        None => git_stdout_at(
+    let raw = match parents.first() {
+        None => git_output_at(
             root,
             &[
                 "diff-tree",
                 "--no-commit-id",
-                "--name-only",
+                "--no-renames",
                 "--root",
                 "-r",
+                "-z",
+                "--raw",
                 sha,
             ],
         )?,
         Some(first_parent) => {
             require_present_commit(root, first_parent)?;
-            git_stdout_at(root, &["diff", "--name-only", first_parent, sha])?
+            git_output_at(
+                root,
+                &[
+                    "diff-tree",
+                    "--no-commit-id",
+                    "--no-renames",
+                    "-r",
+                    "-z",
+                    "--raw",
+                    first_parent,
+                    sha,
+                ],
+            )?
         }
     };
-    Ok(diff
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
+    raw_diff_paths(&raw)
 }
 
 /// Resolve the audited host revision, or explain why it cannot be resolved.
@@ -2982,6 +3085,13 @@ fn resolve_audited_source_revision_at(root: &Path) -> Result<String, String> {
     walk_to_audited_commit(root, &candidate)
 }
 
+const REPLACE_REF_BASE_ENV: &str = "GIT_REPLACE_REF_BASE";
+
+/// The one namespace Git reads object replacements from unless the environment
+/// moves it. Matched exactly: `refs/replace` without the trailing slash is a
+/// different namespace, not a spelling of this one.
+const DEFAULT_REPLACE_REF_BASE: &str = "refs/replace/";
+
 /// Replace refs and the legacy graft file both rewrite the parentage that
 /// `git rev-list` reports without altering a single commit object, so a
 /// resolver that trusts that output can be walked down a forged history and
@@ -2989,9 +3099,29 @@ fn resolve_audited_source_revision_at(root: &Path) -> Result<String, String> {
 /// disqualifying on its own. Reading around them with `--no-replace-objects`
 /// would hide the tampering instead of surfacing it.
 fn require_unrewritten_history(root: &Path) -> Result<(), String> {
+    // `GIT_REPLACE_REF_BASE` relocates the namespace Git reads replacements
+    // from, so a scan of the default namespace can come back empty while Git
+    // is traversing forged parentage out of another one. An inherited
+    // relocation is refused outright rather than followed: scanning wherever it
+    // points would make the check depend on the very setting an attacker
+    // controls. Refusing leaves the default as the only namespace that can be
+    // active here, which is the one scanned below.
+    if let Some(base) = std::env::var_os(REPLACE_REF_BASE_ENV) {
+        if base != OsStr::new(DEFAULT_REPLACE_REF_BASE) {
+            return Err(format!(
+                "refusing to resolve with a relocated replace namespace: \
+                 {REPLACE_REF_BASE_ENV}={} (expected {DEFAULT_REPLACE_REF_BASE}) (fail closed)",
+                Path::new(&base).display()
+            ));
+        }
+    }
     let replaced = git_stdout_at(
         root,
-        &["for-each-ref", "--format=%(refname)", "refs/replace/"],
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            DEFAULT_REPLACE_REF_BASE,
+        ],
     )?;
     let replaced = replaced.split_whitespace().collect::<Vec<_>>();
     if !replaced.is_empty() {
@@ -3031,11 +3161,21 @@ fn require_complete_history(root: &Path) -> Result<(), String> {
 }
 
 fn require_clean_worktree(root: &Path) -> Result<(), String> {
-    let status = git_stdout_at(root, &["status", "--porcelain"])?;
-    for path in porcelain_paths(&status) {
-        if !allowlisted(&path) {
+    let status = git_output_at(
+        root,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        ],
+    )?;
+    for path in porcelain_paths(&status)? {
+        if !allowlisted_path(&path) {
             return Err(format!(
-                "unexpected dirty path outside fixture allowlist: {path}"
+                "unexpected dirty path outside fixture allowlist: {}",
+                String::from_utf8_lossy(&path)
             ));
         }
     }
@@ -3166,7 +3306,7 @@ fn walk_to_audited_commit(root: &Path, candidate: &str) -> Result<String, String
         let parents = parent_shas(root, &sha)?;
         require_ordinary_topology(&sha, &parents)?;
         let files = commit_changed_files_at(root, &sha)?;
-        if files.iter().any(|path| !allowlisted(path)) {
+        if files.iter().any(|path| !allowlisted_path(path)) {
             return Ok(sha);
         }
         match parents.first() {
@@ -4074,4 +4214,467 @@ fn dirty_path_outside_the_fixture_allowlist_fails_closed() {
     let error = resolve_audited_source_revision_at(repo.path())
         .expect_err("a dirty non-fixture path must fail closed");
     assert!(error.contains("unexpected dirty path"), "{error}");
+}
+
+// --- Rename, copy, and replace-namespace evasion ---------------------------
+//
+// Each shape below changes a tree outside the fixture allowlist while trying to
+// read as a fixture-only change, or moves the forged-parentage machinery out of
+// the namespace being scanned. Tree ids are asserted directly so a test cannot
+// pass by exercising a commit that changed nothing.
+
+/// `git mv`, with the destination directory created first: Git will not create
+/// it, and a failed move would silently turn these cases into no-ops.
+fn detector_git_mv(repo: &Path, from: &str, to: &str) {
+    if let Some(parent) = repo.join(to).parent() {
+        std::fs::create_dir_all(parent).expect("rename destination directory");
+    }
+    detector_git(repo, &["mv", from, to]);
+}
+
+fn detector_tree(repo: &Path, rev: &str) -> String {
+    detector_git(repo, &["rev-parse", &format!("{rev}^{{tree}}")])
+}
+
+/// Assert the commit really did change the tree, so "the resolver stopped
+/// here" means it caught a change rather than agreeing with a no-op.
+fn assert_tree_changed(repo: &Path, sha: &str) {
+    assert_ne!(
+        detector_tree(repo, &format!("{sha}^")),
+        detector_tree(repo, sha),
+        "parent and head trees must differ for this case to mean anything"
+    );
+}
+
+/// A repo whose base commit holds one file outside the allowlist and one
+/// inside it, both with enough content for exact-rename detection to fire.
+fn rename_detector_repo() -> TempDir {
+    let repo = detector_repo();
+    detector_write(
+        repo.path(),
+        "outside-resolver-source.rs",
+        "outside resolver source\nline two\nline three\nline four\n",
+    );
+    detector_commit(repo.path(), "outside source outside the fixture allowlist");
+    repo
+}
+
+#[test]
+fn committed_rename_out_of_the_audited_tree_is_not_fixture_only() {
+    // The exact shape the audit reproduced: R100 from a non-fixture path into
+    // an allowlisted destination. `git diff --name-only` names only the
+    // destination, which would let the walk step straight past this commit.
+    let repo = rename_detector_repo();
+    detector_git_mv(
+        repo.path(),
+        "outside-resolver-source.rs",
+        "crates/codegen/grokptah-service/tests/common/mod.rs",
+    );
+    let renamed = detector_commit(repo.path(), "rename outside source into the allowlist");
+    assert_tree_changed(repo.path(), &renamed);
+
+    let raw = detector_git(repo.path(), &["diff", "--name-only", "HEAD^", "HEAD"]);
+    assert!(
+        !raw.contains("outside-resolver-source.rs"),
+        "rename detection must actually be hiding the source for this case: {raw}"
+    );
+
+    let changed = commit_changed_files_at(repo.path(), &renamed).expect("changed files");
+    let changed = changed
+        .iter()
+        .map(|path| String::from_utf8(path.clone()).expect("utf8 path"))
+        .collect::<Vec<_>>();
+    assert!(
+        changed
+            .iter()
+            .any(|path| path == "outside-resolver-source.rs"),
+        "the deleted source must surface: {changed:?}"
+    );
+    assert!(
+        changed
+            .iter()
+            .any(|path| path == "crates/codegen/grokptah-service/tests/common/mod.rs"),
+        "the added destination must surface: {changed:?}"
+    );
+    assert_eq!(
+        resolve_audited_source_revision_at(repo.path()).expect("resolves"),
+        renamed,
+        "a rename out of the audited tree is not a fixture-only change"
+    );
+}
+
+#[test]
+fn committed_rename_into_the_audited_tree_is_not_fixture_only() {
+    let repo = detector_repo();
+    detector_write(
+        repo.path(),
+        "crates/codegen/grokptah-service/tests/common/mod.rs",
+        "fixture module\nline two\nline three\nline four\n",
+    );
+    detector_commit(repo.path(), "allowlisted fixture module");
+    detector_git_mv(
+        repo.path(),
+        "crates/codegen/grokptah-service/tests/common/mod.rs",
+        "outside-resolver-destination.rs",
+    );
+    let renamed = detector_commit(repo.path(), "rename allowlisted file out of the allowlist");
+    assert_tree_changed(repo.path(), &renamed);
+
+    let changed = commit_changed_files_at(repo.path(), &renamed).expect("changed files");
+    let changed = changed
+        .iter()
+        .map(|path| String::from_utf8(path.clone()).expect("utf8 path"))
+        .collect::<Vec<_>>();
+    assert!(
+        changed
+            .iter()
+            .any(|path| path == "crates/codegen/grokptah-service/tests/common/mod.rs"),
+        "the deleted allowlisted source must surface: {changed:?}"
+    );
+    assert!(
+        changed
+            .iter()
+            .any(|path| path == "outside-resolver-destination.rs"),
+        "the added outside destination must surface: {changed:?}"
+    );
+    assert_eq!(
+        resolve_audited_source_revision_at(repo.path()).expect("resolves"),
+        renamed
+    );
+}
+
+#[test]
+fn repository_rename_and_copy_configuration_cannot_hide_a_move() {
+    // `--no-renames` must win over configuration the repository itself sets,
+    // including copy detection, which folds an added path into its source.
+    let repo = rename_detector_repo();
+    detector_git(repo.path(), &["config", "diff.renames", "copies"]);
+    detector_git(repo.path(), &["config", "diff.renameLimit", "10000"]);
+    detector_git(repo.path(), &["config", "status.renames", "copies"]);
+    detector_git_mv(
+        repo.path(),
+        "outside-resolver-source.rs",
+        "crates/codegen/grokptah-service/tests/common/mod.rs",
+    );
+    let renamed = detector_commit(repo.path(), "rename under copy-detecting configuration");
+    assert_tree_changed(repo.path(), &renamed);
+    let changed = commit_changed_files_at(repo.path(), &renamed).expect("changed files");
+    assert!(
+        changed
+            .iter()
+            .any(|path| path.as_slice() == b"outside-resolver-source.rs"),
+        "repository configuration must not suppress the source side"
+    );
+    assert_eq!(
+        resolve_audited_source_revision_at(repo.path()).expect("resolves"),
+        renamed
+    );
+}
+
+#[test]
+fn committed_copy_into_the_audited_tree_surfaces_the_destination() {
+    // A copy leaves its source in place, so only the destination changes the
+    // tree. The destination is outside the allowlist, and must be reported.
+    let repo = detector_repo();
+    detector_write(
+        repo.path(),
+        "crates/codegen/grokptah-service/tests/common/mod.rs",
+        "fixture module\nline two\nline three\nline four\n",
+    );
+    detector_commit(repo.path(), "allowlisted fixture module");
+    detector_git(repo.path(), &["config", "diff.renames", "copies"]);
+    detector_write(
+        repo.path(),
+        "outside-resolver-copy.rs",
+        "fixture module\nline two\nline three\nline four\n",
+    );
+    let copied = detector_commit(
+        repo.path(),
+        "copy allowlisted content outside the allowlist",
+    );
+    assert_tree_changed(repo.path(), &copied);
+    let changed = commit_changed_files_at(repo.path(), &copied).expect("changed files");
+    assert!(
+        changed
+            .iter()
+            .any(|path| path.as_slice() == b"outside-resolver-copy.rs"),
+        "the copy destination must surface"
+    );
+    assert_eq!(
+        resolve_audited_source_revision_at(repo.path()).expect("resolves"),
+        copied
+    );
+}
+
+#[test]
+fn staged_rename_into_the_allowlist_fails_closed() {
+    let repo = rename_detector_repo();
+    detector_git_mv(
+        repo.path(),
+        "outside-resolver-source.rs",
+        "crates/codegen/grokptah-service/tests/common/mod.rs",
+    );
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("a staged rename out of the audited tree must fail closed");
+    assert!(error.contains("unexpected dirty path"), "{error}");
+    assert!(
+        error.contains("outside-resolver-source.rs"),
+        "the dropped source must be the path named: {error}"
+    );
+}
+
+#[test]
+fn unstaged_rename_into_the_allowlist_fails_closed() {
+    let repo = rename_detector_repo();
+    std::fs::create_dir_all(
+        repo.path()
+            .join("crates/codegen/grokptah-service/tests/common"),
+    )
+    .expect("destination directory");
+    std::fs::rename(
+        repo.path().join("outside-resolver-source.rs"),
+        repo.path()
+            .join("crates/codegen/grokptah-service/tests/common/mod.rs"),
+    )
+    .expect("worktree rename");
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("an unstaged rename out of the audited tree must fail closed");
+    assert!(error.contains("unexpected dirty path"), "{error}");
+    assert!(
+        error.contains("outside-resolver-source.rs"),
+        "the dropped source must be the path named: {error}"
+    );
+}
+
+#[test]
+fn staged_copy_outside_the_allowlist_fails_closed() {
+    let repo = detector_repo();
+    detector_write(
+        repo.path(),
+        "crates/codegen/grokptah-service/tests/common/mod.rs",
+        "fixture module\nline two\nline three\nline four\n",
+    );
+    detector_commit(repo.path(), "allowlisted fixture module");
+    detector_git(repo.path(), &["config", "status.renames", "copies"]);
+    detector_write(
+        repo.path(),
+        "outside-resolver-copy.rs",
+        "fixture module\nline two\nline three\nline four\n",
+    );
+    detector_git(repo.path(), &["add", "--all"]);
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("a staged copy outside the allowlist must fail closed");
+    assert!(error.contains("unexpected dirty path"), "{error}");
+    assert!(error.contains("outside-resolver-copy.rs"), "{error}");
+}
+
+#[test]
+fn alternate_replace_ref_base_fails_closed() {
+    // Forged parentage parked outside `refs/replace/`: the default-namespace
+    // scan comes back empty while Git traverses the forgery.
+    let repo = detector_repo();
+    detector_write(repo.path(), "audited-only.txt", "audited\n");
+    detector_commit(repo.path(), "audited change");
+    detector_write(repo.path(), "later.txt", "later\n");
+    let head = detector_commit(repo.path(), "later change");
+    assert!(resolve_audited_source_revision_at(repo.path()).is_ok());
+    let root = detector_git(repo.path(), &["rev-list", "--max-parents=0", "HEAD"]);
+    let real_parent = detector_git(repo.path(), &["rev-parse", "HEAD^"]);
+
+    let mut env = ProcessEnvGuard::new();
+    env.set(REPLACE_REF_BASE_ENV, "refs/audit-escape/");
+    detector_git(repo.path(), &["replace", "--graft", &head, &root]);
+    assert!(
+        detector_git(
+            repo.path(),
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                DEFAULT_REPLACE_REF_BASE
+            ]
+        )
+        .is_empty(),
+        "the default namespace must look clean for this case"
+    );
+    assert!(
+        !detector_git(
+            repo.path(),
+            &["for-each-ref", "--format=%(refname)", "refs/audit-escape/"]
+        )
+        .is_empty(),
+        "the forgery must live in the alternate namespace"
+    );
+    let forged = detector_git(repo.path(), &["rev-list", "--parents", "-n", "1", "HEAD"]);
+    assert!(
+        forged.contains(&root) && !forged.contains(&real_parent),
+        "Git must actually be traversing the forged parentage: {forged}"
+    );
+
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("a relocated replace namespace must fail closed");
+    assert!(error.contains("relocated replace namespace"), "{error}");
+    assert!(error.contains(REPLACE_REF_BASE_ENV), "{error}");
+    assert!(error.contains("refs/audit-escape/"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+    // Never neutralized: the forgery is still there, and still refused.
+    assert!(!detector_git(
+        repo.path(),
+        &["for-each-ref", "--format=%(refname)", "refs/audit-escape/"]
+    )
+    .is_empty());
+}
+
+#[test]
+fn explicit_default_replace_ref_base_is_inspected() {
+    let repo = detector_repo();
+    detector_write(repo.path(), "audited-only.txt", "audited\n");
+    detector_commit(repo.path(), "audited change");
+    detector_write(repo.path(), "later.txt", "later\n");
+    let head = detector_commit(repo.path(), "later change");
+    let root = detector_git(repo.path(), &["rev-list", "--max-parents=0", "HEAD"]);
+
+    let mut env = ProcessEnvGuard::new();
+    env.set(REPLACE_REF_BASE_ENV, DEFAULT_REPLACE_REF_BASE);
+    // Spelled out explicitly, the default namespace is accepted and resolution
+    // proceeds exactly as it does with the variable unset.
+    assert!(resolve_audited_source_revision_at(repo.path()).is_ok());
+
+    // ...and it is genuinely inspected, not merely waved through.
+    detector_git(repo.path(), &["replace", "--graft", &head, &root]);
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("a replace ref in the explicit default namespace must be caught");
+    assert!(error.contains("rewritten history"), "{error}");
+    assert!(error.contains("replace ref"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+}
+
+#[test]
+fn replace_ref_base_environment_is_restored_after_each_guard() {
+    let before = std::env::var_os(REPLACE_REF_BASE_ENV);
+    {
+        let mut env = ProcessEnvGuard::new();
+        env.set(REPLACE_REF_BASE_ENV, "refs/audit-escape/");
+        assert_eq!(
+            std::env::var_os(REPLACE_REF_BASE_ENV).as_deref(),
+            Some(OsStr::new("refs/audit-escape/"))
+        );
+    }
+    assert_eq!(
+        std::env::var_os(REPLACE_REF_BASE_ENV),
+        before,
+        "the guard must restore the environment for the next test"
+    );
+}
+
+// --- Structural parsing ----------------------------------------------------
+
+#[test]
+fn porcelain_records_are_parsed_structurally() {
+    let paths = |records: &[u8]| {
+        porcelain_paths(records).map(|paths| {
+            paths
+                .iter()
+                .map(|path| String::from_utf8_lossy(path).into_owned())
+                .collect::<Vec<_>>()
+        })
+    };
+
+    assert_eq!(paths(b"").expect("empty status"), Vec::<String>::new());
+    assert_eq!(
+        paths(b" M src/lib.rs\0?? other.rs\0").expect("plain records"),
+        vec!["src/lib.rs", "other.rs"]
+    );
+    // A rename record yields both sides, destination first.
+    assert_eq!(
+        paths(b"R  crates/codegen/grokptah-service/tests/common/mod.rs\0outside.rs\0")
+            .expect("rename record"),
+        vec![
+            "crates/codegen/grokptah-service/tests/common/mod.rs",
+            "outside.rs"
+        ]
+    );
+    assert_eq!(
+        paths(b"C  dest.rs\0source.rs\0").expect("copy record"),
+        vec!["dest.rs", "source.rs"]
+    );
+    // A newline inside a path is data, not a record boundary.
+    assert_eq!(
+        paths(b"?? weird\nname.rs\0").expect("embedded newline"),
+        vec!["weird\nname.rs"]
+    );
+
+    for malformed in [
+        &b"R  dest.rs\0"[..],      // rename missing its original path
+        &b"R  dest.rs\0\0"[..],    // rename with an empty original path
+        &b"XY\0"[..],              // no separator and no path
+        &b" M\0"[..],              // status with no path
+        &b"M src/lib.rs\0"[..],    // one status character, so no space at index 2
+        &b"\0 M src/lib.rs\0"[..], // data after an empty leading record
+    ] {
+        assert!(
+            porcelain_paths(malformed).is_err(),
+            "malformed status record must be an error, not skipped: {:?}",
+            String::from_utf8_lossy(malformed)
+        );
+    }
+}
+
+#[test]
+fn raw_diff_records_are_parsed_structurally() {
+    let paths = |records: &[u8]| {
+        raw_diff_paths(records).map(|paths| {
+            paths
+                .iter()
+                .map(|path| String::from_utf8_lossy(path).into_owned())
+                .collect::<Vec<_>>()
+        })
+    };
+
+    assert_eq!(paths(b"").expect("empty diff"), Vec::<String>::new());
+    assert_eq!(
+        paths(b":100644 100644 aaaaaaa bbbbbbb M\0src/lib.rs\0").expect("modify record"),
+        vec!["src/lib.rs"]
+    );
+    assert_eq!(
+        paths(b":000000 100644 0000000 aaaaaaa A\0added.rs\0:100644 000000 aaaaaaa 0000000 D\0removed.rs\0")
+            .expect("add and delete"),
+        vec!["added.rs", "removed.rs"]
+    );
+    // Both sides, even if a Git build ignores --no-renames.
+    assert_eq!(
+        paths(b":100644 100644 aaaaaaa aaaaaaa R100\0source.rs\0dest.rs\0").expect("rename record"),
+        vec!["source.rs", "dest.rs"]
+    );
+    assert_eq!(
+        paths(b":100644 100644 aaaaaaa aaaaaaa C100\0source.rs\0copy.rs\0").expect("copy record"),
+        vec!["source.rs", "copy.rs"]
+    );
+
+    for malformed in [
+        &b":100644 100644 aaaaaaa aaaaaaa R100\0source.rs\0"[..], // rename missing a side
+        &b":100644 100644 aaaaaaa aaaaaaa M\0"[..],               // record missing its path
+        &b"100644 100644 aaaaaaa aaaaaaa M\0src/lib.rs\0"[..],    // metadata not starting with ':'
+        &b"src/lib.rs\0"[..],                                     // a bare path with no metadata
+    ] {
+        assert!(
+            raw_diff_paths(malformed).is_err(),
+            "malformed diff record must be an error, not skipped: {:?}",
+            String::from_utf8_lossy(malformed)
+        );
+    }
+}
+
+#[test]
+fn paths_that_are_not_utf8_are_never_allowlisted() {
+    assert!(allowlisted_path(
+        b"crates/codegen/grokptah-service/tests/common/mod.rs"
+    ));
+    assert!(!allowlisted_path(b"outside-resolver-source.rs"));
+    let mut invalid = b"crates/codegen/grokptah-service/tests/common/mod.rs".to_vec();
+    invalid.push(0xff);
+    assert!(
+        !allowlisted_path(&invalid),
+        "an invalid byte sequence must never be decoded into an allowlisted path"
+    );
+    assert!(!allowlisted_path(&[0xff, 0xfe]));
 }
