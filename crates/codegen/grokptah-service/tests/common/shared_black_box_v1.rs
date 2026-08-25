@@ -28,8 +28,9 @@ use std::time::Duration;
 
 use grokptah_agent_bridge::{
     home_override_serial, set_grokptah_home_override, start_control_server, AgentHost,
-    AgentHostHandle, ControlServerHandle, HostConfig, McpControlClient, McpRemoteError,
-    OrchestrationConfig, OrchestrationService, RuntimeHome, RuntimeHostKind, WorkspaceAllowlist,
+    AgentHostHandle, AuthCredential, ControlServerHandle, HostConfig, McpControlClient,
+    McpRemoteError, OrchestrationConfig, OrchestrationService, RuntimeHome, RuntimeHostKind,
+    WorkspaceAllowlist,
 };
 use grokptah_service::{start_service, ServiceConfig, ServiceHandle};
 use grokptah_test_gateway::{MockGateway, RecordedRequest, Response, Step};
@@ -663,6 +664,9 @@ async fn start_endpoint(
                 },
                 RuntimeHostKind::DesktopLocal,
             );
+            orch.set_auth_credentials(vec![AuthCredential::operator("primary", token)
+                .expect("shared parity operator credential")])
+                .expect("install shared parity operator credential");
             let server = start_control_server(orch, 0)
                 .await
                 .expect("desktop control server");
@@ -687,6 +691,8 @@ async fn start_endpoint(
             .expect("hosted service config")
             .with_runtime_home(home)
             .expect("hosted runtime home");
+            config.client_credentials = vec![AuthCredential::operator("primary", token)
+                .expect("shared parity operator credential")];
             let handle = start_service(config).await.expect("start hosted service");
             let addr = format!("http://{}", handle.addr);
             let mcp = McpControlClient::new(&addr, token);
@@ -773,11 +779,7 @@ fn host_capability_contract(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let expected_hard_denials = vec![
-        "approval".to_string(),
-        "promotion".to_string(),
-        "computer_use".to_string(),
-    ];
+    let expected_hard_denials = vec!["computer_use".to_string()];
     let actual_hard_denials = document["hardDenials"]
         .as_array()
         .map(|values| {
@@ -804,7 +806,7 @@ fn host_capability_contract(
         (
             "principal.role",
             document["principal"]["role"].clone(),
-            json!("remote_coordinator"),
+            json!("remote_operator"),
         ),
         (
             "hostCapabilities",
@@ -2972,7 +2974,7 @@ fn audited_walk_start(root: &Path, head: &str) -> AuditedWalkStart {
         return AuditedWalkStart::RetainHead;
     }
     match parents.len() {
-        1 => AuditedWalkStart::Direct,
+        1 | 2 => AuditedWalkStart::Direct,
         3 => {
             let merge_tree = git_stdout_at(root, &["rev-parse", &format!("{head}^{{tree}}")]);
             let second_parent_tree =
@@ -3387,9 +3389,9 @@ fn host_capability_oracle_rejects_kind_and_capability_drift() {
             "hostKind": "desktop_local",
             "hostVersion": "0.1.0"
         },
-        "principal": { "role": "remote_coordinator" },
+        "principal": { "role": "remote_operator" },
         "hostCapabilities": desktop_capabilities,
-        "hardDenials": ["approval", "promotion", "computer_use"]
+        "hardDenials": ["computer_use"]
     });
     let mut defects = Vec::new();
     host_capability_contract(EndpointKind::Desktop, &document, &mut defects);
