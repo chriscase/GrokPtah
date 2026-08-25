@@ -2286,6 +2286,77 @@ async fn thirty_two_queued_admissions_recover_fifo_and_dispatch_once() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn expired_attempt_reaper_releases_capacity_and_promotes_next_once() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let first = host.session_new_kind(SessionKind::Build).unwrap();
+    let second = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(first.id, ws.path()).unwrap();
+    host.session_set_cwd(second.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 1);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let first_response = orch
+        .submit_task(
+            &auth,
+            "reaper-first",
+            first.id,
+            ws.path(),
+            "run sleep 8".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let second_response = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "reaper-second",
+            second.id,
+            ws.path(),
+            "list files".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+    let first_id = first_response["runId"].as_str().unwrap();
+    let second_id = second_response["runId"].as_str().unwrap();
+    let attempt_path = std::fs::read_dir(orch.store().root().join("attempts"))
+        .unwrap()
+        .flatten()
+        .find(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
+        .expect("running attempt record")
+        .path();
+    let mut attempt: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&attempt_path).unwrap()).unwrap();
+    attempt["expiresAt"] = serde_json::json!("2000-01-01T00:00:00Z");
+    std::fs::write(&attempt_path, serde_json::to_vec_pretty(&attempt).unwrap()).unwrap();
+    orch.reap_expired_attempts_for_test();
+
+    assert_eq!(
+        wait_run_terminal(&orch, &auth, first_id, Duration::from_secs(10)).await,
+        RunState::Interrupted
+    );
+    assert_eq!(
+        wait_run_terminal(&orch, &auth, second_id, Duration::from_secs(10)).await,
+        RunState::Completed
+    );
+    assert_eq!(orch.get_capacity(&auth).unwrap()["activeRuns"], 0);
+    assert_eq!(orch.get_capacity(&auth).unwrap()["queuedRuns"], 0);
+    assert_eq!(
+        orch.store().load_attempt(first_id).unwrap().unwrap().phase,
+        grokptah_agent_bridge::orchestration::AttemptPhase::Reaped
+    );
+    set_grokptah_home_override(None);
+    std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn admitted_run_reserves_session_against_desktop_prompt() {
     let (home, _lock) = setup_home();
     let host = started_host();

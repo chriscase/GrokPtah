@@ -705,7 +705,8 @@ impl OrchStore {
                 entries
                     .flatten()
                     .filter(|entry| {
-                        entry.path().extension().and_then(|s| s.to_str()) == Some("json")
+                        entry.path().is_file()
+                            && entry.path().extension().and_then(|s| s.to_str()) == Some("json")
                     })
                     .count()
             })

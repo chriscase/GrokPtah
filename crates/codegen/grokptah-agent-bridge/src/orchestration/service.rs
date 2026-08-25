@@ -844,6 +844,13 @@ impl OrchestrationService {
         }
     }
 
+    /// Test-only entry point for deterministic expiry/reaper adversarial
+    /// coverage. Production supervision remains periodic and host-owned.
+    #[doc(hidden)]
+    pub fn reap_expired_attempts_for_test(&self) {
+        self.reap_expired_attempts();
+    }
+
     async fn begin_idempotency(
         &self,
         tool: &str,
