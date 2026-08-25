@@ -124,7 +124,33 @@ export const HELP_ENTRIES: readonly HelpEntry[] = [
     keywords: ["consent", "human gate", "authorize", "deny", "risk"],
     audience: ["everyone", "power_user", "operator"],
     access: "public",
-    capabilityIds: ["run.execute", "computer.control"],
+    capabilityIds: ["run.execute", "run.promote", "computer.control"],
+  },
+  {
+    id: "queue-and-steering",
+    title: "Queue and steer work without losing scope",
+    summary:
+      "Queue, steer, or cancel a run with explicit request ids and the same workspace and run fence.",
+    body:
+      "Queue and steer are separate bounded operations, not hidden prompt injection. Use a fresh idempotency key for each intent, preserve the run and workspace identity, and reconcile the queue revision before editing or removing an entry. A retry after an uncertain response is allowed only when the durable oracle proves the original request was not accepted.",
+    tags: ["queue", "steer", "idempotency", "scope"],
+    keywords: ["queued", "cancel", "request id", "revision", "retry", "prompt"],
+    audience: ["power_user", "operator"],
+    access: "gated",
+    capabilityIds: ["run.queue", "run.execute"],
+  },
+  {
+    id: "promotion-and-discard",
+    title: "Promote or discard an isolated review safely",
+    summary:
+      "Promotion consumes a short-lived approval bound to exact fingerprints, changed files, and the same run.",
+    body:
+      "Show the exact source and final fingerprints and the bounded changed-file summaries before approval. A promotion request must consume the matching approval id with a new idempotency key; stale, expired, mismatched, or replayed approvals deny without mutation. Discard is explicit and must leave an auditable terminal receipt.",
+    tags: ["promotion", "discard", "review", "fingerprint"],
+    keywords: ["approve", "promote", "merge", "isolated", "receipt", "expiry"],
+    audience: ["power_user", "operator"],
+    access: "operator",
+    capabilityIds: ["run.promote", "run.review"],
   },
   {
     id: "enterprise-gateway-review",

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   HELP_CONTRACT,
+  HELP_ENTRIES,
   buildHelpAssistantContext,
   searchHelp,
 } from "./help";
@@ -29,6 +30,30 @@ describe("Help Center index", () => {
     });
     expect(hits[0]?.entry.id).toBe("computer-use-safety");
     expect(hits[0]?.entry.access).toBe("gated");
+  });
+
+  it("covers every shipped capability with explicit help content", () => {
+    const covered = new Set(HELP_ENTRIES.flatMap((entry) => entry.capabilityIds));
+    expect(covered).toEqual(new Set([
+      "session.observe",
+      "run.execute",
+      "run.queue",
+      "run.review",
+      "run.promote",
+      "agent.continuity",
+      "agent.resume",
+      "computer.observe",
+      "computer.control",
+    ]));
+  });
+
+  it("ranks queue and promotion guidance for power-user questions", () => {
+    expect(searchHelp("how do I retry a queued prompt safely", { includeRestricted: true })[0]?.entry.id)
+      .toBe("queue-and-steering");
+    expect(searchHelp("can I promote this isolated review", {
+      includeRestricted: true,
+      audience: "operator",
+    })[0]?.entry.id).toBe("promotion-and-discard");
   });
 
   it("builds bounded assistant context with an explicit authority boundary", () => {
