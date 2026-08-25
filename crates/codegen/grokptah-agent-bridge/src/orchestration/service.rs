@@ -3100,9 +3100,9 @@ impl OrchestrationService {
         };
         let payload = json!({
             "sessionId": session_id,
-            "workspace": claimed.display().to_string(),
+            "workspace": workspace.display().to_string(),
             "prompt": prompt,
-            "bounds": bounds,
+            "bounds": bounds_json,
             "executionMode": execution_mode,
             "allowQueue": allow_queue,
             "retryOf": retry_of,
@@ -3195,9 +3195,11 @@ impl OrchestrationService {
             payload_hash: phash.clone(),
             tool: tool.into(),
             session_id,
+            request_workspace: workspace.display().to_string(),
             workspace: run.workspace.clone(),
             execution_mode,
             allow_queue,
+            request_bounds: bounds_json.clone(),
             attempt_id: None,
             prompt: Some(prompt.clone()),
             prompt_hash: hash_payload(&json!(prompt)),

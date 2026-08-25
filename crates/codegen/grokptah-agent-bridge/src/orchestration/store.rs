@@ -66,9 +66,11 @@ pub(crate) struct AcceptanceIntent {
     pub payload_hash: String,
     pub tool: String,
     pub session_id: uuid::Uuid,
+    pub request_workspace: String,
     pub workspace: String,
     pub execution_mode: super::types::RunExecutionMode,
     pub allow_queue: bool,
+    pub request_bounds: Option<serde_json::Value>,
     #[serde(default)]
     pub attempt_id: Option<String>,
     /// Full input exists only in this private acceptance ledger. It is
@@ -126,9 +128,11 @@ impl AcceptanceIntent {
             "payloadHash": self.payload_hash,
             "tool": self.tool,
             "sessionId": self.session_id,
+            "requestWorkspace": self.request_workspace,
             "workspace": self.workspace,
             "executionMode": self.execution_mode,
             "allowQueue": self.allow_queue,
+            "requestBounds": self.request_bounds,
             "attemptId": self.attempt_id,
             "prompt": self.prompt,
             "promptHash": self.prompt_hash,
@@ -149,9 +153,15 @@ impl AcceptanceIntent {
         safe_id_filename(&self.run_id).map_err(|error| anyhow::anyhow!(error.to_string()))?;
         safe_id_filename(&self.request_id).map_err(|error| anyhow::anyhow!(error.to_string()))?;
         if self.sequence == 0
+            || self.request_workspace.is_empty()
+            || self.request_workspace.len() > 4 * 1024
             || self.workspace.is_empty()
             || self.workspace.len() > 4 * 1024
-            || self.workspace.chars().any(|character| character == '\0')
+            || self
+                .request_workspace
+                .chars()
+                .chain(self.workspace.chars())
+                .any(|character| character == '\0')
         {
             anyhow::bail!("acceptance workspace is outside its bound");
         }
@@ -189,9 +199,9 @@ impl AcceptanceIntent {
             }
             let expected_payload = super::types::hash_payload(&serde_json::json!({
                 "sessionId": self.session_id,
-                "workspace": self.workspace,
+                "workspace": self.request_workspace,
                 "prompt": prompt,
-                "bounds": self.bounds,
+                "bounds": self.request_bounds,
                 "executionMode": self.execution_mode,
                 "allowQueue": self.allow_queue,
                 "retryOf": self.run.retry_of,
@@ -2589,7 +2599,7 @@ mod tests {
             "sessionId": run.session_id,
             "workspace": &run.workspace,
             "prompt": &prompt,
-            "bounds": &run.bounds,
+            "bounds": Option::<serde_json::Value>::None,
             "executionMode": super::super::types::RunExecutionMode::Shared,
             "allowQueue": true,
             "retryOf": &run.retry_of,
@@ -2602,9 +2612,11 @@ mod tests {
             payload_hash,
             tool: "ptah_submit_task".into(),
             session_id: run.session_id,
+            request_workspace: run.workspace.clone(),
             workspace: run.workspace.clone(),
             execution_mode: super::super::types::RunExecutionMode::Shared,
             allow_queue: true,
+            request_bounds: None,
             attempt_id: None,
             prompt: Some(prompt.clone()),
             prompt_hash: super::super::types::hash_payload(&serde_json::json!(prompt)),
