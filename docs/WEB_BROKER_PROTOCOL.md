@@ -32,7 +32,8 @@ for an authenticated user/team and an explicitly approved workspace:
 
 ```http
 POST /api/grokptah/v1/bindings
-Authorization: Bearer <ContextDesk user session>
+Cookie: contextdesk_session=<ContextDesk user session>
+X-CSRF-Token: csrf-01J...
 Idempotency-Key: bind-01J...
 Content-Type: application/json
 
@@ -150,6 +151,14 @@ without mutation.
 
 The approval payload uses the same changed-file object shape as the
 `ReviewReceipt` projection; a path-only list is not sufficient evidence:
+
+```http
+POST /api/grokptah/v1/bindings/{bindingId}/runs/{runId}/approve
+Cookie: contextdesk_session=<ContextDesk user session>
+X-CSRF-Token: csrf-01J...
+Idempotency-Key: approve-01J...
+Content-Type: application/json
+```
 
 ```json
 {

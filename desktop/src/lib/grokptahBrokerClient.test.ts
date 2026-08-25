@@ -86,6 +86,31 @@ describe("GrokPtahBrokerClient", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("validates changed-file path and UTF-8 summary bounds independently", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    const base = {
+      sourceFingerprint: "source-1",
+      finalFingerprint: "final-1",
+      ttlMs: 30_000,
+    };
+
+    for (const changedFiles of [
+      [{ path: "../secret", summary: "bounded" }],
+      [{ path: "/absolute", summary: "bounded" }],
+      [{ path: "src/file.ts", summary: "é".repeat(257) }],
+    ]) {
+      await expect(
+        client.approveRun("binding-1", "run-1", { ...base, changedFiles }, "approve-intent-1"),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+    }
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("fails closed before approval without CSRF", async () => {
     const fetcher = vi.fn<typeof fetch>();
     const client = new GrokPtahBrokerClient({
@@ -101,6 +126,18 @@ describe("GrokPtahBrokerClient", () => {
       ),
     ).rejects.toMatchObject({ code: "csrf_required" });
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("trims a broker CSRF token before sending it", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ ok: true }));
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "  csrf-1  ",
+    });
+
+    await client.submitRun("binding-1", { prompt: "review" }, "intent-1");
+    expect(fetcher.mock.calls[0][1]?.headers).toMatchObject({ "X-CSRF-Token": "csrf-1" });
   });
 
   it("maps stable broker errors without exposing a privileged body", async () => {

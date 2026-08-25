@@ -120,7 +120,8 @@ export class GrokPtahBrokerClient {
       : `${baseUrl}/api/grokptah/v1`;
     this.fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
     this.credentials = options.credentials ?? "include";
-    this.csrfToken = options.csrfToken;
+    const csrfToken = options.csrfToken?.trim();
+    this.csrfToken = csrfToken || undefined;
   }
 
   async createBinding(
@@ -371,7 +372,13 @@ function segment(value: string): string {
 }
 
 function validateApprovalRequest(request: GrokPtahBrokerApprovalRequest): void {
-  if (!request.sourceFingerprint.trim() || !request.finalFingerprint.trim()) {
+  if (
+    typeof request.sourceFingerprint !== "string" ||
+    typeof request.finalFingerprint !== "string" ||
+    !request.sourceFingerprint.trim() ||
+    !request.finalFingerprint.trim() ||
+    !Array.isArray(request.changedFiles)
+  ) {
     throw new GrokPtahBrokerError(
       0,
       "invalid_request",
@@ -390,10 +397,14 @@ function validateApprovalRequest(request: GrokPtahBrokerApprovalRequest): void {
   }
   for (const file of request.changedFiles) {
     if (
+      file === null ||
+      typeof file !== "object" ||
+      typeof file.path !== "string" ||
+      typeof file.summary !== "string" ||
       !file.path.trim() ||
       file.path.startsWith("/") ||
       file.path.includes("..") ||
-      file.summary.length > 512
+      new TextEncoder().encode(file.summary).byteLength > 512
     ) {
       throw new GrokPtahBrokerError(
         0,
