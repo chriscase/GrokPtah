@@ -190,15 +190,21 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
     // server to emit the explicit recovery notification when the client
     // resumes reading.
     wait_for_file(&ready_file).await;
+    // Drain work from the earlier probe steps before the flood. A leftover
+    // persist-queue backlog plus a 100-event burst can fill the 256-deep
+    // journal writer and record a durable gap; `ptah_get_events` then returns
+    // 410 `stale_or_recovery` (`reasonCode=cursor_expired`) even for
+    // `after_seq: 0`.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
     for index in 0..6_000 {
         host.event_bus().publish(SessionUpdate::AgentMessageChunk {
             session_id: gap_session.id,
             text: format!("continuity-gap-{index}"),
         });
-        if index % 100 == 99 {
+        if index % 32 == 31 {
             // Keep the persistence writer ahead of its small queue while the
             // unread HTTP body still forces the broadcast receiver to lag.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
