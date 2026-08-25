@@ -25,6 +25,18 @@ pub const CURSOR_CLOUD_API_BASE: &str = "https://api.cursor.com";
 /// Maximum bytes downloaded when hashing a provider artifact.
 pub const MAX_EXTERNAL_WORKER_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Maximum bytes read from a successful provider control-plane response.
+///
+/// Control-plane responses are bounded JSON projections, not bulk transfers;
+/// artifact bytes have their own ceiling and never travel this path.
+pub const MAX_PROVIDER_RESPONSE_BYTES: u64 = 1024 * 1024;
+
+/// Maximum bytes read from a non-success provider response.
+///
+/// Only a closed conflict-code vocabulary is ever parsed out of an error body,
+/// so this ceiling is deliberately tighter than the success ceiling.
+pub const MAX_PROVIDER_ERROR_BODY_BYTES: u64 = 64 * 1024;
+
 /// Documented virtual-hosted Cursor artifact prefix.
 pub const PRODUCTION_ARTIFACT_HOST_PREFIX: &str = "cloud-agent-artifacts.s3.";
 
@@ -193,13 +205,23 @@ impl CursorCloudAdapter {
         }
         let response = request.send().await?;
         let status = response.status();
-        let text = response.text().await?;
         if !status.is_success() {
             // Parse only a closed conflict-code vocabulary. The remainder of
             // the provider body is dropped so credentials cannot enter logs.
-            let code = extract_provider_conflict_code(&text);
+            //
+            // A provider that answers an error with an unbounded body must not
+            // be able to exhaust this host's memory, so the read is capped and
+            // the connection is dropped at the ceiling. A body we refused to
+            // read whole cannot claim a conflict code: `code` stays `None` so
+            // the caller fails closed instead of taking a reconcile shortcut on
+            // an untrusted body. The status still drives policy.
+            let code = read_bounded_body(response, MAX_PROVIDER_ERROR_BODY_BYTES)
+                .await
+                .ok()
+                .and_then(|text| extract_provider_conflict_code(&text));
             return Err(ExternalWorkerAdapterError::Provider { status, code });
         }
+        let text = read_bounded_body(response, MAX_PROVIDER_RESPONSE_BYTES).await?;
         if text.trim().is_empty() {
             return Ok(Value::Null);
         }
@@ -464,6 +486,43 @@ impl CursorCloudAdapter {
             total,
         ))
     }
+}
+
+/// Read at most `max_bytes` of a provider response body.
+///
+/// This mirrors the artifact download guard: the advertised `content-length`
+/// is refused up front when it is already over the ceiling, and the streamed
+/// body is then accumulated with a running total so a chunked or mis-declared
+/// response cannot exceed it either. Passing the ceiling aborts the read and
+/// drops the connection rather than buffering the remainder.
+async fn read_bounded_body(
+    response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<String, ExternalWorkerAdapterError> {
+    if response
+        .content_length()
+        .is_some_and(|content_length| content_length > max_bytes)
+    {
+        return Err(ExternalWorkerAdapterError::InvalidResponse(
+            "provider response exceeds the response byte ceiling",
+        ));
+    }
+    let mut total = 0u64;
+    let mut buffer = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(ExternalWorkerAdapterError::Transport)?;
+        total = total.saturating_add(chunk.len() as u64);
+        if total > max_bytes {
+            return Err(ExternalWorkerAdapterError::InvalidResponse(
+                "provider response exceeds the response byte ceiling",
+            ));
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buffer).map_err(|_| {
+        ExternalWorkerAdapterError::InvalidResponse("provider response was not valid UTF-8")
+    })
 }
 
 fn production_artifact_host_allowed(host: &str) -> bool {
@@ -1043,6 +1102,10 @@ mod tests {
         pub create_delay_ms: u64,
         pub reconcile_cancelled: bool,
         pub defer_listed_runs_until_follow_up: bool,
+        /// Padding bytes appended to the create response body.
+        pub create_body_padding_bytes: usize,
+        /// Send the create body chunked, so it carries no `content-length`.
+        pub create_body_chunked: bool,
     }
 
     impl Default for FakeCursorConfig {
@@ -1076,6 +1139,8 @@ mod tests {
                 create_delay_ms: 0,
                 reconcile_cancelled: false,
                 defer_listed_runs_until_follow_up: false,
+                create_body_padding_bytes: 0,
+                create_body_chunked: false,
             }
         }
     }
@@ -1128,26 +1193,40 @@ mod tests {
     async fn fake_create(
         State(state): State<FakeCursorState>,
         Json(body): Json<Value>,
-    ) -> impl IntoResponse {
+    ) -> axum::response::Response {
         let delay = state.config.lock().unwrap().create_delay_ms;
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
         state.launch_requests.lock().unwrap().push(body);
         let config = state.config.lock().unwrap().clone();
-        if config.create_status != 200 {
-            return (
-                AxumStatus::from_u16(config.create_status).unwrap(),
-                Json(json!({"code": config.create_code})),
-            );
-        }
-        (
-            AxumStatus::OK,
-            Json(json!({
+        let status = AxumStatus::from_u16(config.create_status).unwrap();
+        let mut payload = if config.create_status != 200 {
+            json!({"code": config.create_code})
+        } else {
+            json!({
                 "agent": fake_agent(&config),
                 "run": fake_run(FAKE_RUN, "CREATING"),
-            })),
-        )
+            })
+        };
+        if config.create_body_padding_bytes > 0 {
+            payload["padding"] = json!("x".repeat(config.create_body_padding_bytes));
+        }
+        if config.create_body_chunked {
+            // Streamed without `content-length`, so only the running byte
+            // total can stop the read.
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            let chunks = bytes
+                .chunks(16 * 1024)
+                .map(|chunk| Ok::<_, std::io::Error>(chunk.to_vec()))
+                .collect::<Vec<_>>();
+            return (
+                status,
+                axum::body::Body::from_stream(futures::stream::iter(chunks)),
+            )
+                .into_response();
+        }
+        (status, Json(payload)).into_response()
     }
 
     async fn fake_agent_read(State(state): State<FakeCursorState>) -> Json<Value> {
@@ -1632,6 +1711,97 @@ mod tests {
         assert_eq!(result.worker.external_agent_id, FAKE_AGENT);
         assert_eq!(result.run.external_run_id, FAKE_RUN);
         assert_eq!(state.launch_requests.lock().unwrap().len(), 1);
+    }
+
+    /// The contrast with the test above: the same 409 and the same conflict
+    /// code reconcile when the body is bounded, and must fail closed when the
+    /// provider pads it past the ceiling. A body this host refused to read
+    /// whole cannot be trusted to claim a conflict code.
+    #[tokio::test]
+    async fn oversized_provider_error_body_cannot_claim_a_conflict_code() {
+        let state = FakeCursorState::default();
+        {
+            let mut config = state.config.lock().unwrap();
+            config.create_status = 409;
+            config.create_code = Some("agent_id_conflict".into());
+            config.listed_runs = vec![fake_run(FAKE_RUN, "CREATING")];
+            config.create_body_padding_bytes = MAX_PROVIDER_ERROR_BODY_BYTES as usize + 1024;
+        }
+        let base = spawn_fake_cursor(state.clone()).await;
+        let adapter = CursorCloudAdapter::for_test(&base);
+        let error = adapter
+            .launch(&launch_request(FAKE_AGENT))
+            .await
+            .expect_err("an oversized error body must not reconcile");
+        assert!(
+            matches!(
+                error,
+                ExternalWorkerAdapterError::Provider {
+                    status: StatusCode::CONFLICT,
+                    code: None,
+                }
+            ),
+            "expected a fail-closed 409 with no claimed code, got {error:?}"
+        );
+        assert_eq!(state.launch_requests.lock().unwrap().len(), 1);
+    }
+
+    /// `content-length` may be absent or untrue, so the running byte total is
+    /// the guard that actually has to hold.
+    #[tokio::test]
+    async fn chunked_provider_error_body_without_content_length_is_still_bounded() {
+        let state = FakeCursorState::default();
+        {
+            let mut config = state.config.lock().unwrap();
+            config.create_status = 409;
+            config.create_code = Some("agent_id_conflict".into());
+            config.listed_runs = vec![fake_run(FAKE_RUN, "CREATING")];
+            config.create_body_padding_bytes = MAX_PROVIDER_ERROR_BODY_BYTES as usize + 1024;
+            config.create_body_chunked = true;
+        }
+        let base = spawn_fake_cursor(state.clone()).await;
+        let adapter = CursorCloudAdapter::for_test(&base);
+        let error = adapter
+            .launch(&launch_request(FAKE_AGENT))
+            .await
+            .expect_err("a chunked oversized error body must not reconcile");
+        assert!(
+            matches!(
+                error,
+                ExternalWorkerAdapterError::Provider {
+                    status: StatusCode::CONFLICT,
+                    code: None,
+                }
+            ),
+            "expected a fail-closed 409 with no claimed code, got {error:?}"
+        );
+    }
+
+    /// A success body is bounded too: the control plane exchanges bounded JSON
+    /// projections, and artifact bytes have their own ceiling and never travel
+    /// this path.
+    #[tokio::test]
+    async fn oversized_provider_success_body_fails_closed() {
+        let state = FakeCursorState::default();
+        {
+            let mut config = state.config.lock().unwrap();
+            config.create_body_padding_bytes = MAX_PROVIDER_RESPONSE_BYTES as usize + 1024;
+        }
+        let base = spawn_fake_cursor(state.clone()).await;
+        let adapter = CursorCloudAdapter::for_test(&base);
+        let error = adapter
+            .launch(&launch_request(FAKE_AGENT))
+            .await
+            .expect_err("an oversized success body must not be buffered");
+        assert!(
+            matches!(
+                error,
+                ExternalWorkerAdapterError::InvalidResponse(
+                    "provider response exceeds the response byte ceiling"
+                )
+            ),
+            "expected the bounded-read ceiling, got {error:?}"
+        );
     }
 
     #[tokio::test]
