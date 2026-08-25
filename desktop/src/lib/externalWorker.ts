@@ -378,6 +378,7 @@ export function applyExternalWorkerNotification(
 export function replaceExternalWorkerMonitor(
   values: readonly unknown[],
 ): ExternalWorkerMonitorState | null {
+  if (values.length > MAX_EVENTS) return null;
   const events = values.map(parseExternalWorkerEvent);
   if (events.some((event) => event === null)) return null;
   const parsed = events as ExternalWorkerEvent[];

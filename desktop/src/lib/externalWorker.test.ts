@@ -183,5 +183,8 @@ describe("external worker UI contract", () => {
     expect(replaceExternalWorkerMonitor([
       { seq: 8, ts: "now", kind: "run.progress", detail: "Authorization: secret" },
     ])).toBeNull();
+    expect(replaceExternalWorkerMonitor(
+      Array.from({ length: 257 }, (_, seq) => ({ seq, ts: "now", kind: "run.progress", detail: "bounded" })),
+    )).toBeNull();
   });
 });
