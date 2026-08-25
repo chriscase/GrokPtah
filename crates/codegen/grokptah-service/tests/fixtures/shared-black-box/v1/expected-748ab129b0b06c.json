@@ -1,0 +1,3486 @@
+{
+  "advertisedTools": [
+    "ptah_accept_work",
+    "ptah_ack_message",
+    "ptah_advance_manager_plan",
+    "ptah_approve_run",
+    "ptah_approve_work",
+    "ptah_assign_work",
+    "ptah_authorize_work_execution",
+    "ptah_block_work",
+    "ptah_cancel",
+    "ptah_cancel_work",
+    "ptah_claim_work",
+    "ptah_clear_queue",
+    "ptah_complete_work",
+    "ptah_create_manager_plan",
+    "ptah_create_routine",
+    "ptah_create_session",
+    "ptah_create_work",
+    "ptah_decline_work",
+    "ptah_disable_routine",
+    "ptah_discard_run",
+    "ptah_edit_queue",
+    "ptah_enable_routine",
+    "ptah_fail_work",
+    "ptah_fire_routine",
+    "ptah_get_capacity",
+    "ptah_get_changes",
+    "ptah_get_computer_capacity",
+    "ptah_get_computer_run",
+    "ptah_get_computer_run_events",
+    "ptah_get_events",
+    "ptah_get_handoff",
+    "ptah_get_managed_execution",
+    "ptah_get_manager_plan",
+    "ptah_get_native_coding_readiness",
+    "ptah_get_persistent_agent",
+    "ptah_get_progress",
+    "ptah_get_queue",
+    "ptah_get_routine",
+    "ptah_get_run",
+    "ptah_get_test_results",
+    "ptah_get_work",
+    "ptah_get_worker",
+    "ptah_heartbeat_worker",
+    "ptah_link_work_run",
+    "ptah_list_activations",
+    "ptah_list_computer_runs",
+    "ptah_list_execution_intents",
+    "ptah_list_inbox",
+    "ptah_list_manager_plans",
+    "ptah_list_outbox",
+    "ptah_list_persistent_agents",
+    "ptah_list_routines",
+    "ptah_list_runs",
+    "ptah_list_sessions",
+    "ptah_list_work",
+    "ptah_list_work_decisions",
+    "ptah_list_workers",
+    "ptah_offer_work",
+    "ptah_pause_routine",
+    "ptah_promote_run",
+    "ptah_queue_prompt",
+    "ptah_reassign_work",
+    "ptah_release_work",
+    "ptah_remove_queue",
+    "ptah_renew_work",
+    "ptah_reorder_queue",
+    "ptah_replan_manager_plan",
+    "ptah_report_work_progress",
+    "ptah_reprioritize_work",
+    "ptah_request_review",
+    "ptah_resolve_work_input",
+    "ptah_resume_persistent_agent",
+    "ptah_retry_run",
+    "ptah_retry_work",
+    "ptah_review_run",
+    "ptah_run_next",
+    "ptah_send_message",
+    "ptah_set_managed_execution",
+    "ptah_steer",
+    "ptah_steer_queued",
+    "ptah_submit_task",
+    "ptah_tick_manager_plan"
+  ],
+  "assertions": {
+    "manager": {
+      "decisionIntent": 1,
+      "decisionRun": 1,
+      "decisionWork": 1,
+      "filesystemWrites": 0,
+      "hostDenials": 1,
+      "permissionGrants": 0,
+      "permissionRequests": 0,
+      "proposalHttp": 2,
+      "purpose": "manager_proposal"
+    },
+    "ordinaryNative": {
+      "http": 1,
+      "intent": 1,
+      "providerAttempt": 1,
+      "quotaState": "consumed",
+      "requests": 1,
+      "run": 1,
+      "tokens": 10,
+      "work": 1,
+      "workAttempts": 1
+    },
+    "restart": {
+      "http": 2,
+      "httpBeforeStop": 1,
+      "intent": 2,
+      "providerAttempt": 1,
+      "queued": false,
+      "quotaState": "reserved",
+      "retryClass": "explicit_new_run_only",
+      "run": 2,
+      "sendCertainty": "uncertain_accept",
+      "stallHeldAfterAccept": true,
+      "work": 1,
+      "workAttempt": 2
+    }
+  },
+  "evidenceHash": "sha256:7b31548d32a5d962673e1e0987d8cf2913520ef201eaef875e23efea8c98dd4a",
+  "features": {
+    "hostCapabilityContract": {
+      "attemptTimeCapture": true,
+      "authorityRole": "remote_coordinator",
+      "commonCapabilities": [
+        "durable_runs",
+        "durable_sessions",
+        "durable_work",
+        "event_replay",
+        "native_execution",
+        "persistent_agents",
+        "routines"
+      ],
+      "desktopLocalCapabilities": [
+        "desktop_keychain",
+        "desktop_local_approval",
+        "desktop_pty",
+        "semantic_computer_use_foreground"
+      ],
+      "hostKinds": [
+        "desktop_local",
+        "standalone_service"
+      ],
+      "missingCapabilityDenial": "forbidden_scope",
+      "remoteHardDenials": [
+        "approval",
+        "promotion",
+        "computer_use"
+      ],
+      "schema": "grokptah.authority-capabilities.v1",
+      "schemaVersion": 1
+    },
+    "nativeCodingReadiness": {
+      "support": "present"
+    }
+  },
+  "observations": {
+    "discovery": {
+      "capacity": {
+        "activeRuns": 0,
+        "available": 4,
+        "health": {
+          "auditPersistenceError": null,
+          "eventJournalPersistenceError": null,
+          "managerSupervisor": {
+            "enabled": true,
+            "intervalMs": 2000,
+            "lastError": null,
+            "lastReport": {
+              "bounded": false,
+              "decisionsApplied": 0,
+              "decisionsCreated": 0,
+              "decisionsRejected": 0,
+              "messagesCreated": 0,
+              "plansProcessed": 0,
+              "plansScanned": 0,
+              "workCreated": 0
+            }
+          },
+          "managerSupervisorError": null,
+          "nativeExecutor": {
+            "admitted": 0,
+            "enabled": true,
+            "finalized": 0,
+            "intervalMs": 1000,
+            "lastError": null,
+            "maxConcurrentProviderRuns": 4
+          },
+          "nativeExecutorError": null,
+          "routineSupervisor": {
+            "enabled": true,
+            "intervalMs": 1000,
+            "lastError": null,
+            "lastReport": {
+              "createdWork": 0,
+              "deduplicated": 0,
+              "rejected": 0,
+              "scannedRoutines": 0,
+              "skipped": 0
+            }
+          },
+          "routineSupervisorError": null,
+          "runPersistenceError": null,
+          "workloadSupervisor": {
+            "enabled": true,
+            "intervalMs": 5000,
+            "lastError": null,
+            "lastReport": {
+              "blockedItems": 0,
+              "deadlineFailedItems": 0,
+              "expiredAttempts": 0,
+              "failedItems": 0,
+              "retriedItems": 0,
+              "scannedItems": 0,
+              "unblockedItems": 0
+            }
+          },
+          "workloadSupervisorError": null
+        },
+        "maxConcurrentRuns": 4,
+        "providerQuota": {
+          "activeReservations": 0,
+          "consumedReservations": 0,
+          "providerCount": 0,
+          "providers": [],
+          "providersTruncated": false,
+          "releasedReservations": 0,
+          "requestsConsumed": 0,
+          "requestsReserved": 0,
+          "tokensConsumed": 0,
+          "tokensReserved": 0
+        },
+        "queueLimit": 32,
+        "queuedRuns": 0
+      },
+      "readiness": {
+        "computerUse": {
+          "enabled": false,
+          "source": "unknown",
+          "tier": "none"
+        },
+        "configurationComplete": true,
+        "credentialPresent": true,
+        "execution": {
+          "eligibility": "unknown",
+          "permitted": false,
+          "reasonCode": "unknown_capabilities"
+        },
+        "managedByEnv": true,
+        "managerProposal": {
+          "eligibility": "unknown",
+          "permitted": false,
+          "reasonCode": "unknown_capabilities"
+        },
+        "modelId": "grok-build",
+        "ownerId": "$ID_1",
+        "providerId": "env-grokptah",
+        "qualificationEvidence": "unknown",
+        "schema": "grokptah.native-coding-readiness.v1"
+      }
+    },
+    "manager": {
+      "childWorkId": "$ID_2",
+      "create": {
+        "plan": {
+          "coordination": {
+            "mode": "autonomous"
+          },
+          "managerAgentId": "$ID_3",
+          "maxInFlight": 1,
+          "maxReplans": 3,
+          "objective": "shared-black-box-v1-manager-goal",
+          "planId": "$ID_5",
+          "replanCount": 0,
+          "revision": 1,
+          "rootWorkId": "$ID_6",
+          "schemaVersion": 1,
+          "sessionId": "$ID_4",
+          "state": "active",
+          "steps": [
+            {
+              "assignedAgentId": null,
+              "dependencies": [],
+              "kind": "native",
+              "objective": "shared-black-box-v1-manager-child",
+              "policy": {
+                "bounds": {
+                  "maxDurationMs": 900000,
+                  "maxPromptBytes": 100000,
+                  "maxRounds": 24
+                },
+                "managedExecution": "inherit",
+                "maxConcurrentAttempts": 1,
+                "requiresApproval": false,
+                "retry": {
+                  "backoffMs": 0,
+                  "maxAttempts": 3,
+                  "retryExpired": true,
+                  "retryFailed": true
+                }
+              },
+              "priority": 0,
+              "state": "pending",
+              "stepId": "inspect",
+              "workId": null
+            }
+          ],
+          "workspace": "$WORKSPACE"
+        },
+        "rootWork": {
+          "approval": null,
+          "assignedAgentId": null,
+          "assignmentStatus": "unassigned",
+          "attemptCount": 0,
+          "blockedReason": "manager plan container; execute its child Work items",
+          "createdBy": "$ID_1",
+          "deadline": null,
+          "dependencies": [],
+          "isContainer": true,
+          "kind": "manager-plan",
+          "objective": "shared-black-box-v1-manager-goal",
+          "parentWorkId": null,
+          "policy": {
+            "bounds": {
+              "maxDurationMs": 900000,
+              "maxPromptBytes": 100000,
+              "maxRounds": 24
+            },
+            "managedExecution": "inherit",
+            "maxConcurrentAttempts": 1,
+            "requiresApproval": false,
+            "retry": {
+              "backoffMs": 0,
+              "maxAttempts": 3,
+              "retryExpired": true,
+              "retryFailed": true
+            }
+          },
+          "priority": 0,
+          "progress": null,
+          "result": null,
+          "revision": 2,
+          "schemaVersion": 1,
+          "sessionId": "$ID_4",
+          "state": "blocked",
+          "workId": "$ID_6",
+          "workspace": "$WORKSPACE"
+        }
+      },
+      "decisionRun": {
+        "agentId": "$ID_3",
+        "agentSpecRevision": 2,
+        "aggregates": {
+          "accountedProviderAttemptIds": [
+            "$ID_12",
+            "$ID_13"
+          ],
+          "changes": [
+            {
+              "path": "proposal-escape.txt",
+              "summary": "DENIED by deny rule: tool `write_file`"
+            }
+          ],
+          "permissionsDenied": 0,
+          "permissionsGranted": 0,
+          "permissionsRequested": 0,
+          "tests": [],
+          "usage": {
+            "completionTokens": 8,
+            "promptTokens": 12,
+            "requests": 2,
+            "totalTokens": 20
+          },
+          "usageComplete": true,
+          "usagePendingRequests": 0,
+          "verification": {
+            "claims": {
+              "mentionsChanges": true,
+              "mentionsTests": false,
+              "mentionsVerification": false,
+              "present": true
+            },
+            "interrupted": false,
+            "observations": {
+              "changedFiles": 1,
+              "permissionsDenied": 0,
+              "permissionsGranted": 0,
+              "permissionsRequested": 0,
+              "permissionsUnresolved": 0,
+              "testsFailed": 0,
+              "testsIncomplete": 0,
+              "testsObserved": 0,
+              "testsPassed": 0
+            },
+            "status": "unverified",
+            "stopReason": "completed",
+            "usage": {
+              "completionTokens": 8,
+              "promptTokens": 12,
+              "requests": 2,
+              "totalTokens": 20
+            }
+          }
+        },
+        "approval": null,
+        "bounds": {
+          "maxDurationMs": 120000,
+          "maxPromptBytes": 32768,
+          "maxRounds": 2,
+          "maxTotalTokens": 8000
+        },
+        "checkpointId": null,
+        "clientId": "$ID_9",
+        "continuationContextHash": null,
+        "continuationContextId": null,
+        "continuationFidelity": null,
+        "endSeq": 21,
+        "errorCode": null,
+        "execution": null,
+        "finalResponse": "{\\\"directive\\\":{\\\"reason\\\":\\\"replace with one allowed directive\\\",\\\"type\\\":\\\"no_safe_action\\\"},\\\"expectedAgentSpecRevision\\\":2,\\\"expectedPlanRevision\\\":4,\\\"inputSnapshotHash\\\":\\\"$ID_10\\\",\\\"managerAgentId\\\":\\\"$ID_3\\\",\\\"occurrenceId\\\":\\\"manager-decision-$ID_11\\\",\\\"planId\\\":\\\"$ID_5\\\",\\\"schemaVersion\\\":1} Snapshot: {\\\"effectiveBounds\\\":{\\\"maxDurationMs\\\":300000,\\\"maxPromptBytes\\\":65536,\\\"maxRounds\\\":8,\\\"maxTotalTokens\\\":100000},\\\"managerAgentId\\\":\\\"$ID_3\\\",\\\"managerAgentSpecRevision\\\":2,\\\"objective\\\":\\\"shared-black-box-v1-manager-goal\\\",\\\"outcomes\\\":[{\\\"failure\\\":null,\\\"state\\\":\\\"cancelled\\\",\\\"stepId\\\":\\\"inspect\\\",\\\"summary\\\":\\\"work item cancelled\\\",\\\"workId\\\":\\\"$ID_2\\\",\\\"workRevision\\\":2}],\\\"planId\\\":\\\"$ID_5\\\",\\\"planRevision\\\":4,\\\"toolAuthority\\\":\\\"none\\\"}\\n\",\"role\":\"user\"}\n\nChanged files: proposal-escape.txt.",
+        "parentRunId": null,
+        "progress": {
+          "detail": "Model step 2/2",
+          "lastTool": null,
+          "maxRounds": 2,
+          "round": 2
+        },
+        "promptPreview": "Managed Work execution. This is a new finite Run; do not resume an interrupted model invocation.\nWork ID: manager-decisi",
+        "providerExecution": {
+          "attemptCount": 2,
+          "attempts": [
+            {
+              "attemptId": "$ID_12",
+              "httpStatus": null,
+              "ordinal": 1,
+              "retryClass": "explicit_new_run_only",
+              "sendCertainty": "known_accepted",
+              "state": "finished",
+              "usage": {
+                "completionTokens": 4,
+                "promptTokens": 6,
+                "requests": 1,
+                "totalTokens": 10
+              }
+            },
+            {
+              "attemptId": "$ID_13",
+              "httpStatus": null,
+              "ordinal": 2,
+              "retryClass": "explicit_new_run_only",
+              "sendCertainty": "known_accepted",
+              "state": "finished",
+              "usage": {
+                "completionTokens": 4,
+                "promptTokens": 6,
+                "requests": 1,
+                "totalTokens": 10
+              }
+            }
+          ],
+          "attemptsTruncated": false,
+          "pendingRequests": 0,
+          "quota": {
+            "class": "manager_proposal",
+            "limits": {
+              "maxInFlightReservations": 4,
+              "maxRequestsPerWindow": 4096,
+              "maxTokensPerWindow": 10000000,
+              "windowMs": 3600000
+            },
+            "poolId": "$ID_14",
+            "requestsConsumed": 2,
+            "requestsReserved": 3,
+            "reservationId": "$ID_15",
+            "state": "consumed",
+            "tokensConsumed": 20,
+            "tokensReserved": 8000
+          },
+          "route": {
+            "capabilitySource": "declared",
+            "deadlineClass": "standard",
+            "dialect": "open_ai_chat_completions",
+            "effort": "none",
+            "kind": "open_ai_compatible",
+            "modelId": "grok-build",
+            "providerId": "env-grokptah",
+            "qualificationSchema": null,
+            "snapshotHash": "$ID_17",
+            "wireModelId": "grok-build"
+          },
+          "usageComplete": true
+        },
+        "providerRoute": {
+          "baseUrl": "$GATEWAY/v1",
+          "capabilities": {
+            "computer_capability_source": "unknown",
+            "computer_use_tier": "none",
+            "effort_options": [],
+            "image_input": false,
+            "image_media_types": [],
+            "parallel_tool_calls": true,
+            "source": "declared",
+            "stream": true,
+            "tools": true
+          },
+          "credentialFingerprint": "$ID_18",
+          "credentialRef": "env:GROKPTAH_API_KEY",
+          "deadlineClass": "standard",
+          "dialect": "open_ai_chat_completions",
+          "effort": "none",
+          "endpointFingerprint": "$ID_20",
+          "kind": "open_ai_compatible",
+          "modelId": "grok-build",
+          "providerId": "env-grokptah",
+          "quotaClass": "manager_proposal",
+          "quotaReservationId": "$ID_15",
+          "schemaVersion": 1,
+          "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+          "snapshotHash": "$ID_17",
+          "wireModelId": "grok-build"
+        },
+        "purpose": "manager_proposal",
+        "queuePosition": null,
+        "requestId": "$ID_21",
+        "retryOf": null,
+        "runId": "$ID_16",
+        "sessionId": "$ID_4",
+        "startSeq": 13,
+        "state": "completed",
+        "stopCause": "completed",
+        "terminalResult": "completed",
+        "workspace": "$WORKSPACE"
+      },
+      "decisionWork": {
+        "attempts": [
+          {
+            "attemptId": "$ID_22",
+            "attemptNumber": 1,
+            "claimantId": "$ID_3",
+            "linkedRunIds": [
+              "$ID_16"
+            ],
+            "progress": {
+              "percent": 1,
+              "summary": "native executor admitted a finite Run"
+            },
+            "result": {
+              "artifacts": [],
+              "cancellationReason": null,
+              "evidence": [],
+              "failure": null,
+              "summary": "{\\\"directive\\\":{\\\"reason\\\":\\\"replace with one allowed directive\\\",\\\"type\\\":\\\"no_safe_action\\\"},\\\"expectedAgentSpecRevision\\\":2,\\\"expectedPlanRevision\\\":4,\\\"inputSnapshotHash\\\":\\\"$ID_10\\\",\\\"managerAgentId\\\":\\\"$ID_3\\\",\\\"occurrenceId\\\":\\\"manager-decision-$ID_11\\\",\\\"planId\\\":\\\"$ID_5\\\",\\\"schemaVersion\\\":1} Snapshot: {\\\"effectiveBounds\\\":{\\\"maxDurationMs\\\":300000,\\\"maxPromptBytes\\\":65536,\\\"maxRounds\\\":8,\\\"maxTotalTokens\\\":100000},\\\"managerAgentId\\\":\\\"$ID_3\\\",\\\"managerAgentSpecRevision\\\":2,\\\"objective\\\":\\\"shared-black-box-v1-manager-goal\\\",\\\"outcomes\\\":[{\\\"failure\\\":null,\\\"state\\\":\\\"cancelled\\\",\\\"stepId\\\":\\\"inspect\\\",\\\"summary\\\":\\\"work item cancelled\\\",\\\"workId\\\":\\\"$ID_2\\\",\\\"workRevision\\\":2}],\\\"planId\\\":\\\"$ID_5\\\",\\\"planRevision\\\":4,\\\"toolAuthority\\\":\\\"none\\\"}\\n\",\"role\":\"user\"}\n\nChanged files: proposal-escape.txt."
+            },
+            "schemaVersion": 1,
+            "state": "succeeded",
+            "terminalReason": "managed run completed",
+            "workId": "$ID_23"
+          }
+        ],
+        "work": {
+          "approval": null,
+          "assignedAgentId": "$ID_3",
+          "assignmentStatus": "accepted",
+          "attemptCount": 1,
+          "createdBy": "manager-supervisor",
+          "deadline": null,
+          "dependencies": [],
+          "isContainer": false,
+          "kind": "manager-decision",
+          "objective": "Return exactly this JSON envelope with only directive replaced, and no prose. You have no tool authority. Envelope: {\"directive\":{\"reason\":\"replace with one allowed directive\",\"type\":\"no_safe_action\"},\"expectedAgentSpecRevision\":2,\"expectedPlanRevision\":4,\"inputSnapshotHash\":\"$ID_10\",\"managerAgentId\":\"$ID_3\",\"occurrenceId\":\"manager-decision-$ID_11\",\"planId\":\"$ID_5\",\"schemaVersion\":1} Snapshot: {\"effectiveBounds\":{\"maxDurationMs\":300000,\"maxPromptBytes\":65536,\"maxRounds\":8,\"maxTotalTokens\":100000},\"managerAgentId\":\"$ID_3\",\"managerAgentSpecRevision\":2,\"objective\":\"shared-black-box-v1-manager-goal\",\"outcomes\":[{\"failure\":null,\"state\":\"cancelled\",\"stepId\":\"inspect\",\"summary\":\"work item cancelled\",\"workId\":\"$ID_2\",\"workRevision\":2}],\"planId\":\"$ID_5\",\"planRevision\":4,\"toolAuthority\":\"none\"}",
+          "parentWorkId": "$ID_6",
+          "policy": {
+            "bounds": {
+              "maxDurationMs": 120000,
+              "maxPromptBytes": 32768,
+              "maxRounds": 2,
+              "maxTotalTokens": 8000
+            },
+            "managedExecution": "inherit",
+            "maxConcurrentAttempts": 1,
+            "requiresApproval": false,
+            "retry": {
+              "backoffMs": 0,
+              "maxAttempts": 1,
+              "retryExpired": true,
+              "retryFailed": true
+            }
+          },
+          "priority": 0,
+          "progress": {
+            "percent": 1,
+            "summary": "native executor admitted a finite Run"
+          },
+          "result": {
+            "artifacts": [],
+            "cancellationReason": null,
+            "evidence": [],
+            "failure": null,
+            "summary": "{\\\"directive\\\":{\\\"reason\\\":\\\"replace with one allowed directive\\\",\\\"type\\\":\\\"no_safe_action\\\"},\\\"expectedAgentSpecRevision\\\":2,\\\"expectedPlanRevision\\\":4,\\\"inputSnapshotHash\\\":\\\"$ID_10\\\",\\\"managerAgentId\\\":\\\"$ID_3\\\",\\\"occurrenceId\\\":\\\"manager-decision-$ID_11\\\",\\\"planId\\\":\\\"$ID_5\\\",\\\"schemaVersion\\\":1} Snapshot: {\\\"effectiveBounds\\\":{\\\"maxDurationMs\\\":300000,\\\"maxPromptBytes\\\":65536,\\\"maxRounds\\\":8,\\\"maxTotalTokens\\\":100000},\\\"managerAgentId\\\":\\\"$ID_3\\\",\\\"managerAgentSpecRevision\\\":2,\\\"objective\\\":\\\"shared-black-box-v1-manager-goal\\\",\\\"outcomes\\\":[{\\\"failure\\\":null,\\\"state\\\":\\\"cancelled\\\",\\\"stepId\\\":\\\"inspect\\\",\\\"summary\\\":\\\"work item cancelled\\\",\\\"workId\\\":\\\"$ID_2\\\",\\\"workRevision\\\":2}],\\\"planId\\\":\\\"$ID_5\\\",\\\"planRevision\\\":4,\\\"toolAuthority\\\":\\\"none\\\"}\\n\",\"role\":\"user\"}\n\nChanged files: proposal-escape.txt."
+          },
+          "revision": 4,
+          "schemaVersion": 1,
+          "sessionId": "$ID_4",
+          "sourceManagerPlanId": "$ID_5",
+          "sourceManagerStepId": "__manager_decision__",
+          "state": "succeeded",
+          "workId": "$ID_23",
+          "workspace": "$WORKSPACE"
+        }
+      },
+      "get": {
+        "plan": {
+          "coordination": {
+            "mode": "autonomous"
+          },
+          "lastError": "step Work was cancelled",
+          "managerAgentId": "$ID_3",
+          "maxInFlight": 1,
+          "maxReplans": 3,
+          "objective": "shared-black-box-v1-manager-goal",
+          "planId": "$ID_5",
+          "replanCount": 0,
+          "revision": 4,
+          "rootWorkId": "$ID_6",
+          "schemaVersion": 1,
+          "sessionId": "$ID_4",
+          "state": "needs_replan",
+          "steps": [
+            {
+              "assignedAgentId": null,
+              "dependencies": [],
+              "kind": "native",
+              "lastError": "step Work was cancelled",
+              "lastNotificationMessageId": "$ID_24",
+              "lastNotificationWorkRevision": 2,
+              "objective": "shared-black-box-v1-manager-child",
+              "policy": {
+                "bounds": {
+                  "maxDurationMs": 900000,
+                  "maxPromptBytes": 100000,
+                  "maxRounds": 24
+                },
+                "managedExecution": "inherit",
+                "maxConcurrentAttempts": 1,
+                "requiresApproval": false,
+                "retry": {
+                  "backoffMs": 0,
+                  "maxAttempts": 3,
+                  "retryExpired": true,
+                  "retryFailed": true
+                }
+              },
+              "priority": 0,
+              "state": "cancelled",
+              "stepId": "inspect",
+              "workId": "$ID_2"
+            }
+          ],
+          "workspace": "$WORKSPACE"
+        }
+      },
+      "list": {
+        "plans": [
+          {
+            "coordination": {
+              "mode": "autonomous"
+            },
+            "lastError": "step Work was cancelled",
+            "managerAgentId": "$ID_3",
+            "maxInFlight": 1,
+            "maxReplans": 3,
+            "objective": "shared-black-box-v1-manager-goal",
+            "planId": "$ID_5",
+            "replanCount": 0,
+            "revision": 4,
+            "rootWorkId": "$ID_6",
+            "schemaVersion": 1,
+            "sessionId": "$ID_4",
+            "state": "needs_replan",
+            "steps": [
+              {
+                "assignedAgentId": null,
+                "dependencies": [],
+                "kind": "native",
+                "lastError": "step Work was cancelled",
+                "lastNotificationMessageId": "$ID_24",
+                "lastNotificationWorkRevision": 2,
+                "objective": "shared-black-box-v1-manager-child",
+                "policy": {
+                  "bounds": {
+                    "maxDurationMs": 900000,
+                    "maxPromptBytes": 100000,
+                    "maxRounds": 24
+                  },
+                  "managedExecution": "inherit",
+                  "maxConcurrentAttempts": 1,
+                  "requiresApproval": false,
+                  "retry": {
+                    "backoffMs": 0,
+                    "maxAttempts": 3,
+                    "retryExpired": true,
+                    "retryFailed": true
+                  }
+                },
+                "priority": 0,
+                "state": "cancelled",
+                "stepId": "inspect",
+                "workId": "$ID_2"
+              }
+            ],
+            "workspace": "$WORKSPACE"
+          }
+        ]
+      }
+    },
+    "native": {
+      "capacity": {
+        "activeRuns": 0,
+        "available": 4,
+        "health": {
+          "auditPersistenceError": null,
+          "eventJournalPersistenceError": null,
+          "managerSupervisor": {
+            "enabled": true,
+            "intervalMs": 2000,
+            "lastError": null,
+            "lastReport": {
+              "bounded": false,
+              "decisionsApplied": 0,
+              "decisionsCreated": 0,
+              "decisionsRejected": 0,
+              "messagesCreated": 0,
+              "plansProcessed": 0,
+              "plansScanned": 0,
+              "workCreated": 0
+            }
+          },
+          "managerSupervisorError": null,
+          "nativeExecutor": {
+            "admitted": 1,
+            "enabled": true,
+            "finalized": 1,
+            "intervalMs": 1000,
+            "lastError": null,
+            "maxConcurrentProviderRuns": 4
+          },
+          "nativeExecutorError": null,
+          "routineSupervisor": {
+            "enabled": true,
+            "intervalMs": 1000,
+            "lastError": null,
+            "lastReport": {
+              "createdWork": 0,
+              "deduplicated": 0,
+              "rejected": 0,
+              "scannedRoutines": 0,
+              "skipped": 0
+            }
+          },
+          "routineSupervisorError": null,
+          "runPersistenceError": null,
+          "workloadSupervisor": {
+            "enabled": true,
+            "intervalMs": 5000,
+            "lastError": null,
+            "lastReport": {
+              "blockedItems": 0,
+              "deadlineFailedItems": 0,
+              "expiredAttempts": 0,
+              "failedItems": 0,
+              "retriedItems": 0,
+              "scannedItems": 0,
+              "unblockedItems": 0
+            }
+          },
+          "workloadSupervisorError": null
+        },
+        "maxConcurrentRuns": 4,
+        "providerQuota": {
+          "activeReservations": 0,
+          "consumedReservations": 2,
+          "providerCount": 1,
+          "providers": [
+            "env-grokptah"
+          ],
+          "providersTruncated": false,
+          "releasedReservations": 0,
+          "requestsConsumed": 2,
+          "requestsReserved": 0,
+          "tokensConsumed": 20,
+          "tokensReserved": 0
+        },
+        "queueLimit": 32,
+        "queuedRuns": 0
+      },
+      "getRun": {
+        "agentId": "$ID_3",
+        "agentSpecRevision": 2,
+        "aggregates": {
+          "accountedProviderAttemptIds": [
+            "$ID_27"
+          ],
+          "changes": [],
+          "permissionsDenied": 0,
+          "permissionsGranted": 0,
+          "permissionsRequested": 0,
+          "tests": [],
+          "usage": {
+            "completionTokens": 4,
+            "promptTokens": 6,
+            "requests": 1,
+            "totalTokens": 10
+          },
+          "usageComplete": true,
+          "usagePendingRequests": 0,
+          "verification": {
+            "claims": {
+              "mentionsChanges": true,
+              "mentionsTests": false,
+              "mentionsVerification": true,
+              "present": true
+            },
+            "interrupted": false,
+            "observations": {
+              "changedFiles": 0,
+              "permissionsDenied": 0,
+              "permissionsGranted": 0,
+              "permissionsRequested": 0,
+              "permissionsUnresolved": 0,
+              "testsFailed": 0,
+              "testsIncomplete": 0,
+              "testsObserved": 0,
+              "testsPassed": 0
+            },
+            "status": "unverified",
+            "stopReason": "completed",
+            "usage": {
+              "completionTokens": 4,
+              "promptTokens": 6,
+              "requests": 1,
+              "totalTokens": 10
+            }
+          }
+        },
+        "approval": null,
+        "bounds": {
+          "maxDurationMs": 60000,
+          "maxPromptBytes": 65536,
+          "maxRounds": 4,
+          "maxTotalTokens": 1000
+        },
+        "checkpointId": null,
+        "clientId": "$ID_9",
+        "continuationContextHash": null,
+        "continuationContextId": null,
+        "continuationFidelity": null,
+        "endSeq": 12,
+        "errorCode": null,
+        "execution": null,
+        "finalResponse": "native route snapshot verified\n\nNo files changed.",
+        "parentRunId": null,
+        "progress": {
+          "detail": "Model step 1/4",
+          "lastTool": null,
+          "maxRounds": 4,
+          "round": 1
+        },
+        "promptPreview": "Managed Work execution. This is a new finite Run; do not resume an interrupted model invocation.\nWork ID: $ID_35",
+        "providerExecution": {
+          "attemptCount": 1,
+          "attempts": [
+            {
+              "attemptId": "$ID_27",
+              "httpStatus": null,
+              "ordinal": 1,
+              "retryClass": "explicit_new_run_only",
+              "sendCertainty": "known_accepted",
+              "state": "finished",
+              "usage": {
+                "completionTokens": 4,
+                "promptTokens": 6,
+                "requests": 1,
+                "totalTokens": 10
+              }
+            }
+          ],
+          "attemptsTruncated": false,
+          "pendingRequests": 0,
+          "quota": {
+            "class": "coding_execution",
+            "limits": {
+              "maxInFlightReservations": 4,
+              "maxRequestsPerWindow": 4096,
+              "maxTokensPerWindow": 10000000,
+              "windowMs": 3600000
+            },
+            "poolId": "$ID_28",
+            "requestsConsumed": 1,
+            "requestsReserved": 5,
+            "reservationId": "$ID_29",
+            "state": "consumed",
+            "tokensConsumed": 10,
+            "tokensReserved": 1000
+          },
+          "route": {
+            "capabilitySource": "declared",
+            "deadlineClass": "standard",
+            "dialect": "open_ai_chat_completions",
+            "effort": "none",
+            "kind": "open_ai_compatible",
+            "modelId": "grok-build",
+            "providerId": "env-grokptah",
+            "qualificationSchema": null,
+            "snapshotHash": "$ID_31",
+            "wireModelId": "grok-build"
+          },
+          "usageComplete": true
+        },
+        "providerRoute": {
+          "baseUrl": "$GATEWAY/v1",
+          "capabilities": {
+            "computer_capability_source": "unknown",
+            "computer_use_tier": "none",
+            "effort_options": [],
+            "image_input": false,
+            "image_media_types": [],
+            "parallel_tool_calls": true,
+            "source": "declared",
+            "stream": true,
+            "tools": true
+          },
+          "credentialFingerprint": "$ID_18",
+          "credentialRef": "env:GROKPTAH_API_KEY",
+          "deadlineClass": "standard",
+          "dialect": "open_ai_chat_completions",
+          "effort": "none",
+          "endpointFingerprint": "$ID_20",
+          "kind": "open_ai_compatible",
+          "modelId": "grok-build",
+          "providerId": "env-grokptah",
+          "quotaClass": "coding_execution",
+          "quotaReservationId": "$ID_29",
+          "schemaVersion": 1,
+          "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+          "snapshotHash": "$ID_31",
+          "wireModelId": "grok-build"
+        },
+        "purpose": "execution",
+        "queuePosition": null,
+        "requestId": "$ID_32",
+        "retryOf": null,
+        "runId": "$ID_30",
+        "sessionId": "$ID_4",
+        "startSeq": 7,
+        "state": "completed",
+        "stopCause": "completed",
+        "terminalResult": "completed",
+        "workspace": "$WORKSPACE"
+      },
+      "intents": {
+        "executor": {
+          "admitted": 1,
+          "enabled": true,
+          "finalized": 1,
+          "intervalMs": 1000,
+          "lastError": null,
+          "maxConcurrentProviderRuns": 4
+        },
+        "intents": [
+          {
+            "agentId": "$ID_3",
+            "agentSpecRevision": 2,
+            "attemptId": "$ID_33",
+            "bounds": {
+              "maxDurationMs": 60000,
+              "maxPromptBytes": 65536,
+              "maxRounds": 4,
+              "maxTotalTokens": 1000
+            },
+            "inputHash": "$ID_34",
+            "intentId": "$ID_32",
+            "modelSelectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+            "providerRoute": {
+              "modelId": "grok-build",
+              "providerId": "env-grokptah"
+            },
+            "runId": "$ID_30",
+            "schemaVersion": 1,
+            "sessionId": "$ID_4",
+            "state": "finalized",
+            "workId": "$ID_35",
+            "workRevision": 2,
+            "workspace": "$WORKSPACE"
+          }
+        ],
+        "providerAdmission": {
+          "liveInScopeByProvider": {},
+          "maxConcurrentRunsPerProvider": 4
+        }
+      },
+      "listWork": {
+        "work": [
+          {
+            "approval": null,
+            "assignedAgentId": "$ID_3",
+            "assignmentStatus": "accepted",
+            "attemptCount": 1,
+            "createdBy": "$ID_1",
+            "deadline": null,
+            "dependencies": [],
+            "isContainer": false,
+            "kind": "native",
+            "objective": "shared-black-box-v1-ordinary-native",
+            "parentWorkId": null,
+            "policy": {
+              "bounds": {
+                "maxDurationMs": 60000,
+                "maxPromptBytes": 65536,
+                "maxRounds": 4,
+                "maxTotalTokens": 1000
+              },
+              "managedExecution": "inherit",
+              "maxConcurrentAttempts": 1,
+              "requiresApproval": false,
+              "retry": {
+                "backoffMs": 0,
+                "maxAttempts": 1,
+                "retryExpired": false,
+                "retryFailed": false
+              }
+            },
+            "priority": 0,
+            "progress": {
+              "percent": 1,
+              "summary": "native executor admitted a finite Run"
+            },
+            "result": {
+              "artifacts": [],
+              "cancellationReason": null,
+              "evidence": [],
+              "failure": null,
+              "summary": "native route snapshot verified\n\nNo files changed."
+            },
+            "revision": 5,
+            "schemaVersion": 1,
+            "sessionId": "$ID_4",
+            "state": "succeeded",
+            "workId": "$ID_35",
+            "workspace": "$WORKSPACE"
+          }
+        ]
+      },
+      "managed": {
+        "agentId": "$ID_3",
+        "executor": {
+          "admitted": 0,
+          "enabled": true,
+          "finalized": 0,
+          "intervalMs": 1000,
+          "lastError": null,
+          "maxConcurrentProviderRuns": 4
+        },
+        "managedExecution": {
+          "allowedSourceRoutineIds": [],
+          "allowedWorkKinds": [
+            "manager-decision",
+            "native"
+          ],
+          "bounds": {
+            "maxDurationMs": 300000,
+            "maxPromptBytes": 65536,
+            "maxRounds": 8,
+            "maxTotalTokens": 100000
+          },
+          "enabled": true,
+          "maxConcurrentRuns": 1,
+          "requiresApprovalBeforeExecution": false,
+          "retryEligible": true
+        },
+        "policyRevision": 2
+      },
+      "runs": {
+        "runs": [
+          {
+            "agentId": "$ID_3",
+            "agentSpecRevision": 2,
+            "aggregates": {
+              "accountedProviderAttemptIds": [
+                "$ID_27"
+              ],
+              "changes": [],
+              "permissionsDenied": 0,
+              "permissionsGranted": 0,
+              "permissionsRequested": 0,
+              "tests": [],
+              "usage": {
+                "completionTokens": 4,
+                "promptTokens": 6,
+                "requests": 1,
+                "totalTokens": 10
+              },
+              "usageComplete": true,
+              "usagePendingRequests": 0,
+              "verification": {
+                "claims": {
+                  "mentionsChanges": true,
+                  "mentionsTests": false,
+                  "mentionsVerification": true,
+                  "present": true
+                },
+                "interrupted": false,
+                "observations": {
+                  "changedFiles": 0,
+                  "permissionsDenied": 0,
+                  "permissionsGranted": 0,
+                  "permissionsRequested": 0,
+                  "permissionsUnresolved": 0,
+                  "testsFailed": 0,
+                  "testsIncomplete": 0,
+                  "testsObserved": 0,
+                  "testsPassed": 0
+                },
+                "status": "unverified",
+                "stopReason": "completed",
+                "usage": {
+                  "completionTokens": 4,
+                  "promptTokens": 6,
+                  "requests": 1,
+                  "totalTokens": 10
+                }
+              }
+            },
+            "approval": null,
+            "bounds": {
+              "maxDurationMs": 60000,
+              "maxPromptBytes": 65536,
+              "maxRounds": 4,
+              "maxTotalTokens": 1000
+            },
+            "checkpointId": null,
+            "clientId": "$ID_9",
+            "continuationContextHash": null,
+            "continuationContextId": null,
+            "continuationFidelity": null,
+            "endSeq": 12,
+            "errorCode": null,
+            "execution": null,
+            "finalResponse": "native route snapshot verified\n\nNo files changed.",
+            "parentRunId": null,
+            "progress": {
+              "detail": "Model step 1/4",
+              "lastTool": null,
+              "maxRounds": 4,
+              "round": 1
+            },
+            "promptPreview": "Managed Work execution. This is a new finite Run; do not resume an interrupted model invocation.\nWork ID: $ID_35",
+            "providerRoute": {
+              "baseUrl": "$GATEWAY/v1",
+              "capabilities": {
+                "computer_capability_source": "unknown",
+                "computer_use_tier": "none",
+                "effort_options": [],
+                "image_input": false,
+                "image_media_types": [],
+                "parallel_tool_calls": true,
+                "source": "declared",
+                "stream": true,
+                "tools": true
+              },
+              "credentialFingerprint": "$ID_18",
+              "credentialRef": "env:GROKPTAH_API_KEY",
+              "deadlineClass": "standard",
+              "dialect": "open_ai_chat_completions",
+              "effort": "none",
+              "endpointFingerprint": "$ID_20",
+              "kind": "open_ai_compatible",
+              "modelId": "grok-build",
+              "providerId": "env-grokptah",
+              "quotaClass": "coding_execution",
+              "quotaReservationId": "$ID_29",
+              "schemaVersion": 1,
+              "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+              "snapshotHash": "$ID_31",
+              "wireModelId": "grok-build"
+            },
+            "purpose": "execution",
+            "queuePosition": null,
+            "requestId": "$ID_32",
+            "retryOf": null,
+            "runId": "$ID_30",
+            "sessionId": "$ID_4",
+            "startSeq": 7,
+            "state": "completed",
+            "stopCause": "completed",
+            "terminalResult": "completed",
+            "workspace": "$WORKSPACE"
+          },
+          {
+            "agentId": "$ID_3",
+            "agentSpecRevision": 1,
+            "aggregates": {
+              "accountedProviderAttemptIds": [
+                "provider-attempt-$ID_36"
+              ],
+              "changes": [],
+              "permissionsDenied": 0,
+              "permissionsGranted": 0,
+              "permissionsRequested": 0,
+              "tests": [],
+              "usage": {
+                "completionTokens": 4,
+                "promptTokens": 6,
+                "requests": 1,
+                "totalTokens": 10
+              },
+              "usageComplete": true,
+              "usagePendingRequests": 0,
+              "verification": {
+                "claims": {
+                  "mentionsChanges": true,
+                  "mentionsTests": false,
+                  "mentionsVerification": true,
+                  "present": true
+                },
+                "interrupted": false,
+                "observations": {
+                  "changedFiles": 0,
+                  "permissionsDenied": 0,
+                  "permissionsGranted": 0,
+                  "permissionsRequested": 0,
+                  "permissionsUnresolved": 0,
+                  "testsFailed": 0,
+                  "testsIncomplete": 0,
+                  "testsObserved": 0,
+                  "testsPassed": 0
+                },
+                "status": "unverified",
+                "stopReason": "completed",
+                "usage": {
+                  "completionTokens": 4,
+                  "promptTokens": 6,
+                  "requests": 1,
+                  "totalTokens": 10
+                }
+              }
+            },
+            "approval": null,
+            "bounds": {
+              "maxDurationMs": 900000,
+              "maxPromptBytes": 100000,
+              "maxRounds": 24,
+              "maxTotalTokens": 250000
+            },
+            "checkpointId": null,
+            "clientId": "$ID_37",
+            "continuationContextHash": null,
+            "continuationContextId": null,
+            "continuationFidelity": null,
+            "endSeq": 6,
+            "errorCode": null,
+            "execution": null,
+            "finalResponse": "native route snapshot verified\n\nNo files changed.",
+            "parentRunId": null,
+            "progress": {
+              "detail": "Model step 1/24",
+              "lastTool": null,
+              "maxRounds": 24,
+              "round": 1
+            },
+            "promptPreview": "shared-black-box-v1-bootstrap-session-agent",
+            "providerRoute": {
+              "baseUrl": "$GATEWAY/v1",
+              "capabilities": {
+                "computer_capability_source": "unknown",
+                "computer_use_tier": "none",
+                "effort_options": [],
+                "image_input": false,
+                "image_media_types": [],
+                "parallel_tool_calls": true,
+                "source": "declared",
+                "stream": true,
+                "tools": true
+              },
+              "credentialFingerprint": "$ID_18",
+              "credentialRef": "env:GROKPTAH_API_KEY",
+              "deadlineClass": "standard",
+              "dialect": "open_ai_chat_completions",
+              "effort": "none",
+              "endpointFingerprint": "$ID_20",
+              "kind": "open_ai_compatible",
+              "modelId": "grok-build",
+              "providerId": "env-grokptah",
+              "quotaClass": "coding_execution",
+              "quotaReservationId": "$ID_38",
+              "schemaVersion": 1,
+              "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+              "snapshotHash": "$ID_40",
+              "wireModelId": "grok-build"
+            },
+            "purpose": "execution",
+            "queuePosition": null,
+            "requestId": "sbb-v1-bootstrap-submit",
+            "retryOf": null,
+            "runId": "$ID_39",
+            "sessionId": "$ID_4",
+            "startSeq": 1,
+            "state": "completed",
+            "stopCause": "completed",
+            "terminalResult": "completed",
+            "workspace": "$WORKSPACE"
+          }
+        ]
+      },
+      "session": {
+        "busy": false,
+        "sessionId": "$ID_4",
+        "title": "shared-black-box-v1",
+        "workspace": "$WORKSPACE"
+      },
+      "work": {
+        "attempts": [
+          {
+            "attemptId": "$ID_33",
+            "attemptNumber": 1,
+            "claimantId": "$ID_3",
+            "linkedRunIds": [
+              "$ID_30"
+            ],
+            "progress": {
+              "percent": 1,
+              "summary": "native executor admitted a finite Run"
+            },
+            "result": {
+              "artifacts": [],
+              "cancellationReason": null,
+              "evidence": [],
+              "failure": null,
+              "summary": "native route snapshot verified\n\nNo files changed."
+            },
+            "schemaVersion": 1,
+            "state": "succeeded",
+            "terminalReason": "managed run completed",
+            "workId": "$ID_35"
+          }
+        ],
+        "work": {
+          "approval": null,
+          "assignedAgentId": "$ID_3",
+          "assignmentStatus": "accepted",
+          "attemptCount": 1,
+          "createdBy": "$ID_1",
+          "deadline": null,
+          "dependencies": [],
+          "isContainer": false,
+          "kind": "native",
+          "objective": "shared-black-box-v1-ordinary-native",
+          "parentWorkId": null,
+          "policy": {
+            "bounds": {
+              "maxDurationMs": 60000,
+              "maxPromptBytes": 65536,
+              "maxRounds": 4,
+              "maxTotalTokens": 1000
+            },
+            "managedExecution": "inherit",
+            "maxConcurrentAttempts": 1,
+            "requiresApproval": false,
+            "retry": {
+              "backoffMs": 0,
+              "maxAttempts": 1,
+              "retryExpired": false,
+              "retryFailed": false
+            }
+          },
+          "priority": 0,
+          "progress": {
+            "percent": 1,
+            "summary": "native executor admitted a finite Run"
+          },
+          "result": {
+            "artifacts": [],
+            "cancellationReason": null,
+            "evidence": [],
+            "failure": null,
+            "summary": "native route snapshot verified\n\nNo files changed."
+          },
+          "revision": 5,
+          "schemaVersion": 1,
+          "sessionId": "$ID_4",
+          "state": "succeeded",
+          "workId": "$ID_35",
+          "workspace": "$WORKSPACE"
+        }
+      }
+    },
+    "proposal": {
+      "fileExists": false,
+      "hostDenials": 1,
+      "targetRelativePath": "proposal-escape.txt"
+    },
+    "restart": {
+      "httpBeforeStop": 1,
+      "postRestart": [
+        {
+          "capacity": {
+            "activeRuns": 1,
+            "available": 3,
+            "health": {
+              "auditPersistenceError": null,
+              "eventJournalPersistenceError": null,
+              "managerSupervisor": {
+                "enabled": true,
+                "intervalMs": 2000,
+                "lastError": null,
+                "lastReport": {
+                  "bounded": false,
+                  "decisionsApplied": 0,
+                  "decisionsCreated": 0,
+                  "decisionsRejected": 0,
+                  "messagesCreated": 0,
+                  "plansProcessed": 1,
+                  "plansScanned": 1,
+                  "workCreated": 0
+                }
+              },
+              "managerSupervisorError": null,
+              "nativeExecutor": {
+                "admitted": 1,
+                "enabled": true,
+                "finalized": 1,
+                "intervalMs": 1000,
+                "lastError": null,
+                "maxConcurrentProviderRuns": 4
+              },
+              "nativeExecutorError": null,
+              "routineSupervisor": {
+                "enabled": true,
+                "intervalMs": 1000,
+                "lastError": null,
+                "lastReport": {
+                  "createdWork": 0,
+                  "deduplicated": 0,
+                  "rejected": 0,
+                  "scannedRoutines": 0,
+                  "skipped": 0
+                }
+              },
+              "routineSupervisorError": null,
+              "runPersistenceError": null,
+              "workloadSupervisor": {
+                "enabled": true,
+                "intervalMs": 5000,
+                "lastError": null,
+                "lastReport": {
+                  "blockedItems": 0,
+                  "deadlineFailedItems": 0,
+                  "expiredAttempts": 0,
+                  "failedItems": 0,
+                  "retriedItems": 0,
+                  "scannedItems": 5,
+                  "unblockedItems": 0
+                }
+              },
+              "workloadSupervisorError": null
+            },
+            "maxConcurrentRuns": 4,
+            "providerQuota": {
+              "activeReservations": 2,
+              "consumedReservations": 3,
+              "providerCount": 1,
+              "providers": [
+                "env-grokptah"
+              ],
+              "providersTruncated": false,
+              "releasedReservations": 0,
+              "requestsConsumed": 4,
+              "requestsReserved": 10,
+              "tokensConsumed": 40,
+              "tokensReserved": 2000
+            },
+            "queueLimit": 32,
+            "queuedRuns": 0
+          },
+          "getRun": {
+            "agentId": "$ID_3",
+            "agentSpecRevision": 2,
+            "aggregates": {
+              "accountedProviderAttemptIds": [
+                "$ID_42"
+              ],
+              "changes": [],
+              "permissionsDenied": 0,
+              "permissionsGranted": 0,
+              "permissionsRequested": 0,
+              "tests": [],
+              "usage": {
+                "completionTokens": 0,
+                "promptTokens": 0,
+                "requests": 0,
+                "totalTokens": 0
+              },
+              "usageComplete": false,
+              "usagePendingRequests": 0,
+              "verification": {
+                "claims": {
+                  "mentionsChanges": true,
+                  "mentionsTests": false,
+                  "mentionsVerification": false,
+                  "present": true
+                },
+                "interrupted": true,
+                "observations": {
+                  "changedFiles": 0,
+                  "permissionsDenied": 0,
+                  "permissionsGranted": 0,
+                  "permissionsRequested": 0,
+                  "permissionsUnresolved": 0,
+                  "testsFailed": 0,
+                  "testsIncomplete": 0,
+                  "testsObserved": 0,
+                  "testsPassed": 0
+                },
+                "status": "incomplete",
+                "stopReason": "cancelled",
+                "usage": {
+                  "completionTokens": 0,
+                  "promptTokens": 0,
+                  "requests": 0,
+                  "totalTokens": 0
+                }
+              }
+            },
+            "approval": null,
+            "bounds": {
+              "maxDurationMs": 300000,
+              "maxPromptBytes": 65536,
+              "maxRounds": 4,
+              "maxTotalTokens": 1000
+            },
+            "checkpointId": null,
+            "clientId": "$ID_9",
+            "continuationContextHash": null,
+            "continuationContextId": null,
+            "continuationFidelity": null,
+            "endSeq": 27,
+            "errorCode": "max_total_tokens_usage_unavailable",
+            "execution": null,
+            "finalResponse": "Stopped at the run token boundary because the provider did not return usable token metadata for a run bounded by max_total_tokens=1000.\n\nChanged files: proposal-escape.txt.",
+            "parentRunId": null,
+            "progress": {
+              "detail": "Model step 1/4",
+              "lastTool": null,
+              "maxRounds": 4,
+              "round": 1
+            },
+            "promptPreview": "Managed Work execution. This is a new finite Run; do not resume an interrupted model invocation.\nWork ID: $ID_49",
+            "providerExecution": {
+              "attemptCount": 1,
+              "attempts": [
+                {
+                  "attemptId": "$ID_42",
+                  "httpStatus": null,
+                  "ordinal": 1,
+                  "retryClass": "explicit_new_run_only",
+                  "sendCertainty": "uncertain_accept",
+                  "state": "finished",
+                  "usage": null
+                }
+              ],
+              "attemptsTruncated": false,
+              "pendingRequests": 0,
+              "quota": {
+                "class": "coding_execution",
+                "limits": {
+                  "maxInFlightReservations": 4,
+                  "maxRequestsPerWindow": 4096,
+                  "maxTokensPerWindow": 10000000,
+                  "windowMs": 3600000
+                },
+                "poolId": "$ID_28",
+                "requestsConsumed": 0,
+                "requestsReserved": 5,
+                "reservationId": "$ID_43",
+                "state": "reserved",
+                "tokensConsumed": 0,
+                "tokensReserved": 1000
+              },
+              "route": {
+                "capabilitySource": "declared",
+                "deadlineClass": "standard",
+                "dialect": "open_ai_chat_completions",
+                "effort": "none",
+                "kind": "open_ai_compatible",
+                "modelId": "grok-build",
+                "providerId": "env-grokptah",
+                "qualificationSchema": null,
+                "snapshotHash": "$ID_45",
+                "wireModelId": "grok-build"
+              },
+              "usageComplete": false
+            },
+            "providerRoute": {
+              "baseUrl": "$GATEWAY/v1",
+              "capabilities": {
+                "computer_capability_source": "unknown",
+                "computer_use_tier": "none",
+                "effort_options": [],
+                "image_input": false,
+                "image_media_types": [],
+                "parallel_tool_calls": true,
+                "source": "declared",
+                "stream": true,
+                "tools": true
+              },
+              "credentialFingerprint": "$ID_18",
+              "credentialRef": "env:GROKPTAH_API_KEY",
+              "deadlineClass": "standard",
+              "dialect": "open_ai_chat_completions",
+              "effort": "none",
+              "endpointFingerprint": "$ID_20",
+              "kind": "open_ai_compatible",
+              "modelId": "grok-build",
+              "providerId": "env-grokptah",
+              "quotaClass": "coding_execution",
+              "quotaReservationId": "$ID_43",
+              "schemaVersion": 1,
+              "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+              "snapshotHash": "$ID_45",
+              "wireModelId": "grok-build"
+            },
+            "purpose": "execution",
+            "queuePosition": null,
+            "requestId": "$ID_46",
+            "retryOf": null,
+            "runId": "$ID_44",
+            "sessionId": "$ID_4",
+            "startSeq": 22,
+            "state": "limit_reached",
+            "stopCause": "token_accounting_unavailable",
+            "terminalResult": "max_total_tokens_usage_unavailable",
+            "workspace": "$WORKSPACE"
+          },
+          "http": 2,
+          "intents": {
+            "executor": {
+              "admitted": 1,
+              "enabled": true,
+              "finalized": 1,
+              "intervalMs": 1000,
+              "lastError": null,
+              "maxConcurrentProviderRuns": 4
+            },
+            "intents": [
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "attemptId": "$ID_22",
+                "bounds": {
+                  "maxDurationMs": 120000,
+                  "maxPromptBytes": 32768,
+                  "maxRounds": 2,
+                  "maxTotalTokens": 8000
+                },
+                "inputHash": "$ID_54",
+                "intentId": "$ID_21",
+                "modelSelectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                "providerRoute": {
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah"
+                },
+                "runId": "$ID_16",
+                "schemaVersion": 1,
+                "sessionId": "$ID_4",
+                "state": "finalized",
+                "workId": "$ID_23",
+                "workRevision": 1,
+                "workspace": "$WORKSPACE"
+              },
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "attemptId": "$ID_33",
+                "bounds": {
+                  "maxDurationMs": 60000,
+                  "maxPromptBytes": 65536,
+                  "maxRounds": 4,
+                  "maxTotalTokens": 1000
+                },
+                "inputHash": "$ID_34",
+                "intentId": "$ID_32",
+                "modelSelectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                "providerRoute": {
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah"
+                },
+                "runId": "$ID_30",
+                "schemaVersion": 1,
+                "sessionId": "$ID_4",
+                "state": "finalized",
+                "workId": "$ID_35",
+                "workRevision": 2,
+                "workspace": "$WORKSPACE"
+              },
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "attemptId": "$ID_47",
+                "bounds": {
+                  "maxDurationMs": 300000,
+                  "maxPromptBytes": 65536,
+                  "maxRounds": 4,
+                  "maxTotalTokens": 1000
+                },
+                "inputHash": "$ID_48",
+                "intentId": "$ID_46",
+                "modelSelectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                "providerRoute": {
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah"
+                },
+                "runId": "$ID_44",
+                "schemaVersion": 1,
+                "sessionId": "$ID_4",
+                "state": "finalized",
+                "workId": "$ID_49",
+                "workRevision": 2,
+                "workspace": "$WORKSPACE"
+              },
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "attemptId": "$ID_50",
+                "bounds": {
+                  "maxDurationMs": 300000,
+                  "maxPromptBytes": 65536,
+                  "maxRounds": 4,
+                  "maxTotalTokens": 1000
+                },
+                "inputHash": "$ID_51",
+                "intentId": "$ID_52",
+                "modelSelectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                "providerRoute": {
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah"
+                },
+                "runId": "$ID_53",
+                "schemaVersion": 1,
+                "sessionId": "$ID_4",
+                "state": "admitted",
+                "workId": "$ID_49",
+                "workRevision": 5,
+                "workspace": "$WORKSPACE"
+              }
+            ],
+            "providerAdmission": {
+              "liveInScopeByProvider": {
+                "env-grokptah": 1
+              },
+              "maxConcurrentRunsPerProvider": 4
+            }
+          },
+          "runs": {
+            "runs": [
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "aggregates": {
+                  "accountedProviderAttemptIds": [],
+                  "changes": [],
+                  "permissionsDenied": 0,
+                  "permissionsGranted": 0,
+                  "permissionsRequested": 0,
+                  "tests": [],
+                  "usage": {
+                    "completionTokens": 0,
+                    "promptTokens": 0,
+                    "requests": 0,
+                    "totalTokens": 0
+                  },
+                  "usageComplete": true,
+                  "usagePendingRequests": 1,
+                  "verification": null
+                },
+                "approval": null,
+                "bounds": {
+                  "maxDurationMs": 300000,
+                  "maxPromptBytes": 65536,
+                  "maxRounds": 4,
+                  "maxTotalTokens": 1000
+                },
+                "checkpointId": null,
+                "clientId": "$ID_9",
+                "continuationContextHash": null,
+                "continuationContextId": null,
+                "continuationFidelity": null,
+                "endSeq": null,
+                "errorCode": null,
+                "execution": null,
+                "finalResponse": null,
+                "parentRunId": null,
+                "progress": {
+                  "detail": "Model step 1/4",
+                  "lastTool": null,
+                  "maxRounds": 4,
+                  "round": 1
+                },
+                "promptPreview": "Managed Work execution. This is a new finite Run; do not resume an interrupted model invocation.\nWork ID: $ID_49",
+                "providerRoute": {
+                  "baseUrl": "$GATEWAY/v1",
+                  "capabilities": {
+                    "computer_capability_source": "unknown",
+                    "computer_use_tier": "none",
+                    "effort_options": [],
+                    "image_input": false,
+                    "image_media_types": [],
+                    "parallel_tool_calls": true,
+                    "source": "declared",
+                    "stream": true,
+                    "tools": true
+                  },
+                  "credentialFingerprint": "$ID_18",
+                  "credentialRef": "env:GROKPTAH_API_KEY",
+                  "deadlineClass": "standard",
+                  "dialect": "open_ai_chat_completions",
+                  "effort": "none",
+                  "endpointFingerprint": "$ID_20",
+                  "kind": "open_ai_compatible",
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah",
+                  "quotaClass": "coding_execution",
+                  "quotaReservationId": "$ID_55",
+                  "schemaVersion": 1,
+                  "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                  "snapshotHash": "$ID_56",
+                  "wireModelId": "grok-build"
+                },
+                "purpose": "execution",
+                "queuePosition": null,
+                "requestId": "$ID_52",
+                "retryOf": null,
+                "runId": "$ID_53",
+                "sessionId": "$ID_4",
+                "startSeq": 1000001,
+                "state": "running",
+                "stopCause": null,
+                "terminalResult": null,
+                "workspace": "$WORKSPACE"
+              },
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "aggregates": {
+                  "accountedProviderAttemptIds": [
+                    "$ID_42"
+                  ],
+                  "changes": [],
+                  "permissionsDenied": 0,
+                  "permissionsGranted": 0,
+                  "permissionsRequested": 0,
+                  "tests": [],
+                  "usage": {
+                    "completionTokens": 0,
+                    "promptTokens": 0,
+                    "requests": 0,
+                    "totalTokens": 0
+                  },
+                  "usageComplete": false,
+                  "usagePendingRequests": 0,
+                  "verification": {
+                    "claims": {
+                      "mentionsChanges": true,
+                      "mentionsTests": false,
+                      "mentionsVerification": false,
+                      "present": true
+                    },
+                    "interrupted": true,
+                    "observations": {
+                      "changedFiles": 0,
+                      "permissionsDenied": 0,
+                      "permissionsGranted": 0,
+                      "permissionsRequested": 0,
+                      "permissionsUnresolved": 0,
+                      "testsFailed": 0,
+                      "testsIncomplete": 0,
+                      "testsObserved": 0,
+                      "testsPassed": 0
+                    },
+                    "status": "incomplete",
+                    "stopReason": "cancelled",
+                    "usage": {
+                      "completionTokens": 0,
+                      "promptTokens": 0,
+                      "requests": 0,
+                      "totalTokens": 0
+                    }
+                  }
+                },
+                "approval": null,
+                "bounds": {
+                  "maxDurationMs": 300000,
+                  "maxPromptBytes": 65536,
+                  "maxRounds": 4,
+                  "maxTotalTokens": 1000
+                },
+                "checkpointId": null,
+                "clientId": "$ID_9",
+                "continuationContextHash": null,
+                "continuationContextId": null,
+                "continuationFidelity": null,
+                "endSeq": 27,
+                "errorCode": "max_total_tokens_usage_unavailable",
+                "execution": null,
+                "finalResponse": "Stopped at the run token boundary because the provider did not return usable token metadata for a run bounded by max_total_tokens=1000.\n\nChanged files: proposal-escape.txt.",
+                "parentRunId": null,
+                "progress": {
+                  "detail": "Model step 1/4",
+                  "lastTool": null,
+                  "maxRounds": 4,
+                  "round": 1
+                },
+                "promptPreview": "Managed Work execution. This is a new finite Run; do not resume an interrupted model invocation.\nWork ID: $ID_49",
+                "providerRoute": {
+                  "baseUrl": "$GATEWAY/v1",
+                  "capabilities": {
+                    "computer_capability_source": "unknown",
+                    "computer_use_tier": "none",
+                    "effort_options": [],
+                    "image_input": false,
+                    "image_media_types": [],
+                    "parallel_tool_calls": true,
+                    "source": "declared",
+                    "stream": true,
+                    "tools": true
+                  },
+                  "credentialFingerprint": "$ID_18",
+                  "credentialRef": "env:GROKPTAH_API_KEY",
+                  "deadlineClass": "standard",
+                  "dialect": "open_ai_chat_completions",
+                  "effort": "none",
+                  "endpointFingerprint": "$ID_20",
+                  "kind": "open_ai_compatible",
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah",
+                  "quotaClass": "coding_execution",
+                  "quotaReservationId": "$ID_43",
+                  "schemaVersion": 1,
+                  "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                  "snapshotHash": "$ID_45",
+                  "wireModelId": "grok-build"
+                },
+                "purpose": "execution",
+                "queuePosition": null,
+                "requestId": "$ID_46",
+                "retryOf": null,
+                "runId": "$ID_44",
+                "sessionId": "$ID_4",
+                "startSeq": 22,
+                "state": "limit_reached",
+                "stopCause": "token_accounting_unavailable",
+                "terminalResult": "max_total_tokens_usage_unavailable",
+                "workspace": "$WORKSPACE"
+              },
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "aggregates": {
+                  "accountedProviderAttemptIds": [
+                    "$ID_27"
+                  ],
+                  "changes": [],
+                  "permissionsDenied": 0,
+                  "permissionsGranted": 0,
+                  "permissionsRequested": 0,
+                  "tests": [],
+                  "usage": {
+                    "completionTokens": 4,
+                    "promptTokens": 6,
+                    "requests": 1,
+                    "totalTokens": 10
+                  },
+                  "usageComplete": true,
+                  "usagePendingRequests": 0,
+                  "verification": {
+                    "claims": {
+                      "mentionsChanges": true,
+                      "mentionsTests": false,
+                      "mentionsVerification": true,
+                      "present": true
+                    },
+                    "interrupted": false,
+                    "observations": {
+                      "changedFiles": 0,
+                      "permissionsDenied": 0,
+                      "permissionsGranted": 0,
+                      "permissionsRequested": 0,
+                      "permissionsUnresolved": 0,
+                      "testsFailed": 0,
+                      "testsIncomplete": 0,
+                      "testsObserved": 0,
+                      "testsPassed": 0
+                    },
+                    "status": "unverified",
+                    "stopReason": "completed",
+                    "usage": {
+                      "completionTokens": 4,
+                      "promptTokens": 6,
+                      "requests": 1,
+                      "totalTokens": 10
+                    }
+                  }
+                },
+                "approval": null,
+                "bounds": {
+                  "maxDurationMs": 60000,
+                  "maxPromptBytes": 65536,
+                  "maxRounds": 4,
+                  "maxTotalTokens": 1000
+                },
+                "checkpointId": null,
+                "clientId": "$ID_9",
+                "continuationContextHash": null,
+                "continuationContextId": null,
+                "continuationFidelity": null,
+                "endSeq": 12,
+                "errorCode": null,
+                "execution": null,
+                "finalResponse": "native route snapshot verified\n\nNo files changed.",
+                "parentRunId": null,
+                "progress": {
+                  "detail": "Model step 1/4",
+                  "lastTool": null,
+                  "maxRounds": 4,
+                  "round": 1
+                },
+                "promptPreview": "Managed Work execution. This is a new finite Run; do not resume an interrupted model invocation.\nWork ID: $ID_35",
+                "providerRoute": {
+                  "baseUrl": "$GATEWAY/v1",
+                  "capabilities": {
+                    "computer_capability_source": "unknown",
+                    "computer_use_tier": "none",
+                    "effort_options": [],
+                    "image_input": false,
+                    "image_media_types": [],
+                    "parallel_tool_calls": true,
+                    "source": "declared",
+                    "stream": true,
+                    "tools": true
+                  },
+                  "credentialFingerprint": "$ID_18",
+                  "credentialRef": "env:GROKPTAH_API_KEY",
+                  "deadlineClass": "standard",
+                  "dialect": "open_ai_chat_completions",
+                  "effort": "none",
+                  "endpointFingerprint": "$ID_20",
+                  "kind": "open_ai_compatible",
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah",
+                  "quotaClass": "coding_execution",
+                  "quotaReservationId": "$ID_29",
+                  "schemaVersion": 1,
+                  "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                  "snapshotHash": "$ID_31",
+                  "wireModelId": "grok-build"
+                },
+                "purpose": "execution",
+                "queuePosition": null,
+                "requestId": "$ID_32",
+                "retryOf": null,
+                "runId": "$ID_30",
+                "sessionId": "$ID_4",
+                "startSeq": 7,
+                "state": "completed",
+                "stopCause": "completed",
+                "terminalResult": "completed",
+                "workspace": "$WORKSPACE"
+              },
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 1,
+                "aggregates": {
+                  "accountedProviderAttemptIds": [
+                    "provider-attempt-$ID_36"
+                  ],
+                  "changes": [],
+                  "permissionsDenied": 0,
+                  "permissionsGranted": 0,
+                  "permissionsRequested": 0,
+                  "tests": [],
+                  "usage": {
+                    "completionTokens": 4,
+                    "promptTokens": 6,
+                    "requests": 1,
+                    "totalTokens": 10
+                  },
+                  "usageComplete": true,
+                  "usagePendingRequests": 0,
+                  "verification": {
+                    "claims": {
+                      "mentionsChanges": true,
+                      "mentionsTests": false,
+                      "mentionsVerification": true,
+                      "present": true
+                    },
+                    "interrupted": false,
+                    "observations": {
+                      "changedFiles": 0,
+                      "permissionsDenied": 0,
+                      "permissionsGranted": 0,
+                      "permissionsRequested": 0,
+                      "permissionsUnresolved": 0,
+                      "testsFailed": 0,
+                      "testsIncomplete": 0,
+                      "testsObserved": 0,
+                      "testsPassed": 0
+                    },
+                    "status": "unverified",
+                    "stopReason": "completed",
+                    "usage": {
+                      "completionTokens": 4,
+                      "promptTokens": 6,
+                      "requests": 1,
+                      "totalTokens": 10
+                    }
+                  }
+                },
+                "approval": null,
+                "bounds": {
+                  "maxDurationMs": 900000,
+                  "maxPromptBytes": 100000,
+                  "maxRounds": 24,
+                  "maxTotalTokens": 250000
+                },
+                "checkpointId": null,
+                "clientId": "$ID_37",
+                "continuationContextHash": null,
+                "continuationContextId": null,
+                "continuationFidelity": null,
+                "endSeq": 6,
+                "errorCode": null,
+                "execution": null,
+                "finalResponse": "native route snapshot verified\n\nNo files changed.",
+                "parentRunId": null,
+                "progress": {
+                  "detail": "Model step 1/24",
+                  "lastTool": null,
+                  "maxRounds": 24,
+                  "round": 1
+                },
+                "promptPreview": "shared-black-box-v1-bootstrap-session-agent",
+                "providerRoute": {
+                  "baseUrl": "$GATEWAY/v1",
+                  "capabilities": {
+                    "computer_capability_source": "unknown",
+                    "computer_use_tier": "none",
+                    "effort_options": [],
+                    "image_input": false,
+                    "image_media_types": [],
+                    "parallel_tool_calls": true,
+                    "source": "declared",
+                    "stream": true,
+                    "tools": true
+                  },
+                  "credentialFingerprint": "$ID_18",
+                  "credentialRef": "env:GROKPTAH_API_KEY",
+                  "deadlineClass": "standard",
+                  "dialect": "open_ai_chat_completions",
+                  "effort": "none",
+                  "endpointFingerprint": "$ID_20",
+                  "kind": "open_ai_compatible",
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah",
+                  "quotaClass": "coding_execution",
+                  "quotaReservationId": "$ID_38",
+                  "schemaVersion": 1,
+                  "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                  "snapshotHash": "$ID_40",
+                  "wireModelId": "grok-build"
+                },
+                "purpose": "execution",
+                "queuePosition": null,
+                "requestId": "sbb-v1-bootstrap-submit",
+                "retryOf": null,
+                "runId": "$ID_39",
+                "sessionId": "$ID_4",
+                "startSeq": 1,
+                "state": "completed",
+                "stopCause": "completed",
+                "terminalResult": "completed",
+                "workspace": "$WORKSPACE"
+              },
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "aggregates": {
+                  "accountedProviderAttemptIds": [
+                    "$ID_12",
+                    "$ID_13"
+                  ],
+                  "changes": [
+                    {
+                      "path": "proposal-escape.txt",
+                      "summary": "DENIED by deny rule: tool `write_file`"
+                    }
+                  ],
+                  "permissionsDenied": 0,
+                  "permissionsGranted": 0,
+                  "permissionsRequested": 0,
+                  "tests": [],
+                  "usage": {
+                    "completionTokens": 8,
+                    "promptTokens": 12,
+                    "requests": 2,
+                    "totalTokens": 20
+                  },
+                  "usageComplete": true,
+                  "usagePendingRequests": 0,
+                  "verification": {
+                    "claims": {
+                      "mentionsChanges": true,
+                      "mentionsTests": false,
+                      "mentionsVerification": false,
+                      "present": true
+                    },
+                    "interrupted": false,
+                    "observations": {
+                      "changedFiles": 1,
+                      "permissionsDenied": 0,
+                      "permissionsGranted": 0,
+                      "permissionsRequested": 0,
+                      "permissionsUnresolved": 0,
+                      "testsFailed": 0,
+                      "testsIncomplete": 0,
+                      "testsObserved": 0,
+                      "testsPassed": 0
+                    },
+                    "status": "unverified",
+                    "stopReason": "completed",
+                    "usage": {
+                      "completionTokens": 8,
+                      "promptTokens": 12,
+                      "requests": 2,
+                      "totalTokens": 20
+                    }
+                  }
+                },
+                "approval": null,
+                "bounds": {
+                  "maxDurationMs": 120000,
+                  "maxPromptBytes": 32768,
+                  "maxRounds": 2,
+                  "maxTotalTokens": 8000
+                },
+                "checkpointId": null,
+                "clientId": "$ID_9",
+                "continuationContextHash": null,
+                "continuationContextId": null,
+                "continuationFidelity": null,
+                "endSeq": 21,
+                "errorCode": null,
+                "execution": null,
+                "finalResponse": "{\\\"directive\\\":{\\\"reason\\\":\\\"replace with one allowed directive\\\",\\\"type\\\":\\\"no_safe_action\\\"},\\\"expectedAgentSpecRevision\\\":2,\\\"expectedPlanRevision\\\":4,\\\"inputSnapshotHash\\\":\\\"$ID_10\\\",\\\"managerAgentId\\\":\\\"$ID_3\\\",\\\"occurrenceId\\\":\\\"manager-decision-$ID_11\\\",\\\"planId\\\":\\\"$ID_5\\\",\\\"schemaVersion\\\":1} Snapshot: {\\\"effectiveBounds\\\":{\\\"maxDurationMs\\\":300000,\\\"maxPromptBytes\\\":65536,\\\"maxRounds\\\":8,\\\"maxTotalTokens\\\":100000},\\\"managerAgentId\\\":\\\"$ID_3\\\",\\\"managerAgentSpecRevision\\\":2,\\\"objective\\\":\\\"shared-black-box-v1-manager-goal\\\",\\\"outcomes\\\":[{\\\"failure\\\":null,\\\"state\\\":\\\"cancelled\\\",\\\"stepId\\\":\\\"inspect\\\",\\\"summary\\\":\\\"work item cancelled\\\",\\\"workId\\\":\\\"$ID_2\\\",\\\"workRevision\\\":2}],\\\"planId\\\":\\\"$ID_5\\\",\\\"planRevision\\\":4,\\\"toolAuthority\\\":\\\"none\\\"}\\n\",\"role\":\"user\"}\n\nChanged files: proposal-escape.txt.",
+                "parentRunId": null,
+                "progress": {
+                  "detail": "Model step 2/2",
+                  "lastTool": null,
+                  "maxRounds": 2,
+                  "round": 2
+                },
+                "promptPreview": "Managed Work execution. This is a new finite Run; do not resume an interrupted model invocation.\nWork ID: manager-decisi",
+                "providerRoute": {
+                  "baseUrl": "$GATEWAY/v1",
+                  "capabilities": {
+                    "computer_capability_source": "unknown",
+                    "computer_use_tier": "none",
+                    "effort_options": [],
+                    "image_input": false,
+                    "image_media_types": [],
+                    "parallel_tool_calls": true,
+                    "source": "declared",
+                    "stream": true,
+                    "tools": true
+                  },
+                  "credentialFingerprint": "$ID_18",
+                  "credentialRef": "env:GROKPTAH_API_KEY",
+                  "deadlineClass": "standard",
+                  "dialect": "open_ai_chat_completions",
+                  "effort": "none",
+                  "endpointFingerprint": "$ID_20",
+                  "kind": "open_ai_compatible",
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah",
+                  "quotaClass": "manager_proposal",
+                  "quotaReservationId": "$ID_15",
+                  "schemaVersion": 1,
+                  "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                  "snapshotHash": "$ID_17",
+                  "wireModelId": "grok-build"
+                },
+                "purpose": "manager_proposal",
+                "queuePosition": null,
+                "requestId": "$ID_21",
+                "retryOf": null,
+                "runId": "$ID_16",
+                "sessionId": "$ID_4",
+                "startSeq": 13,
+                "state": "completed",
+                "stopCause": "completed",
+                "terminalResult": "completed",
+                "workspace": "$WORKSPACE"
+              }
+            ]
+          },
+          "work": {
+            "attempts": [
+              {
+                "attemptId": "$ID_47",
+                "attemptNumber": 1,
+                "claimantId": "$ID_3",
+                "linkedRunIds": [
+                  "$ID_44"
+                ],
+                "progress": {
+                  "percent": 1,
+                  "summary": "native executor admitted a finite Run"
+                },
+                "result": null,
+                "schemaVersion": 1,
+                "state": "failed",
+                "terminalReason": "max_total_tokens_usage_unavailable",
+                "workId": "$ID_49"
+              },
+              {
+                "attemptId": "$ID_50",
+                "attemptNumber": 2,
+                "claimantId": "$ID_3",
+                "linkedRunIds": [
+                  "$ID_53"
+                ],
+                "progress": {
+                  "percent": 1,
+                  "summary": "native executor admitted a finite Run"
+                },
+                "result": null,
+                "schemaVersion": 1,
+                "state": "running",
+                "terminalReason": null,
+                "workId": "$ID_49"
+              }
+            ],
+            "work": {
+              "approval": null,
+              "assignedAgentId": "$ID_3",
+              "assignmentStatus": "accepted",
+              "attemptCount": 2,
+              "createdBy": "$ID_1",
+              "deadline": null,
+              "dependencies": [],
+              "isContainer": false,
+              "kind": "native",
+              "objective": "shared-black-box-v1-restart-cut",
+              "parentWorkId": null,
+              "policy": {
+                "bounds": {
+                  "maxDurationMs": 3600000,
+                  "maxPromptBytes": 65536,
+                  "maxRounds": 4,
+                  "maxTotalTokens": 1000
+                },
+                "managedExecution": "inherit",
+                "maxConcurrentAttempts": 1,
+                "requiresApproval": false,
+                "retry": {
+                  "backoffMs": 0,
+                  "maxAttempts": 2,
+                  "retryExpired": true,
+                  "retryFailed": true
+                }
+              },
+              "priority": 0,
+              "progress": {
+                "percent": 1,
+                "summary": "native executor admitted a finite Run"
+              },
+              "result": null,
+              "revision": 7,
+              "schemaVersion": 1,
+              "sessionId": "$ID_4",
+              "state": "running",
+              "workId": "$ID_49",
+              "workspace": "$WORKSPACE"
+            }
+          }
+        },
+        {
+          "capacity": {
+            "activeRuns": 1,
+            "available": 3,
+            "health": {
+              "auditPersistenceError": null,
+              "eventJournalPersistenceError": null,
+              "managerSupervisor": {
+                "enabled": true,
+                "intervalMs": 2000,
+                "lastError": null,
+                "lastReport": {
+                  "bounded": false,
+                  "decisionsApplied": 0,
+                  "decisionsCreated": 0,
+                  "decisionsRejected": 0,
+                  "messagesCreated": 0,
+                  "plansProcessed": 1,
+                  "plansScanned": 1,
+                  "workCreated": 0
+                }
+              },
+              "managerSupervisorError": null,
+              "nativeExecutor": {
+                "admitted": 1,
+                "enabled": true,
+                "finalized": 1,
+                "intervalMs": 1000,
+                "lastError": null,
+                "maxConcurrentProviderRuns": 4
+              },
+              "nativeExecutorError": null,
+              "routineSupervisor": {
+                "enabled": true,
+                "intervalMs": 1000,
+                "lastError": null,
+                "lastReport": {
+                  "createdWork": 0,
+                  "deduplicated": 0,
+                  "rejected": 0,
+                  "scannedRoutines": 0,
+                  "skipped": 0
+                }
+              },
+              "routineSupervisorError": null,
+              "runPersistenceError": null,
+              "workloadSupervisor": {
+                "enabled": true,
+                "intervalMs": 5000,
+                "lastError": null,
+                "lastReport": {
+                  "blockedItems": 0,
+                  "deadlineFailedItems": 0,
+                  "expiredAttempts": 0,
+                  "failedItems": 0,
+                  "retriedItems": 0,
+                  "scannedItems": 5,
+                  "unblockedItems": 0
+                }
+              },
+              "workloadSupervisorError": null
+            },
+            "maxConcurrentRuns": 4,
+            "providerQuota": {
+              "activeReservations": 2,
+              "consumedReservations": 3,
+              "providerCount": 1,
+              "providers": [
+                "env-grokptah"
+              ],
+              "providersTruncated": false,
+              "releasedReservations": 0,
+              "requestsConsumed": 4,
+              "requestsReserved": 10,
+              "tokensConsumed": 40,
+              "tokensReserved": 2000
+            },
+            "queueLimit": 32,
+            "queuedRuns": 0
+          },
+          "getRun": {
+            "agentId": "$ID_3",
+            "agentSpecRevision": 2,
+            "aggregates": {
+              "accountedProviderAttemptIds": [
+                "$ID_42"
+              ],
+              "changes": [],
+              "permissionsDenied": 0,
+              "permissionsGranted": 0,
+              "permissionsRequested": 0,
+              "tests": [],
+              "usage": {
+                "completionTokens": 0,
+                "promptTokens": 0,
+                "requests": 0,
+                "totalTokens": 0
+              },
+              "usageComplete": false,
+              "usagePendingRequests": 0,
+              "verification": {
+                "claims": {
+                  "mentionsChanges": true,
+                  "mentionsTests": false,
+                  "mentionsVerification": false,
+                  "present": true
+                },
+                "interrupted": true,
+                "observations": {
+                  "changedFiles": 0,
+                  "permissionsDenied": 0,
+                  "permissionsGranted": 0,
+                  "permissionsRequested": 0,
+                  "permissionsUnresolved": 0,
+                  "testsFailed": 0,
+                  "testsIncomplete": 0,
+                  "testsObserved": 0,
+                  "testsPassed": 0
+                },
+                "status": "incomplete",
+                "stopReason": "cancelled",
+                "usage": {
+                  "completionTokens": 0,
+                  "promptTokens": 0,
+                  "requests": 0,
+                  "totalTokens": 0
+                }
+              }
+            },
+            "approval": null,
+            "bounds": {
+              "maxDurationMs": 300000,
+              "maxPromptBytes": 65536,
+              "maxRounds": 4,
+              "maxTotalTokens": 1000
+            },
+            "checkpointId": null,
+            "clientId": "$ID_9",
+            "continuationContextHash": null,
+            "continuationContextId": null,
+            "continuationFidelity": null,
+            "endSeq": 27,
+            "errorCode": "max_total_tokens_usage_unavailable",
+            "execution": null,
+            "finalResponse": "Stopped at the run token boundary because the provider did not return usable token metadata for a run bounded by max_total_tokens=1000.\n\nChanged files: proposal-escape.txt.",
+            "parentRunId": null,
+            "progress": {
+              "detail": "Model step 1/4",
+              "lastTool": null,
+              "maxRounds": 4,
+              "round": 1
+            },
+            "promptPreview": "Managed Work execution. This is a new finite Run; do not resume an interrupted model invocation.\nWork ID: $ID_49",
+            "providerExecution": {
+              "attemptCount": 1,
+              "attempts": [
+                {
+                  "attemptId": "$ID_42",
+                  "httpStatus": null,
+                  "ordinal": 1,
+                  "retryClass": "explicit_new_run_only",
+                  "sendCertainty": "uncertain_accept",
+                  "state": "finished",
+                  "usage": null
+                }
+              ],
+              "attemptsTruncated": false,
+              "pendingRequests": 0,
+              "quota": {
+                "class": "coding_execution",
+                "limits": {
+                  "maxInFlightReservations": 4,
+                  "maxRequestsPerWindow": 4096,
+                  "maxTokensPerWindow": 10000000,
+                  "windowMs": 3600000
+                },
+                "poolId": "$ID_28",
+                "requestsConsumed": 0,
+                "requestsReserved": 5,
+                "reservationId": "$ID_43",
+                "state": "reserved",
+                "tokensConsumed": 0,
+                "tokensReserved": 1000
+              },
+              "route": {
+                "capabilitySource": "declared",
+                "deadlineClass": "standard",
+                "dialect": "open_ai_chat_completions",
+                "effort": "none",
+                "kind": "open_ai_compatible",
+                "modelId": "grok-build",
+                "providerId": "env-grokptah",
+                "qualificationSchema": null,
+                "snapshotHash": "$ID_45",
+                "wireModelId": "grok-build"
+              },
+              "usageComplete": false
+            },
+            "providerRoute": {
+              "baseUrl": "$GATEWAY/v1",
+              "capabilities": {
+                "computer_capability_source": "unknown",
+                "computer_use_tier": "none",
+                "effort_options": [],
+                "image_input": false,
+                "image_media_types": [],
+                "parallel_tool_calls": true,
+                "source": "declared",
+                "stream": true,
+                "tools": true
+              },
+              "credentialFingerprint": "$ID_18",
+              "credentialRef": "env:GROKPTAH_API_KEY",
+              "deadlineClass": "standard",
+              "dialect": "open_ai_chat_completions",
+              "effort": "none",
+              "endpointFingerprint": "$ID_20",
+              "kind": "open_ai_compatible",
+              "modelId": "grok-build",
+              "providerId": "env-grokptah",
+              "quotaClass": "coding_execution",
+              "quotaReservationId": "$ID_43",
+              "schemaVersion": 1,
+              "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+              "snapshotHash": "$ID_45",
+              "wireModelId": "grok-build"
+            },
+            "purpose": "execution",
+            "queuePosition": null,
+            "requestId": "$ID_46",
+            "retryOf": null,
+            "runId": "$ID_44",
+            "sessionId": "$ID_4",
+            "startSeq": 22,
+            "state": "limit_reached",
+            "stopCause": "token_accounting_unavailable",
+            "terminalResult": "max_total_tokens_usage_unavailable",
+            "workspace": "$WORKSPACE"
+          },
+          "http": 2,
+          "intents": {
+            "executor": {
+              "admitted": 1,
+              "enabled": true,
+              "finalized": 1,
+              "intervalMs": 1000,
+              "lastError": null,
+              "maxConcurrentProviderRuns": 4
+            },
+            "intents": [
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "attemptId": "$ID_22",
+                "bounds": {
+                  "maxDurationMs": 120000,
+                  "maxPromptBytes": 32768,
+                  "maxRounds": 2,
+                  "maxTotalTokens": 8000
+                },
+                "inputHash": "$ID_54",
+                "intentId": "$ID_21",
+                "modelSelectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                "providerRoute": {
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah"
+                },
+                "runId": "$ID_16",
+                "schemaVersion": 1,
+                "sessionId": "$ID_4",
+                "state": "finalized",
+                "workId": "$ID_23",
+                "workRevision": 1,
+                "workspace": "$WORKSPACE"
+              },
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "attemptId": "$ID_33",
+                "bounds": {
+                  "maxDurationMs": 60000,
+                  "maxPromptBytes": 65536,
+                  "maxRounds": 4,
+                  "maxTotalTokens": 1000
+                },
+                "inputHash": "$ID_34",
+                "intentId": "$ID_32",
+                "modelSelectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                "providerRoute": {
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah"
+                },
+                "runId": "$ID_30",
+                "schemaVersion": 1,
+                "sessionId": "$ID_4",
+                "state": "finalized",
+                "workId": "$ID_35",
+                "workRevision": 2,
+                "workspace": "$WORKSPACE"
+              },
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "attemptId": "$ID_47",
+                "bounds": {
+                  "maxDurationMs": 300000,
+                  "maxPromptBytes": 65536,
+                  "maxRounds": 4,
+                  "maxTotalTokens": 1000
+                },
+                "inputHash": "$ID_48",
+                "intentId": "$ID_46",
+                "modelSelectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                "providerRoute": {
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah"
+                },
+                "runId": "$ID_44",
+                "schemaVersion": 1,
+                "sessionId": "$ID_4",
+                "state": "finalized",
+                "workId": "$ID_49",
+                "workRevision": 2,
+                "workspace": "$WORKSPACE"
+              },
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "attemptId": "$ID_50",
+                "bounds": {
+                  "maxDurationMs": 300000,
+                  "maxPromptBytes": 65536,
+                  "maxRounds": 4,
+                  "maxTotalTokens": 1000
+                },
+                "inputHash": "$ID_51",
+                "intentId": "$ID_52",
+                "modelSelectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                "providerRoute": {
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah"
+                },
+                "runId": "$ID_53",
+                "schemaVersion": 1,
+                "sessionId": "$ID_4",
+                "state": "admitted",
+                "workId": "$ID_49",
+                "workRevision": 5,
+                "workspace": "$WORKSPACE"
+              }
+            ],
+            "providerAdmission": {
+              "liveInScopeByProvider": {
+                "env-grokptah": 1
+              },
+              "maxConcurrentRunsPerProvider": 4
+            }
+          },
+          "runs": {
+            "runs": [
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "aggregates": {
+                  "accountedProviderAttemptIds": [],
+                  "changes": [],
+                  "permissionsDenied": 0,
+                  "permissionsGranted": 0,
+                  "permissionsRequested": 0,
+                  "tests": [],
+                  "usage": {
+                    "completionTokens": 0,
+                    "promptTokens": 0,
+                    "requests": 0,
+                    "totalTokens": 0
+                  },
+                  "usageComplete": true,
+                  "usagePendingRequests": 1,
+                  "verification": null
+                },
+                "approval": null,
+                "bounds": {
+                  "maxDurationMs": 300000,
+                  "maxPromptBytes": 65536,
+                  "maxRounds": 4,
+                  "maxTotalTokens": 1000
+                },
+                "checkpointId": null,
+                "clientId": "$ID_9",
+                "continuationContextHash": null,
+                "continuationContextId": null,
+                "continuationFidelity": null,
+                "endSeq": null,
+                "errorCode": null,
+                "execution": null,
+                "finalResponse": null,
+                "parentRunId": null,
+                "progress": {
+                  "detail": "Model step 1/4",
+                  "lastTool": null,
+                  "maxRounds": 4,
+                  "round": 1
+                },
+                "promptPreview": "Managed Work execution. This is a new finite Run; do not resume an interrupted model invocation.\nWork ID: $ID_49",
+                "providerRoute": {
+                  "baseUrl": "$GATEWAY/v1",
+                  "capabilities": {
+                    "computer_capability_source": "unknown",
+                    "computer_use_tier": "none",
+                    "effort_options": [],
+                    "image_input": false,
+                    "image_media_types": [],
+                    "parallel_tool_calls": true,
+                    "source": "declared",
+                    "stream": true,
+                    "tools": true
+                  },
+                  "credentialFingerprint": "$ID_18",
+                  "credentialRef": "env:GROKPTAH_API_KEY",
+                  "deadlineClass": "standard",
+                  "dialect": "open_ai_chat_completions",
+                  "effort": "none",
+                  "endpointFingerprint": "$ID_20",
+                  "kind": "open_ai_compatible",
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah",
+                  "quotaClass": "coding_execution",
+                  "quotaReservationId": "$ID_55",
+                  "schemaVersion": 1,
+                  "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                  "snapshotHash": "$ID_56",
+                  "wireModelId": "grok-build"
+                },
+                "purpose": "execution",
+                "queuePosition": null,
+                "requestId": "$ID_52",
+                "retryOf": null,
+                "runId": "$ID_53",
+                "sessionId": "$ID_4",
+                "startSeq": 1000001,
+                "state": "running",
+                "stopCause": null,
+                "terminalResult": null,
+                "workspace": "$WORKSPACE"
+              },
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "aggregates": {
+                  "accountedProviderAttemptIds": [
+                    "$ID_42"
+                  ],
+                  "changes": [],
+                  "permissionsDenied": 0,
+                  "permissionsGranted": 0,
+                  "permissionsRequested": 0,
+                  "tests": [],
+                  "usage": {
+                    "completionTokens": 0,
+                    "promptTokens": 0,
+                    "requests": 0,
+                    "totalTokens": 0
+                  },
+                  "usageComplete": false,
+                  "usagePendingRequests": 0,
+                  "verification": {
+                    "claims": {
+                      "mentionsChanges": true,
+                      "mentionsTests": false,
+                      "mentionsVerification": false,
+                      "present": true
+                    },
+                    "interrupted": true,
+                    "observations": {
+                      "changedFiles": 0,
+                      "permissionsDenied": 0,
+                      "permissionsGranted": 0,
+                      "permissionsRequested": 0,
+                      "permissionsUnresolved": 0,
+                      "testsFailed": 0,
+                      "testsIncomplete": 0,
+                      "testsObserved": 0,
+                      "testsPassed": 0
+                    },
+                    "status": "incomplete",
+                    "stopReason": "cancelled",
+                    "usage": {
+                      "completionTokens": 0,
+                      "promptTokens": 0,
+                      "requests": 0,
+                      "totalTokens": 0
+                    }
+                  }
+                },
+                "approval": null,
+                "bounds": {
+                  "maxDurationMs": 300000,
+                  "maxPromptBytes": 65536,
+                  "maxRounds": 4,
+                  "maxTotalTokens": 1000
+                },
+                "checkpointId": null,
+                "clientId": "$ID_9",
+                "continuationContextHash": null,
+                "continuationContextId": null,
+                "continuationFidelity": null,
+                "endSeq": 27,
+                "errorCode": "max_total_tokens_usage_unavailable",
+                "execution": null,
+                "finalResponse": "Stopped at the run token boundary because the provider did not return usable token metadata for a run bounded by max_total_tokens=1000.\n\nChanged files: proposal-escape.txt.",
+                "parentRunId": null,
+                "progress": {
+                  "detail": "Model step 1/4",
+                  "lastTool": null,
+                  "maxRounds": 4,
+                  "round": 1
+                },
+                "promptPreview": "Managed Work execution. This is a new finite Run; do not resume an interrupted model invocation.\nWork ID: $ID_49",
+                "providerRoute": {
+                  "baseUrl": "$GATEWAY/v1",
+                  "capabilities": {
+                    "computer_capability_source": "unknown",
+                    "computer_use_tier": "none",
+                    "effort_options": [],
+                    "image_input": false,
+                    "image_media_types": [],
+                    "parallel_tool_calls": true,
+                    "source": "declared",
+                    "stream": true,
+                    "tools": true
+                  },
+                  "credentialFingerprint": "$ID_18",
+                  "credentialRef": "env:GROKPTAH_API_KEY",
+                  "deadlineClass": "standard",
+                  "dialect": "open_ai_chat_completions",
+                  "effort": "none",
+                  "endpointFingerprint": "$ID_20",
+                  "kind": "open_ai_compatible",
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah",
+                  "quotaClass": "coding_execution",
+                  "quotaReservationId": "$ID_43",
+                  "schemaVersion": 1,
+                  "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                  "snapshotHash": "$ID_45",
+                  "wireModelId": "grok-build"
+                },
+                "purpose": "execution",
+                "queuePosition": null,
+                "requestId": "$ID_46",
+                "retryOf": null,
+                "runId": "$ID_44",
+                "sessionId": "$ID_4",
+                "startSeq": 22,
+                "state": "limit_reached",
+                "stopCause": "token_accounting_unavailable",
+                "terminalResult": "max_total_tokens_usage_unavailable",
+                "workspace": "$WORKSPACE"
+              },
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "aggregates": {
+                  "accountedProviderAttemptIds": [
+                    "$ID_27"
+                  ],
+                  "changes": [],
+                  "permissionsDenied": 0,
+                  "permissionsGranted": 0,
+                  "permissionsRequested": 0,
+                  "tests": [],
+                  "usage": {
+                    "completionTokens": 4,
+                    "promptTokens": 6,
+                    "requests": 1,
+                    "totalTokens": 10
+                  },
+                  "usageComplete": true,
+                  "usagePendingRequests": 0,
+                  "verification": {
+                    "claims": {
+                      "mentionsChanges": true,
+                      "mentionsTests": false,
+                      "mentionsVerification": true,
+                      "present": true
+                    },
+                    "interrupted": false,
+                    "observations": {
+                      "changedFiles": 0,
+                      "permissionsDenied": 0,
+                      "permissionsGranted": 0,
+                      "permissionsRequested": 0,
+                      "permissionsUnresolved": 0,
+                      "testsFailed": 0,
+                      "testsIncomplete": 0,
+                      "testsObserved": 0,
+                      "testsPassed": 0
+                    },
+                    "status": "unverified",
+                    "stopReason": "completed",
+                    "usage": {
+                      "completionTokens": 4,
+                      "promptTokens": 6,
+                      "requests": 1,
+                      "totalTokens": 10
+                    }
+                  }
+                },
+                "approval": null,
+                "bounds": {
+                  "maxDurationMs": 60000,
+                  "maxPromptBytes": 65536,
+                  "maxRounds": 4,
+                  "maxTotalTokens": 1000
+                },
+                "checkpointId": null,
+                "clientId": "$ID_9",
+                "continuationContextHash": null,
+                "continuationContextId": null,
+                "continuationFidelity": null,
+                "endSeq": 12,
+                "errorCode": null,
+                "execution": null,
+                "finalResponse": "native route snapshot verified\n\nNo files changed.",
+                "parentRunId": null,
+                "progress": {
+                  "detail": "Model step 1/4",
+                  "lastTool": null,
+                  "maxRounds": 4,
+                  "round": 1
+                },
+                "promptPreview": "Managed Work execution. This is a new finite Run; do not resume an interrupted model invocation.\nWork ID: $ID_35",
+                "providerRoute": {
+                  "baseUrl": "$GATEWAY/v1",
+                  "capabilities": {
+                    "computer_capability_source": "unknown",
+                    "computer_use_tier": "none",
+                    "effort_options": [],
+                    "image_input": false,
+                    "image_media_types": [],
+                    "parallel_tool_calls": true,
+                    "source": "declared",
+                    "stream": true,
+                    "tools": true
+                  },
+                  "credentialFingerprint": "$ID_18",
+                  "credentialRef": "env:GROKPTAH_API_KEY",
+                  "deadlineClass": "standard",
+                  "dialect": "open_ai_chat_completions",
+                  "effort": "none",
+                  "endpointFingerprint": "$ID_20",
+                  "kind": "open_ai_compatible",
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah",
+                  "quotaClass": "coding_execution",
+                  "quotaReservationId": "$ID_29",
+                  "schemaVersion": 1,
+                  "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                  "snapshotHash": "$ID_31",
+                  "wireModelId": "grok-build"
+                },
+                "purpose": "execution",
+                "queuePosition": null,
+                "requestId": "$ID_32",
+                "retryOf": null,
+                "runId": "$ID_30",
+                "sessionId": "$ID_4",
+                "startSeq": 7,
+                "state": "completed",
+                "stopCause": "completed",
+                "terminalResult": "completed",
+                "workspace": "$WORKSPACE"
+              },
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 1,
+                "aggregates": {
+                  "accountedProviderAttemptIds": [
+                    "provider-attempt-$ID_36"
+                  ],
+                  "changes": [],
+                  "permissionsDenied": 0,
+                  "permissionsGranted": 0,
+                  "permissionsRequested": 0,
+                  "tests": [],
+                  "usage": {
+                    "completionTokens": 4,
+                    "promptTokens": 6,
+                    "requests": 1,
+                    "totalTokens": 10
+                  },
+                  "usageComplete": true,
+                  "usagePendingRequests": 0,
+                  "verification": {
+                    "claims": {
+                      "mentionsChanges": true,
+                      "mentionsTests": false,
+                      "mentionsVerification": true,
+                      "present": true
+                    },
+                    "interrupted": false,
+                    "observations": {
+                      "changedFiles": 0,
+                      "permissionsDenied": 0,
+                      "permissionsGranted": 0,
+                      "permissionsRequested": 0,
+                      "permissionsUnresolved": 0,
+                      "testsFailed": 0,
+                      "testsIncomplete": 0,
+                      "testsObserved": 0,
+                      "testsPassed": 0
+                    },
+                    "status": "unverified",
+                    "stopReason": "completed",
+                    "usage": {
+                      "completionTokens": 4,
+                      "promptTokens": 6,
+                      "requests": 1,
+                      "totalTokens": 10
+                    }
+                  }
+                },
+                "approval": null,
+                "bounds": {
+                  "maxDurationMs": 900000,
+                  "maxPromptBytes": 100000,
+                  "maxRounds": 24,
+                  "maxTotalTokens": 250000
+                },
+                "checkpointId": null,
+                "clientId": "$ID_37",
+                "continuationContextHash": null,
+                "continuationContextId": null,
+                "continuationFidelity": null,
+                "endSeq": 6,
+                "errorCode": null,
+                "execution": null,
+                "finalResponse": "native route snapshot verified\n\nNo files changed.",
+                "parentRunId": null,
+                "progress": {
+                  "detail": "Model step 1/24",
+                  "lastTool": null,
+                  "maxRounds": 24,
+                  "round": 1
+                },
+                "promptPreview": "shared-black-box-v1-bootstrap-session-agent",
+                "providerRoute": {
+                  "baseUrl": "$GATEWAY/v1",
+                  "capabilities": {
+                    "computer_capability_source": "unknown",
+                    "computer_use_tier": "none",
+                    "effort_options": [],
+                    "image_input": false,
+                    "image_media_types": [],
+                    "parallel_tool_calls": true,
+                    "source": "declared",
+                    "stream": true,
+                    "tools": true
+                  },
+                  "credentialFingerprint": "$ID_18",
+                  "credentialRef": "env:GROKPTAH_API_KEY",
+                  "deadlineClass": "standard",
+                  "dialect": "open_ai_chat_completions",
+                  "effort": "none",
+                  "endpointFingerprint": "$ID_20",
+                  "kind": "open_ai_compatible",
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah",
+                  "quotaClass": "coding_execution",
+                  "quotaReservationId": "$ID_38",
+                  "schemaVersion": 1,
+                  "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                  "snapshotHash": "$ID_40",
+                  "wireModelId": "grok-build"
+                },
+                "purpose": "execution",
+                "queuePosition": null,
+                "requestId": "sbb-v1-bootstrap-submit",
+                "retryOf": null,
+                "runId": "$ID_39",
+                "sessionId": "$ID_4",
+                "startSeq": 1,
+                "state": "completed",
+                "stopCause": "completed",
+                "terminalResult": "completed",
+                "workspace": "$WORKSPACE"
+              },
+              {
+                "agentId": "$ID_3",
+                "agentSpecRevision": 2,
+                "aggregates": {
+                  "accountedProviderAttemptIds": [
+                    "$ID_12",
+                    "$ID_13"
+                  ],
+                  "changes": [
+                    {
+                      "path": "proposal-escape.txt",
+                      "summary": "DENIED by deny rule: tool `write_file`"
+                    }
+                  ],
+                  "permissionsDenied": 0,
+                  "permissionsGranted": 0,
+                  "permissionsRequested": 0,
+                  "tests": [],
+                  "usage": {
+                    "completionTokens": 8,
+                    "promptTokens": 12,
+                    "requests": 2,
+                    "totalTokens": 20
+                  },
+                  "usageComplete": true,
+                  "usagePendingRequests": 0,
+                  "verification": {
+                    "claims": {
+                      "mentionsChanges": true,
+                      "mentionsTests": false,
+                      "mentionsVerification": false,
+                      "present": true
+                    },
+                    "interrupted": false,
+                    "observations": {
+                      "changedFiles": 1,
+                      "permissionsDenied": 0,
+                      "permissionsGranted": 0,
+                      "permissionsRequested": 0,
+                      "permissionsUnresolved": 0,
+                      "testsFailed": 0,
+                      "testsIncomplete": 0,
+                      "testsObserved": 0,
+                      "testsPassed": 0
+                    },
+                    "status": "unverified",
+                    "stopReason": "completed",
+                    "usage": {
+                      "completionTokens": 8,
+                      "promptTokens": 12,
+                      "requests": 2,
+                      "totalTokens": 20
+                    }
+                  }
+                },
+                "approval": null,
+                "bounds": {
+                  "maxDurationMs": 120000,
+                  "maxPromptBytes": 32768,
+                  "maxRounds": 2,
+                  "maxTotalTokens": 8000
+                },
+                "checkpointId": null,
+                "clientId": "$ID_9",
+                "continuationContextHash": null,
+                "continuationContextId": null,
+                "continuationFidelity": null,
+                "endSeq": 21,
+                "errorCode": null,
+                "execution": null,
+                "finalResponse": "{\\\"directive\\\":{\\\"reason\\\":\\\"replace with one allowed directive\\\",\\\"type\\\":\\\"no_safe_action\\\"},\\\"expectedAgentSpecRevision\\\":2,\\\"expectedPlanRevision\\\":4,\\\"inputSnapshotHash\\\":\\\"$ID_10\\\",\\\"managerAgentId\\\":\\\"$ID_3\\\",\\\"occurrenceId\\\":\\\"manager-decision-$ID_11\\\",\\\"planId\\\":\\\"$ID_5\\\",\\\"schemaVersion\\\":1} Snapshot: {\\\"effectiveBounds\\\":{\\\"maxDurationMs\\\":300000,\\\"maxPromptBytes\\\":65536,\\\"maxRounds\\\":8,\\\"maxTotalTokens\\\":100000},\\\"managerAgentId\\\":\\\"$ID_3\\\",\\\"managerAgentSpecRevision\\\":2,\\\"objective\\\":\\\"shared-black-box-v1-manager-goal\\\",\\\"outcomes\\\":[{\\\"failure\\\":null,\\\"state\\\":\\\"cancelled\\\",\\\"stepId\\\":\\\"inspect\\\",\\\"summary\\\":\\\"work item cancelled\\\",\\\"workId\\\":\\\"$ID_2\\\",\\\"workRevision\\\":2}],\\\"planId\\\":\\\"$ID_5\\\",\\\"planRevision\\\":4,\\\"toolAuthority\\\":\\\"none\\\"}\\n\",\"role\":\"user\"}\n\nChanged files: proposal-escape.txt.",
+                "parentRunId": null,
+                "progress": {
+                  "detail": "Model step 2/2",
+                  "lastTool": null,
+                  "maxRounds": 2,
+                  "round": 2
+                },
+                "promptPreview": "Managed Work execution. This is a new finite Run; do not resume an interrupted model invocation.\nWork ID: manager-decisi",
+                "providerRoute": {
+                  "baseUrl": "$GATEWAY/v1",
+                  "capabilities": {
+                    "computer_capability_source": "unknown",
+                    "computer_use_tier": "none",
+                    "effort_options": [],
+                    "image_input": false,
+                    "image_media_types": [],
+                    "parallel_tool_calls": true,
+                    "source": "declared",
+                    "stream": true,
+                    "tools": true
+                  },
+                  "credentialFingerprint": "$ID_18",
+                  "credentialRef": "env:GROKPTAH_API_KEY",
+                  "deadlineClass": "standard",
+                  "dialect": "open_ai_chat_completions",
+                  "effort": "none",
+                  "endpointFingerprint": "$ID_20",
+                  "kind": "open_ai_compatible",
+                  "modelId": "grok-build",
+                  "providerId": "env-grokptah",
+                  "quotaClass": "manager_proposal",
+                  "quotaReservationId": "$ID_15",
+                  "schemaVersion": 1,
+                  "selectionKey": "ptah.model.v1:12:env-grokptah10:grok-build",
+                  "snapshotHash": "$ID_17",
+                  "wireModelId": "grok-build"
+                },
+                "purpose": "manager_proposal",
+                "queuePosition": null,
+                "requestId": "$ID_21",
+                "retryOf": null,
+                "runId": "$ID_16",
+                "sessionId": "$ID_4",
+                "startSeq": 13,
+                "state": "completed",
+                "stopCause": "completed",
+                "terminalResult": "completed",
+                "workspace": "$WORKSPACE"
+              }
+            ]
+          },
+          "work": {
+            "attempts": [
+              {
+                "attemptId": "$ID_47",
+                "attemptNumber": 1,
+                "claimantId": "$ID_3",
+                "linkedRunIds": [
+                  "$ID_44"
+                ],
+                "progress": {
+                  "percent": 1,
+                  "summary": "native executor admitted a finite Run"
+                },
+                "result": null,
+                "schemaVersion": 1,
+                "state": "failed",
+                "terminalReason": "max_total_tokens_usage_unavailable",
+                "workId": "$ID_49"
+              },
+              {
+                "attemptId": "$ID_50",
+                "attemptNumber": 2,
+                "claimantId": "$ID_3",
+                "linkedRunIds": [
+                  "$ID_53"
+                ],
+                "progress": {
+                  "percent": 1,
+                  "summary": "native executor admitted a finite Run"
+                },
+                "result": null,
+                "schemaVersion": 1,
+                "state": "running",
+                "terminalReason": null,
+                "workId": "$ID_49"
+              }
+            ],
+            "work": {
+              "approval": null,
+              "assignedAgentId": "$ID_3",
+              "assignmentStatus": "accepted",
+              "attemptCount": 2,
+              "createdBy": "$ID_1",
+              "deadline": null,
+              "dependencies": [],
+              "isContainer": false,
+              "kind": "native",
+              "objective": "shared-black-box-v1-restart-cut",
+              "parentWorkId": null,
+              "policy": {
+                "bounds": {
+                  "maxDurationMs": 3600000,
+                  "maxPromptBytes": 65536,
+                  "maxRounds": 4,
+                  "maxTotalTokens": 1000
+                },
+                "managedExecution": "inherit",
+                "maxConcurrentAttempts": 1,
+                "requiresApproval": false,
+                "retry": {
+                  "backoffMs": 0,
+                  "maxAttempts": 2,
+                  "retryExpired": true,
+                  "retryFailed": true
+                }
+              },
+              "priority": 0,
+              "progress": {
+                "percent": 1,
+                "summary": "native executor admitted a finite Run"
+              },
+              "result": null,
+              "revision": 7,
+              "schemaVersion": 1,
+              "sessionId": "$ID_4",
+              "state": "running",
+              "workId": "$ID_49",
+              "workspace": "$WORKSPACE"
+            }
+          }
+        }
+      ],
+      "stallHeldAfterAccept": true
+    }
+  },
+  "schema": "grokptah.shared-black-box-result.v1",
+  "sourceRevision": "748ab129b0b06c2fb475990f8f572c93ac87d392",
+  "transport": {
+    "headerCardinalities": [
+      {
+        "authorizationPresent": true,
+        "bodyLen": 10115,
+        "headerNames": {
+          "accept": 1,
+          "authorization": 1,
+          "content-length": 1,
+          "content-type": 1,
+          "host": 1,
+          "user-agent": 1
+        },
+        "method": "POST",
+        "path": "/v1/chat/completions"
+      },
+      {
+        "authorizationPresent": true,
+        "bodyLen": 10473,
+        "headerNames": {
+          "accept": 1,
+          "authorization": 1,
+          "content-length": 1,
+          "content-type": 1,
+          "host": 1,
+          "user-agent": 1
+        },
+        "method": "POST",
+        "path": "/v1/chat/completions"
+      },
+      {
+        "authorizationPresent": true,
+        "bodyLen": 12286,
+        "headerNames": {
+          "accept": 1,
+          "authorization": 1,
+          "content-length": 1,
+          "content-type": 1,
+          "host": 1,
+          "user-agent": 1
+        },
+        "method": "POST",
+        "path": "/v1/chat/completions"
+      },
+      {
+        "authorizationPresent": true,
+        "bodyLen": 8311,
+        "headerNames": {
+          "accept": 1,
+          "authorization": 1,
+          "content-length": 1,
+          "content-type": 1,
+          "host": 1,
+          "user-agent": 1
+        },
+        "method": "POST",
+        "path": "/v1/chat/completions"
+      },
+      {
+        "authorizationPresent": true,
+        "bodyLen": 13586,
+        "headerNames": {
+          "accept": 1,
+          "authorization": 1,
+          "content-length": 1,
+          "content-type": 1,
+          "host": 1,
+          "user-agent": 1
+        },
+        "method": "POST",
+        "path": "/v1/chat/completions"
+      },
+      {
+        "authorizationPresent": true,
+        "bodyLen": 14063,
+        "headerNames": {
+          "accept": 1,
+          "authorization": 1,
+          "content-length": 1,
+          "content-type": 1,
+          "host": 1,
+          "user-agent": 1
+        },
+        "method": "POST",
+        "path": "/v1/chat/completions"
+      }
+    ],
+    "ordinaryNativeHttp": 1,
+    "proposalHttp": 2,
+    "restartHttp": 2
+  },
+  "version": "v1"
+}

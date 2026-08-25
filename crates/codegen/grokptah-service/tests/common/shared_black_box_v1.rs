@@ -73,6 +73,10 @@ const AUDITED_GOLDENS: &[(&str, &str)] = &[
         "67e29bd34dc64049432c715c93c2cef2185c63ea",
         "expected-main-67e29bd3.json",
     ),
+    (
+        "748ab129b0b06c2fb475990f8f572c93ac87d392",
+        "expected-748ab129b0b06c.json",
+    ),
 ];
 
 const FIXTURE_ALLOWLIST: &[&str] = &[
@@ -84,6 +88,7 @@ const FIXTURE_ALLOWLIST: &[&str] = &[
     "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/scenario.json",
     "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-main-67e29bd3.json",
     "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-pr352-4bd2081b.json",
+    "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-748ab129b0b06c.json",
 ];
 
 const GOLDEN_UPDATE_ENV_VARS: &[&str] = &[
@@ -3573,5 +3578,23 @@ fn expected_main_golden_is_immutable_for_audited_revision() {
     assert_eq!(
         loaded["overlay"]["mcpError"]["code"],
         json!("invalid_request")
+    );
+}
+
+#[test]
+fn expected_748ab129_golden_is_immutable_for_audited_revision() {
+    let path = PathBuf::from(GOLDEN_DIR).join("expected-748ab129b0b06c.json");
+    let loaded = load_immutable_golden(&path, "748ab129b0b06c2fb475990f8f572c93ac87d392");
+    assert_eq!(
+        loaded["features"]["hostCapabilityContract"]["missingCapabilityDenial"],
+        json!("forbidden_scope")
+    );
+    assert_eq!(
+        loaded["features"]["nativeCodingReadiness"]["support"],
+        json!("present")
+    );
+    assert_eq!(
+        loaded["sourceRevision"],
+        json!("748ab129b0b06c2fb475990f8f572c93ac87d392")
     );
 }
