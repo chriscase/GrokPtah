@@ -20,6 +20,7 @@ try {
     consumerPath,
     `import {
   GrokPtahBrokerClient,
+  parseBrokerApproval,
   HELP_ARTICLES,
   HELP_ENTRIES,
   applyAssistantStreamChunk,
@@ -62,6 +63,17 @@ const broker = new GrokPtahBrokerClient({
   fetcher: async () => new Response(null, { status: 204 }),
 });
 if (!(broker instanceof GrokPtahBrokerClient)) throw new Error("consumer broker client did not construct");
+if (parseBrokerApproval({
+  approvalId: "approval-1",
+  bindingId: "binding-1",
+  brokerRunId: "run-1",
+  sourceFingerprint: "source-1",
+  finalFingerprint: "final-1",
+  changedFiles: [],
+  expiresAt: "2026-08-24T23:00:00Z",
+})?.approvalId !== "approval-1") {
+  throw new Error("consumer broker approval parser was not usable");
+}
 console.log("external consumer fixture passed");
 `,
   );

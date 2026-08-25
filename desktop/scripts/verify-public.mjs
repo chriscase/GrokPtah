@@ -39,6 +39,7 @@ const publicApi = await import(bundlePath.href);
 const uiCoreApi = await import(uiCoreBundlePath.href);
 const requiredExports = [
   "GrokPtahBrokerClient",
+  "parseBrokerApproval",
   "searchHelp",
   "searchHelpArticles",
   "HELP_ARTICLES",
