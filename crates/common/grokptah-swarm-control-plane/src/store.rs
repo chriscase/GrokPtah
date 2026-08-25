@@ -148,10 +148,10 @@ impl DurableSwarmStore for InMemorySwarmStore {
         lease_claim: Option<&LeaseClaim>,
     ) -> SwarmResult<()> {
         let mut store = self.lock()?;
-        let current = store
-            .swarms
-            .get(swarm_id)
-            .ok_or_else(|| SwarmError::not_found("swarm is not present in the durable store"))?;
+        let current =
+            store.swarms.get(swarm_id).cloned().ok_or_else(|| {
+                SwarmError::not_found("swarm is not present in the durable store")
+            })?;
         if current.revision != expected_revision {
             return Err(SwarmError::conflict(
                 "swarm revision is stale; reload before retrying the mutation",

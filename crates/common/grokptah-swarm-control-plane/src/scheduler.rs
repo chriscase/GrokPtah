@@ -24,13 +24,23 @@ use crate::ids::{DispatchId, ExternalRefId, TaskId};
 use crate::policy::FailurePolicy;
 use crate::spec::{ComputerUseLeaseRef, SwarmSpec, TaskKind, TaskSpec, validate_text};
 use crate::state::{
-    DispatchIntent, DispatchProbe, DispatchRecord, DispatchState, MAX_EVIDENCE_DETAIL_BYTES,
-    MAX_EVIDENCE_ENTRIES, MAX_EVIDENCE_LABEL_BYTES, MAX_REASON_BYTES, MAX_SUMMARY_BYTES,
-    ReviewVerdict, SwarmLifecycle, SwarmState, TaskOutcome, TaskResult, TaskState,
-    derive_dispatch_id,
+    DispatchIntent, DispatchProbe, DispatchRecord, DispatchState, MAX_EVIDENCE_ENTRIES,
+    MAX_REASON_BYTES, MAX_SUMMARY_BYTES, ReviewVerdict, SwarmLifecycle, SwarmState, TaskOutcome,
+    TaskResult, TaskState, derive_dispatch_id,
 };
 use crate::store::{DurableSwarmStore, InMemorySwarmStore, LeaseClaim};
 use crate::validate::validate_swarm_spec;
+
+fn corrupt(message: impl Into<String>) -> SwarmError {
+    SwarmError::corrupt(message)
+}
+
+fn corrupt_dispatch(message: impl Into<String>) -> SwarmError {
+    corrupt(format!(
+        "stored dispatch record is invalid: {}",
+        message.into()
+    ))
+}
 
 /// What a restart recovery pass changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -56,8 +66,6 @@ impl RecoveryReport {
 }
 
 fn validate_loaded_state(state: &SwarmState) -> SwarmResult<()> {
-    let corrupt = |message: impl Into<String>| SwarmError::corrupt(message);
-
     if state.schema_version != crate::spec::SWARM_SCHEMA_VERSION {
         return Err(corrupt("swarm record schema version is not supported"));
     }
@@ -102,26 +110,20 @@ fn validate_loaded_state(state: &SwarmState) -> SwarmResult<()> {
     let mut seen_leases = std::collections::BTreeSet::new();
     let mut seen_dispatches = std::collections::BTreeSet::new();
     for dispatch in &state.dispatches {
-        let dispatch_corrupt = |message: impl Into<String>| {
-            corrupt(format!(
-                "stored dispatch record is invalid: {}",
-                message.into()
-            ))
-        };
         dispatch
             .dispatch_id
             .validate()
-            .map_err(|error| dispatch_corrupt(error.message))?;
+            .map_err(|error| corrupt_dispatch(error.message))?;
         dispatch
             .task_id
             .validate()
-            .map_err(|error| dispatch_corrupt(error.message))?;
+            .map_err(|error| corrupt_dispatch(error.message))?;
         dispatch
             .worker_id
             .validate()
-            .map_err(|error| dispatch_corrupt(error.message))?;
+            .map_err(|error| corrupt_dispatch(error.message))?;
         if dispatch.attempt == 0 || dispatch.attempt > state.spec.budget.max_total_dispatches {
-            return Err(dispatch_corrupt(
+            return Err(corrupt_dispatch(
                 "dispatch attempt is outside the valid range",
             ));
         }
@@ -139,7 +141,7 @@ fn validate_loaded_state(state: &SwarmState) -> SwarmResult<()> {
             .worker(&task_spec.worker_id)
             .ok_or_else(|| corrupt("stored task names an unknown dispatch worker"))?;
         if dispatch.worker_id != worker.worker_id || dispatch.isolation != worker.isolation {
-            return Err(dispatch_corrupt(
+            return Err(corrupt_dispatch(
                 "dispatch worker or isolation does not match its task",
             ));
         }
@@ -153,7 +155,7 @@ fn validate_loaded_state(state: &SwarmState) -> SwarmResult<()> {
         if let Some(external_ref) = &dispatch.external_ref {
             external_ref
                 .validate()
-                .map_err(|error| dispatch_corrupt(error.message))?;
+                .map_err(|error| corrupt_dispatch(error.message))?;
         }
         match (&task_spec.computer_use, &dispatch.lease) {
             (Some(requirement), Some(lease)) => lease
@@ -164,14 +166,14 @@ fn validate_loaded_state(state: &SwarmState) -> SwarmResult<()> {
                     &dispatch.dispatch_id,
                     dispatch.requested_at,
                 )
-                .map_err(|error| dispatch_corrupt(error.message))?,
+                .map_err(|error| corrupt_dispatch(error.message))?,
             (Some(_), None) => {
-                return Err(dispatch_corrupt(
+                return Err(corrupt_dispatch(
                     "Computer Use task dispatch has no bound lease",
                 ));
             }
             (None, Some(_)) => {
-                return Err(dispatch_corrupt(
+                return Err(corrupt_dispatch(
                     "non-Computer Use dispatch carries a lease",
                 ));
             }
@@ -192,7 +194,7 @@ fn validate_loaded_state(state: &SwarmState) -> SwarmResult<()> {
                 .settled_at
                 .is_some_and(|at| at < dispatch.acknowledged_at.unwrap_or(dispatch.requested_at))
         {
-            return Err(dispatch_corrupt(
+            return Err(corrupt_dispatch(
                 "dispatch timestamps are not monotonic or precede swarm creation",
             ));
         }
@@ -203,7 +205,7 @@ fn validate_loaded_state(state: &SwarmState) -> SwarmResult<()> {
                     || dispatch.settled_at.is_some()
                     || dispatch.uncertain_reason.is_some()
                 {
-                    return Err(dispatch_corrupt(
+                    return Err(corrupt_dispatch(
                         "pre-acknowledgement dispatch has terminal fields",
                     ));
                 }
@@ -214,14 +216,14 @@ fn validate_loaded_state(state: &SwarmState) -> SwarmResult<()> {
                     || dispatch.settled_at.is_some()
                     || dispatch.uncertain_reason.is_some()
                 {
-                    return Err(dispatch_corrupt(
+                    return Err(corrupt_dispatch(
                         "acknowledged dispatch does not have exactly its acknowledgement fields",
                     ));
                 }
             }
             DispatchState::Settled => {
                 if dispatch.settled_at.is_none() || dispatch.uncertain_reason.is_some() {
-                    return Err(dispatch_corrupt(
+                    return Err(corrupt_dispatch(
                         "settled dispatch does not have a settlement timestamp",
                     ));
                 }
@@ -231,7 +233,7 @@ fn validate_loaded_state(state: &SwarmState) -> SwarmResult<()> {
                     validate_text(reason, "uncertainty reason", MAX_REASON_BYTES).is_err()
                 }) || dispatch.settled_at.is_some()
                 {
-                    return Err(dispatch_corrupt(
+                    return Err(corrupt_dispatch(
                         "uncertain dispatch does not have exactly its uncertainty fields",
                     ));
                 }
@@ -888,7 +890,7 @@ impl SwarmController {
                 }
             }
             record.state = DispatchState::Acknowledged;
-            record.external_ref = Some(external_ref);
+            record.external_ref = Some(external_ref.clone());
             record.acknowledged_at = Some(now);
             record.task_id.clone()
         };
@@ -1047,6 +1049,11 @@ impl SwarmController {
             .dispatch(dispatch_id)
             .ok_or_else(|| SwarmError::not_found("unknown dispatch"))?;
         match record.state {
+            DispatchState::Requested => {
+                return Err(SwarmError::conflict(
+                    "dispatch must be spawn-claimed before recording an outcome",
+                ));
+            }
             DispatchState::SpawnClaimed | DispatchState::Acknowledged => {}
             DispatchState::Uncertain => {
                 return Err(SwarmError::new(
