@@ -59,9 +59,10 @@ for await (const notification of grokptah.streamEvents(binding.bindingId, run.br
 }
 ```
 
-The client validates opaque binding/run response envelopes, requires CSRF and
-idempotency headers for mutations, rejects external recovery URLs, and enforces
-monotonic event sequence numbers. The broker remains authoritative: it must
+The client validates opaque binding/run response envelopes and bounded run,
+queue, and steer requests, requires CSRF and idempotency headers for
+mutations, rejects external recovery URLs, and enforces monotonic event
+sequence numbers. The broker remains authoritative: it must
 re-check the user, team, workspace, capability, policy, and exact run scope.
 
 ## Trusted desktop adapter example
