@@ -53,8 +53,10 @@ fn context_desk_consumer_imports_only_crate_root_surfaces() {
         !source.contains(&error_module),
         "ContextDesk consumer must not reach through the error module path"
     );
+    let native_crate = ["grokptah", "agent", "bridge"].join("-");
+    let native_module = ["grokptah", "agent", "bridge"].join("_");
     assert!(
-        !source.contains("grokptah-agent-bridge") && !source.contains("grokptah_agent_bridge"),
+        !source.contains(&native_crate) && !source.contains(&native_module),
         "ContextDesk consumer must not depend on the native desktop bridge"
     );
 }
@@ -73,13 +75,27 @@ fn context_desk_consumer_round_trips_list_archive_unarchive_with_utf8_names() {
         .expect("UTF-8 identity cursor is valid at the crate root");
     let query_json = serde_json::to_value(&query).expect("list query serializes");
     assert_eq!(query_json["cursor"], "page-审查-1");
-    assert_eq!(query_json["includeArchived"], false);
+    assert!(
+        query_json.get("includeArchived").is_none(),
+        "includeArchived false must be omitted rather than inheriting a provider default"
+    );
     let query_round: ExternalWorkerListQuery =
         serde_json::from_value(query_json).expect("list query deserializes");
     query_round
         .validate()
         .expect("round-tripped query validates");
     assert_eq!(query_round, query);
+
+    let archived_query = ExternalWorkerListQuery {
+        include_archived: true,
+        ..ExternalWorkerListQuery::default()
+    };
+    archived_query
+        .validate()
+        .expect("includeArchived true is valid");
+    let archived_query_json =
+        serde_json::to_value(&archived_query).expect("archived list query serializes");
+    assert_eq!(archived_query_json["includeArchived"], true);
 
     let unknown_cursor = ExternalWorkerListQuery {
         cursor: Some("page\u{0000}2".into()),
