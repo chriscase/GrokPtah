@@ -2623,7 +2623,7 @@ mod tests {
     }
 
     #[test]
-    fn acceptance_crash_cuts_rebuild_run_and_receipt_in_fifo_order() {
+    fn acceptance_crash_cuts_fail_unacknowledged_admissions() {
         for cut in 0..=3 {
             let d = tempdir().unwrap();
             let store = OrchStore::open(d.path()).unwrap();
@@ -3060,6 +3060,54 @@ mod tests {
             AttemptPhase::Interrupted
         );
         assert!(reopened.list_acceptance_intents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn complete_receipt_before_attempt_lease_recovers_as_queued_work() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let (run, intent) = queued_run("receipt-before-lease", 1);
+        store.save_run(&run).unwrap();
+        store.save_acceptance_intent(&intent).unwrap();
+        store
+            .complete_idempotency(
+                &intent.tool,
+                &intent.request_id,
+                &intent.payload_hash,
+                Some(intent.run_id.clone()),
+                intent.response.clone(),
+            )
+            .err()
+            .expect("no claim exists yet");
+        store
+            .claim_idempotency(&intent.tool, &intent.request_id, &intent.payload_hash)
+            .unwrap();
+        store
+            .complete_idempotency(
+                &intent.tool,
+                &intent.request_id,
+                &intent.payload_hash,
+                Some(intent.run_id.clone()),
+                intent.response.clone(),
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = OrchStore::open(d.path()).unwrap();
+        assert_eq!(
+            reopened.load_run(&run.run_id).unwrap().unwrap().state,
+            RunState::Queued
+        );
+        assert_eq!(
+            reopened
+                .load_idempotency(&intent.request_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "complete"
+        );
+        assert!(reopened.load_attempt(&run.run_id).unwrap().is_none());
+        assert_eq!(reopened.list_acceptance_intents().unwrap().len(), 1);
     }
 
     #[test]
