@@ -53,7 +53,8 @@ the same candidate release:
 - Keep the current TypeScript/desktop verification attached to the same reviewable
   candidate: the Help Center integration (`45441d1f`) and follow-up
   hardening/corpus/public-consumer/broker-boundary/typed-projection/event-redaction
-  commits through `cc151fcc`
+  commits through `cc151fcc`; external-worker SDK/schema `17f3318b` and
+  Tauri-free monitor `25d7b6c3`
   pass 48 test files / 279 tests, typecheck, the production Vite build, and
   `npm run verify:public`.
   The public check includes generated export/authority-boundary checks,
