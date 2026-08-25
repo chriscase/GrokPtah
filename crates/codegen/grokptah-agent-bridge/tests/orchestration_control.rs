@@ -2228,7 +2228,7 @@ async fn thirty_two_queued_admissions_recover_fifo_and_dispatch_once() {
         .await
         .unwrap();
     let mut started_order = Vec::new();
-    for (_, session_id, run_id) in &queued {
+    for (_, _, run_id) in &queued {
         assert_eq!(
             wait_run_terminal(
                 &replacement,
