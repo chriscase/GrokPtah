@@ -2579,6 +2579,69 @@ async fn failed_run_write_fails_receipt_and_never_executes_after_restart() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn lease_write_failure_cannot_produce_running_work() {
+    let (home, _lock) = setup_home();
+    let ws = tempdir().unwrap();
+    let host = started_host();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 1);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let attempts = orch.store().root().join("attempts");
+    std::fs::remove_dir(&attempts).unwrap();
+    std::fs::write(&attempts, b"blocked").unwrap();
+
+    let refused = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "failed-lease-write",
+            session.id,
+            ws.path(),
+            "this work must never reach the model".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .expect_err("a lease write failure must fail closed");
+    assert_eq!(refused.code.as_str(), "internal");
+    std::fs::remove_file(&attempts).unwrap();
+    std::fs::create_dir(&attempts).unwrap();
+
+    let receipt = orch
+        .store()
+        .load_idempotency("failed-lease-write")
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.status, "complete");
+    let run_id = receipt.run_id.as_deref().unwrap();
+    let run = orch.store().load_run(run_id).unwrap().unwrap();
+    assert_eq!(run.state, RunState::Interrupted);
+    assert_eq!(run.error_code.as_deref(), Some("admission_lost"));
+    assert_eq!(orch.get_capacity(&auth).unwrap()["activeRuns"], 0);
+    assert_eq!(orch.get_capacity(&auth).unwrap()["queuedRuns"], 0);
+    let replay = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "failed-lease-write",
+            session.id,
+            ws.path(),
+            "this work must never reach the model".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await;
+    assert!(
+        replay.is_err(),
+        "replay of a lost post-receipt admission must fail closed"
+    );
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn lost_recovered_slot_refuses_stale_queued_replay() {
     let (home, _lock) = setup_home();
     let ws = tempdir().unwrap();

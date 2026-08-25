@@ -58,6 +58,9 @@ transcript.
 - An accepted queued run resumes dispatch after restart. A claimed/running
   model attempt does not resume after restart; it must be explicitly retried
   with a fresh prompt.
+- A live attempt whose persisted heartbeat expires is interrupted by the
+  reaper after the exact worker/supervisor is stopped and awaited; expiry is
+  not limited to process restart recovery.
 - An optional request id is protected by the existing durable idempotency
   ledger. Exact retries replay the response; changed payloads cannot create a
   second run.

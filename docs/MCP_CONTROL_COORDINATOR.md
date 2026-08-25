@@ -467,8 +467,8 @@ coordinator wants a bounded admission queue for capacity or session contention.
 - Each claimed model attempt has a private compare-and-set lease with
   `attemptId`, `ownerInstanceId`, `revision`, `heartbeatAt`, `expiresAt`, and
   `phase`. A stale revision, wrong owner, or expired heartbeat cannot mutate
-  it. The reaper aborts only the exact expired task, marks the run interrupted,
-  and releases admission idempotently.
+  it. The reaper aborts only the exact expired task, awaits worker/supervisor
+  termination, then marks the run interrupted and releases admission.
 - Admission uses one host-global scheduler across embedded control services.
   It preserves FIFO order for each session and prefers a different eligible
   session after a session starts, preventing one session from monopolizing the
@@ -477,11 +477,12 @@ coordinator wants a bounded admission queue for capacity or session contention.
 - A queued task can be cancelled with `ptah_cancel` before it starts. The
   response includes `wasQueued: true`; cancellation is idempotent and does not
   launch a model turn.
-- Queue memory is process-local by design. On process restart, durable queued
-  and running records are marked `interrupted`; their in-memory prompts are not
-  resumed automatically. After reconnecting, a coordinator should inspect the
-  durable record and use `ptah_retry_run` with a new request id only when it
-  has decided that retrying is safe.
+- The queue index is process-local, but accepted queued input is durable in the
+  private acceptance ledger. On process restart, accepted queued records are
+  reconstructed and dispatched FIFO; model work already running is marked
+  `interrupted` and never resumes automatically. After reconnecting, a
+  coordinator should inspect that interrupted record and use `ptah_retry_run`
+  with a new request id only when it has decided that retrying is safe.
 
 ### Isolated review and promotion
 

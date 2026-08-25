@@ -13,7 +13,7 @@ running -> completed
         -> failed
         -> cancelled
         -> limit_reached
-        -> interrupted (only after a restart)
+        -> interrupted (after restart or live lease expiry)
 ```
 
 Each run records a stable run ID, session and workspace identity, a bounded
@@ -35,6 +35,8 @@ revision, heartbeat, expiry, and phase. A periodic reaper can interrupt only
 the exact expired attempt. Finalization retries are bounded; an unresolved
 terminal write remains in the bounded recovery queue and projects degraded
 durability health rather than wedging capacity.
+Live lease expiry is a liveness terminal transition, not a restart-only
+condition; the expired worker is stopped and awaited before capacity is reused.
 
 The desktop inspector is read-only for shared runs. Build sessions may opt into
 strict isolated execution. An isolated run starts from a clean Git workspace in
