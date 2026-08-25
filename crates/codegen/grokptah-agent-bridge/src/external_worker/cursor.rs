@@ -581,6 +581,22 @@ impl ExternalWorkerAdapter for CursorCloudAdapter {
         ExternalWorkerProvider::CursorCloud
     }
 
+    /// A stable, non-reversible label for the credential's account.
+    ///
+    /// A namespaced digest of the API key, truncated. It distinguishes two
+    /// accounts without ever putting the key — or anything a key can be
+    /// recovered from — into a grant, a listing, or an audit record.
+    fn account_identity(&self) -> String {
+        let digest = Sha256::digest(
+            format!(
+                "grokptah.external-worker.cursor.account.v1\0{}",
+                self.api_key
+            )
+            .as_bytes(),
+        );
+        format!("cursor:{}", &hex_sha256(&digest)[..32])
+    }
+
     /// What Cursor Cloud Agents v1 can actually be held to.
     ///
     /// A prompt ceiling is real because this host measures the prompt before

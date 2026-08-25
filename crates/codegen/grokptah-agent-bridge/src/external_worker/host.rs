@@ -871,6 +871,10 @@ mod tests {
             ExternalWorkerProvider::LocalWorker
         }
 
+        fn account_identity(&self) -> String {
+            "account-1".into()
+        }
+
         async fn launch(
             &self,
             _request: &ExternalWorkerLaunchRequest,

@@ -29,10 +29,11 @@ pub use ledger::{
 };
 
 use async_trait::async_trait;
+pub use grokptah_agent_sdk::ExternalWorkerProvider;
+
 use grokptah_agent_sdk::{
     ExternalWorkerArtifact, ExternalWorkerFollowUpRequest, ExternalWorkerLaunchRequest,
-    ExternalWorkerLaunchResult, ExternalWorkerProvider, ExternalWorkerRecord,
-    ExternalWorkerRunRecord,
+    ExternalWorkerLaunchResult, ExternalWorkerRecord, ExternalWorkerRunRecord,
 };
 use parking_lot::RwLock;
 use reqwest::StatusCode;
@@ -234,6 +235,14 @@ pub struct BoundsDisposition {
 pub trait ExternalWorkerAdapter: Send + Sync {
     /// Provider family implemented by this adapter.
     fn provider(&self) -> ExternalWorkerProvider;
+
+    /// Non-secret label identifying the provider account this adapter acts as.
+    ///
+    /// Two accounts under one provider are different authorities: an ID minted
+    /// by one must not be actionable with the other's credential. The label is
+    /// derived from the credential rather than being the credential, so it can
+    /// sit in a durable grant and an audit record safely.
+    fn account_identity(&self) -> String;
 
     /// Which requested ceilings this adapter can actually make true.
     ///

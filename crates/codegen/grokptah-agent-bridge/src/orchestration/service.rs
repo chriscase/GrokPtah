@@ -1023,6 +1023,237 @@ impl OrchestrationService {
     /// Unknown session, missing cwd, and cwd mismatch then collapse into the
     /// same `forbidden_scope` as an unauthorized run, so session existence
     /// is not distinguishable from cross-scope.
+    /// List the external workers this authenticated scope holds a grant for.
+    pub fn list_external_workers_scoped(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        provider: crate::external_worker::ExternalWorkerProvider,
+    ) -> Result<serde_json::Value, OrchError> {
+        let host = self.external_workers()?;
+        let principal = self.external_worker_principal(auth, session_id, workspace, provider)?;
+        let workers = host
+            .list_workers(&principal)
+            .map_err(external_worker_error)?;
+        // Only the share-safe projection crosses this boundary: the grant also
+        // holds the scope it was issued to, which the caller already knows and
+        // which has no business being echoed back into a transcript.
+        let projections = workers
+            .iter()
+            .map(external_worker_projection)
+            .collect::<Vec<_>>();
+        Ok(json!({ "workers": projections }))
+    }
+
+    /// Read one external worker projection.
+    pub async fn get_external_worker_scoped(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        provider: crate::external_worker::ExternalWorkerProvider,
+        external_agent_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let host = self.external_workers()?;
+        let principal = self.external_worker_principal(auth, session_id, workspace, provider)?;
+        let record = host
+            .get_worker(&principal, provider, external_agent_id)
+            .await
+            .map_err(external_worker_error)?;
+        serde_json::to_value(record)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    /// Read one external provider run projection.
+    pub async fn get_external_worker_run_scoped(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        provider: crate::external_worker::ExternalWorkerProvider,
+        external_agent_id: &str,
+        external_run_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let host = self.external_workers()?;
+        let principal = self.external_worker_principal(auth, session_id, workspace, provider)?;
+        let record = host
+            .get_run(&principal, provider, external_agent_id, external_run_id)
+            .await
+            .map_err(external_worker_error)?;
+        serde_json::to_value(record)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    /// List run-attributed artifacts for one external run.
+    pub async fn list_external_worker_artifacts_scoped(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        provider: crate::external_worker::ExternalWorkerProvider,
+        external_agent_id: &str,
+        external_run_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let host = self.external_workers()?;
+        let principal = self.external_worker_principal(auth, session_id, workspace, provider)?;
+        let artifacts = host
+            .list_artifacts(&principal, provider, external_agent_id, external_run_id)
+            .await
+            .map_err(external_worker_error)?;
+        Ok(json!({ "artifacts": artifacts }))
+    }
+
+    /// Archive or unarchive one external worker.
+    pub fn set_external_worker_archived_scoped(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        provider: crate::external_worker::ExternalWorkerProvider,
+        external_agent_id: &str,
+        archived: bool,
+    ) -> Result<serde_json::Value, OrchError> {
+        let host = self.external_workers()?;
+        let principal = self.external_worker_principal(auth, session_id, workspace, provider)?;
+        let now = Utc::now().to_rfc3339();
+        let record = if archived {
+            host.archive(&principal, provider, external_agent_id, &now)
+        } else {
+            host.unarchive(&principal, provider, external_agent_id, &now)
+        }
+        .map_err(external_worker_error)?;
+        Ok(external_worker_projection(&record))
+    }
+
+    /// Reconcile one external worker against the provider.
+    pub async fn reconcile_external_worker_scoped(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        provider: crate::external_worker::ExternalWorkerProvider,
+        external_agent_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let host = self.external_workers()?;
+        let principal = self.external_worker_principal(auth, session_id, workspace, provider)?;
+        let report = host
+            .reconcile(&principal, provider, external_agent_id)
+            .await
+            .map_err(external_worker_error)?;
+        serde_json::to_value(report)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    /// Open the single external-worker host, or report it unavailable.
+    fn external_workers(
+        &self,
+    ) -> Result<std::sync::Arc<crate::external_worker::ExternalWorkerHost>, OrchError> {
+        self.host.ensure_external_worker_host().map_err(|_| {
+            OrchError::new(
+                OrchErrorCode::Unsupported,
+                "external workers are unavailable on this host",
+            )
+        })
+    }
+
+    /// Resolve the adapter for a provider, failing closed when none is
+    /// installed.
+    ///
+    /// A provider is not available because the contract names it. Until
+    /// bootstrap installs a qualified adapter, every request for it is
+    /// `unsupported` rather than an error deeper in the stack.
+    fn external_worker_adapter(
+        &self,
+        provider: crate::external_worker::ExternalWorkerProvider,
+    ) -> Result<std::sync::Arc<dyn crate::external_worker::ExternalWorkerAdapter>, OrchError> {
+        self.host
+            .external_worker_registry()
+            .get(provider)
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::Unsupported,
+                    "no qualified adapter is installed for this provider",
+                )
+            })
+    }
+
+    /// Digest of the policy currently in force for external workers.
+    ///
+    /// Bound into every grant. When the workspace allowlist or the host bounds
+    /// change, this changes, and grants issued under the old policy stop
+    /// authorizing — they must be re-issued rather than silently inheriting
+    /// rules that no longer exist.
+    fn external_worker_policy_revision(&self) -> String {
+        let config = self.config.lock();
+        let mut roots = config
+            .allowlist
+            .roots()
+            .iter()
+            .map(|root| root.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        roots.sort();
+        let canonical = json!({
+            "allowlist": roots,
+            "bounds": config.bounds,
+            "maxConcurrentRuns": config.max_concurrent_runs,
+        });
+        format!("policy:{}", hash_payload(&canonical))
+    }
+
+    /// Digest of the capability set currently advertised.
+    ///
+    /// Bound into every grant, so installing or removing an adapter invalidates
+    /// grants issued when a different set was negotiated.
+    fn external_worker_capability_revision(&self) -> String {
+        let providers = self
+            .host
+            .external_worker_registry()
+            .providers()
+            .iter()
+            .map(|provider| format!("{provider:?}"))
+            .collect::<Vec<_>>();
+        let canonical = json!({
+            "contract": crate::capability_contract::CAPABILITY_CONTRACT_VERSION,
+            "providers": providers,
+        });
+        format!("cap:{}", hash_payload(&canonical))
+    }
+
+    /// Derive the action-time external-worker identity from authenticated state.
+    ///
+    /// Nothing here is supplied by the caller as data: the principal comes from
+    /// the verified bearer token, the workspace and project from the session
+    /// gate that already refuses a workspace outside the allowlist or a session
+    /// whose cwd disagrees, the provider account from the installed adapter's
+    /// credential, and both revisions from live host state. A caller cannot
+    /// widen their own scope by asking for a different one.
+    ///
+    /// Single-tenant today: the control plane authenticates one bearer identity
+    /// and carries no tenant claim, so `tenant` is derived from that identity
+    /// rather than invented. When a tenant claim exists it replaces this line
+    /// and every existing grant is invalidated by the policy revision changing.
+    fn external_worker_principal(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        provider: crate::external_worker::ExternalWorkerProvider,
+    ) -> Result<crate::external_worker::ExternalWorkerPrincipal, OrchError> {
+        let claimed = self.authorize_computer_scope(session_id, workspace)?;
+        let adapter = self.external_worker_adapter(provider)?;
+        Ok(crate::external_worker::ExternalWorkerPrincipal {
+            principal: auth.token_id.clone(),
+            tenant: format!("bearer:{}", auth.token_id),
+            project: claimed.clone(),
+            workspace: claimed,
+            session_id: session_id.to_string(),
+            policy_revision: self.external_worker_policy_revision(),
+            capability_revision: self.external_worker_capability_revision(),
+            provider_account: adapter.account_identity(),
+        })
+    }
+
     fn authorize_computer_scope(
         &self,
         session_id: Uuid,
@@ -3491,6 +3722,75 @@ impl OrchestrationService {
 /// `Unauthorized` covers unknown, cross-session, cross-workspace, unbound, and
 /// traversal-shaped reads with one shared message, so this mapping must stay
 /// single-valued to preserve that indistinguishability on the wire.
+/// Map an external-worker failure onto the public control-plane taxonomy.
+///
+/// Every authority refusal collapses to one `forbidden_scope`. Distinguishing
+/// "no such worker" from "not yours" would confirm a worker exists to a caller
+/// who may not know that, and naming the failed binding tells them what to
+/// forge next.
+fn external_worker_error(error: crate::external_worker::ExternalWorkerAdapterError) -> OrchError {
+    use crate::external_worker::ExternalWorkerAdapterError as Failure;
+    match error {
+        Failure::Unauthorized(_) => OrchError::new(
+            OrchErrorCode::ForbiddenScope,
+            "external worker action is not authorized",
+        ),
+        Failure::InvalidRequest(message) => OrchError::new(OrchErrorCode::InvalidRequest, message),
+        Failure::UnsupportedProvider => OrchError::new(
+            OrchErrorCode::Unsupported,
+            "external worker provider is unsupported",
+        ),
+        Failure::Pending => OrchError::new(
+            OrchErrorCode::Conflict,
+            "external worker request is pending until reconciled",
+        ),
+        Failure::Uncertain => OrchError::new(
+            OrchErrorCode::Conflict,
+            "external worker request outcome is uncertain until reconciled",
+        ),
+        Failure::PayloadDrift => OrchError::new(
+            OrchErrorCode::Conflict,
+            "external worker request_id reused with a different payload",
+        ),
+        // Provider bodies and transport detail never reach a caller: they can
+        // carry a URL, a header echo, or a credential fragment.
+        Failure::Provider { .. } | Failure::Transport(_) | Failure::InvalidResponse(_) => {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                "external worker provider response was not usable",
+            )
+        }
+        Failure::InvalidBaseUrl => OrchError::new(
+            OrchErrorCode::Internal,
+            "external worker provider is misconfigured",
+        ),
+    }
+}
+
+/// Share-safe projection of one durable grant.
+///
+/// Deliberately omits the bound scope. The caller supplied it, so echoing it
+/// back adds nothing and puts a tenant and a workspace path into a transcript.
+fn external_worker_projection(
+    record: &crate::external_worker::ExternalWorkerAuthority,
+) -> serde_json::Value {
+    json!({
+        "provider": record.provider,
+        "externalAgentId": record.external_agent_id,
+        "externalRunIds": record.external_run_ids,
+        "runId": record.run_id,
+        "attempt": record.attempt,
+        "requestId": record.request_id,
+        "launchIntentDigest": record.launch_intent_digest,
+        "repository": record.launch_intent.repository,
+        "startingRef": record.launch_intent.starting_ref,
+        "bounds": record.bounds,
+        "state": record.state,
+        "createdAt": record.created_at,
+        "updatedAt": record.updated_at,
+    })
+}
+
 fn computer_scope_denied() -> OrchError {
     OrchError::new(
         OrchErrorCode::ForbiddenScope,

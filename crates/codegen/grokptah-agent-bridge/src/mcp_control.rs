@@ -797,6 +797,53 @@ struct ComputerScopeArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ExternalWorkerScopeArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    provider: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalWorkerArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    provider: String,
+    external_agent_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalWorkerRunArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    provider: String,
+    external_agent_id: String,
+    external_run_id: String,
+}
+
+/// Parse a provider name, failing closed on anything the contract does not name.
+///
+/// An unknown provider is `unsupported`, not a default: silently falling back to
+/// one provider would let a caller reach an adapter they did not name.
+fn parse_provider(
+    value: &str,
+) -> Result<crate::external_worker::ExternalWorkerProvider, OrchError> {
+    use crate::external_worker::ExternalWorkerProvider as Provider;
+    match value {
+        "cursor_cloud" => Ok(Provider::CursorCloud),
+        "claude_code_cloud" => Ok(Provider::ClaudeCodeCloud),
+        "local_worker" => Ok(Provider::LocalWorker),
+        "custom" => Ok(Provider::Custom),
+        _ => Err(OrchError::new(
+            OrchErrorCode::Unsupported,
+            "unknown external worker provider",
+        )),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ComputerEventsArgs {
     session_id: Uuid,
     workspace: PathBuf,
@@ -1463,6 +1510,12 @@ fn tool_input_schema(name: &str) -> Value {
     let session = json!({"type": "string", "format": "uuid"});
     let workspace = json!({"type": "string", "minLength": 1});
     let run_id = json!({"type": "string", "minLength": 1, "maxLength": 256});
+    let external_provider = json!({
+        "type": "string",
+        "enum": ["cursor_cloud", "claude_code_cloud", "local_worker", "custom"],
+        "description": "Provider family. A provider with no qualified adapter installed fails closed as unsupported."
+    });
+    let external_id = json!({"type": "string", "minLength": 1, "maxLength": 256});
     let bounds = json!({
         "type": "object",
         "additionalProperties": false,
@@ -1502,6 +1555,44 @@ fn tool_input_schema(name: &str) -> Value {
                 "session_id": session,
                 "workspace": workspace,
                 "run_id": run_id
+            }
+        }),
+        "ptah_list_external_workers" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "provider"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "provider": external_provider
+            }
+        }),
+        "ptah_get_external_worker"
+        | "ptah_archive_external_worker"
+        | "ptah_unarchive_external_worker"
+        | "ptah_reconcile_external_worker" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "provider", "external_agent_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "provider": external_provider,
+                "external_agent_id": external_id
+            }
+        }),
+        "ptah_get_external_worker_run" | "ptah_list_external_worker_artifacts" => json!({
+            "type": "object",
+            "required": [
+                "session_id", "workspace", "provider", "external_agent_id", "external_run_id"
+            ],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "provider": external_provider,
+                "external_agent_id": external_id,
+                "external_run_id": external_id
             }
         }),
         "ptah_list_computer_runs" | "ptah_get_computer_capacity" => json!({
@@ -1902,6 +1993,80 @@ async fn dispatch_tool(
             require_nonempty(&args.run_id, "run_id")?;
             orch.review_run(auth, args.session_id, &args.workspace, &args.run_id)
         }
+        "ptah_list_external_workers" => {
+            let args: ExternalWorkerScopeArgs = parse_value(args)?;
+            let provider = parse_provider(&args.provider)?;
+            orch.list_external_workers_scoped(auth, args.session_id, &args.workspace, provider)
+        }
+        "ptah_get_external_worker" => {
+            let args: ExternalWorkerArgs = parse_value(args)?;
+            require_nonempty(&args.external_agent_id, "external_agent_id")?;
+            let provider = parse_provider(&args.provider)?;
+            orch.get_external_worker_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                provider,
+                &args.external_agent_id,
+            )
+            .await
+        }
+        "ptah_get_external_worker_run" => {
+            let args: ExternalWorkerRunArgs = parse_value(args)?;
+            require_nonempty(&args.external_agent_id, "external_agent_id")?;
+            require_nonempty(&args.external_run_id, "external_run_id")?;
+            let provider = parse_provider(&args.provider)?;
+            orch.get_external_worker_run_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                provider,
+                &args.external_agent_id,
+                &args.external_run_id,
+            )
+            .await
+        }
+        "ptah_list_external_worker_artifacts" => {
+            let args: ExternalWorkerRunArgs = parse_value(args)?;
+            require_nonempty(&args.external_agent_id, "external_agent_id")?;
+            require_nonempty(&args.external_run_id, "external_run_id")?;
+            let provider = parse_provider(&args.provider)?;
+            orch.list_external_worker_artifacts_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                provider,
+                &args.external_agent_id,
+                &args.external_run_id,
+            )
+            .await
+        }
+        "ptah_archive_external_worker" | "ptah_unarchive_external_worker" => {
+            let args: ExternalWorkerArgs = parse_value(args)?;
+            require_nonempty(&args.external_agent_id, "external_agent_id")?;
+            let provider = parse_provider(&args.provider)?;
+            orch.set_external_worker_archived_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                provider,
+                &args.external_agent_id,
+                name == "ptah_archive_external_worker",
+            )
+        }
+        "ptah_reconcile_external_worker" => {
+            let args: ExternalWorkerArgs = parse_value(args)?;
+            require_nonempty(&args.external_agent_id, "external_agent_id")?;
+            let provider = parse_provider(&args.provider)?;
+            orch.reconcile_external_worker_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                provider,
+                &args.external_agent_id,
+            )
+            .await
+        }
         "ptah_list_computer_runs" => {
             let args: ComputerScopeArgs = parse_value(args)?;
             orch.list_computer_runs_scoped(auth, args.session_id, &args.workspace)
@@ -2261,6 +2426,47 @@ pub fn discovered_tool_names() -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    /// Every external-worker tool must carry a real input schema, and an
+    /// unknown provider must fail closed rather than defaulting to one.
+    #[test]
+    fn external_worker_tools_have_schemas_and_reject_unknown_providers() {
+        use crate::external_worker::ExternalWorkerProvider;
+
+        for tool in CONTROL_TOOLS
+            .iter()
+            .filter(|tool| tool.contains("external_worker"))
+        {
+            let schema = tool_input_schema(tool);
+            assert_eq!(schema["type"], "object", "{tool} needs an object schema");
+            assert_eq!(
+                schema["additionalProperties"], false,
+                "{tool} must not accept unknown properties",
+            );
+            let required = schema["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{tool} declares required fields"));
+            for field in ["session_id", "workspace", "provider"] {
+                assert!(
+                    required.iter().any(|item| item == field),
+                    "{tool} must require {field}",
+                );
+            }
+        }
+
+        assert_eq!(
+            parse_provider("cursor_cloud").unwrap(),
+            ExternalWorkerProvider::CursorCloud,
+        );
+        for unknown in ["", "cursor", "CURSOR_CLOUD", "openai", "../custom"] {
+            let error = parse_provider(unknown).expect_err("unknown providers fail closed");
+            assert_eq!(
+                error.code,
+                OrchErrorCode::Unsupported,
+                "provider {unknown:?}"
+            );
+        }
+    }
+
     use super::*;
     use crate::host::{AgentHost, HostConfig};
     use crate::orchestration::{

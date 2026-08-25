@@ -19,6 +19,22 @@ use crate::orchestration::CONTROL_TOOLS;
 /// told that an operation exists when the transport does not expose it.
 /// Availability remains separate from authorization; promotion and Computer
 /// Use control are still advertised as gated.
+/// The advertised set for a host, including external workers.
+///
+/// External-worker availability cannot be derived from `CONTROL_TOOLS` the way
+/// every other capability is: the tools are always compiled in, but a provider
+/// is only usable once bootstrap installs a qualified adapter. Availability
+/// therefore comes from the live registry, so an absent or unqualified provider
+/// advertises `Unavailable` and fails closed rather than being discovered at
+/// call time.
+pub fn advertised_capabilities_for(
+    registry: &crate::external_worker::ExternalWorkerRegistry,
+) -> CapabilitySet {
+    let mut set = advertised_capabilities();
+    set.capabilities.push(external_worker_capability(registry));
+    set
+}
+
 pub fn advertised_capabilities() -> CapabilitySet {
     let has = |tool: &str| CONTROL_TOOLS.contains(&tool);
     let mut capabilities = Vec::new();
@@ -209,6 +225,33 @@ mod tests {
         assert_eq!(installed.availability, CapabilityAvailability::Gated);
         assert!(installed.human_gate);
         assert!(installed.mutating);
+    }
+
+    /// The advertised set must tell the truth about what is installed, because
+    /// a consumer negotiates against it before calling anything.
+    #[test]
+    fn the_advertised_set_reports_external_workers_from_the_live_registry() {
+        use crate::external_worker::{CursorCloudAdapter, ExternalWorkerRegistry};
+        use std::sync::Arc;
+
+        let registry = ExternalWorkerRegistry::new();
+        let set = advertised_capabilities_for(&registry);
+        assert_eq!(
+            set.get("external.worker").map(|item| item.availability),
+            Some(CapabilityAvailability::Unavailable),
+        );
+
+        registry.register(Arc::new(CursorCloudAdapter::new("synthetic-key").unwrap()));
+        let set = advertised_capabilities_for(&registry);
+        assert_eq!(
+            set.get("external.worker").map(|item| item.availability),
+            Some(CapabilityAvailability::Gated),
+        );
+        // The rest of the advertised set is unchanged by the registry.
+        assert!(set.get("session.observe").is_some());
+        let encoded = serde_json::to_vec(&set).expect("payload serializes");
+        let decoded: CapabilitySet = serde_json::from_slice(&encoded).expect("round trips");
+        assert_eq!(decoded, set);
     }
 
     #[test]

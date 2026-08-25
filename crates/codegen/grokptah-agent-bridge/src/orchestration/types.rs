@@ -805,6 +805,18 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_steer_queued",
     "ptah_steer",
     "ptah_cancel",
+    // External workers. Deliberately least-privilege: reads, artifact listing,
+    // archive/unarchive and reconcile only. Creating a worker, steering one, or
+    // cancelling a provider run is not reachable from this transport — those
+    // spend money on a third party and are gated behind the desktop authority,
+    // not an MCP tool an agent can call.
+    "ptah_list_external_workers",
+    "ptah_get_external_worker",
+    "ptah_get_external_worker_run",
+    "ptah_list_external_worker_artifacts",
+    "ptah_archive_external_worker",
+    "ptah_unarchive_external_worker",
+    "ptah_reconcile_external_worker",
 ];
 
 pub const FORBIDDEN_TOOLS: &[&str] = &[
@@ -841,6 +853,46 @@ mod tests {
     fn control_tools_exclude_forbidden() {
         for f in FORBIDDEN_TOOLS {
             assert!(!CONTROL_TOOLS.contains(f), "{f} must not be in allowlist");
+        }
+    }
+
+    /// The external-worker MCP surface is deliberately read-and-lifecycle only.
+    ///
+    /// Creating a worker, steering one, or cancelling a provider run spends
+    /// money on a third party and starts work in a repository. Those stay
+    /// behind the desktop authority; an agent holding an MCP session must not
+    /// be able to reach them, and this test is what keeps that true when
+    /// someone later adds a tool "for symmetry".
+    #[test]
+    fn external_worker_control_tools_are_least_privilege() {
+        let external = CONTROL_TOOLS
+            .iter()
+            .filter(|tool| tool.contains("external_worker"))
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            external,
+            vec![
+                "ptah_list_external_workers",
+                "ptah_get_external_worker",
+                "ptah_get_external_worker_run",
+                "ptah_list_external_worker_artifacts",
+                "ptah_archive_external_worker",
+                "ptah_unarchive_external_worker",
+                "ptah_reconcile_external_worker",
+            ],
+        );
+        for forbidden in [
+            "ptah_launch_external_worker",
+            "ptah_create_external_worker",
+            "ptah_follow_up_external_worker",
+            "ptah_cancel_external_worker",
+            "ptah_steer_external_worker",
+        ] {
+            assert!(
+                !CONTROL_TOOLS.contains(&forbidden),
+                "{forbidden} must not be reachable from the MCP control plane",
+            );
         }
     }
 
