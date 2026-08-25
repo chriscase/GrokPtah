@@ -121,6 +121,14 @@ describe("GrokPtahBrokerClient", () => {
       updatedAt: "now",
       progress: { round: 25, maxRounds: 24, detail: "too far", updatedAt: "now" },
     })).toBeNull();
+    expect(parseBrokerRunProjection({
+      brokerRunId: "run-1",
+      bindingId: "binding-1",
+      state: "running",
+      promptPreview: "Review /private/secret",
+      createdAt: "now",
+      updatedAt: "now",
+    })).toBeNull();
 
     const review = parseBrokerReviewProjection({
       changedFiles: [{ path: "src/lib.ts", summary: "bounded" }],
