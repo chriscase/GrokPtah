@@ -28,8 +28,9 @@ use std::time::Duration;
 
 use grokptah_agent_bridge::{
     home_override_serial, set_grokptah_home_override, start_control_server, AgentHost,
-    AgentHostHandle, ControlServerHandle, HostConfig, McpControlClient, McpRemoteError,
-    OrchestrationConfig, OrchestrationService, RuntimeHome, RuntimeHostKind, WorkspaceAllowlist,
+    AgentHostHandle, AuthCredential, ControlServerHandle, HostConfig, McpControlClient,
+    McpRemoteError, OrchestrationConfig, OrchestrationService, RuntimeHome, RuntimeHostKind,
+    WorkspaceAllowlist,
 };
 use grokptah_service::{start_service, ServiceConfig, ServiceHandle};
 use grokptah_test_gateway::{MockGateway, RecordedRequest, Response, Step};
@@ -53,6 +54,23 @@ const EXPECTED_DESKTOP_LOCAL_HOST_CAPABILITIES: &[&str] = &[
     "desktop_pty",
     "semantic_computer_use_foreground",
 ];
+/// The single source of truth for this fixture's authority contract.
+///
+/// Both endpoints are launched with `AuthCredential::operator`, which the
+/// bridge maps to `AuthorityRole::RemoteOperator`, and which
+/// `orchestration::authority` maps in turn to exactly one hard denial. A
+/// remote operator may approve and promote; it never receives Computer Use
+/// authority. Runtime validation and the normalized evidence both read these
+/// two constants, so the oracle cannot claim one authority while the harness
+/// validates another.
+const EXPECTED_AUTHORITY_ROLE: &str = "remote_operator";
+const EXPECTED_HARD_DENIALS: &[&str] = &["computer_use"];
+
+/// Stable token recorded when an undeclared Computer Use mutation is refused.
+/// The raw refusal embeds the requested tool name; normalizing keeps the
+/// evidence deterministic without weakening the boundary it records.
+const UNKNOWN_TOOL_DENIAL: &str = "unknown_tool";
+
 const SCENARIO_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/shared-black-box/v1/scenario.json"
@@ -663,6 +681,13 @@ async fn start_endpoint(
                 },
                 RuntimeHostKind::DesktopLocal,
             );
+            // Qualify parity against an explicit remote operator on both
+            // endpoints. Without this the desktop adapter would fall back to a
+            // coordinator bearer and the two hosts would be compared under
+            // different authority contracts.
+            orch.set_auth_credentials(vec![AuthCredential::operator("primary", token)
+                .expect("shared parity operator credential")])
+                .expect("install shared parity operator credential");
             let server = start_control_server(orch, 0)
                 .await
                 .expect("desktop control server");
@@ -676,7 +701,7 @@ async fn start_endpoint(
             }
         }
         EndpointKind::Hosted => {
-            let config = ServiceConfig::new(
+            let mut config = ServiceConfig::new(
                 "127.0.0.1:0".parse().unwrap(),
                 token,
                 vec![workspace.to_path_buf()],
@@ -687,6 +712,11 @@ async fn start_endpoint(
             .expect("hosted service config")
             .with_runtime_home(home)
             .expect("hosted runtime home");
+            // `ServiceConfig::new` derives a coordinator bearer from the raw
+            // token. Replace it so the hosted endpoint carries the same
+            // operator authority the desktop endpoint was given.
+            config.client_credentials = vec![AuthCredential::operator("primary", token)
+                .expect("shared parity operator credential")];
             let handle = start_service(config).await.expect("start hosted service");
             let addr = format!("http://{}", handle.addr);
             let mcp = McpControlClient::new(&addr, token);
@@ -773,11 +803,10 @@ fn host_capability_contract(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let expected_hard_denials = vec![
-        "approval".to_string(),
-        "promotion".to_string(),
-        "computer_use".to_string(),
-    ];
+    let expected_hard_denials = EXPECTED_HARD_DENIALS
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
     let actual_hard_denials = document["hardDenials"]
         .as_array()
         .map(|values| {
@@ -804,7 +833,7 @@ fn host_capability_contract(
         (
             "principal.role",
             document["principal"]["role"].clone(),
-            json!("remote_coordinator"),
+            json!(EXPECTED_AUTHORITY_ROLE),
         ),
         (
             "hostCapabilities",
@@ -855,11 +884,13 @@ fn host_capability_contract(
         "schema": "grokptah.authority-capabilities.v1",
         "schemaVersion": 1,
         "attemptTimeCapture": true,
-        "authorityRole": "remote_coordinator",
+        // Emitted from the same constants the validation above enforces, so
+        // the recorded oracle can never disagree with the runtime contract.
+        "authorityRole": EXPECTED_AUTHORITY_ROLE,
         "hostKinds": ["desktop_local", "standalone_service"],
         "commonCapabilities": EXPECTED_COMMON_HOST_CAPABILITIES,
         "desktopLocalCapabilities": EXPECTED_DESKTOP_LOCAL_HOST_CAPABILITIES,
-        "remoteHardDenials": ["approval", "promotion", "computer_use"]
+        "remoteHardDenials": EXPECTED_HARD_DENIALS
     })
 }
 
@@ -930,14 +961,41 @@ async fn drive_six_phases(
     )
     .await
     .expect_err("undeclared Computer mutation must fail closed");
-    if missing_capability_denial != "forbidden_scope" {
+    // `computer_use` is a hard denial for a remote operator, so no Computer
+    // mutation tool is advertised and the call is refused before it reaches
+    // the wire. The raw refusal names the requested tool, which would pin a
+    // tool name into the oracle; record the stable class instead.
+    let missing_capability_denial = if missing_capability_denial.starts_with("unknown tool ") {
+        UNKNOWN_TOOL_DENIAL
+    } else {
+        missing_capability_denial.as_str()
+    };
+    if missing_capability_denial != UNKNOWN_TOOL_DENIAL {
         defects.push(format!(
-            "{}.hostCapability.missingCapabilityDenial: actual={} expected=forbidden_scope",
-            kind.as_str(),
-            missing_capability_denial
+            "{}.hostCapability.missingCapabilityDenial: actual={missing_capability_denial} \
+             expected={UNKNOWN_TOOL_DENIAL}",
+            kind.as_str()
         ));
     }
     host_contract["missingCapabilityDenial"] = json!(missing_capability_denial);
+
+    // Refusing one known mutation name is not the boundary; the boundary is
+    // that no Computer Use tool is reachable at all. A denied `computer_use`
+    // grant withdraws the entire surface, read-only projections included, so
+    // anything advertised here is a regression rather than a lesser grant.
+    let advertised_computer_use = advertised
+        .iter()
+        .filter(|name| name.contains("computer"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !advertised_computer_use.is_empty() {
+        defects.push(format!(
+            "{}.hostCapability.computerUseSurface: {} advertised while computer_use is hard-denied",
+            kind.as_str(),
+            advertised_computer_use.join(", ")
+        ));
+    }
+    host_contract["computerUseSurface"] = json!(advertised_computer_use);
 
     let capacity0 = call_ok(&mut launched.mcp, "ptah_get_capacity", json!({}), scan).await;
     let readiness_supported = advertised
@@ -2885,11 +2943,10 @@ fn repo_root() -> PathBuf {
         .expect("canonicalize repo root")
 }
 
-fn git_stdout(args: &[&str]) -> Result<String, String> {
-    let root = repo_root();
+fn git_stdout_at(root: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(&root)
+        .arg(root)
         .args(args)
         .output()
         .map_err(|error| format!("git {}: {error}", args.join(" ")))?;
@@ -2930,19 +2987,22 @@ fn allowlisted(path: &str) -> bool {
     })
 }
 
-fn commit_changed_files(sha: &str) -> Result<Vec<String>, String> {
-    let parent = git_stdout(&["rev-parse", &format!("{sha}^")]);
+fn commit_changed_files_at(root: &Path, sha: &str) -> Result<Vec<String>, String> {
+    let parent = git_stdout_at(root, &["rev-parse", &format!("{sha}^")]);
     let diff = if parent.is_ok() {
-        git_stdout(&["diff", "--name-only", &format!("{sha}^"), sha])?
+        git_stdout_at(root, &["diff", "--name-only", &format!("{sha}^"), sha])?
     } else {
-        git_stdout(&[
-            "diff-tree",
-            "--no-commit-id",
-            "--name-only",
-            "--root",
-            "-r",
-            sha,
-        ])?
+        git_stdout_at(
+            root,
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "--root",
+                "-r",
+                sha,
+            ],
+        )?
     };
     Ok(diff
         .lines()
@@ -2951,24 +3011,146 @@ fn commit_changed_files(sha: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-fn detect_audited_source_revision() -> String {
-    let status = git_stdout(&["status", "--porcelain"]).expect("git status");
+/// Resolve the audited host revision, or explain why it cannot be resolved.
+///
+/// Every failure is terminal. The resolver never falls back to `HEAD`: on a
+/// pull-request run `HEAD` is an ephemeral synthetic merge that exists only
+/// for that run, so naming it would let an immutable golden be keyed to an
+/// identity nobody can check out again. Refusing is always correct; guessing
+/// never is.
+fn resolve_audited_source_revision_at(root: &Path) -> Result<String, String> {
+    let status = git_stdout_at(root, &["status", "--porcelain"])?;
     for path in porcelain_paths(&status) {
         if !allowlisted(&path) {
-            panic!("unexpected dirty path outside fixture allowlist: {path}");
+            return Err(format!(
+                "unexpected dirty path outside fixture allowlist: {path}"
+            ));
         }
     }
-    let mut sha = git_stdout(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    require_complete_history(root)?;
+    let head = git_stdout_at(root, &["rev-parse", "HEAD"])?;
+    let candidate = audited_walk_start(root, &head)?;
+    walk_to_audited_commit(root, &candidate)
+}
+
+/// Refuse to resolve anything inside a shallow or grafted clone. A truncated
+/// history stops the audited walk at whatever commit happens to be the oldest
+/// object present, which silently names the wrong revision.
+fn require_complete_history(root: &Path) -> Result<(), String> {
+    let shallow = git_stdout_at(root, &["rev-parse", "--is-shallow-repository"])?;
+    if shallow.trim() != "false" {
+        return Err(
+            "shallow checkout cannot identify the audited source revision; \
+             check out full history (fail closed)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Pick the commit the audited walk starts from.
+///
+/// Only two shapes are accepted:
+/// * an ordinary (or root) commit, which is its own candidate; and
+/// * a two-parent merge whose tree is identical to exactly its second parent,
+///   which is how a hosted pull-request checkout wraps the revision under
+///   test.
+///
+/// An ordinary commit is never unwrapped to its parent, because that would
+/// name a revision the runner never checked out.
+fn audited_walk_start(root: &Path, head: &str) -> Result<String, String> {
+    let parent_line = git_stdout_at(root, &["rev-list", "--parents", "-n", "1", head])?;
+    let mut fields = parent_line.split_whitespace();
+    let listed = fields.next().unwrap_or_default();
+    if listed != head {
+        return Err(format!(
+            "rev-list named {listed} for HEAD {head}; refusing to resolve an ambiguous head"
+        ));
+    }
+    let parents = fields.collect::<Vec<_>>();
+    match parents.len() {
+        0 | 1 => Ok(head.to_string()),
+        2 => matching_tree_parent(root, head, parents[0], parents[1]),
+        count => Err(format!(
+            "HEAD {head} is an octopus merge with {count} parents; only a unique two-parent \
+             matching-tree merge can be resolved (fail closed)"
+        )),
+    }
+}
+
+/// A hosted pull-request checkout is a synthetic merge of the base branch into
+/// the revision under test, so its tree is byte-identical to that revision's
+/// tree and the revision can be recovered exactly. That recovery is only sound
+/// when the second parent is the *only* tree that matches: if the base side
+/// matches too the merge is empty and either parent would fit, and if neither
+/// matches the merge resolved real content that exists in no single commit.
+/// Both are unrecoverable, and both fail closed.
+fn matching_tree_parent(
+    root: &Path,
+    head: &str,
+    first_parent: &str,
+    second_parent: &str,
+) -> Result<String, String> {
+    require_present_commit(root, first_parent)?;
+    require_present_commit(root, second_parent)?;
+    let head_tree = tree_of(root, head)?;
+    let first_matches = tree_of(root, first_parent)? == head_tree;
+    let second_matches = tree_of(root, second_parent)? == head_tree;
+    match (first_matches, second_matches) {
+        (false, true) => Ok(second_parent.to_string()),
+        (true, true) => Err(format!(
+            "merge {head} shares its tree with both parents ({first_parent}, {second_parent}); \
+             refusing to guess the audited source (fail closed)"
+        )),
+        (true, false) => Err(format!(
+            "merge {head} shares its tree only with its base parent {first_parent}; the audited \
+             revision contributed nothing and cannot be named (fail closed)"
+        )),
+        (false, false) => Err(format!(
+            "merge {head} shares its tree with neither parent; the audited source is not \
+             recoverable (fail closed)"
+        )),
+    }
+}
+
+/// A commit named in the graph but absent from the object store is the
+/// signature of a truncated clone. Naming a revision from it would be a guess.
+fn require_present_commit(root: &Path, sha: &str) -> Result<(), String> {
+    git_stdout_at(root, &["cat-file", "-e", &format!("{sha}^{{commit}}")])
+        .map(|_| ())
+        .map_err(|_| format!("commit {sha} is missing from this checkout (fail closed)"))
+}
+
+fn tree_of(root: &Path, sha: &str) -> Result<String, String> {
+    git_stdout_at(root, &["rev-parse", &format!("{sha}^{{tree}}")])
+}
+
+/// Walk first-parent history from the candidate until a commit changes
+/// something outside the fixture allowlist. That commit is the audited host
+/// revision: the newest revision whose behaviour a golden may describe.
+/// Running off the end of history means no such commit exists here, which is
+/// a failure, not a reason to fall back to the head.
+fn walk_to_audited_commit(root: &Path, candidate: &str) -> Result<String, String> {
+    let mut sha = candidate.to_string();
     loop {
-        let files = commit_changed_files(&sha).expect("commit files");
+        let files = commit_changed_files_at(root, &sha)?;
         if files.iter().any(|path| !allowlisted(path)) {
-            return sha;
+            return Ok(sha);
         }
-        match git_stdout(&["rev-parse", &format!("{sha}^")]) {
-            Ok(parent) => sha = parent,
-            Err(_) => panic!("could not identify audited host revision (fail closed)"),
-        }
+        let parent = git_stdout_at(root, &["rev-parse", &format!("{sha}^")])
+            .map_err(|_| "could not identify audited host revision (fail closed)".to_string())?;
+        require_present_commit(root, &parent)?;
+        sha = parent;
     }
+}
+
+fn detect_audited_source_revision_at(root: &Path) -> String {
+    resolve_audited_source_revision_at(root)
+        .unwrap_or_else(|error| panic!("audited source revision: {error}"))
+}
+
+fn detect_audited_source_revision() -> String {
+    detect_audited_source_revision_at(&repo_root())
 }
 
 fn write_golden_document(result: &Value, source: &str) -> Value {
@@ -3342,9 +3524,9 @@ fn host_capability_oracle_rejects_kind_and_capability_drift() {
             "hostKind": "desktop_local",
             "hostVersion": "0.1.0"
         },
-        "principal": { "role": "remote_coordinator" },
+        "principal": { "role": EXPECTED_AUTHORITY_ROLE },
         "hostCapabilities": desktop_capabilities,
-        "hardDenials": ["approval", "promotion", "computer_use"]
+        "hardDenials": EXPECTED_HARD_DENIALS
     });
     let mut defects = Vec::new();
     host_capability_contract(EndpointKind::Desktop, &document, &mut defects);
@@ -3369,4 +3551,562 @@ fn expected_main_golden_is_immutable_for_audited_revision() {
         loaded["overlay"]["mcpError"]["code"],
         json!("invalid_request")
     );
+}
+
+// --- Audited-source resolver: adversarial topology coverage -----------------
+//
+// Each test builds a real repository whose shape the resolver must either
+// name exactly or refuse outright. The refusals matter as much as the
+// successes: a resolver that falls back to HEAD would key an immutable golden
+// to an ephemeral synthetic merge.
+
+fn detector_git(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("run detector git command");
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string()
+}
+
+fn detector_write(repo: &Path, path: &str, contents: &str) {
+    let path = repo.join(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("detector fixture parent");
+    }
+    std::fs::write(path, contents).expect("detector fixture file");
+}
+
+fn detector_commit(repo: &Path, message: &str) -> String {
+    detector_git(repo, &["add", "--all"]);
+    detector_git(repo, &["commit", "--quiet", "-m", message]);
+    detector_git(repo, &["rev-parse", "HEAD"])
+}
+
+/// A repository whose only commit touches an allowlisted fixture path, so the
+/// audited walk must keep walking past it.
+fn detector_repo() -> TempDir {
+    let repo = tempfile::tempdir().expect("detector repo");
+    detector_git(repo.path(), &["init", "--quiet", "-b", "main"]);
+    detector_git(
+        repo.path(),
+        &["config", "user.email", "detector-tests@example.invalid"],
+    );
+    detector_git(repo.path(), &["config", "user.name", "detector tests"]);
+    detector_git(repo.path(), &["config", "commit.gpgsign", "false"]);
+    detector_write(
+        repo.path(),
+        "crates/codegen/grokptah-service/tests/shared_black_box_v1.rs",
+        "fixture-only base\n",
+    );
+    detector_commit(repo.path(), "allowlisted base");
+    repo
+}
+
+/// `main` merged with a branch it is already up to date with: the merge tree
+/// equals the second parent's tree exactly, which is the hosted pull-request
+/// shape.
+fn matching_tree_repo() -> (TempDir, String, String) {
+    let repo = detector_repo();
+    detector_git(repo.path(), &["checkout", "--quiet", "-b", "candidate"]);
+    detector_write(repo.path(), "candidate-only.txt", "candidate\n");
+    let candidate = detector_commit(repo.path(), "candidate outside fixture allowlist");
+    detector_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_git(
+        repo.path(),
+        &["merge", "--quiet", "--no-ff", "--no-edit", "candidate"],
+    );
+    let merge = detector_git(repo.path(), &["rev-parse", "HEAD"]);
+    (repo, candidate, merge)
+}
+
+#[test]
+fn direct_candidate_resolves_to_the_checked_out_commit() {
+    let repo = detector_repo();
+    detector_write(repo.path(), "direct-only.txt", "direct\n");
+    let head = detector_commit(repo.path(), "ordinary commit outside fixture allowlist");
+    let parents = detector_git(repo.path(), &["rev-list", "--parents", "-n", "1", "HEAD"]);
+    assert_eq!(parents.split_whitespace().count(), 2, "ordinary commit");
+    assert_eq!(
+        resolve_audited_source_revision_at(repo.path()).expect("direct candidate"),
+        head
+    );
+}
+
+#[test]
+fn direct_candidate_walks_past_allowlisted_only_commits() {
+    let repo = detector_repo();
+    detector_write(repo.path(), "audited-only.txt", "audited\n");
+    let audited = detector_commit(repo.path(), "audited change");
+    detector_write(
+        repo.path(),
+        "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/scenario.json",
+        "{}\n",
+    );
+    let head = detector_commit(repo.path(), "allowlisted fixture-only change");
+    assert_ne!(head, audited);
+    assert_eq!(
+        resolve_audited_source_revision_at(repo.path()).expect("walk past fixture commits"),
+        audited,
+        "a fixture-only commit must not become the audited revision"
+    );
+}
+
+#[test]
+fn matching_tree_two_parent_merge_resolves_to_the_second_parent() {
+    let (repo, candidate, merge) = matching_tree_repo();
+    assert_ne!(candidate, merge);
+    let resolved = resolve_audited_source_revision_at(repo.path()).expect("matching-tree merge");
+    assert_eq!(resolved, candidate);
+    assert_ne!(
+        resolved, merge,
+        "the ephemeral synthetic merge must never be named"
+    );
+}
+
+#[test]
+fn ephemeral_merge_identity_is_never_mappable_to_a_golden() {
+    let (repo, _candidate, merge) = matching_tree_repo();
+    let resolved = resolve_audited_source_revision_at(repo.path()).expect("matching-tree merge");
+    assert_ne!(resolved, merge);
+    assert!(
+        AUDITED_GOLDENS.iter().all(|(sha, _)| *sha != merge),
+        "a synthetic merge identity must never appear in the compile-time golden map"
+    );
+    let scenario = Scenario::load();
+    let message = catch_unwind(AssertUnwindSafe(|| select_golden_file(&merge, &scenario)))
+        .expect_err("a synthetic merge identity must not select a golden");
+    let text = panic_text(message);
+    assert!(text.contains("unexpected source revision"), "{text}");
+}
+
+#[test]
+fn merge_whose_tree_matches_neither_parent_fails_closed() {
+    let repo = detector_repo();
+    detector_git(repo.path(), &["checkout", "--quiet", "-b", "candidate"]);
+    detector_write(repo.path(), "candidate-only.txt", "candidate\n");
+    detector_commit(repo.path(), "candidate change");
+    detector_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_write(repo.path(), "base-only.txt", "base branch\n");
+    detector_commit(repo.path(), "base branch change");
+    detector_git(
+        repo.path(),
+        &["merge", "--quiet", "--no-ff", "--no-edit", "candidate"],
+    );
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("a real merge is not a recoverable audited source");
+    assert!(error.contains("neither parent"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+}
+
+#[test]
+fn merge_whose_tree_matches_both_parents_is_ambiguous_and_fails_closed() {
+    let repo = detector_repo();
+    detector_write(repo.path(), "shared.txt", "shared\n");
+    detector_commit(repo.path(), "shared content outside fixture allowlist");
+    detector_git(repo.path(), &["checkout", "--quiet", "-b", "candidate"]);
+    // Change a file and change it straight back: a distinct commit whose tree
+    // is identical to the base branch's tree.
+    detector_write(repo.path(), "shared.txt", "diverged\n");
+    detector_commit(repo.path(), "diverge");
+    detector_write(repo.path(), "shared.txt", "shared\n");
+    detector_commit(repo.path(), "converge back onto the base tree");
+    detector_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_git(
+        repo.path(),
+        &["merge", "--quiet", "--no-ff", "--no-edit", "candidate"],
+    );
+    let head = detector_git(repo.path(), &["rev-parse", "HEAD"]);
+    let parents = detector_git(repo.path(), &["rev-list", "--parents", "-n", "1", "HEAD"]);
+    let parents = parents.split_whitespace().skip(1).collect::<Vec<_>>();
+    assert_eq!(parents.len(), 2);
+    let head_tree = detector_git(repo.path(), &["rev-parse", &format!("{head}^{{tree}}")]);
+    for parent in &parents {
+        assert_eq!(
+            detector_git(repo.path(), &["rev-parse", &format!("{parent}^{{tree}}")]),
+            head_tree,
+            "both parents must share the merge tree for this case"
+        );
+    }
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("an ambiguous merge tree must not resolve");
+    assert!(error.contains("both parents"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+}
+
+#[test]
+fn merge_whose_tree_matches_only_the_base_parent_fails_closed() {
+    // A merge that discards the candidate side entirely: two real parents, but
+    // the merge tree is the base tree. Naming the base here would attribute the
+    // run to a revision that contributed nothing under test.
+    let repo = detector_repo();
+    detector_write(repo.path(), "base-only.txt", "base\n");
+    detector_commit(repo.path(), "base outside fixture allowlist");
+    detector_git(repo.path(), &["checkout", "--quiet", "-b", "candidate"]);
+    detector_write(repo.path(), "candidate-only.txt", "candidate\n");
+    let candidate = detector_commit(repo.path(), "candidate change");
+    detector_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_write(repo.path(), "base-advance.txt", "advance\n");
+    let base = detector_commit(repo.path(), "base advances past the candidate");
+    detector_git(
+        repo.path(),
+        &[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "--no-edit",
+            "-s",
+            "ours",
+            "candidate",
+        ],
+    );
+    let head = detector_git(repo.path(), &["rev-parse", "HEAD"]);
+    let parents = detector_git(repo.path(), &["rev-list", "--parents", "-n", "1", "HEAD"]);
+    let parents = parents.split_whitespace().skip(1).collect::<Vec<_>>();
+    assert_eq!(parents, vec![base.as_str(), candidate.as_str()]);
+    let head_tree = detector_git(repo.path(), &["rev-parse", &format!("{head}^{{tree}}")]);
+    assert_eq!(
+        head_tree,
+        detector_git(repo.path(), &["rev-parse", &format!("{base}^{{tree}}")]),
+        "the merge must carry the base tree"
+    );
+    assert_ne!(
+        head_tree,
+        detector_git(
+            repo.path(),
+            &["rev-parse", &format!("{candidate}^{{tree}}")]
+        ),
+        "the merge must not carry the candidate tree"
+    );
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("an empty candidate must not resolve to the base parent");
+    assert!(error.contains("base parent"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+}
+
+#[test]
+fn octopus_merge_fails_closed() {
+    let repo = detector_repo();
+    for name in ["one", "two", "three"] {
+        detector_git(repo.path(), &["checkout", "--quiet", "main"]);
+        detector_git(repo.path(), &["checkout", "--quiet", "-b", name]);
+        detector_write(repo.path(), &format!("{name}-only.txt"), name);
+        detector_commit(repo.path(), name);
+    }
+    detector_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_git(
+        repo.path(),
+        &[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "--no-edit",
+            "one",
+            "two",
+            "three",
+        ],
+    );
+    let parents = detector_git(repo.path(), &["rev-list", "--parents", "-n", "1", "HEAD"]);
+    assert_eq!(
+        parents.split_whitespace().count(),
+        5,
+        "octopus with 3 sides"
+    );
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("an octopus merge must not resolve");
+    assert!(error.contains("octopus merge"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+}
+
+#[test]
+fn shallow_history_fails_closed_instead_of_naming_the_merge() {
+    let (repo, candidate, merge) = matching_tree_repo();
+    let parent = tempfile::tempdir().expect("shallow clone parent");
+    let clone = parent.path().join("clone");
+    let output = Command::new("git")
+        .args(["clone", "--quiet", "--depth", "1", "--branch", "main"])
+        .arg(format!("file://{}", repo.path().display()))
+        .arg(&clone)
+        .output()
+        .expect("clone shallow detector repo");
+    assert!(
+        output.status.success(),
+        "git clone failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(detector_git(&clone, &["rev-parse", "HEAD"]), merge);
+    let error = resolve_audited_source_revision_at(&clone)
+        .expect_err("a shallow checkout must not resolve an audited revision");
+    assert!(error.contains("shallow checkout"), "{error}");
+    assert!(error.contains("fail closed"), "{error}");
+    assert!(!error.contains(&merge), "{error}");
+    assert!(!error.contains(&candidate), "{error}");
+}
+
+#[test]
+fn history_without_an_audited_commit_fails_closed() {
+    // Every commit touches only allowlisted fixture paths, so the walk runs
+    // off the end of history. That is a failure, not a fallback to HEAD.
+    let repo = detector_repo();
+    detector_write(
+        repo.path(),
+        "crates/codegen/grokptah-service/tests/common/mod.rs",
+        "// fixture-only\n",
+    );
+    detector_commit(repo.path(), "another allowlisted change");
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("history with no audited commit must fail closed");
+    assert!(
+        error.contains("could not identify audited host revision"),
+        "{error}"
+    );
+    assert!(error.contains("fail closed"), "{error}");
+}
+
+#[test]
+fn dirty_path_outside_the_fixture_allowlist_fails_closed() {
+    let repo = detector_repo();
+    detector_write(repo.path(), "audited-only.txt", "audited\n");
+    detector_commit(repo.path(), "audited change");
+    detector_write(repo.path(), "uncommitted-source.rs", "fn main() {}\n");
+    let error = resolve_audited_source_revision_at(repo.path())
+        .expect_err("a dirty non-fixture path must fail closed");
+    assert!(error.contains("unexpected dirty path"), "{error}");
+}
+
+// --- Authority contract ----------------------------------------------------
+
+#[test]
+fn authority_contract_is_identical_in_validation_and_evidence() {
+    // The fixture launches both endpoints with `AuthCredential::operator`, so
+    // the audited contract is a remote operator denied exactly Computer Use.
+    assert_eq!(EXPECTED_AUTHORITY_ROLE, "remote_operator");
+    assert_eq!(EXPECTED_HARD_DENIALS, &["computer_use"]);
+
+    let mut capabilities = EXPECTED_COMMON_HOST_CAPABILITIES
+        .iter()
+        .chain(EXPECTED_DESKTOP_LOCAL_HOST_CAPABILITIES.iter())
+        .copied()
+        .collect::<Vec<_>>();
+    capabilities.sort();
+    let coherent = json!({
+        "schema": "grokptah.authority-capabilities.v1",
+        "schemaVersion": 1,
+        "documentHash": "a".repeat(64),
+        "assertedBy": {
+            "hostInstanceId": "b".repeat(64),
+            "hostKind": "desktop_local",
+            "hostVersion": "0.1.0"
+        },
+        "principal": { "role": EXPECTED_AUTHORITY_ROLE },
+        "hostCapabilities": capabilities.clone(),
+        "hardDenials": EXPECTED_HARD_DENIALS
+    });
+
+    let mut defects = Vec::new();
+    let evidence = host_capability_contract(EndpointKind::Desktop, &coherent, &mut defects);
+    assert!(defects.is_empty(), "{defects:?}");
+
+    // Rebuild the runtime document out of the recorded evidence and require
+    // that it still validates. If the oracle ever reported one authority while
+    // the harness enforced another, this round trip could not pass.
+    let replayed = json!({
+        "schema": "grokptah.authority-capabilities.v1",
+        "schemaVersion": 1,
+        "documentHash": "a".repeat(64),
+        "assertedBy": {
+            "hostInstanceId": "b".repeat(64),
+            "hostKind": "desktop_local",
+            "hostVersion": "0.1.0"
+        },
+        "principal": { "role": evidence["authorityRole"].clone() },
+        "hostCapabilities": capabilities,
+        "hardDenials": evidence["remoteHardDenials"].clone()
+    });
+    let mut defects = Vec::new();
+    host_capability_contract(EndpointKind::Desktop, &replayed, &mut defects);
+    assert!(
+        defects.is_empty(),
+        "recorded evidence must satisfy the contract it records: {defects:?}"
+    );
+}
+
+#[test]
+fn coordinator_authority_is_rejected_as_contract_drift() {
+    // The pre-operator oracle: a coordinator principal with approval and
+    // promotion denied as well. It must not validate against the operator
+    // contract the fixture now qualifies.
+    let mut capabilities = EXPECTED_COMMON_HOST_CAPABILITIES
+        .iter()
+        .chain(EXPECTED_DESKTOP_LOCAL_HOST_CAPABILITIES.iter())
+        .copied()
+        .collect::<Vec<_>>();
+    capabilities.sort();
+    let drifted = json!({
+        "schema": "grokptah.authority-capabilities.v1",
+        "schemaVersion": 1,
+        "documentHash": "a".repeat(64),
+        "assertedBy": {
+            "hostInstanceId": "b".repeat(64),
+            "hostKind": "desktop_local",
+            "hostVersion": "0.1.0"
+        },
+        "principal": { "role": "remote_coordinator" },
+        "hostCapabilities": capabilities,
+        "hardDenials": ["approval", "promotion", "computer_use"]
+    });
+    let mut defects = Vec::new();
+    host_capability_contract(EndpointKind::Desktop, &drifted, &mut defects);
+    let joined = defects.join("\n");
+    assert!(joined.contains("principal.role"), "{joined}");
+    assert!(joined.contains("hardDenials"), "{joined}");
+}
+
+/// Both endpoints, launched exactly as the fixture launches them, must report
+/// the same authority and the same empty Computer Use surface. This runs
+/// without a golden, so the PR #399 boundary stays covered even while the
+/// oracle for a revision is still being calibrated.
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)]
+async fn computer_use_is_hard_denied_on_both_endpoints() {
+    assert!(
+        EXPECTED_HARD_DENIALS.contains(&"computer_use"),
+        "PR #399 boundary: Computer Use is always hard-denied for a remote bearer"
+    );
+    let env = super::ServiceEnv::new();
+    let workspace = env.workspace_path();
+
+    let mut hosted_config = ServiceConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        super::TOKEN,
+        vec![workspace.clone()],
+        false,
+        1,
+        Duration::from_secs(8),
+    )
+    .expect("hosted service config")
+    .with_runtime_home(env._home.path())
+    .expect("hosted runtime home");
+    hosted_config.client_credentials = vec![
+        AuthCredential::operator("primary", super::TOKEN).expect("hosted operator credential")
+    ];
+    let hosted = start_service(hosted_config)
+        .await
+        .expect("start hosted service");
+    let mut hosted_mcp = McpControlClient::new(format!("http://{}", hosted.addr), super::TOKEN);
+    let hosted_init = hosted_mcp.initialize().await.expect("hosted initialize");
+
+    // A runtime home admits one host at a time, so the desktop endpoint gets
+    // its own, exactly as the fixture gives each endpoint a separate home.
+    let desktop_home = tempfile::tempdir().expect("desktop home");
+    let runtime_home = RuntimeHome::from_path(desktop_home.path()).expect("desktop runtime home");
+    let host = AgentHost::create_with_runtime_home(HostConfig::default(), runtime_home);
+    host.start().expect("start desktop agent host");
+    let store = host
+        .ensure_orchestration_store()
+        .expect("desktop orchestration store");
+    let orch = OrchestrationService::new_for_host(
+        host.clone(),
+        host.event_bus(),
+        store,
+        OrchestrationConfig {
+            bearer_token: super::TOKEN.to_string(),
+            allowlist: WorkspaceAllowlist::new([workspace]),
+            max_concurrent_runs: 4,
+            bounds: Default::default(),
+        },
+        RuntimeHostKind::DesktopLocal,
+    );
+    orch.set_auth_credentials(vec![
+        AuthCredential::operator("primary", super::TOKEN).expect("desktop operator credential")
+    ])
+    .expect("install desktop operator credential");
+    let server = start_control_server(orch, 0)
+        .await
+        .expect("desktop control server");
+    let mut desktop_mcp = McpControlClient::new(format!("http://{}", server.addr), super::TOKEN);
+    let desktop_init = desktop_mcp.initialize().await.expect("desktop initialize");
+
+    for (label, init, mcp) in [
+        ("hosted", hosted_init, &mut hosted_mcp),
+        ("desktop", desktop_init, &mut desktop_mcp),
+    ] {
+        let document = authority_capability_document(&init);
+        assert_eq!(
+            document["principal"]["role"],
+            json!(EXPECTED_AUTHORITY_ROLE),
+            "{label} authority role"
+        );
+        assert_eq!(
+            document["hardDenials"],
+            json!(EXPECTED_HARD_DENIALS),
+            "{label} hard denials"
+        );
+        let advertised = mcp
+            .list_tools()
+            .await
+            .expect("tools/list")
+            .iter()
+            .map(|tool| tool.name.clone())
+            .filter(|name| name.contains("computer"))
+            .collect::<Vec<_>>();
+        assert!(
+            advertised.is_empty(),
+            "{label} advertised Computer Use tools while computer_use is hard-denied: {advertised:?}"
+        );
+        let denial = mcp
+            .call_tool("ptah_start_computer_run", json!({}))
+            .await
+            .err()
+            .map(|error| error.to_string())
+            .expect("undeclared Computer mutation must fail closed");
+        assert!(
+            denial.starts_with("unknown tool "),
+            "{label} denial normalizes to {UNKNOWN_TOOL_DENIAL}: {denial}"
+        );
+    }
+
+    host.stop().expect("stop desktop agent host");
+}
+
+// --- Immutable golden topology ---------------------------------------------
+
+#[test]
+fn golden_compile_map_and_scenario_selector_agree_exactly() {
+    // The compile-time map, the scenario selector, and the fixture allowlist
+    // are three independent statements of the same fact. Any future golden
+    // must land in all three or fail here.
+    let selector = Scenario::load().golden_selector();
+    let compile_map = AUDITED_GOLDENS
+        .iter()
+        .map(|(sha, file)| ((*sha).to_string(), (*file).to_string()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        compile_map, selector,
+        "compile-time golden map and scenario goldenSelector must be identical"
+    );
+    for (sha, file) in &compile_map {
+        assert!(
+            sha.len() == 40
+                && sha
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "audited revision {sha} must be a full lowercase 40-hex commit id"
+        );
+        assert!(
+            FIXTURE_ALLOWLIST
+                .iter()
+                .any(|allowed| allowed.ends_with(&format!("/{file}"))),
+            "golden {file} must be covered by the fixture allowlist"
+        );
+    }
 }

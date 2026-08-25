@@ -40,6 +40,13 @@ jobs:
         working-directory: crates/codegen/grokptah-service
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The shared black-box harness resolves the audited source revision
+          # by walking real commit history, and fails closed on a shallow or
+          # truncated clone rather than guessing. A pull-request checkout is
+          # also a synthetic two-parent merge whose second parent is the only
+          # revision a golden may be keyed to, so both parents must be present.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: "1.92.0"
