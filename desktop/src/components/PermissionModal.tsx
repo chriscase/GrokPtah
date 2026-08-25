@@ -50,7 +50,11 @@ export function PermissionModal({
   }
 
   return (
-    <div className="modal-backdrop" data-testid="permission-modal-backdrop">
+    <div
+      className="modal-backdrop"
+      data-modal-layer="consent"
+      data-testid="permission-modal-backdrop"
+    >
       <div
         className="modal permission-modal"
         role="dialog"

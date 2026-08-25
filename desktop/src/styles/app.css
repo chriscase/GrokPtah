@@ -13,6 +13,7 @@
   --muted: #8b919c;
   --accent: #f0b429;
   --accent-dim: #a67c1a;
+  --accent-label: #f0b429;
   --accent-bg: rgba(240, 180, 41, 0.12);
   --danger: #f07178;
   --ok: #7fd99a;
@@ -53,6 +54,7 @@
   --muted: #5c6573;
   --accent: #b8860b;
   --accent-dim: #8a6508;
+  --accent-label: #8a6508;
   --accent-bg: rgba(184, 134, 11, 0.12);
   --danger: #c23b44;
   --ok: #2f8f57;
@@ -3487,6 +3489,10 @@ button:disabled {
   align-items: center;
   justify-content: center;
   z-index: 50;
+}
+
+.modal-backdrop[data-modal-layer="consent"] {
+  z-index: 120;
 }
 
 .modal {
