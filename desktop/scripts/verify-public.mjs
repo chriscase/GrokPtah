@@ -40,6 +40,8 @@ const uiCoreApi = await import(uiCoreBundlePath.href);
 const requiredExports = [
   "GrokPtahBrokerClient",
   "parseBrokerApproval",
+  "parseBrokerBinding",
+  "parseBrokerErrorEnvelope",
   "parseBrokerEventUpdate",
   "parseBrokerRunProjection",
   "parseBrokerReviewProjection",
@@ -80,6 +82,12 @@ for (const name of [
 }
 if ("GrokPtahBrokerClient" in uiCoreApi) {
   throw new Error("ui-core bundle must not expose the browser broker client");
+}
+if ("GrokPtahClient" in publicApi || "GrokPtahClient" in uiCoreApi) {
+  throw new Error("published package must not expose the trusted MCP client");
+}
+if (Object.keys(manifest.exports).sort().join(",") !== ".,./ui-core") {
+  throw new Error("public package must not export private or trusted subpaths");
 }
 if (!Object.isFrozen(publicApi.HELP_ARTICLES) || !Object.isFrozen(uiCoreApi.HELP_ARTICLES)) {
   throw new Error("published Help corpus must be immutable");

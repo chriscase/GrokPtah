@@ -117,8 +117,9 @@ path is qualified.
    that cannot cancel/archive/mutate a sibling worker, direct launch/get
    coverage for a U+FFFD display name plus crate-root public DTO
    validation/round-trip, hosted Desktop `cargo test -p grokptah-agent-sdk`
-   on SDK-path changes, and run-attributed digest-bearing artifacts without
-   network credentials. Stream
+   on SDK-path changes, a crate-root ContextDesk-shaped consumer fixture for
+   list/archive/unarchive and typed public error envelopes, and run-attributed
+   digest-bearing artifacts without network credentials. Stream
    reconnect/expiry, durable idempotent retry, and a real artifact download/hash
    path remain to be added. Live Cursor qualification is still an open gate.
 2. **Read-only live probe:** list models/repositories and read an existing
@@ -132,7 +133,10 @@ path is qualified.
    list, archive/unarchive, artifact, and cancellation calls; the trusted native
    lifecycle adapter is staged. Published schema, embedding, and web-broker
    protocol now document the list/archive/unarchive seam; ContextDesk HTTP
-   handlers and live qualification remain to be completed.
+   handlers and live qualification remain to be completed. The disposable
+   in-tree ContextDesk-shaped consumer fixture exercises the published TypeScript
+   package and crate-root Rust DTOs; it is not a live ContextDesk HTTP handler
+   or cross-repository qualification.
 5. **Release gate:** independently review the adapter, run a retry/restart
    soak, and prove that approval, promotion, and Computer Use remain separate.
 

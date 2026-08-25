@@ -1,10 +1,11 @@
-import { mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
 const packageSource = new URL("../dist/public/", import.meta.url);
+const fixtureSource = fileURLToPath(new URL("./fixtures/context-desk-consumer.mjs", import.meta.url));
 const workspace = await mkdtemp(join(tmpdir(), "grokptah-public-consumer-"));
 const consumerPath = join(workspace, "consumer.mjs");
 const packDirectory = join(workspace, "pack");
@@ -44,169 +45,7 @@ try {
     workspace,
     join(packDirectory, packed),
   ], { cwd: workspace });
-  await writeFile(
-    consumerPath,
-    `import {
-  GrokPtahBrokerClient,
-  parseBrokerApproval,
-  parseBrokerEventUpdate,
-  parseBrokerRunProjection,
-  parseBrokerReviewProjection,
-  EXTERNAL_WORKER_CONTRACT,
-  parseExternalWorkerLaunchRequest,
-  parseExternalWorkerFollowUpRequest,
-  parseExternalWorkerLaunchResult,
-  parseExternalWorkerNotification,
-  parseExternalWorkerListQuery,
-  parseExternalWorkerListPage,
-  parseExternalWorkerSummary,
-  applyExternalWorkerNotification,
-  createExternalWorkerMonitor,
-  HELP_ARTICLES,
-  HELP_ENTRIES,
-  applyAssistantStreamChunk,
-  createPromptQueueEntry,
-  emptyPromptQueueState,
-  promptQueueReducer,
-  searchHelpArticles,
-} from "@grokptah/client";
-import {
-  HELP_ARTICLES as UI_CORE_HELP_ARTICLES,
-  searchHelpArticles as uiCoreSearchHelpArticles,
-} from "@grokptah/client/ui-core";
-
-if (HELP_ARTICLES.length < 1) throw new Error("consumer could not read the Help Center corpus");
-if (!Object.isFrozen(HELP_ARTICLES) || !Object.isFrozen(HELP_ENTRIES)) {
-  throw new Error("consumer Help corpora were not immutable");
-}
-if (UI_CORE_HELP_ARTICLES.length !== HELP_ARTICLES.length) {
-  throw new Error("ui-core subpath exposed a different Help Center corpus");
-}
-if (searchHelpArticles("restricted company gateway")[0]?.article?.id !== "providers.restricted-gateway-review") {
-  throw new Error("consumer Help Center ranking did not match the published contract");
-}
-if (uiCoreSearchHelpArticles("restricted company gateway")[0]?.article?.id !== "providers.restricted-gateway-review") {
-  throw new Error("ui-core consumer Help Center ranking did not match the published contract");
-}
-if (applyAssistantStreamChunk("", "consumer").text !== "consumer") {
-  throw new Error("consumer stream helper did not apply a bounded update");
-}
-const queued = promptQueueReducer(emptyPromptQueueState, {
-  type: "add",
-  sessionId: "consumer-session",
-  entry: createPromptQueueEntry("review", { id: "consumer-entry" }),
-});
-if (queued.entries["consumer-session"]?.[0]?.text !== "review") {
-  throw new Error("consumer queue reducer was not usable");
-}
-const broker = new GrokPtahBrokerClient({
-  baseUrl: "https://contextdesk.example",
-  fetcher: async () => new Response(null, { status: 204 }),
-});
-if (!(broker instanceof GrokPtahBrokerClient)) throw new Error("consumer broker client did not construct");
-if (parseBrokerApproval({
-  approvalId: "approval-1",
-  bindingId: "binding-1",
-  brokerRunId: "run-1",
-  sourceFingerprint: "source-1",
-  finalFingerprint: "final-1",
-  changedFiles: [],
-  expiresAt: "2026-08-24T23:00:00Z",
-})?.approvalId !== "approval-1") {
-  throw new Error("consumer broker approval parser was not usable");
-}
-if (parseBrokerRunProjection({
-  brokerRunId: "run-1",
-  bindingId: "binding-1",
-  state: "completed",
-  promptPreview: "Review",
-  createdAt: "2026-08-24T00:00:00Z",
-  updatedAt: "2026-08-24T00:01:00Z",
-})?.state !== "completed") {
-  throw new Error("consumer broker run projection parser was not usable");
-}
-if (parseBrokerEventUpdate({ type: "progress", round: 1, maxRounds: 12 })?.type !== "progress") {
-  throw new Error("consumer broker event update parser was not usable");
-}
-if (parseBrokerEventUpdate({ type: "progress", detail: "/private/secret" }) !== null) {
-  throw new Error("consumer broker event update parser exposed privileged text");
-}
-if (parseBrokerReviewProjection({
-  changedFiles: [],
-  diff: "diff",
-  diffTruncated: false,
-  fingerprint: "final-1",
-})?.fingerprint !== "final-1") {
-  throw new Error("consumer broker review projection parser was not usable");
-}
-if (EXTERNAL_WORKER_CONTRACT !== "grokptah.external-workers.v1") {
-  throw new Error("consumer external-worker contract version was not usable");
-}
-const launch = parseExternalWorkerLaunchRequest({
-  requestId: "consumer-request",
-  provider: "cursor_cloud",
-  repository: "org/repo",
-  startingRef: "main",
-  prompt: "Review the exact candidate",
-  executionMode: "isolated",
-  autoCreatePr: false,
-});
-if (launch?.executionMode !== "isolated") {
-  throw new Error("consumer external-worker launch parser was not usable");
-}
-const followUp = parseExternalWorkerFollowUpRequest({
-  requestId: "consumer-follow-up",
-  prompt: "Re-check the focused candidate",
-  bounds: { maxRounds: 8 },
-});
-if (followUp?.requestId !== "consumer-follow-up") {
-  throw new Error("consumer external-worker follow-up parser was not usable");
-}
-if (parseExternalWorkerLaunchResult({ worker: {}, run: {} }) !== null) {
-  throw new Error("consumer external-worker launch result parser failed closed");
-}
-if (parseExternalWorkerListQuery({ limit: 0 }) !== null) {
-  throw new Error("consumer external-worker list query parser failed closed");
-}
-if (parseExternalWorkerListQuery({ includeArchived: false })?.includeArchived !== false) {
-  throw new Error("consumer external-worker list query parser was not usable");
-}
-if (parseExternalWorkerSummary({
-  provider: "cursor_cloud",
-  externalAgentId: "agent-1",
-  repository: "org/repo",
-  startingRef: "main",
-  state: "ready",
-  createdAt: "now",
-  updatedAt: "now",
-}) !== null) {
-  throw new Error("consumer external-worker summary parser leaked repository fields");
-}
-if (parseExternalWorkerListPage({
-  items: [{
-    provider: "cursor_cloud",
-    externalAgentId: "agent-1",
-    state: "ready",
-    createdAt: "now",
-    updatedAt: "now",
-  }],
-})?.items[0]?.externalAgentId !== "agent-1") {
-  throw new Error("consumer external-worker list page parser was not usable");
-}
-const externalNotification = parseExternalWorkerNotification({
-  type: "event",
-  event: { seq: 0, ts: "2026-08-24T00:00:00Z", kind: "run.started", detail: "started" },
-});
-const externalState = externalNotification
-  ? applyExternalWorkerNotification(createExternalWorkerMonitor(), externalNotification)
-  : null;
-if (externalState?.lastSeq !== 0 || externalState.recoveryRequired) {
-  throw new Error("consumer external-worker monitor was not usable");
-}
-console.log("external consumer fixture passed");
-`,
-  );
-
+  await copyFile(fixtureSource, consumerPath);
   process.stdout.write(await run(process.execPath, [consumerPath], { cwd: workspace }));
 } finally {
   await rm(workspace, { recursive: true, force: true });

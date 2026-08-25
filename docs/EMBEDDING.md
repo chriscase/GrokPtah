@@ -171,11 +171,18 @@ provider API-key markers, absolute host paths, `GROKPTAH_HOME`, or native
 Computer Use authority. The same command then installs that generated manifest
 into a disposable external-consumer fixture, installs the generated `npm pack`
 archive, and imports it through normal `node_modules/@grokptah/client` package
-resolution. That fixture exercises the
-Help Center corpus, queue reducer, stream helper, broker constructor, and the
-separate `@grokptah/client/ui-core` import, so a direct bundle import cannot
-masquerade as a consumer integration. The fixture is deleted after the check.
-Publication still requires the compatibility and release gates in the roadmap.
+resolution. That fixture is the ContextDesk-shaped consumer at
+`desktop/scripts/fixtures/context-desk-consumer.mjs`. It exercises the Help
+Center corpus, queue reducer, stream helper, broker constructor, capability-scoped
+bindings, opaque binding/run ids, list/archive/unarchive projections, typed public
+error envelopes (including UTF-8 names and unknown/expired cursors), reconnect
+expiry, fail-closed invalid authority, and the separate `@grokptah/client/ui-core`
+import, so a direct bundle import cannot masquerade as a consumer integration.
+The fixture also proves that `@grokptah/client/trusted`, the trusted MCP client,
+bearer credentials, and native desktop authority are not importable from the
+published package. The fixture is deleted after the check. Publication still
+requires the compatibility and release gates in the roadmap. This hosted-equivalent
+smoke is not a live ContextDesk HTTP integration or Cursor-account qualification.
 
 ## ContextDesk integration checklist
 
@@ -188,6 +195,10 @@ The minimum disposable integration should prove, against one exact candidate:
 - duplicate request-id behavior and restart recovery;
 - no browser access to bearer tokens, raw paths, or native Computer Use data;
 - audit records for user, capability, scope, request id, and outcome.
+
+The in-tree disposable fixture covers package import, list/archive/unarchive
+round-trips, typed error envelopes, and fail-closed authority checks against a
+fake broker. It does not replace a live ContextDesk server or War Room session.
 
 Keep the War Room surface observe/review-only until packaged Computer Use,
 lease soak, and human acceptance evidence are green. Promotion is a separate

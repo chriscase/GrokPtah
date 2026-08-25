@@ -41,3 +41,8 @@ its `call_tool` method does not itself satisfy a descriptor's `human_gate`.
 Authority-aware adapters should use the desktop operation facade (or an
 equivalent approval/lease layer) before invoking promotion or Computer Use
 control, and should never treat transport reachability as approval.
+
+A second-product consumer such as ContextDesk must import launch, list, archive,
+and error types from this crate root. `tests/context_desk_consumer.rs` is the
+disposable crate-root fixture for that import surface. It is not a live
+ContextDesk HTTP integration and does not grant native desktop authority.
