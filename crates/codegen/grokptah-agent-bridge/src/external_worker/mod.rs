@@ -7,6 +7,7 @@
 //! Computer Use authority.
 
 mod cursor;
+mod durable;
 mod host;
 mod ledger;
 

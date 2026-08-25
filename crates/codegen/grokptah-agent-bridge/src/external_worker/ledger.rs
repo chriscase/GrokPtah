@@ -137,7 +137,7 @@ impl ExternalWorkerLedger {
     /// Orphaned pending claims become Uncertain and stay fail-closed.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, ExternalWorkerAdapterError> {
         let root = root.as_ref().join("external-workers").join("idempotency");
-        fs::create_dir_all(root.join(OWNERS_DIR)).map_err(|_| {
+        super::durable::create_private_dir_all(&root.join(OWNERS_DIR)).map_err(|_| {
             ExternalWorkerAdapterError::InvalidRequest(
                 "external worker ledger could not be created",
             )
@@ -382,7 +382,7 @@ impl ExternalWorkerLedger {
             };
         }
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|_| {
+            super::durable::create_private_dir_all(parent).map_err(|_| {
                 ExternalWorkerAdapterError::InvalidRequest(
                     "external worker ledger could not be created",
                 )
@@ -676,34 +676,30 @@ fn terminal_receipt_is_expired(receipt: &LedgerReceipt, path: &Path) -> bool {
         .is_some_and(|age| age > Duration::from_secs(TERMINAL_RECEIPT_RETENTION_SECS))
 }
 
+/// Publish a receipt atomically, privately, and crash-durably.
+///
+/// Delegates to [`super::durable`]: an unpredictable private temp name, an
+/// `O_NOFOLLOW` create, an `fsync` of the contents before the rename and of the
+/// parent directory after it. The previous implementation staged under a
+/// guessable `.json.tmp`, created it with `File::create` (following a symlink
+/// at that name, world-readable by default), and never synced the parent, so a
+/// crash could lose the rename even when the bytes had reached the disk.
 fn atomic_write_json<T: Serialize>(
     path: &Path,
     value: &T,
 ) -> Result<(), ExternalWorkerAdapterError> {
-    let tmp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(value).map_err(|_| {
-        ExternalWorkerAdapterError::InvalidRequest("external worker ledger could not be encoded")
-    })?;
-    let mut file = fs::File::create(&tmp).map_err(|_| {
+    super::durable::write_private_json(path, value).map_err(|_| {
         ExternalWorkerAdapterError::InvalidRequest("external worker ledger could not be written")
-    })?;
-    file.write_all(&bytes).map_err(|_| {
-        ExternalWorkerAdapterError::InvalidRequest("external worker ledger could not be written")
-    })?;
-    file.sync_all().map_err(|_| {
-        ExternalWorkerAdapterError::InvalidRequest("external worker ledger could not be written")
-    })?;
-    fs::rename(&tmp, path).map_err(|_| {
-        ExternalWorkerAdapterError::InvalidRequest("external worker ledger could not be written")
-    })?;
-    Ok(())
+    })
 }
 
+/// Publish a receipt only if nothing has claimed this path yet.
+///
+/// This is the claim's compare-and-swap: exactly one writer may create the
+/// pending receipt, which is what makes a concurrent identical request fail
+/// closed on `Pending` instead of launching twice.
 fn write_json_exclusive<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(&serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?)?;
-    file.sync_all()?;
-    Ok(())
+    super::durable::cas_private_json(path, None, value)
 }
 
 #[cfg(test)]
@@ -868,6 +864,48 @@ mod tests {
             ),
             "got {error:?}"
         );
+    }
+
+    /// Receipts decide whether a provider mutation may be retried, so they
+    /// must not be readable by another local user, must not be redirectable
+    /// through a symlink planted at the receipt name, and must not be staged
+    /// under a name an attacker can guess.
+    #[test]
+    fn receipts_are_written_privately_and_leave_no_guessable_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = ExternalWorkerLedger::open(dir.path()).unwrap();
+        let request = launch("req-private", "do the work");
+        let hash = canonical_launch_payload_hash(&request).unwrap();
+        ledger
+            .claim(ExternalWorkerOperation::Launch, "req-private", &hash)
+            .unwrap();
+        ledger
+            .complete(
+                ExternalWorkerOperation::Launch,
+                "req-private",
+                &hash,
+                serde_json::json!({"ok": true}),
+            )
+            .unwrap();
+
+        let path = receipt_path(dir.path(), ExternalWorkerOperation::Launch, "req-private");
+        assert!(path.exists(), "receipt was published");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the guessable staging name must not be used",
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "receipt must not be group/other readable");
+            let parent = fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(parent & 0o077, 0, "receipt directory must be owner-only");
+        }
     }
 
     #[test]
