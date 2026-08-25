@@ -38,6 +38,11 @@ durability health rather than wedging capacity.
 Live lease expiry is a liveness terminal transition, not a restart-only
 condition; the expired worker is stopped and awaited before capacity is reused.
 
+An admission or receipt write error is a failed acceptance: its private input is
+tombstoned, no model attempt is started, and a later restart cannot recover it.
+If a settled receipt names queued work whose acceptance record is gone, replay
+fails closed with `admission_lost` rather than returning stale queued success.
+
 The desktop inspector is read-only for shared runs. Build sessions may opt into
 strict isolated execution. An isolated run starts from a clean Git workspace in
 a detached worktree below `.grokptah/worktrees/runs/`; the model writes only to
