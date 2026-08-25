@@ -597,6 +597,17 @@ impl TaskSpec {
                 "the unrestricted task capability mode is not admissible",
             ));
         }
+        let required_capability = match self.kind {
+            TaskKind::Work => WorkerCapability::ReadWorkspace,
+            TaskKind::Review => WorkerCapability::Review,
+            TaskKind::Synthesis => WorkerCapability::Synthesize,
+        };
+        if !self.capabilities.contains(&required_capability) {
+            return Err(SwarmError::capability(format!(
+                "task '{}' must declare its task-kind capability",
+                self.task_id
+            )));
+        }
         if self.capability_mode == SubagentCapabilityMode::ReadOnly
             && self.capabilities.iter().any(|capability| {
                 matches!(
@@ -614,13 +625,10 @@ impl TaskSpec {
             SubagentCapabilityMode::ReadWrite
                 if !self
                     .capabilities
-                    .contains(&WorkerCapability::WriteWorkspace)
-                    && !self
-                        .capabilities
-                        .contains(&WorkerCapability::ExecuteInWorktree) =>
+                    .contains(&WorkerCapability::WriteWorkspace) =>
             {
                 return Err(SwarmError::capability(format!(
-                    "read-write task '{}' declares no mutating capability",
+                    "read-write task '{}' must declare WriteWorkspace",
                     self.task_id
                 )));
             }

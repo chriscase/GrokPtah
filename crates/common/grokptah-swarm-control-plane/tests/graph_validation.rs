@@ -437,6 +437,32 @@ fn a_read_only_worker_cannot_run_an_execute_task() {
 }
 
 #[test]
+fn a_read_write_task_must_declare_write_workspace() {
+    let mut spec = single_task_spec();
+    spec.tasks[0].capabilities = [
+        WorkerCapability::ReadWorkspace,
+        WorkerCapability::ExecuteInWorktree,
+    ]
+    .into_iter()
+    .collect();
+    let message = expect_rejected(spec, SwarmErrorCode::CapabilityNotGranted);
+    assert!(message.contains("WriteWorkspace"), "{message}");
+}
+
+#[test]
+fn a_work_task_must_declare_its_minimum_capability() {
+    let mut spec = single_task_spec();
+    spec.tasks[0].capabilities = [
+        WorkerCapability::WriteWorkspace,
+        WorkerCapability::ExecuteInWorktree,
+    ]
+    .into_iter()
+    .collect();
+    let message = expect_rejected(spec, SwarmErrorCode::CapabilityNotGranted);
+    assert!(message.contains("task-kind capability"), "{message}");
+}
+
+#[test]
 fn a_synthesis_task_must_declare_a_review_quorum() {
     let mut spec = diamond_spec(QuorumRule::Unanimous);
     spec.tasks[5].review_gate = None;
