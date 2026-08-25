@@ -233,11 +233,11 @@ impl ExternalWorkerRegistry {
 pub(crate) fn github_repository_url(
     repository: &str,
 ) -> Result<String, ExternalWorkerAdapterError> {
-    if repository.starts_with("https://github.com/") {
+    if let Some(path) = repository.strip_prefix("https://github.com/") {
         if repository.contains('?')
             || repository.contains('#')
             || repository.ends_with('/')
-            || repository[19..].split('/').count() != 2
+            || path.split('/').count() != 2
         {
             return Err(ExternalWorkerAdapterError::InvalidRequest(
                 "repository must identify exactly one GitHub repository",
