@@ -150,8 +150,18 @@ fn run_stop_cause(run: &Value) -> &str {
 
 fn public_error_matches(run: &Value, expect: &str) -> bool {
     let code = run_error_code(run);
-    code == expect
-        || (code == "privileged_diagnostics" && run["terminalResult"].as_str() == Some(expect))
+    if code == expect {
+        return true;
+    }
+    if code != "privileged_diagnostics" {
+        return false;
+    }
+    // Public runs redact token-accounting codes. Accept the remaining public
+    // stop-cause when the fixture asked for the redacted code, or when the
+    // terminalResult still carries that code.
+    run["terminalResult"].as_str() == Some(expect)
+        || (expect == "max_total_tokens_usage_unavailable"
+            && run_stop_cause(run) == "token_accounting_unavailable")
 }
 
 fn matches_fail_closed(

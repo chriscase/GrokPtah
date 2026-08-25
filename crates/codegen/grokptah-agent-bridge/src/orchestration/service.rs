@@ -62,6 +62,25 @@ use super::workload::{
 /// queued submissions into an unbounded in-memory prompt store.
 const MAX_PENDING_ADMISSIONS: usize = 32;
 
+fn work_result_idempotency_details(
+    attempt_id: &str,
+    lease_token: &str,
+    result: &WorkResult,
+) -> serde_json::Value {
+    // `completed_at` is stamped at the mutation boundary and must not be part
+    // of the idempotency hash, or an identical retry would look like a new
+    // payload and conflict against the already-terminal attempt.
+    json!({
+        "attemptId": attempt_id,
+        "leaseToken": lease_token,
+        "summary": result.summary,
+        "evidence": result.evidence,
+        "artifacts": result.artifacts,
+        "failure": result.failure,
+        "cancellationReason": result.cancellation_reason,
+    })
+}
+
 fn validate_provider_route_for_purpose(
     route: &super::types::ProviderRouteSnapshot,
     purpose: RunPurpose,
@@ -3758,7 +3777,7 @@ impl OrchestrationService {
             session_id,
             workspace,
             work_id,
-            json!({"attemptId": attempt_id, "leaseToken": lease_token, "result": result}),
+            work_result_idempotency_details(attempt_id, lease_token, &result),
             |store| store.complete_work(work_id, attempt_id, lease_token, result),
         )
         .await
@@ -3783,7 +3802,7 @@ impl OrchestrationService {
             session_id,
             workspace,
             work_id,
-            json!({"attemptId": attempt_id, "leaseToken": lease_token, "result": result}),
+            work_result_idempotency_details(attempt_id, lease_token, &result),
             |store| store.fail_work(work_id, attempt_id, lease_token, result),
         )
         .await
