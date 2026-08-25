@@ -856,7 +856,7 @@ impl OrchestrationService {
             return false;
         };
         live.model_abort.abort();
-        let mut supervisor = live.supervisor;
+        let supervisor = live.supervisor;
         supervisor.abort();
         let _ = supervisor.await;
         true
