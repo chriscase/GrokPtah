@@ -51,10 +51,11 @@ the same candidate release:
 - Preserve the protected Stage 6 soak until it emits its final artifact; do not
   start another Cargo build wave on its shared target.
 - Keep the current TypeScript/desktop verification attached to the same reviewable
-  candidate: `45441d1f` passes 47 test files / 262 tests, typecheck, and the
-  production Vite build; `b8338cc9` plus the external-consumer fixture additionally
-  pass `npm run verify:public` and `npm pack --dry-run` with generated
-  export/authority-boundary and package-resolution smoke checks. The package
+  candidate: the Help Center integration (`45441d1f`) and follow-up
+  hardening/corpus/public-consumer commits through `826982f8` pass 47 test files /
+  262 tests, typecheck, the production Vite build, and `npm run verify:public`.
+  The public check includes generated export/authority-boundary checks and a
+  normal `node_modules/@grokptah/client` consumer smoke fixture. The package
   remains a release candidate until publication and a real cross-repository
   consumer integration are green.
 - Put the current integration changes on an exact reviewable candidate, then
