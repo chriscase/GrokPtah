@@ -34,6 +34,17 @@ pub const MAX_SUMMARY_BYTES: usize = 4 * 1024;
 /// Maximum bytes in a failure, cancellation, or uncertainty reason.
 pub const MAX_REASON_BYTES: usize = 1024;
 
+pub(crate) fn truncate_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
 /// Where the whole campaign stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

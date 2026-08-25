@@ -26,7 +26,7 @@ use crate::spec::{ComputerUseLeaseRef, SwarmSpec, TaskKind, TaskSpec, validate_t
 use crate::state::{
     DispatchIntent, DispatchProbe, DispatchRecord, DispatchState, MAX_EVIDENCE_ENTRIES,
     MAX_REASON_BYTES, MAX_SUMMARY_BYTES, ReviewVerdict, SwarmLifecycle, SwarmState, TaskOutcome,
-    TaskResult, TaskState, derive_dispatch_id,
+    TaskResult, TaskState, derive_dispatch_id, truncate_text,
 };
 use crate::store::{DurableSwarmStore, InMemorySwarmStore, LeaseClaim};
 use crate::validate::validate_swarm_spec;
@@ -1014,6 +1014,7 @@ impl SwarmController {
                 if let Some(record) = self.state.dispatch_mut(dispatch_id) {
                     record.state = DispatchState::Settled;
                     record.settled_at = Some(now);
+                    record.uncertain_reason = None;
                 }
                 if let Some(task) = self.state.task_mut(&task_id) {
                     // The attempt counter already advanced, so the next
@@ -1033,6 +1034,7 @@ impl SwarmController {
                     record.state = DispatchState::Acknowledged;
                     record.external_ref = Some(external_ref);
                     record.acknowledged_at = Some(now);
+                    record.uncertain_reason = None;
                 }
                 if let Some(task) = self.state.task_mut(&task_id) {
                     task.state = TaskState::Running;
@@ -1294,6 +1296,7 @@ impl SwarmController {
         if let Some(record) = self.state.dispatch_mut(dispatch_id) {
             record.state = DispatchState::Settled;
             record.settled_at = Some(now);
+            record.uncertain_reason = None;
         }
 
         let next = match outcome.result {
@@ -1309,6 +1312,7 @@ impl SwarmController {
                 TaskResult::Failed => outcome
                     .summary
                     .clone()
+                    .map(|summary| truncate_text(&summary, MAX_REASON_BYTES))
                     .or_else(|| Some("task failed without a summary".to_string())),
                 _ => None,
             };
