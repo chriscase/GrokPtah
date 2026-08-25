@@ -81,6 +81,36 @@ export const HELP_RETRIEVAL_FIXTURES: HelpRetrievalFixture[] = [
     rationale: "paraphrase",
   },
   {
+    query: "recover interrupted run checkpoint",
+    expectedId: "operations.durable-recovery",
+    rationale: "paraphrase",
+  },
+  {
+    query: "queue next prompt stale revision",
+    expectedId: "operations.prompt-queue",
+    rationale: "paraphrase",
+  },
+  {
+    query: "review receipt changed files fingerprint",
+    expectedId: "operations.review-receipts",
+    rationale: "paraphrase",
+  },
+  {
+    query: "MCP reconnect capability events",
+    expectedId: "operations.mcp-coordination",
+    rationale: "paraphrase",
+  },
+  {
+    query: "ContextDesk War Room browser broker",
+    expectedId: "providers.browser-broker",
+    rationale: "paraphrase",
+  },
+  {
+    query: "approve semantic action postcondition",
+    expectedId: "computer-use.consent",
+    rationale: "paraphrase",
+  },
+  {
     query: "teleport my repository",
     expectedId: null,
     rationale: "unsupported",
