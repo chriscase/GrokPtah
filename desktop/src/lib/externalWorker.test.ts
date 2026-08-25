@@ -9,6 +9,7 @@ import {
   parseExternalWorkerLaunchResult,
   parseExternalWorkerNotification,
   parseExternalWorkerRecord,
+  replaceExternalWorkerMonitor,
 } from "./externalWorker";
 
 describe("external worker UI contract", () => {
@@ -146,6 +147,10 @@ describe("external worker UI contract", () => {
     expect(gap).not.toBeNull();
     const afterGap = applyExternalWorkerNotification(afterFirst!, { type: "event", event: gap! });
     expect(afterGap).toMatchObject({ lastSeq: 0, recoveryRequired: true });
+    const lateContiguous = parseExternalWorkerEvent({ seq: 1, ts: "now", kind: "run.progress", detail: "late" });
+    expect(lateContiguous).not.toBeNull();
+    expect(applyExternalWorkerNotification(afterGap!, { type: "event", event: lateContiguous! }))
+      .toMatchObject({ lastSeq: 1, recoveryRequired: true });
     const recovery = parseExternalWorkerNotification({
       type: "recovery",
       afterSeq: 0,
@@ -164,5 +169,19 @@ describe("external worker UI contract", () => {
       type: "event",
       event: { seq: 1, ts: "now", kind: "run.progress", detail: "Authorization: secret" },
     })).toBeNull();
+  });
+
+  it("clears recovery only from a contiguous authoritative snapshot", () => {
+    expect(replaceExternalWorkerMonitor([
+      { seq: 8, ts: "now", kind: "run.progress", detail: "replayed" },
+      { seq: 9, ts: "now", kind: "run.completed", detail: "done" },
+    ])).toMatchObject({ lastSeq: 9, recoveryRequired: false });
+    expect(replaceExternalWorkerMonitor([
+      { seq: 8, ts: "now", kind: "run.progress", detail: "replayed" },
+      { seq: 10, ts: "now", kind: "run.completed", detail: "gap" },
+    ])).toBeNull();
+    expect(replaceExternalWorkerMonitor([
+      { seq: 8, ts: "now", kind: "run.progress", detail: "Authorization: secret" },
+    ])).toBeNull();
   });
 });
