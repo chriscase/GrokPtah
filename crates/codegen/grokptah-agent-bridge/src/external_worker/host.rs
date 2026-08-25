@@ -113,52 +113,62 @@ impl ExternalWorkerHost {
         {
             ExternalWorkerLedgerClaim::Replay(value) => replay_launch(value),
             ExternalWorkerLedgerClaim::ReplayError(error) => Err(error),
-            ExternalWorkerLedgerClaim::Perform => match adapter.launch(request).await {
-                Ok(result) => {
-                    let value = serde_json::to_value(&result).map_err(|_| {
-                        ExternalWorkerAdapterError::InvalidResponse(
-                            "launch result could not be persisted",
-                        )
-                    })?;
-                    // The grant is written before the receipt completes. A
-                    // worker that exists at the provider with no grant is
-                    // ungovernable, so failing to record it is Uncertain — an
-                    // operator reconciles — rather than a success that returns
-                    // an ID nothing can later authorize.
-                    let grant = ExternalWorkerAuthority::issue(NewGrant {
-                        principal: principal.clone(),
-                        provider: request.provider,
-                        external_agent_id: result.worker.external_agent_id.clone(),
-                        external_run_id: result.run.external_run_id.clone(),
-                        run_id: run_id.to_string(),
-                        attempt,
-                        request_id: request.request_id.clone(),
-                        launch_intent: LaunchIntent::from_request(request),
-                        now: result.worker.created_at.clone(),
-                    })?;
-                    if self.authority.insert(&grant).is_err() {
-                        self.ledger.uncertain(
-                            ExternalWorkerOperation::Launch,
-                            &request.request_id,
-                            &hash,
-                        )?;
-                        return Err(ExternalWorkerAdapterError::Uncertain);
-                    }
-                    self.ledger.complete(
-                        ExternalWorkerOperation::Launch,
-                        &request.request_id,
-                        &hash,
-                        value,
-                    )?;
-                    Ok(result)
-                }
-                Err(error) => Err(self.record_mutation_error(
+            ExternalWorkerLedgerClaim::Perform => {
+                // Everything up to here is provably un-sent, so an interrupted
+                // attempt may auto-retry. Past this line the provider may have
+                // acted, and recovery must reconcile instead.
+                self.ledger.mark_sending(
                     ExternalWorkerOperation::Launch,
                     &request.request_id,
                     &hash,
-                    error,
-                )),
-            },
+                )?;
+                match adapter.launch(request).await {
+                    Ok(result) => {
+                        let value = serde_json::to_value(&result).map_err(|_| {
+                            ExternalWorkerAdapterError::InvalidResponse(
+                                "launch result could not be persisted",
+                            )
+                        })?;
+                        // The grant is written before the receipt completes. A
+                        // worker that exists at the provider with no grant is
+                        // ungovernable, so failing to record it is Uncertain — an
+                        // operator reconciles — rather than a success that returns
+                        // an ID nothing can later authorize.
+                        let grant = ExternalWorkerAuthority::issue(NewGrant {
+                            principal: principal.clone(),
+                            provider: request.provider,
+                            external_agent_id: result.worker.external_agent_id.clone(),
+                            external_run_id: result.run.external_run_id.clone(),
+                            run_id: run_id.to_string(),
+                            attempt,
+                            request_id: request.request_id.clone(),
+                            launch_intent: LaunchIntent::from_request(request),
+                            now: result.worker.created_at.clone(),
+                        })?;
+                        if self.authority.insert(&grant).is_err() {
+                            self.ledger.uncertain(
+                                ExternalWorkerOperation::Launch,
+                                &request.request_id,
+                                &hash,
+                            )?;
+                            return Err(ExternalWorkerAdapterError::Uncertain);
+                        }
+                        self.ledger.complete(
+                            ExternalWorkerOperation::Launch,
+                            &request.request_id,
+                            &hash,
+                            value,
+                        )?;
+                        Ok(result)
+                    }
+                    Err(error) => Err(self.record_mutation_error(
+                        ExternalWorkerOperation::Launch,
+                        &request.request_id,
+                        &hash,
+                        error,
+                    )),
+                }
+            }
         }
     }
 
@@ -190,6 +200,11 @@ impl ExternalWorkerHost {
             ExternalWorkerLedgerClaim::Replay(value) => replay_run(value),
             ExternalWorkerLedgerClaim::ReplayError(error) => Err(error),
             ExternalWorkerLedgerClaim::Perform => {
+                self.ledger.mark_sending(
+                    ExternalWorkerOperation::FollowUp,
+                    &request.request_id,
+                    &hash,
+                )?;
                 match adapter.follow_up(external_agent_id, request).await {
                     Ok(result) => {
                         let value = serde_json::to_value(&result).map_err(|_| {
@@ -258,6 +273,8 @@ impl ExternalWorkerHost {
             ExternalWorkerLedgerClaim::Replay(value) => replay_run(value),
             ExternalWorkerLedgerClaim::ReplayError(error) => Err(error),
             ExternalWorkerLedgerClaim::Perform => {
+                self.ledger
+                    .mark_sending(ExternalWorkerOperation::Cancel, request_id, &hash)?;
                 match adapter.cancel(external_agent_id, external_run_id).await {
                     Ok(result) => {
                         if result.state != grokptah_agent_sdk::ExternalWorkerState::Cancelled {

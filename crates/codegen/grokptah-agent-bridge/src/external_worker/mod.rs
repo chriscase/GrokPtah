@@ -24,7 +24,7 @@ pub use host::ExternalWorkerHost;
 pub use ledger::{
     canonical_cancel_payload_hash, canonical_follow_up_payload_hash, canonical_launch_payload_hash,
     ExternalWorkerLedger, ExternalWorkerLedgerClaim, ExternalWorkerLedgerStatus,
-    ExternalWorkerOperation,
+    ExternalWorkerOperation, ExternalWorkerSendState,
 };
 
 use async_trait::async_trait;

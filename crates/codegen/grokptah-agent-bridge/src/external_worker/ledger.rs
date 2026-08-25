@@ -70,6 +70,30 @@ pub enum ExternalWorkerLedgerStatus {
     Uncertain,
 }
 
+/// How far one provider request got before this process stopped observing it.
+///
+/// `Pending` alone cannot answer the question that decides whether a retry is
+/// safe: a claim that was written and then interrupted might never have reached
+/// the provider, or might have created a worker whose response was lost. The
+/// old recovery path could not tell those apart, so it marked every interrupted
+/// claim `Uncertain` and required an operator to reconcile — including the
+/// common case where nothing had been sent at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalWorkerSendState {
+    /// The claim is durable and no request has left this process.
+    ///
+    /// The only state an interrupted attempt may auto-retry from: the provider
+    /// cannot have acted on a request that was never transmitted.
+    KnownNotSent,
+    /// A request is in flight. Its outcome is unknown until it returns.
+    Sending,
+    /// The request may or may not have been applied; reconcile before retrying.
+    Uncertain,
+    /// The provider acknowledged the request and a durable result was recorded.
+    Sent,
+}
+
 /// Result of claiming a request_id + payload hash.
 #[derive(Debug)]
 pub enum ExternalWorkerLedgerClaim {
@@ -88,6 +112,11 @@ struct LedgerReceipt {
     operation: ExternalWorkerOperation,
     payload_hash: String,
     status: ExternalWorkerLedgerStatus,
+    /// How far the provider request got. Absent on receipts written before
+    /// send state was tracked; those are read as `Uncertain`, because an older
+    /// receipt cannot prove nothing was sent.
+    #[serde(default)]
+    send_state: Option<ExternalWorkerSendState>,
     response: serde_json::Value,
     error: Option<String>,
     /// Ledger instance that holds this claim. Absent on receipts written
@@ -321,7 +350,20 @@ impl ExternalWorkerLedger {
                         if !self.owner_is_dead(receipt.owner.as_deref(), &mut dead_owners) {
                             continue;
                         }
+                        // A claim whose owner died without ever transmitting a
+                        // request is safe to retry: the provider cannot have
+                        // acted on something it never received. Dropping the
+                        // receipt returns the request_id to `Perform`.
+                        //
+                        // Anything else — mid-send, or a receipt too old to
+                        // carry a send state — may have been applied, so it
+                        // stays Uncertain until an operator reconciles.
+                        if receipt.send_state == Some(ExternalWorkerSendState::KnownNotSent) {
+                            let _ = fs::remove_file(&path);
+                            continue;
+                        }
                         receipt.status = ExternalWorkerLedgerStatus::Uncertain;
+                        receipt.send_state = Some(ExternalWorkerSendState::Uncertain);
                         receipt.error =
                             Some("interrupted before a durable result was recorded".into());
                         receipt.finished_at = Some(now_rfc3339());
@@ -345,6 +387,37 @@ impl ExternalWorkerLedger {
             }
         }
         Ok(())
+    }
+
+    /// Record that a request is about to leave this process.
+    ///
+    /// Called between the claim and the provider call. Everything before this
+    /// point is provably un-sent and therefore safely retryable; everything
+    /// after it may have been applied.
+    pub fn mark_sending(
+        &self,
+        operation: ExternalWorkerOperation,
+        request_id: &str,
+        payload_hash: &str,
+    ) -> Result<(), ExternalWorkerAdapterError> {
+        let _g = self.guard()?;
+        let path = self.path(operation, request_id)?;
+        let Some(bytes) = super::durable::read_private_json(&path).map_err(|_| {
+            ExternalWorkerAdapterError::InvalidRequest("external worker ledger is unreadable")
+        })?
+        else {
+            return Err(ExternalWorkerAdapterError::Uncertain);
+        };
+        let mut receipt: LedgerReceipt = serde_json::from_slice(&bytes).map_err(|_| {
+            ExternalWorkerAdapterError::InvalidRequest("external worker ledger is unreadable")
+        })?;
+        if receipt.payload_hash != payload_hash
+            || receipt.owner.as_deref() != Some(&self.inner.owner)
+        {
+            return Err(ExternalWorkerAdapterError::PayloadDrift);
+        }
+        receipt.send_state = Some(ExternalWorkerSendState::Sending);
+        atomic_write_json(&path, &receipt)
     }
 
     /// Atomically claim `request_id` for one operation.
@@ -392,6 +465,7 @@ impl ExternalWorkerLedger {
             operation,
             payload_hash: payload_hash.into(),
             status: ExternalWorkerLedgerStatus::Pending,
+            send_state: Some(ExternalWorkerSendState::KnownNotSent),
             response: serde_json::Value::Null,
             error: None,
             owner: Some(self.inner.owner.clone()),
@@ -510,6 +584,13 @@ impl ExternalWorkerLedger {
             operation,
             payload_hash: payload_hash.into(),
             status,
+            // A terminal status settles the send question: Complete and Failed
+            // are both provider answers, so the request was Sent; Uncertain
+            // stays exactly that.
+            send_state: Some(match status {
+                ExternalWorkerLedgerStatus::Uncertain => ExternalWorkerSendState::Uncertain,
+                _ => ExternalWorkerSendState::Sent,
+            }),
             response,
             error,
             owner: previous.owner,
@@ -773,16 +854,83 @@ mod tests {
         ledger
             .claim(ExternalWorkerOperation::Launch, "req-pending", &hash)
             .unwrap();
+        // A live claim is Pending to anyone else, sent or not.
         assert!(matches!(
             ledger.claim(ExternalWorkerOperation::Launch, "req-pending", &hash),
             Err(ExternalWorkerAdapterError::Pending)
         ));
+        // The owner died mid-send: the provider may have acted, so this must
+        // stay closed until an operator reconciles.
+        ledger
+            .mark_sending(ExternalWorkerOperation::Launch, "req-pending", &hash)
+            .unwrap();
         drop(ledger);
         let reopened = ExternalWorkerLedger::open(dir.path()).unwrap();
         assert!(matches!(
             reopened.claim(ExternalWorkerOperation::Launch, "req-pending", &hash),
             Err(ExternalWorkerAdapterError::Uncertain)
         ));
+    }
+
+    /// The case the old recovery path could not see. A claim whose owner died
+    /// before transmitting anything is safe to retry: the provider cannot have
+    /// acted on a request it never received. Marking it Uncertain — as every
+    /// interrupted claim used to be — turned an ordinary crash into work that
+    /// needed a human.
+    #[test]
+    fn a_claim_that_was_never_sent_is_retryable_after_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = ExternalWorkerLedger::open(dir.path()).unwrap();
+        let request = launch("req-unsent", "do the work");
+        let hash = canonical_launch_payload_hash(&request).unwrap();
+        ledger
+            .claim(ExternalWorkerOperation::Launch, "req-unsent", &hash)
+            .unwrap();
+        // The owner dies here, before mark_sending.
+        drop(ledger);
+
+        let reopened = ExternalWorkerLedger::open(dir.path()).unwrap();
+        assert!(
+            matches!(
+                reopened.claim(ExternalWorkerOperation::Launch, "req-unsent", &hash),
+                Ok(ExternalWorkerLedgerClaim::Perform)
+            ),
+            "an un-sent claim must be retryable rather than needing reconciliation",
+        );
+    }
+
+    /// Send state is only a safety property if it is durable. A receipt from
+    /// before send state existed cannot prove nothing was sent, so it must be
+    /// read conservatively rather than optimistically.
+    #[test]
+    fn a_receipt_without_a_recorded_send_state_is_not_assumed_unsent() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = ExternalWorkerLedger::open(dir.path()).unwrap();
+        let request = launch("req-legacy", "do the work");
+        let hash = canonical_launch_payload_hash(&request).unwrap();
+        ledger
+            .claim(ExternalWorkerOperation::Launch, "req-legacy", &hash)
+            .unwrap();
+        drop(ledger);
+
+        // Strip the field, as a receipt written by an older build would be.
+        let path = receipt_path(dir.path(), ExternalWorkerOperation::Launch, "req-legacy");
+        let mut receipt: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        receipt
+            .as_object_mut()
+            .expect("receipt is an object")
+            .remove("sendState");
+        fs::write(&path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+
+        let reopened = ExternalWorkerLedger::open(dir.path()).unwrap();
+        assert!(
+            matches!(
+                reopened.claim(ExternalWorkerOperation::Launch, "req-legacy", &hash),
+                Err(ExternalWorkerAdapterError::Uncertain)
+            ),
+            "a receipt that cannot prove it was un-sent must fail closed",
+        );
     }
 
     fn receipt_path(root: &Path, operation: ExternalWorkerOperation, request_id: &str) -> PathBuf {
