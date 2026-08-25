@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { HelpPanel } from "./HelpPanel";
 
@@ -22,5 +22,34 @@ describe("HelpPanel", () => {
       target: { value: "enterprise gateway" },
     });
     expect(screen.queryByRole("button", { name: /restricted company gateway/i })).toBeNull();
+  });
+
+  it("enters the search field, wraps keyboard focus, and closes on Escape", () => {
+    const onClose = vi.fn();
+    render(<HelpPanel open onClose={onClose} />);
+    const input = screen.getByRole("textbox", { name: "Search Help Center" });
+    const close = screen.getByRole("button", { name: /Close Help Center/i });
+    expect(document.activeElement).toBe(input);
+
+    close.focus();
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(input);
+    input.focus();
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(document.activeElement).toBe(close);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores focus to the invoking control when closed", () => {
+    const trigger = document.createElement("button");
+    trigger.textContent = "Open Help";
+    document.body.appendChild(trigger);
+    trigger.focus();
+    const { rerender } = render(<HelpPanel open onClose={() => {}} />);
+    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "Search Help Center" }));
+    rerender(<HelpPanel open={false} onClose={() => {}} />);
+    expect(document.activeElement).toBe(trigger);
+    trigger.remove();
   });
 });
