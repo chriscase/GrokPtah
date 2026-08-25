@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    hash_payload, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
-    RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist,
+    hash_payload, safe_id_filename, OrchStore, OrchestrationConfig, OrchestrationService,
+    RunBounds, RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     discovered_tool_names, set_grokptah_home_override, start_control_server, AgentHost, EventBus,
@@ -2350,6 +2350,82 @@ async fn expired_attempt_reaper_releases_capacity_and_promotes_next_once() {
     assert_eq!(
         orch.store().load_attempt(first_id).unwrap().unwrap().phase,
         grokptah_agent_bridge::orchestration::AttemptPhase::Reaped
+    );
+    set_grokptah_home_override(None);
+    std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn finalization_write_failure_releases_capacity_and_recovers_intent() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let first = host.session_new_kind(SessionKind::Build).unwrap();
+    let second = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(first.id, ws.path()).unwrap();
+    host.session_set_cwd(second.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 1);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let first_response = orch
+        .submit_task(
+            &auth,
+            "finalization-failure-first",
+            first.id,
+            ws.path(),
+            "run sleep 3".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let second_response = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "finalization-failure-second",
+            second.id,
+            ws.path(),
+            "list files".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+    let first_id = first_response["runId"].as_str().unwrap().to_string();
+    let second_id = second_response["runId"].as_str().unwrap().to_string();
+    let run_path = orch
+        .store()
+        .root()
+        .join("runs")
+        .join(format!("{}.json", safe_id_filename(&first_id).unwrap()));
+    std::fs::remove_file(&run_path).unwrap();
+    std::fs::create_dir(&run_path).unwrap();
+
+    assert_eq!(
+        wait_run_terminal(&orch, &auth, &second_id, Duration::from_secs(20)).await,
+        RunState::Completed
+    );
+    let health = orch.get_capacity(&auth).unwrap()["health"]["durability"].clone();
+    assert_eq!(health["degraded"], true);
+    assert_eq!(health["finalizationRecoveryPending"], 1);
+    assert_eq!(orch.get_capacity(&auth).unwrap()["activeRuns"], 0);
+    std::fs::remove_dir(&run_path).unwrap();
+
+    let finalization_path = orch
+        .store()
+        .root()
+        .join("finalization")
+        .join(format!("{}.json", safe_id_filename(&first_id).unwrap()));
+    let candidate: RunRecord =
+        serde_json::from_str(&std::fs::read_to_string(&finalization_path).unwrap()).unwrap();
+    orch.store().persist_finalization(&candidate).unwrap();
+    assert_eq!(orch.store().finalization_recovery_count(), 0);
+    assert_eq!(
+        orch.store().load_run(&first_id).unwrap().unwrap().state,
+        RunState::Completed
     );
     set_grokptah_home_override(None);
     std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
