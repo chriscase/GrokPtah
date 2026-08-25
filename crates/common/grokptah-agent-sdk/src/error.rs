@@ -14,6 +14,15 @@ pub enum ErrorCode {
     ForbiddenScope,
     /// Opaque identity was not found for this caller.
     NotFound,
+    /// The method, or a host capability it requires, is not available here.
+    ///
+    /// This is the fail-closed category for a host that never offers the
+    /// capability (an unknown method, or a Computer Use ledger that is not
+    /// installed on this host). It is deliberately distinct from
+    /// [`Self::InvalidRequest`], which reports a malformed request, and from
+    /// [`Self::AuthorityUnavailable`], which reports an installed authority
+    /// that is temporarily asleep or locked and may recover on retry.
+    Unsupported,
     /// Cursor, revision, or approval is stale.
     StaleOrRecovery,
     /// Bounded admission is full.
@@ -84,5 +93,49 @@ mod tests {
         let decoded: ErrorEnvelope =
             serde_json::from_value(recovered_value).expect("recovery round-trips");
         assert_eq!(decoded.event_range, recovered.event_range);
+    }
+
+    /// Every wire code a transport may emit must round-trip through the
+    /// published envelope. A transport that patches a code onto the
+    /// serialized payload without a matching variant produces a body no
+    /// Rust consumer can decode, so the taxonomy is asserted here rather
+    /// than at each transport.
+    #[test]
+    fn every_public_error_code_round_trips_on_the_wire() {
+        let expected = [
+            (ErrorCode::InvalidRequest, "invalid_request"),
+            (ErrorCode::Unauthenticated, "unauthenticated"),
+            (ErrorCode::ForbiddenScope, "forbidden_scope"),
+            (ErrorCode::NotFound, "not_found"),
+            (ErrorCode::Unsupported, "unsupported"),
+            (ErrorCode::StaleOrRecovery, "stale_or_recovery"),
+            (ErrorCode::Capacity, "capacity"),
+            (ErrorCode::AuthorityUnavailable, "authority_unavailable"),
+            (ErrorCode::Internal, "internal"),
+        ];
+        for (code, wire) in expected {
+            let envelope = ErrorEnvelope {
+                code,
+                message: "bounded".into(),
+                request_id: None,
+                reason_code: None,
+                event_range: None,
+            };
+            let value = serde_json::to_value(&envelope).expect("envelope serializes");
+            assert_eq!(value["code"], wire, "{code:?} must serialize to {wire}");
+            let decoded: ErrorEnvelope =
+                serde_json::from_value(value).expect("envelope round-trips");
+            assert_eq!(decoded, envelope);
+        }
+    }
+
+    /// The fail-closed 405 category is its own code. Collapsing it into the
+    /// HTTP 400 request-shape category would tell a client to edit a request
+    /// that no host here will ever accept.
+    #[test]
+    fn unsupported_is_not_the_invalid_request_category() {
+        assert_ne!(ErrorCode::Unsupported, ErrorCode::InvalidRequest);
+        let value = serde_json::to_value(ErrorCode::Unsupported).expect("code serializes");
+        assert_eq!(value, "unsupported");
     }
 }

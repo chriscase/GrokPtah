@@ -125,6 +125,7 @@
             "unauthenticated",
             "forbidden_scope",
             "not_found",
+            "unsupported",
             "stale_or_recovery",
             "capacity",
             "authority_unavailable",

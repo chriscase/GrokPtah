@@ -1363,7 +1363,7 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
         reason_code: Some(e.code.as_str().into()),
         event_range,
     };
-    let mut data = serde_json::to_value(public).unwrap_or_else(|_| {
+    let data = serde_json::to_value(public).unwrap_or_else(|_| {
         json!({
             "code": "internal",
             "message": "The operation failed.",
@@ -1373,17 +1373,9 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
     // Keep `code` stable for cross-product consumers. The detailed server-side
     // reason is separately named and bounded; never forward arbitrary OrchError
     // data or overwrite the public taxonomy with an internal transport code.
-    //
-    // `unsupported` is the documented MCP fail-closed public code (HTTP 405)
-    // when a method or host capability such as the Computer Use ledger is
-    // unavailable. The SDK ErrorCode taxonomy has no matching variant; do not
-    // collapse it to `invalid_request`, which is the HTTP 400 request-shape
-    // category.
-    if e.code == OrchErrorCode::Unsupported {
-        if let Some(object) = data.as_object_mut() {
-            object.insert("code".into(), json!("unsupported"));
-        }
-    }
+    // `code` is projected by `public_error_code` alone: patching a code onto
+    // this serialized value would emit a body the published `ErrorEnvelope`
+    // cannot decode.
     let message = data
         .get("message")
         .and_then(Value::as_str)
@@ -1416,9 +1408,12 @@ fn public_error_code(code: &OrchErrorCode) -> PublicErrorCode {
         }
         OrchErrorCode::Timeout => PublicErrorCode::Internal,
         OrchErrorCode::InvalidRequest | OrchErrorCode::Conflict => PublicErrorCode::InvalidRequest,
-        // Placeholder only: json_err projects the documented wire code
-        // `unsupported`. SDK ErrorCode has no Unsupported variant.
-        OrchErrorCode::Unsupported => PublicErrorCode::InvalidRequest,
+        // `unsupported` is the documented fail-closed public code (HTTP 405)
+        // when a method, or a host capability it requires such as the Computer
+        // Use ledger, is not available here. It is not `invalid_request`: the
+        // HTTP 400 category tells a client to edit a request, and no edit
+        // makes an absent host capability appear.
+        OrchErrorCode::Unsupported => PublicErrorCode::Unsupported,
         OrchErrorCode::Internal => PublicErrorCode::Internal,
     }
 }
@@ -3079,6 +3074,12 @@ mod tests {
             body["error"]["data"]["message"],
             "The operation is unsupported."
         );
+        // The fail-closed body must decode as the published envelope. A
+        // transport that patches `code` onto the serialized value emits a
+        // body every Rust consumer of the SDK rejects.
+        let envelope: ErrorEnvelope = serde_json::from_value(body["error"]["data"].clone())
+            .expect("fail-closed body decodes as the published error envelope");
+        assert_eq!(envelope.code, PublicErrorCode::Unsupported);
         assert!(
             body["error"]["message"]
                 .as_str()

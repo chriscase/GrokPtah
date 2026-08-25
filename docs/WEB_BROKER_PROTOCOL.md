@@ -256,6 +256,7 @@ server-side audit logs:
 | `401` | `unauthenticated` | User session missing/expired. |
 | `403` | `forbidden_scope` | User, binding, workspace, or capability mismatch. |
 | `404` | `not_found` | Opaque binding/run is unknown to this user. |
+| `405` | `unsupported` | Method, or a host capability it requires, is not available here. |
 | `409` | `stale_or_recovery` | Cursor/version/approval is stale; no mutation implied. |
 | `429` | `capacity` | Bounded admission is full and queueing was not allowed. |
 | `502` | `authority_unavailable` | GrokPtah authority is asleep, locked, or unavailable. |
