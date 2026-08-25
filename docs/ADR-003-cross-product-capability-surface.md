@@ -1,6 +1,6 @@
 # ADR-003: Cross-product capability surface
 
-**Status:** Proposed for implementation
+**Status:** In progress — contract and package staging implemented; consumer qualification open
 **Date:** 2026-08-24
 **Scope:** GrokPtah consumers such as ContextDesk desktop and War Room
 
@@ -88,8 +88,10 @@ The Tauri-free source barrels are split by trust boundary. Browser consumers
 use `desktop/src/lib/public.ts`, which exports only the broker client,
 capability contracts, and help index. A trusted desktop/server adapter may use
 `desktop/src/lib/trusted.ts`, which contains the direct MCP client and therefore
-must never be shipped in a browser bundle. Both are implementation staging
-points, not yet published packages or compatibility promises.
+must never be shipped in a browser bundle. The public surface now has a
+reproducible `@grokptah/client` package staging build and consumer smoke check;
+the generated package remains a release candidate until SemVer compatibility
+and cross-product qualification are complete.
 
 The project-wide ordered status and 100% exit gate are tracked in
 [`docs/ROADMAP_TO_100.md`](./ROADMAP_TO_100.md).
@@ -200,10 +202,11 @@ changing the authority boundary:
   broker session, accepts only opaque binding/run ids, validates binding/run
   response envelopes before exposing them to consumers, and enforces
   cursor-aware redacted SSE recovery.
-- `desktop/src/lib/uiCore.ts` is a headless, Tauri-free staging barrel for
+- `desktop/src/lib/uiCore.ts` is a headless, Tauri-free surface for
   capability/help search, prompt-queue reducers, and stream application
-  helpers. It contains no React components or native authority and is the
-  extraction point for the future `@grokptah/ui-core` package.
+  helpers. It contains no React components or native authority and is included
+  in the current `@grokptah/client` staging artifact; a separately versioned
+  `@grokptah/ui-core` package remains a release decision.
 - `docs/schemas/grokptah-run.v1.schema.json` pins the shared run, event,
   recovery, and review-receipt JSON shapes used by non-Rust consumers.
 - `docs/WEB_BROKER_PROTOCOL.md` is the concrete server-side contract for
