@@ -512,7 +512,10 @@ impl OrchStore {
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let _g = self.inner.lock.lock();
         let result = private_write_json_exclusive(&path, &sealed);
-        if result.is_err_and(|error| error.kind() != std::io::ErrorKind::AlreadyExists) {
+        if result
+            .as_ref()
+            .is_err_and(|error| error.kind() != std::io::ErrorKind::AlreadyExists)
+        {
             let _ = fs::remove_file(&path);
         }
         result.map_err(anyhow::Error::from)

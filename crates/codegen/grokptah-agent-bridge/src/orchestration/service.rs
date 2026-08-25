@@ -3464,6 +3464,7 @@ impl OrchestrationService {
                 .await
         });
         let model_abort = model_task.abort_handle();
+        let live_model_abort = model_abort.clone();
 
         let join = tokio::spawn(async move {
             let admission_guard = AdmissionGuard {
@@ -3783,7 +3784,7 @@ impl OrchestrationService {
             rid,
             LiveAttempt {
                 attempt_id,
-                model_abort,
+                model_abort: live_model_abort,
                 supervisor: join,
             },
         );
