@@ -19,10 +19,8 @@
     }
   },
   "files": [
-    "grokptah-public.js",
-    "ui-core.js",
-    "types",
-    "help-react.js"
+    "*.js",
+    "types"
   ],
   "peerDependencies": {
     "react": ">=18"
