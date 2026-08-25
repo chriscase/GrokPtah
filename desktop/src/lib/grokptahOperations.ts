@@ -118,7 +118,12 @@ export class GrokPtahOperations {
     scope: GrokPtahScope,
   ): Promise<GrokPtahOperationResult<T>> {
     this.requireAvailable("agent.continuity");
-    return this.invoke<T>("ptah_list_persistent_agents", scopeArgs(scope));
+    // The list endpoint is intentionally allowlist-wide and has an EmptyArgs
+    // wire schema.  The scope is still required by this facade so callers must
+    // present an authenticated run context, but it must not be serialized into
+    // the request or the strict server parser rejects it as invalid_request.
+    void scopeArgs(scope);
+    return this.invoke<T>("ptah_list_persistent_agents", {});
   }
 
   async resumePersistentAgent<T = unknown>(

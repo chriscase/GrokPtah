@@ -165,6 +165,30 @@ describe("GrokPtahOperations", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("uses the empty-args wire shape for allowlist-wide persistent-agent listing", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      response({ jsonrpc: "2.0", id: 1, result: { agents: [] } }),
+    );
+    const operations = new GrokPtahOperations(
+      clientWithCapabilities(fetcher, [
+        {
+          id: "agent.continuity",
+          tier: "observe",
+          mutating: false,
+          human_gate: false,
+          availability: "available",
+          description: "List durable agents",
+        },
+      ]),
+    );
+
+    await operations.listPersistentAgents({ sessionId: "session-1", workspace: "/repo" });
+    const body = JSON.parse(String(fetcher.mock.calls[0][1]?.body)) as {
+      params?: { arguments?: unknown };
+    };
+    expect(body.params?.arguments).toEqual({});
+  });
+
   it("exposes queue CAS operations through the same capability fence", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
       response({ jsonrpc: "2.0", id: 1, result: { ok: true } }),
