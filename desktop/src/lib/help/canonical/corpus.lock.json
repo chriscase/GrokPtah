@@ -1,10 +1,10 @@
 {
   "schemaVersion": "grokptah.help-canonical.v1",
   "contentVersion": "help-canonical-2026.08.1",
-  "digest": "sha256:add280ca1f15e19e7188f3b4498a2e0c1d61209aee3bbd47f89dfeae38f7e06e",
+  "digest": "sha256:fcdb78f7019a7a11349205626058f230273831ea6eabb76c9e16c7d9dd6efc79",
   "sourceDigest": "sha256:66d8ee9ccf1c1e502d92e91e019cd296e4dda94a4db3a0730625eba03bce1f52",
   "articleCount": 24,
   "chunkCount": 105,
   "sourceCount": 22,
-  "serializationSha256": "add280ca1f15e19e7188f3b4498a2e0c1d61209aee3bbd47f89dfeae38f7e06e"
+  "serializationSha256": "fcdb78f7019a7a11349205626058f230273831ea6eabb76c9e16c7d9dd6efc79"
 }

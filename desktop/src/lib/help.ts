@@ -11,8 +11,11 @@ import { PROJECTED_HELP_ENTRIES } from "./help/canonical/projections";
 
 export const HELP_CONTRACT = "grokptah.help.v1" as const;
 
-export type HelpAudience = "everyone" | "power_user" | "operator";
-export type HelpAccess = "public" | "gated" | "operator";
+// Declared once, in the canonical corpus schema. Re-exported here so the
+// published `grokptah.help.v1` surface is unchanged, while `uiCore` can star-
+// export both this contract and the Help core without an ambiguous name.
+export type { HelpAccess, HelpAudience } from "./help/canonical/types";
+import type { HelpAccess, HelpAudience } from "./help/canonical/types";
 
 export type HelpEntry = {
   readonly id: string;

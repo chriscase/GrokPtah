@@ -1,7 +1,9 @@
 import { HELP_CORPUS_DIGEST } from "./help/canonical/corpus";
 import { PROJECTED_HELP_ARTICLES } from "./help/canonical/projections";
 
-export type HelpTopic = "getting-started" | "providers" | "computer-use" | "operations";
+// Declared once, in the canonical corpus schema.
+export type { HelpTopic } from "./help/canonical/types";
+import type { HelpTopic } from "./help/canonical/types";
 
 export type HelpSource = {
   readonly id: string;

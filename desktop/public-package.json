@@ -1,7 +1,7 @@
 {
   "name": "@grokptah/client",
   "version": "0.1.0",
-  "description": "Browser-safe GrokPtah broker client and headless UI primitives",
+  "description": "Browser-safe GrokPtah broker client, headless UI primitives, and the offline Help core",
   "type": "module",
   "sideEffects": false,
   "exports": {
@@ -12,11 +12,24 @@
     "./ui-core": {
       "types": "./types/uiCore.d.ts",
       "import": "./ui-core.js"
+    },
+    "./help-react": {
+      "types": "./types/helpPublic.d.ts",
+      "import": "./help-react.js"
     }
   },
   "files": [
     "grokptah-public.js",
     "ui-core.js",
-    "types"
-  ]
+    "types",
+    "help-react.js"
+  ],
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  }
 }

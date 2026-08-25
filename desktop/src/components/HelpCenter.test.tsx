@@ -39,7 +39,7 @@ describe("HelpCenter", () => {
     const onClose = vi.fn();
     const onAskAssistant = vi.fn().mockResolvedValue({
       text: "A bounded answer.",
-      citations: ["product.readme"],
+      citations: ["product.readme.quick-start"],
       uncertainty: "The selected article is the authority.",
     });
     render(<HelpCenter open onClose={onClose} onAskAssistant={onAskAssistant} />);
@@ -117,7 +117,10 @@ describe("HelpCenter", () => {
   it("requires confirmation before calling the optional assistant and validates citations", async () => {
     const onAskAssistant = vi.fn().mockResolvedValue({
       text: "Builds and chats are separate surfaces.",
-      citations: ["product.readme"],
+      // `product.readme` was split during the corpus consolidation: it used to
+      // point at both "Quick start" and "Features (desktop)", so a citation
+      // could not identify which section backed a claim.
+      citations: ["product.readme.quick-start"],
       uncertainty: "This answer is limited to the selected article.",
     });
     render(<HelpCenter open onClose={vi.fn()} onAskAssistant={onAskAssistant} assistantProviderLabel="Company gateway · review-model" />);

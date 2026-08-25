@@ -13,12 +13,21 @@ import {
   type HelpCanonicalCorpus,
   type HelpChunk,
   type HelpSourceAnchor,
+  type HelpTopic,
 } from "./types";
 
 /** Retrieval and citation bounds. Enforced at build time, not just documented. */
 export const HELP_CHUNK_MAX_CHARS = 512;
 export const HELP_ARTICLE_MAX_BODY_CHARS = 4_096;
 export const HELP_MAX_ARTICLES = 512;
+
+/** Reading order for topics; also fixes the canonical article order. */
+export const HELP_TOPIC_ORDER: readonly HelpTopic[] = Object.freeze([
+  "getting-started",
+  "providers",
+  "computer-use",
+  "operations",
+]);
 
 function compare(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -150,9 +159,19 @@ function buildCorpus(): HelpCanonicalCorpus {
   if (HELP_ARTICLE_SEEDS.length > HELP_MAX_ARTICLES) {
     throw new Error(`help corpus: more than ${HELP_MAX_ARTICLES} articles`);
   }
+  // Ordered by topic, then by the order the articles are authored in `data.ts`.
+  // Deterministic — the seed file is fixed, and any reorder shows up as a lock
+  // diff — while still reading in a sensible sequence. Sorting by id would put
+  // computer-use first and, within getting-started, lead with accessibility
+  // rather than the introductory article, purely because of the alphabet.
+  const seedOrder = new Map(HELP_ARTICLE_SEEDS.map((seed, index) => [seed.id, index]));
   const articles = HELP_ARTICLE_SEEDS.map(resolveArticle)
     .slice()
-    .sort((left, right) => compare(left.id, right.id));
+    .sort(
+      (left, right) =>
+        HELP_TOPIC_ORDER.indexOf(left.topic) - HELP_TOPIC_ORDER.indexOf(right.topic) ||
+        (seedOrder.get(left.id) ?? 0) - (seedOrder.get(right.id) ?? 0),
+    );
 
   const ids = new Set<string>();
   const legacyIds = new Set<string>();
