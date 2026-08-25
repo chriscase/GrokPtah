@@ -48,6 +48,13 @@ jobs:
         working-directory: desktop
         run: npm ci
 
+      - name: Verify public package and consumer smoke
+        working-directory: desktop
+        run: npm run verify:public
+
+      - name: Test host-neutral Agent SDK
+        run: cargo test --locked -p grokptah-agent-sdk
+
       - name: Build unsigned desktop bundle
         working-directory: desktop
         run: npm run tauri:build
