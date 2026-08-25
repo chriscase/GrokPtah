@@ -27,7 +27,7 @@ use uuid::Uuid;
 use super::types::{
     ActionClass, ComputerAttentionPoint, ComputerCapabilities, ComputerControlDisposition,
     ComputerError, ComputerErrorCode, ComputerRun, ComputerRunState, ComputerSurfaceEvent,
-    ComputerUseLimits, GrantIssuer, SemanticAction, Sensitivity, SurfaceAuditInput,
+    ComputerUseLimits, GrantIssuer, SemanticAction, Sensitivity,
 };
 
 /// Hard ceiling on one event page regardless of the requested limit.
@@ -648,7 +648,7 @@ mod tests {
     use super::*;
     use crate::computer_use::types::{
         ActionGrant, ActionOutcome, ComputerObservation, ComputerTarget, EvidenceRef,
-        ObservationGeometry, SemanticElement,
+        ObservationGeometry, SemanticElement, SurfaceAuditInput,
     };
 
     fn target() -> ComputerTarget {
