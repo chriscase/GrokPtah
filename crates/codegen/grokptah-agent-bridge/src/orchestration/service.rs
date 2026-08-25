@@ -3465,13 +3465,15 @@ impl OrchestrationService {
         });
         let model_abort = model_task.abort_handle();
         let live_model_abort = model_abort.clone();
+        let supervisor_run_id = rid.clone();
+        let supervisor_attempt_id = attempt_id.clone();
 
         let join = tokio::spawn(async move {
             let admission_guard = AdmissionGuard {
                 host: host.clone(),
                 store: store.clone(),
-                run_id: rid.clone(),
-                attempt_id: attempt_id.clone(),
+                run_id: supervisor_run_id,
+                attempt_id: supervisor_attempt_id,
                 owner_instance_id: owner_instance_id.clone(),
                 model_abort,
                 armed: true,
