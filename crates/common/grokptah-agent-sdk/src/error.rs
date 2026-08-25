@@ -81,5 +81,8 @@ mod tests {
         let recovered_value = serde_json::to_value(recovered).expect("recovery serializes");
         assert_eq!(recovered_value["eventRange"]["startSeq"], 12);
         assert_eq!(recovered_value["eventRange"]["endSeq"], 18);
+        let decoded: ErrorEnvelope =
+            serde_json::from_value(recovered_value).expect("recovery round-trips");
+        assert_eq!(decoded.event_range, recovered.event_range);
     }
 }

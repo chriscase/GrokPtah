@@ -645,6 +645,12 @@ DELETE /mcp  mcp-session-id: S → 204
 In-tree Rust helper: `McpControlClient` (`mcp_control_client.rs`).
 Independent Node harness: `tests/mcp_sdk_interop/run_conformance.mjs`.
 
+`McpControlClient` is deliberately transport-only: negotiated capability
+presence proves that a tool is exposed, not that a human/lease gate has been
+satisfied. Use `GrokPtahOperations` or an equivalent authority-aware adapter
+for promotion and Computer Use control; never infer approval from a successful
+transport call.
+
 The Rust helper also exposes the coordinator-neutral live channel. After
 `initialize`, construct an exact `RunScope` and call
 `open_event_stream(scope, last_event_id)`. Consume

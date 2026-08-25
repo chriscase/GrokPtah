@@ -28,3 +28,9 @@ Adapters remain responsible for mapping these contracts to MCP, applying host
 policy, authenticating users, redacting data, and retaining credentials. The
 desktop bridge remains the authority anchor; this crate does not authorize a
 remote originator or bypass human gates.
+
+The in-tree `McpControlClient` is a transport and negotiated-capability helper;
+its `call_tool` method does not itself satisfy a descriptor's `human_gate`.
+Authority-aware adapters should use the desktop operation facade (or an
+equivalent approval/lease layer) before invoking promotion or Computer Use
+control, and should never treat transport reachability as approval.

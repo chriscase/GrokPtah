@@ -1352,10 +1352,9 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
         .and_then(|extra| extra.get("eventRange"))
         .and_then(Value::as_object)
         .and_then(|range| {
-            Some(ErrorEventRange {
-                start_seq: range.get("startSeq")?.as_u64()?,
-                end_seq: range.get("endSeq")?.as_u64()?,
-            })
+            let start_seq = range.get("startSeq")?.as_u64()?;
+            let end_seq = range.get("endSeq")?.as_u64()?;
+            (end_seq >= start_seq).then_some(ErrorEventRange { start_seq, end_seq })
         });
     let public = ErrorEnvelope {
         code: public_error_code(&e.code),
