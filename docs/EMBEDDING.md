@@ -97,6 +97,14 @@ rendering, focus management, transport adapter, and approval presentation.
 The barrel is intentionally a staging source for `@grokptah/ui-core`; it is
 not yet a published package or SemVer promise.
 
+To produce a reviewable, Tauri-free consumer artifact from an exact checkout,
+run `npm run build:public` in `desktop/`. This emits a bundled
+`desktop/dist/public/grokptah-public.js` plus declaration files under
+`desktop/dist/public/types/`. The generated artifact contains the browser-safe
+broker client and headless primitives only; it does not contain `trusted.ts`,
+Tauri APIs, bearer tokens, or native Computer Use authority. Publication still
+requires the compatibility and release gates in the roadmap.
+
 ## ContextDesk integration checklist
 
 The minimum disposable integration should prove, against one exact candidate:
