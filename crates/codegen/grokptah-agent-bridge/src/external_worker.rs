@@ -305,6 +305,8 @@ impl CursorCloudAdapter {
             return Err(ExternalWorkerAdapterError::Provider { status });
         }
         let bytes = response.bytes().await?;
+        // Decode the provider body as strict UTF-8 JSON. `from_slice` fails
+        // closed on invalid UTF-8 instead of substituting U+FFFD.
         serde_json::from_slice(&bytes).map_err(|_| {
             ExternalWorkerAdapterError::InvalidResponse("provider response is malformed")
         })
@@ -744,6 +746,10 @@ struct CursorFollowUpResponse {
 #[serde(rename_all = "camelCase")]
 struct CursorAgent {
     id: String,
+    /// Provider-visible display name. Decoded for charset integrity, then
+    /// discarded; identity projections must not carry it.
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     url: Option<String>,
     status: String,
@@ -802,6 +808,10 @@ struct CursorAgentList {
 #[serde(rename_all = "camelCase")]
 struct CursorAgentListItem {
     id: String,
+    /// Provider-visible display name. Decoded for charset integrity, then
+    /// discarded; identity-only summaries must not carry it.
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     url: Option<String>,
     status: String,
@@ -894,6 +904,7 @@ fn worker_record(
             "Cursor worker status is missing",
         ));
     }
+    reject_lossy_utf8(agent.name.as_deref())?;
     if agent.auto_create_pr != Some(false) || agent.work_on_current_branch != Some(false) {
         return Err(ExternalWorkerAdapterError::InvalidResponse(
             "Cursor response did not prove PR creation and current-branch writes are disabled",
@@ -958,6 +969,7 @@ fn worker_summary(
             "Cursor worker status is missing",
         ));
     }
+    reject_lossy_utf8(agent.name.as_deref())?;
     if let Some(env) = &agent.env {
         if env.kind != "cloud" {
             return Err(ExternalWorkerAdapterError::InvalidResponse(
@@ -1011,8 +1023,17 @@ fn run_record(
     Ok(run)
 }
 
+fn reject_lossy_utf8(value: Option<&str>) -> Result<(), ExternalWorkerAdapterError> {
+    if value.is_some_and(|text| text.contains('\u{FFFD}')) {
+        return Err(ExternalWorkerAdapterError::InvalidResponse(
+            "provider response is malformed",
+        ));
+    }
+    Ok(())
+}
+
 fn safe_terminal_result(value: &str) -> Option<String> {
-    if value.contains('\0') {
+    if value.contains('\0') || value.contains('\u{FFFD}') {
         return None;
     }
     // Preserve readable multi-line final replies without allowing control
@@ -1471,6 +1492,11 @@ mod tests {
             safe_terminal_result("completed\nwith two lines"),
             Some("completed with two lines".into())
         );
+        assert_eq!(
+            safe_terminal_result("完成：café 日本語"),
+            Some("完成：café 日本語".into())
+        );
+        assert_eq!(safe_terminal_result("caf\u{FFFD}"), None);
         assert_eq!(safe_terminal_result("wrote /Users/alice/project"), None);
         assert_eq!(safe_terminal_result("Authorization: Bearer token"), None);
         assert_eq!(safe_terminal_result("password=secret"), None);
@@ -1848,5 +1874,228 @@ mod tests {
             adapter.archive(AGENT_1).await.unwrap_err(),
             ExternalWorkerAdapterError::InvalidResponse(_)
         ));
+    }
+
+    const UTF8_PROMPT: &str = "审查候选用例 — café 日本語";
+    const UTF8_NAME: &str = "候选用例 café Bearer secret";
+    const UTF8_DETAIL: &str = "完成：café 日本語";
+
+    fn latin1_list_body() -> Vec<u8> {
+        let mut body =
+            br#"{"items":[{"id":"bc-00000000-0000-0000-0000-000000000001","name":"caf"#.to_vec();
+        body.push(0xE9);
+        body.extend_from_slice(
+            br#"","status":"ACTIVE","url":"https://cursor.com/agents/bc-00000000-0000-0000-0000-000000000001","createdAt":"2026-08-24T00:00:00Z","updatedAt":"2026-08-24T00:00:01Z"}]}"#,
+        );
+        body
+    }
+
+    fn charset_agent() -> Value {
+        let mut agent = fake_agent();
+        agent["name"] = json!(UTF8_NAME);
+        agent
+    }
+
+    #[derive(Clone, Default)]
+    struct CharsetCursorState {
+        launch_requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    fn charset_router(state: CharsetCursorState) -> Router {
+        Router::new()
+            .route("/v1/agents", post(charset_create).get(charset_list))
+            .route("/v1/agents/{id}", get(charset_agent_read))
+            .route("/v1/agents/{id}/runs/{run_id}", get(charset_run_read))
+            .with_state(state)
+    }
+
+    async fn charset_create(
+        State(state): State<CharsetCursorState>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        state.launch_requests.lock().unwrap().push(body);
+        Json(json!({
+            "agent": charset_agent(),
+            "run": {
+                "id": RUN_1,
+                "agentId": AGENT_1,
+                "status": "CREATING",
+                "createdAt": "2026-08-24T00:00:00Z",
+                "updatedAt": "2026-08-24T00:00:01Z",
+                "result": UTF8_DETAIL
+            }
+        }))
+    }
+
+    async fn charset_list() -> Json<Value> {
+        Json(json!({
+            "items": [{
+                "id": AGENT_1,
+                "name": UTF8_NAME,
+                "status": "ACTIVE",
+                "env": {"type": "cloud"},
+                "url": format!("https://cursor.com/agents/{AGENT_1}"),
+                "createdAt": "2026-08-24T00:00:00Z",
+                "updatedAt": "2026-08-24T00:00:01Z",
+                "latestRunId": RUN_1
+            }]
+        }))
+    }
+
+    async fn charset_agent_read() -> Json<Value> {
+        Json(charset_agent())
+    }
+
+    async fn charset_run_read() -> Json<Value> {
+        Json(json!({
+            "id": RUN_1,
+            "agentId": AGENT_1,
+            "status": "FINISHED",
+            "createdAt": "2026-08-24T00:00:00Z",
+            "updatedAt": "2026-08-24T00:00:02Z",
+            "result": UTF8_DETAIL
+        }))
+    }
+
+    #[test]
+    fn cursor_list_item_decodes_non_ascii_utf8_names_without_projecting_them() {
+        let mut value = fake_list_item(AGENT_1, false, "2026-08-24T00:00:01Z");
+        value["name"] = json!(UTF8_NAME);
+        let item: CursorAgentListItem = serde_json::from_value(value).unwrap();
+        assert_eq!(item.name.as_deref(), Some(UTF8_NAME));
+        assert!(!item.name.as_deref().unwrap().contains('\u{FFFD}'));
+        let summary = worker_summary(&item).unwrap();
+        let projected = serde_json::to_value(&summary).unwrap();
+        assert!(projected.get("name").is_none());
+        let rendered = projected.to_string();
+        assert!(!rendered.contains("候选用例"));
+        assert!(!rendered.contains("café"));
+        assert!(!rendered.contains("Bearer"));
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn provider_json_fails_closed_on_non_utf8_bytes_instead_of_lossy_replacement() {
+        let body = latin1_list_body();
+        assert!(
+            serde_json::from_slice::<CursorAgentList>(&body).is_err(),
+            "strict UTF-8 JSON decoding must fail closed"
+        );
+        let lossy = String::from_utf8_lossy(&body);
+        assert!(lossy.contains('\u{FFFD}'));
+        assert!(
+            serde_json::from_str::<CursorAgentList>(&lossy).is_ok(),
+            "lossy replacement would silently accept latin-1 as U+FFFD"
+        );
+        let mut item: CursorAgentListItem =
+            serde_json::from_value(fake_list_item(AGENT_1, false, "2026-08-24T00:00:01Z")).unwrap();
+        item.name = Some("caf\u{FFFD}".into());
+        assert!(worker_summary(&item).is_err());
+    }
+
+    #[tokio::test]
+    async fn fake_cursor_api_round_trips_non_ascii_utf8_and_fails_closed_on_non_utf8() {
+        let state = CharsetCursorState::default();
+        let address = spawn_app(charset_router(state.clone())).await;
+        let adapter = CursorCloudAdapter::for_test(&address);
+
+        let mut request = launch_request();
+        request.prompt = UTF8_PROMPT.into();
+        request.validate().expect("utf-8 prompt stays in bounds");
+        let launch = adapter.launch(&request).await.unwrap();
+        assert_eq!(launch.worker.external_agent_id, AGENT_1);
+        {
+            let sent = state.launch_requests.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0]["prompt"]["text"], UTF8_PROMPT);
+            let sent_json = sent[0].to_string();
+            assert!(sent_json.contains("审查候选用例"));
+            assert!(sent_json.contains("café"));
+            assert!(!sent_json.contains('\u{FFFD}'));
+            assert!(!sent_json.contains("synthetic-cursor-key"));
+        }
+
+        let worker = adapter.get_worker(AGENT_1).await.unwrap();
+        let worker_json = serde_json::to_value(&worker).unwrap();
+        assert!(worker_json.get("name").is_none());
+        let worker_rendered = worker_json.to_string();
+        assert!(!worker_rendered.contains("候选用例"));
+        assert!(!worker_rendered.contains("Bearer"));
+        assert!(!worker_rendered.contains("secret"));
+        assert!(!worker_rendered.contains("synthetic-cursor-key"));
+        assert!(!worker_rendered.contains('\u{FFFD}'));
+
+        let page = adapter
+            .list_workers(&ExternalWorkerListQuery::default())
+            .await
+            .unwrap();
+        page.validate().expect("utf-8 list page stays bounded");
+        assert_eq!(page.items.len(), 1);
+        let page_json = serde_json::to_value(&page).unwrap();
+        assert!(page_json["items"][0].get("name").is_none());
+        assert!(page_json["items"][0].get("repository").is_none());
+        let page_rendered = page_json.to_string();
+        assert!(!page_rendered.contains("候选用例"));
+        assert!(!page_rendered.contains("café"));
+        assert!(!page_rendered.contains("Bearer"));
+        assert!(!page_rendered.contains("secret"));
+        assert!(!page_rendered.contains('\u{FFFD}'));
+
+        let run = adapter.get_run(AGENT_1, RUN_1).await.unwrap();
+        assert_eq!(run.terminal_result.as_deref(), Some(UTF8_DETAIL));
+        assert!(!run.terminal_result.as_deref().unwrap().contains('\u{FFFD}'));
+        let run_rendered = serde_json::to_string(&run).unwrap();
+        assert!(run_rendered.contains("完成：café 日本語"));
+        assert!(!run_rendered.contains("synthetic-cursor-key"));
+        assert!(!run_rendered.contains("Bearer"));
+
+        let leaked = spawn_app(Router::new().route(
+            "/v1/agents/{id}/runs/{run_id}",
+            get(|| async {
+                Json(json!({
+                    "id": RUN_1,
+                    "agentId": AGENT_1,
+                    "status": "FINISHED",
+                    "createdAt": "2026-08-24T00:00:00Z",
+                    "updatedAt": "2026-08-24T00:00:02Z",
+                    "result": "完成 Authorization: Bearer secret"
+                }))
+            }),
+        ))
+        .await;
+        let leaked_run = CursorCloudAdapter::for_test(&leaked)
+            .get_run(AGENT_1, RUN_1)
+            .await
+            .unwrap();
+        assert!(leaked_run.terminal_result.is_none());
+        let leaked_rendered = serde_json::to_string(&leaked_run).unwrap();
+        assert!(!leaked_rendered.contains("Bearer"));
+        assert!(!leaked_rendered.contains("secret"));
+        assert!(!leaked_rendered.contains("synthetic-cursor-key"));
+
+        let non_utf8 = spawn_app(Router::new().route(
+            "/v1/agents",
+            get(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    latin1_list_body(),
+                )
+            }),
+        ))
+        .await;
+        let error = CursorCloudAdapter::for_test(&non_utf8)
+            .list_workers(&ExternalWorkerListQuery::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExternalWorkerAdapterError::InvalidResponse(_)
+        ));
+        let rendered = error.to_string();
+        assert!(!rendered.contains('\u{FFFD}'));
+        assert!(!rendered.contains("synthetic-cursor-key"));
+        assert!(!rendered.contains("Bearer"));
     }
 }

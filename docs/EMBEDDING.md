@@ -21,13 +21,17 @@ paths and Computer Use details.
 ## External cloud workers
 
 Products that want GrokPtah to launch and monitor an external coding agent
-should import the `external_worker` contracts from `grokptah-agent-sdk` rather
-than inventing provider-specific DTOs. The contract covers an exact-ref,
-isolated launch request, opaque worker/run identities, redacted event updates,
-bounded relative artifact references, identity-only list pages, and explicit
-archive/unarchive. The provider adapter keeps its API key and network client in
-the trusted service; the desktop and War Room UI receive only the redacted
-projections and existing review/approval receipts.
+should import the documented crate-root contracts from `grokptah-agent-sdk`
+rather than inventing provider-specific DTOs or reaching into a private module
+path. The crate root re-exports `ExternalWorkerListQuery`,
+`ExternalWorkerSummary`, `ExternalWorkerListPage`, and
+`MAX_EXTERNAL_WORKER_LIST_LIMIT` alongside the launch/lifecycle types. The
+contract covers an exact-ref, isolated launch request, opaque worker/run
+identities, redacted event updates, bounded relative artifact references,
+identity-only list pages, and explicit archive/unarchive. The provider adapter
+keeps its API key and network client in the trusted service; the desktop and
+War Room UI receive only the redacted projections and existing review/approval
+receipts.
 
 The JSON representation is versioned at
 [`grokptah-external-worker.v1.schema.json`](./schemas/grokptah-external-worker.v1.schema.json).

@@ -47,11 +47,15 @@ ref, and persist the Cursor agent/run IDs as opaque external IDs. A Cursor
 follow-up is a new run on the same agent; it is not an implicit resume of a
 cancelled run.
 
-The reusable DTO boundary is `grokptah-agent-sdk::external_worker`. It exposes
-validated launch requests plus redacted worker, run, event, and artifact
-projections. It deliberately has no provider credentials or network client, so
-another product can import the same contracts from a desktop adapter, service,
-or browser-safe broker without importing GrokPtah's authority implementation.
+The reusable DTO boundary is `grokptah-agent-sdk`. Public consumers import
+list/query/summary/page types and `MAX_EXTERNAL_WORKER_LIST_LIMIT` from the
+crate root (they remain defined in `external_worker` with
+`deny_unknown_fields` and bounded validation). The crate exposes validated
+launch requests plus redacted worker, run, event, artifact, and identity-only
+list projections. It deliberately has no provider credentials or network
+client, so another product can import the same contracts from a desktop
+adapter, service, or browser-safe broker without importing GrokPtah's
+authority implementation.
 
 The native bridge now exposes `CursorCloudAdapter` behind the
 `ExternalWorkerAdapter` trait. It targets Cursor Cloud Agents API v1, keeps the
@@ -107,8 +111,10 @@ path is qualified.
    projection, status polling, busy/unknown follow-up rejection, redacted
    terminal text, terminal cancellation, identity-only list pagination with an
    explicit `includeArchived` flag, reversible archive/unarchive with identity
-   and state verification, malformed/unknown list responses failing closed, and
-   run-attributed digest-bearing artifacts without network credentials. Stream
+   and state verification, malformed/unknown list responses failing closed,
+   non-ASCII UTF-8 name/detail/prompt round-trip without lossy conversion,
+   fail-closed invalid or non-UTF-8 JSON, and run-attributed digest-bearing
+   artifacts without network credentials. Stream
    reconnect/expiry, durable idempotent retry, and a real artifact download/hash
    path remain to be added. Live Cursor qualification is still an open gate.
 2. **Read-only live probe:** list models/repositories and read an existing
