@@ -526,6 +526,13 @@ mod tests {
     fn writable_handles_wrong_modes_and_sparse_oversize_fail_closed() {
         let (helper_dir, _helper) = write_artifact("helper", b"helper-v1", true);
         let helper_path = helper_dir.path().join("helper");
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // The helper fixture is 0o500 so a direct RDWR open fails at the
+            // OS before validate_read_only_handle can reject a writable fd.
+            std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let mut writable = OpenOptions::new()
             .read(true)
             .write(true)

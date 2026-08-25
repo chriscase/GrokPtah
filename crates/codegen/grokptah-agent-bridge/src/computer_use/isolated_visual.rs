@@ -633,14 +633,12 @@ mod tests {
             assert!(object.contains_key(required));
         }
         let encoded = serde_json::to_string(&value).unwrap();
-        for forbidden in [
-            "overlayPath",
-            "helperPath",
-            "channelSecret",
-            "credential",
-            "hostHome",
-        ] {
+        for forbidden in ["overlayPath", "helperPath", "channelSecret", "hostHome"] {
             assert!(!encoded.contains(forbidden));
         }
+        assert_eq!(
+            value["manifest"]["securityProfile"]["credentialForwarding"],
+            serde_json::Value::Bool(false)
+        );
     }
 }

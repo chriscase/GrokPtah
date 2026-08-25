@@ -2522,11 +2522,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(observation.geometry.x, -1200.0);
-        assert_eq!(observation.elements.len(), 1);
+        assert_eq!(observation.elements.len(), 2);
         assert_eq!(observation.elements[0].role, "AXButton");
-        assert!(!serde_json::to_string(&observation)
-            .unwrap()
-            .contains("must-not-escape"));
+        assert_eq!(observation.elements[1].role, "AXTextField");
+        assert!(observation
+            .elements
+            .iter()
+            .all(|element| element.role != "AXSecureTextField"));
+        let encoded = serde_json::to_string(&observation).unwrap();
+        assert!(!encoded.contains("must-not-escape"));
+        assert!(!encoded.contains("AXSecureTextField"));
         assert_eq!(observation.elements[0].bounds.unwrap().x, 1.0);
         let evidence = observation.screenshot.unwrap();
         assert_eq!(
