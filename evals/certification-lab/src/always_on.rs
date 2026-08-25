@@ -1722,25 +1722,103 @@ impl LoopbackProviderLane {
 /// attempt. When the public Run projects a provider-attempt id/ordinal those
 /// are included; otherwise the fixture's declared send count for that
 /// semantic stands in so the value is never an implicit `1`.
-pub fn provider_attempt_correlation(
-    run: &RunIdentity,
-    fixture_sends: u64,
-) -> Result<String, DiagnosticCode> {
-    if fixture_sends == 0 {
-        return Err(DiagnosticCode::FixtureInvalid);
+/// One at-send correlation exactly as the loopback observed it on the wire.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservedSendCorrelation {
+    pub ordinal: u64,
+    pub capability_revision: String,
+    pub digest: String,
+}
+
+/// Parse the sender's wire value, refusing anything it does not fully
+/// understand.
+pub fn parse_send_correlation(value: &str) -> Result<ObservedSendCorrelation, DiagnosticCode> {
+    let mut parts = value.split(';');
+    let version = parts
+        .next()
+        .and_then(|part| part.parse::<u32>().ok())
+        .ok_or(DiagnosticCode::McpResultMalformed)?;
+    if version != grokptah_agent_bridge::ProviderSendCorrelation::WIRE_VERSION {
+        return Err(DiagnosticCode::McpResultMalformed);
     }
-    let material = match (
-        run.provider_attempt_id.as_deref(),
-        run.provider_attempt_ordinal,
-    ) {
-        (Some(attempt_id), Some(ordinal)) => {
-            format!("{}:{attempt_id}:{ordinal}", run.run_id)
-        }
-        (Some(attempt_id), None) => format!("{}:{attempt_id}", run.run_id),
-        (None, Some(ordinal)) => format!("{}:ordinal:{ordinal}", run.run_id),
-        (None, None) => format!("{}:fixture-sends:{fixture_sends}", run.run_id),
-    };
-    Ok(opaque_durable_id(&material))
+    let ordinal = parts
+        .next()
+        .and_then(|part| part.parse::<u64>().ok())
+        .ok_or(DiagnosticCode::McpResultMalformed)?;
+    let capability_revision = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or(DiagnosticCode::McpResultMalformed)?
+        .to_owned();
+    let digest = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or(DiagnosticCode::McpResultMalformed)?
+        .to_owned();
+    if parts.next().is_some() || ordinal == 0 {
+        return Err(DiagnosticCode::McpResultMalformed);
+    }
+    Ok(ObservedSendCorrelation {
+        ordinal,
+        capability_revision,
+        digest,
+    })
+}
+
+/// Verify that `run_id` is the Run that actually sent `record`.
+///
+/// The sender binds its Run, the route snapshot that authorised the send, the
+/// per-Run send ordinal and the exact request bytes into one digest before the
+/// request leaves the process. The lab cannot produce that value; it can only
+/// recompute it against a candidate Run. A record moved to another lane, Run or
+/// home therefore fails here, even when every count and every internal digest
+/// in the report is self-consistent.
+pub fn verify_send_correlation(
+    record: &LoopbackProviderRecord,
+    run_id: &str,
+) -> Result<ObservedSendCorrelation, DiagnosticCode> {
+    let raw = record
+        .send_correlation
+        .as_deref()
+        .ok_or(DiagnosticCode::ProviderObservationUnavailable)?;
+    let observed = parse_send_correlation(raw)?;
+    if record.wire_body_digest.is_empty() {
+        return Err(DiagnosticCode::McpResultMalformed);
+    }
+    let expected = grokptah_agent_bridge::ProviderSendCorrelation::digest(
+        run_id,
+        &observed.capability_revision,
+        observed.ordinal,
+        &record.wire_body_digest,
+    );
+    if expected != observed.digest {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    Ok(observed)
+}
+
+/// Verify `record` against `run_id` and prove no other Run in the snapshot can
+/// claim it.
+///
+/// Verification alone binds one direction. Requiring that exactly one Run in
+/// the whole snapshot verifies closes the other, so a coordinated substitution
+/// that swaps a complete Work+attempt+intent+Run chain cannot quietly move a
+/// provider row onto the replacement chain.
+pub fn bind_record_to_unique_run(
+    record: &LoopbackProviderRecord,
+    snapshot: &AlwaysOnSnapshot,
+    run_id: &str,
+) -> Result<ObservedSendCorrelation, DiagnosticCode> {
+    let observed = verify_send_correlation(record, run_id)?;
+    let claimants = snapshot
+        .runs
+        .iter()
+        .filter(|candidate| verify_send_correlation(record, &candidate.run_id).is_ok())
+        .count();
+    if claimants != 1 {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    Ok(observed)
 }
 
 fn join_provider_record(
@@ -1767,15 +1845,19 @@ fn join_provider_record(
         return Err(DiagnosticCode::StateTransitionMismatch);
     };
     let lane = resolve_lane(snapshot, step_id)?;
-    let run = snapshot.run(&lane.run_id)?;
-    let sends = fixture
-        .posts_for(&record.semantic_id)
-        .ok_or(DiagnosticCode::FixtureInvalid)?;
+    let _ = snapshot.run(&lane.run_id)?;
+    if fixture.posts_for(&record.semantic_id).is_none() {
+        return Err(DiagnosticCode::FixtureInvalid);
+    }
+    // The lane the semantic label suggests only stands if the sender's own
+    // at-send correlation verifies against that lane's Run, and against no
+    // other Run in the snapshot.
+    let observed = bind_record_to_unique_run(record, snapshot, &lane.run_id)?;
     Ok(AlwaysOnProviderJoin {
         home,
         semantic_id: record.semantic_id.clone(),
         body_digest: record.body_digest.clone(),
-        correlation: provider_attempt_correlation(run, sends)?,
+        correlation: observed.digest,
         work: Some(opaque_durable_id(&lane.work_id)),
         attempt: Some(opaque_durable_id(&lane.attempt_id)),
         intent: Some(opaque_durable_id(&lane.intent_id)),
@@ -1812,11 +1894,12 @@ fn join_setup_record(
     if fixture.setup.work != 0 || fixture.setup.attempts != 0 || fixture.setup.intents != 0 {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
+    let observed = bind_record_to_unique_run(record, snapshot, &run.run_id)?;
     Ok(AlwaysOnProviderJoin {
         home,
         semantic_id: record.semantic_id.clone(),
         body_digest: record.body_digest.clone(),
-        correlation: provider_attempt_correlation(run, fixture.setup.provider_sends)?,
+        correlation: observed.digest,
         work: None,
         attempt: None,
         intent: None,
@@ -3386,6 +3469,27 @@ mod tests {
     // -- loopback provider lanes ---------------------------------------------
 
     fn record(semantic: &str, digest: &str) -> LoopbackProviderRecord {
+        signed_record(semantic, digest, None)
+    }
+
+    /// A record carrying the at-send correlation `run_id` would have published.
+    ///
+    /// Tests build it the way the sender does, so the canonical fixtures run
+    /// through the real verification path instead of bypassing it.
+    fn signed_record(
+        semantic: &str,
+        digest: &str,
+        signed_for: Option<(&str, u64)>,
+    ) -> LoopbackProviderRecord {
+        let wire_body_digest = format!("wire-{digest}");
+        let send_correlation = signed_for.map(|(run_id, ordinal)| {
+            grokptah_agent_bridge::ProviderSendCorrelation::new(
+                run_id,
+                TEST_CAPABILITY_REVISION,
+                ordinal,
+            )
+            .wire_value(&wire_body_digest)
+        });
         LoopbackProviderRecord {
             method: "POST".into(),
             path: "/v1/chat/completions".into(),
@@ -3394,8 +3498,12 @@ mod tests {
             auth_accepted: true,
             route_ok: true,
             correlation: String::new(),
+            send_correlation,
+            wire_body_digest,
         }
     }
+
+    const TEST_CAPABILITY_REVISION: &str = "route-snapshot-hash";
 
     fn home_a_lane() -> LoopbackProviderLane {
         LoopbackProviderLane {
@@ -3403,11 +3511,11 @@ mod tests {
             accepted_posts: 5,
             rejected_auth: 0,
             records: vec![
-                record(SETUP_SEMANTIC_ID, "d-setup-a"),
-                record("step-a", "d-step-a"),
-                record("step-b", "d-step-b"),
-                record(MANAGER_DECISION_KIND, "d-decision"),
-                record("step-b-fix", "d-step-b-fix"),
+                signed_record(SETUP_SEMANTIC_ID, "d-setup-a", Some((SETUP_RUN, 1))),
+                signed_record("step-a", "d-step-a", Some(("run-a", 1))),
+                signed_record("step-b", "d-step-b", Some(("run-b", 1))),
+                signed_record(MANAGER_DECISION_KIND, "d-decision", Some(("run-d", 1))),
+                signed_record("step-b-fix", "d-step-b-fix", Some(("run-c", 1))),
             ],
             joins: Vec::new(),
         }
@@ -3421,14 +3529,208 @@ mod tests {
             accepted_posts: 3,
             rejected_auth: 0,
             records: vec![
-                record(SETUP_SEMANTIC_ID, "d-setup-b"),
-                record("step-a", "d-step-a-held"),
-                record(MANAGER_DECISION_KIND, "d-decision-b"),
+                signed_record(SETUP_SEMANTIC_ID, "d-setup-b", Some((SETUP_RUN, 1))),
+                signed_record("step-a", "d-step-a-held", Some(("run-a", 1))),
+                signed_record(MANAGER_DECISION_KIND, "d-decision-b", Some(("run-d", 1))),
             ],
             joins: Vec::new(),
         }
         .bind(&fixture(), &post_restart())
         .expect("home B joins")
+    }
+
+    /// Rewrite one lane's whole identity chain, consistently, in place.
+    fn substitute_chain(
+        snapshot: &mut AlwaysOnSnapshot,
+        from: (&str, &str, &str, &str),
+        to: (&str, &str, &str, &str),
+    ) {
+        let (work, attempt, intent, run) = from;
+        let (work_to, attempt_to, intent_to, run_to) = to;
+        for item in snapshot.work.iter_mut() {
+            if item.work_id == work {
+                item.work_id = work_to.into();
+            }
+            for entry in item.attempts.iter_mut() {
+                if entry.attempt_id == attempt {
+                    entry.attempt_id = attempt_to.into();
+                }
+                for linked in entry.linked_run_ids.iter_mut() {
+                    if linked == run {
+                        *linked = run_to.into();
+                    }
+                }
+            }
+        }
+        for row in snapshot.intents.iter_mut() {
+            if row.intent_id == intent {
+                row.intent_id = intent_to.into();
+            }
+            if row.work_id == work {
+                row.work_id = work_to.into();
+            }
+            if row.attempt_id == attempt {
+                row.attempt_id = attempt_to.into();
+            }
+            if row.run_id == run {
+                row.run_id = run_to.into();
+            }
+        }
+        for row in snapshot.runs.iter_mut() {
+            if row.run_id == run {
+                row.run_id = run_to.into();
+            }
+            if row.request_id == intent {
+                row.request_id = intent_to.into();
+            }
+        }
+        snapshot.work.sort();
+        snapshot.intents.sort();
+        snapshot.runs.sort();
+    }
+
+    fn unique_identity_count(snapshot: &AlwaysOnSnapshot) -> usize {
+        let mut seen = BTreeSet::new();
+        for item in &snapshot.work {
+            seen.insert(item.work_id.clone());
+            for attempt in &item.attempts {
+                seen.insert(attempt.attempt_id.clone());
+            }
+        }
+        for row in &snapshot.intents {
+            seen.insert(row.intent_id.clone());
+        }
+        for row in &snapshot.runs {
+            seen.insert(row.run_id.clone());
+        }
+        seen.len()
+    }
+
+    #[test]
+    fn coordinated_whole_chain_substitution_cannot_replace_a_lane() {
+        let fixture = fixture();
+        let canonical = happy();
+        // The canonical lane binds, so the mutants below start from a pass.
+        assert!(home_a_lane().joins.len() == 5);
+
+        // A foreign chain that is internally perfect: fresh Work, attempt,
+        // intent and Run, every internal reference rewritten together, counts
+        // and uniqueness preserved.
+        let mut substituted = canonical.clone();
+        substitute_chain(
+            &mut substituted,
+            ("work-a", "attempt-a", "intent-a", "run-a"),
+            ("work-z", "attempt-z", "intent-z", "run-z"),
+        );
+        assert_eq!(substituted.counts, canonical.counts, "counts preserved");
+        assert_eq!(
+            unique_identity_count(&substituted),
+            unique_identity_count(&canonical),
+            "uniqueness preserved"
+        );
+        assert_eq!(
+            resolve_lane(&substituted, "step-a").map(|lane| lane.run_id),
+            Ok("run-z".to_owned()),
+            "the substituted chain is internally resolvable"
+        );
+        // The sender published its correlation against run-a, so the whole
+        // chain swap is caught even though nothing inside the snapshot is
+        // inconsistent.
+        let relaid = LoopbackProviderLane {
+            home: AlwaysOnHome::HomeA,
+            accepted_posts: 5,
+            rejected_auth: 0,
+            records: home_a_lane().records,
+            joins: Vec::new(),
+        }
+        .bind(&fixture, &substituted);
+        assert!(
+            relaid.is_err(),
+            "a coordinated whole-chain substitution must fail"
+        );
+
+        // Two-way intra-home permutation: step-a and step-b exchange their
+        // entire chains. Counts, uniqueness and every internal reference stay
+        // self-consistent; only the sender's correlation disagrees.
+        let mut permuted = canonical.clone();
+        substitute_chain(
+            &mut permuted,
+            ("work-a", "attempt-a", "intent-a", "run-a"),
+            ("work-tmp", "attempt-tmp", "intent-tmp", "run-tmp"),
+        );
+        substitute_chain(
+            &mut permuted,
+            ("work-b", "attempt-b", "intent-b", "run-b"),
+            ("work-a", "attempt-a", "intent-a", "run-a"),
+        );
+        substitute_chain(
+            &mut permuted,
+            ("work-tmp", "attempt-tmp", "intent-tmp", "run-tmp"),
+            ("work-b", "attempt-b", "intent-b", "run-b"),
+        );
+        assert_eq!(permuted.counts, canonical.counts);
+        assert_eq!(
+            unique_identity_count(&permuted),
+            unique_identity_count(&canonical)
+        );
+        let permuted_lane = LoopbackProviderLane {
+            home: AlwaysOnHome::HomeA,
+            accepted_posts: 5,
+            rejected_auth: 0,
+            records: home_a_lane().records,
+            joins: Vec::new(),
+        }
+        .bind(&fixture, &permuted);
+        assert!(
+            permuted_lane.is_err(),
+            "a count-preserving two-way chain permutation must fail"
+        );
+    }
+
+    #[test]
+    fn send_correlation_binds_run_revision_ordinal_and_body() {
+        let record = signed_record("step-a", "d-step-a", Some(("run-a", 1)));
+        assert!(verify_send_correlation(&record, "run-a").is_ok());
+        // Any other Run rejects it.
+        for other in ["run-b", "run-c", "run-d", SETUP_RUN] {
+            assert_eq!(
+                verify_send_correlation(&record, other),
+                Err(DiagnosticCode::StateTransitionMismatch),
+                "{other} must not be able to claim this record"
+            );
+        }
+        // A record with no published correlation fails closed.
+        let mut unsigned = record.clone();
+        unsigned.send_correlation = None;
+        assert_eq!(
+            verify_send_correlation(&unsigned, "run-a"),
+            Err(DiagnosticCode::ProviderObservationUnavailable)
+        );
+        // A replayed body no longer matches.
+        let mut replayed = record.clone();
+        replayed.wire_body_digest = "wire-d-step-b".into();
+        assert_eq!(
+            verify_send_correlation(&replayed, "run-a"),
+            Err(DiagnosticCode::StateTransitionMismatch)
+        );
+        // A different position in the Run's send order no longer matches.
+        let moved = signed_record("step-a", "d-step-a", Some(("run-a", 2)));
+        assert_ne!(moved.send_correlation, record.send_correlation);
+        // Malformed wire values are refused rather than guessed at.
+        for bad in [
+            "",
+            "1",
+            "1;1;rev",
+            "2;1;rev;digest",
+            "1;0;rev;digest",
+            "1;x;rev;digest",
+            "1;1;rev;digest;extra",
+        ] {
+            assert!(
+                parse_send_correlation(bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
     }
 
     #[test]
@@ -3473,9 +3775,11 @@ mod tests {
             .expect("home B setup join");
         assert_eq!(setup_b.body_digest, "d-setup-b");
         assert_eq!(setup_b.run, opaque_durable_id(SETUP_RUN));
-        // Unit projections reuse the same setup Run id, so the Run-derived
-        // correlation matches; homes stay distinct by body digest.
-        assert_eq!(setup_a.correlation, setup_b.correlation);
+        // The correlation is published by the sender and binds the exact
+        // request bytes, so two homes never share one even when a unit
+        // projection reuses the same synthetic Run id. The Run-derived
+        // synthesis this replaced produced the same value for both.
+        assert_ne!(setup_a.correlation, setup_b.correlation);
         assert_ne!(setup_a.body_digest, setup_b.body_digest);
         let held_b = home_b
             .joins

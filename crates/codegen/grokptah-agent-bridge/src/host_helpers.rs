@@ -2143,6 +2143,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_xai_agent_step_routed<F, G>(
     creds: &crate::auth_store::WireCredentials,
     snapshot: &crate::orchestration::ProviderRouteSnapshot,
@@ -2151,6 +2152,7 @@ pub(crate) async fn call_xai_agent_step_routed<F, G>(
     allow_transient_retries: bool,
     cancel: &CancellationToken,
     observation: Option<&ProviderObservationContext>,
+    send_correlation: Option<&ProviderSendCorrelation>,
     on_delta: F,
     on_thought: G,
 ) -> Result<AgentStep>
@@ -2168,6 +2170,7 @@ where
         allow_transient_retries,
         cancel,
         observation,
+        send_correlation,
         on_delta,
         on_thought,
     )
@@ -2204,6 +2207,7 @@ where
         allow_transient_retries,
         cancel,
         observation,
+        None,
         on_delta,
         on_thought,
     )
@@ -2278,6 +2282,7 @@ pub(crate) struct ProviderAgentStepRequest<'a> {
     pub routed_provider_id: Option<&'a str>,
     pub route_snapshot_hash: Option<&'a str>,
     pub durable_attempt: bool,
+    pub send_correlation: Option<&'a ProviderSendCorrelation>,
     pub messages: &'a [serde_json::Value],
     pub tools: &'a serde_json::Value,
     pub allow_transient_retries: bool,
@@ -2290,6 +2295,88 @@ pub(crate) struct ProviderTransportResult {
     pub step: AgentStep,
     pub wire_model: String,
     pub route_snapshot_hash: Option<String>,
+}
+
+/// Correlation a run publishes on the wire for every physical provider send.
+///
+/// The value is a digest, never raw identifiers: it binds the durable Run, the
+/// frozen route snapshot that authorised the send, the per-run send ordinal and
+/// the exact request body. A provider that receives it learns nothing, but an
+/// observer that already knows the Run can recompute it and refuse a record
+/// that was moved between Runs, lanes or homes, or replayed against a different
+/// body. Because only the sender knows the Run and ordinal at send time, the
+/// value cannot be attached afterwards by a semantic lookup or a report join.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSendCorrelation {
+    run_id: String,
+    capability_revision: String,
+    ordinal: u64,
+}
+
+/// Header carrying [`ProviderSendCorrelation`]. Nonsecret and opaque.
+pub const SEND_CORRELATION_HEADER: &str = "x-grokptah-send-correlation";
+
+impl ProviderSendCorrelation {
+    pub fn new(
+        run_id: impl Into<String>,
+        capability_revision: impl Into<String>,
+        ordinal: u64,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            capability_revision: capability_revision.into(),
+            ordinal,
+        }
+    }
+
+    /// The wire value for a request whose body digest is `body_digest`.
+    ///
+    /// Shape: `1;<ordinal>;<capability revision>;<digest>`. The ordinal and the
+    /// route-snapshot hash travel in the clear so an observer can recompute the
+    /// digest against a candidate Run; the Run id itself never leaves the
+    /// process. Verification therefore succeeds only for the Run that actually
+    /// sent the request, which is what makes a record moved to another lane,
+    /// Run or home detectable.
+    pub fn wire_value(&self, body_digest: &str) -> String {
+        format!(
+            "{};{};{};{}",
+            Self::WIRE_VERSION,
+            self.ordinal,
+            self.capability_revision,
+            Self::digest(
+                &self.run_id,
+                &self.capability_revision,
+                self.ordinal,
+                body_digest,
+            )
+        )
+    }
+
+    /// Wire format version for [`ProviderSendCorrelation::wire_value`].
+    pub const WIRE_VERSION: u32 = 1;
+
+    /// Recompute the wire value from independently known parts.
+    pub fn digest(
+        run_id: &str,
+        capability_revision: &str,
+        ordinal: u64,
+        body_digest: &str,
+    ) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        // Length-prefix every part so no two different tuples can collide by
+        // sliding a delimiter.
+        for part in [run_id, capability_revision, body_digest] {
+            hasher.update((part.len() as u64).to_be_bytes());
+            hasher.update(part.as_bytes());
+        }
+        hasher.update(ordinal.to_be_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    pub fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
 }
 
 #[async_trait::async_trait]
@@ -2365,6 +2452,7 @@ async fn call_xai_agent_step_observed_inner<F, G>(
     allow_transient_retries: bool,
     cancel: &CancellationToken,
     observation: Option<&ProviderObservationContext>,
+    send_correlation: Option<&ProviderSendCorrelation>,
     on_delta: F,
     on_thought: G,
 ) -> Result<AgentStep>
@@ -2401,6 +2489,7 @@ where
                 cancel,
                 observation,
                 observation_route,
+                send_correlation,
                 on_delta,
                 on_thought,
             )
@@ -2419,6 +2508,7 @@ where
                 cancel,
                 observation,
                 observation_route,
+                send_correlation,
                 on_delta,
                 on_thought,
             )
@@ -2440,6 +2530,7 @@ async fn dispatch_provider_agent_step<T, F, G>(
     cancel: &CancellationToken,
     observation: Option<&ProviderObservationContext>,
     observation_route: Option<ProviderObservationRoute>,
+    send_correlation: Option<&ProviderSendCorrelation>,
     mut on_delta: F,
     mut on_thought: G,
 ) -> Result<AgentStep>
@@ -2460,6 +2551,7 @@ where
                 effort,
                 routed_provider_id: snapshot.map(|snapshot| snapshot.provider_id.as_str()),
                 route_snapshot_hash: snapshot.map(|snapshot| snapshot.snapshot_hash.as_str()),
+                send_correlation,
                 durable_attempt: snapshot
                     .is_some_and(|snapshot| snapshot.quota_reservation_id.is_some()),
                 messages,
@@ -2508,6 +2600,7 @@ where
                 effort,
                 routed_provider_id: None,
                 route_snapshot_hash: None,
+                send_correlation,
                 durable_attempt: false,
                 messages,
                 tools,
@@ -2548,6 +2641,7 @@ async fn send_chat_completions_agent_step(
         routed_provider_id,
         route_snapshot_hash: _,
         durable_attempt,
+        send_correlation,
         messages,
         tools,
         allow_transient_retries,
@@ -2618,6 +2712,21 @@ async fn send_chat_completions_agent_step(
                 .header("Accept", "text/event-stream");
             if target.dialect == crate::gateway_config::ProviderDialect::XaiChatCompletions {
                 req = req.header("x-grok-effort", effort.as_str());
+            }
+            // Publish the send correlation before the request leaves the
+            // process, so an observer on the far side records a value only this
+            // sender could have produced for this Run, ordinal and body.
+            if let Some(correlation) = send_correlation {
+                let body_digest = serde_json::to_vec(&body)
+                    .map(|bytes| {
+                        use sha2::{Digest, Sha256};
+                        format!("{:x}", Sha256::digest(&bytes))
+                    })
+                    .unwrap_or_default();
+                req = req.header(
+                    SEND_CORRELATION_HEADER,
+                    correlation.wire_value(&body_digest),
+                );
             }
             let req = credential.apply_headers(req, &base);
             req.json(&body)
@@ -3356,6 +3465,7 @@ pub async fn replay_xai_provider_contract_on_loopback(
                 credentials: ProviderCredentialHandle::from(&credentials),
                 target,
                 effort: EffortLevel::None,
+                send_correlation: None,
                 routed_provider_id: None,
                 route_snapshot_hash: None,
                 durable_attempt: false,

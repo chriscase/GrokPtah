@@ -444,6 +444,10 @@ struct RunUsageTracker {
     max_provider_requests: Option<u64>,
     state: Mutex<RunUsageState>,
     bounded_admission: Arc<tokio::sync::Mutex<()>>,
+    /// Monotonic per-Run ordinal for physical provider sends. It is published
+    /// on the wire inside the send correlation, so a record cannot be replayed
+    /// under a different position in the Run's send order.
+    send_ordinal: Arc<std::sync::atomic::AtomicU64>,
 }
 
 struct RunUsageAttempt {
@@ -453,6 +457,14 @@ struct RunUsageAttempt {
 }
 
 impl RunUsageAttempt {
+    /// The correlation this Run publishes for the send this attempt admits.
+    fn send_correlation(
+        &self,
+        capability_revision: &str,
+    ) -> Result<crate::host_helpers::ProviderSendCorrelation> {
+        self.tracker.send_correlation(capability_revision)
+    }
+
     fn finish(
         self,
         certainty: ProviderSendCertainty,
@@ -486,6 +498,7 @@ impl RunUsageTracker {
                 stop: None,
             }),
             bounded_admission: Arc::new(tokio::sync::Mutex::new(())),
+            send_ordinal: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -525,6 +538,39 @@ impl RunUsageTracker {
 
     fn is_bounded(&self) -> bool {
         self.max_total_tokens.is_some()
+    }
+
+    /// Claim the next send ordinal for this Run.
+    ///
+    /// Overflow fails closed: a Run that has exhausted the ordinal space must
+    /// stop rather than reuse a position another send already published.
+    fn claim_send_ordinal(&self) -> Result<u64> {
+        use std::sync::atomic::Ordering;
+        loop {
+            let current = self.send_ordinal.load(Ordering::Relaxed);
+            let next = current
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("provider send ordinal overflowed"))?;
+            if self
+                .send_ordinal
+                .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(next);
+            }
+        }
+    }
+
+    /// The correlation this Run publishes for its next physical send.
+    fn send_correlation(
+        &self,
+        capability_revision: &str,
+    ) -> Result<crate::host_helpers::ProviderSendCorrelation> {
+        Ok(crate::host_helpers::ProviderSendCorrelation::new(
+            self.run_id.clone(),
+            capability_revision.to_string(),
+            self.claim_send_ordinal()?,
+        ))
     }
 
     async fn begin_attempt(self: &Arc<Self>) -> Result<RunUsageAttempt> {
@@ -9687,6 +9733,12 @@ impl AgentHostHandle {
                 }
             };
             let provider_observation = self.provider_observation_context(session_id);
+            // Claim the send correlation before entering the transport. It is
+            // published on the wire, so it cannot be attached afterwards.
+            let send_correlation = match usage_attempt.as_ref() {
+                Some(attempt) => Some(attempt.send_correlation(&provider_route.snapshot_hash)?),
+                None => None,
+            };
             let step = match call_xai_agent_step_routed(
                 creds,
                 provider_route,
@@ -9695,6 +9747,7 @@ impl AgentHostHandle {
                 !self.run_tokens_bounded(session_id),
                 cancel,
                 provider_observation.as_ref(),
+                send_correlation.as_ref(),
                 |delta| {
                     emit_message(event_tx, session_id, delta);
                 },
@@ -11349,6 +11402,16 @@ impl AgentHostHandle {
                     }
                 };
             let provider_observation = self.provider_observation_context(session_id);
+            let send_correlation = match usage_attempt.as_ref() {
+                Some(attempt) => match attempt.send_correlation(&provider_route.snapshot_hash) {
+                    Ok(correlation) => Some(correlation),
+                    Err(error) => {
+                        last = format!("GP subagent send correlation failed: {error:#}");
+                        break;
+                    }
+                },
+                None => None,
+            };
             let step = call_xai_agent_step_routed(
                 &creds,
                 &provider_route,
@@ -11359,6 +11422,7 @@ impl AgentHostHandle {
                     .is_some_and(|tracker| tracker.is_bounded()),
                 &cancel,
                 provider_observation.as_ref(),
+                send_correlation.as_ref(),
                 |_d| {},
                 |_t| {},
             )

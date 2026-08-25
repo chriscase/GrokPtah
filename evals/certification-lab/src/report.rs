@@ -355,6 +355,16 @@ pub struct LoopbackProviderRecord {
     /// attempt. Empty until the always-on probe binds the record to a snapshot.
     #[serde(default)]
     pub correlation: String,
+    /// The at-send correlation the sender published on the wire, exactly as the
+    /// loopback observed it. The lab never computes this value; it can only
+    /// verify it, so a record whose value does not verify against the Run the
+    /// report claims sent it is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_correlation: Option<String>,
+    /// Sha256 of the exact request bytes the sender bound into its
+    /// correlation, so the report can recompute and cross-check it.
+    #[serde(default)]
+    pub wire_body_digest: String,
 }
 
 impl ProbeResult {
@@ -2019,6 +2029,8 @@ mod tests {
             auth_accepted: true,
             route_ok: true,
             correlation: format!("corr-{semantic}-{digest}"),
+            send_correlation: None,
+            wire_body_digest: String::new(),
         }
     }
 

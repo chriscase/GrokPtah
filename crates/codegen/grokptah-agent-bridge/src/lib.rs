@@ -158,6 +158,7 @@ pub use host_helpers::{
 };
 #[doc(hidden)]
 pub use host_helpers::{replay_xai_provider_contract_on_loopback, ProviderContractReplay};
+pub use host_helpers::{ProviderSendCorrelation, SEND_CORRELATION_HEADER};
 
 pub use memory::{MemoryFact, MemoryScope};
 

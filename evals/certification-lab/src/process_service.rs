@@ -63,6 +63,12 @@ pub struct ProviderRecord {
     pub body_digest: String,
     pub semantic_id: String,
     pub route_ok: bool,
+    /// Raw at-send correlation the sender published, exactly as observed.
+    pub send_correlation: Option<String>,
+    /// Sha256 of the exact request bytes, which is what the sender bound into
+    /// its correlation. Recomputing the correlation needs the same digest the
+    /// sender used, not the lab's own body hash.
+    pub wire_body_digest: String,
 }
 
 struct ProviderState {
@@ -174,6 +180,8 @@ impl FakeProvider {
                     auth_accepted: record.auth_accepted,
                     route_ok: record.route_ok,
                     correlation: String::new(),
+                    send_correlation: record.send_correlation,
+                    wire_body_digest: record.wire_body_digest,
                 })
                 .collect(),
         }
@@ -294,6 +302,11 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
         body_digest: hash_payload(&Value::String(body.clone())),
         semantic_id: semantic_id.clone(),
         route_ok: path == "/v1/chat/completions",
+        send_correlation: observed_send_correlation(&headers),
+        wire_body_digest: {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(body.as_bytes()))
+        },
     };
     {
         let mut records = state
@@ -364,6 +377,29 @@ fn split_request_line(head: &str) -> (String, String) {
         .unwrap_or("/")
         .to_string();
     (method, path)
+}
+
+/// The at-send correlation the sender published for this request.
+///
+/// The value is produced inside the sending process before the request leaves
+/// it, so observing it here is independent evidence: the lab never computes it
+/// and cannot attach it afterwards.
+fn observed_send_correlation(headers: &str) -> Option<String> {
+    for line in headers.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name
+            .trim()
+            .eq_ignore_ascii_case(grokptah_agent_bridge::SEND_CORRELATION_HEADER)
+        {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
 }
 
 fn auth_presence(headers: &str) -> (bool, Option<String>) {
