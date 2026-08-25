@@ -52,6 +52,17 @@ token. A browser receives only a broker session and capability-scoped events.
 The broker authenticates the user, maps the request to an explicitly approved
 workspace/run, and asks the local GrokPtah authority to perform the operation.
 
+### External agent workers
+
+The agentic harness may also schedule external cloud workers behind the same
+provider-neutral run contract. The first concrete candidate is Cursor Cloud's
+official Cloud Agents API: GrokPtah can create an isolated agent from an exact
+Git ref, follow up, stream and poll status, cancel, collect bounded artifacts,
+and archive the worker. The API key remains server-side; a browser sees only
+the same redacted run projections, review receipts, and approval gates used for
+local runs. This is a planned adapter, not a claim that Cursor Cloud is
+currently integrated or qualified. See [`CURSOR_CLOUD_INTEGRATION.md`](./CURSOR_CLOUD_INTEGRATION.md).
+
 ## Public contract layers
 
 ### 1. `grokptah-agent-sdk` (Rust, stable contract)
