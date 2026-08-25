@@ -5,7 +5,8 @@ live provider qualification, and 100% release qualification remain open.
 
 ## Candidate
 
-- Code head: `45441d1f` (`feat(desktop): integrate evidence-backed Help Center`)
+- Code head: `389b9ceb` (Help Center integration, hardening, corpus, and public
+  consumer package follow-ups)
 - Public contract follow-up: `c7800a46` (`feat(public): expose source-cited Help Center contract`)
 - Styling correction: `f9eee072` (`fix(ui): apply Help Center surface styles`)
 - Consent layering correction: `1235406d` (`fix(ui): keep consent above Help Center`)
@@ -35,8 +36,8 @@ live provider qualification, and 100% release qualification remain open.
 - `npm run build`: passed; Vite production bundle emitted.
 - `npm run verify:public`: passed; browser-safe public bundle, authority checks,
   and a disposable external-consumer import through normal `node_modules`
-  resolution remained green, including `searchHelpArticles` and the exported
-  `HELP_ARTICLES` corpus.
+  resolution remained green, including `searchHelpArticles`, the exported
+  `HELP_ARTICLES` corpus, and the separate `@grokptah/client/ui-core` subpath.
 - `git diff --check`: passed.
 
 ## Remaining gates
