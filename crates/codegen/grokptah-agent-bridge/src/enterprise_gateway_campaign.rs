@@ -3,8 +3,9 @@
 //! This module records restricted-company gateway identity, quota receipts,
 //! retry attempts, Cursor-account presence, and release/promotion gates. It
 //! never contacts a live company gateway, invents credentials, or treats an
-//! offline fixture as live proof. A passing fixture makes the live-evidence
-//! requirements explicit; it does not qualify a release.
+//! offline fixture or hand-labeled `LiveCampaign` as live proof. A passing
+//! fixture makes the live-evidence requirements explicit; it does not qualify
+//! a release.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -15,6 +16,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::external_worker::CURSOR_CLOUD_API_BASE;
 use crate::gateway_config::{
     normalized_profile_id, validate_base_url, ProviderKind, XAI_PROVIDER_ID,
 };
@@ -22,15 +24,28 @@ use crate::gateway_config::{
 /// Contract identifier for enterprise-gateway campaign bundles.
 pub const ENTERPRISE_GATEWAY_CAMPAIGN_SCHEMA: &str = "grokptah.enterprise-gateway-campaign.v1";
 
+const PUBLIC_ERROR_NEEDLES: &[&str] = &[
+    "api_key",
+    "authorization",
+    "bearer",
+    "[redacted]",
+    "credential",
+    "sk-",
+    "keychain:",
+    "cursor_api",
+];
+
 /// How an evidence field was obtained.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
     /// No receipt exists. Release and quota gates fail closed.
+    #[default]
     Absent,
     /// Loopback or scripted provider. Never live proof.
     OfflineFixture,
     /// Named live campaign against a non-loopback company/Cursor route.
+    /// Hand-labeling this kind is not verifier evidence.
     LiveCampaign,
 }
 
@@ -89,11 +104,17 @@ pub enum QuotaTruth {
     Contradictory { detail: String },
 }
 
-/// One provider quota receipt bound to a request.
+/// One provider quota receipt bound to a request and route identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaReceipt {
     pub request_id: String,
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    pub provider_kind: ProviderKind,
+    pub profile_id: String,
+    pub model_id: String,
     pub truth: QuotaTruth,
 }
 
@@ -104,6 +125,8 @@ pub enum AttemptOutcome {
     Succeeded,
     Failed,
     Replayed,
+    Pending,
+    Uncertain,
 }
 
 /// Request/attempt/outcome receipt for idempotent retries.
@@ -124,6 +147,12 @@ pub struct AttemptReceipt {
 pub struct CursorAccountEvidence {
     pub provider: ExternalWorkerProvider,
     pub kind: EvidenceKind,
+    /// Cursor Cloud API base. Live receipts must equal [`CURSOR_CLOUD_API_BASE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base: Option<String>,
+    /// Stable Cursor run or campaign identifier. Never a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_id: Option<String>,
 }
 
 /// Release/promotion evidence kinds. Live fields must not be inferred.
@@ -133,6 +162,10 @@ pub struct ReleasePromotionEvidence {
     pub live_gateway: EvidenceKind,
     pub live_quota: EvidenceKind,
     pub live_cursor_account: EvidenceKind,
+    #[serde(default)]
+    pub live_https_retry: EvidenceKind,
+    #[serde(default)]
+    pub live_release_artifact: EvidenceKind,
 }
 
 /// One campaign bundle evaluated by [`verify_campaign`].
@@ -140,6 +173,7 @@ pub struct ReleasePromotionEvidence {
 #[serde(rename_all = "camelCase")]
 pub struct CampaignBundle {
     pub schema: String,
+    pub request_id: String,
     pub requested: GatewayIdentityRecord,
     pub observed: GatewayIdentityRecord,
     pub quota: QuotaReceipt,
@@ -183,8 +217,9 @@ pub struct CampaignVerdict {
     pub schema: String,
     /// Identity, quota fail-closed, retry, redaction, and promotion-gate checks.
     pub contract_passed: bool,
-    /// True only when live gateway, quota, and Cursor-account evidence are
-    /// present and contract checks passed. Offline fixtures never set this.
+    /// True only when this verifier independently evidences live gateway,
+    /// quota, Cursor-account, HTTPS retry/idempotency, and release-artifact
+    /// gates. Offline fixtures and hand-labeled `LiveCampaign` never set this.
     pub qualified_for_release: bool,
     pub checks: Vec<CampaignCheck>,
     pub remaining_live_gates: Vec<String>,
@@ -193,9 +228,10 @@ pub struct CampaignVerdict {
 /// In-process fake restricted gateway used by offline tests.
 #[derive(Debug)]
 pub struct FakeRestrictedGateway {
+    requested: GatewayIdentityRecord,
     identity: GatewayIdentityRecord,
     quota_mode: FakeQuotaMode,
-    unavailable: bool,
+    ledger_mode: FakeLedgerMode,
     leak_secret: Option<String>,
     attempts: Mutex<HashMap<String, StoredAttempt>>,
 }
@@ -213,6 +249,14 @@ pub enum FakeQuotaMode {
     LocalInference,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FakeLedgerMode {
+    Ready,
+    Unavailable,
+    Pending,
+    Uncertain,
+}
+
 #[derive(Debug, Clone)]
 struct StoredAttempt {
     payload_hash: String,
@@ -224,17 +268,19 @@ struct StoredAttempt {
 impl FakeRestrictedGateway {
     /// Restricted company fixture. Loopback URLs stay [`EvidenceKind::OfflineFixture`].
     pub fn restricted_loopback(base_url: impl Into<String>) -> Self {
+        let identity = GatewayIdentityRecord {
+            profile_id: "corp-restricted".into(),
+            base_url: base_url.into(),
+            model_id: "company-code-small".into(),
+            tenant: Some("acme-tenant".into()),
+            class: GatewayClass::RestrictedCompany,
+            provider_kind: ProviderKind::OpenAiCompatible,
+        };
         Self {
-            identity: GatewayIdentityRecord {
-                profile_id: "corp-restricted".into(),
-                base_url: base_url.into(),
-                model_id: "company-code-small".into(),
-                tenant: Some("acme-tenant".into()),
-                class: GatewayClass::RestrictedCompany,
-                provider_kind: ProviderKind::OpenAiCompatible,
-            },
+            requested: identity.clone(),
+            identity,
             quota_mode: FakeQuotaMode::ProviderReceipt,
-            unavailable: false,
+            ledger_mode: FakeLedgerMode::Ready,
             leak_secret: None,
             attempts: Mutex::new(HashMap::new()),
         }
@@ -258,7 +304,19 @@ impl FakeRestrictedGateway {
 
     #[must_use]
     pub fn with_unavailable(mut self) -> Self {
-        self.unavailable = true;
+        self.ledger_mode = FakeLedgerMode::Unavailable;
+        self
+    }
+
+    #[must_use]
+    pub fn with_pending(mut self) -> Self {
+        self.ledger_mode = FakeLedgerMode::Pending;
+        self
+    }
+
+    #[must_use]
+    pub fn with_uncertain(mut self) -> Self {
+        self.ledger_mode = FakeLedgerMode::Uncertain;
         self
     }
 
@@ -269,14 +327,7 @@ impl FakeRestrictedGateway {
     }
 
     pub fn requested_identity(&self) -> GatewayIdentityRecord {
-        GatewayIdentityRecord {
-            profile_id: "corp-restricted".into(),
-            base_url: self.identity.base_url.clone(),
-            model_id: "company-code-small".into(),
-            tenant: Some("acme-tenant".into()),
-            class: GatewayClass::RestrictedCompany,
-            provider_kind: ProviderKind::OpenAiCompatible,
-        }
+        self.requested.clone()
     }
 
     /// Probe the fake gateway. Identical retries replay; payload drift fails.
@@ -314,37 +365,64 @@ impl FakeRestrictedGateway {
             return Ok((self.identity.clone(), prior.quota.clone(), attempt));
         }
 
-        if self.unavailable {
-            let raw = match self.leak_secret.as_deref() {
-                Some(secret) => format!(
-                    "upstream 503 api_key={secret} Authorization: Bearer {secret} url=https://evil.example/v1"
-                ),
-                None => "The requested provider is unavailable.".into(),
-            };
-            let error = bounded_provider_error(
-                ErrorCode::AuthorityUnavailable,
-                &raw,
-                request_id,
-                self.leak_secret.as_deref(),
-            );
-            attempts.insert(
-                request_id.into(),
-                StoredAttempt {
-                    payload_hash: payload_hash.clone(),
-                    quota: QuotaReceipt {
-                        request_id: request_id.into(),
-                        truth: QuotaTruth::Unknown,
+        match self.ledger_mode {
+            FakeLedgerMode::Unavailable => {
+                let raw = match self.leak_secret.as_deref() {
+                    Some(secret) => format!(
+                        "upstream 503 api_key={secret} Authorization: Bearer {secret} url=https://evil.example/v1"
+                    ),
+                    None => "The requested provider is unavailable.".into(),
+                };
+                let error = bounded_provider_error(
+                    ErrorCode::AuthorityUnavailable,
+                    &raw,
+                    request_id,
+                    self.leak_secret.as_deref(),
+                );
+                let quota = self.route_bound_quota(request_id, QuotaTruth::Unknown);
+                attempts.insert(
+                    request_id.into(),
+                    StoredAttempt {
+                        payload_hash: payload_hash.clone(),
+                        quota,
+                        error: Some(error.clone()),
+                        count: 1,
                     },
+                );
+                return Err(error);
+            }
+            FakeLedgerMode::Pending | FakeLedgerMode::Uncertain => {
+                let outcome = if self.ledger_mode == FakeLedgerMode::Pending {
+                    AttemptOutcome::Pending
+                } else {
+                    AttemptOutcome::Uncertain
+                };
+                let error = bounded_ledger_status_error(outcome, request_id);
+                let quota = self.route_bound_quota(request_id, QuotaTruth::Unknown);
+                let attempt = AttemptReceipt {
+                    request_id: request_id.into(),
+                    attempt: 1,
+                    payload_hash: payload_hash.clone(),
+                    outcome,
                     error: Some(error.clone()),
-                    count: 1,
-                },
-            );
-            return Err(error);
+                };
+                attempts.insert(
+                    request_id.into(),
+                    StoredAttempt {
+                        payload_hash,
+                        quota: quota.clone(),
+                        error: Some(error),
+                        count: 1,
+                    },
+                );
+                return Ok((self.identity.clone(), quota, attempt));
+            }
+            FakeLedgerMode::Ready => {}
         }
 
-        let quota = QuotaReceipt {
-            request_id: request_id.into(),
-            truth: match self.quota_mode {
+        let quota = self.route_bound_quota(
+            request_id,
+            match self.quota_mode {
                 FakeQuotaMode::ProviderReceipt => QuotaTruth::ProviderReceipt {
                     used: 12,
                     remaining: Some(88),
@@ -371,7 +449,7 @@ impl FakeRestrictedGateway {
                     evidence_kind: EvidenceKind::OfflineFixture,
                 },
             },
-        };
+        );
         let attempt = AttemptReceipt {
             request_id: request_id.into(),
             attempt: 1,
@@ -392,25 +470,52 @@ impl FakeRestrictedGateway {
     }
 
     /// Build an offline campaign bundle, including an identical retry.
+    ///
+    /// Unavailable, pending, and uncertain probes are retained as attempt
+    /// receipts so [`verify_campaign`] can prove fail-closed behavior. Only
+    /// invalid request identity fails this collector.
     pub fn collect_offline_campaign(
         &self,
         request_id: &str,
         payload: &str,
     ) -> Result<CampaignBundle, ErrorEnvelope> {
+        validate_request_id(request_id).map_err(|message| {
+            bounded_provider_error(ErrorCode::InvalidRequest, message, request_id, None)
+        })?;
         let requested = self.requested_identity();
-        let (observed, quota, first) = self.probe(request_id, payload)?;
-        let retry = match self.probe(request_id, payload) {
+        let payload_hash = campaign_payload_hash(request_id, payload);
+        let first_probe = self.probe(request_id, payload);
+        let retry_probe = self.probe(request_id, payload);
+        let (observed, quota, first) = match first_probe {
+            Ok(result) => result,
+            Err(error) => {
+                let first = AttemptReceipt {
+                    request_id: request_id.into(),
+                    attempt: 1,
+                    payload_hash: payload_hash.clone(),
+                    outcome: AttemptOutcome::Failed,
+                    error: Some(error),
+                };
+                (
+                    self.identity.clone(),
+                    self.route_bound_quota(request_id, QuotaTruth::Unknown),
+                    first,
+                )
+            }
+        };
+        let retry = match retry_probe {
             Ok((_, _, retry)) => retry,
             Err(error) => AttemptReceipt {
                 request_id: request_id.into(),
                 attempt: 2,
-                payload_hash: campaign_payload_hash(request_id, payload),
+                payload_hash,
                 outcome: AttemptOutcome::Replayed,
                 error: Some(error),
             },
         };
         Ok(CampaignBundle {
             schema: ENTERPRISE_GATEWAY_CAMPAIGN_SCHEMA.into(),
+            request_id: request_id.into(),
             requested,
             observed,
             quota,
@@ -418,22 +523,39 @@ impl FakeRestrictedGateway {
             cursor_account: CursorAccountEvidence {
                 provider: ExternalWorkerProvider::CursorCloud,
                 kind: EvidenceKind::Absent,
+                api_base: None,
+                campaign_id: None,
             },
             promotion: ReleasePromotionEvidence {
                 live_gateway: EvidenceKind::Absent,
                 live_quota: EvidenceKind::Absent,
                 live_cursor_account: EvidenceKind::Absent,
+                live_https_retry: EvidenceKind::Absent,
+                live_release_artifact: EvidenceKind::Absent,
             },
         })
     }
+
+    fn route_bound_quota(&self, request_id: &str, truth: QuotaTruth) -> QuotaReceipt {
+        QuotaReceipt {
+            request_id: request_id.into(),
+            base_url: self.identity.base_url.clone(),
+            tenant: self.identity.tenant.clone(),
+            provider_kind: self.identity.provider_kind,
+            profile_id: self.identity.profile_id.clone(),
+            model_id: self.identity.model_id.clone(),
+            truth,
+        }
+    }
 }
 
-/// SHA-256 identity for one campaign payload. Matches ledger-style hex.
+/// SHA-256 identity for one campaign payload. JSON is canonicalized first.
 pub fn campaign_payload_hash(request_id: &str, payload: &str) -> String {
+    let canonical = canonicalize_campaign_payload(payload);
     let mut hasher = Sha256::new();
     hasher.update(request_id.as_bytes());
     hasher.update([0xff]);
-    hasher.update(payload.as_bytes());
+    hasher.update(canonical.as_bytes());
     hex_sha256(&hasher.finalize())
 }
 
@@ -444,25 +566,19 @@ pub fn bounded_provider_error(
     request_id: &str,
     leaked_secret: Option<&str>,
 ) -> ErrorEnvelope {
-    let mut message = redact_public_text(message);
-    if let Some(secret) = leaked_secret.filter(|value| !value.is_empty()) {
-        message = message.replace(secret, "[redacted]");
-    }
-    if message.trim().is_empty() {
-        message = "The provider request failed.".into();
-    }
-    let reason_code = match code {
-        ErrorCode::AuthorityUnavailable => Some("provider_unavailable".into()),
-        ErrorCode::Capacity => Some("rate_limited".into()),
-        ErrorCode::InvalidRequest => Some("invalid_request".into()),
-        ErrorCode::ForbiddenScope => Some("forbidden_scope".into()),
-        _ => Some("provider_error".into()),
-    };
+    let _ = redact_internal_diagnostics(message, leaked_secret);
     ErrorEnvelope {
         code,
-        message,
+        message: public_provider_message(code, None).into(),
         request_id: Some(request_id.into()),
-        reason_code,
+        reason_code: match code {
+            ErrorCode::AuthorityUnavailable => Some("provider_unavailable".into()),
+            ErrorCode::Capacity => Some("rate_limited".into()),
+            ErrorCode::InvalidRequest => Some("invalid_request".into()),
+            ErrorCode::ForbiddenScope => Some("forbidden_scope".into()),
+            ErrorCode::StaleOrRecovery => Some("uncertain".into()),
+            _ => Some("provider_error".into()),
+        },
         event_range: None,
     }
 }
@@ -474,6 +590,7 @@ pub fn verify_campaign(bundle: &CampaignBundle) -> CampaignVerdict {
         identity_recorded_check(bundle),
         no_silent_frontier_fallback_check(bundle),
         quota_receipt_check(bundle),
+        cursor_account_receipt_check(bundle),
         retry_idempotency_check(bundle),
         redaction_least_privilege_check(bundle),
         promotion_refuses_absent_live_check(bundle),
@@ -481,11 +598,7 @@ pub fn verify_campaign(bundle: &CampaignBundle) -> CampaignVerdict {
 
     let contract_passed = checks.iter().all(|check| check.passed);
     let remaining_live_gates = remaining_live_gates(bundle);
-    let qualified_for_release = contract_passed
-        && remaining_live_gates.is_empty()
-        && bundle.requested.class == GatewayClass::RestrictedCompany
-        && !is_frontier(&bundle.observed)
-        && url_can_be_live(&bundle.observed.base_url);
+    let qualified_for_release = contract_passed && remaining_live_gates.is_empty();
 
     CampaignVerdict {
         schema: ENTERPRISE_GATEWAY_CAMPAIGN_SCHEMA.into(),
@@ -514,6 +627,12 @@ fn schema_check(bundle: &CampaignBundle) -> CampaignCheck {
 }
 
 fn identity_recorded_check(bundle: &CampaignBundle) -> CampaignCheck {
+    if bundle.request_id.trim().is_empty() || bundle.request_id.len() > MAX_REQUEST_ID_BYTES {
+        return CampaignCheck::fail(
+            "restricted_gateway_identity",
+            "bundle request_id must be non-empty and bounded",
+        );
+    }
     let requested = validate_identity_record(&bundle.requested);
     let observed = validate_identity_record(&bundle.observed);
     match (requested, observed) {
@@ -545,17 +664,15 @@ fn no_silent_frontier_fallback_check(bundle: &CampaignBundle) -> CampaignCheck {
         return CampaignCheck::fail(
             "no_silent_frontier_fallback",
             format!(
-                "restricted route `{}` silently served frontier identity `{}` ({})",
-                bundle.requested.profile_id, bundle.observed.profile_id, bundle.observed.base_url
+                "restricted route `{}` silently served frontier identity `{}`",
+                bundle.requested.profile_id, bundle.observed.profile_id
             ),
         );
     }
-    if bundle.requested.profile_id != bundle.observed.profile_id
-        || bundle.requested.model_id != bundle.observed.model_id
-    {
+    if !same_route(&bundle.requested, &bundle.observed) {
         return CampaignCheck::fail(
             "no_silent_frontier_fallback",
-            "observed profile or model drifted from the recorded restricted route",
+            "observed base URL, tenant, provider kind, profile, or model drifted from the recorded restricted route",
         );
     }
     CampaignCheck::pass(
@@ -565,10 +682,18 @@ fn no_silent_frontier_fallback_check(bundle: &CampaignBundle) -> CampaignCheck {
 }
 
 fn quota_receipt_check(bundle: &CampaignBundle) -> CampaignCheck {
-    if bundle.quota.request_id != bundle.requested_request_id() {
+    if bundle.quota.request_id != bundle.request_id {
         return CampaignCheck::fail(
             "quota_provider_receipt",
             "quota receipt request_id does not match the campaign request",
+        );
+    }
+    if !quota_matches_identity(&bundle.quota, &bundle.requested)
+        || !quota_matches_identity(&bundle.quota, &bundle.observed)
+    {
+        return CampaignCheck::fail(
+            "quota_provider_receipt",
+            "quota receipt is not bound to the bundle route identity",
         );
     }
     match &bundle.quota.truth {
@@ -594,12 +719,16 @@ fn quota_receipt_check(bundle: &CampaignBundle) -> CampaignCheck {
                     format!("quota source `{source}` is not an explicit provider receipt"),
                 );
             }
-            if *evidence_kind == EvidenceKind::LiveCampaign
-                && !url_can_be_live(&bundle.observed.base_url)
-            {
+            if *evidence_kind == EvidenceKind::LiveCampaign {
                 return CampaignCheck::fail(
                     "quota_provider_receipt",
-                    "loopback or fixture URLs cannot carry live quota evidence",
+                    "hand-labeled LiveCampaign quota is not a live provider receipt",
+                );
+            }
+            if *evidence_kind != EvidenceKind::OfflineFixture {
+                return CampaignCheck::fail(
+                    "quota_provider_receipt",
+                    "quota receipts in this verifier must be labeled offline_fixture",
                 );
             }
             if let (Some(remaining), Some(limit)) = (*remaining, *limit) {
@@ -620,6 +749,69 @@ fn quota_receipt_check(bundle: &CampaignBundle) -> CampaignCheck {
     }
 }
 
+fn cursor_account_receipt_check(bundle: &CampaignBundle) -> CampaignCheck {
+    let cursor = &bundle.cursor_account;
+    if cursor.provider != ExternalWorkerProvider::CursorCloud {
+        return CampaignCheck::fail(
+            "cursor_account_receipt",
+            "Cursor-account evidence must use the Cursor Cloud provider family",
+        );
+    }
+    match cursor.kind {
+        EvidenceKind::Absent => {
+            if cursor.api_base.is_some() || cursor.campaign_id.is_some() {
+                return CampaignCheck::fail(
+                    "cursor_account_receipt",
+                    "absent Cursor evidence must not carry an API base or campaign id",
+                );
+            }
+            CampaignCheck::pass(
+                "cursor_account_receipt",
+                "Cursor-account evidence is honestly absent",
+            )
+        }
+        EvidenceKind::OfflineFixture => {
+            if cursor_uses_company_gateway(cursor, bundle) {
+                return CampaignCheck::fail(
+                    "cursor_account_receipt",
+                    "Cursor-account receipts must not use the company gateway URL",
+                );
+            }
+            if cursor.api_base.as_deref().is_some_and(|base| {
+                normalize_api_base(base) == normalize_api_base(CURSOR_CLOUD_API_BASE)
+            }) {
+                return CampaignCheck::fail(
+                    "cursor_account_receipt",
+                    "offline Cursor fixtures cannot use the live Cursor API base",
+                );
+            }
+            if cursor
+                .api_base
+                .as_deref()
+                .is_some_and(|base| url_can_be_live(base))
+            {
+                return CampaignCheck::fail(
+                    "cursor_account_receipt",
+                    "offline Cursor fixtures cannot carry a non-loopback API base",
+                );
+            }
+            CampaignCheck::pass(
+                "cursor_account_receipt",
+                "offline Cursor fixture is secret-free and not a live receipt",
+            )
+        }
+        EvidenceKind::LiveCampaign => {
+            if let Err(detail) = validate_live_cursor_receipt(cursor, bundle) {
+                return CampaignCheck::fail("cursor_account_receipt", detail);
+            }
+            CampaignCheck::fail(
+                "cursor_account_receipt",
+                "hand-labeled LiveCampaign is not a live Cursor-account receipt",
+            )
+        }
+    }
+}
+
 fn retry_idempotency_check(bundle: &CampaignBundle) -> CampaignCheck {
     if bundle.attempts.is_empty() {
         return CampaignCheck::fail(
@@ -628,9 +820,10 @@ fn retry_idempotency_check(bundle: &CampaignBundle) -> CampaignCheck {
         );
     }
     let mut seen_attempts = HashMap::<u32, &AttemptReceipt>::new();
-    let expected_id = bundle.requested_request_id();
+    let expected_id = bundle.request_id.as_str();
     let mut first_hash: Option<&str> = None;
     let mut first_terminal: Option<AttemptOutcome> = None;
+    let mut first_error: Option<ErrorEnvelope> = None;
     for (index, receipt) in bundle.attempts.iter().enumerate() {
         let expected_attempt = u32::try_from(index + 1).unwrap_or(u32::MAX);
         if receipt.attempt != expected_attempt {
@@ -677,33 +870,54 @@ fn retry_idempotency_check(bundle: &CampaignBundle) -> CampaignCheck {
                     "first attempt cannot be a replay",
                 );
             }
+            if receipt.outcome == AttemptOutcome::Succeeded && receipt.error.is_some() {
+                return CampaignCheck::fail(
+                    "idempotent_retry_receipts",
+                    "succeeded attempts must not carry an error envelope",
+                );
+            }
             first_terminal = Some(receipt.outcome);
+            first_error = receipt.error.clone();
         } else if receipt.outcome != AttemptOutcome::Replayed {
             return CampaignCheck::fail(
                 "idempotent_retry_receipts",
                 "identical retries must replay the original outcome",
             );
-        }
-        if receipt.outcome == AttemptOutcome::Failed && receipt.error.is_none() {
+        } else if receipt.error != first_error {
             return CampaignCheck::fail(
                 "idempotent_retry_receipts",
-                "failed attempts must carry a bounded error envelope",
+                "replayed success/error envelope drifted from the original attempt",
             );
         }
         if matches!(
-            first_terminal,
-            Some(AttemptOutcome::Failed) if receipt.error.is_none()
-        ) {
+            receipt.outcome,
+            AttemptOutcome::Failed | AttemptOutcome::Pending | AttemptOutcome::Uncertain
+        ) && receipt.error.is_none()
+        {
             return CampaignCheck::fail(
                 "idempotent_retry_receipts",
-                "replay of a failure must retain the bounded error envelope",
+                "failed, pending, and uncertain attempts must carry a bounded error envelope",
             );
         }
+        if let Some(error) = &receipt.error {
+            if let Err(detail) = public_error_is_needle_free(error) {
+                return CampaignCheck::fail("idempotent_retry_receipts", detail);
+            }
+        }
+    }
+    if matches!(
+        first_terminal,
+        Some(AttemptOutcome::Pending | AttemptOutcome::Uncertain)
+    ) {
+        return CampaignCheck::fail(
+            "idempotent_retry_receipts",
+            "pending/uncertain outcomes fail closed until reconciled",
+        );
     }
     CampaignCheck::pass(
         "idempotent_retry_receipts",
         format!(
-            "{} auditable attempt receipts with stable payload hash",
+            "{} auditable attempt receipts with canonical payload hash and matching replay envelopes",
             bundle.attempts.len()
         ),
     )
@@ -732,17 +946,14 @@ fn redaction_least_privilege_check(bundle: &CampaignBundle) -> CampaignCheck {
         if lowered.contains(needle) {
             return CampaignCheck::fail(
                 "bounded_errors_and_redaction",
-                format!("campaign evidence leaked privileged token `{needle}`"),
+                "campaign evidence leaked a privileged token",
             );
         }
     }
     for receipt in &bundle.attempts {
         if let Some(error) = &receipt.error {
-            if error.message.contains("://") || error.message.contains("api_key") {
-                return CampaignCheck::fail(
-                    "bounded_errors_and_redaction",
-                    "bounded errors must not include provider URLs or credentials",
-                );
+            if let Err(detail) = public_error_is_needle_free(error) {
+                return CampaignCheck::fail("bounded_errors_and_redaction", detail);
             }
             if error.event_range.is_some() {
                 return CampaignCheck::fail(
@@ -754,7 +965,7 @@ fn redaction_least_privilege_check(bundle: &CampaignBundle) -> CampaignCheck {
     }
     CampaignCheck::pass(
         "bounded_errors_and_redaction",
-        "errors stay inside ErrorEnvelope and omit credentials",
+        "public errors stay inside ErrorEnvelope and are needle-free",
     )
 }
 
@@ -762,55 +973,34 @@ fn promotion_refuses_absent_live_check(bundle: &CampaignBundle) -> CampaignCheck
     let gates = remaining_live_gates(bundle);
     let claimed_live = bundle.promotion.live_gateway == EvidenceKind::LiveCampaign
         || bundle.promotion.live_quota == EvidenceKind::LiveCampaign
-        || bundle.promotion.live_cursor_account == EvidenceKind::LiveCampaign;
-    if claimed_live && !gates.is_empty() {
+        || bundle.promotion.live_cursor_account == EvidenceKind::LiveCampaign
+        || bundle.promotion.live_https_retry == EvidenceKind::LiveCampaign
+        || bundle.promotion.live_release_artifact == EvidenceKind::LiveCampaign;
+    if claimed_live {
         return CampaignCheck::fail(
             "release_promotion_gate",
             format!(
-                "promotion claimed live evidence while gates remain: {}",
+                "hand-labeled LiveCampaign fields are not verifier evidence; remaining live gates: {}",
                 gates.join(", ")
             ),
         );
     }
-    if gates.is_empty() {
-        CampaignCheck::pass(
-            "release_promotion_gate",
-            "live gateway, quota, and Cursor-account evidence are all present",
-        )
-    } else {
-        CampaignCheck::pass(
-            "release_promotion_gate",
-            format!("refusing release qualification until: {}", gates.join(", ")),
-        )
-    }
+    CampaignCheck::pass(
+        "release_promotion_gate",
+        format!("refusing release qualification until: {}", gates.join(", ")),
+    )
 }
 
-fn remaining_live_gates(bundle: &CampaignBundle) -> Vec<String> {
-    let mut gates = Vec::new();
-    if bundle.promotion.live_gateway != EvidenceKind::LiveCampaign
-        || !url_can_be_live(&bundle.observed.base_url)
-        || is_frontier(&bundle.observed)
-    {
-        gates.push("live restricted-company gateway campaign".into());
-    }
-    match &bundle.quota.truth {
-        QuotaTruth::ProviderReceipt {
-            source,
-            evidence_kind: EvidenceKind::LiveCampaign,
-            ..
-        } if source == "provider"
-            && bundle.promotion.live_quota == EvidenceKind::LiveCampaign
-            && url_can_be_live(&bundle.observed.base_url) => {}
-        _ => gates.push("live provider quota receipt".into()),
-    }
-    if bundle.cursor_account.provider != ExternalWorkerProvider::CursorCloud
-        || bundle.cursor_account.kind != EvidenceKind::LiveCampaign
-        || bundle.promotion.live_cursor_account != EvidenceKind::LiveCampaign
-        || !url_can_be_live(&bundle.observed.base_url)
-    {
-        gates.push("live Cursor-account campaign".into());
-    }
-    gates
+fn remaining_live_gates(_bundle: &CampaignBundle) -> Vec<String> {
+    // This verifier never contacts a live gateway, Cursor account, or release
+    // artifact store. Schema labels therefore cannot clear these gates.
+    vec![
+        "live restricted-company gateway campaign".into(),
+        "live provider quota receipt".into(),
+        "live Cursor-account campaign".into(),
+        "live HTTPS retry/idempotency".into(),
+        "release artifact from the reviewed head".into(),
+    ]
 }
 
 fn validate_identity_record(record: &GatewayIdentityRecord) -> Result<(), String> {
@@ -833,6 +1023,23 @@ fn validate_identity_record(record: &GatewayIdentityRecord) -> Result<(), String
         return Err("tenant label must be non-empty and bounded".into());
     }
     Ok(())
+}
+
+fn same_route(left: &GatewayIdentityRecord, right: &GatewayIdentityRecord) -> bool {
+    left.profile_id == right.profile_id
+        && left.base_url == right.base_url
+        && left.model_id == right.model_id
+        && left.tenant == right.tenant
+        && left.class == right.class
+        && left.provider_kind == right.provider_kind
+}
+
+fn quota_matches_identity(quota: &QuotaReceipt, identity: &GatewayIdentityRecord) -> bool {
+    quota.base_url == identity.base_url
+        && quota.tenant == identity.tenant
+        && quota.provider_kind == identity.provider_kind
+        && quota.profile_id == identity.profile_id
+        && quota.model_id == identity.model_id
 }
 
 fn is_frontier(record: &GatewayIdentityRecord) -> bool {
@@ -874,6 +1081,61 @@ fn url_can_be_live(base_url: &str) -> bool {
     !loopback && !frontier_host(base_url)
 }
 
+fn normalize_api_base(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn cursor_uses_company_gateway(cursor: &CursorAccountEvidence, bundle: &CampaignBundle) -> bool {
+    let Some(api_base) = cursor.api_base.as_deref() else {
+        return false;
+    };
+    let normalized = normalize_api_base(api_base);
+    normalized == normalize_api_base(&bundle.requested.base_url)
+        || normalized == normalize_api_base(&bundle.observed.base_url)
+}
+
+fn validate_live_cursor_receipt(
+    cursor: &CursorAccountEvidence,
+    bundle: &CampaignBundle,
+) -> Result<(), String> {
+    let api_base = cursor
+        .api_base
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("live Cursor receipts require CURSOR_CLOUD_API_BASE")?;
+    if normalize_api_base(api_base) != normalize_api_base(CURSOR_CLOUD_API_BASE) {
+        return Err("live Cursor receipts must use CURSOR_CLOUD_API_BASE".into());
+    }
+    if cursor_uses_company_gateway(cursor, bundle) {
+        return Err("Cursor-account receipts must not use the company gateway URL".into());
+    }
+    let campaign_id = cursor
+        .campaign_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("live Cursor receipts require a stable run/campaign identifier")?;
+    validate_stable_campaign_id(campaign_id)?;
+    if public_text_contains_needle(campaign_id) {
+        return Err("Cursor campaign id must be secret-free".into());
+    }
+    Ok(())
+}
+
+fn validate_stable_campaign_id(campaign_id: &str) -> Result<(), String> {
+    if campaign_id.len() > MAX_REQUEST_ID_BYTES {
+        return Err("Cursor campaign id must be bounded".into());
+    }
+    if !campaign_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err("Cursor campaign id must be a stable identifier".into());
+    }
+    Ok(())
+}
+
 fn validate_request_id(request_id: &str) -> Result<(), &'static str> {
     if request_id.trim().is_empty() || request_id.len() > MAX_REQUEST_ID_BYTES {
         return Err("request_id must be non-empty and bounded");
@@ -881,9 +1143,42 @@ fn validate_request_id(request_id: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-impl CampaignBundle {
-    fn requested_request_id(&self) -> &str {
-        self.quota.request_id.as_str()
+fn public_provider_message(code: ErrorCode, reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("pending") => "The provider request is pending.",
+        Some("uncertain") => "The provider request outcome is uncertain.",
+        _ => match code {
+            ErrorCode::AuthorityUnavailable => "The requested provider is unavailable.",
+            ErrorCode::Capacity => "The provider is at capacity.",
+            ErrorCode::InvalidRequest => "The request is invalid.",
+            ErrorCode::ForbiddenScope => "The requested scope is not allowed.",
+            ErrorCode::Unauthenticated => "The request is not authenticated.",
+            ErrorCode::NotFound => "The requested resource was not found.",
+            ErrorCode::StaleOrRecovery => "The provider request outcome is uncertain.",
+            ErrorCode::Internal => "The provider request failed.",
+        },
+    }
+}
+
+fn bounded_ledger_status_error(outcome: AttemptOutcome, request_id: &str) -> ErrorEnvelope {
+    let reason = match outcome {
+        AttemptOutcome::Pending => "pending",
+        AttemptOutcome::Uncertain => "uncertain",
+        _ => "provider_error",
+    };
+    ErrorEnvelope {
+        code: ErrorCode::StaleOrRecovery,
+        message: public_provider_message(ErrorCode::StaleOrRecovery, Some(reason)).into(),
+        request_id: Some(request_id.into()),
+        reason_code: Some(reason.into()),
+        event_range: None,
+    }
+}
+
+fn canonicalize_campaign_payload(payload: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(payload) {
+        Ok(value) => serde_json::to_string(&value).unwrap_or_else(|_| payload.to_string()),
+        Err(_) => payload.to_string(),
     }
 }
 
@@ -896,7 +1191,7 @@ fn hex_sha256(bytes: &[u8]) -> String {
     out
 }
 
-fn redact_public_text(text: &str) -> String {
+fn redact_internal_diagnostics(text: &str, leaked_secret: Option<&str>) -> String {
     static BEARER: OnceLock<Regex> = OnceLock::new();
     static ASSIGNMENT: OnceLock<Regex> = OnceLock::new();
     static URLS: OnceLock<Regex> = OnceLock::new();
@@ -910,7 +1205,33 @@ fn redact_public_text(text: &str) -> String {
     let urls = URLS.get_or_init(|| Regex::new(r#"https?://\S+"#).expect("valid url redaction"));
     let mut out = bearer.replace_all(text, "Bearer [redacted]").into_owned();
     out = assignment.replace_all(&out, "$1=[redacted]").into_owned();
-    urls.replace_all(&out, "provider endpoint").into_owned()
+    out = urls.replace_all(&out, "provider endpoint").into_owned();
+    if let Some(secret) = leaked_secret.filter(|value| !value.is_empty()) {
+        out = out.replace(secret, "[redacted]");
+    }
+    out
+}
+
+fn public_text_contains_needle(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    PUBLIC_ERROR_NEEDLES
+        .iter()
+        .any(|needle| lowered.contains(needle))
+        || text.contains("://")
+}
+
+fn public_error_is_needle_free(error: &ErrorEnvelope) -> Result<(), String> {
+    if public_text_contains_needle(&error.message) {
+        return Err("public ErrorEnvelope message must be needle-free".into());
+    }
+    if error
+        .reason_code
+        .as_deref()
+        .is_some_and(public_text_contains_needle)
+    {
+        return Err("public ErrorEnvelope reason must be needle-free".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -928,15 +1249,33 @@ mod tests {
         }
     }
 
+    fn route_bound_quota(
+        request_id: &str,
+        identity: &GatewayIdentityRecord,
+        truth: QuotaTruth,
+    ) -> QuotaReceipt {
+        QuotaReceipt {
+            request_id: request_id.into(),
+            base_url: identity.base_url.clone(),
+            tenant: identity.tenant.clone(),
+            provider_kind: identity.provider_kind,
+            profile_id: identity.profile_id.clone(),
+            model_id: identity.model_id.clone(),
+            truth,
+        }
+    }
+
     fn live_shaped_bundle() -> CampaignBundle {
         let identity = restricted_https();
         CampaignBundle {
             schema: ENTERPRISE_GATEWAY_CAMPAIGN_SCHEMA.into(),
+            request_id: "req-live-shape".into(),
             requested: identity.clone(),
-            observed: identity,
-            quota: QuotaReceipt {
-                request_id: "req-live-shape".into(),
-                truth: QuotaTruth::ProviderReceipt {
+            observed: identity.clone(),
+            quota: route_bound_quota(
+                "req-live-shape",
+                &identity,
+                QuotaTruth::ProviderReceipt {
                     used: 3,
                     remaining: Some(7),
                     limit: Some(10),
@@ -944,7 +1283,7 @@ mod tests {
                     source: "provider".into(),
                     evidence_kind: EvidenceKind::LiveCampaign,
                 },
-            },
+            ),
             attempts: vec![
                 AttemptReceipt {
                     request_id: "req-live-shape".into(),
@@ -964,13 +1303,25 @@ mod tests {
             cursor_account: CursorAccountEvidence {
                 provider: ExternalWorkerProvider::CursorCloud,
                 kind: EvidenceKind::LiveCampaign,
+                api_base: Some(CURSOR_CLOUD_API_BASE.into()),
+                campaign_id: Some("bc-live-campaign-1".into()),
             },
             promotion: ReleasePromotionEvidence {
                 live_gateway: EvidenceKind::LiveCampaign,
                 live_quota: EvidenceKind::LiveCampaign,
                 live_cursor_account: EvidenceKind::LiveCampaign,
+                live_https_retry: EvidenceKind::LiveCampaign,
+                live_release_artifact: EvidenceKind::LiveCampaign,
             },
         }
+    }
+
+    fn remaining_gate_names(verdict: &CampaignVerdict) -> Vec<&str> {
+        verdict
+            .remaining_live_gates
+            .iter()
+            .map(String::as_str)
+            .collect()
     }
 
     #[test]
@@ -982,20 +1333,20 @@ mod tests {
         let verdict = verify_campaign(&bundle);
         assert!(verdict.contract_passed, "{verdict:#?}");
         assert!(!verdict.qualified_for_release);
-        assert!(verdict
-            .remaining_live_gates
-            .iter()
-            .any(|gate| gate.contains("gateway")));
-        assert!(verdict
-            .remaining_live_gates
-            .iter()
-            .any(|gate| gate.contains("quota")));
-        assert!(verdict
-            .remaining_live_gates
-            .iter()
-            .any(|gate| gate.contains("Cursor-account")));
+        assert_eq!(
+            remaining_gate_names(&verdict),
+            [
+                "live restricted-company gateway campaign",
+                "live provider quota receipt",
+                "live Cursor-account campaign",
+                "live HTTPS retry/idempotency",
+                "release artifact from the reviewed head",
+            ]
+        );
         assert_eq!(bundle.attempts[1].outcome, AttemptOutcome::Replayed);
         assert_eq!(bundle.observed.class, GatewayClass::RestrictedCompany);
+        assert_eq!(bundle.quota.request_id, bundle.request_id);
+        assert_eq!(bundle.quota.base_url, bundle.observed.base_url);
     }
 
     #[test]
@@ -1015,6 +1366,12 @@ mod tests {
             .unwrap();
         assert!(!fallback.passed);
         assert!(fallback.detail.contains("frontier"));
+        let quota = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "quota_provider_receipt")
+            .unwrap();
+        assert!(!quota.passed);
     }
 
     #[test]
@@ -1076,12 +1433,13 @@ mod tests {
         gateway.probe("req-drift", "first").unwrap();
         let error = gateway.probe("req-drift", "second").unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidRequest);
-        assert!(error.message.contains("different payload"));
-        assert!(!error.message.contains("secret"));
+        assert_eq!(error.reason_code.as_deref(), Some("invalid_request"));
+        assert_eq!(error.message, "The request is invalid.");
+        assert!(public_error_is_needle_free(&error).is_ok());
     }
 
     #[test]
-    fn unavailable_provider_returns_redacted_bounded_error() {
+    fn unavailable_provider_returns_needle_free_public_error() {
         let secret = "sk-live-secret-value";
         let gateway = FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:9/v1")
             .with_unavailable()
@@ -1089,11 +1447,54 @@ mod tests {
         let error = gateway.probe("req-down", "review").unwrap_err();
         assert_eq!(error.code, ErrorCode::AuthorityUnavailable);
         assert_eq!(error.reason_code.as_deref(), Some("provider_unavailable"));
+        assert_eq!(error.message, "The requested provider is unavailable.");
+        assert!(public_error_is_needle_free(&error).is_ok());
         assert!(!error.message.contains(secret));
-        assert!(!error.message.contains("127.0.0.1"));
+        assert!(!error.message.contains("[redacted]"));
         let retry = gateway.probe("req-down", "review").unwrap_err();
-        assert_eq!(retry.code, ErrorCode::AuthorityUnavailable);
-        assert_eq!(retry.request_id.as_deref(), Some("req-down"));
+        assert_eq!(retry, error);
+    }
+
+    #[test]
+    fn collect_unavailable_campaign_is_verified_fail_closed() {
+        let secret = "sk-live-secret-value";
+        let gateway = FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:9/v1")
+            .with_unavailable()
+            .with_leaked_secret(secret);
+        let bundle = gateway
+            .collect_offline_campaign("req-down-collect", "review")
+            .unwrap();
+        assert_eq!(bundle.attempts[0].outcome, AttemptOutcome::Failed);
+        assert_eq!(bundle.attempts[1].outcome, AttemptOutcome::Replayed);
+        assert_eq!(
+            bundle.attempts[0].error.as_ref(),
+            bundle.attempts[1].error.as_ref()
+        );
+        let verdict = verify_campaign(&bundle);
+        assert!(!verdict.contract_passed);
+        assert!(!verdict.qualified_for_release);
+        let redaction = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "bounded_errors_and_redaction")
+            .unwrap();
+        assert!(redaction.passed, "{verdict:#?}");
+        let retry = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "idempotent_retry_receipts")
+            .unwrap();
+        assert!(retry.passed, "{verdict:#?}");
+        let quota = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "quota_provider_receipt")
+            .unwrap();
+        assert!(!quota.passed);
+        let serialized = serde_json::to_string(&bundle).unwrap();
+        assert!(!serialized.contains(secret));
+        assert!(!serialized.contains("[redacted]"));
+        assert!(!serialized.to_ascii_lowercase().contains("api_key"));
     }
 
     #[test]
@@ -1106,45 +1507,256 @@ mod tests {
         bundle.promotion.live_quota = EvidenceKind::LiveCampaign;
         bundle.promotion.live_cursor_account = EvidenceKind::LiveCampaign;
         bundle.cursor_account.kind = EvidenceKind::LiveCampaign;
+        bundle.cursor_account.api_base = Some(bundle.observed.base_url.clone());
+        bundle.cursor_account.campaign_id = Some("loopback-claim".into());
         if let QuotaTruth::ProviderReceipt { evidence_kind, .. } = &mut bundle.quota.truth {
             *evidence_kind = EvidenceKind::LiveCampaign;
         }
         let verdict = verify_campaign(&bundle);
         assert!(!verdict.qualified_for_release);
-        assert!(verdict
-            .remaining_live_gates
-            .iter()
-            .any(|gate| gate.contains("gateway")));
+        assert_eq!(verdict.remaining_live_gates.len(), 5);
         let promotion = verdict
             .checks
             .iter()
             .find(|check| check.name == "release_promotion_gate")
             .unwrap();
         assert!(
-            !promotion.passed || !verdict.contract_passed,
+            !promotion.passed,
             "loopback cannot be advertised as live: {verdict:#?}"
+        );
+        let cursor = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "cursor_account_receipt")
+            .unwrap();
+        assert!(!cursor.passed);
+        assert!(
+            cursor.detail.contains("CURSOR_CLOUD_API_BASE") || cursor.detail.contains("company")
         );
     }
 
     #[test]
-    fn schema_fixture_with_complete_live_fields_would_qualify() {
-        // Schema-only positive path. This is not a live company-gateway campaign.
+    fn schema_fixture_with_complete_live_fields_does_not_qualify() {
         let verdict = verify_campaign(&live_shaped_bundle());
-        assert!(verdict.contract_passed, "{verdict:#?}");
-        assert!(verdict.qualified_for_release);
-        assert!(verdict.remaining_live_gates.is_empty());
+        assert!(!verdict.qualified_for_release);
+        assert!(!verdict.contract_passed, "{verdict:#?}");
+        assert_eq!(verdict.remaining_live_gates.len(), 5);
+        let promotion = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "release_promotion_gate")
+            .unwrap();
+        assert!(!promotion.passed);
+        let quota = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "quota_provider_receipt")
+            .unwrap();
+        assert!(!quota.passed);
+        let cursor = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "cursor_account_receipt")
+            .unwrap();
+        assert!(!cursor.passed);
+        assert!(cursor.detail.contains("hand-labeled"));
     }
 
     #[test]
-    fn bounded_error_redacts_bearer_and_assignment_secrets() {
+    fn public_error_is_needle_free_while_internal_diagnostics_stay_redacted() {
         let error = bounded_provider_error(
             ErrorCode::Internal,
-            "Authorization: Bearer abc.def and api_key=super-secret",
+            "Authorization: Bearer abc.def and api_key=super-secret https://evil.example/v1",
             "req-redact",
             Some("super-secret"),
         );
-        assert!(!error.message.contains("abc.def"));
-        assert!(!error.message.contains("super-secret"));
-        assert!(error.message.contains("[redacted]"));
+        assert_eq!(error.message, "The provider request failed.");
+        assert!(public_error_is_needle_free(&error).is_ok());
+        let internal = redact_internal_diagnostics(
+            "Authorization: Bearer abc.def and api_key=super-secret https://evil.example/v1",
+            Some("super-secret"),
+        );
+        assert!(internal.contains("[redacted]"));
+        assert!(!internal.contains("abc.def"));
+        assert!(!internal.contains("super-secret"));
+        assert!(!internal.contains("https://"));
+        assert_ne!(error.message, internal);
+    }
+
+    #[test]
+    fn quota_route_drift_fails_closed() {
+        let gateway = FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:9/v1");
+        let mut bundle = gateway
+            .collect_offline_campaign("req-quota-drift", "review")
+            .unwrap();
+        bundle.quota.base_url = "https://gw.example.internal/v1".into();
+        let verdict = verify_campaign(&bundle);
+        assert!(!verdict.contract_passed);
+        let quota = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "quota_provider_receipt")
+            .unwrap();
+        assert!(!quota.passed);
+        assert!(quota.detail.contains("route identity"));
+    }
+
+    #[test]
+    fn tenant_and_provider_kind_drift_fails_closed() {
+        let gateway = FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:9/v1");
+        let mut bundle = gateway
+            .collect_offline_campaign("req-tenant-drift", "review")
+            .unwrap();
+        bundle.observed.tenant = Some("other-tenant".into());
+        let verdict = verify_campaign(&bundle);
+        assert!(!verdict.contract_passed);
+        let fallback = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "no_silent_frontier_fallback")
+            .unwrap();
+        assert!(!fallback.passed);
+    }
+
+    #[test]
+    fn cursor_live_claim_requires_cursor_api_base_and_campaign_id() {
+        let gateway = FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:9/v1");
+        let mut bundle = gateway
+            .collect_offline_campaign("req-cursor-shape", "review")
+            .unwrap();
+        bundle.cursor_account.kind = EvidenceKind::LiveCampaign;
+        let missing = verify_campaign(&bundle);
+        let cursor = missing
+            .checks
+            .iter()
+            .find(|check| check.name == "cursor_account_receipt")
+            .unwrap();
+        assert!(!cursor.passed);
+        assert!(cursor.detail.contains("CURSOR_CLOUD_API_BASE"));
+
+        bundle.cursor_account.api_base = Some(CURSOR_CLOUD_API_BASE.into());
+        let missing_id = verify_campaign(&bundle);
+        let cursor = missing_id
+            .checks
+            .iter()
+            .find(|check| check.name == "cursor_account_receipt")
+            .unwrap();
+        assert!(!cursor.passed);
+        assert!(cursor.detail.contains("campaign"));
+    }
+
+    #[test]
+    fn cursor_receipt_cannot_use_company_gateway_url() {
+        let identity = restricted_https();
+        let mut bundle = live_shaped_bundle();
+        bundle.quota.truth = QuotaTruth::ProviderReceipt {
+            used: 3,
+            remaining: Some(7),
+            limit: Some(10),
+            unit: "requests".into(),
+            source: "provider".into(),
+            evidence_kind: EvidenceKind::OfflineFixture,
+        };
+        bundle.promotion = ReleasePromotionEvidence {
+            live_gateway: EvidenceKind::Absent,
+            live_quota: EvidenceKind::Absent,
+            live_cursor_account: EvidenceKind::Absent,
+            live_https_retry: EvidenceKind::Absent,
+            live_release_artifact: EvidenceKind::Absent,
+        };
+        bundle.cursor_account.api_base = Some(identity.base_url.clone());
+        let verdict = verify_campaign(&bundle);
+        let cursor = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "cursor_account_receipt")
+            .unwrap();
+        assert!(!cursor.passed);
+        assert!(
+            cursor.detail.contains("CURSOR_CLOUD_API_BASE")
+                || cursor.detail.contains("company gateway")
+        );
+        assert!(!verdict.qualified_for_release);
+    }
+
+    #[test]
+    fn json_payload_hash_is_canonical() {
+        let left = campaign_payload_hash("req-canon", r#"{"b":2,"a":1}"#);
+        let right = campaign_payload_hash("req-canon", r#"{"a":1,"b":2}"#);
+        let spaced = campaign_payload_hash("req-canon", r#"{ "a": 1, "b": 2 }"#);
+        assert_eq!(left, right);
+        assert_eq!(left, spaced);
+        assert_ne!(
+            campaign_payload_hash("req-canon", r#"{"a":1}"#),
+            campaign_payload_hash("req-canon", r#"{"a":2}"#)
+        );
+    }
+
+    #[test]
+    fn replayed_error_envelopes_must_match() {
+        let gateway =
+            FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:9/v1").with_unavailable();
+        let mut bundle = gateway
+            .collect_offline_campaign("req-replay-drift", "review")
+            .unwrap();
+        let drifted = bounded_provider_error(
+            ErrorCode::Capacity,
+            "different public failure",
+            "req-replay-drift",
+            None,
+        );
+        bundle.attempts[1].error = Some(drifted);
+        let verdict = verify_campaign(&bundle);
+        let retry = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "idempotent_retry_receipts")
+            .unwrap();
+        assert!(!retry.passed);
+        assert!(retry.detail.contains("envelope"));
+    }
+
+    #[test]
+    fn pending_and_uncertain_fail_closed() {
+        let pending = FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:9/v1")
+            .with_pending()
+            .collect_offline_campaign("req-pending", "review")
+            .unwrap();
+        assert_eq!(pending.attempts[0].outcome, AttemptOutcome::Pending);
+        assert_eq!(pending.attempts[1].outcome, AttemptOutcome::Replayed);
+        assert_eq!(
+            pending.attempts[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .reason_code
+                .as_deref(),
+            Some("pending")
+        );
+        let pending_verdict = verify_campaign(&pending);
+        assert!(!pending_verdict.contract_passed);
+        assert!(!pending_verdict.qualified_for_release);
+        let retry = pending_verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "idempotent_retry_receipts")
+            .unwrap();
+        assert!(!retry.passed);
+        assert!(retry.detail.contains("pending"));
+
+        let uncertain = FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:9/v1")
+            .with_uncertain()
+            .collect_offline_campaign("req-uncertain", "review")
+            .unwrap();
+        assert_eq!(uncertain.attempts[0].outcome, AttemptOutcome::Uncertain);
+        let uncertain_verdict = verify_campaign(&uncertain);
+        assert!(!uncertain_verdict.contract_passed);
+        let retry = uncertain_verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "idempotent_retry_receipts")
+            .unwrap();
+        assert!(retry.detail.contains("uncertain"));
+        assert!(public_error_is_needle_free(uncertain.attempts[0].error.as_ref().unwrap()).is_ok());
     }
 }

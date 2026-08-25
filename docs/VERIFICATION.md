@@ -28,16 +28,23 @@ cargo test --locked --test reliability_eval -- --test-threads=1
 
 The offline enterprise-gateway evidence contract is a supported focused check.
 It uses a loopback fake gateway and does **not** contact a company route,
-spend quota, or exercise a Cursor account:
+spend quota, or exercise a Cursor account. Use an isolated target so the
+protected Stage 6 soak is untouched:
 
 ```sh
 cd crates/codegen/grokptah-agent-bridge
-cargo test --locked --lib enterprise_gateway_campaign -- --test-threads=1
-cargo test --locked --test enterprise_gateway_campaign -- --test-threads=1
+CARGO_TARGET_DIR=/tmp/grokptah-enterprise-gateway-target CARGO_INCREMENTAL=0 \
+  cargo test --locked --lib enterprise_gateway_campaign -- --test-threads=1
+CARGO_TARGET_DIR=/tmp/grokptah-enterprise-gateway-target CARGO_INCREMENTAL=0 \
+  cargo test --locked --test enterprise_gateway_campaign -- --test-threads=1
 ```
 
 See [ENTERPRISE_GATEWAY_CAMPAIGN.md](./ENTERPRISE_GATEWAY_CAMPAIGN.md). A
 passing fixture is not live proof and does not qualify a release.
+`qualified_for_release` stays false; `remaining_live_gates` still lists live
+restricted-gateway, quota, Cursor-account, HTTPS retry/idempotency, and
+release-artifact evidence. Public unavailable/replayed `ErrorEnvelope` text
+must stay needle-free.
 
 For the report-producing operator command and scenario matrix, see
 [RELIABILITY_EVALS.md](RELIABILITY_EVALS.md).
