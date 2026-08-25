@@ -36,5 +36,31 @@ describe("Help Center index", () => {
     expect(context.contract).toBe(HELP_CONTRACT);
     expect(context.hits.length).toBeLessThanOrEqual(5);
     expect(context.instruction).toMatch(/fresh scoped check/i);
+    expect(context.contextBytes).toBeLessThanOrEqual(context.maxBytes);
+    expect(context.truncated).toBe(false);
+  });
+
+  it("enforces a caller-selected UTF-8 byte bound and reports truncation", () => {
+    const context = buildHelpAssistantContext("computer use safety", {
+      includeRestricted: true,
+      maxBytes: 2_048,
+    });
+    expect(context.contextBytes).toBeLessThanOrEqual(2_048);
+    expect(context.truncated).toBe(true);
+    expect(context.hits.length).toBeGreaterThan(0);
+    expect(context.hits.some(({ entry }) => entry.id === "computer-use-safety")).toBe(true);
+  });
+
+  it("does not split multibyte query text when applying the bound", () => {
+    const query = "日本語コンピューター利用".repeat(100);
+    const context = buildHelpAssistantContext(query, { maxBytes: 2_048 });
+    expect(context.contextBytes).toBeLessThanOrEqual(2_048);
+    expect(() => JSON.stringify(context)).not.toThrow();
+  });
+
+  it("keeps the envelope bounded even when the caller supplies a tiny limit", () => {
+    const context = buildHelpAssistantContext("x".repeat(1_000), { maxBytes: 512 });
+    expect(context.contextBytes).toBeLessThanOrEqual(512);
+    expect(context.query.length).toBeLessThan(1_000);
   });
 });
