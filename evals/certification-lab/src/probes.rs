@@ -903,11 +903,17 @@ impl AlwaysOnFixture {
             .map_err(|_| DiagnosticCode::FixtureInvalid)?,
             runs: usize::try_from(
                 first_work
-                    .checked_add(1)
+                    .checked_add(self.proposal_runs)
+                    .and_then(|total| total.checked_add(1))
                     .ok_or(DiagnosticCode::FixtureInvalid)?,
             )
             .map_err(|_| DiagnosticCode::FixtureInvalid)?,
-            intents: usize::try_from(first_work).map_err(|_| DiagnosticCode::FixtureInvalid)?,
+            intents: usize::try_from(
+                first_work
+                    .checked_add(self.decision_work)
+                    .ok_or(DiagnosticCode::FixtureInvalid)?,
+            )
+            .map_err(|_| DiagnosticCode::FixtureInvalid)?,
         })
     }
 }
