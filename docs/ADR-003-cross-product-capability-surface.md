@@ -96,6 +96,10 @@ and cross-product qualification are complete.
 The project-wide ordered status and 100% exit gate are tracked in
 [`docs/ROADMAP_TO_100.md`](./ROADMAP_TO_100.md).
 
+Provider/product boundaries, including the explicit separation between Grok
+Build evidence and the unrelated Grok Bot product, are recorded in
+[`PROVIDER_PRODUCT_BOUNDARIES.md`](./PROVIDER_PRODUCT_BOUNDARIES.md).
+
 The consumer-facing staging guide is [`docs/EMBEDDING.md`](./EMBEDDING.md).
 It documents the trust-boundary choice and the disposable ContextDesk
 desktop/War Room integration sequence without presenting the staging barrels

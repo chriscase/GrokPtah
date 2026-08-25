@@ -81,7 +81,7 @@ explicit session/workspace/run identity. A desktop adapter should:
 
 Products that want their own visual language can use the Tauri-free
 `desktop/src/lib/uiCore.ts` staging barrel. It exposes capability negotiation,
-Help Center search, prompt-queue reducers, and stream application helpers, but
+Help Center search (`helpCenter.ts`), prompt-queue reducers, and stream application helpers, but
 no React components, native APIs, credentials, or desktop state:
 
 ```ts
