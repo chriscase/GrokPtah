@@ -110,14 +110,9 @@ fn recording_past_the_concurrency_bound_is_refused() {
     // try to force it through anyway.
     let forced =
         derive_dispatch_id(&swarm.spec().swarm_id.clone(), &task_id("t-b"), 1).expect("derivable");
-    let intent = grokptah_swarm_control_plane::DispatchIntent {
-        dispatch_id: forced,
-        task_id: task_id("t-b"),
-        worker_id: worker_id("impl-grok"),
-        attempt: 1,
-        isolation: grokptah_swarm_control_plane::IsolationRequirement::Worktree,
-        requires_computer_use: false,
-    };
+    let mut intent = a.clone();
+    intent.dispatch_id = forced;
+    intent.task_id = task_id("t-b");
     let error = swarm
         .record_dispatch_requested(&intent, None, at(3))
         .expect_err("the bound must hold even against a hand-built intent");

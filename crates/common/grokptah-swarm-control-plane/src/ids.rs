@@ -7,6 +7,7 @@
 //! into a durable record or a public projection.
 
 use serde::{Deserialize, Serialize};
+use xai_grok_secrets::redact_secrets;
 
 use crate::error::{SwarmError, SwarmResult};
 
@@ -32,6 +33,11 @@ pub(crate) fn validate_id_str(value: &str, field: &str) -> SwarmResult<()> {
     if !id_charset_ok(value) {
         return Err(SwarmError::invalid(format!(
             "{field} may only contain ASCII alphanumerics and '-', '_', '.', ':'"
+        )));
+    }
+    if matches!(redact_secrets(value), std::borrow::Cow::Owned(_)) {
+        return Err(SwarmError::invalid(format!(
+            "{field} must not contain credential-shaped material"
         )));
     }
     Ok(())
@@ -169,6 +175,11 @@ impl ModelId {
         if !ok {
             return Err(SwarmError::invalid(
                 "model may only contain ASCII alphanumerics and '-', '_', '.', ':', '/'",
+            ));
+        }
+        if matches!(redact_secrets(value), std::borrow::Cow::Owned(_)) {
+            return Err(SwarmError::invalid(
+                "model must not contain credential-shaped material",
             ));
         }
         Ok(())

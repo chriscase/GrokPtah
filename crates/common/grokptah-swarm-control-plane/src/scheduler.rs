@@ -436,6 +436,11 @@ impl SwarmController {
         store: Arc<dyn DurableSwarmStore>,
     ) -> SwarmResult<Self> {
         let state = store.load(swarm_id)?;
+        if state.spec.swarm_id != *swarm_id {
+            return Err(SwarmError::corrupt(
+                "durable store returned a record for a different swarm",
+            ));
+        }
         validate_loaded_state(&state)?;
         Ok(Self { state, store })
     }
@@ -460,12 +465,14 @@ impl SwarmController {
     {
         for _ in 0..=1 {
             let latest = self.store.load(&self.state.spec.swarm_id)?;
+            validate_loaded_state(&latest)?;
             if latest.revision != self.state.revision {
                 self.state = latest;
             }
 
             let mut next = self.clone();
             let result = operation(&mut next)?;
+            validate_loaded_state(&next.state)?;
             if next.state == self.state {
                 return Ok(result);
             }
@@ -634,6 +641,11 @@ impl SwarmController {
                     task_id: task.task_id.clone(),
                     worker_id: worker.worker_id.clone(),
                     attempt,
+                    provider: worker.provider.clone(),
+                    model: worker.model.clone(),
+                    role: worker.role,
+                    capability_mode: worker.capability_mode,
+                    capabilities: worker.capabilities.clone(),
                     isolation: worker.isolation,
                     requires_computer_use: task.requires_computer_use,
                 })
@@ -697,6 +709,16 @@ impl SwarmController {
         if worker.worker_id != intent.worker_id {
             return Err(SwarmError::conflict(
                 "dispatch names a worker the task is not assigned to",
+            ));
+        }
+        if worker.provider != intent.provider
+            || worker.model != intent.model
+            || worker.role != intent.role
+            || worker.capability_mode != intent.capability_mode
+            || worker.capabilities != intent.capabilities
+        {
+            return Err(SwarmError::conflict(
+                "dispatch worker capabilities do not match the recorded worker",
             ));
         }
 

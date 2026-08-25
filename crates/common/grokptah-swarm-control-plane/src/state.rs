@@ -5,13 +5,19 @@
 //! evidence that something *may* have started — which the scheduler treats as
 //! uncertain rather than as free to repeat.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{SwarmError, SwarmResult};
-use crate::ids::{DispatchId, ExternalRefId, TaskId, WorkerId};
-use crate::spec::{ComputerUseLeaseRef, IsolationRequirement, SwarmSpec, validate_text};
+use crate::ids::{DispatchId, ExternalRefId, ModelId, ProviderId, TaskId, WorkerId};
+use crate::spec::{
+    ComputerUseLeaseRef, IsolationRequirement, SwarmSpec, WorkerCapability, WorkerRole,
+    validate_text,
+};
+use xai_tool_types::SubagentCapabilityMode;
 
 /// Namespace for content-derived dispatch identifiers. Fixed forever: changing
 /// it would make a replayed attempt mint a second identity.
@@ -307,6 +313,11 @@ pub struct DispatchIntent {
     pub task_id: TaskId,
     pub worker_id: WorkerId,
     pub attempt: u32,
+    pub provider: ProviderId,
+    pub model: ModelId,
+    pub role: WorkerRole,
+    pub capability_mode: SubagentCapabilityMode,
+    pub capabilities: BTreeSet<WorkerCapability>,
     pub isolation: IsolationRequirement,
     /// True when the caller must attach a usable Computer Use lease reference.
     pub requires_computer_use: bool,
