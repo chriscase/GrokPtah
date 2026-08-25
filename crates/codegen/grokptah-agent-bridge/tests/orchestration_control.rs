@@ -2483,7 +2483,14 @@ async fn failed_run_write_fails_receipt_and_never_executes_after_restart() {
     drop(store);
 
     let reopened = OrchStore::open(home.path().join("orch")).unwrap();
-    assert!(reopened.list_acceptance_intents().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_dir(reopened.root().join("acceptance"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name() != "sequence.json")
+            .count(),
+        0
+    );
     let host2 = started_host();
     let orch2 = OrchestrationService::new(
         host2.clone(),

@@ -797,7 +797,7 @@ impl OrchestrationService {
             else {
                 continue;
             };
-            let live = { self.live_attempts.lock().remove(&run_id) };
+            let live = self.take_live_attempt(&run_id);
             if let Some(live) = live {
                 if live.attempt_id == attempt.attempt_id {
                     live.model_abort.abort();
@@ -846,6 +846,10 @@ impl OrchestrationService {
     #[doc(hidden)]
     pub async fn reap_expired_attempts_for_test(&self) {
         self.reap_expired_attempts().await;
+    }
+
+    fn take_live_attempt(&self, run_id: &str) -> Option<LiveAttempt> {
+        self.live_attempts.lock().remove(run_id)
     }
 
     async fn begin_idempotency(
