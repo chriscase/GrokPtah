@@ -78,6 +78,8 @@ binding and run ids to the exact GrokPtah `session_id`, `workspace`, and
 | `GET /bindings/{bindingId}/runs/{runId}/tests` | `ptah_get_test_results` | read-only | No arbitrary command output. |
 | `GET /bindings/{bindingId}/runs/{runId}/handoff` | `ptah_get_handoff` | read-only | Bounded final handoff. |
 | `GET /bindings/{bindingId}/runs/{runId}/review` | `ptah_review_run` | read-only | Isolated-run diff/fingerprint. |
+| `POST /bindings/{bindingId}/runs/{runId}/approve` | broker approval | execute | Binds exact review fingerprints to a short-lived approval. |
+| `POST /bindings/{bindingId}/runs/{runId}/promote` | promotion authority | promote | Requires the short-lived approval and desktop human gate. |
 | `POST /bindings/{bindingId}/runs/{runId}/cancel` | `ptah_cancel` | execute | Explicit user action; idempotent request id. |
 | `GET /bindings/{bindingId}/queue` | `ptah_get_queue` | read-only | Includes queue revision. |
 | `POST /bindings/{bindingId}/queue` | `ptah_queue_prompt` | execute | Server adds request id and policy bounds. |
@@ -144,6 +146,13 @@ changed-file list returned by `ptah_review_run`. `POST /runs/{id}/promote`
 accepts only the short-lived approval receipt. A browser session, a focused tab,
 or a team role is not a Computer Use grant. Computer control requests must
 carry the expected run revision and action class; stale revisions are rejected
+without mutation.
+
+The browser-facing client may carry these two routes as typed calls, but the
+client is not the authority: the broker must recompute or verify the review
+receipt, bind the approval to the same opaque run and fingerprints, enforce a
+short expiry, and require the desktop-side human gate before forwarding a
+promotion. A stale, expired, mismatched, or replayed approval is rejected
 without mutation.
 
 The web broker should initially expose only `computer.observe`. Add

@@ -85,6 +85,50 @@ describe("GrokPtahBrokerClient", () => {
     );
   });
 
+  it("binds approval and promotion to opaque ids and broker CSRF", async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ approvalId: "approval-1" }))
+      .mockResolvedValueOnce(jsonResponse({ promoted: true }));
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+
+    await client.approveRun(
+      "binding/1",
+      "run/1",
+      {
+        sourceFingerprint: "source-1",
+        finalFingerprint: "final-1",
+        changedFiles: ["src/lib.ts"],
+        ttlMs: 30_000,
+      },
+      "approve-intent-1",
+    );
+    await client.promoteRun("binding/1", "run/1", "approval/1", "promote-intent-1");
+
+    expect(String(fetcher.mock.calls[0][0])).toBe(
+      "https://contextdesk.example/api/grokptah/v1/bindings/binding%2F1/runs/run%2F1/approve",
+    );
+    expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body))).toEqual({
+      sourceFingerprint: "source-1",
+      finalFingerprint: "final-1",
+      changedFiles: ["src/lib.ts"],
+      ttlMs: 30_000,
+    });
+    expect(String(fetcher.mock.calls[1][0])).toBe(
+      "https://contextdesk.example/api/grokptah/v1/bindings/binding%2F1/runs/run%2F1/promote",
+    );
+    expect(JSON.parse(String(fetcher.mock.calls[1][1]?.body))).toEqual({
+      approvalId: "approval/1",
+    });
+    expect(fetcher.mock.calls[1][1]?.headers).toMatchObject({
+      "Idempotency-Key": "promote-intent-1",
+      "X-CSRF-Token": "csrf-1",
+    });
+  });
+
   it("replays scoped broker events and stops at recovery", async () => {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {

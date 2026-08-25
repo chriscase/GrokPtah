@@ -34,6 +34,25 @@ export type GrokPtahBrokerRunRequest = {
   allowQueue?: boolean;
 };
 
+/** The exact review evidence a broker must bind before issuing approval. */
+export type GrokPtahBrokerApprovalRequest = {
+  sourceFingerprint: string;
+  finalFingerprint: string;
+  changedFiles: string[];
+  ttlMs?: number;
+};
+
+/** Opaque, short-lived approval returned by the trusted broker. */
+export type GrokPtahBrokerApproval = {
+  approvalId: string;
+  bindingId: string;
+  brokerRunId: string;
+  sourceFingerprint: string;
+  finalFingerprint: string;
+  changedFiles: string[];
+  expiresAt: string;
+};
+
 export type GrokPtahBrokerEvent = {
   kind: "event";
   brokerRunId: string;
@@ -152,6 +171,41 @@ export class GrokPtahBrokerClient {
 
   async getReview<T = unknown>(bindingId: string, brokerRunId: string): Promise<T> {
     return this.request<T>(`${this.runPath(bindingId, brokerRunId)}/review`);
+  }
+
+  /**
+   * Ask the broker to create a short-lived approval for the exact review
+   * evidence shown to the user. This does not promote anything by itself.
+   */
+  async approveRun<T = GrokPtahBrokerApproval>(
+    bindingId: string,
+    brokerRunId: string,
+    request: GrokPtahBrokerApprovalRequest,
+    idempotencyKey: string,
+  ): Promise<T> {
+    return this.request<T>(`${this.runPath(bindingId, brokerRunId)}/approve`, {
+      method: "POST",
+      idempotencyKey,
+      body: request,
+    });
+  }
+
+  /**
+   * Consume a broker-issued approval. The broker remains responsible for
+   * checking expiry, fingerprints, capability policy, and the desktop human
+   * gate before asking GrokPtah to promote.
+   */
+  async promoteRun<T = unknown>(
+    bindingId: string,
+    brokerRunId: string,
+    approvalId: string,
+    idempotencyKey: string,
+  ): Promise<T> {
+    return this.request<T>(`${this.runPath(bindingId, brokerRunId)}/promote`, {
+      method: "POST",
+      idempotencyKey,
+      body: { approvalId },
+    });
   }
 
   async cancelRun<T = unknown>(
