@@ -100,6 +100,24 @@ export function ComputerCockpit({
   const [busy, setBusy] = useState(false);
   const requestEpoch = useRef(0);
   const proposalFocus = useRef<HTMLButtonElement | null>(null);
+  const cockpitRef = useRef<HTMLElement | null>(null);
+  const approvalRef = useRef<HTMLDivElement | null>(null);
+
+  /**
+   * Both approval outcomes unmount the dialog. Reject leaves the staging
+   * controls mounted, so it can hand focus straight back; approve usually moves
+   * the run to `paused`, taking those controls with it. Falling through to the
+   * cockpit region keeps the operator's next Tab inside the cockpit instead of
+   * restarting at the top of the document.
+   */
+  const restoreApprovalFocus = () => {
+    const proposal = proposalFocus.current;
+    if (proposal?.isConnected) {
+      proposal.focus();
+      return;
+    }
+    cockpitRef.current?.focus();
+  };
 
   useEffect(() => {
     const epoch = ++requestEpoch.current;
@@ -203,6 +221,7 @@ export function ComputerCockpit({
     ["status", "AXStaticText"].includes(element.role),
   );
   const approval = snapshot?.pendingApproval ?? null;
+  const approvalId = approval?.approvalId ?? null;
   const grantActive = Boolean(run?.grant && !run.grant.revokedAt);
   const timeline = useMemo(() => run?.audit.slice(-12).reverse() ?? [], [run]);
   const selectedNativeTarget = nativeTargets.find(
@@ -216,6 +235,15 @@ export function ComputerCockpit({
     agentEligibility?.model === model ? agentEligibility.tier : computerUseTier;
   const effectiveAgentSource =
     agentEligibility?.model === model ? agentEligibility.source : computerCapabilitySource;
+
+  // An approval can appear asynchronously while the operator is activating a
+  // Stage button with Space or Enter. Focus the dialog itself so the prompt is
+  // reachable and announced without pre-arming the affirmative control — a
+  // queued keypress must never land on "Approve once".
+  useEffect(() => {
+    if (!approvalId) return;
+    approvalRef.current?.focus();
+  }, [approvalId]);
 
   const qualifyAgent = async () => {
     if (!sessionId) return;
@@ -335,7 +363,12 @@ export function ComputerCockpit({
   };
 
   return (
-    <section className="computer-cockpit" aria-label="Computer Run cockpit">
+    <section
+      ref={cockpitRef}
+      className="computer-cockpit"
+      aria-label="Computer Run cockpit"
+      tabIndex={-1}
+    >
       <header className="computer-cockpit-header">
         <div>
           <div className="computer-eyebrow">Computer Run</div>
@@ -819,10 +852,19 @@ export function ComputerCockpit({
           )}
 
           {approval && (
-            <div className="computer-approval" role="dialog" aria-label="Approve Computer Use action">
+            <div
+              ref={approvalRef}
+              className="computer-approval"
+              role="dialog"
+              aria-label="Approve Computer Use action"
+              tabIndex={-1}
+            >
               <div className="computer-approval-title">
                 <div><span className="computer-section-label">Approval required</span><h2>{approval.actionSummary}</h2></div>
-                <span className="computer-risk">{approval.risk}</span>
+                <span className="computer-risk">
+                  <span className="sr-only">Risk level: </span>
+                  {approval.risk}
+                </span>
               </div>
               <dl>
                 <div><dt>Target</dt><dd>{approval.targetLabel}</dd></div>
@@ -834,8 +876,8 @@ export function ComputerCockpit({
                   type="button"
                   disabled={busy}
                   onClick={() =>
-                    void apply(() => api.computerUseCockpitDiscardApproval(sessionId)).finally(() =>
-                      proposalFocus.current?.focus(),
+                    void apply(() => api.computerUseCockpitDiscardApproval(sessionId)).finally(
+                      restoreApprovalFocus,
                     )
                   }
                 >
@@ -845,7 +887,6 @@ export function ComputerCockpit({
                   type="button"
                   className="primary"
                   disabled={busy}
-                  autoFocus
                   onClick={() =>
                     void apply(
                       () =>
@@ -855,7 +896,7 @@ export function ComputerCockpit({
                           crypto.randomUUID(),
                         ),
                       "Action completed. Reauthorization is required.",
-                    )
+                    ).finally(restoreApprovalFocus)
                   }
                 >
                   Approve once

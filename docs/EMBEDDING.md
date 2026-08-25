@@ -111,7 +111,7 @@ explicit session/workspace/run identity. A desktop adapter should:
 
 Products that want their own visual language can use the Tauri-free
 `@grokptah/client/ui-core` entry (generated from `desktop/src/lib/uiCore.ts`). It exposes capability negotiation,
-the source-cited Help Center corpus (`searchHelpArticles`), prompt-queue
+the source-cited Help Center corpus, prompt-queue
 reducers, and stream application helpers, but
 no React components, native APIs, credentials, or desktop state:
 
@@ -119,12 +119,54 @@ no React components, native APIs, credentials, or desktop state:
 import {
   applyAssistantStreamChunk,
   promptQueueReducer,
-  searchHelpArticles,
+  searchHelp,
 } from "@grokptah/client/ui-core";
 ```
 
+### One Help corpus
+
+Browser consumers see exactly one Help corpus: the live, source-cited
+`product-corpus-v1` corpus the desktop actually renders. `searchHelp` and
+`searchHelpArticles` are the **same binding**, so neither name can drift onto a
+different corpus.
+
+The capability-gated `grokptah.help.v1` corpus (`HELP_ENTRIES`, `HELP_CONTRACT`,
+`buildHelpAssistantContext`) carries `audience` / `access` / `capabilityIds`
+metadata and defaults to public-only results. It remains the contract for
+trusted adapters and is reachable only through `desktop/src/lib/trusted.ts`,
+which is never shipped in a browser bundle. It is not exported from
+`@grokptah/client` or `@grokptah/client/ui-core`, and `verify:public` fails if
+it reappears there.
+
 The reducer inputs and stream cursors remain host-neutral. A consumer owns its
 rendering, focus management, transport adapter, and approval presentation.
+
+### Shared visual layer — and what it does not cover
+
+`@grokptah/client/styles/tokens.css` is the whole shared visual layer. It is
+staged verbatim from the marked regions of `desktop/src/styles/app.css` at
+build time, so the desktop and a browser consumer cannot drift apart:
+
+```ts
+import "@grokptah/client/styles/tokens.css";
+```
+
+It contains colour tokens for both themes and all three accents, the type scale
+with its density and type-scale controls, the focus indicator, the
+`prefers-contrast` and `forced-colors` escapes, and the `.sr-only` utility.
+
+It is **not** a component library. Continuity that may be claimed on this tree
+is contract-level plus these tokens:
+
+| May be claimed | May not be claimed |
+|---|---|
+| Help corpus, prompt-queue reducers, stream-apply helpers, external-worker parsers, capability types | Component or layout parity |
+| Colour, type-scale, focus, contrast and screen-reader tokens | Focus management, focus trapping, inert handling, live regions |
+| Both themes and all three accent palettes | Packaged screen-reader, high-zoom or forced-colour acceptance |
+
+Every focus trap, inert background, live region and approval presentation in
+the desktop app is desktop-only. A browser consumer implements its own, and
+nothing in this package does it for them.
 The generated package now exposes the same headless surface as the
 `@grokptah/client/ui-core` subpath. It is still a staging artifact rather than
 a published SemVer promise, but consumers can exercise the real import path
@@ -136,8 +178,9 @@ shapes.
 To produce a reviewable, Tauri-free consumer artifact from an exact checkout,
 run `npm run verify:public` in `desktop/`. This builds and verifies a bundled
 `desktop/dist/public/grokptah-public.js`, `desktop/dist/public/ui-core.js`,
-declaration files under `desktop/dist/public/types/`, and a package manifest
-for `@grokptah/client` with its `./ui-core` subpath.
+declaration files under `desktop/dist/public/types/`, the derived
+`desktop/dist/public/styles/tokens.css`, and a package manifest
+for `@grokptah/client` with its `./ui-core` and `./styles/tokens.css` subpaths.
 The generated artifact contains the browser-safe broker client and headless
 primitives only; it does not contain `trusted.ts`, Tauri APIs, bearer tokens,
 provider API-key markers, absolute host paths, `GROKPTAH_HOME`, or native
@@ -145,8 +188,9 @@ Computer Use authority. The same command then installs that generated manifest
 into a disposable external-consumer fixture, installs the generated `npm pack`
 archive, and imports it through normal `node_modules/@grokptah/client` package
 resolution. That fixture exercises the
-Help Center corpus, queue reducer, stream helper, broker constructor, and the
-separate `@grokptah/client/ui-core` import, so a direct bundle import cannot
+Help Center corpus, queue reducer, stream helper, broker constructor, the
+separate `@grokptah/client/ui-core` import, and the `styles/tokens.css`
+subpath, so a direct bundle import cannot
 masquerade as a consumer integration. The fixture is deleted after the check.
 Publication still requires the compatibility and release gates in the roadmap.
 
@@ -172,8 +216,11 @@ transport reachability.
 The eventual published surfaces should be generated from the same contracts:
 
 - `@grokptah/client`: typed browser-safe broker and host-neutral DTOs;
-- `@grokptah/ui-core`: headless state machines, hooks, and accessibility behavior;
-- `@grokptah/ui`: optional styled components and theme tokens;
+- `@grokptah/ui-core`: headless state machines and hooks — accessibility
+  *behavior* (focus traps, inert handling, live regions) is not part of the
+  surface today and must not be claimed until it ships;
+- `@grokptah/ui`: optional styled components on top of the already-shipped
+  `styles/tokens.css`;
 - `grokptah-agent-sdk`: versioned Rust DTOs and validation vocabulary.
 
 Publish only after the compatibility, schema migration, security, Always-On,

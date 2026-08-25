@@ -60,30 +60,57 @@ try {
   applyExternalWorkerNotification,
   createExternalWorkerMonitor,
   HELP_ARTICLES,
-  HELP_ENTRIES,
+  HELP_CORPUS_VERSION,
   applyAssistantStreamChunk,
   createPromptQueueEntry,
   emptyPromptQueueState,
   promptQueueReducer,
+  searchHelp,
   searchHelpArticles,
 } from "@grokptah/client";
 import {
   HELP_ARTICLES as UI_CORE_HELP_ARTICLES,
+  searchHelp as uiCoreSearchHelp,
   searchHelpArticles as uiCoreSearchHelpArticles,
 } from "@grokptah/client/ui-core";
+import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
 
 if (HELP_ARTICLES.length < 1) throw new Error("consumer could not read the Help Center corpus");
-if (!Object.isFrozen(HELP_ARTICLES) || !Object.isFrozen(HELP_ENTRIES)) {
-  throw new Error("consumer Help corpora were not immutable");
+if (!Object.isFrozen(HELP_ARTICLES)) {
+  throw new Error("consumer Help corpus was not immutable");
 }
-if (UI_CORE_HELP_ARTICLES.length !== HELP_ARTICLES.length) {
+if (HELP_CORPUS_VERSION !== "product-corpus-v1") {
+  throw new Error("consumer did not receive the live source-cited Help corpus");
+}
+if (UI_CORE_HELP_ARTICLES !== HELP_ARTICLES) {
   throw new Error("ui-core subpath exposed a different Help Center corpus");
+}
+// A consumer reaching for the obvious name must land on the corpus the desktop
+// displays — not the access-gated grokptah.help.v1 corpus.
+if (searchHelp !== searchHelpArticles || uiCoreSearchHelp !== uiCoreSearchHelpArticles) {
+  throw new Error("consumer Help search names resolved to different corpora");
 }
 if (searchHelpArticles("restricted company gateway")[0]?.article?.id !== "providers.restricted-gateway-review") {
   throw new Error("consumer Help Center ranking did not match the published contract");
 }
 if (uiCoreSearchHelpArticles("restricted company gateway")[0]?.article?.id !== "providers.restricted-gateway-review") {
   throw new Error("ui-core consumer Help Center ranking did not match the published contract");
+}
+// The shared visual layer must resolve through normal package resolution, and
+// must stay a token contract rather than a component library.
+const requireFromConsumer = createRequire(import.meta.url);
+const tokensPath = requireFromConsumer.resolve("@grokptah/client/styles/tokens.css");
+const tokens = readFileSync(tokensPath, "utf8");
+for (const required of ['[data-theme="light"]', "--fs-11:", "--type-scale:", ".sr-only", ":focus-visible"]) {
+  if (!tokens.includes(required)) {
+    throw new Error("consumer stylesheet is missing the published contract piece: " + required);
+  }
+}
+for (const componentish of [".permission-", ".computer-", ".help-", ".modal"]) {
+  if (tokens.includes(componentish)) {
+    throw new Error("consumer stylesheet exported a component rule: " + componentish);
+  }
 }
 if (applyAssistantStreamChunk("", "consumer").text !== "consumer") {
   throw new Error("consumer stream helper did not apply a bounded update");
@@ -172,7 +199,7 @@ const externalState = externalNotification
 if (externalState?.lastSeq !== 0 || externalState.recoveryRequired) {
   throw new Error("consumer external-worker monitor was not usable");
 }
-console.log("external consumer fixture passed");
+console.log("external consumer fixture passed (contracts + styles/tokens.css)");
 `,
   );
 

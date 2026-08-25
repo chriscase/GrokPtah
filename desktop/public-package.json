@@ -12,11 +12,13 @@
     "./ui-core": {
       "types": "./types/uiCore.d.ts",
       "import": "./ui-core.js"
-    }
+    },
+    "./styles/tokens.css": "./styles/tokens.css"
   },
   "files": [
     "grokptah-public.js",
     "ui-core.js",
+    "styles",
     "types"
   ]
 }

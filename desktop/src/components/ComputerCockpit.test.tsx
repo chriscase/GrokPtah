@@ -221,6 +221,29 @@ function snapshot(runValue: ComputerRun | null = null): ComputerCockpitSnapshot 
   };
 }
 
+/** The one-use approval the cockpit raises after a staged action. */
+function pendingApprovalSnapshot(base: ComputerCockpitSnapshot): ComputerCockpitSnapshot {
+  return {
+    ...base,
+    pendingApproval: {
+      approvalId: "approval-1",
+      ownerSessionId: "session-1",
+      runId: "run-1",
+      runVersion: 3,
+      observationId: "observation-1",
+      targetLabel: "Computer Use Simulator",
+      action: {
+        type: "set_value" as const,
+        element_id: "observation-1-name",
+        text: "Ada Lovelace",
+      },
+      actionSummary: "Enter visible text in Name",
+      risk: "Text entry",
+      createdAt: "2026-08-13T10:00:01Z",
+    },
+  };
+}
+
 const props = {
   sessionId: "session-1",
   sessionTitle: "Demo build",
@@ -391,6 +414,80 @@ describe("ComputerCockpit", () => {
       await screen.findByRole("button", { name: "Reauthorize and observe" }),
     ).toBeTruthy();
     expect(mocks.approve).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not pre-arm Approve once, and labels the risk level", async () => {
+    const ready = snapshot(run());
+    mocks.snapshot.mockResolvedValue(ready);
+    mocks.stage.mockResolvedValue(pendingApprovalSnapshot(ready));
+    render(<ComputerCockpit {...props} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stage text entry" }));
+    const approve = await screen.findByRole("button", { name: "Approve once" });
+    const dialog = screen.getByRole("dialog", { name: "Approve Computer Use action" });
+
+    // A keypress queued while the approval arrives must not land on the
+    // affirmative control; focus goes to the dialog itself.
+    expect(document.activeElement).toBe(dialog);
+    expect(document.activeElement).not.toBe(approve);
+    expect(approve.hasAttribute("autofocus")).toBe(false);
+    // Risk was announced with no label at all; Target and Will send were paired.
+    expect(screen.getByText("Risk level:")).toBeTruthy();
+  });
+
+  it("returns focus to the staging control when an approval is rejected", async () => {
+    const ready = snapshot(run());
+    mocks.snapshot.mockResolvedValue(ready);
+    mocks.stage.mockResolvedValue(pendingApprovalSnapshot(ready));
+    mocks.discard.mockResolvedValue(ready);
+    render(<ComputerCockpit {...props} />);
+
+    const stage = await screen.findByRole("button", { name: "Stage text entry" });
+    fireEvent.click(stage);
+    fireEvent.click(await screen.findByRole("button", { name: "Reject" }));
+
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Stage text entry" }),
+      ),
+    );
+  });
+
+  it("returns focus to the staging control when an approval is granted", async () => {
+    const ready = snapshot(run());
+    mocks.snapshot.mockResolvedValue(ready);
+    mocks.stage.mockResolvedValue(pendingApprovalSnapshot(ready));
+    // The run stays observable, so the control the operator came from survives.
+    mocks.approve.mockResolvedValue(ready);
+    render(<ComputerCockpit {...props} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stage text entry" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Approve once" }));
+
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Stage text entry" }),
+      ),
+    );
+    expect(mocks.approve).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps focus inside the cockpit when approving unmounts the staging control", async () => {
+    const ready = snapshot(run());
+    mocks.snapshot.mockResolvedValue(ready);
+    mocks.stage.mockResolvedValue(pendingApprovalSnapshot(ready));
+    // The normal rhythm: approving pauses the run pending reauthorization.
+    mocks.approve.mockResolvedValue(snapshot(run("paused")));
+    render(<ComputerCockpit {...props} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stage text entry" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Approve once" }));
+    await screen.findByRole("button", { name: "Reauthorize and observe" });
+
+    const cockpit = screen.getByRole("region", { name: "Computer Run cockpit" });
+    await waitFor(() => expect(document.activeElement).toBe(cockpit));
+    // Never the document body: the next Tab must not restart at the top.
+    expect(document.activeElement).not.toBe(document.body);
   });
 
   it("shows measured model eligibility without expanding local approval", async () => {

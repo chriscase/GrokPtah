@@ -58,6 +58,8 @@ import {
   enqueuePermission,
   headPermission,
 } from "./lib/permissionQueue";
+import { isChromeLocked, isShellInert, inertProps } from "./lib/overlayA11y";
+import { resolveWorkspaceShortcut } from "./lib/workspaceShortcuts";
 import {
   clampDocks,
   SPLIT_MIN_WIDTH,
@@ -365,6 +367,24 @@ export default function App() {
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("build");
   const [computerOpen, setComputerOpen] = useState(false);
   const [computerRunState, setComputerRunState] = useState<string | null>(null);
+  /**
+   * Every overlay authority boundary, in one place. `chromeLocked` gates the
+   * global shortcuts — an operator judging a consent prompt must not be able to
+   * switch session, cycle docks or collapse chrome underneath the decision they
+   * are making. `isShellInert` drops the overlays that inert the background
+   * themselves (consent, Help), so `inert` keeps exactly one owner per element.
+   */
+  const overlayFlags = {
+    settingsOpen,
+    sessionBrowserOpen,
+    permissionOpen: Boolean(permission),
+    searchOpen,
+    aboutOpen,
+    mcpTrustOpen: Boolean(mcpTrustPrompt),
+    helpOpen,
+  };
+  const chromeLocked = isChromeLocked(overlayFlags);
+  const lockChrome = inertProps(isShellInert(overlayFlags));
   const chromeRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
   const runsRefreshGuard = useMemo(() => createLatestRequestGuard(), []);
   const runsRefreshInFlight = useRef<{ sessionId: string; request: number } | null>(null);
@@ -1272,66 +1292,60 @@ export default function App() {
   // Keyboard: multi-zone + chrome (capture so composer/webview don't eat them)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const meta = e.metaKey || e.ctrlKey;
-      if (!meta) return;
+      // `chromeLocked` is the gate: while any modal/consent/overlay layer is
+      // open the resolver returns null for every keystroke, so no shortcut can
+      // reshape the workspace underneath a pending decision.
+      const shortcut = resolveWorkspaceShortcut(e, { chromeLocked });
+      if (!shortcut) return;
 
-      // ⌘B left chrome, ⌘⌥B right chrome, ⌘⇧L Live
-      const isB = e.key === "b" || e.key === "B" || e.code === "KeyB";
-      if (isB) {
-        if (e.altKey) {
+      switch (shortcut.kind) {
+        // ⌘⌥B right chrome, ⌘B left chrome, ⌘⇧L Live
+        case "toggle-rightbar":
           e.preventDefault();
           e.stopPropagation();
           setRightbarCollapsed((v) => !v);
           return;
-        }
-        if (!e.shiftKey) {
+        case "toggle-sidebar":
           e.preventDefault();
           e.stopPropagation();
           setSidebarCollapsed((v) => !v);
           return;
-        }
-      }
-      if (e.shiftKey && (e.key === "l" || e.key === "L" || e.code === "KeyL")) {
-        e.preventDefault();
-        e.stopPropagation();
-        setLiveHidden((v) => !v);
-        return;
-      }
-
-      // ⌘1–⌘6 focus dock by zone index
-      if (e.key >= "1" && e.key <= "6" && !e.altKey && !e.shiftKey) {
-        const idx = Number(e.key) - 1;
-        if (docks[idx]) {
+        case "toggle-live":
           e.preventDefault();
-          setActiveSessionId(docks[idx]);
+          e.stopPropagation();
+          setLiveHidden((v) => !v);
+          return;
+        // ⌘1–⌘6 focus dock by zone index
+        case "focus-dock": {
+          const target = docks[shortcut.index];
+          if (target) {
+            e.preventDefault();
+            setActiveSessionId(target);
+          }
+          return;
         }
-        return;
-      }
-
-      // ⌘⌥← / ⌘⌥→ cycle docks
-      if (e.altKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
-        if (docks.length < 2 || !activeSessionId) return;
-        e.preventDefault();
-        const i = docks.indexOf(activeSessionId);
-        if (i < 0) return;
-        const next =
-          e.key === "ArrowLeft"
-            ? docks[(i - 1 + docks.length) % docks.length]
-            : docks[(i + 1) % docks.length];
-        setActiveSessionId(next);
-        return;
-      }
-
-      // ⌘\ toggle multi-dock
-      if (e.key === "\\") {
-        e.preventDefault();
-        if (maxDocks < 2) return;
-        void openBeside();
+        // ⌘⌥← / ⌘⌥→ cycle docks
+        case "cycle-dock": {
+          if (docks.length < 2 || !activeSessionId) return;
+          e.preventDefault();
+          const i = docks.indexOf(activeSessionId);
+          if (i < 0) return;
+          setActiveSessionId(
+            docks[(i + shortcut.delta + docks.length) % docks.length],
+          );
+          return;
+        }
+        // ⌘\ toggle multi-dock
+        case "open-beside":
+          e.preventDefault();
+          if (maxDocks < 2) return;
+          void openBeside();
+          return;
       }
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [docks, activeSessionId, maxDocks, openBeside]);
+  }, [docks, activeSessionId, maxDocks, openBeside, chromeLocked]);
 
   async function ensureSession(): Promise<string> {
     // Prefer the active tab only when its kind matches Builds/Chats mode.
@@ -2157,7 +2171,7 @@ export default function App() {
       className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${rightbarCollapsed ? "rightbar-collapsed" : ""}`}
     >
       <LaunchSplash ready={splashReady} />
-      <header className="titlebar">
+      <header className="titlebar" {...lockChrome}>
         <div className="brand">
           <BrandMark size={20} className="brand-mark-img" />
           <span className="brand-name">
@@ -2282,6 +2296,7 @@ export default function App() {
       </header>
 
       <aside
+        {...lockChrome}
         className={`sidebar ${sidebarCollapsed ? "is-collapsed" : ""}`}
         aria-expanded={!sidebarCollapsed}
       >
@@ -2484,6 +2499,7 @@ export default function App() {
       </aside>
 
       <main
+        {...lockChrome}
         className={`main density-${layoutDensity} ${computerOpen ? "computer-open" : ""} ${
           docks.length > 1 ? "is-split" : ""
         }`}
@@ -3179,6 +3195,7 @@ export default function App() {
       </main>
 
       <aside
+        {...lockChrome}
         className={`rightbar ${rightbarCollapsed ? "is-collapsed" : ""}`}
         aria-expanded={!rightbarCollapsed}
       >
@@ -3711,7 +3728,7 @@ export default function App() {
         </div>
       </aside>
 
-      <footer className="status-bar">
+      <footer className="status-bar" {...lockChrome}>
         <span className={busy || anyBusy ? "status-live" : "status-idle"}>
           {busy
             ? `● Live · ${activity.label}${activity.detail ? ` — ${activity.detail}` : ""}`
