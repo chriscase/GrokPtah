@@ -110,11 +110,53 @@ impl Drop for OrchestrationService {
 
 struct AdmissionGuard {
     host: AgentHostHandle,
+    store: OrchStore,
     run_id: String,
+    attempt_id: String,
+    owner_instance_id: String,
+    model_abort: tokio::task::AbortHandle,
+    armed: bool,
 }
 
 impl Drop for AdmissionGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.model_abort.abort();
+        let _ = self.store.update_run(&self.run_id, |run| {
+            if !run.state.is_terminal() {
+                run.state = RunState::Interrupted;
+                run.queue_position = None;
+                run.terminal_result = Some("interrupted".into());
+                run.error_code = Some("supervisor_aborted".into());
+                run.final_response = Some("model supervisor was cancelled".into());
+                run.updated_at = Utc::now();
+            }
+            Ok(())
+        });
+        if let Some(attempt) = self.store.load_attempt(&self.run_id).ok().flatten() {
+            if attempt.attempt_id == self.attempt_id
+                && attempt.owner_instance_id == self.owner_instance_id
+                && attempt.phase.is_active()
+            {
+                let _ = self.store.finalize_attempt(
+                    &self.run_id,
+                    &self.attempt_id,
+                    &self.owner_instance_id,
+                    attempt.revision,
+                    AttemptPhase::Interrupted,
+                    Utc::now(),
+                );
+            }
+        }
+        self.host.release_orchestration_turn(&self.run_id);
+    }
+}
+
+impl AdmissionGuard {
+    fn release(mut self) {
+        self.armed = false;
         self.host.release_orchestration_turn(&self.run_id);
     }
 }
@@ -3349,14 +3391,19 @@ impl OrchestrationService {
             rid.clone(),
             LiveAttempt {
                 attempt_id: attempt_id.clone(),
-                model_abort,
+                model_abort: model_abort.clone(),
             },
         );
 
         let join = tokio::spawn(async move {
             let admission_guard = AdmissionGuard {
                 host: host.clone(),
+                store: store.clone(),
                 run_id: rid.clone(),
+                attempt_id: attempt_id.clone(),
+                owner_instance_id: owner_instance_id.clone(),
+                model_abort,
+                armed: true,
             };
             let deadline = tokio::time::sleep(Duration::from_millis(max_ms.max(1)));
             tokio::pin!(deadline);
@@ -3655,7 +3702,7 @@ impl OrchestrationService {
             }
             // Release capacity before waking the scheduler, so a queued task
             // can be promoted immediately and fairly.
-            drop(admission_guard);
+            admission_guard.release();
             if let Some(service) = service_ref.upgrade() {
                 service.live_attempts.lock().remove(&rid);
                 service.pump_pending();
