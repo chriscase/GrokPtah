@@ -868,16 +868,23 @@ impl AlwaysOnFixture {
             work: usize::try_from(
                 native_work
                     .checked_add(self.decision_work)
+                    .and_then(|total| total.checked_add(1))
                     .ok_or(DiagnosticCode::FixtureInvalid)?,
             )
             .map_err(|_| DiagnosticCode::FixtureInvalid)?,
             runs: usize::try_from(
                 native_work
                     .checked_add(self.proposal_runs)
+                    .and_then(|total| total.checked_add(1))
                     .ok_or(DiagnosticCode::FixtureInvalid)?,
             )
             .map_err(|_| DiagnosticCode::FixtureInvalid)?,
-            intents: usize::try_from(native_work).map_err(|_| DiagnosticCode::FixtureInvalid)?,
+            intents: usize::try_from(
+                native_work
+                    .checked_add(1)
+                    .ok_or(DiagnosticCode::FixtureInvalid)?,
+            )
+            .map_err(|_| DiagnosticCode::FixtureInvalid)?,
         })
     }
 }
@@ -6550,9 +6557,9 @@ mod tests {
     #[test]
     fn always_on_cardinality_comparison_rejects_each_growth_dimension() {
         let expected = AlwaysOnCardinality {
-            work: 4,
-            runs: 4,
-            intents: 3,
+            work: 5,
+            runs: 5,
+            intents: 4,
         };
         for mutant in [
             AlwaysOnCardinality {
