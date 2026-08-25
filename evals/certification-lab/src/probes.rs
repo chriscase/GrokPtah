@@ -1426,7 +1426,12 @@ async fn always_on_home_a(
 
     for step in fixture.native_steps() {
         let items = work_for_step(&work, step);
-        if items.len() != 1 || items[0]["state"].as_str() != Some("succeeded") {
+        let expected_state = if step == fixture.step_failing {
+            "failed"
+        } else {
+            "succeeded"
+        };
+        if items.len() != 1 || items[0]["state"].as_str() != Some(expected_state) {
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
         let work_id = items[0]["workId"]
