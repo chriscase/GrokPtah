@@ -2973,13 +2973,13 @@ fn audited_walk_start(root: &Path, head: &str) -> AuditedWalkStart {
     }
     match parents.len() {
         1 => AuditedWalkStart::Direct,
-        2 => {
+        3 => {
             let merge_tree = git_stdout_at(root, &["rev-parse", &format!("{head}^{{tree}}")]);
             let second_parent_tree =
-                git_stdout_at(root, &["rev-parse", &format!("{}^{{tree}}", parents[1])]);
+                git_stdout_at(root, &["rev-parse", &format!("{}^{{tree}}", parents[2])]);
             match (merge_tree, second_parent_tree) {
                 (Ok(merge_tree), Ok(second_parent_tree)) if merge_tree == second_parent_tree => {
-                    AuditedWalkStart::SecondParent(parents[1].to_string())
+                    AuditedWalkStart::SecondParent(parents[2].to_string())
                 }
                 _ => AuditedWalkStart::RetainHead,
             }
@@ -3549,7 +3549,7 @@ fn octopus_merge_retains_merge_sha() {
     );
     let merge = detector_test_git(repo.path(), &["rev-parse", "HEAD"]);
     let parents = detector_test_git(repo.path(), &["rev-list", "--parents", "-n", "1", "HEAD"]);
-    assert_eq!(parents.split_whitespace().count(), 4);
+    assert_eq!(parents.split_whitespace().count(), 5);
     assert_eq!(detect_audited_source_revision_at(repo.path()), merge);
 }
 
