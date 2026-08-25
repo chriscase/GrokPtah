@@ -726,6 +726,16 @@ pub struct ProcessService {
 }
 
 impl ProcessService {
+    /// Whether a service binary is available to launch. The certification
+    /// workflow builds it and exports `GROKPTAH_SERVICE_BIN`; without it the
+    /// probe has nothing to certify and must report a capability gap rather
+    /// than a result.
+    pub fn launchable() -> bool {
+        std::env::var_os("GROKPTAH_SERVICE_BIN")
+            .map(PathBuf::from)
+            .is_some_and(|bin| bin.is_file())
+    }
+
     pub fn spawn() -> Result<Self> {
         let bin =
             PathBuf::from(std::env::var("GROKPTAH_SERVICE_BIN").context("GROKPTAH_SERVICE_BIN")?);

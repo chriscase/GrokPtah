@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::local_service::LocalService;
 use crate::manifest::ProbeDefinition;
+use crate::process_service::{ProcessService, ProviderDisposition};
 use crate::report::{
     diagnostic_failure_class, opaque_durable_id, ArgumentFieldCode, DiagnosticCode, DurableIdKind,
     DurableStateCode, EntityKind, EvidenceCounters, LoopbackProviderObservation, OpaqueDurableId,
@@ -481,6 +482,22 @@ pub fn implementation_tools(probe_id: &str) -> Option<&'static [&'static str]> {
             "ptah_list_execution_intents",
             "ptah_get_capacity",
         ]),
+        "always-on-grokbot-lifecycle-v1" => Some(&[
+            "ptah_create_session",
+            "ptah_submit_task",
+            "ptah_cancel",
+            "ptah_get_run",
+            "ptah_list_persistent_agents",
+            "ptah_set_managed_execution",
+            "ptah_create_manager_plan",
+            "ptah_tick_manager_plan",
+            "ptah_get_manager_plan",
+            "ptah_list_work",
+            "ptah_get_work",
+            "ptah_list_runs",
+            "ptah_list_execution_intents",
+            "ptah_get_capacity",
+        ]),
         "native-restart-intent-adoption-v1" => Some(&[
             "ptah_create_session",
             "ptah_submit_task",
@@ -540,6 +557,9 @@ pub async fn execute_minimal_probe(
         "native-interruption-retry-policy-v1" | "native-restart-intent-adoption-v1" => {
             Err(DiagnosticCode::ProbeImplementationUnavailable)
         }
+        // Implemented, but only over the launched process transport: the
+        // restart fence needs SIGKILL of a real service process.
+        "always-on-grokbot-lifecycle-v1" => Err(DiagnosticCode::TransportIneligible),
         _ => Err(DiagnosticCode::ProbeImplementationUnavailable),
     };
     match outcome {
@@ -4726,6 +4746,978 @@ fn request_id(prefix: &str) -> String {
     format!("cert-{prefix}-{}", Uuid::new_v4().simple())
 }
 
+// ---------------------------------------------------------------------------
+// Always-on Grokbot lifecycle probe
+//
+// "Grokbot" here is GrokPtah's internal certification lane name. The probe
+// talks to a standalone `grokptah-service` over the public MCP control plane
+// and a loopback fake provider; it introduces no product dependency.
+// ---------------------------------------------------------------------------
+
+/// Bounded wait for the autonomous Manager DAG. The manifest bounds the probe
+/// by wall clock, so every poll here is deadline-bound rather than unbounded.
+const ALWAYS_ON_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn always_on_managed_policy() -> Value {
+    json!({
+        "enabled": true,
+        "allowedWorkKinds": [],
+        "allowedSourceRoutineIds": [],
+        "maxConcurrentRuns": 2,
+        "bounds": {
+            "maxPromptBytes": 16384,
+            "maxRounds": 4,
+            "maxDurationMs": 45000,
+            "maxTotalTokens": 8000
+        },
+        "retryEligible": false,
+        "requiresApprovalBeforeExecution": false
+    })
+}
+
+fn always_on_step(step_id: &str, objective: &str, deps: &[&str], agent_id: &str) -> Value {
+    json!({
+        "stepId": step_id,
+        "kind": "native",
+        "objective": objective,
+        "assignedAgentId": agent_id,
+        "dependencies": deps,
+        "policy": {
+            "bounds": {
+                "maxPromptBytes": 16384,
+                "maxRounds": 4,
+                "maxDurationMs": 45000,
+                "maxTotalTokens": 8000
+            },
+            "retry": {
+                "maxAttempts": 1,
+                "retryFailed": false,
+                "retryExpired": false,
+                "backoffMs": 0
+            },
+            "requiresApproval": false,
+            "maxConcurrentAttempts": 1
+        }
+    })
+}
+
+/// Exact cardinalities the no-duplicate and no-resume oracles compare. Any
+/// growth across a post-success tick, a replay, or a restart is a duplicate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AlwaysOnCardinality {
+    work: usize,
+    runs: usize,
+    intents: usize,
+}
+
+fn always_on_terminal_run(state: Option<&str>) -> bool {
+    matches!(
+        state,
+        Some("succeeded" | "failed" | "cancelled" | "interrupted" | "limit_reached")
+    )
+}
+
+fn always_on_state_code(state: Option<&str>) -> DurableStateCode {
+    match state {
+        Some("queued") => DurableStateCode::Queued,
+        Some("running") => DurableStateCode::Running,
+        Some("succeeded") => DurableStateCode::Succeeded,
+        Some("failed") => DurableStateCode::Failed,
+        Some("cancelled") => DurableStateCode::Cancelled,
+        Some("interrupted") => DurableStateCode::Interrupted,
+        _ => DurableStateCode::Unknown,
+    }
+}
+
+struct AlwaysOnLane {
+    session: String,
+    workspace: String,
+    agent_id: String,
+}
+
+/// The exact identities a held request must keep across every restart.
+#[derive(Clone, Debug)]
+struct AlwaysOnHeldJoin {
+    work_id: String,
+    attempt_id: String,
+    run_id: String,
+}
+
+async fn always_on_snapshot(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    lane: &AlwaysOnLane,
+) -> Result<AlwaysOnCardinality, DiagnosticCode> {
+    let scope = json!({ "session_id": lane.session, "workspace": lane.workspace });
+    let fields = vec![ArgumentFieldCode::SessionId, ArgumentFieldCode::Workspace];
+    let work = probe
+        .call(
+            client,
+            TraceOperationCode::ListWork,
+            "ptah_list_work",
+            scope.clone(),
+            fields.clone(),
+        )
+        .await?;
+    let runs = probe
+        .call(
+            client,
+            TraceOperationCode::ListRuns,
+            "ptah_list_runs",
+            scope.clone(),
+            fields.clone(),
+        )
+        .await?;
+    let intents = probe
+        .call(
+            client,
+            TraceOperationCode::ListExecutionIntents,
+            "ptah_list_execution_intents",
+            scope,
+            fields,
+        )
+        .await?;
+    Ok(AlwaysOnCardinality {
+        work: always_on_work_items(&work).len(),
+        runs: runs["runs"].as_array().map(Vec::len).unwrap_or_default(),
+        intents: intents["intents"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or_default(),
+    })
+}
+
+async fn always_on_bootstrap(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    workspace: &str,
+) -> Result<AlwaysOnLane, DiagnosticCode> {
+    let created = probe
+        .call(
+            client,
+            TraceOperationCode::CreateSession,
+            "ptah_create_session",
+            json!({ "workspace": workspace, "title": SAFE_TITLE }),
+            vec![ArgumentFieldCode::Workspace],
+        )
+        .await?;
+    let session = created["sessionId"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or(DiagnosticCode::McpResultMalformed)?
+        .to_string();
+    probe.retain_id(DurableIdKind::Session, &session);
+
+    let submitted = probe
+        .call(
+            client,
+            TraceOperationCode::SubmitRun,
+            "ptah_submit_task",
+            json!({
+                "request_id": format!("always-on-setup-{}", Uuid::new_v4()),
+                "session_id": session,
+                "workspace": workspace,
+                "prompt": "GROKBOT_SETUP materialize the lane Agent"
+            }),
+            vec![
+                ArgumentFieldCode::RequestId,
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::Prompt,
+            ],
+        )
+        .await?;
+    let run_id = submitted["runId"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or(DiagnosticCode::McpResultMalformed)?
+        .to_string();
+    probe.retain_id(DurableIdKind::Run, &run_id);
+
+    let mut settled = false;
+    for _ in 0..600 {
+        let run = probe
+            .call(
+                client,
+                TraceOperationCode::GetRun,
+                "ptah_get_run",
+                json!({
+                    "session_id": session,
+                    "workspace": workspace,
+                    "run_id": run_id
+                }),
+                vec![
+                    ArgumentFieldCode::SessionId,
+                    ArgumentFieldCode::Workspace,
+                    ArgumentFieldCode::RunId,
+                ],
+            )
+            .await?;
+        if always_on_terminal_run(run["state"].as_str()) {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(ALWAYS_ON_POLL).await;
+    }
+    if !settled {
+        return Err(DiagnosticCode::Timeout);
+    }
+
+    let mut agent_id = String::new();
+    for _ in 0..600 {
+        let agents = probe
+            .call(
+                client,
+                TraceOperationCode::ListAgents,
+                "ptah_list_persistent_agents",
+                json!({}),
+                vec![],
+            )
+            .await?;
+        let listed = agents["agents"]
+            .as_array()
+            .ok_or(DiagnosticCode::McpResultMalformed)?;
+        if listed.len() > 1 {
+            // The lane must materialize exactly one Agent; more than one means
+            // the setup Run was admitted twice.
+            return Err(DiagnosticCode::StateTransitionMismatch);
+        }
+        if let Some(found) = listed
+            .first()
+            .and_then(|agent| agent["agentId"].as_str())
+            .filter(|value| !value.is_empty())
+        {
+            agent_id = found.to_string();
+            break;
+        }
+        tokio::time::sleep(ALWAYS_ON_POLL).await;
+    }
+    if agent_id.is_empty() {
+        return Err(DiagnosticCode::Timeout);
+    }
+    probe.retain_id(DurableIdKind::Agent, &agent_id);
+
+    probe
+        .call(
+            client,
+            TraceOperationCode::SetManagedExecution,
+            "ptah_set_managed_execution",
+            json!({
+                "session_id": session,
+                "workspace": workspace,
+                "agent_id": agent_id,
+                "policy": always_on_managed_policy()
+            }),
+            vec![
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::AgentId,
+                ArgumentFieldCode::Policy,
+            ],
+        )
+        .await?;
+
+    Ok(AlwaysOnLane {
+        session,
+        workspace: workspace.to_string(),
+        agent_id,
+    })
+}
+
+struct AlwaysOnFixture {
+    step_first: String,
+    step_failing: String,
+    zero_growth_window: std::time::Duration,
+}
+
+impl AlwaysOnFixture {
+    fn load() -> Result<Self, DiagnosticCode> {
+        let value: Value = serde_json::from_slice(crate::ALWAYS_ON_GROKBOT_FIXTURE)
+            .map_err(|_| DiagnosticCode::FixtureInvalid)?;
+        if value["schema"].as_str() != Some(crate::ALWAYS_ON_GROKBOT_FIXTURE_SCHEMA) {
+            return Err(DiagnosticCode::FixtureInvalid);
+        }
+        let step = |name: &str| -> Result<String, DiagnosticCode> {
+            value["steps"][name]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or(DiagnosticCode::FixtureInvalid)
+        };
+        let period = value["supervisorPeriodMs"]
+            .as_u64()
+            .ok_or(DiagnosticCode::FixtureInvalid)?;
+        let periods = value["zeroGrowthSupervisorPeriods"]
+            .as_u64()
+            .ok_or(DiagnosticCode::FixtureInvalid)?;
+        Ok(Self {
+            step_first: step("first")?,
+            step_failing: step("failing")?,
+            zero_growth_window: std::time::Duration::from_millis(
+                period
+                    .checked_mul(periods)
+                    .ok_or(DiagnosticCode::FixtureInvalid)?,
+            ),
+        })
+    }
+
+    fn plan_args(&self, request_id: &str, lane: &AlwaysOnLane) -> Value {
+        json!({
+            "request_id": request_id,
+            "session_id": lane.session,
+            "workspace": lane.workspace,
+            "manager_agent_id": lane.agent_id,
+            "objective": "always-on grokbot dependent DAG",
+            "autonomous": true,
+            "max_replans": 2,
+            "max_in_flight": 2,
+            "steps": [
+                always_on_step(
+                    &self.step_first,
+                    "GROKBOT_SUCCESS first native unit",
+                    &[],
+                    &lane.agent_id
+                ),
+                always_on_step(
+                    &self.step_failing,
+                    "GROKBOT_FORCE_FAIL child that must be replaced",
+                    &[self.step_first.as_str()],
+                    &lane.agent_id
+                )
+            ]
+        })
+    }
+}
+
+fn always_on_plan_fields() -> Vec<ArgumentFieldCode> {
+    vec![
+        ArgumentFieldCode::RequestId,
+        ArgumentFieldCode::SessionId,
+        ArgumentFieldCode::Workspace,
+        ArgumentFieldCode::AgentId,
+        ArgumentFieldCode::Objective,
+        ArgumentFieldCode::Steps,
+    ]
+}
+
+async fn always_on_get_plan(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    lane: &AlwaysOnLane,
+    plan_id: &str,
+) -> Result<Value, DiagnosticCode> {
+    probe
+        .call(
+            client,
+            TraceOperationCode::GetManagerPlan,
+            "ptah_get_manager_plan",
+            json!({
+                "session_id": lane.session,
+                "workspace": lane.workspace,
+                "plan_id": plan_id
+            }),
+            vec![
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::PlanId,
+            ],
+        )
+        .await
+}
+
+fn always_on_work_items(work: &Value) -> &[Value] {
+    work.get("work")
+        .or_else(|| work.get("items"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// Work rows the Manager created for one DAG step.
+fn always_on_work_for_step<'a>(work: &'a Value, step_id: &str) -> Vec<&'a Value> {
+    always_on_work_items(work)
+        .iter()
+        .filter(|row| row["sourceManagerStepId"].as_str() == Some(step_id))
+        .collect()
+}
+
+/// Phase A: the autonomous DAG reaches `succeeded` with no manual tick, and
+/// nothing the probe does afterwards re-invokes it.
+///
+/// Oracles proven here: `always_on_plan_succeeded`, `no_duplicate_native_run`,
+/// `no_implicit_invocation_resume`, `request_replay_same_resource`,
+/// `changed_payload_conflict`.
+async fn always_on_autonomous_lifecycle(
+    probe: &mut ProbeBuilder<'_>,
+    service: &ProcessService,
+    client: &mut McpControlClient,
+    fixture: &AlwaysOnFixture,
+    lane: &AlwaysOnLane,
+) -> Result<(), DiagnosticCode> {
+    let request_id = format!("always-on-plan-{}", Uuid::new_v4());
+    let args = fixture.plan_args(&request_id, lane);
+    let created = probe
+        .call(
+            client,
+            TraceOperationCode::CreateManagerPlan,
+            "ptah_create_manager_plan",
+            args.clone(),
+            always_on_plan_fields(),
+        )
+        .await?;
+    let plan_id = created["plan"]["planId"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or(DiagnosticCode::McpResultMalformed)?
+        .to_string();
+    probe.retain_id(DurableIdKind::ManagerPlan, &plan_id);
+
+    // No manual tick before success: the plan is autonomous or it is not
+    // certified. Only `ptah_get_manager_plan` runs inside this loop.
+    let mut succeeded = false;
+    for _ in 0..2_400 {
+        let plan = always_on_get_plan(probe, client, lane, &plan_id).await?;
+        match plan["plan"]["state"].as_str() {
+            Some("succeeded") => {
+                succeeded = true;
+                break;
+            }
+            Some("failed" | "cancelled") => return Err(DiagnosticCode::OracleMismatch),
+            _ => {}
+        }
+        tokio::time::sleep(ALWAYS_ON_POLL).await;
+    }
+    if !succeeded {
+        return Err(DiagnosticCode::Timeout);
+    }
+    probe.transition(
+        EntityKind::ManagerPlan,
+        DurableStateCode::Active,
+        DurableStateCode::Succeeded,
+        Some(&plan_id),
+    );
+
+    // The first step's Work must exist exactly once and have reached
+    // `succeeded` from `queued`.
+    let work = probe
+        .call(
+            client,
+            TraceOperationCode::ListWork,
+            "ptah_list_work",
+            json!({ "session_id": lane.session, "workspace": lane.workspace }),
+            vec![ArgumentFieldCode::SessionId, ArgumentFieldCode::Workspace],
+        )
+        .await?;
+    let rows = always_on_work_for_step(&work, &fixture.step_first);
+    if rows.len() != 1 {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    let work_id = rows[0]["workId"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or(DiagnosticCode::McpResultMalformed)?
+        .to_string();
+    probe.retain_id(DurableIdKind::Work, &work_id);
+    let detailed = probe
+        .call(
+            client,
+            TraceOperationCode::GetWork,
+            "ptah_get_work",
+            json!({
+                "session_id": lane.session,
+                "workspace": lane.workspace,
+                "work_id": work_id
+            }),
+            vec![
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::WorkId,
+            ],
+        )
+        .await?;
+    if always_on_state_code(detailed["work"]["state"].as_str()) != DurableStateCode::Succeeded {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    let attempts = detailed["attempts"]
+        .as_array()
+        .ok_or(DiagnosticCode::McpResultMalformed)?;
+    if attempts.len() != 1 {
+        // A second attempt on a succeeded unit is a duplicate invocation.
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    if let Some(attempt_id) = attempts[0]["attemptId"].as_str() {
+        probe.retain_id(DurableIdKind::Attempt, attempt_id);
+    }
+    probe.transition(
+        EntityKind::Work,
+        DurableStateCode::Queued,
+        DurableStateCode::Succeeded,
+        Some(&work_id),
+    );
+
+    // Post-success ticks must be inert: no new Work, Run, or execution intent,
+    // and no further provider POST for any step.
+    let before = always_on_snapshot(probe, client, lane).await?;
+    let before_posts = (
+        service.provider.count_for(&fixture.step_first),
+        service.provider.count_for(&fixture.step_failing),
+        service.provider.send_count(),
+    );
+    for _ in 0..2 {
+        probe
+            .call(
+                client,
+                TraceOperationCode::TickManagerPlan,
+                "ptah_tick_manager_plan",
+                json!({
+                    "request_id": format!("always-on-tick-{}", Uuid::new_v4()),
+                    "session_id": lane.session,
+                    "workspace": lane.workspace,
+                    "plan_id": plan_id
+                }),
+                vec![
+                    ArgumentFieldCode::RequestId,
+                    ArgumentFieldCode::SessionId,
+                    ArgumentFieldCode::Workspace,
+                    ArgumentFieldCode::PlanId,
+                ],
+            )
+            .await?;
+    }
+    let after = always_on_snapshot(probe, client, lane).await?;
+    if after != before {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    if before_posts
+        != (
+            service.provider.count_for(&fixture.step_first),
+            service.provider.count_for(&fixture.step_failing),
+            service.provider.send_count(),
+        )
+    {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+
+    // Same request id, same payload: the same plan, never a second one.
+    let replay = probe
+        .call(
+            client,
+            TraceOperationCode::CreateManagerPlan,
+            "ptah_create_manager_plan",
+            args.clone(),
+            always_on_plan_fields(),
+        )
+        .await?;
+    if replay["plan"]["planId"].as_str() != Some(plan_id.as_str()) {
+        return Err(DiagnosticCode::IdempotencyReplayMismatch);
+    }
+    if always_on_snapshot(probe, client, lane).await? != after {
+        return Err(DiagnosticCode::IdempotencyReplayMismatch);
+    }
+
+    // Same request id, different payload: a conflict, and still no new state.
+    let mut conflicting = args;
+    conflicting["objective"] = json!("changed payload must conflict");
+    match probe
+        .call(
+            client,
+            TraceOperationCode::CreateManagerPlan,
+            "ptah_create_manager_plan",
+            conflicting,
+            always_on_plan_fields(),
+        )
+        .await
+    {
+        Ok(_) => return Err(DiagnosticCode::IdempotencyConflictAccepted),
+        Err(DiagnosticCode::StateTransitionMismatch | DiagnosticCode::McpToolError) => {}
+        Err(_) => return Err(DiagnosticCode::IdempotencyConflictUnproven),
+    }
+    if always_on_snapshot(probe, client, lane).await? != after {
+        return Err(DiagnosticCode::IdempotencyConflictUnproven);
+    }
+    Ok(())
+}
+
+/// Waits until the held step has one Work row whose latest attempt is linked
+/// to a `running` Run. This is the causal join the restart fence must keep.
+async fn always_on_wait_in_flight(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    lane: &AlwaysOnLane,
+    step_id: &str,
+) -> Result<AlwaysOnHeldJoin, DiagnosticCode> {
+    for _ in 0..2_400 {
+        let work = probe
+            .call(
+                client,
+                TraceOperationCode::ListWork,
+                "ptah_list_work",
+                json!({ "session_id": lane.session, "workspace": lane.workspace }),
+                vec![ArgumentFieldCode::SessionId, ArgumentFieldCode::Workspace],
+            )
+            .await?;
+        let rows = always_on_work_for_step(&work, step_id);
+        if rows.len() > 1 {
+            return Err(DiagnosticCode::StateTransitionMismatch);
+        }
+        if let Some(work_id) = rows
+            .first()
+            .and_then(|row| row["workId"].as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+        {
+            let detailed = probe
+                .call(
+                    client,
+                    TraceOperationCode::GetWork,
+                    "ptah_get_work",
+                    json!({
+                        "session_id": lane.session,
+                        "workspace": lane.workspace,
+                        "work_id": work_id
+                    }),
+                    vec![
+                        ArgumentFieldCode::SessionId,
+                        ArgumentFieldCode::Workspace,
+                        ArgumentFieldCode::WorkId,
+                    ],
+                )
+                .await?;
+            let work_state = detailed["work"]["state"].as_str().unwrap_or_default();
+            let attempt = detailed["attempts"]
+                .as_array()
+                .and_then(|attempts| attempts.last())
+                .cloned()
+                .unwrap_or(Value::Null);
+            let attempt_id = attempt["attemptId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let run_id = attempt["linkedRunIds"]
+                .as_array()
+                .and_then(|runs| runs.first())
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if matches!(work_state, "running" | "leased")
+                && !attempt_id.is_empty()
+                && !run_id.is_empty()
+            {
+                let run = probe
+                    .call(
+                        client,
+                        TraceOperationCode::GetRun,
+                        "ptah_get_run",
+                        json!({
+                            "session_id": lane.session,
+                            "workspace": lane.workspace,
+                            "run_id": run_id
+                        }),
+                        vec![
+                            ArgumentFieldCode::SessionId,
+                            ArgumentFieldCode::Workspace,
+                            ArgumentFieldCode::RunId,
+                        ],
+                    )
+                    .await?;
+                if run["state"].as_str() == Some("running") {
+                    probe.retain_id(DurableIdKind::Work, &work_id);
+                    probe.retain_id(DurableIdKind::Attempt, &attempt_id);
+                    probe.retain_id(DurableIdKind::Run, &run_id);
+                    return Ok(AlwaysOnHeldJoin {
+                        work_id,
+                        attempt_id,
+                        run_id,
+                    });
+                }
+            }
+        }
+        tokio::time::sleep(ALWAYS_ON_POLL).await;
+    }
+    Err(DiagnosticCode::Timeout)
+}
+
+/// After a SIGKILL the held Run must be `interrupted`, its Work `failed`, the
+/// identities unchanged, and the provider must not have been sent the request
+/// a second time.
+async fn always_on_assert_interrupted_fence(
+    probe: &mut ProbeBuilder<'_>,
+    service: &ProcessService,
+    client: &mut McpControlClient,
+    lane: &AlwaysOnLane,
+    join: &AlwaysOnHeldJoin,
+    semantic: &str,
+) -> Result<(), DiagnosticCode> {
+    let mut run_terminal = false;
+    for _ in 0..2_400 {
+        let run = probe
+            .call(
+                client,
+                TraceOperationCode::GetRun,
+                "ptah_get_run",
+                json!({
+                    "session_id": lane.session,
+                    "workspace": lane.workspace,
+                    "run_id": join.run_id
+                }),
+                vec![
+                    ArgumentFieldCode::SessionId,
+                    ArgumentFieldCode::Workspace,
+                    ArgumentFieldCode::RunId,
+                ],
+            )
+            .await?;
+        if run["runId"].as_str() == Some(join.run_id.as_str())
+            && always_on_terminal_run(run["state"].as_str())
+        {
+            if run["state"].as_str() != Some("interrupted") {
+                return Err(DiagnosticCode::StateTransitionMismatch);
+            }
+            run_terminal = true;
+            break;
+        }
+        tokio::time::sleep(ALWAYS_ON_POLL).await;
+    }
+    if !run_terminal {
+        return Err(DiagnosticCode::Timeout);
+    }
+
+    let mut work_failed = false;
+    for _ in 0..2_400 {
+        let detailed = probe
+            .call(
+                client,
+                TraceOperationCode::GetWork,
+                "ptah_get_work",
+                json!({
+                    "session_id": lane.session,
+                    "workspace": lane.workspace,
+                    "work_id": join.work_id
+                }),
+                vec![
+                    ArgumentFieldCode::SessionId,
+                    ArgumentFieldCode::Workspace,
+                    ArgumentFieldCode::WorkId,
+                ],
+            )
+            .await?;
+        let state = detailed["work"]["state"].as_str();
+        if state == Some("failed") {
+            // The recovered attempt must be the same one that was in flight;
+            // a new attempt id would mean the unit was silently re-invoked.
+            let same_attempt = detailed["attempts"].as_array().is_some_and(|attempts| {
+                attempts.len() == 1
+                    && attempts[0]["attemptId"].as_str() == Some(join.attempt_id.as_str())
+            });
+            if !same_attempt {
+                return Err(DiagnosticCode::StateTransitionMismatch);
+            }
+            work_failed = true;
+            break;
+        }
+        if state == Some("queued") {
+            // Re-queueing the held unit is exactly the readmission this fence
+            // exists to refuse.
+            return Err(DiagnosticCode::StateTransitionMismatch);
+        }
+        tokio::time::sleep(ALWAYS_ON_POLL).await;
+    }
+    if !work_failed {
+        return Err(DiagnosticCode::Timeout);
+    }
+    if service.provider.count_for(semantic) != 1 {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    Ok(())
+}
+
+/// Nothing may grow while the supervisor runs its window: no new Work, Run, or
+/// execution intent, and no resend of the held request.
+async fn always_on_assert_zero_growth(
+    probe: &mut ProbeBuilder<'_>,
+    service: &ProcessService,
+    client: &mut McpControlClient,
+    lane: &AlwaysOnLane,
+    fixture: &AlwaysOnFixture,
+    semantic: &str,
+) -> Result<(), DiagnosticCode> {
+    let before = always_on_snapshot(probe, client, lane).await?;
+    let posts = service.provider.count_for(semantic);
+    tokio::time::sleep(fixture.zero_growth_window).await;
+    if always_on_snapshot(probe, client, lane).await? != before {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    if service.provider.count_for(semantic) != posts || posts != 1 {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    Ok(())
+}
+
+/// Phase B: a held provider POST plus two same-home SIGKILL recoveries.
+///
+/// Oracles proven here: `interrupted_run_not_readmitted_within_window`,
+/// `durable_read_after_restart`, `restart_reconnect_observed`.
+async fn always_on_restart_fence(
+    probe: &mut ProbeBuilder<'_>,
+    fixture: &AlwaysOnFixture,
+) -> Result<(), DiagnosticCode> {
+    // A separate home: phase A already drove this step to success, and the
+    // hold has to be armed before the Manager ever posts.
+    let mut service = ProcessService::spawn().map_err(|_| DiagnosticCode::ServiceUnreachable)?;
+    service
+        .provider
+        .arm(&fixture.step_first, ProviderDisposition::Hold);
+    let mut client = service
+        .client()
+        .await
+        .map_err(|_| DiagnosticCode::McpInitializeFailed)?;
+    let workspace = service.workspace.display().to_string();
+    let lane = always_on_bootstrap(probe, &mut client, &workspace).await?;
+
+    let request_id = format!("always-on-held-{}", Uuid::new_v4());
+    probe
+        .call(
+            &mut client,
+            TraceOperationCode::CreateManagerPlan,
+            "ptah_create_manager_plan",
+            fixture.plan_args(&request_id, &lane),
+            always_on_plan_fields(),
+        )
+        .await?;
+    service
+        .provider
+        .wait_accepted(&fixture.step_first, std::time::Duration::from_secs(120))
+        .map_err(|_| DiagnosticCode::Timeout)?;
+    if service.provider.count_for(&fixture.step_first) != 1 {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    let join = always_on_wait_in_flight(probe, &mut client, &lane, &fixture.step_first).await?;
+    probe.transition(
+        EntityKind::Run,
+        DurableStateCode::Running,
+        DurableStateCode::Interrupted,
+        Some(&join.run_id),
+    );
+    probe.transition(
+        EntityKind::Work,
+        DurableStateCode::Running,
+        DurableStateCode::Failed,
+        Some(&join.work_id),
+    );
+
+    let mut pids = vec![service.pid()];
+    for _ in 0..2 {
+        probe.push_trace(TraceOperationCode::Disconnect, vec![], None)?;
+        let _ = client.close_session().await;
+        probe.push_trace(TraceOperationCode::Restart, vec![], None)?;
+        service
+            .respawn()
+            .map_err(|_| DiagnosticCode::RestartControlUnavailable)?;
+        probe.counters.restarts = probe
+            .counters
+            .restarts
+            .checked_add(1)
+            .ok_or(DiagnosticCode::BoundExceeded)?;
+        let pid = service.pid();
+        if pids.contains(&pid) {
+            return Err(DiagnosticCode::RestartControlUnavailable);
+        }
+        pids.push(pid);
+        probe.push_trace(TraceOperationCode::Reconnect, vec![], None)?;
+        client = service
+            .client()
+            .await
+            .map_err(|_| DiagnosticCode::McpInitializeFailed)?;
+        always_on_assert_interrupted_fence(
+            probe,
+            &service,
+            &mut client,
+            &lane,
+            &join,
+            &fixture.step_first,
+        )
+        .await?;
+        always_on_assert_zero_growth(
+            probe,
+            &service,
+            &mut client,
+            &lane,
+            fixture,
+            &fixture.step_first,
+        )
+        .await?;
+    }
+
+    probe.restart = RestartEvidence {
+        attempted: true,
+        host_owned: true,
+        durable_read_recovered: true,
+        event_cursor_recovered: false,
+        implicit_execution_observed: false,
+    };
+    probe.reconnect = ReconnectEvidence {
+        attempted: true,
+        reinitialized: true,
+        cursor_before: None,
+        cursor_after: None,
+        continuity_proven: false,
+    };
+    service
+        .scan_artifacts()
+        .map_err(|_| DiagnosticCode::RedactionRejected)?;
+    Ok(())
+}
+
+/// Execute the always-on lifecycle probe.
+///
+/// The probe owns a standalone `grokptah-service` process and a loopback fake
+/// provider, because the manifest's restart fence needs SIGKILL of a real
+/// process, which the in-process lab host cannot provide. Without a service
+/// binary to launch there is nothing to certify, so the probe reports a
+/// capability gap rather than a pass; a skipped probe still leaves the
+/// campaign uncertified.
+pub async fn execute_always_on_grokbot_probe(definition: &ProbeDefinition) -> ProbeExecution {
+    let mut probe = ProbeBuilder::new(definition);
+    if !ProcessService::launchable() {
+        return probe.finish(ProbeStatus::Skipped, DiagnosticCode::CapabilityAbsent);
+    }
+    let outcome = always_on_grokbot_lifecycle(&mut probe).await;
+    match outcome {
+        Ok(()) => probe.finish(ProbeStatus::Passed, DiagnosticCode::Ok),
+        Err(DiagnosticCode::CapabilityAbsent) => {
+            probe.finish(ProbeStatus::Skipped, DiagnosticCode::CapabilityAbsent)
+        }
+        Err(code) => probe.finish(ProbeStatus::Failed, code),
+    }
+}
+
+async fn always_on_grokbot_lifecycle(probe: &mut ProbeBuilder<'_>) -> Result<(), DiagnosticCode> {
+    let fixture = AlwaysOnFixture::load()?;
+    let service = ProcessService::spawn().map_err(|_| DiagnosticCode::ServiceUnreachable)?;
+    let mut client = service
+        .client()
+        .await
+        .map_err(|_| DiagnosticCode::McpInitializeFailed)?;
+    let workspace = service.workspace.display().to_string();
+    probe
+        .call(
+            &mut client,
+            TraceOperationCode::GetCapacity,
+            "ptah_get_capacity",
+            json!({}),
+            vec![],
+        )
+        .await?;
+    let lane = always_on_bootstrap(probe, &mut client, &workspace).await?;
+    always_on_autonomous_lifecycle(probe, &service, &mut client, &fixture, &lane).await?;
+    service
+        .scan_artifacts()
+        .map_err(|_| DiagnosticCode::RedactionRejected)?;
+    drop(client);
+    drop(service);
+    always_on_restart_fence(probe, &fixture).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4745,6 +5737,52 @@ mod tests {
             assert!(has_implementation(id));
             assert!(manifest.probe(id).is_some());
         }
+    }
+
+    /// The configuration contract that was broken: a release workflow named a
+    /// probe the lab had no implementation for, so every run of that campaign
+    /// was deterministically indeterminate. Nothing tied the two together, so
+    /// nothing failed until CI did.
+    #[test]
+    fn every_probe_a_release_workflow_runs_is_implemented_and_declared() {
+        let workflows =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
+        let manifest = CampaignManifest::bundled().unwrap();
+        let mut checked = 0usize;
+        for entry in std::fs::read_dir(&workflows).expect("read workflows") {
+            let path = entry.expect("workflow entry").path();
+            if path.extension().and_then(|value| value.to_str()) != Some("yml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read workflow");
+            for (index, _) in text.match_indices("--probe") {
+                let id: String = text[index + "--probe".len()..]
+                    .trim_start()
+                    .chars()
+                    .take_while(|value| {
+                        value.is_ascii_alphanumeric() || *value == '-' || *value == '_'
+                    })
+                    .collect();
+                if id.is_empty() {
+                    continue;
+                }
+                assert!(
+                    manifest.probe(&id).is_some(),
+                    "{} runs probe {id}, which is not in the campaign manifest",
+                    path.display()
+                );
+                assert!(
+                    has_implementation(&id),
+                    "{} runs probe {id}, which the lab does not implement",
+                    path.display()
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "no workflow-selected probe was checked; the guard would pass vacuously"
+        );
     }
 
     #[test]

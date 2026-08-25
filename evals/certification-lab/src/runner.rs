@@ -28,8 +28,9 @@ use crate::manifest::{
     AttachAccess, CampaignManifest, ProbeDefinition, ProbeEffect, ProbeScope, RunnerCapability,
 };
 use crate::probes::{
-    execute_minimal_probe, execute_native_interruption_retry_probe, execute_native_restart_probe,
-    execute_restart_probe, has_implementation, ProbeExecution,
+    execute_always_on_grokbot_probe, execute_minimal_probe,
+    execute_native_interruption_retry_probe, execute_native_restart_probe, execute_restart_probe,
+    has_implementation, ProbeExecution,
 };
 use crate::report::{
     ArtifactReference, CampaignReport, CaptureReference, CredentialMethodCode, DiagnosticCode,
@@ -398,6 +399,22 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
                                 &workspace,
                                 recorder.as_ref(),
                             ),
+                        )
+                        .await
+                        {
+                            Ok(execution) => execution,
+                            Err(_) => ProbeExecution::timed_out(definition),
+                        }
+                    }
+                    ActiveTransport::Local { .. }
+                        if definition.id == "always-on-grokbot-lifecycle-v1" =>
+                    {
+                        // The probe launches and SIGKILLs its own standalone
+                        // service, so it takes neither the shared client nor
+                        // the in-process host.
+                        match tokio::time::timeout(
+                            Duration::from_secs(definition.bounds.max_duration_seconds),
+                            execute_always_on_grokbot_probe(definition),
                         )
                         .await
                         {
