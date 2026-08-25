@@ -3061,7 +3061,8 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(body["error"]["data"]["code"], "unsupported");
+        assert_eq!(body["error"]["data"]["code"], "invalid_request");
+        assert_eq!(body["error"]["data"]["reasonCode"], "unsupported");
 
         fixture.srv.stop();
         set_grokptah_home_override(None);
