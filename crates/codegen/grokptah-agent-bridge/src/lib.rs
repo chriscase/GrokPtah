@@ -3,6 +3,7 @@
 //! No child `grok agent stdio` process on the happy path. The host owns
 //! sessions, streams typed updates, and completes permission futures from the UI.
 
+pub mod account_facts;
 mod agents_personas;
 mod auth_store;
 pub mod capability_contract;

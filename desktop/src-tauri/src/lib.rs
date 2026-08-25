@@ -141,6 +141,7 @@ pub fn run() {
             commands::set_effort,
             commands::set_always_approve,
             commands::auth_state,
+            commands::grok_account_facts,
             commands::sign_in_local,
             commands::sign_out,
             commands::auth_set_api_key,

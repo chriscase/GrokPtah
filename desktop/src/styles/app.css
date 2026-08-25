@@ -6909,3 +6909,174 @@ html[data-accent="violet"] {
     outline-color: Highlight;
   }
 }
+
+/* ── Grok Build account readiness badge ──
+   Sits beside the Run control and in Settings → Auth. Sized in em/ch so a
+   200% text setting reflows instead of clipping, and every tone is carried by
+   text as well as colour so forced-colors and monochrome stay unambiguous. */
+.grok-account-badge {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.25em;
+  min-width: 0;
+  font-size: 0.8125rem;
+}
+
+.grok-account-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  max-width: 32ch;
+  padding: 0.25em 0.6em;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-chip);
+  color: var(--muted);
+  font: inherit;
+  line-height: 1.4;
+  text-align: left;
+  cursor: pointer;
+}
+
+.grok-account-trigger:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+.grok-account-trigger:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.grok-account-dot {
+  flex: none;
+  width: 0.55em;
+  height: 0.55em;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.grok-account-tone {
+  flex: none;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* Truncate only the variable-length account summary, never the tone word. */
+.grok-account-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.grok-account-badge.is-ready .grok-account-dot {
+  background: var(--ok);
+}
+
+.grok-account-badge.is-unknown .grok-account-dot {
+  background: var(--accent);
+}
+
+.grok-account-badge.is-blocked .grok-account-dot {
+  background: var(--danger);
+}
+
+.grok-account-badge.is-blocked .grok-account-trigger {
+  border-color: rgba(240, 113, 120, 0.55);
+  color: var(--text);
+}
+
+.grok-account-detail {
+  max-width: 46ch;
+  padding: 0.5em 0.65em;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  color: var(--text);
+  line-height: 1.5;
+}
+
+.grok-account-detail[hidden] {
+  display: none;
+}
+
+.grok-account-detail-text,
+.grok-account-remedy,
+.grok-account-scope {
+  margin: 0 0 0.4em;
+}
+
+.grok-account-scope {
+  margin-bottom: 0;
+  color: var(--muted);
+}
+
+.grok-account-remedy {
+  color: var(--accent-label);
+}
+
+.grok-account-reauth {
+  margin-bottom: 0.4em;
+  padding: 0.3em 0.7em;
+  border: 1px solid var(--accent-dim);
+  border-radius: var(--radius);
+  background: var(--accent-bg);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.grok-account-reauth:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* In the composer the badge is a single row so it never pushes the Run
+   control off the toolbar; the detail panel floats above it. */
+.grok-account-badge.at-composer {
+  position: relative;
+}
+
+.grok-account-badge.at-composer .grok-account-trigger {
+  max-width: 24ch;
+}
+
+.grok-account-badge.at-composer .grok-account-detail {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 0.35em);
+  z-index: 20;
+  box-shadow: 0 6px 20px var(--overlay-soft);
+}
+
+.grok-account-badge.at-settings {
+  width: 100%;
+  margin-top: 0.5em;
+}
+
+.grok-account-badge.at-settings .grok-account-trigger {
+  max-width: 100%;
+}
+
+@media (forced-colors: active) {
+  /* Colour is unavailable here; the tone word carries the state. */
+  .grok-account-trigger,
+  .grok-account-detail,
+  .grok-account-reauth {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+    forced-color-adjust: none;
+  }
+
+  .grok-account-dot {
+    display: none;
+  }
+
+  .grok-account-trigger:focus-visible,
+  .grok-account-reauth:focus-visible {
+    outline: 2px solid Highlight;
+  }
+}

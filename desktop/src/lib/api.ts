@@ -416,6 +416,8 @@ export const api = {
   setAlwaysApprove: (value: boolean) =>
     invoke<void>("set_always_approve", { value }),
   authState: () => invoke<AuthState>("auth_state"),
+  /** Bounded, credential-free Grok Build account readiness for the editor. */
+  grokAccountFacts: () => invoke<unknown>("grok_account_facts"),
   signInLocal: (displayName: string) =>
     invoke<AuthState>("sign_in_local", { displayName }),
   signOut: () => invoke<AuthState>("sign_out"),
