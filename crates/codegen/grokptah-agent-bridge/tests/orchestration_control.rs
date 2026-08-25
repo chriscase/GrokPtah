@@ -2016,6 +2016,131 @@ async fn queued_admission_is_bounded_fair_and_cancellable() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn accepted_queued_prompt_restarts_from_private_intent_exactly_once() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let active = host.session_new_kind(SessionKind::Build).unwrap();
+    let queued = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(active.id, ws.path()).unwrap();
+    host.session_set_cwd(queued.id, ws.path()).unwrap();
+    let primary = orch_for(&host, &home, &ws, 1);
+    let auth = primary.auth_header(Some("Bearer t")).unwrap();
+    let active_run = primary
+        .submit_task(
+            &auth,
+            "durability-active",
+            active.id,
+            ws.path(),
+            "run sleep 3".into(),
+            Some(json!({"maxDurationMs": 30000})),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let full_prompt = "private queued prompt must survive service replacement";
+    let accepted = primary
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "durability-queued",
+            queued.id,
+            ws.path(),
+            full_prompt.into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+    let run_id = accepted["runId"].as_str().unwrap().to_string();
+    assert_eq!(accepted["state"], "queued");
+    let public = primary.get_run(&auth, &run_id).unwrap();
+    assert!(!serde_json::to_string(&public)
+        .unwrap()
+        .contains(full_prompt));
+    let private_entries = std::fs::read_dir(primary.store().root().join("acceptance"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry.file_name() != "sequence.json"
+                && entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(private_entries.len(), 1);
+    assert!(std::fs::read_to_string(private_entries[0].path())
+        .unwrap()
+        .contains(full_prompt));
+
+    let store = primary.store().clone();
+    drop(primary);
+    let replacement = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store,
+        OrchestrationConfig {
+            bearer_token: "t".into(),
+            allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+            max_concurrent_runs: 1,
+            bounds: RunBounds::default(),
+        },
+    );
+    let replacement_auth = replacement.auth_header(Some("Bearer t")).unwrap();
+    assert_eq!(
+        replacement.get_capacity(&replacement_auth).unwrap()["queuedRuns"],
+        1
+    );
+    replacement
+        .cancel(
+            &replacement_auth,
+            "durability-cancel-active",
+            active.id,
+            ws.path(),
+            active_run["runId"].as_str(),
+        )
+        .await
+        .unwrap();
+    let terminal = wait_run_terminal(
+        &replacement,
+        &replacement_auth,
+        &run_id,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(terminal, RunState::Completed);
+    let replay = replacement
+        .submit_task_with_execution_mode_and_queue(
+            &replacement_auth,
+            "durability-queued",
+            queued.id,
+            ws.path(),
+            full_prompt.into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay["runId"], run_id);
+    assert_eq!(
+        std::fs::read_dir(replacement.store().root().join("acceptance"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry.file_name() != "sequence.json"
+                    && entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+            })
+            .count(),
+        0
+    );
+    set_grokptah_home_override(None);
+    std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn admitted_run_reserves_session_against_desktop_prompt() {
     let (home, _lock) = setup_home();
     let host = started_host();
