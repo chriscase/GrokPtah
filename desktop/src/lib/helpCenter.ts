@@ -178,7 +178,7 @@ export const HELP_ARTICLES: HelpArticle[] = [
       "Durable runs expose a state, cursor, and evidence trail that survive an app restart. Reconnect from the advertised cursor, treat uncertain delivery as unknown, and use an explicit retry or continuation action. Never infer that a linked session or a visible queue means a provider request was sent.",
     aliases: ["restart a run", "recover interrupted agent", "resume after crash", "unknown send", "checkpoint recovery"],
     keywords: ["durable", "restart", "recover", "checkpoint", "cursor", "retry", "uncertain", "resume"],
-    sources: [{ id: "durable.runs", path: "docs/DURABLE_RUNS.md", heading: "Recovery contract" }],
+    sources: [{ id: "durable.runs", path: "docs/DURABLE_RUNS.md", heading: "Lifecycle" }],
   },
   {
     id: "operations.prompt-queue",
@@ -189,7 +189,7 @@ export const HELP_ARTICLES: HelpArticle[] = [
       "The prompt queue is scoped to a session and carries revisions so an out-of-order snapshot cannot overwrite a newer queue. Queue a future prompt when the current turn should finish; use steering only when the run exposes that control. A stale revision or uncertain delivery must fail closed instead of silently targeting another turn.",
     aliases: ["prompt queue", "steer agent", "send next prompt", "queue work", "deferred steering"],
     keywords: ["queue", "prompt", "steer", "revision", "session", "ordering", "stale"],
-    sources: [{ id: "durable.queue", path: "docs/PERSISTENT_AGENT_PROTOCOL.md", heading: "Queue and steering" }],
+    sources: [{ id: "durable.queue", path: "docs/MCP_CONTROL_COORDINATOR.md", heading: "Queue" }],
   },
   {
     id: "operations.review-receipts",
@@ -200,7 +200,7 @@ export const HELP_ARTICLES: HelpArticle[] = [
       "A review receipt binds the changed-file list, bounded diff, fingerprint, tests, and handoff to one run identity. Check the exact workspace and revision, inspect the redacted evidence, and keep approval separate from promotion. A green provider response without a matching receipt is not approval evidence.",
     aliases: ["review changes", "approval receipt", "changed file list", "diff fingerprint", "approve code review"],
     keywords: ["review", "receipt", "changed", "diff", "fingerprint", "approval", "promotion", "handoff"],
-    sources: [{ id: "review.protocol", path: "docs/INDEPENDENT_REVIEW_PROTOCOL.md", heading: "Review receipt" }],
+    sources: [{ id: "review.protocol", path: "docs/MCP_CONTROL_COORDINATOR.md", heading: "Evidence-backed handoff" }],
   },
   {
     id: "operations.mcp-coordination",
@@ -211,7 +211,7 @@ export const HELP_ARTICLES: HelpArticle[] = [
       "MCP coordination negotiates a versioned capability set, session scope, and event cursor. The transport can report a tool, but the desktop authority still applies approvals, leases, workspace fences, and redaction. Reconnect from the advertised cursor and handle recovery notifications instead of replaying an uncertain mutation.",
     aliases: ["MCP tools", "tool coordinator", "live events", "MCP reconnect", "capability negotiation"],
     keywords: ["MCP", "tool", "coordinator", "capability", "cursor", "reconnect", "authority", "event"],
-    sources: [{ id: "mcp.coordinator", path: "docs/MCP_CONTROL_COORDINATOR.md", heading: "Coordinator contract" }],
+    sources: [{ id: "mcp.coordinator", path: "docs/MCP_CONTROL_COORDINATOR.md", heading: "Cross-product capability discovery" }],
   },
   {
     id: "providers.browser-broker",
