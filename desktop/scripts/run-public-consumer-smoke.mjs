@@ -21,6 +21,7 @@ try {
     `import {
   GrokPtahBrokerClient,
   HELP_ARTICLES,
+  HELP_ENTRIES,
   applyAssistantStreamChunk,
   createPromptQueueEntry,
   emptyPromptQueueState,
@@ -33,6 +34,9 @@ import {
 } from "@grokptah/client/ui-core";
 
 if (HELP_ARTICLES.length < 1) throw new Error("consumer could not read the Help Center corpus");
+if (!Object.isFrozen(HELP_ARTICLES) || !Object.isFrozen(HELP_ENTRIES)) {
+  throw new Error("consumer Help corpora were not immutable");
+}
 if (UI_CORE_HELP_ARTICLES.length !== HELP_ARTICLES.length) {
   throw new Error("ui-core subpath exposed a different Help Center corpus");
 }

@@ -55,6 +55,12 @@ for (const name of ["HELP_ARTICLES", "searchHelpArticles", "promptQueueReducer",
 if ("GrokPtahBrokerClient" in uiCoreApi) {
   throw new Error("ui-core bundle must not expose the browser broker client");
 }
+if (!Object.isFrozen(publicApi.HELP_ARTICLES) || !Object.isFrozen(uiCoreApi.HELP_ARTICLES)) {
+  throw new Error("published Help corpus must be immutable");
+}
+if (!Object.isFrozen(publicApi.HELP_ENTRIES) || !Object.isFrozen(uiCoreApi.HELP_ENTRIES)) {
+  throw new Error("published capability-aware Help corpus must be immutable");
+}
 
 const helpHits = publicApi.searchHelp("restricted gateway", {
   audience: "operator",
