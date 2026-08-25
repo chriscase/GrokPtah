@@ -3393,7 +3393,10 @@ mod tests {
             .find(|join| join.semantic_id == SETUP_SEMANTIC_ID)
             .expect("home B setup join");
         assert_eq!(setup_b.body_digest, "d-setup-b");
-        assert_ne!(setup_a.correlation, setup_b.correlation);
+        assert_eq!(setup_b.run, opaque_durable_id(SETUP_RUN));
+        // Unit projections reuse the same setup Run id, so the Run-derived
+        // correlation matches; homes stay distinct by body digest.
+        assert_eq!(setup_a.correlation, setup_b.correlation);
         assert_ne!(setup_a.body_digest, setup_b.body_digest);
         let held_b = home_b
             .joins
