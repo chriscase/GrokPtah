@@ -2145,6 +2145,147 @@ async fn accepted_queued_prompt_restarts_from_private_intent_exactly_once() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn thirty_two_queued_admissions_recover_fifo_and_dispatch_once() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let mut sessions = Vec::new();
+    for _ in 0..33 {
+        let session = host.session_new_kind(SessionKind::Build).unwrap();
+        host.session_set_cwd(session.id, ws.path()).unwrap();
+        sessions.push(session.id);
+    }
+    let primary = orch_for(&host, &home, &ws, 1);
+    let auth = primary.auth_header(Some("Bearer t")).unwrap();
+    let active = primary
+        .submit_task(
+            &auth,
+            "fifo-active",
+            sessions[0],
+            ws.path(),
+            "run sleep 3".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut queued = Vec::new();
+    for (index, session_id) in sessions.iter().copied().skip(1).enumerate() {
+        let request_id = format!("fifo-queued-{index}");
+        let response = primary
+            .submit_task_with_execution_mode_and_queue(
+                &auth,
+                &request_id,
+                session_id,
+                ws.path(),
+                format!("queued fifo prompt {index}"),
+                None,
+                RunExecutionMode::Shared,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["state"], "queued");
+        assert_eq!(response["queuedPosition"], index + 1);
+        queued.push((
+            request_id,
+            session_id,
+            response["runId"].as_str().unwrap().to_string(),
+        ));
+    }
+    assert_eq!(primary.get_capacity(&auth).unwrap()["queuedRuns"], 32);
+
+    let store = primary.store().clone();
+    drop(primary);
+    let replacement = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store,
+        OrchestrationConfig {
+            bearer_token: "t".into(),
+            allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+            max_concurrent_runs: 1,
+            bounds: RunBounds::default(),
+        },
+    );
+    let replacement_auth = replacement.auth_header(Some("Bearer t")).unwrap();
+    assert_eq!(
+        replacement.get_capacity(&replacement_auth).unwrap()["queuedRuns"],
+        32
+    );
+    let mut events = host.event_bus().subscribe();
+    replacement
+        .cancel(
+            &replacement_auth,
+            "fifo-cancel-active",
+            sessions[0],
+            ws.path(),
+            active["runId"].as_str(),
+        )
+        .await
+        .unwrap();
+    let mut started_order = Vec::new();
+    for (_, session_id, run_id) in &queued {
+        assert_eq!(
+            wait_run_terminal(
+                &replacement,
+                &replacement_auth,
+                run_id,
+                Duration::from_secs(20)
+            )
+            .await,
+            RunState::Completed
+        );
+        while let Ok(event) = events.try_recv() {
+            if let SessionUpdate::TurnStarted { session_id, .. } = event {
+                started_order.push(session_id);
+            }
+        }
+    }
+    assert_eq!(
+        started_order,
+        queued
+            .iter()
+            .map(|(_, session_id, _)| *session_id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        replacement.get_capacity(&replacement_auth).unwrap()["queuedRuns"],
+        0
+    );
+
+    let (request_id, session_id, run_id) = &queued[17];
+    let replay = replacement
+        .submit_task_with_execution_mode_and_queue(
+            &replacement_auth,
+            request_id,
+            *session_id,
+            ws.path(),
+            "queued fifo prompt 17".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay["runId"], run_id);
+    assert_eq!(
+        std::fs::read_dir(replacement.store().root().join("acceptance"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name() != "sequence.json")
+            .count(),
+        0
+    );
+    set_grokptah_home_override(None);
+    std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn admitted_run_reserves_session_against_desktop_prompt() {
     let (home, _lock) = setup_home();
     let host = started_host();
