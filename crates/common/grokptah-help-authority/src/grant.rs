@@ -181,6 +181,19 @@ fn mac_fields(grant: &HelpGrant) -> Vec<String> {
 /// crate already depends on `sha2` and nothing else, and a Help grant does not
 /// justify widening the trusted dependency surface.
 fn grant_mac(key: &GrantMintingKey, grant: &HelpGrant) -> String {
+    let fields = mac_fields(grant);
+    let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+    hmac_sha256(key, &domain_digest("grokptah.help.grant.v1", &refs))
+}
+
+/// HMAC-SHA256, built explicitly from `sha2`.
+///
+/// Shared with the admission module so a grant and an admission are MAC'd by
+/// the same construction under the same key. They are still not
+/// interchangeable: each hashes a *domain-separated* payload first, so a grant
+/// MAC can never verify as an admission MAC even though both use this
+/// function.
+pub(crate) fn hmac_sha256(key: &GrantMintingKey, payload: &str) -> String {
     const BLOCK: usize = 64;
     let mut normalized = [0u8; BLOCK];
     if key.secret.len() > BLOCK {
@@ -196,10 +209,6 @@ fn grant_mac(key: &GrantMintingKey, grant: &HelpGrant) -> String {
         outer_pad[index] ^= normalized[index];
     }
 
-    let fields = mac_fields(grant);
-    let refs: Vec<&str> = fields.iter().map(String::as_str).collect();
-    let payload = domain_digest("grokptah.help.grant.v1", &refs);
-
     let mut inner = Sha256::new();
     inner.update(inner_pad);
     inner.update(payload.as_bytes());
@@ -212,7 +221,7 @@ fn grant_mac(key: &GrantMintingKey, grant: &HelpGrant) -> String {
 }
 
 /// Constant-time comparison, so a rejected MAC leaks no prefix information.
-fn constant_time_eq(left: &str, right: &str) -> bool {
+pub(crate) fn constant_time_eq(left: &str, right: &str) -> bool {
     if left.len() != right.len() {
         return false;
     }

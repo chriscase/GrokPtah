@@ -327,3 +327,55 @@ fn a_manifest_rebuild_invalidates_the_grant() {
     assert!(!response.allowed);
     assert_eq!(response.denied_because, Some(DenyReason::StaleIndex));
 }
+
+#[test]
+fn an_owner_named_like_the_sentinel_is_not_the_same_as_no_owner() {
+    // The first version wrote `Option<&str>` as `<none>` when absent, which is
+    // not injective: a source owned by a principal literally named `<none>`
+    // digested identically to an unowned one.
+    let owned = source_digest(
+        "s1",
+        "docs/A.md",
+        "Lifecycle",
+        Visibility::Private,
+        "tenant-a",
+        None,
+        Some("<none>"),
+        "body",
+    );
+    let unowned = source_digest(
+        "s1",
+        "docs/A.md",
+        "Lifecycle",
+        Visibility::Private,
+        "tenant-a",
+        None,
+        None,
+        "body",
+    );
+    assert_ne!(owned, unowned);
+
+    // The same for the project scope, and a project must not be confusable
+    // with an owner: swapping which field holds the value changes the digest.
+    let by_project = source_digest(
+        "s1",
+        "docs/A.md",
+        "Lifecycle",
+        Visibility::Project,
+        "tenant-a",
+        Some("shared"),
+        None,
+        "body",
+    );
+    let by_owner = source_digest(
+        "s1",
+        "docs/A.md",
+        "Lifecycle",
+        Visibility::Project,
+        "tenant-a",
+        None,
+        Some("shared"),
+        "body",
+    );
+    assert_ne!(by_project, by_owner);
+}

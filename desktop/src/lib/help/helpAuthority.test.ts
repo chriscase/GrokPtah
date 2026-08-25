@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   HELP_MAX_ID_BYTES,
@@ -15,8 +16,19 @@ import {
  * The same fixture set the Rust crate executes. If the two implementations
  * ever disagree on a case, one of these suites fails.
  */
-/** vitest runs with `desktop/` as the working directory. */
-const AUTHORITY_CRATE = resolve(process.cwd(), "..", "crates", "common", "grokptah-help-authority");
+/**
+ * Resolved from this file, not from the working directory.
+ *
+ * A cwd-relative path made the parity gate depend on where the runner was
+ * invoked from: run from the repository root instead of `desktop/`, the
+ * fixture simply was not there and the suite failed for a reason that had
+ * nothing to do with the two implementations agreeing.
+ */
+const AUTHORITY_CRATE = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "..", "..", "..", "..",
+  "crates", "common", "grokptah-help-authority",
+);
 
 const FIXTURES = JSON.parse(
   readFileSync(resolve(AUTHORITY_CRATE, "fixtures", "authority-parity.json"), "utf8"),

@@ -115,6 +115,8 @@ pub fn source_digest(
     raw_bytes: &str,
 ) -> String {
     let normalized = normalize_source_bytes(raw_bytes);
+    let project = optional_fields(project_id);
+    let owner = optional_fields(owner_principal_id);
     domain_digest(
         "grokptah.help.source-bytes.v1",
         &[
@@ -123,11 +125,26 @@ pub fn source_digest(
             heading,
             &format!("{visibility:?}"),
             tenant_id,
-            project_id.unwrap_or("<none>"),
-            owner_principal_id.unwrap_or("<none>"),
+            &project[0],
+            &project[1],
+            &owner[0],
+            &owner[1],
             &normalized,
         ],
     )
+}
+
+/// Encode an optional field injectively.
+///
+/// A sentinel is not enough. `Some("<none>")` and `None` both render as
+/// `<none>`, so a source owned by a principal literally named that would
+/// digest identically to an unowned one. A separate presence discriminant
+/// keeps them apart whatever the value spells.
+fn optional_fields(value: Option<&str>) -> [String; 2] {
+    match value {
+        Some(text) => ["present".to_string(), text.to_string()],
+        None => ["absent".to_string(), String::new()],
+    }
 }
 
 /// Scan raw JSON for a repeated key within any single object.

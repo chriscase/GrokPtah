@@ -22,6 +22,7 @@
 //! [`authorize`] function, which is what makes their decisions identical by
 //! construction rather than by convention.
 
+pub mod admission;
 pub mod contract;
 pub mod grant;
 pub mod manifest;
@@ -33,6 +34,12 @@ use thiserror::Error;
 pub use manifest::{
     HELP_MANIFEST_SCHEMA, ManifestEntry, ManifestError, SourceManifest, normalize_source_bytes,
     reject_duplicate_keys, source_digest,
+};
+
+pub use admission::{
+    AdmissionExpectation, AdmissionRejection, AnswerAdmission, AnswerRoute, BoundCitation,
+    HELP_ADMISSION_SCHEMA, MAX_ADMISSION_LIFETIME_MS, bind_outcome, citations_overlap,
+    mint_admission, verify_admission,
 };
 
 pub use grant::{
@@ -577,6 +584,8 @@ pub fn authorize_json(
     ))
 }
 
+#[cfg(test)]
+mod admission_tests;
 #[cfg(test)]
 mod grant_tests;
 #[cfg(test)]
