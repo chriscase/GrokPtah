@@ -703,6 +703,7 @@ mod tests {
     fn native_shim_exposes_semantic_accessibility_without_raw_input() {
         let shim = include_str!("macos_native_shim.m");
         for forbidden in [
+            "CGEventCreate",
             "CGEventPost",
             "CGWarpMouseCursorPosition",
             "CGAssociateMouseAndMouseCursorPosition",
@@ -721,7 +722,7 @@ mod tests {
         assert!(shim.contains("GPT_MAC_INTERRUPTED"));
         assert!(shim.contains("GPT_MAC_UNCERTAIN_OUTCOME"));
         assert!(shim.contains("GPTCaptureUserInteractionState"));
-        assert!(shim.contains("CGEventGetLocation"));
+        assert!(shim.contains("[NSEvent mouseLocation]"));
         assert!(shim.contains("measured_background"));
         assert!(shim.contains("AXUIElementPerformAction"));
         assert!(shim.contains("AXUIElementSetAttributeValue"));

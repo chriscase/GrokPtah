@@ -124,12 +124,9 @@ static GPTMacUserInteractionState GPTCaptureUserInteractionState(void) {
     if (frontmost == nil || frontmost.processIdentifier <= 0) {
         return state;
     }
-    CGEventRef event = CGEventCreate(NULL);
-    if (event == NULL) {
-        return state;
-    }
-    state.pointer_location = CGEventGetLocation(event);
-    CFRelease(event);
+    // Read-only AppKit snapshot of the physical pointer. Do not sample or
+    // synthesize input through the Quartz event-injection family.
+    state.pointer_location = [NSEvent mouseLocation];
     state.frontmost_process_id = frontmost.processIdentifier;
 
     CFArrayRef windowInfo = CGWindowListCopyWindowInfo(
