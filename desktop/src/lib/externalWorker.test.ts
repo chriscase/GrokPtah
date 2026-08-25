@@ -52,6 +52,15 @@ describe("external worker UI contract", () => {
       executionMode: "isolated",
       autoCreatePr: true,
     })).toBeNull();
+    expect(parseExternalWorkerLaunchRequest({
+      requestId: "req-1",
+      provider: "cursor_cloud",
+      repository: "org/repo",
+      startingRef: "main",
+      prompt: "Review\u0007",
+      executionMode: "isolated",
+      autoCreatePr: false,
+    })).toBeNull();
   });
 
   it("parses redacted records and relative artifacts only", () => {

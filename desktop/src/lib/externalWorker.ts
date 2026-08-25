@@ -139,6 +139,7 @@ function boundedString(value: unknown, maxBytes: number, rejectPrivileged = fals
     typeof value === "string" &&
     value.trim().length > 0 &&
     new TextEncoder().encode(value).byteLength <= maxBytes &&
+    !/[\u0000-\u001f\u007f]/.test(value) &&
     (!rejectPrivileged || !PRIVILEGED_TEXT.test(value))
   );
 }

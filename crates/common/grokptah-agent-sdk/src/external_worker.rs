@@ -337,7 +337,7 @@ fn validate_identity(value: &str, field: &str) -> Result<(), &'static str> {
     }
     if value
         .chars()
-        .any(|character| matches!(character, '\n' | '\r' | '\0'))
+        .any(|character| character.is_control() || character == '\u{7f}')
     {
         return Err("worker identity contains a control character");
     }
@@ -387,7 +387,7 @@ fn validate_ref(value: &str, field: &str) -> Result<(), &'static str> {
     }
     if value
         .chars()
-        .any(|character| matches!(character, '\n' | '\r' | '\0'))
+        .any(|character| character.is_control() || character == '\u{7f}')
     {
         return Err("worker identity contains a control character");
     }
