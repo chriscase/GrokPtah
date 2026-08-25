@@ -21,9 +21,14 @@ verification evidence, a bounded final response, and the terminal reason.
 
 Build turns create a run before model work begins. Typed bridge events are
 aggregated while the turn runs and reconciled from the journal at finalization.
-The store atomically installs terminal records and marks queued or running
-runs `interrupted` when it is reopened. An interrupted run is inspectable but
-is never resumed automatically.
+The store atomically installs terminal records when it is reopened. A running
+run becomes `interrupted`; a queued run keeps its accepted position when its
+durable admission record survived and its receipt was settled, and otherwise
+fails closed to `interrupted`. An interrupted run is inspectable but is never
+resumed automatically. Every `running` run is additionally owned by an attempt
+lease with a heartbeat and an expiry, so a worker that dies without finalizing
+is reaped to `interrupted` with `lost_worker` rather than pinning capacity
+until the next restart.
 
 The desktop inspector is read-only for shared runs. Build sessions may opt into
 strict isolated execution. An isolated run starts from a clean Git workspace in
@@ -67,5 +72,13 @@ does not need a second event stream or a separate coordinator dashboard.
   through the shared event bus before persistence.
 - Run records do not store credentials, full prompts, full transcripts, or
   unrestricted terminal output.
+- Work that is accepted but not yet started is the one exception, and it is
+  kept outside the run record. A private `AdmissionRecord` beside the ledger
+  holds the complete bounded execution input until promotion consumes it, so a
+  restart cannot destroy work the client already holds a receipt for. It is
+  written `0600`, carries an integrity digest, and is never projected into a
+  run, event, receipt, or capacity response — those keep the same bounded,
+  redacted preview as before. See
+  [durable admission and leases](./DURABLE_ADMISSION_AND_LEASES.md).
 - The existing journal, audit, idempotency, workspace allowlist, and MCP tool
   restrictions remain authoritative.

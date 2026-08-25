@@ -20,19 +20,53 @@ use super::store::{IdempotencyClaim, OrchStore};
 use super::types::*;
 
 /// Admission is deliberately bounded so an untrusted coordinator cannot turn
-/// queued submissions into an unbounded in-memory prompt store.
+/// queued submissions into an unbounded durable prompt store.
 const MAX_PENDING_ADMISSIONS: usize = 32;
+
+/// Liveness policy for `Running` work.
+///
+/// The defaults are deliberate: a heartbeat well inside the lease, and an
+/// expiry that needs several consecutive missed beats before the reaper
+/// acts, so a briefly starved runtime is never mistaken for a dead worker.
+#[derive(Debug, Clone, Copy)]
+pub struct LeasePolicy {
+    pub heartbeat: Duration,
+    pub ttl: Duration,
+    pub sweep: Duration,
+}
+
+impl Default for LeasePolicy {
+    fn default() -> Self {
+        Self {
+            heartbeat: Duration::from_secs(5),
+            ttl: Duration::from_secs(45),
+            sweep: Duration::from_secs(5),
+        }
+    }
+}
+
+fn chrono_ttl(ttl: Duration) -> chrono::Duration {
+    chrono::Duration::from_std(ttl).unwrap_or_else(|_| chrono::Duration::seconds(45))
+}
+
+/// A finalization write that keeps failing must not pin an admission slot.
+/// Past either bound the terminal record is preserved as a write-ahead
+/// intent for replay at the next open, and the capacity is released without
+/// ever claiming the run was finalized.
+const MAX_FINALIZATION_ATTEMPTS: u32 = 12;
+const MAX_FINALIZATION_WALL_CLOCK: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 struct AdmissionQueueState {
     pending: VecDeque<PendingRun>,
 }
 
+/// The in-memory index of durably admitted work. It deliberately carries no
+/// execution input: the durable admission record is the only admission truth,
+/// and the input is read back from it at promotion.
 struct PendingRun {
     run_id: String,
     session_id: Uuid,
-    prompt: String,
-    execution_mode: RunExecutionMode,
 }
 
 #[derive(Clone)]
@@ -64,6 +98,11 @@ pub struct OrchestrationService {
     scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Identity of this supervisor instance. Attempt leases are owned by
+    /// `(supervisor_id, attempt)`, so a stale attempt can never heartbeat or
+    /// release a newer one, in this process or after a restart.
+    supervisor_id: String,
+    lease_policy: Mutex<LeasePolicy>,
 }
 
 /// Authorized bounds for a live run event stream.
@@ -203,9 +242,105 @@ impl OrchestrationService {
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
             scheduler_watcher: Mutex::new(None),
             join_handles: Mutex::new(Vec::new()),
+            supervisor_id: Uuid::new_v4().to_string(),
+            lease_policy: Mutex::new(LeasePolicy::default()),
         });
+        service.rehydrate_admissions();
         service.start_scheduler_watcher();
         service
+    }
+
+    /// Identity used to own attempt leases created by this supervisor.
+    pub fn supervisor_id(&self) -> &str {
+        &self.supervisor_id
+    }
+
+    /// Override the liveness policy: heartbeat cadence, lease expiry, and the
+    /// reaper's sweep interval. Exposed so a deployment (and the focused
+    /// liveness tests) can pick an expiry appropriate to its own scheduling
+    /// jitter without rebuilding the service. The sweep deadline is
+    /// recomputed on every iteration, so a change here takes effect from the
+    /// next sweep onward.
+    pub fn set_lease_policy(&self, policy: LeasePolicy) {
+        *self.lease_policy.lock() = policy;
+    }
+
+    fn lease_policy(&self) -> LeasePolicy {
+        *self.lease_policy.lock()
+    }
+
+    /// Re-adopt the accepted queue the store reconstructed at open.
+    ///
+    /// The store hands the recovered queue to exactly one caller, so a second
+    /// embedded control service sharing the same ledger cannot adopt — and
+    /// therefore cannot dispatch — the same work a second time.
+    fn rehydrate_admissions(&self) {
+        let recovered = self.store.take_recovered_admissions();
+        if recovered.is_empty() {
+            return;
+        }
+        let mut adopted = 0usize;
+        for record in recovered {
+            // Re-register in durable admission order so the host's global
+            // fairness ledger reproduces the original arrival sequence.
+            if let Err(error) = self
+                .host
+                .reserve_orchestration_queue_slot(&record.run_id, record.session_id)
+            {
+                eprintln!(
+                    "[grokptah] recovered admission {} could not be re-registered: {error}",
+                    record.run_id
+                );
+                continue;
+            }
+            self.pending_admissions
+                .lock()
+                .pending
+                .push_back(PendingRun {
+                    run_id: record.run_id.clone(),
+                    session_id: record.session_id,
+                });
+            adopted += 1;
+        }
+        self.sync_pending_positions();
+        self.audit(
+            "orchestration_recovery",
+            None,
+            None,
+            None,
+            "accepted",
+            None,
+            &format!("re-admitted {adopted} durably queued runs after restart"),
+        );
+        self.pump_pending();
+    }
+
+    /// Retire every `Running` attempt whose lease expired, releasing the
+    /// capacity it held. Returns how many were reaped.
+    pub fn reap_stale_runs(&self) -> usize {
+        let reaped = self.store.reap_expired_leases(Utc::now());
+        for lost in &reaped {
+            self.host
+                .release_turn_reservation(lost.session_id, &lost.run_id);
+            self.host.release_orchestration_turn(&lost.run_id);
+            self.remove_pending(&lost.run_id);
+            self.audit(
+                "run_liveness",
+                None,
+                Some(lost.session_id),
+                None,
+                "rejected",
+                Some("lost_worker"),
+                &format!(
+                    "attempt {} of run {} exceeded its lease and was interrupted",
+                    lost.attempt, lost.run_id
+                ),
+            );
+        }
+        if !reaped.is_empty() {
+            self.pump_pending();
+        }
+        reaped.len()
     }
 
     fn start_scheduler_watcher(&self) {
@@ -216,8 +351,26 @@ impl OrchestrationService {
         let wakeup = self.host.orchestration_wakeup();
         let service_ref = self.self_ref.clone();
         let watcher = runtime.spawn(async move {
+            // The liveness sweep deadline is recomputed every iteration, so a
+            // policy change takes effect without rebuilding the service, and
+            // a chatty event stream cannot starve the reaper: the deadline is
+            // absolute, not a timer restarted by every other branch.
+            let mut last_sweep = tokio::time::Instant::now();
             loop {
+                let sweep_at = {
+                    let Some(service) = service_ref.upgrade() else {
+                        break;
+                    };
+                    last_sweep + service.lease_policy().sweep.max(Duration::from_millis(50))
+                };
                 tokio::select! {
+                    _ = tokio::time::sleep_until(sweep_at) => {
+                        last_sweep = tokio::time::Instant::now();
+                        let Some(service) = service_ref.upgrade() else {
+                            break;
+                        };
+                        service.reap_stale_runs();
+                    }
                     update = events.recv() => {
                         let Some(update) = update else {
                             break;
@@ -360,9 +513,9 @@ impl OrchestrationService {
         self.pump_pending();
     }
 
-    /// Keep the durable records aligned with the host-global scheduler. The
-    /// prompt itself remains in memory by design; this metadata is only for
-    /// honest operator/coordinator visibility while the run is pending.
+    /// Keep the durable run records aligned with the host-global scheduler.
+    /// The authoritative arrival order is the admission record's sequence;
+    /// this position is the operator-visible projection of it.
     fn sync_pending_positions(&self) {
         let run_ids: Vec<String> = {
             let queue = self.pending_admissions.lock();
@@ -388,31 +541,46 @@ impl OrchestrationService {
         }
     }
 
-    fn clear_queue_position(&self, run_id: &str) {
-        if let Err(error) = self.store.update_run(run_id, |run| {
-            if run.queue_position.take().is_some() {
-                run.updated_at = Utc::now();
+    /// Admit one run into the bounded queue, durably.
+    ///
+    /// The order here is the whole point of the P0-A repair: the complete
+    /// execution input and its queue position are fsync-safe *before* this
+    /// returns, and the caller may only settle its idempotency receipt after
+    /// that. Nothing between acceptance and promotion lives only in memory.
+    fn enqueue_pending(&self, admission: AdmissionRecord) -> Result<usize, OrchError> {
+        let run_id = admission.run_id.clone();
+        let session_id = admission.session_id;
+        {
+            let queue = self.pending_admissions.lock();
+            if queue.pending.len() >= MAX_PENDING_ADMISSIONS {
+                return Err(OrchError::new(
+                    OrchErrorCode::CapacityExhausted,
+                    format!(
+                        "bounded admission queue is full ({MAX_PENDING_ADMISSIONS} pending runs)"
+                    ),
+                ));
             }
-            Ok(())
-        }) {
-            eprintln!("[grokptah] queued run position clear failed: {error}");
         }
-    }
-
-    fn enqueue_pending(&self, pending: PendingRun) -> Result<usize, OrchError> {
-        let mut queue = self.pending_admissions.lock();
-        if queue.pending.len() >= MAX_PENDING_ADMISSIONS {
+        self.store.save_admission(&admission)?;
+        if let Err(error) = self
+            .host
+            .reserve_orchestration_queue_slot(&run_id, session_id)
+        {
+            // Nothing was accepted, so nothing may survive: retire the record
+            // rather than leave promotable work no scheduler knows about.
+            self.store.tombstone_admission(&run_id);
             return Err(OrchError::new(
                 OrchErrorCode::CapacityExhausted,
-                format!("bounded admission queue is full ({MAX_PENDING_ADMISSIONS} pending runs)"),
+                error.to_string(),
             ));
         }
-        let run_id = pending.run_id.clone();
-        self.host
-            .reserve_orchestration_queue_slot(&run_id, pending.session_id)
-            .map_err(|error| OrchError::new(OrchErrorCode::CapacityExhausted, error.to_string()))?;
-        queue.pending.push_back(pending);
-        drop(queue);
+        self.pending_admissions
+            .lock()
+            .pending
+            .push_back(PendingRun {
+                run_id: run_id.clone(),
+                session_id,
+            });
         self.sync_pending_positions();
         Ok(self
             .host
@@ -420,17 +588,21 @@ impl OrchestrationService {
             .unwrap_or(1))
     }
 
+    /// Retire queued work everywhere it exists. The durable tombstone is what
+    /// stops a restart from resurrecting cancelled or abandoned admissions;
+    /// the in-memory index and the host slot are the live projections of it.
     fn remove_pending(&self, run_id: &str) -> bool {
         let mut queue = self.pending_admissions.lock();
         let before = queue.pending.len();
         queue.pending.retain(|pending| pending.run_id != run_id);
         let removed = before != queue.pending.len();
         drop(queue);
-        if removed {
+        let tombstoned = self.store.tombstone_admission(run_id);
+        if removed || tombstoned {
             self.host.release_orchestration_queue_slot(run_id);
             self.sync_pending_positions();
         }
-        removed
+        removed || tombstoned
     }
 
     /// Promote as many queued tasks as the shared host capacity allows. The
@@ -457,54 +629,57 @@ impl OrchestrationService {
             else {
                 return;
             };
-            let pending = {
+            {
                 let mut queue = self.pending_admissions.lock();
-                let Some(index) = queue.pending.iter().position(|p| p.run_id == run_id) else {
+                let before = queue.pending.len();
+                queue.pending.retain(|pending| pending.run_id != run_id);
+                if before == queue.pending.len() {
                     self.host.release_orchestration_turn(&run_id);
                     continue;
-                };
-                queue.pending.remove(index).expect("pending index exists")
-            };
-            self.clear_queue_position(&pending.run_id);
+                }
+            }
             self.sync_pending_positions();
 
             // Cancellation can win after the task left the queue but before
             // promotion. Treat terminal records as a normal, safe skip.
-            let Some(current) = self.store.load_run(&pending.run_id).ok().flatten() else {
-                self.host.release_orchestration_turn(&pending.run_id);
+            let Some(current) = self.store.load_run(&run_id).ok().flatten() else {
+                self.host.release_orchestration_turn(&run_id);
                 continue;
             };
             if current.state != RunState::Queued {
-                self.host.release_orchestration_turn(&pending.run_id);
+                self.host.release_orchestration_turn(&run_id);
                 continue;
             }
 
+            // Consume the durable admission exactly once and take the
+            // execution input from it. A cancelled run, a crashed earlier
+            // promotion, or a competing supervisor all arrive here as a
+            // refusal — never as a second dispatch of the same work.
             let start_seq = self.bus.next_seq();
-            let transitioned = self.store.update_run(&pending.run_id, |run| {
-                if run.state != RunState::Queued {
-                    anyhow::bail!("queued run is no longer pending");
+            let ttl = chrono_ttl(self.lease_policy().ttl);
+            match self
+                .store
+                .promote_admission(&run_id, &self.supervisor_id, start_seq, ttl)
+            {
+                Ok((run, admission)) => {
+                    self.spawn_run(run, admission.prompt, admission.execution_mode);
                 }
-                run.state = RunState::Running;
-                run.queue_position = None;
-                run.start_seq = Some(start_seq);
-                run.updated_at = Utc::now();
-                Ok(())
-            });
-            match transitioned {
-                Ok(Some(run)) => self.spawn_run(run, pending.prompt, pending.execution_mode),
-                Ok(None) | Err(_) => {
-                    self.host.release_orchestration_turn(&pending.run_id);
-                    if let Err(error) = self
-                        .host
-                        .reserve_orchestration_queue_slot(&pending.run_id, pending.session_id)
-                    {
-                        eprintln!("[grokptah] queued run could not be re-registered: {error}");
-                    } else {
-                        let mut queue = self.pending_admissions.lock();
-                        queue.pending.push_front(pending);
-                        drop(queue);
-                        self.sync_pending_positions();
-                        return;
+                Err(error) => {
+                    self.host.release_orchestration_turn(&run_id);
+                    if error.code != OrchErrorCode::Conflict {
+                        eprintln!(
+                            "[grokptah] queued run {run_id} could not be promoted: {}",
+                            error.message
+                        );
+                        self.audit(
+                            "run_promotion",
+                            None,
+                            Some(current.session_id),
+                            None,
+                            "rejected",
+                            Some(error.code.as_str()),
+                            &error.message,
+                        );
                     }
                 }
             }
@@ -842,17 +1017,26 @@ impl OrchestrationService {
             .store
             .last_run_error()
             .map(|error| self.bus.redact_text(&error, 500));
+        // Bounded counters only: no identifiers, no execution input, nothing
+        // derived from the private admission records beyond how many exist.
         Ok(json!({
             "maxConcurrentRuns": max,
             "activeRuns": active,
             "available": max.saturating_sub(active),
             "queuedRuns": queued,
             "queueLimit": MAX_PENDING_ADMISSIONS,
+            "durableQueuedRuns": self.store.queued_admission_count(),
             "health": {
                 "laggedLiveEvents": self.bus.lagged_event_count(),
                 "eventJournalPersistenceError": event_error,
                 "auditPersistenceError": audit_error,
                 "runPersistenceError": run_error,
+                "stuckFinalizations": self.store.stuck_finalizations(),
+                "pendingFinalizationIntents": self.store.pending_finalization_intents(),
+                "reapedRuns": self.store.reaped_runs(),
+                "recoveredAdmissions": self.store.recovered_admission_count(),
+                "uncertainAdmissions": self.store.uncertain_admissions(),
+                "admissionIntegrityFailures": self.store.admission_integrity_failures(),
             },
         }))
     }
@@ -2694,12 +2878,29 @@ impl OrchestrationService {
         }
 
         let queued_position = if queued {
-            match self.enqueue_pending(PendingRun {
+            // One durable admission record carries everything promotion will
+            // need: the complete bounded input, the execution mode, the queue
+            // lineage and order, the session/run identity, and a private
+            // integrity digest. The public run record keeps only its bounded,
+            // redacted preview exactly as before.
+            let admission = AdmissionRecord {
                 run_id: run_id.clone(),
                 session_id,
+                workspace: run.workspace.clone(),
+                request_id: request_id.into(),
+                client_id: run.client_id.clone(),
                 prompt: prompt.clone(),
+                bounds: bounds.clone(),
                 execution_mode,
-            }) {
+                parent_run_id: run.parent_run_id.clone(),
+                retry_of: run.retry_of.clone(),
+                sequence: self.store.next_admission_sequence(),
+                state: AdmissionState::Queued,
+                created_at: run.created_at,
+                updated_at: Utc::now(),
+                integrity: String::new(),
+            };
+            match self.enqueue_pending(admission) {
                 Ok(position) => Some(position),
                 Err(error) => {
                     let _ = self.store.update_run(&run_id, |current| {
@@ -2904,6 +3105,18 @@ impl OrchestrationService {
         let rid = run.run_id.clone();
         let max_ms = run.bounds.max_duration_ms;
         let max_rounds = run.bounds.max_rounds;
+        let policy = self.lease_policy();
+        let owner = self.supervisor_id.clone();
+
+        // Own this attempt. Promotion already installed the lease for queued
+        // work; a run that starts without queueing installs its own. Either
+        // way `Running` stops being an unverified state: it is now backed by
+        // an owner, an attempt number, and an expiry the reaper enforces.
+        let lease = store
+            .load_lease(&rid)
+            .filter(|existing| existing.owner_id == owner && existing.session_id == session_id)
+            .or_else(|| store.install_lease(&rid, session_id, &owner, chrono_ttl(policy.ttl)));
+        let attempt = lease.as_ref().map(|lease| lease.attempt).unwrap_or(1);
 
         // Dedicated aggregator task: must not share a biased select with the
         // duration deadline (chatty ShellOutput must not starve max_duration_ms).
@@ -2915,179 +3128,253 @@ impl OrchestrationService {
                 apply_run_aggregate(&store_agg, &rid_agg, session_id, &update);
             }
         });
+        // Kept by the supervisor so a panicking attempt cannot leak the
+        // aggregator, which the attempt would normally stop itself.
+        let agg_abort = agg_task.abort_handle();
 
-        let join = tokio::spawn(async move {
-            let admission_guard = AdmissionGuard {
-                host: host.clone(),
-                run_id: rid.clone(),
-            };
-            let prompt_fut = host.session_prompt_reserved_with_max_rounds_for_run(
-                session_id,
-                prompt,
-                Some(max_rounds.max(1)),
-                &rid,
-                &rid,
-                execution_mode,
-            );
-            tokio::pin!(prompt_fut);
-            let deadline = tokio::time::sleep(Duration::from_millis(max_ms.max(1)));
-            tokio::pin!(deadline);
-
-            // Cancellation and teardown are bounded. A backend that ignores its
-            // token cannot hold admission capacity forever.
-            let (timed_out, result): (bool, Result<String, anyhow::Error>) = tokio::select! {
-                biased;
-                _ = &mut deadline => {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        host.cancel_turn_and_await(Some(session_id)),
-                    ).await;
-                    let settled = tokio::time::timeout(
-                        Duration::from_secs(1),
-                        &mut prompt_fut,
-                    ).await;
-                    let result = match settled {
-                        Ok(result) => result,
-                        Err(_) => Err(anyhow::anyhow!(
-                            "turn did not stop within the teardown deadline"
-                        )),
-                    };
-                    (true, result)
-                }
-                r = &mut prompt_fut => (false, r),
-            };
-
-            // Stop aggregator; then reconcile aggregates from the journal range
-            // so late FileEdit/test events are not lost if the task was aborted mid-drain.
-            agg_task.abort();
-            let _ = agg_task.await;
-
-            let end_seq = bus.current_seq();
-            let reconciliation = collect_run_updates(&bus, &store, &rid, end_seq);
-            let durable_result = match &result {
-                Ok(text) => Ok(bus.redact_text(text, 8_000)),
-                Err(error) => Err(bus.redact_text(&error.to_string(), 2_000)),
-            };
-            let incomplete_stop = result
-                .as_ref()
-                .is_ok_and(|text| crate::host_helpers::is_incomplete_stop_message(text));
-            let mut candidate = store.load_run(&rid).ok().flatten().unwrap_or(run);
-            for update in &reconciliation {
-                fold_run_update(&mut candidate, update);
-            }
-            candidate.end_seq = candidate.end_seq.or(Some(end_seq));
-            candidate.updated_at = Utc::now();
-            if !candidate.state.is_terminal() {
-                if timed_out {
-                    candidate.state = RunState::LimitReached;
-                    candidate.terminal_result = Some("limit_reached".into());
-                    candidate.error_code = Some("limit_reached".into());
-                    if let Ok(text) = &durable_result {
-                        candidate.final_response = Some(text.clone());
+        // Liveness is refreshed on a fixed interval by its own task, not per
+        // event and not by the turn future, so a wedged turn stops beating
+        // while a merely chatty one does not beat harder. A denied heartbeat
+        // (terminal run, or a newer owner/attempt) ends the loop instead of
+        // reviving anything.
+        let heartbeat = {
+            let store = store.clone();
+            let rid = rid.clone();
+            let owner = owner.clone();
+            tokio::spawn(async move {
+                let mut ticker =
+                    tokio::time::interval(policy.heartbeat.max(Duration::from_millis(50)));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    if store
+                        .heartbeat_run(&rid, &owner, attempt, chrono_ttl(policy.ttl))
+                        .is_err()
+                    {
+                        break;
                     }
-                } else {
-                    match &durable_result {
-                        Ok(text) => {
-                            if incomplete_stop {
-                                candidate.state = RunState::LimitReached;
-                                candidate.terminal_result = Some("limit_reached".into());
-                                candidate.error_code = Some("limit_reached".into());
-                            } else {
-                                candidate.state = RunState::Completed;
-                                candidate.terminal_result = Some("completed".into());
-                            }
+                }
+            })
+        };
+
+        let attempt_task = {
+            let host = host.clone();
+            let store = store.clone();
+            let bus = bus.clone();
+            let rid = rid.clone();
+            tokio::spawn(async move {
+                let prompt_fut = host.session_prompt_reserved_with_max_rounds_for_run(
+                    session_id,
+                    prompt,
+                    Some(max_rounds.max(1)),
+                    &rid,
+                    &rid,
+                    execution_mode,
+                );
+                tokio::pin!(prompt_fut);
+                let deadline = tokio::time::sleep(Duration::from_millis(max_ms.max(1)));
+                tokio::pin!(deadline);
+
+                // Cancellation and teardown are bounded. A backend that ignores its
+                // token cannot hold admission capacity forever.
+                let (timed_out, result): (bool, Result<String, anyhow::Error>) = tokio::select! {
+                    biased;
+                    _ = &mut deadline => {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            host.cancel_turn_and_await(Some(session_id)),
+                        ).await;
+                        let settled = tokio::time::timeout(
+                            Duration::from_secs(1),
+                            &mut prompt_fut,
+                        ).await;
+                        let result = match settled {
+                            Ok(result) => result,
+                            Err(_) => Err(anyhow::anyhow!(
+                                "turn did not stop within the teardown deadline"
+                            )),
+                        };
+                        (true, result)
+                    }
+                    r = &mut prompt_fut => (false, r),
+                };
+
+                // Stop aggregator; then reconcile aggregates from the journal range
+                // so late FileEdit/test events are not lost if the task was aborted mid-drain.
+                agg_task.abort();
+                let _ = agg_task.await;
+
+                let end_seq = bus.current_seq();
+                let reconciliation = collect_run_updates(&bus, &store, &rid, end_seq);
+                let durable_result = match &result {
+                    Ok(text) => Ok(bus.redact_text(text, 8_000)),
+                    Err(error) => Err(bus.redact_text(&error.to_string(), 2_000)),
+                };
+                let incomplete_stop = result
+                    .as_ref()
+                    .is_ok_and(|text| crate::host_helpers::is_incomplete_stop_message(text));
+                let mut candidate = store.load_run(&rid).ok().flatten().unwrap_or(run);
+                for update in &reconciliation {
+                    fold_run_update(&mut candidate, update);
+                }
+                candidate.end_seq = candidate.end_seq.or(Some(end_seq));
+                candidate.updated_at = Utc::now();
+                if !candidate.state.is_terminal() {
+                    if timed_out {
+                        candidate.state = RunState::LimitReached;
+                        candidate.terminal_result = Some("limit_reached".into());
+                        candidate.error_code = Some("limit_reached".into());
+                        if let Ok(text) = &durable_result {
                             candidate.final_response = Some(text.clone());
                         }
-                        Err(error) => {
-                            candidate.state = RunState::Failed;
-                            candidate.terminal_result = Some("failed".into());
-                            candidate.error_code = Some("internal".into());
-                            candidate.final_response = Some(error.clone());
-                        }
-                    }
-                }
-            }
-            if candidate.aggregates.verification.is_none() {
-                let observations = crate::completion::observations_from_run(
-                    candidate.aggregates.changes.len(),
-                    candidate
-                        .aggregates
-                        .tests
-                        .iter()
-                        .map(|t| (t.exit_code, t.cancelled)),
-                    candidate.aggregates.permissions_requested,
-                    candidate.aggregates.permissions_granted,
-                    candidate.aggregates.permissions_denied,
-                );
-                let outcome = candidate.terminal_result.as_deref().unwrap_or("incomplete");
-                candidate.aggregates.verification = Some(crate::completion::build_evidence(
-                    outcome,
-                    candidate.final_response.as_deref(),
-                    observations,
-                    candidate.aggregates.usage.clone(),
-                    matches!(candidate.state, RunState::Cancelled | RunState::Interrupted),
-                ));
-            }
-            // External isolated runs do not pass through the desktop finalizer.
-            if let Some(execution) = candidate.execution.as_mut() {
-                if execution.mode == RunExecutionMode::IsolatedWorktree {
-                    if candidate.state == RunState::Completed {
-                        match crate::run_promotion::snapshot(
-                            Path::new(&execution.execution_workspace),
-                            &execution.base_revision,
-                        ) {
-                            Ok(snapshot) => {
-                                execution.final_fingerprint = Some(snapshot.fingerprint);
-                                execution.promotion_state = PromotionState::Ready;
-                                if !snapshot.changed_files.is_empty() {
-                                    candidate.aggregates.changes = snapshot.changed_files;
+                    } else {
+                        match &durable_result {
+                            Ok(text) => {
+                                if incomplete_stop {
+                                    candidate.state = RunState::LimitReached;
+                                    candidate.terminal_result = Some("limit_reached".into());
+                                    candidate.error_code = Some("limit_reached".into());
+                                } else {
+                                    candidate.state = RunState::Completed;
+                                    candidate.terminal_result = Some("completed".into());
                                 }
+                                candidate.final_response = Some(text.clone());
                             }
                             Err(error) => {
-                                execution.promotion_state = PromotionState::Conflicted;
-                                candidate.error_code = Some("promotion_conflict".into());
-                                let _ = store.enqueue_audit(AuditEntry {
-                                    ts: Utc::now(),
-                                    tool: "run_finalization".into(),
-                                    request_id: None,
-                                    session_id: Some(session_id),
-                                    workspace: Some(candidate.workspace.clone()),
-                                    outcome: "promotion_conflict".into(),
-                                    error_code: Some("promotion_conflict".into()),
-                                    detail: bus.redact_text(&error.to_string(), 500),
-                                });
+                                candidate.state = RunState::Failed;
+                                candidate.terminal_result = Some("failed".into());
+                                candidate.error_code = Some("internal".into());
+                                candidate.final_response = Some(error.clone());
                             }
                         }
-                    } else {
-                        execution.promotion_state = PromotionState::Conflicted;
                     }
                 }
-            }
-            let mut attempt = 0u32;
-            loop {
-                let error = match store.persist_finalization(&candidate) {
-                    Ok(_) => break,
-                    Err(error) => error.to_string(),
-                };
-                if attempt == 0 {
-                    let entry = AuditEntry {
-                        ts: Utc::now(),
-                        tool: "run_finalization".into(),
-                        request_id: None,
-                        session_id: Some(session_id),
-                        workspace: None,
-                        outcome: "retrying".into(),
-                        error_code: Some("run_persistence_failed".into()),
-                        detail: bus.redact_text(&error, 500),
-                    };
-                    let _ = store.enqueue_audit(entry);
-                    eprintln!("[grokptah] run {rid} finalization retrying: {error}");
+                if candidate.aggregates.verification.is_none() {
+                    let observations = crate::completion::observations_from_run(
+                        candidate.aggregates.changes.len(),
+                        candidate
+                            .aggregates
+                            .tests
+                            .iter()
+                            .map(|t| (t.exit_code, t.cancelled)),
+                        candidate.aggregates.permissions_requested,
+                        candidate.aggregates.permissions_granted,
+                        candidate.aggregates.permissions_denied,
+                    );
+                    let outcome = candidate.terminal_result.as_deref().unwrap_or("incomplete");
+                    candidate.aggregates.verification = Some(crate::completion::build_evidence(
+                        outcome,
+                        candidate.final_response.as_deref(),
+                        observations,
+                        candidate.aggregates.usage.clone(),
+                        matches!(candidate.state, RunState::Cancelled | RunState::Interrupted),
+                    ));
                 }
-                attempt = attempt.saturating_add(1);
-                let shift = attempt.min(6);
-                let backoff_ms = 25u64.saturating_mul(1u64 << shift).min(1_000);
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                // External isolated runs do not pass through the desktop finalizer.
+                if let Some(execution) = candidate.execution.as_mut() {
+                    if execution.mode == RunExecutionMode::IsolatedWorktree {
+                        if candidate.state == RunState::Completed {
+                            match crate::run_promotion::snapshot(
+                                Path::new(&execution.execution_workspace),
+                                &execution.base_revision,
+                            ) {
+                                Ok(snapshot) => {
+                                    execution.final_fingerprint = Some(snapshot.fingerprint);
+                                    execution.promotion_state = PromotionState::Ready;
+                                    if !snapshot.changed_files.is_empty() {
+                                        candidate.aggregates.changes = snapshot.changed_files;
+                                    }
+                                }
+                                Err(error) => {
+                                    execution.promotion_state = PromotionState::Conflicted;
+                                    candidate.error_code = Some("promotion_conflict".into());
+                                    let _ = store.enqueue_audit(AuditEntry {
+                                        ts: Utc::now(),
+                                        tool: "run_finalization".into(),
+                                        request_id: None,
+                                        session_id: Some(session_id),
+                                        workspace: Some(candidate.workspace.clone()),
+                                        outcome: "promotion_conflict".into(),
+                                        error_code: Some("promotion_conflict".into()),
+                                        detail: bus.redact_text(&error.to_string(), 500),
+                                    });
+                                }
+                            }
+                        } else {
+                            execution.promotion_state = PromotionState::Conflicted;
+                        }
+                    }
+                }
+
+                // Bounded finalization. A storage failure that never clears
+                // used to spin here at 1 Hz forever while holding an
+                // admission slot; now it is capped by attempts and by wall
+                // clock, and exhaustion preserves a replayable intent instead
+                // of claiming a success that never happened.
+                let mut attempts = 0u32;
+                let started = tokio::time::Instant::now();
+                loop {
+                    let error = match store.persist_finalization(&candidate) {
+                        Ok(_) => break,
+                        Err(error) => error.to_string(),
+                    };
+                    let exhausted = attempts.saturating_add(1) >= MAX_FINALIZATION_ATTEMPTS
+                        || started.elapsed() >= MAX_FINALIZATION_WALL_CLOCK;
+                    if attempts == 0 || exhausted {
+                        let _ = store.enqueue_audit(AuditEntry {
+                            ts: Utc::now(),
+                            tool: "run_finalization".into(),
+                            request_id: None,
+                            session_id: Some(session_id),
+                            workspace: None,
+                            outcome: if exhausted { "stuck" } else { "retrying" }.into(),
+                            error_code: Some("run_persistence_failed".into()),
+                            detail: bus.redact_text(&error, 500),
+                        });
+                        eprintln!(
+                            "[grokptah] run {rid} finalization {}: {error}",
+                            if exhausted {
+                                "exhausted its bounded retry"
+                            } else {
+                                "retrying"
+                            }
+                        );
+                    }
+                    if exhausted {
+                        if store.write_finalization_intent(&candidate).is_err() {
+                            eprintln!(
+                                "[grokptah] run {rid} finalization intent could not be preserved"
+                            );
+                        }
+                        store.note_stuck_finalization();
+                        break;
+                    }
+                    attempts = attempts.saturating_add(1);
+                    let shift = attempts.min(6);
+                    let backoff_ms = 25u64.saturating_mul(1u64 << shift).min(1_000);
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
+            })
+        };
+
+        // The supervisor owns admission capacity and inspects the attempt's
+        // join result. A panicked or cancelled attempt never reaches its own
+        // finalizer, so without this the record stayed `Running` until the
+        // next process restart.
+        let supervisor = tokio::spawn(async move {
+            let admission_guard = AdmissionGuard {
+                host,
+                run_id: rid.clone(),
+            };
+            let outcome = attempt_task.await;
+            heartbeat.abort();
+            let _ = heartbeat.await;
+            agg_abort.abort();
+            if let Err(join_error) = outcome {
+                finalize_lost_attempt(&store, &bus, &rid, session_id, &owner, attempt, &join_error);
             }
+            store.release_lease(&rid, &owner, attempt);
 
             // Release capacity before waking the scheduler, so a queued task
             // can be promoted immediately and fairly.
@@ -3097,7 +3384,7 @@ impl OrchestrationService {
             }
         });
         self.reaping_handles();
-        self.join_handles.lock().push(join);
+        self.join_handles.lock().push(supervisor);
     }
 
     pub async fn queue_prompt(
@@ -3537,6 +3824,69 @@ fn canonical_cmp(a: &Path, b: &Path) -> Result<(), ()> {
 }
 
 /// Incrementally persist run-scoped aggregates so journal rollover cannot erase them.
+/// Durably finalize an attempt that ended without running its own finalizer.
+///
+/// A panicking or cancelled turn future never reaches the finalization block,
+/// so before this existed the record stayed `Running` until the next process
+/// restart. Only the exact attempt may do this: if the lease has already
+/// moved to another owner or attempt, this one has been superseded and must
+/// not write anything.
+fn finalize_lost_attempt(
+    store: &OrchStore,
+    bus: &EventBus,
+    run_id: &str,
+    session_id: Uuid,
+    owner: &str,
+    attempt: u32,
+    join_error: &tokio::task::JoinError,
+) {
+    if let Some(lease) = store.load_lease(run_id) {
+        if !lease.matches(owner, attempt) {
+            return;
+        }
+    }
+    let error_code = if join_error.is_cancelled() {
+        "worker_cancelled"
+    } else {
+        "worker_panic"
+    };
+    let Ok(Some(mut candidate)) = store.load_run(run_id) else {
+        return;
+    };
+    if candidate.state.is_terminal() {
+        return;
+    }
+    candidate.state = RunState::Interrupted;
+    candidate.queue_position = None;
+    candidate.terminal_result = Some("interrupted".into());
+    candidate.error_code = Some(error_code.into());
+    candidate.final_response = Some(bus.redact_text(
+        &format!("attempt {attempt} ended before finalizing: {join_error}"),
+        2_000,
+    ));
+    candidate.end_seq = candidate.end_seq.or(Some(bus.current_seq()));
+    candidate.updated_at = Utc::now();
+    if let Some(execution) = candidate.execution.as_mut() {
+        execution.promotion_state = PromotionState::Conflicted;
+    }
+    let _ = store.enqueue_audit(AuditEntry {
+        ts: Utc::now(),
+        tool: "run_finalization".into(),
+        request_id: None,
+        session_id: Some(session_id),
+        workspace: Some(candidate.workspace.clone()),
+        outcome: "rejected".into(),
+        error_code: Some(error_code.into()),
+        detail: bus.redact_text(&join_error.to_string(), 500),
+    });
+    if store.persist_finalization(&candidate).is_err() {
+        // Same bounded-honesty rule as the normal path: preserve a replayable
+        // intent, never report a finalization that did not land.
+        let _ = store.write_finalization_intent(&candidate);
+        store.note_stuck_finalization();
+    }
+}
+
 pub(crate) fn apply_run_aggregate(
     store: &OrchStore,
     run_id: &str,
@@ -3679,5 +4029,178 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         | PromptQueueChanged { session_id, .. }
         | ComputerApprovalRequired { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn running_run(run_id: &str, session_id: Uuid, workspace: &str) -> RunRecord {
+        RunRecord {
+            run_id: run_id.into(),
+            session_id,
+            workspace: workspace.into(),
+            request_id: format!("req-{run_id}"),
+            client_id: Some("mcp".into()),
+            state: RunState::Running,
+            agent_id: None,
+            retry_of: None,
+            parent_run_id: None,
+            queue_position: None,
+            bounds: RunBounds::default(),
+            prompt_preview: "preview".into(),
+            start_seq: Some(1),
+            end_seq: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            terminal_result: None,
+            final_response: None,
+            error_code: None,
+            aggregates: RunAggregates::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        }
+    }
+
+    async fn panic_join_error() -> tokio::task::JoinError {
+        tokio::spawn(async { panic!("turn exploded") })
+            .await
+            .expect_err("a panicking task must yield a JoinError")
+    }
+
+    async fn cancel_join_error() -> tokio::task::JoinError {
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        handle.abort();
+        handle
+            .await
+            .expect_err("an aborted task yields a JoinError")
+    }
+
+    /// A panicking turn future never reaches its own finalizer. Before the
+    /// supervisor inspected the join result the record stayed `Running` until
+    /// the next process restart.
+    #[tokio::test]
+    async fn panicked_attempt_is_durably_interrupted_without_a_restart() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let bus = EventBus::new(64);
+        let session_id = Uuid::new_v4();
+        store
+            .save_run(&running_run("panicky", session_id, "/ws"))
+            .unwrap();
+        store
+            .install_lease(
+                "panicky",
+                session_id,
+                "owner-a",
+                chrono::Duration::seconds(30),
+            )
+            .unwrap();
+
+        let error = panic_join_error().await;
+        assert!(!error.is_cancelled());
+        finalize_lost_attempt(&store, &bus, "panicky", session_id, "owner-a", 1, &error);
+
+        let run = store.load_run("panicky").unwrap().unwrap();
+        assert_eq!(run.state, RunState::Interrupted);
+        assert_eq!(run.error_code.as_deref(), Some("worker_panic"));
+        assert!(run.end_seq.is_some(), "the attempt's window must be closed");
+    }
+
+    #[tokio::test]
+    async fn cancelled_attempt_is_durably_interrupted() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let bus = EventBus::new(64);
+        let session_id = Uuid::new_v4();
+        store
+            .save_run(&running_run("aborted", session_id, "/ws"))
+            .unwrap();
+        store
+            .install_lease(
+                "aborted",
+                session_id,
+                "owner-a",
+                chrono::Duration::seconds(30),
+            )
+            .unwrap();
+
+        let error = cancel_join_error().await;
+        assert!(error.is_cancelled());
+        finalize_lost_attempt(&store, &bus, "aborted", session_id, "owner-a", 1, &error);
+
+        let run = store.load_run("aborted").unwrap().unwrap();
+        assert_eq!(run.state, RunState::Interrupted);
+        assert_eq!(run.error_code.as_deref(), Some("worker_cancelled"));
+    }
+
+    /// Only the exact attempt may finalize. A superseded one must write
+    /// nothing, or a reaped-and-replaced run would be clobbered by its ghost.
+    #[tokio::test]
+    async fn a_superseded_attempt_cannot_finalize_the_run() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let bus = EventBus::new(64);
+        let session_id = Uuid::new_v4();
+        store
+            .save_run(&running_run("superseded", session_id, "/ws"))
+            .unwrap();
+        // Attempt 1 is replaced by attempt 2 before the ghost reports back.
+        store
+            .install_lease(
+                "superseded",
+                session_id,
+                "owner-a",
+                chrono::Duration::seconds(30),
+            )
+            .unwrap();
+        store
+            .install_lease(
+                "superseded",
+                session_id,
+                "owner-b",
+                chrono::Duration::seconds(30),
+            )
+            .unwrap();
+
+        let error = panic_join_error().await;
+        finalize_lost_attempt(&store, &bus, "superseded", session_id, "owner-a", 1, &error);
+        assert_eq!(
+            store.load_run("superseded").unwrap().unwrap().state,
+            RunState::Running,
+            "a stale attempt must not terminalize a run it no longer owns"
+        );
+
+        // The live attempt can.
+        finalize_lost_attempt(&store, &bus, "superseded", session_id, "owner-b", 2, &error);
+        assert_eq!(
+            store.load_run("superseded").unwrap().unwrap().state,
+            RunState::Interrupted
+        );
+    }
+
+    /// A terminal run is never rewritten by a late attempt.
+    #[tokio::test]
+    async fn a_terminal_run_is_not_rewritten_by_a_lost_attempt() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let bus = EventBus::new(64);
+        let session_id = Uuid::new_v4();
+        let mut run = running_run("finished", session_id, "/ws");
+        run.state = RunState::Completed;
+        run.terminal_result = Some("completed".into());
+        run.final_response = Some("done".into());
+        store.save_run(&run).unwrap();
+
+        let error = panic_join_error().await;
+        finalize_lost_attempt(&store, &bus, "finished", session_id, "owner-a", 1, &error);
+        let reloaded = store.load_run("finished").unwrap().unwrap();
+        assert_eq!(reloaded.state, RunState::Completed);
+        assert_eq!(reloaded.final_response.as_deref(), Some("done"));
     }
 }

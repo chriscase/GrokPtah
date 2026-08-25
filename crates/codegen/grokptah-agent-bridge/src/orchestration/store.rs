@@ -1,18 +1,22 @@
 //! Durable run records, idempotency receipts, audit log (#196).
 
+use std::collections::HashSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{self, AtomicU64};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
+use uuid::Uuid;
 
 use super::types::{
-    safe_id_filename, AgentRecord, AgentState, AuditEntry, ContinuationCheckpoint,
-    IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunRecord, RunState,
+    safe_id_filename, AdmissionRecord, AdmissionState, AgentRecord, AgentState, AuditEntry,
+    ContinuationCheckpoint, IdempotencyReceipt, LeaseDenied, OrchError, OrchErrorCode,
+    PromotionState, RunLease, RunRecord, RunState,
 };
 
 #[derive(Clone)]
@@ -28,6 +32,23 @@ struct OrchStoreInner {
     last_audit_error: Arc<Mutex<Option<String>>>,
     audit_file_lock: Arc<Mutex<()>>,
     audit_writer: AuditWriter,
+    /// Durable admission order, re-seeded from disk at every open.
+    next_admission_sequence: AtomicU64,
+    /// Queue reconstructed at open, handed to the first supervisor that asks.
+    recovered_admissions: Mutex<Option<Vec<AdmissionRecord>>>,
+    recovered_admissions_total: AtomicU64,
+    admission_integrity_failures: AtomicU64,
+    uncertain_admissions: AtomicU64,
+    reaped_runs: AtomicU64,
+    stuck_finalizations: AtomicU64,
+}
+
+/// One `Running` attempt the reaper retired because its lease expired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReapedRun {
+    pub run_id: String,
+    pub session_id: Uuid,
+    pub attempt: u32,
 }
 
 const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
@@ -93,6 +114,10 @@ impl OrchStore {
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
+        // Private: the complete execution input for accepted work, and the
+        // ownership of live attempts. Neither is ever projected publicly.
+        fs::create_dir_all(root.join("admissions"))?;
+        fs::create_dir_all(root.join("leases"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -136,10 +161,27 @@ impl OrchStore {
                     tx: Mutex::new(Some(audit_tx)),
                     join: Mutex::new(Some(audit_join)),
                 },
+                next_admission_sequence: AtomicU64::new(1),
+                recovered_admissions: Mutex::new(None),
+                recovered_admissions_total: AtomicU64::new(0),
+                admission_integrity_failures: AtomicU64::new(0),
+                uncertain_admissions: AtomicU64::new(0),
+                reaped_runs: AtomicU64::new(0),
+                stuck_finalizations: AtomicU64::new(0),
             }),
         };
         store.recover_finalization_intents()?;
-        store.mark_unfinished_interrupted()?;
+        // Reconstruct the accepted queue before anything interrupts it, and
+        // retire every attempt lease: the exclusive store lock means a lease
+        // present at open cannot belong to a live attempt.
+        store.clear_stale_leases()?;
+        let recovered = store.recover_admissions()?;
+        let survivors: HashSet<String> = recovered
+            .iter()
+            .map(|record| record.run_id.clone())
+            .collect();
+        *store.inner.recovered_admissions.lock() = Some(recovered);
+        store.mark_unfinished_interrupted_excluding(&survivors)?;
         store.fail_orphaned_idempotency_claims()?;
         // Cleanup is best-effort at the record level, but directory access
         // failures still surface so a broken ledger cannot look healthy.
@@ -778,9 +820,22 @@ impl OrchStore {
     }
 
     pub fn mark_unfinished_interrupted(&self) -> anyhow::Result<usize> {
+        self.mark_unfinished_interrupted_excluding(&HashSet::new())
+    }
+
+    /// Crash recovery, minus the queued runs whose durable admission record
+    /// survived. Those keep their accepted position instead of being silently
+    /// destroyed; everything else that was mid-flight becomes `interrupted`.
+    fn mark_unfinished_interrupted_excluding(
+        &self,
+        keep_queued: &HashSet<String>,
+    ) -> anyhow::Result<usize> {
         let mut n = 0;
         let mut interrupted_agents = Vec::new();
         for mut run in self.list_runs()? {
+            if run.state == RunState::Queued && keep_queued.contains(&run.run_id) {
+                continue;
+            }
             if matches!(run.state, RunState::Queued | RunState::Running) {
                 run.state = RunState::Interrupted;
                 run.queue_position = None;
@@ -826,6 +881,599 @@ impl OrchStore {
             })?;
         }
         Ok(n)
+    }
+
+    // ── durable admission queue ────────────────────────────────────────
+    //
+    // Accepted-but-not-started work is durable here, not in a process-local
+    // queue. The two invariants that make the receipt honest:
+    //   1. the record is fsync-safe (file + parent dir) before the caller's
+    //      idempotency receipt is allowed to settle, and
+    //   2. `Queued` is the only promotable state, and the transition out of
+    //      it is a compare-and-set under this store's lock, so exactly one
+    //      supervisor can ever consume it.
+
+    fn admission_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(run_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("admissions")
+            .join(format!("{safe}.json")))
+    }
+
+    fn lease_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(run_id)?;
+        Ok(self.inner.root.join("leases").join(format!("{safe}.json")))
+    }
+
+    /// Allocate the next durable admission order number. Monotonic for the
+    /// life of this store handle, and re-seeded from disk at every open, so
+    /// restart replays the accepted queue in arrival order rather than in
+    /// directory order.
+    pub fn next_admission_sequence(&self) -> u64 {
+        self.inner
+            .next_admission_sequence
+            .fetch_add(1, atomic::Ordering::SeqCst)
+    }
+
+    /// Durably record one accepted admission. Exclusive-create: a second
+    /// write for the same run is a conflict, never a silent overwrite.
+    pub fn save_admission(&self, record: &AdmissionRecord) -> Result<(), OrchError> {
+        record.validate()?;
+        if record.state != AdmissionState::Queued {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "a new admission must be queued",
+            ));
+        }
+        let mut sealed = record.clone();
+        sealed.seal();
+        let path = self.admission_path(&record.run_id)?;
+        let _guard = self.inner.lock.lock();
+        match write_private_json_exclusive(&path, &sealed) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "admission already exists for this run",
+            )),
+            Err(error) => Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        }
+    }
+
+    /// Read one admission, failing closed on a tampered or truncated record.
+    pub fn load_admission(&self, run_id: &str) -> Result<Option<AdmissionRecord>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.load_admission_unlocked(run_id)
+    }
+
+    fn load_admission_unlocked(&self, run_id: &str) -> Result<Option<AdmissionRecord>, OrchError> {
+        let path = match self.admission_path(run_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let text = fs::read_to_string(&path)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let record: AdmissionRecord = serde_json::from_str(&text)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        if !record.integrity_ok() || record.run_id != run_id {
+            return Err(OrchError::new(
+                OrchErrorCode::Internal,
+                "admission integrity check failed",
+            ));
+        }
+        record.validate()?;
+        Ok(Some(record))
+    }
+
+    /// Number of durably queued admissions still awaiting promotion.
+    pub fn queued_admission_count(&self) -> usize {
+        let _guard = self.inner.lock.lock();
+        let Ok(entries) = fs::read_dir(self.inner.root.join("admissions")) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("json"))
+            .filter(|entry| {
+                fs::read_to_string(entry.path())
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<AdmissionRecord>(&text).ok())
+                    .is_some_and(|record| record.state == AdmissionState::Queued)
+            })
+            .count()
+    }
+
+    /// Durably retire queued work so nothing can resurrect it. The tombstone
+    /// is written before the file is unlinked, so a crash mid-cancel still
+    /// leaves a consumed marker rather than a promotable record.
+    pub fn tombstone_admission(&self, run_id: &str) -> bool {
+        let _guard = self.inner.lock.lock();
+        let Ok(path) = self.admission_path(run_id) else {
+            return false;
+        };
+        if !path.is_file() {
+            return false;
+        }
+        if let Ok(text) = fs::read_to_string(&path) {
+            if let Ok(mut record) = serde_json::from_str::<AdmissionRecord>(&text) {
+                record.state = AdmissionState::Tombstoned;
+                record.updated_at = Utc::now();
+                record.seal();
+                let _ = atomic_write_private_json(&path, &record);
+            }
+        }
+        fs::remove_file(&path).is_ok()
+    }
+
+    /// Consume one queued admission and start its run, exactly once.
+    ///
+    /// Everything below happens under the single store lock: the admission is
+    /// compare-and-set out of `Queued`, the attempt lease is installed, and
+    /// only then does the run become `Running`. A crash at any cut leaves the
+    /// admission consumed and the run non-running, which recovery resolves to
+    /// `interrupted` — never to a second dispatch.
+    pub fn promote_admission(
+        &self,
+        run_id: &str,
+        owner_id: &str,
+        start_seq: u64,
+        lease_ttl: Duration,
+    ) -> Result<(RunRecord, AdmissionRecord), OrchError> {
+        let _guard = self.inner.lock.lock();
+        let Some(mut admission) = self.load_admission_unlocked(run_id)? else {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "admission is no longer queued",
+            ));
+        };
+        if admission.state != AdmissionState::Queued {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "admission is already consumed",
+            ));
+        }
+        let run = self
+            .load_run_unlocked(run_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "run record is missing"))?;
+        if run.state != RunState::Queued {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("run is no longer queued ({:?})", run.state),
+            ));
+        }
+        if run.session_id != admission.session_id {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "admission does not belong to the run's session",
+            ));
+        }
+
+        let path = self.admission_path(run_id)?;
+        let consumed = {
+            let mut consumed = admission.clone();
+            consumed.state = AdmissionState::Promoted;
+            consumed.updated_at = Utc::now();
+            consumed.seal();
+            consumed
+        };
+        atomic_write_private_json(&path, &consumed)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+
+        let attempt = self
+            .load_lease_unlocked(run_id)
+            .map(|lease| lease.attempt.saturating_add(1))
+            .unwrap_or(1);
+        let lease = self.write_lease_unlocked(run_id, run.session_id, owner_id, attempt, lease_ttl);
+        let started = (|| -> anyhow::Result<RunRecord> {
+            let mut started = run.clone();
+            started.state = RunState::Running;
+            started.queue_position = None;
+            started.start_seq = Some(start_seq);
+            started.updated_at = Utc::now();
+            let run_path = self
+                .run_path(run_id)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            atomic_write_json(&run_path, &started)?;
+            Ok(started)
+        })();
+
+        match started {
+            Ok(started) => {
+                let _ = fs::remove_file(&path);
+                admission.state = AdmissionState::Promoted;
+                Ok((started, admission))
+            }
+            Err(error) => {
+                // The admission is already consumed, so this work must never
+                // be re-dispatched. Fail the run closed instead of leaving a
+                // queued record nothing will ever start.
+                if lease.is_some() {
+                    let _ = self.clear_lease_unlocked(run_id);
+                }
+                let mut failed = run;
+                failed.state = RunState::Failed;
+                failed.queue_position = None;
+                failed.terminal_result = Some("failed".into());
+                failed.error_code = Some("admission_promotion_failed".into());
+                failed.updated_at = Utc::now();
+                if let Ok(run_path) = self.run_path(run_id) {
+                    if atomic_write_json(&run_path, &failed).is_err() {
+                        self.inner
+                            .stuck_finalizations
+                            .fetch_add(1, atomic::Ordering::Relaxed);
+                    }
+                }
+                let _ = fs::remove_file(&path);
+                Err(OrchError::new(OrchErrorCode::Internal, error.to_string()))
+            }
+        }
+    }
+
+    /// Adopt the queue reconstructed at open, exactly once per store handle.
+    ///
+    /// The store root is held under an exclusive advisory lock, so there is
+    /// one store per ledger per process. Handing the recovered queue to the
+    /// first caller keeps a second embedded control service from adopting the
+    /// same work and dispatching it twice.
+    pub fn take_recovered_admissions(&self) -> Vec<AdmissionRecord> {
+        self.inner
+            .recovered_admissions
+            .lock()
+            .take()
+            .unwrap_or_default()
+    }
+
+    // ── attempt leases and the staleness reaper ────────────────────────
+
+    fn load_lease_unlocked(&self, run_id: &str) -> Option<RunLease> {
+        let path = self.lease_path(run_id).ok()?;
+        let text = fs::read_to_string(path).ok()?;
+        let lease: RunLease = serde_json::from_str(&text).ok()?;
+        (lease.run_id == run_id).then_some(lease)
+    }
+
+    fn write_lease_unlocked(
+        &self,
+        run_id: &str,
+        session_id: Uuid,
+        owner_id: &str,
+        attempt: u32,
+        ttl: Duration,
+    ) -> Option<RunLease> {
+        let now = Utc::now();
+        let lease = RunLease {
+            run_id: run_id.to_string(),
+            session_id,
+            owner_id: owner_id.to_string(),
+            attempt,
+            acquired_at: now,
+            heartbeat_at: now,
+            expires_at: now + ttl,
+        };
+        let path = self.lease_path(run_id).ok()?;
+        atomic_write_private_json(&path, &lease).ok()?;
+        Some(lease)
+    }
+
+    fn clear_lease_unlocked(&self, run_id: &str) -> bool {
+        let Ok(path) = self.lease_path(run_id) else {
+            return false;
+        };
+        fs::remove_file(path).is_ok()
+    }
+
+    /// Install the owning lease for a run that starts without queueing.
+    pub fn install_lease(
+        &self,
+        run_id: &str,
+        session_id: Uuid,
+        owner_id: &str,
+        ttl: Duration,
+    ) -> Option<RunLease> {
+        let _guard = self.inner.lock.lock();
+        let attempt = self
+            .load_lease_unlocked(run_id)
+            .map(|lease| lease.attempt.saturating_add(1))
+            .unwrap_or(1);
+        self.write_lease_unlocked(run_id, session_id, owner_id, attempt, ttl)
+    }
+
+    pub fn load_lease(&self, run_id: &str) -> Option<RunLease> {
+        let _guard = self.inner.lock.lock();
+        self.load_lease_unlocked(run_id)
+    }
+
+    /// Refresh one attempt's liveness. A heartbeat can only ever extend the
+    /// exact live attempt: it never creates a lease, never adopts one owned
+    /// by another owner or attempt, and never touches a terminal run.
+    pub fn heartbeat_run(
+        &self,
+        run_id: &str,
+        owner_id: &str,
+        attempt: u32,
+        ttl: Duration,
+    ) -> Result<RunLease, LeaseDenied> {
+        let _guard = self.inner.lock.lock();
+        let run = match self.load_run_unlocked(run_id) {
+            Ok(Some(run)) => run,
+            Ok(None) => return Err(LeaseDenied::UnknownRun),
+            Err(_) => return Err(LeaseDenied::UnknownRun),
+        };
+        if run.state.is_terminal() {
+            return Err(LeaseDenied::Terminal);
+        }
+        let Some(existing) = self.load_lease_unlocked(run_id) else {
+            return Err(LeaseDenied::Missing);
+        };
+        if !existing.matches(owner_id, attempt) {
+            return Err(LeaseDenied::WrongOwner);
+        }
+        let now = Utc::now();
+        let refreshed = RunLease {
+            heartbeat_at: now,
+            expires_at: now + ttl,
+            ..existing
+        };
+        let path = self
+            .lease_path(run_id)
+            .map_err(|_| LeaseDenied::UnknownRun)?;
+        atomic_write_private_json(&path, &refreshed).map_err(|_| LeaseDenied::Missing)?;
+        Ok(refreshed)
+    }
+
+    /// Release the lease held by this exact attempt. A stale owner cannot
+    /// release a newer attempt's lease.
+    pub fn release_lease(&self, run_id: &str, owner_id: &str, attempt: u32) -> bool {
+        let _guard = self.inner.lock.lock();
+        match self.load_lease_unlocked(run_id) {
+            Some(lease) if lease.matches(owner_id, attempt) => self.clear_lease_unlocked(run_id),
+            _ => false,
+        }
+    }
+
+    /// Move every `Running` run whose attempt lease has expired to
+    /// `interrupted` with `lost_worker`, and report them so the caller can
+    /// release the capacity they were holding.
+    ///
+    /// Deterministic by construction: the only input is the persisted
+    /// expiry, so the same ledger and the same clock always reap the same
+    /// set. Live attempts (fresh heartbeat) and terminal runs are never
+    /// touched; a lease whose run is already terminal is simply cleared.
+    pub fn reap_expired_leases(&self, now: DateTime<Utc>) -> Vec<ReapedRun> {
+        let _guard = self.inner.lock.lock();
+        let mut reaped = Vec::new();
+        let Ok(entries) = fs::read_dir(self.inner.root.join("leases")) else {
+            return reaped;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(lease) = serde_json::from_str::<RunLease>(&text) else {
+                let _ = fs::remove_file(&path);
+                continue;
+            };
+            let run = match self.load_run_unlocked(&lease.run_id) {
+                Ok(Some(run)) => run,
+                _ => {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+            };
+            if run.state.is_terminal() {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            if !lease.is_expired_at(now) {
+                continue;
+            }
+            let mut lost = run;
+            lost.state = RunState::Interrupted;
+            lost.queue_position = None;
+            lost.terminal_result = Some("interrupted".into());
+            lost.error_code = Some("lost_worker".into());
+            lost.updated_at = now;
+            if let Some(execution) = lost.execution.as_mut() {
+                execution.promotion_state = PromotionState::Conflicted;
+            }
+            let Ok(run_path) = self.run_path(&lease.run_id) else {
+                continue;
+            };
+            if atomic_write_json(&run_path, &lost).is_err() {
+                continue;
+            }
+            let _ = fs::remove_file(&path);
+            self.inner
+                .reaped_runs
+                .fetch_add(1, atomic::Ordering::Relaxed);
+            reaped.push(ReapedRun {
+                run_id: lease.run_id,
+                session_id: lease.session_id,
+                attempt: lease.attempt,
+            });
+        }
+        reaped
+    }
+
+    // ── bounded finalization ───────────────────────────────────────────
+
+    /// Preserve a terminal candidate as a write-ahead intent without claiming
+    /// the run was finalized. `recover_finalization_intents` replays it at the
+    /// next open. This is the escape hatch that lets a bounded retry give the
+    /// admission slot back instead of spinning on a full disk forever.
+    pub fn write_finalization_intent(&self, candidate: &RunRecord) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            candidate.state.is_terminal(),
+            "finalization candidate must be terminal"
+        );
+        let _guard = self.inner.lock.lock();
+        let intent_path = self
+            .finalization_path(&candidate.run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        atomic_write_json(&intent_path, candidate)
+    }
+
+    /// Count of finalizations that exhausted their bounded retry and were
+    /// left to intent replay. Non-zero means a run is durably unresolved.
+    pub fn note_stuck_finalization(&self) -> u64 {
+        self.inner
+            .stuck_finalizations
+            .fetch_add(1, atomic::Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    pub fn stuck_finalizations(&self) -> u64 {
+        self.inner
+            .stuck_finalizations
+            .load(atomic::Ordering::Relaxed)
+    }
+
+    pub fn reaped_runs(&self) -> u64 {
+        self.inner.reaped_runs.load(atomic::Ordering::Relaxed)
+    }
+
+    pub fn admission_integrity_failures(&self) -> u64 {
+        self.inner
+            .admission_integrity_failures
+            .load(atomic::Ordering::Relaxed)
+    }
+
+    /// Admissions retired at open because their acceptance was never
+    /// acknowledged to the client. Each one is work that fails closed rather
+    /// than running against a receipt the client was told had failed.
+    pub fn uncertain_admissions(&self) -> u64 {
+        self.inner
+            .uncertain_admissions
+            .load(atomic::Ordering::Relaxed)
+    }
+
+    pub fn recovered_admission_count(&self) -> u64 {
+        self.inner
+            .recovered_admissions_total
+            .load(atomic::Ordering::Relaxed)
+    }
+
+    pub fn pending_finalization_intents(&self) -> usize {
+        let Ok(entries) = fs::read_dir(self.inner.root.join("finalization")) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("json"))
+            .count()
+    }
+
+    // ── restart reconstruction ─────────────────────────────────────────
+
+    /// Rebuild the exact accepted admission queue and retire everything that
+    /// cannot be honoured. Runs before `mark_unfinished_interrupted`, whose
+    /// exception set it produces.
+    fn recover_admissions(&self) -> anyhow::Result<Vec<AdmissionRecord>> {
+        let dir = self.inner.root.join("admissions");
+        let mut recovered: Vec<AdmissionRecord> = Vec::new();
+        let mut highest = 0u64;
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let parsed = fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<AdmissionRecord>(&text).ok())
+                .filter(|record| record.integrity_ok() && record.validate().is_ok());
+            let Some(record) = parsed else {
+                // Never execute a record whose bytes cannot be trusted, and
+                // never delete the evidence either.
+                self.inner
+                    .admission_integrity_failures
+                    .fetch_add(1, atomic::Ordering::Relaxed);
+                let quarantine =
+                    path.with_extension(format!("json.corrupt-{}", Utc::now().timestamp_millis()));
+                let _ = fs::rename(&path, &quarantine);
+                continue;
+            };
+            highest = highest.max(record.sequence);
+            if record.state != AdmissionState::Queued {
+                // Already consumed: promoted or tombstoned before the crash.
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            match self.load_run_unlocked(&record.run_id) {
+                Ok(Some(run)) if run.state == RunState::Queued => {
+                    // Reconcile by request identity before re-admitting.
+                    // A crash between the durable record and the settled
+                    // receipt leaves the client holding a *failed* mutation
+                    // (`fail_orphaned_idempotency_claims` below), so running
+                    // this work anyway would execute a request its caller was
+                    // told did not happen. Fail closed instead; the caller
+                    // owns the retry, and it can never become a duplicate.
+                    if self.receipt_acknowledged(&record.request_id) {
+                        recovered.push(record);
+                    } else {
+                        self.inner
+                            .uncertain_admissions
+                            .fetch_add(1, atomic::Ordering::Relaxed);
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+                // Terminal, running, or missing: the admission is either
+                // already consumed or unresolvable. Fail closed and let the
+                // run's own recovery state stand.
+                _ => {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        recovered.sort_by(|left, right| {
+            left.sequence
+                .cmp(&right.sequence)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.run_id.cmp(&right.run_id))
+        });
+        self.inner
+            .next_admission_sequence
+            .store(highest.saturating_add(1), atomic::Ordering::SeqCst);
+        self.inner
+            .recovered_admissions_total
+            .store(recovered.len() as u64, atomic::Ordering::Relaxed);
+        Ok(recovered)
+    }
+
+    /// Whether the caller was durably told this request was accepted. Only a
+    /// settled `complete` receipt counts; a pending claim (about to be failed
+    /// as orphaned) and a missing one are both uncertain.
+    fn receipt_acknowledged(&self, request_id: &str) -> bool {
+        matches!(
+            self.load_idempotency(request_id),
+            Ok(Some(receipt)) if receipt.status == "complete" && receipt.request_id == request_id
+        )
+    }
+
+    /// Every attempt lease dies with the process that owned it. The store
+    /// root is exclusively locked, so a lease found at open can never belong
+    /// to a live attempt.
+    fn clear_stale_leases(&self) -> anyhow::Result<usize> {
+        let dir = self.inner.root.join("leases");
+        let mut cleared = 0;
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            if fs::remove_file(&path).is_ok() {
+                cleared += 1;
+            }
+        }
+        Ok(cleared)
     }
 
     fn recover_finalization_intents(&self) -> anyhow::Result<usize> {
@@ -955,6 +1603,62 @@ fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Res
     file.write_all(&serde_json::to_vec_pretty(value)?)?;
     file.sync_all()?;
     fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Atomic replace for a record that must not be world-readable. Same durable
+/// shape as `atomic_write_json` (fsync on the file and the parent directory),
+/// with `0600` established before any bytes are written.
+fn atomic_write_private_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let _ = fs::remove_file(&tmp);
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(&serde_json::to_vec_pretty(value)?)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Exclusive private create: the durable proof that this admission is new.
+fn write_private_json_exclusive<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(&serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?)?;
+    file.sync_all()?;
+    drop(file);
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
         fs::File::open(parent)?.sync_all()?;

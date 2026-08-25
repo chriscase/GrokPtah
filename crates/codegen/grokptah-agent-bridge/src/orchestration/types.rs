@@ -375,6 +375,196 @@ pub struct RunRecord {
     pub approval: Option<RunApproval>,
 }
 
+/// Hard structural ceiling for one durable admission input, independent of
+/// the negotiated per-run `RunBounds`. A record above this is refused rather
+/// than written, so a bad ceiling cannot turn the queue into a blob store.
+pub const MAX_ADMISSION_INPUT_BYTES: usize = 1_000_000;
+
+/// Lifecycle of one durable admission record.
+///
+/// `Queued` is the only promotable state. Both other states are consumed
+/// markers: recovery deletes them and never re-dispatches their work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionState {
+    Queued,
+    Promoted,
+    Tombstoned,
+}
+
+/// The complete, crash-safe truth for one accepted-but-not-yet-started run.
+///
+/// Before this record existed the queue was split: a durable `RunRecord` in
+/// state `Queued` carrying only a redacted 500-byte preview, and the real
+/// execution input in a process-local `VecDeque`. A restart destroyed the
+/// input while the client held a durable receipt saying the work was
+/// accepted. This record is the single admission truth instead, and the
+/// idempotency receipt is only settled after it is fsync-safe on disk.
+///
+/// It is deliberately **private**: it lives beside the run ledger under the
+/// same store authority, is written `0600` on Unix, and is never projected
+/// into a run, event, receipt, or capacity response. Only bounded counts
+/// derived from it are public.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdmissionRecord {
+    pub run_id: String,
+    pub session_id: Uuid,
+    pub workspace: String,
+    pub request_id: String,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// The complete bounded execution input. Never projected publicly.
+    pub prompt: String,
+    pub bounds: RunBounds,
+    pub execution_mode: RunExecutionMode,
+    /// Queue lineage: the run this queued work continues, and the
+    /// interrupted run it explicitly replaces.
+    #[serde(default)]
+    pub parent_run_id: Option<String>,
+    #[serde(default)]
+    pub retry_of: Option<String>,
+    /// Durable admission order. Restart replays the accepted queue in exactly
+    /// this order, so arrival order does not depend on directory iteration.
+    pub sequence: u64,
+    pub state: AdmissionState,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// Private integrity digest over every field above. A record that fails
+    /// verification is quarantined and its run fails closed; it is never
+    /// executed on the assumption that the missing bytes did not matter.
+    pub integrity: String,
+}
+
+impl AdmissionRecord {
+    /// Digest of every semantically load-bearing field. `updated_at` and the
+    /// digest itself are excluded so a state transition can be re-sealed
+    /// without invalidating the original acceptance.
+    pub fn digest(&self) -> String {
+        hash_payload(&serde_json::json!({
+            "runId": self.run_id,
+            "sessionId": self.session_id,
+            "workspace": self.workspace,
+            "requestId": self.request_id,
+            "clientId": self.client_id,
+            "prompt": self.prompt,
+            "bounds": {
+                "maxPromptBytes": self.bounds.max_prompt_bytes,
+                "maxRounds": self.bounds.max_rounds,
+                "maxDurationMs": self.bounds.max_duration_ms,
+            },
+            "executionMode": self.execution_mode,
+            "parentRunId": self.parent_run_id,
+            "retryOf": self.retry_of,
+            "sequence": self.sequence,
+            "state": self.state,
+            "createdAt": self.created_at,
+        }))
+    }
+
+    /// Stamp the current integrity digest. Every write goes through this.
+    pub fn seal(&mut self) {
+        self.integrity = self.digest();
+    }
+
+    pub fn integrity_ok(&self) -> bool {
+        !self.integrity.is_empty() && constant_time_str_eq(&self.integrity, &self.digest())
+    }
+
+    /// Structural validation applied before the record is written and again
+    /// after it is read back, so a truncated or hand-edited file fails closed.
+    pub fn validate(&self) -> Result<(), OrchError> {
+        safe_id_filename(&self.run_id)?;
+        safe_id_filename(&self.request_id)?;
+        if self.prompt.is_empty() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "admission input must not be empty",
+            ));
+        }
+        if self.prompt.len() > MAX_ADMISSION_INPUT_BYTES {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                format!("admission input exceeds {MAX_ADMISSION_INPUT_BYTES} bytes"),
+            ));
+        }
+        if self.prompt.len() > self.bounds.max_prompt_bytes {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "admission input exceeds its own negotiated bounds",
+            ));
+        }
+        self.bounds.validate()?;
+        if self.workspace.is_empty() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "admission workspace must not be empty",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Ownership of one live `Running` attempt.
+///
+/// This is a **sidecar** record rather than a `RunRecord` field on purpose:
+/// the run projection stays exactly as bounded and redacted as it already
+/// was, and the reaper sweeps only live attempts instead of the whole ledger.
+/// The run record remains authoritative for terminal state; a lease is always
+/// re-validated against it inside the store lock before it can do anything.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunLease {
+    pub run_id: String,
+    pub session_id: Uuid,
+    /// Identity of the supervisor instance that owns this attempt.
+    pub owner_id: String,
+    /// Monotonic attempt number for this run, starting at 1.
+    pub attempt: u32,
+    pub acquired_at: DateTime<Utc>,
+    pub heartbeat_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl RunLease {
+    pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
+        now > self.expires_at
+    }
+
+    pub fn matches(&self, owner_id: &str, attempt: u32) -> bool {
+        self.attempt == attempt && constant_time_str_eq(&self.owner_id, owner_id)
+    }
+}
+
+/// Why a heartbeat or promotion was refused. Every variant is a fail-closed
+/// outcome: the caller must stop, never retry blind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseDenied {
+    /// No lease exists for this run any more (reaped, released, or restarted).
+    Missing,
+    /// A different owner or a different attempt holds the run.
+    WrongOwner,
+    /// The run already reached a terminal state; nothing may revive it.
+    Terminal,
+    /// The run record itself is gone.
+    UnknownRun,
+}
+
+impl LeaseDenied {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "lease_missing",
+            Self::WrongOwner => "lease_wrong_owner",
+            Self::Terminal => "run_terminal",
+            Self::UnknownRun => "unknown_run",
+        }
+    }
+}
+
+fn constant_time_str_eq(left: &str, right: &str) -> bool {
+    super::authz::constant_time_eq(left.as_bytes(), right.as_bytes())
+}
+
 pub const MAX_AGENT_CONTEXT_BYTES: usize = 16 * 1024;
 pub const MAX_AGENT_WORKSPACE_BYTES: usize = 4 * 1024;
 pub const MAX_AGENT_MODEL_BYTES: usize = 256;
