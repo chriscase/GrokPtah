@@ -1035,13 +1035,12 @@ fn assert_happy_path_counts(
     if service.send_count() != expected_posts {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
-    if exact_array(intents, "intents")?.len() as u64
-        != fixture
-            .native_work_by_step
-            .values()
-            .try_fold(0_u64, |total, count| total.checked_add(*count))
-            .ok_or(DiagnosticCode::FixtureInvalid)?
-    {
+    let expected_intents = fixture
+        .native_work_by_step
+        .values()
+        .try_fold(1_u64, |total, count| total.checked_add(*count))
+        .ok_or(DiagnosticCode::FixtureInvalid)?;
+    if exact_array(intents, "intents")?.len() as u64 != expected_intents {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
     if exact_array(runs, "runs")?.iter().any(|run| {
