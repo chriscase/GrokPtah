@@ -2143,7 +2143,6 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_xai_agent_step_routed<F, G>(
     creds: &crate::auth_store::WireCredentials,
     snapshot: &crate::orchestration::ProviderRouteSnapshot,
