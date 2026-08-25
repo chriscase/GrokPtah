@@ -1,8 +1,9 @@
 # Cursor Cloud agents from GrokPtah
 
-**Status:** provider-neutral external-worker contract and a trusted native
-Cursor Cloud v1 lifecycle adapter are now staged in `grokptah-agent-sdk` and
-`grokptah-agent-bridge`; the adapter is not live-qualified yet.
+**Status:** provider-neutral external-worker contract, a trusted native
+Cursor Cloud v1 lifecycle adapter, and a manager/MCP production slice are
+now staged in `grokptah-agent-sdk` and `grokptah-agent-bridge`. The adapter
+is not live-qualified against a real Cursor account yet.
 
 GrokPtah can manage Cursor's Cloud Agents as an external execution provider.
 This is separate from controlling a local Cursor desktop window. Cursor's
@@ -95,13 +96,14 @@ path is qualified.
 
 ## Qualification stages
 
-1. **Contract fixture:** the native fake Cursor API fixture now proves
-   isolated create, explicit allowlist and response-safety checks, exact source
-   projection, status polling, busy/unknown follow-up rejection, redacted
-   terminal text, terminal cancellation, and run-attributed digest-bearing
-   artifacts without network credentials. Provider list/archive, stream
-   reconnect/expiry, durable idempotent retry, and a real artifact download/hash
-   path remain to be added.
+1. **Contract fixture:** the native fake Cursor API fixture plus the manager
+   fake-adapter tests now prove isolated create, explicit allowlist and
+   response-safety checks, exact source projection, status polling, stream
+   expiry fallback, busy/unknown follow-up rejection, durable idempotent retry
+   and restart replay, redacted terminal text, terminal cancellation, cursor
+   recovery, and run-attributed digest-bearing artifacts without network
+   credentials. Provider list/archive and a real artifact download/hash path
+   remain to be added.
 2. **Read-only live probe:** list models/repositories and read an existing
    disposable agent; record API version, limits, retention, and redaction.
 3. **Disposable create:** create one agent from an exact public test ref with
@@ -109,9 +111,12 @@ path is qualified.
    it and verify no source checkout was changed.
 4. **Manager integration:** expose Cursor as a provider-neutral lane in the
    desktop and browser-safe broker, with explicit user-visible provider and
-   cost/usage labels. The staged browser client now has typed launch, status,
-   artifact, and cancellation calls; the trusted native lifecycle adapter is
-   staged, while server routes and live qualification remain to be completed.
+   cost/usage labels. Trusted host setup now installs `ExternalWorkerRegistry`
+   from `start_control_from_env`, persists opaque agent/run identity on the
+   orchestration ledger, and exposes launch/status/follow-up/cancel/artifact
+   MCP tools plus redacted desktop/broker projections with cursor recovery.
+   Browser clients still cannot acquire Computer Use or promotion authority
+   through this lane. Live Cursor-account HTTP qualification remains open.
 5. **Release gate:** independently review the adapter, run a retry/restart
    soak, and prove that approval, promotion, and Computer Use remain separate.
 

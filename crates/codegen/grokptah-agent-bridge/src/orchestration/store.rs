@@ -12,7 +12,8 @@ use parking_lot::Mutex;
 
 use super::types::{
     safe_id_filename, AgentRecord, AgentState, AuditEntry, ContinuationCheckpoint,
-    IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunRecord, RunState,
+    DurableExternalRun, DurableExternalWorker, IdempotencyReceipt, OrchError, OrchErrorCode,
+    PromotionState, RunRecord, RunState,
 };
 
 #[derive(Clone)]
@@ -93,6 +94,8 @@ impl OrchStore {
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
+        fs::create_dir_all(root.join("external_workers"))?;
+        fs::create_dir_all(root.join("external_runs"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -186,6 +189,29 @@ impl OrchStore {
             .root
             .join("checkpoints")
             .join(format!("{safe}.json")))
+    }
+
+    fn external_worker_path(&self, external_agent_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(external_agent_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("external_workers")
+            .join(format!("{safe}.json")))
+    }
+
+    fn external_run_path(
+        &self,
+        external_agent_id: &str,
+        external_run_id: &str,
+    ) -> Result<PathBuf, OrchError> {
+        let agent = safe_id_filename(external_agent_id)?;
+        let run = safe_id_filename(external_run_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("external_runs")
+            .join(format!("{agent}_{run}.json")))
     }
 
     pub fn save_run(&self, run: &RunRecord) -> anyhow::Result<()> {
@@ -393,6 +419,123 @@ impl OrchStore {
                 .cmp(&a.ordinal)
                 .then(b.created_at.cmp(&a.created_at))
         });
+        Ok(out)
+    }
+
+    pub fn save_external_worker(&self, worker: &DurableExternalWorker) -> anyhow::Result<()> {
+        worker
+            .worker
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let _g = self.inner.lock.lock();
+        let path = self
+            .external_worker_path(&worker.worker.external_agent_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        atomic_write_json(&path, worker)
+    }
+
+    pub fn load_external_worker(
+        &self,
+        external_agent_id: &str,
+    ) -> anyhow::Result<Option<DurableExternalWorker>> {
+        let _g = self.inner.lock.lock();
+        self.load_external_worker_unlocked(external_agent_id)
+    }
+
+    fn load_external_worker_unlocked(
+        &self,
+        external_agent_id: &str,
+    ) -> anyhow::Result<Option<DurableExternalWorker>> {
+        let path = match self.external_worker_path(external_agent_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let worker: DurableExternalWorker = serde_json::from_str(&fs::read_to_string(path)?)?;
+        worker
+            .worker
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        Ok(Some(worker))
+    }
+
+    pub fn list_external_workers(&self) -> anyhow::Result<Vec<DurableExternalWorker>> {
+        let _g = self.inner.lock.lock();
+        let mut out = Vec::new();
+        let dir = self.inner.root.join("external_workers");
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let worker: DurableExternalWorker = serde_json::from_str(&fs::read_to_string(path)?)?;
+            worker
+                .worker
+                .validate()
+                .map_err(|error| anyhow::anyhow!(error))?;
+            out.push(worker);
+        }
+        out.sort_by(|a, b| b.worker.updated_at.cmp(&a.worker.updated_at));
+        Ok(out)
+    }
+
+    pub fn save_external_run(&self, run: &DurableExternalRun) -> anyhow::Result<()> {
+        run.run.validate().map_err(|error| anyhow::anyhow!(error))?;
+        let _g = self.inner.lock.lock();
+        let path = self
+            .external_run_path(&run.run.external_agent_id, &run.run.external_run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        atomic_write_json(&path, run)
+    }
+
+    pub fn load_external_run(
+        &self,
+        external_agent_id: &str,
+        external_run_id: &str,
+    ) -> anyhow::Result<Option<DurableExternalRun>> {
+        let _g = self.inner.lock.lock();
+        self.load_external_run_unlocked(external_agent_id, external_run_id)
+    }
+
+    fn load_external_run_unlocked(
+        &self,
+        external_agent_id: &str,
+        external_run_id: &str,
+    ) -> anyhow::Result<Option<DurableExternalRun>> {
+        let path = match self.external_run_path(external_agent_id, external_run_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let run: DurableExternalRun = serde_json::from_str(&fs::read_to_string(path)?)?;
+        run.run.validate().map_err(|error| anyhow::anyhow!(error))?;
+        Ok(Some(run))
+    }
+
+    pub fn list_external_runs(&self) -> anyhow::Result<Vec<DurableExternalRun>> {
+        let _g = self.inner.lock.lock();
+        let mut out = Vec::new();
+        let dir = self.inner.root.join("external_runs");
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let run: DurableExternalRun = serde_json::from_str(&fs::read_to_string(path)?)?;
+            run.run.validate().map_err(|error| anyhow::anyhow!(error))?;
+            out.push(run);
+        }
+        out.sort_by(|a, b| b.run.updated_at.cmp(&a.run.updated_at));
         Ok(out)
     }
 
@@ -781,6 +924,12 @@ impl OrchStore {
         let mut n = 0;
         let mut interrupted_agents = Vec::new();
         for mut run in self.list_runs()? {
+            // Provider-managed external runs remain live across host restart.
+            // Reconnect polls the adapter; a closed local process is not
+            // evidence of completion or interruption.
+            if run.external.is_some() {
+                continue;
+            }
             if matches!(run.state, RunState::Queued | RunState::Running) {
                 run.state = RunState::Interrupted;
                 run.queue_position = None;
@@ -878,6 +1027,9 @@ impl OrchStore {
 /// worktree. Reviewable and promotable records therefore remain durable until
 /// their managed resource is explicitly discarded or otherwise disappears.
 fn safe_to_expire_run(run: &RunRecord) -> bool {
+    if run.external.is_some() {
+        return false;
+    }
     run.execution
         .as_ref()
         .map(|execution| !Path::new(&execution.execution_workspace).exists())
@@ -1010,6 +1162,7 @@ mod tests {
             progress: None,
             execution: None,
             approval: None,
+            external: None,
         }
     }
 
@@ -1060,6 +1213,7 @@ mod tests {
             progress: None,
             execution: None,
             approval: None,
+            external: None,
         };
         store.save_run(&run).unwrap();
         drop(store);
@@ -1184,6 +1338,7 @@ mod tests {
             progress: None,
             execution: None,
             approval: None,
+            external: None,
         };
         store.save_run(&run).unwrap();
         let clone = store.clone();
@@ -1412,6 +1567,7 @@ mod tests {
             progress: None,
             execution: None,
             approval: None,
+            external: None,
         };
         store.save_run(&run).unwrap();
         store

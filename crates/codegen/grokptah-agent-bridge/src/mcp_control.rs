@@ -30,13 +30,18 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use grokptah_agent_sdk::{ErrorCode as PublicErrorCode, ErrorEnvelope, ErrorEventRange};
+use grokptah_agent_sdk::{
+    Bounds, ErrorCode as PublicErrorCode, ErrorEnvelope, ErrorEventRange,
+    ExternalWorkerExecutionMode, ExternalWorkerFollowUpRequest, ExternalWorkerLaunchRequest,
+    ExternalWorkerProvider,
+};
 
 use crate::computer_use::ComputerClientIdentity;
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
-    AuthContext, ChangeRecord, OrchError, OrchErrorCode, OrchestrationConfig, OrchestrationService,
-    RunExecutionMode, WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    external_worker_registry_from_env, AuthContext, ChangeRecord, OrchError, OrchErrorCode,
+    OrchestrationConfig, OrchestrationService, RunExecutionMode, WorkspaceAllowlist, CONTROL_TOOLS,
+    FORBIDDEN_TOOLS,
 };
 use crate::{EventReceiver, JournalPage, SessionUpdate};
 
@@ -380,6 +385,7 @@ pub async fn start_control_from_env(host: AgentHostHandle) -> Option<ControlServ
             bounds: Default::default(),
         },
     );
+    orch.install_external_worker_registry(external_worker_registry_from_env(&host.event_bus()));
     let mut limits = ControlServerLimits::default();
     if let Ok(n) = std::env::var("GROKPTAH_CONTROL_MAX_CONCURRENT") {
         if let Ok(v) = n.parse::<usize>() {
@@ -786,6 +792,89 @@ struct EventsArgs {
     after_seq: u64,
     #[serde(default = "default_event_limit")]
     limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchExternalWorkerArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    provider: ExternalWorkerProvider,
+    #[serde(default)]
+    provider_id: Option<String>,
+    repository: String,
+    starting_ref: String,
+    prompt: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    execution_mode: Option<ExternalWorkerExecutionMode>,
+    #[serde(default)]
+    auto_create_pr: bool,
+    #[serde(default)]
+    bounds: Option<Bounds>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalWorkerScopeArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalWorkerArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    external_agent_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalWorkerRunArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    external_agent_id: String,
+    external_run_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalWorkerEventsArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    external_agent_id: String,
+    external_run_id: String,
+    #[serde(default)]
+    after_seq: u64,
+    #[serde(default = "default_event_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FollowUpExternalWorkerArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    external_agent_id: String,
+    expected_version: u64,
+    prompt: String,
+    #[serde(default)]
+    bounds: Option<Bounds>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelExternalWorkerArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    external_agent_id: String,
+    external_run_id: String,
+    expected_version: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1370,6 +1459,17 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
             "requestId": null
         })
     });
+    if let Some(poll_route) = e
+        .data
+        .as_ref()
+        .and_then(|extra| extra.get("pollRoute"))
+        .and_then(Value::as_str)
+        .filter(|route| route.starts_with('/') && !route.starts_with("//"))
+    {
+        if let Some(object) = data.as_object_mut() {
+            object.insert("pollRoute".into(), json!(poll_route));
+        }
+    }
     // Keep `code` stable for cross-product consumers. The detailed server-side
     // reason is separately named and bounded; never forward arbitrary OrchError
     // data or overwrite the public taxonomy with an internal transport code.
@@ -1559,6 +1659,111 @@ fn tool_input_schema(name: &str) -> Value {
                 }
             })
         }
+        "ptah_launch_external_worker" => json!({
+            "type": "object",
+            "required": [
+                "request_id", "session_id", "workspace", "provider",
+                "repository", "starting_ref", "prompt"
+            ],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "provider": {
+                    "type": "string",
+                    "enum": ["cursor_cloud", "claude_code_cloud", "local_worker", "custom"]
+                },
+                "provider_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "repository": {"type": "string", "minLength": 1, "maxLength": 512},
+                "starting_ref": {"type": "string", "minLength": 1, "maxLength": 512},
+                "prompt": {"type": "string", "minLength": 1},
+                "model": {"type": "string", "minLength": 1, "maxLength": 256},
+                "execution_mode": {"type": "string", "enum": ["isolated"], "default": "isolated"},
+                "auto_create_pr": {"type": "boolean", "default": false},
+                "bounds": bounds
+            }
+        }),
+        "ptah_list_external_workers" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace
+            }
+        }),
+        "ptah_get_external_worker" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "external_agent_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "external_agent_id": {"type": "string", "minLength": 1, "maxLength": 256}
+            }
+        }),
+        "ptah_get_external_worker_run" | "ptah_list_external_worker_artifacts" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "external_agent_id", "external_run_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "external_agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "external_run_id": {"type": "string", "minLength": 1, "maxLength": 256}
+            }
+        }),
+        "ptah_get_external_worker_events" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "external_agent_id", "external_run_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "external_agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "external_run_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "after_seq": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Durable cursor. A cursor below the retained window fails with cursor_expired and includes eventRange plus pollRoute."
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500}
+            }
+        }),
+        "ptah_follow_up_external_worker" => json!({
+            "type": "object",
+            "required": [
+                "request_id", "session_id", "workspace", "external_agent_id",
+                "expected_version", "prompt"
+            ],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "external_agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "expected_version": {"type": "integer", "minimum": 0},
+                "prompt": {"type": "string", "minLength": 1},
+                "bounds": bounds
+            }
+        }),
+        "ptah_cancel_external_worker" => json!({
+            "type": "object",
+            "required": [
+                "request_id", "session_id", "workspace", "external_agent_id",
+                "external_run_id", "expected_version"
+            ],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "external_agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "external_run_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "expected_version": {"type": "integer", "minimum": 0}
+            }
+        }),
         "ptah_get_events" => json!({
             "type": "object",
             "required": ["session_id", "workspace", "run_id"],
@@ -2011,6 +2216,122 @@ async fn dispatch_tool(
                 args.session_id,
                 &args.workspace,
                 &args.run_id,
+                args.expected_version,
+            )
+            .await
+        }
+        "ptah_launch_external_worker" => {
+            let args: LaunchExternalWorkerArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.repository, "repository")?;
+            require_nonempty(&args.starting_ref, "starting_ref")?;
+            orch.launch_external_worker(
+                auth,
+                ExternalWorkerLaunchRequest {
+                    request_id: args.request_id,
+                    provider: args.provider,
+                    provider_id: args.provider_id,
+                    repository: args.repository,
+                    starting_ref: args.starting_ref,
+                    prompt: args.prompt,
+                    model: args.model,
+                    execution_mode: args
+                        .execution_mode
+                        .unwrap_or(ExternalWorkerExecutionMode::Isolated),
+                    auto_create_pr: args.auto_create_pr,
+                    bounds: args.bounds,
+                },
+                args.session_id,
+                &args.workspace,
+            )
+            .await
+        }
+        "ptah_list_external_workers" => {
+            let args: ExternalWorkerScopeArgs = parse_value(args)?;
+            orch.list_external_workers_scoped(auth, args.session_id, &args.workspace)
+        }
+        "ptah_get_external_worker" => {
+            let args: ExternalWorkerArgs = parse_value(args)?;
+            require_nonempty(&args.external_agent_id, "external_agent_id")?;
+            orch.get_external_worker_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.external_agent_id,
+            )
+            .await
+        }
+        "ptah_get_external_worker_run" => {
+            let args: ExternalWorkerRunArgs = parse_value(args)?;
+            require_nonempty(&args.external_agent_id, "external_agent_id")?;
+            require_nonempty(&args.external_run_id, "external_run_id")?;
+            orch.get_external_worker_run_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.external_agent_id,
+                &args.external_run_id,
+            )
+            .await
+        }
+        "ptah_get_external_worker_events" => {
+            let args: ExternalWorkerEventsArgs = parse_value(args)?;
+            require_nonempty(&args.external_agent_id, "external_agent_id")?;
+            require_nonempty(&args.external_run_id, "external_run_id")?;
+            orch.get_external_worker_events_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.external_agent_id,
+                &args.external_run_id,
+                args.after_seq,
+                args.limit,
+            )
+            .await
+        }
+        "ptah_follow_up_external_worker" => {
+            let args: FollowUpExternalWorkerArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.external_agent_id, "external_agent_id")?;
+            orch.follow_up_external_worker(
+                auth,
+                ExternalWorkerFollowUpRequest {
+                    request_id: args.request_id,
+                    prompt: args.prompt,
+                    bounds: args.bounds,
+                },
+                args.session_id,
+                &args.workspace,
+                &args.external_agent_id,
+                args.expected_version,
+            )
+            .await
+        }
+        "ptah_list_external_worker_artifacts" => {
+            let args: ExternalWorkerRunArgs = parse_value(args)?;
+            require_nonempty(&args.external_agent_id, "external_agent_id")?;
+            require_nonempty(&args.external_run_id, "external_run_id")?;
+            orch.list_external_worker_artifacts_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.external_agent_id,
+                &args.external_run_id,
+            )
+            .await
+        }
+        "ptah_cancel_external_worker" => {
+            let args: CancelExternalWorkerArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.external_agent_id, "external_agent_id")?;
+            require_nonempty(&args.external_run_id, "external_run_id")?;
+            orch.cancel_external_worker(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.external_agent_id,
+                &args.external_run_id,
                 args.expected_version,
             )
             .await

@@ -213,6 +213,7 @@ fn service_store_seed(
             progress: None,
             execution: None,
             approval: None,
+            external: None,
         })
         .unwrap();
 }

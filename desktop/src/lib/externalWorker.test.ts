@@ -4,6 +4,7 @@ import {
   createExternalWorkerMonitor,
   parseExternalWorkerArtifact,
   parseExternalWorkerEvent,
+  parseExternalWorkerEventPage,
   parseExternalWorkerFollowUpRequest,
   parseExternalWorkerLaunchRequest,
   parseExternalWorkerLaunchResult,
@@ -163,6 +164,20 @@ describe("external worker UI contract", () => {
     expect(parseExternalWorkerNotification({
       type: "event",
       event: { seq: 1, ts: "now", kind: "run.progress", detail: "Authorization: secret" },
+    })).toBeNull();
+  });
+
+  it("parses a redacted event page and rejects privileged poll routes", () => {
+    expect(parseExternalWorkerEventPage({
+      events: [{ seq: 1, ts: "2026-08-24T00:00:00Z", kind: "run.launched", detail: "external worker launched" }],
+      lastSeq: 1,
+      pollRoute: "/external-workers/agent-1/runs/run-1",
+      nextCursor: 1,
+    })).not.toBeNull();
+    expect(parseExternalWorkerEventPage({
+      events: [],
+      lastSeq: 0,
+      pollRoute: "https://cursor.com/agents/secret",
     })).toBeNull();
   });
 });

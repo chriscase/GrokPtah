@@ -79,12 +79,14 @@ binding and run ids to the exact GrokPtah `session_id`, `workspace`, and
 | `GET /bindings/{bindingId}/runs/{runId}/tests` | `ptah_get_test_results` | read-only | No arbitrary command output. |
 | `GET /bindings/{bindingId}/runs/{runId}/handoff` | `ptah_get_handoff` | read-only | Bounded final handoff. |
 | `GET /bindings/{bindingId}/runs/{runId}/review` | `ptah_review_run` | read-only | Isolated-run diff/fingerprint. |
-| `POST /bindings/{bindingId}/external-workers` | external worker adapter | execute | Launches an isolated exact-ref cloud worker; requires idempotency and CSRF. |
-| `GET /bindings/{bindingId}/external-workers/{agentId}` | external worker adapter | read-only | Redacted provider worker identity and lifecycle. |
-| `POST /bindings/{bindingId}/external-workers/{agentId}/runs` | external worker adapter | execute | Queues one bounded follow-up run; only one active provider run is allowed; requires idempotency and CSRF. |
-| `GET /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}` | external worker adapter | read-only | Redacted provider run status and cursor. |
-| `GET /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/artifacts` | external worker adapter | read-only | Bounded relative artifact references only. |
-| `POST /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/cancel` | external worker adapter | execute | Explicit terminal cancellation; requires idempotency and CSRF. |
+| `POST /bindings/{bindingId}/external-workers` | `ptah_launch_external_worker` | execute | Launches an isolated exact-ref cloud worker; requires idempotency and CSRF. |
+| `GET /bindings/{bindingId}/external-workers` | `ptah_list_external_workers` | read-only | Redacted worker identities for the bound workspace. |
+| `GET /bindings/{bindingId}/external-workers/{agentId}` | `ptah_get_external_worker` | read-only | Redacted provider worker identity and lifecycle. |
+| `POST /bindings/{bindingId}/external-workers/{agentId}/runs` | `ptah_follow_up_external_worker` | execute | Queues one bounded follow-up run; only one active provider run is allowed; requires idempotency, CSRF, and `expected_version`. |
+| `GET /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}` | `ptah_get_external_worker_run` | read-only | Redacted provider run status and cursor; reconnects via stream-then-status fallback. |
+| `GET /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/events` | `ptah_get_external_worker_events` | read-only | Redacted events with `cursor_expired` recovery and a same-origin poll route. |
+| `GET /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/artifacts` | `ptah_list_external_worker_artifacts` | read-only | Bounded relative artifact references only; digest and run attribution required. |
+| `POST /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/cancel` | `ptah_cancel_external_worker` | execute | Explicit terminal cancellation; requires idempotency, CSRF, and `expected_version`. |
 | `POST /bindings/{bindingId}/runs/{runId}/approve` | broker approval | execute | Binds exact review fingerprints to a short-lived approval. |
 | `POST /bindings/{bindingId}/runs/{runId}/promote` | promotion authority | promote | Requires the short-lived approval and desktop human gate. |
 | `POST /bindings/{bindingId}/runs/{runId}/cancel` | `ptah_cancel` | execute | Explicit user action; idempotent request id. |

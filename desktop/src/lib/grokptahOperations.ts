@@ -490,6 +490,131 @@ export class GrokPtahOperations {
     return this.computerControl<T>("ptah_cancel_computer_run", scope, requestId, expectedVersion, gateSatisfied);
   }
 
+  async launchExternalWorker<T = unknown>(
+    scope: GrokPtahScope,
+    request: {
+      requestId: string;
+      provider: "cursor_cloud" | "claude_code_cloud" | "local_worker" | "custom";
+      providerId?: string;
+      repository: string;
+      startingRef: string;
+      prompt: string;
+      model?: string;
+      bounds?: GrokPtahBounds;
+    },
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("external.execute");
+    return this.invoke<T>("ptah_launch_external_worker", {
+      request_id: nonEmpty(request.requestId, "requestId"),
+      ...scopeArgs(scope),
+      provider: request.provider,
+      ...(request.providerId ? { provider_id: nonEmpty(request.providerId, "providerId") } : {}),
+      repository: nonEmpty(request.repository, "repository"),
+      starting_ref: nonEmpty(request.startingRef, "startingRef"),
+      prompt: nonEmpty(request.prompt, "prompt"),
+      ...(request.model ? { model: nonEmpty(request.model, "model") } : {}),
+      execution_mode: "isolated",
+      auto_create_pr: false,
+      ...(request.bounds ? { bounds: validateGrokPtahBounds(request.bounds) } : {}),
+    });
+  }
+
+  async listExternalWorkers<T = unknown>(
+    scope: GrokPtahScope,
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("external.observe");
+    return this.invoke<T>("ptah_list_external_workers", scopeArgs(scope));
+  }
+
+  async getExternalWorker<T = unknown>(
+    scope: GrokPtahScope,
+    externalAgentId: string,
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("external.observe");
+    return this.invoke<T>("ptah_get_external_worker", {
+      ...scopeArgs(scope),
+      external_agent_id: nonEmpty(externalAgentId, "externalAgentId"),
+    });
+  }
+
+  async getExternalWorkerRun<T = unknown>(
+    scope: GrokPtahScope,
+    externalAgentId: string,
+    externalRunId: string,
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("external.observe");
+    return this.invoke<T>("ptah_get_external_worker_run", {
+      ...scopeArgs(scope),
+      external_agent_id: nonEmpty(externalAgentId, "externalAgentId"),
+      external_run_id: nonEmpty(externalRunId, "externalRunId"),
+    });
+  }
+
+  async getExternalWorkerEvents<T = unknown>(
+    scope: GrokPtahScope,
+    externalAgentId: string,
+    externalRunId: string,
+    options: { afterSeq?: number; limit?: number } = {},
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("external.observe");
+    return this.invoke<T>("ptah_get_external_worker_events", {
+      ...scopeArgs(scope),
+      external_agent_id: nonEmpty(externalAgentId, "externalAgentId"),
+      external_run_id: nonEmpty(externalRunId, "externalRunId"),
+      ...(options.afterSeq === undefined ? {} : { after_seq: options.afterSeq }),
+      ...(options.limit === undefined ? {} : { limit: options.limit }),
+    });
+  }
+
+  async followUpExternalWorker<T = unknown>(
+    scope: GrokPtahScope,
+    externalAgentId: string,
+    requestId: string,
+    prompt: string,
+    expectedVersion: number,
+    bounds?: GrokPtahBounds,
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("external.execute");
+    return this.invoke<T>("ptah_follow_up_external_worker", {
+      request_id: nonEmpty(requestId, "requestId"),
+      ...scopeArgs(scope),
+      external_agent_id: nonEmpty(externalAgentId, "externalAgentId"),
+      expected_version: expectedVersion,
+      prompt: nonEmpty(prompt, "prompt"),
+      ...(bounds ? { bounds: validateGrokPtahBounds(bounds) } : {}),
+    });
+  }
+
+  async listExternalWorkerArtifacts<T = unknown>(
+    scope: GrokPtahScope,
+    externalAgentId: string,
+    externalRunId: string,
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("external.observe");
+    return this.invoke<T>("ptah_list_external_worker_artifacts", {
+      ...scopeArgs(scope),
+      external_agent_id: nonEmpty(externalAgentId, "externalAgentId"),
+      external_run_id: nonEmpty(externalRunId, "externalRunId"),
+    });
+  }
+
+  async cancelExternalWorker<T = unknown>(
+    scope: GrokPtahScope,
+    externalAgentId: string,
+    externalRunId: string,
+    requestId: string,
+    expectedVersion: number,
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAvailable("external.execute");
+    return this.invoke<T>("ptah_cancel_external_worker", {
+      request_id: nonEmpty(requestId, "requestId"),
+      ...scopeArgs(scope),
+      external_agent_id: nonEmpty(externalAgentId, "externalAgentId"),
+      external_run_id: nonEmpty(externalRunId, "externalRunId"),
+      expected_version: expectedVersion,
+    });
+  }
+
   private async computerControl<T>(
     tool: string,
     scope: GrokPtahRunScope,

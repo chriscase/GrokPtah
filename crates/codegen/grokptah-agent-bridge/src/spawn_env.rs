@@ -13,6 +13,9 @@ pub const CONTROL_SECRET_ENV_KEYS: &[&str] = &[
     "GROKPTAH_CONTROL_WORKSPACES",
     "GROKPTAH_CONTROL_SECRET",
     "GROKPTAH_MCP_CONTROL_TOKEN",
+    "GROKPTAH_CURSOR_API_KEY",
+    "GROKPTAH_CURSOR_API_BASE",
+    "GROKPTAH_CURSOR_REPOSITORY_ALLOWLIST",
 ];
 
 fn is_scrubbed_key(key: &OsStr) -> bool {
@@ -20,9 +23,11 @@ fn is_scrubbed_key(key: &OsStr) -> bool {
         return false;
     };
     let upper = s.to_ascii_uppercase();
-    CONTROL_SECRET_ENV_KEYS
-        .iter()
-        .any(|k| upper == *k || upper.starts_with("GROKPTAH_CONTROL_"))
+    CONTROL_SECRET_ENV_KEYS.iter().any(|k| {
+        upper == *k
+            || upper.starts_with("GROKPTAH_CONTROL_")
+            || upper.starts_with("GROKPTAH_CURSOR_")
+    })
 }
 
 /// Apply scrub list to a tokio `Command` (clears then rebuilds without secrets).
@@ -72,6 +77,7 @@ mod tests {
         assert!(is_scrubbed_key(OsStr::new("GROKPTAH_CONTROL_TOKEN")));
         assert!(is_scrubbed_key(OsStr::new("grokptah_control_port")));
         assert!(is_scrubbed_key(OsStr::new("GROKPTAH_CONTROL_EXTRA")));
+        assert!(is_scrubbed_key(OsStr::new("GROKPTAH_CURSOR_API_KEY")));
         assert!(!is_scrubbed_key(OsStr::new("PATH")));
         assert!(!is_scrubbed_key(OsStr::new("GROKPTAH_AGENT_OFFLINE")));
     }

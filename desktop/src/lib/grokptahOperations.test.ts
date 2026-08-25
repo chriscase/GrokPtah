@@ -220,4 +220,60 @@ describe("GrokPtahOperations", () => {
       expected_revision: 9,
     });
   });
+
+  it("launches an external worker through external.execute without computer or promote authority", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      response({ jsonrpc: "2.0", id: 1, result: { localRunId: "local-1" } }),
+    );
+    const operations = new GrokPtahOperations(
+      clientWithCapabilities(fetcher, [
+        {
+          id: "external.execute",
+          tier: "execute",
+          mutating: true,
+          human_gate: false,
+          availability: "available",
+          description: "Launch isolated external workers",
+        },
+      ]),
+    );
+    const result = await operations.launchExternalWorker(
+      { sessionId: "session-1", workspace: "/repo" },
+      {
+        requestId: "ext-1",
+        provider: "cursor_cloud",
+        repository: "org/repo",
+        startingRef: "refs/heads/review",
+        prompt: "Review the exact candidate",
+      },
+    );
+    expect(result.value).toEqual({ localRunId: "local-1" });
+    expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body)).params.arguments).toEqual({
+      request_id: "ext-1",
+      session_id: "session-1",
+      workspace: "/repo",
+      provider: "cursor_cloud",
+      repository: "org/repo",
+      starting_ref: "refs/heads/review",
+      prompt: "Review the exact candidate",
+      execution_mode: "isolated",
+      auto_create_pr: false,
+    });
+    await expect(
+      operations.promoteRun(
+        { sessionId: "session-1", workspace: "/repo", runId: "run-1" },
+        "request-1",
+        "approval-1",
+      ),
+    ).rejects.toMatchObject({ capabilityId: "run.promote", state: "unavailable" });
+    await expect(
+      operations.authorizeComputerRun(
+        { sessionId: "session-1", workspace: "/repo", runId: "run-1" },
+        "request-1",
+        1,
+        ["semantic"],
+        1000,
+      ),
+    ).rejects.toMatchObject({ capabilityId: "computer.control", state: "unavailable" });
+  });
 });
