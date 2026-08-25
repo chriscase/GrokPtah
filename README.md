@@ -1,12 +1,14 @@
 # GrokPtah
 
-**GrokPtah** is a desktop-first AI coding agent: open a project, chat with the agent, approve tools, review diffs, and run an integrated terminal — all in a native window.
+**GrokPtah** is a local-first coding and persistent-agent harness: open a
+project, run durable agents, approve tools, review diffs, and reconnect from a
+native desktop or an authorized web client.
 
 The name combines **Grok** (the agent lineage) with **Ptah** (Egyptian craftsman-creator), reflecting a tool meant for *building* software, not only chatting about it.
 
 | | |
 |--|--|
-| **Product** | GrokPtah desktop (Tauri 2 + React) |
+| **Product** | GrokPtah desktop + persistent agent service |
 | **Origin** | Fork of [xai-org/grok-build](https://github.com/xai-org/grok-build) (Grok Build / SpaceXAI) |
 | **License** | [Apache License 2.0](LICENSE) |
 | **Repo** | [chriscase/GrokPtah](https://github.com/chriscase/GrokPtah) |
@@ -17,10 +19,18 @@ The name combines **Grok** (the agent lineage) with **Ptah** (Egyptian craftsman
 
 ## What is this?
 
-GrokPtah is a **local coding agent harness** with two clients over the same kind of workflow:
+GrokPtah is a **local-first coding and persistent-agent harness** with two
+execution hosts and multiple clients over the same authority-scoped workflow:
 
-1. **Desktop app (primary for this fork)** — a fullscreen Tauri application with a React UI: sessions, streaming replies, tool cards, permissions, plan mode, file tree, git, MCP/plugins/skills, settings, subagents, background tasks, and multi-tab terminal.
-2. **CLI / TUI (upstream path)** — the original terminal UI from Grok Build (`xai-grok-pager`), still buildable from this tree for people who prefer the ratatui pager.
+1. **Desktop app (primary interactive client)** — a fullscreen Tauri
+   application with sessions, streaming replies, permissions, plan mode,
+   files/git, persistent agents, remote runs, MCP/plugins/skills, Help Center,
+   and a multi-tab terminal.
+2. **Headless service (local, private host, or VM)** — the same bridge runtime
+   and authenticated control plane without Tauri, suitable for long-running
+   agents that remain available while a laptop is offline.
+3. **CLI / TUI (upstream path)** — the original terminal UI from Grok Build
+   (`xai-grok-pager`), still buildable for people who prefer the ratatui pager.
 
 The agent can read and edit files, search the codebase, run shell commands (with approval), and — when you provide an xAI API key — call live models for the reply. Shell tool runs stream into the UI as a **single live process** (the terminal attaches to that stream; it does not re-run the command).
 
@@ -50,6 +60,10 @@ This is **not** an official xAI product. It is a personal/community fork for des
 - **Plan mode** — propose steps; accept or reject from the UI  
 - **Sessions** — separate **Builds** (coding agent) and **Chats** (plain Grok); multi-tab; full-screen browser (rename / delete / archive / folders / tags); durable under `~/.grokptah/`  
 - **Search** — hybrid **keyword + semantic (TF–IDF)** search across chats and builds (filter by kind, archive, folder, tag)  
+- **Help Center** — source-cited offline guidance, paraphrase search, optional
+  confirmation-gated semantic ranking, and a bounded citation-validated assistant
+- **Reusable surfaces** — browser-safe broker client and Tauri-free headless
+  UI primitives for desktop products and War Room integrations ([embedding guide](docs/EMBEDDING.md))
 
 
 - **Project** — open folder (native dialog); rules discovery (`AGENTS.md`, etc.)  
@@ -58,6 +72,11 @@ This is **not** an official xAI product. It is a personal/community fork for des
 - **Extensibility** — MCP config under `~/.grokptah` / project `.mcp.json`; plugins & skills on disk; hooks config  
 - **Auth** — store an xAI API key in the OS keychain (or `XAI_API_KEY`); open console for keys  
 - **Settings** — model, effort, tool safety profile (soft agent gates, not OS sandbox), appearance, permission mode  
+
+GrokPtah keeps the configured Grok Build route separate from the unrelated Grok
+Bot product. External development tools such as Claude Code, Cursor, and
+user-submitted Grok Build prompts are not hidden runtime dependencies or quota
+claims; see [`PROVIDER_PRODUCT_BOUNDARIES.md`](docs/PROVIDER_PRODUCT_BOUNDARIES.md).
 
 Capability parity with the TUI is the target; the UI is desktop-native, not a pixel clone of the terminal theme.
 
@@ -107,6 +126,14 @@ npm run tauri:build
 
 On first use: **Open folder**, optionally **Save key** (xAI API key) or set `XAI_API_KEY`.
 
+To stage the browser-safe client package and run its authority-boundary smoke
+checks:
+
+```sh
+cd desktop
+npm run verify:public
+```
+
 ### CLI / TUI (upstream-style)
 
 ```sh
@@ -126,18 +153,18 @@ cargo check -p xai-grok-pager-bin
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  GrokPtah desktop (desktop/)                            │
-│  React + Vite in Tauri 2 webview                        │
+│ Clients: desktop UI · MCP · future web/mobile           │
 └──────────────────────────┬──────────────────────────────┘
-                           │ commands + events
+                           │ typed IPC or authenticated protocol
 ┌──────────────────────────▼──────────────────────────────┐
-│  grokptah-desktop (src-tauri)                           │
-│  dialogs · PTY hub · thin IPC                           │
+│ Hosts: desktop/src-tauri or grokptah-service            │
+│ OS capabilities · configured roots · process lifecycle  │
 └──────────────────────────┬──────────────────────────────┘
-                           │ in-process
+                           │ shared domain API
 ┌──────────────────────────▼──────────────────────────────┐
 │  grokptah-agent-bridge                                  │
-│  sessions · stream · permissions · tools · shell kill   │
+│  sessions · finite runs · agents · memory · policy      │
+│  durable events · tools · review/promotion              │
 └─────────────────────────────────────────────────────────┘
 
 Separately (same monorepo root workspace):
@@ -156,11 +183,12 @@ Full design notes: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 | Path | Role |
 |------|------|
 | `desktop/` | GrokPtah app — frontend + Tauri backend |
-| `crates/codegen/grokptah-agent-bridge/` | In-process agent host (desktop happy path) |
+| `crates/codegen/grokptah-agent-bridge/` | Shared runtime/domain layer used by both hosts |
+| `crates/codegen/grokptah-service/` | Standalone local/VM/private-cloud service host |
 | `crates/codegen/xai-grok-pager*` | Upstream TUI / pager |
 | `crates/codegen/xai-grok-shell` | Upstream agent runtime (CLI/ACP) |
 | `docs/` | Architecture and developer setup |
-| `~/.grokptah/` | Local MCP, plugins, skills, hooks (created on use) |
+| `~/.grokptah/` or `GROKPTAH_HOME` | The owning process's durable home and local configuration |
 
 ---
 
