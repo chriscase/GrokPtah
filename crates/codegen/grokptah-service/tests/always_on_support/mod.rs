@@ -2162,6 +2162,7 @@ pub fn require_unique_step_work<'a>(work: &'a Value, step_id: &str) -> &'a Value
     items[0]
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn require_causal_join(
     work: &Value,
     detailed: &Value,
@@ -2185,6 +2186,7 @@ pub fn require_causal_join(
     .unwrap_or_else(|error| panic!("{error}"))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn causal_join(
     work: &Value,
     detailed: &Value,
