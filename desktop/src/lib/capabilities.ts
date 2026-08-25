@@ -52,6 +52,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
 const CAPABILITY_ID = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9_]*)+$/;
 const MAX_CAPABILITY_ID_LENGTH = 128;
 const DESCRIPTOR_KEYS = new Set([
@@ -72,7 +76,7 @@ function parseDescriptor(value: unknown): CapabilityDescriptor | null {
   if (
     typeof id !== "string" ||
     !CAPABILITY_ID.test(id) ||
-    id.length > MAX_CAPABILITY_ID_LENGTH ||
+    utf8Bytes(id) > MAX_CAPABILITY_ID_LENGTH ||
     typeof tier !== "string" ||
     !TIERS.has(tier as CapabilityTier) ||
     typeof mutating !== "boolean" ||
@@ -81,7 +85,7 @@ function parseDescriptor(value: unknown): CapabilityDescriptor | null {
     !AVAILABILITIES.has(availability as CapabilityAvailability) ||
     typeof description !== "string" ||
     description.length === 0 ||
-    description.length > MAX_DESCRIPTION_LENGTH ||
+    utf8Bytes(description) > MAX_DESCRIPTION_LENGTH ||
     (availability === "gated" && human_gate !== true)
   ) {
     return null;
