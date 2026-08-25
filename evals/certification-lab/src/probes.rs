@@ -1704,6 +1704,10 @@ async fn always_on_home_b(
         .provider
         .wait_accepted(&fixture.step_first, Duration::from_secs(90))
         .map_err(|_| DiagnosticCode::Timeout)?;
+    service
+        .provider
+        .wait_accepted("manager-decision", Duration::from_secs(90))
+        .map_err(|_| DiagnosticCode::Timeout)?;
     let join = always_on_find_in_flight(
         probe,
         &mut client,
@@ -1714,10 +1718,6 @@ async fn always_on_home_b(
     .await?;
     let work_id = join.work_id.clone();
     let run_id = join.run_id.clone();
-    service
-        .provider
-        .wait_accepted("manager-decision", Duration::from_secs(90))
-        .map_err(|_| DiagnosticCode::Timeout)?;
     let expected_cardinality = fixture.expected_restart_cardinality()?;
     assert_exact_cardinality(
         expected_cardinality,
