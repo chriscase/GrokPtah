@@ -680,7 +680,7 @@ async fn start_endpoint(
             }
         }
         EndpointKind::Hosted => {
-            let config = ServiceConfig::new(
+            let mut config = ServiceConfig::new(
                 "127.0.0.1:0".parse().unwrap(),
                 token,
                 vec![workspace.to_path_buf()],
