@@ -2979,6 +2979,43 @@ mod tests {
     }
 
     #[test]
+    fn receipt_write_failure_tombstones_acceptance_before_restart() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let (run, intent) = queued_run("receipt-write-failure", 1);
+        store.save_run(&run).unwrap();
+        store.save_acceptance_intent(&intent).unwrap();
+        store
+            .claim_idempotency(&intent.tool, &intent.request_id, &intent.payload_hash)
+            .unwrap();
+        let receipt_path = store.idemp_path(&intent.request_id).unwrap();
+        fs::remove_file(&receipt_path).unwrap();
+        fs::create_dir(&receipt_path).unwrap();
+        assert!(store
+            .complete_idempotency(
+                &intent.tool,
+                &intent.request_id,
+                &intent.payload_hash,
+                Some(intent.run_id.clone()),
+                intent.response.clone(),
+            )
+            .is_err());
+        store.fail_acceptance_intent(&intent.run_id).unwrap();
+        fs::remove_dir(&receipt_path).unwrap();
+        drop(store);
+
+        let reopened = OrchStore::open(d.path()).unwrap();
+        let run = reopened.load_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(run.state, RunState::Interrupted);
+        assert_eq!(run.error_code.as_deref(), Some("admission_lost"));
+        assert!(reopened.list_acceptance_intents().unwrap().is_empty());
+        assert!(reopened
+            .load_idempotency(&intent.request_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn finalization_recovery_queue_is_bounded_and_projects_degraded_health() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
