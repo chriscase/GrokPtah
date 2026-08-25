@@ -73,9 +73,63 @@ impl ComputerControlResponse {
     }
 }
 
+/// Maximum UTF-8 bytes accepted for a Computer Use event kind.
+const MAX_COMPUTER_EVENT_KIND_BYTES: usize = 128;
+/// Maximum UTF-8 bytes accepted for a Computer Use event timestamp.
+const MAX_COMPUTER_EVENT_TS_BYTES: usize = 128;
+/// Maximum UTF-8 bytes accepted for a Computer Use disposition.
+const MAX_COMPUTER_EVENT_DISPOSITION_BYTES: usize = 128;
+/// Maximum UTF-8 bytes accepted for a Computer Use observation identity.
+const MAX_COMPUTER_EVENT_ID_BYTES: usize = 256;
+/// Maximum UTF-8 bytes accepted for a Computer Use error code.
+const MAX_COMPUTER_EVENT_ERROR_BYTES: usize = 128;
+
+/// Bounded, redacted Computer Use audit payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerEventDetail {
+    /// Share-safe disposition such as `observed`, `acted`, or `denied`.
+    pub disposition: String,
+    /// Optional opaque observation identity; never a host path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_id: Option<String>,
+    /// Optional share-safe error code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+impl ComputerEventDetail {
+    /// Validate the share-safe, bounded Computer Use detail projection.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        crate::redact::reject_bounded_text(
+            &self.disposition,
+            MAX_COMPUTER_EVENT_DISPOSITION_BYTES,
+            "computer event disposition must be non-empty and bounded",
+            "computer event disposition contains privileged data",
+        )?;
+        if let Some(observation_id) = &self.observation_id {
+            crate::redact::reject_bounded_text(
+                observation_id,
+                MAX_COMPUTER_EVENT_ID_BYTES,
+                "computer event observation_id must be non-empty and bounded",
+                "computer event observation_id contains privileged data",
+            )?;
+        }
+        if let Some(error_code) = &self.error_code {
+            crate::redact::reject_bounded_text(
+                error_code,
+                MAX_COMPUTER_EVENT_ERROR_BYTES,
+                "computer event error_code must be non-empty and bounded",
+                "computer event error_code contains privileged data",
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// One redacted Computer Use audit event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ComputerEvent {
     /// Strictly increasing event sequence.
     pub seq: u64,
@@ -84,27 +138,31 @@ pub struct ComputerEvent {
     /// Share-safe event kind.
     pub kind: String,
     /// Redacted event payload.
-    pub detail: serde_json::Value,
+    pub detail: ComputerEventDetail,
 }
 
 impl ComputerEvent {
     /// Validate the share-safe, bounded event projection.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.ts.trim().is_empty() || self.kind.trim().is_empty() || self.kind.len() > 128 {
-            return Err("computer event metadata must be non-empty and bounded");
-        }
-        let bytes = serde_json::to_vec(&self.detail)
-            .map_err(|_| "computer event detail is not serializable")?;
-        if bytes.len() > 256 * 1024 {
-            return Err("computer event detail exceeds its byte bound");
-        }
-        Ok(())
+        crate::redact::reject_bounded_text(
+            &self.ts,
+            MAX_COMPUTER_EVENT_TS_BYTES,
+            "computer event metadata must be non-empty and bounded",
+            "computer event metadata contains privileged data",
+        )?;
+        crate::redact::reject_bounded_text(
+            &self.kind,
+            MAX_COMPUTER_EVENT_KIND_BYTES,
+            "computer event metadata must be non-empty and bounded",
+            "computer event metadata contains privileged data",
+        )?;
+        self.detail.validate()
     }
 }
 
 /// Cursor-paged Computer Use audit events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ComputerEventPage {
     /// Retained events in sequence order.
     pub entries: Vec<ComputerEvent>,
@@ -151,5 +209,69 @@ mod tests {
             ttl_ms: 0,
         };
         assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn computer_event_detail_is_bounded_redacted_and_fail_closed() {
+        let event = ComputerEvent {
+            seq: 4,
+            ts: "2026-08-25T00:00:00Z".into(),
+            kind: "observe".into(),
+            detail: ComputerEventDetail {
+                disposition: "observed".into(),
+                observation_id: Some("obs-1".into()),
+                error_code: None,
+            },
+        };
+        event
+            .validate()
+            .expect("share-safe computer event validates");
+        let value = serde_json::to_value(&event).expect("computer event serializes");
+        assert_eq!(value["kind"], "observe");
+        assert_eq!(value["detail"]["disposition"], "observed");
+        assert_eq!(value["detail"]["observationId"], "obs-1");
+        assert!(value["detail"].get("authorization").is_none());
+        let round: ComputerEvent =
+            serde_json::from_value(value).expect("computer event deserializes");
+        round
+            .validate()
+            .expect("round-tripped computer event validates");
+        assert_eq!(round.detail.observation_id.as_deref(), Some("obs-1"));
+
+        assert!(
+            serde_json::from_value::<ComputerEvent>(serde_json::json!({
+                "seq": 4,
+                "ts": "2026-08-25T00:00:00Z",
+                "kind": "observe",
+                "detail": { "disposition": "observed", "authorization": "Bearer secret" }
+            }))
+            .is_err(),
+            "computer event detail must deny unknown fields"
+        );
+        assert!(
+            serde_json::from_value::<ComputerEvent>(serde_json::json!({
+                "seq": 4,
+                "ts": "2026-08-25T00:00:00Z",
+                "kind": "observe",
+                "detail": "raw screenshot bytes"
+            }))
+            .is_err(),
+            "computer event detail must not accept an unparsed JSON value"
+        );
+        assert!(
+            ComputerEvent {
+                seq: 4,
+                ts: "2026-08-25T00:00:00Z".into(),
+                kind: "observe".into(),
+                detail: ComputerEventDetail {
+                    disposition: "/private/secret".into(),
+                    observation_id: None,
+                    error_code: None,
+                },
+            }
+            .validate()
+            .is_err(),
+            "computer event detail must reject privileged text"
+        );
     }
 }

@@ -43,6 +43,7 @@ equivalent approval/lease layer) before invoking promotion or Computer Use
 control, and should never treat transport reachability as approval.
 
 A second-product consumer such as ContextDesk must import launch, list, archive,
-and error types from this crate root. `tests/context_desk_consumer.rs` is the
-disposable crate-root fixture for that import surface. It is not a live
+and error types from this crate root. Implementation modules are private; the
+crate-root re-exports are the only public surface. `tests/context_desk_consumer.rs`
+is the disposable crate-root fixture for that import surface. It is not a live
 ContextDesk HTTP integration and does not grant native desktop authority.

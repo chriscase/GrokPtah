@@ -7,10 +7,11 @@
 //! module fixture.
 
 use grokptah_agent_sdk::{
-    ExternalWorkerExecutionMode, ExternalWorkerLaunchRequest, ExternalWorkerLaunchResult,
-    ExternalWorkerListPage, ExternalWorkerListQuery, ExternalWorkerProvider, ExternalWorkerRecord,
-    ExternalWorkerRunRecord, ExternalWorkerState, ExternalWorkerSummary,
-    MAX_EXTERNAL_WORKER_LIST_LIMIT,
+    ComputerEvent, ComputerEventDetail, DurableRunState, ExternalWorkerExecutionMode,
+    ExternalWorkerLaunchRequest, ExternalWorkerLaunchResult, ExternalWorkerListPage,
+    ExternalWorkerListQuery, ExternalWorkerProvider, ExternalWorkerRecord, ExternalWorkerRunRecord,
+    ExternalWorkerState, ExternalWorkerSummary, MAX_EXTERNAL_WORKER_LIST_LIMIT, RunEvent,
+    RunEventUpdate,
 };
 
 fn crate_root_launch_request() -> ExternalWorkerLaunchRequest {
@@ -224,4 +225,78 @@ fn crate_root_launch_and_get_dtos_validate_and_round_trip_including_fffd() {
         worker.external_agent_id
     );
     assert_eq!(result_round.worker.state, ExternalWorkerState::Ready);
+}
+
+#[test]
+fn implementation_modules_stay_private_behind_crate_root_reexports() {
+    let lib = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+    for module in ["capability", "computer", "error", "external_worker", "run"] {
+        let private_mod = ["mod ", module, ";"].concat();
+        let public_mod = ["pub mod ", module, ";"].concat();
+        assert!(
+            lib.lines().any(|line| line.trim() == private_mod.as_str()),
+            "SDK implementation modules must stay private"
+        );
+        assert!(
+            !lib.contains(public_mod.as_str()),
+            "SDK implementation modules must not be publicly reachable"
+        );
+    }
+    assert!(lib.contains("pub use external_worker::{"));
+    assert!(lib.contains("pub use computer::{"));
+    assert!(lib.contains("pub use run::{"));
+    assert!(lib.contains("ComputerEventDetail"));
+    assert!(lib.contains("RunEventUpdate"));
+
+    let computer = ComputerEvent {
+        seq: 1,
+        ts: "2026-08-25T00:00:00Z".into(),
+        kind: "observe".into(),
+        detail: ComputerEventDetail {
+            disposition: "observed".into(),
+            observation_id: None,
+            error_code: None,
+        },
+    };
+    computer
+        .validate()
+        .expect("crate-root computer event projection validates");
+    assert!(
+        serde_json::from_value::<ComputerEvent>(serde_json::json!({
+            "seq": 1,
+            "ts": "2026-08-25T00:00:00Z",
+            "kind": "observe",
+            "detail": { "raw": { "screenshot": "AAAA" } }
+        }))
+        .is_err(),
+        "crate-root computer events must reject unparsed detail payloads"
+    );
+
+    let event = RunEvent {
+        seq: 1,
+        ts: "2026-08-25T00:00:00Z".into(),
+        update: RunEventUpdate {
+            event_type: "progress".into(),
+            detail: Some("checking tests".into()),
+            round: Some(1),
+            max_rounds: Some(8),
+            last_tool: None,
+            state: Some(DurableRunState::Running),
+            terminal_result: None,
+            error_code: None,
+            updated_at: None,
+        },
+    };
+    event
+        .validate()
+        .expect("crate-root run event projection validates");
+    assert!(
+        serde_json::from_value::<RunEvent>(serde_json::json!({
+            "seq": 1,
+            "ts": "2026-08-25T00:00:00Z",
+            "update": { "type": "progress", "workspace": "/private/secret" }
+        }))
+        .is_err(),
+        "crate-root run events must reject unknown update fields"
+    );
 }

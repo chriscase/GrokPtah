@@ -324,7 +324,11 @@ export function parseExternalWorkerListQuery(value: unknown): ExternalWorkerList
     (value.cursor !== undefined && !identity(value.cursor)) ||
     (value.includeArchived !== undefined && typeof value.includeArchived !== "boolean")
   ) return null;
-  return value as ExternalWorkerListQuery;
+  return {
+    ...(value.limit === undefined ? {} : { limit: value.limit as number }),
+    ...(value.cursor === undefined ? {} : { cursor: value.cursor as string }),
+    includeArchived: value.includeArchived === true,
+  };
 }
 
 /** Parse a redacted identity-only worker summary from a list page. */

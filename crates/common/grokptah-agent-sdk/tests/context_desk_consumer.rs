@@ -25,6 +25,16 @@ fn utf8_summary(state: ExternalWorkerState) -> ExternalWorkerSummary {
     }
 }
 
+fn crate_root_use_tree(source: &str) -> &str {
+    const PREFIX: &str = "use grokptah_agent_sdk::{";
+    let start = source
+        .find(PREFIX)
+        .expect("ContextDesk consumer must import crate-root SDK surfaces");
+    let rest = &source[start + PREFIX.len()..];
+    let end = rest.find("};").expect("crate-root use tree must be closed");
+    &rest[..end]
+}
+
 fn utf8_worker(state: ExternalWorkerState) -> ExternalWorkerRecord {
     ExternalWorkerRecord {
         provider: ExternalWorkerProvider::CursorCloud,
@@ -44,14 +54,13 @@ fn utf8_worker(state: ExternalWorkerState) -> ExternalWorkerRecord {
 fn context_desk_consumer_imports_only_crate_root_surfaces() {
     let source = include_str!("context_desk_consumer.rs");
     let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
-    let module_path = ["grokptah_agent_sdk", "external_worker"].join("::");
-    let error_module = ["grokptah_agent_sdk", "error", ""].join("::");
     let native_crate = ["grokptah", "agent", "bridge"].join("-");
     let native_module = ["grokptah", "agent", "bridge"].join("_");
     let tauri_package = ["@", "tauri", "-apps"].join("");
     let trusted_export = ["client", "trusted"].join("/");
     let bearer_header = ["Authorization", "Bearer"].join(": ");
     let desktop_src = ["src", "tauri"].join("-");
+    let use_tree = crate_root_use_tree(source);
     assert!(
         source
             .lines()
@@ -60,13 +69,23 @@ fn context_desk_consumer_imports_only_crate_root_surfaces() {
         "ContextDesk consumer must import only crate-root SDK surfaces"
     );
     assert!(
-        !source.contains(&module_path),
-        "ContextDesk consumer must not reach through the external_worker module path"
+        use_tree
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .all(|item| item
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')),
+        "ContextDesk consumer must not use nested or module-qualified SDK imports"
     );
-    assert!(
-        !source.contains(&error_module),
-        "ContextDesk consumer must not reach through the error module path"
-    );
+    for module in ["external_worker", "error", "capability", "computer", "run"] {
+        let nested = [module, ""].join("::");
+        let absolute = ["grokptah_agent_sdk", module].join("::");
+        assert!(
+            !use_tree.contains(&nested) && !source.contains(&absolute),
+            "ContextDesk consumer must not reach through SDK implementation modules"
+        );
+    }
     assert!(
         !source.contains(&native_crate)
             && !source.contains(&native_module)

@@ -7,7 +7,7 @@
 //! Computer Use authority.
 
 use async_trait::async_trait;
-use grokptah_agent_sdk::external_worker::{
+use grokptah_agent_sdk::{
     ExternalWorkerArtifact, ExternalWorkerExecutionMode, ExternalWorkerFollowUpRequest,
     ExternalWorkerLaunchRequest, ExternalWorkerLaunchResult, ExternalWorkerListPage,
     ExternalWorkerListQuery, ExternalWorkerProvider, ExternalWorkerRecord, ExternalWorkerRunRecord,

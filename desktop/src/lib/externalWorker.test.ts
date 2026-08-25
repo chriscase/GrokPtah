@@ -205,7 +205,15 @@ describe("external worker UI contract", () => {
       limit: 20,
       includeArchived: false,
     })).toEqual({ limit: 20, includeArchived: false });
-    expect(parseExternalWorkerListQuery({})).toEqual({});
+    expect(parseExternalWorkerListQuery({})).toEqual({ includeArchived: false });
+    expect(parseExternalWorkerListQuery({ limit: 20 })).toEqual({
+      limit: 20,
+      includeArchived: false,
+    });
+    expect(parseExternalWorkerListQuery({ includeArchived: true })).toEqual({
+      includeArchived: true,
+    });
+    expect(parseExternalWorkerListQuery({ includeArchived: null })).toBeNull();
     expect(parseExternalWorkerListQuery({ limit: 0 })).toBeNull();
     expect(parseExternalWorkerListQuery({ limit: 101 })).toBeNull();
     expect(parseExternalWorkerListQuery({
