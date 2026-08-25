@@ -127,6 +127,7 @@
             "not_found",
             "stale_or_recovery",
             "capacity",
+            "unsupported",
             "authority_unavailable",
             "internal"
           ]

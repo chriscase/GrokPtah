@@ -1504,9 +1504,8 @@ fn public_error_code(code: &OrchErrorCode) -> PublicErrorCode {
             PublicErrorCode::StaleOrRecovery
         }
         OrchErrorCode::Timeout => PublicErrorCode::Internal,
-        OrchErrorCode::InvalidRequest | OrchErrorCode::Unsupported | OrchErrorCode::Conflict => {
-            PublicErrorCode::InvalidRequest
-        }
+        OrchErrorCode::Unsupported => PublicErrorCode::Unsupported,
+        OrchErrorCode::InvalidRequest | OrchErrorCode::Conflict => PublicErrorCode::InvalidRequest,
         OrchErrorCode::Internal => PublicErrorCode::Internal,
     }
 }
@@ -3383,6 +3382,12 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(body["error"]["data"]["code"], "unsupported");
+        assert_eq!(body["error"]["message"], "The operation is unsupported.");
+        assert_eq!(
+            body["error"]["data"]["message"],
+            "The operation is unsupported."
+        );
+        assert_eq!(body["error"]["data"]["reasonCode"], "unsupported");
 
         fixture.srv.stop();
         set_grokptah_home_override(None);
