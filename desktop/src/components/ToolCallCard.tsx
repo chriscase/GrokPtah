@@ -1,19 +1,51 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useId, useRef, useState } from "react";
 import type { TranscriptItem } from "../lib/protocol";
+import "./ToolCallCard.css";
 
 type ToolItem = Extract<TranscriptItem, { kind: "tool" }>;
 
-function statusLabel(status: unknown): string {
-  if (typeof status === "string" && status.trim()) return status;
-  if (status && typeof status === "object") {
+export type ToolStatusKind =
+  | "completed"
+  | "failed"
+  | "denied"
+  | "running"
+  | "pending"
+  | "unknown";
+
+const KNOWN_STATUSES: readonly string[] = [
+  "completed",
+  "failed",
+  "denied",
+  "running",
+  "pending",
+];
+
+/**
+ * Restored transcripts and older bridges can carry statuses outside the
+ * ToolCallStatus union (arbitrary strings, or Rust-enum objects like
+ * `{ failed: {...} }`). Collapse everything to a bounded, class-safe kind and
+ * keep the raw text so the expanded view can still show what was reported.
+ */
+export function normalizeToolStatus(status: unknown): {
+  kind: ToolStatusKind;
+  raw: string;
+} {
+  let raw = "";
+  if (typeof status === "string") {
+    raw = status.trim();
+  } else if (status && typeof status === "object") {
     const keys = Object.keys(status as object);
-    if (keys.length) return keys[0];
+    if (keys.length) raw = keys[0].trim();
   }
-  return "unknown";
+  const lower = raw.toLowerCase();
+  const kind = KNOWN_STATUSES.includes(lower)
+    ? (lower as ToolStatusKind)
+    : "unknown";
+  return { kind, raw };
 }
 
-function statusGlyph(status: string): string {
-  switch (status) {
+function statusGlyph(kind: ToolStatusKind): string {
+  switch (kind) {
     case "completed":
       return "✓";
     case "failed":
@@ -24,7 +56,7 @@ function statusGlyph(status: string): string {
     case "pending":
       return "●";
     default:
-      return "·";
+      return "?";
   }
 }
 
@@ -35,6 +67,10 @@ function shortOutput(output?: string, max = 88): string {
   return `${one.slice(0, max)}…`;
 }
 
+const COPY_RESET_MS = 2000;
+/** Bound how much of an odd raw status we ever render. */
+const RAW_STATUS_MAX = 40;
+
 /**
  * Compact tool row — collapsed by default.
  *
@@ -42,11 +78,20 @@ function shortOutput(output?: string, max = 88): string {
  * collapses again unless the user has manually toggled this card.
  */
 /** Memoized so settled tool cards skip re-render when other panes stream (#122). */
-export const ToolCallCard = memo(function ToolCallCard({ item }: { item: ToolItem }) {
-  const status = statusLabel(item.status);
-  const live = status === "running" || status === "pending";
+export const ToolCallCard = memo(function ToolCallCard({
+  item,
+}: {
+  item: ToolItem;
+}) {
+  const { kind, raw } = normalizeToolStatus(item.status);
+  const live = kind === "running" || kind === "pending";
   /** null = follow automatic open rules; boolean = user override */
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">(
+    "idle",
+  );
+  const copyTimer = useRef<number | null>(null);
+  const bodyId = useId();
   const title = item.title?.trim() || "tool";
   const preview = shortOutput(item.output);
 
@@ -55,40 +100,143 @@ export const ToolCallCard = memo(function ToolCallCard({ item }: { item: ToolIte
     setUserOpen(null);
   }, [item.callId]);
 
+  useEffect(
+    () => () => {
+      if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+    },
+    [],
+  );
+
   const open = userOpen !== null ? userOpen : live;
+  const canCopy =
+    Boolean(item.output) &&
+    typeof navigator !== "undefined" &&
+    typeof navigator.clipboard?.writeText === "function";
+
+  // Restrained announcements: only terminal states the user must not miss.
+  // Text depends solely on (title, kind), so streaming output never re-fires it.
+  const announcement =
+    kind === "failed"
+      ? `${title} failed`
+      : kind === "denied"
+        ? `${title} denied`
+        : "";
+
+  const oddRawStatus =
+    kind === "unknown" && raw && raw.toLowerCase() !== "unknown"
+      ? raw.slice(0, RAW_STATUS_MAX)
+      : "";
+
+  const settleCopy = (state: "copied" | "failed") => {
+    setCopyState(state);
+    if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+    copyTimer.current = window.setTimeout(
+      () => setCopyState("idle"),
+      COPY_RESET_MS,
+    );
+  };
+
+  const handleCopy = () => {
+    const text = item.output ?? "";
+    navigator.clipboard.writeText(text).then(
+      () => settleCopy("copied"),
+      // Clipboard refused (permissions/webview quirk) — a silent no-op reads
+      // as success and ships stale evidence; say it failed.
+      () => settleCopy("failed"),
+    );
+  };
 
   return (
-    <details
-      className={`tool-card status-${status} ${live ? "is-live" : ""}`}
-      open={open}
-      onToggle={(e) => {
-        // Capture user intent so we don't re-open finished tools after they click.
-        setUserOpen((e.target as HTMLDetailsElement).open);
-      }}
+    <div
+      className={`tool-card status-${kind}${live ? " is-live" : ""}`}
+      data-status={kind}
     >
-      <summary className="tool-card-header">
-        <span className="tool-card-glyph" aria-hidden>
-          {statusGlyph(status)}
+      <button
+        type="button"
+        className="tool-card-header"
+        aria-expanded={open}
+        aria-controls={bodyId}
+        onClick={() => setUserOpen(!open)}
+      >
+        <span className="tool-card-glyph" aria-hidden="true">
+          {statusGlyph(kind)}
         </span>
-        <span className="tool-card-title">{title}</span>
-        <span className="tool-card-status">{status}</span>
+        <span className="tool-card-title" title={title}>
+          {title}
+        </span>
+        <span className="tool-card-status">{kind}</span>
         {!open && preview ? (
-          <span className="tool-card-preview" title={item.output}>
+          <span className="tool-card-preview" aria-hidden="true">
             {preview}
           </span>
         ) : null}
         {!open && live && !preview ? (
-          <span className="tool-card-preview">running…</span>
+          <span className="tool-card-preview" aria-hidden="true">
+            {kind === "pending" ? "waiting…" : "running…"}
+          </span>
         ) : null}
-      </summary>
-      {item.output ? (
-        <pre className="tool-card-output">{item.output}</pre>
-      ) : live ? (
-        <div className="tool-card-waiting">Running…</div>
-      ) : (
-        <div className="tool-card-waiting">(no output)</div>
-      )}
-    </details>
+        <span className="tool-card-caret" aria-hidden="true">
+          {open ? "▾" : "▸"}
+        </span>
+      </button>
+      <div id={bodyId} className="tool-card-body" hidden={!open}>
+        {!open ? null : item.output ? (
+          <>
+            {oddRawStatus || canCopy ? (
+              <div className="tool-card-meta">
+                {oddRawStatus ? (
+                  <span className="tool-card-meta-status">
+                    reported status: {oddRawStatus}
+                  </span>
+                ) : null}
+                {canCopy ? (
+                  <>
+                    <button
+                      type="button"
+                      className={`tool-card-copy${copyState === "failed" ? " is-failed" : ""}`}
+                      onClick={handleCopy}
+                    >
+                      {copyState === "copied"
+                        ? "Copied"
+                        : copyState === "failed"
+                          ? "Copy failed"
+                          : "Copy output"}
+                    </button>
+                    <span
+                      className="sr-only"
+                      role="status"
+                      data-testid="tool-card-copy-status"
+                    >
+                      {copyState === "copied"
+                        ? "Output copied"
+                        : copyState === "failed"
+                          ? "Copy failed"
+                          : ""}
+                    </span>
+                  </>
+                ) : null}
+              </div>
+            ) : null}
+            <pre className="tool-card-output">{item.output}</pre>
+          </>
+        ) : live ? (
+          <div className="tool-card-waiting">
+            {kind === "pending" ? "Waiting to start…" : "Running…"}
+          </div>
+        ) : (
+          <div className="tool-card-waiting">
+            {oddRawStatus ? `(no output — reported status: ${oddRawStatus})` : "(no output)"}
+          </div>
+        )}
+      </div>
+      <span
+        className="sr-only"
+        role="status"
+        data-testid="tool-card-announce"
+      >
+        {announcement}
+      </span>
+    </div>
   );
 });
 
@@ -104,6 +252,7 @@ export function ToolHistoryGroup({
   keepRecent?: number;
 }) {
   const [showOlder, setShowOlder] = useState(false);
+  const olderId = useId();
   if (tools.length === 0) return null;
 
   const older =
@@ -114,22 +263,39 @@ export function ToolHistoryGroup({
       : tools;
 
   return (
-    <div className="tool-history-group">
+    <div
+      className="tool-history-group"
+      role="group"
+      aria-label={`Tool activity: ${tools.length} call${tools.length === 1 ? "" : "s"}`}
+    >
       {older.length > 0 && (
         <button
           type="button"
           className="tool-history-toggle"
           onClick={() => setShowOlder((v) => !v)}
           aria-expanded={showOlder}
+          aria-controls={olderId}
         >
           {showOlder ? "Hide" : "Show"} {older.length} earlier tool
           {older.length === 1 ? "" : "s"}
         </button>
       )}
-      {showOlder &&
-        older.map(({ item, index }) => (
-          <ToolCallCard key={`tool-old-${item.callId || index}`} item={item} />
-        ))}
+      {older.length > 0 && (
+        <div
+          id={olderId}
+          className="tool-history-older"
+          hidden={!showOlder}
+        >
+          {showOlder
+            ? older.map(({ item, index }) => (
+                <ToolCallCard
+                  key={`tool-old-${item.callId || index}`}
+                  item={item}
+                />
+              ))
+            : null}
+        </div>
+      )}
       {recent.map(({ item, index }) => (
         <ToolCallCard key={`tool-r-${item.callId || index}`} item={item} />
       ))}

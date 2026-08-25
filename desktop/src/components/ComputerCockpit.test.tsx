@@ -1,9 +1,9 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ComputerCockpit } from "./ComputerCockpit";
 import type {
   ComputerCockpitSnapshot,
-  ComputerRun,
+  ComputerLocalApproval,
   ComputerRunProjection,
 } from "../lib/protocol";
 
@@ -18,12 +18,15 @@ const mocks = vi.hoisted(() => ({
   targets: vi.fn(),
   start: vi.fn(),
   startNative: vi.fn(),
+  measureBackground: vi.fn(),
+  startBackground: vi.fn(),
   refresh: vi.fn(),
   stage: vi.fn(),
   approve: vi.fn(),
   discard: vi.fn(),
   pause: vi.fn(),
   takeOver: vi.fn(),
+  reconcile: vi.fn(),
   stop: vi.fn(),
 }));
 
@@ -39,12 +42,15 @@ vi.mock("../lib/api", () => ({
     computerUseListTargets: mocks.targets,
     computerUseCockpitStartSimulator: mocks.start,
     computerUseCockpitStartNative: mocks.startNative,
+    computerUseMeasureBackgroundTextEntry: mocks.measureBackground,
+    computerUseCockpitStartMeasuredBackground: mocks.startBackground,
     computerUseCockpitRefresh: mocks.refresh,
     computerUseCockpitStageAction: mocks.stage,
     computerUseCockpitApprove: mocks.approve,
     computerUseCockpitDiscardApproval: mocks.discard,
     computerUseCockpitPause: mocks.pause,
     computerUseCockpitTakeOver: mocks.takeOver,
+    computerUseCockpitReconcileUncertainSurface: mocks.reconcile,
     computerUseCockpitStop: mocks.stop,
   },
 }));
@@ -56,48 +62,36 @@ const backend = {
   textEntry: true,
   keyChords: false,
   pointerFallback: false,
+  foregroundConflictCapacity: 1,
 };
 
-function run(state = "ready"): ComputerRun {
+function localView(
+  state = "ready",
+  extras: Partial<ComputerLocalApproval> = {},
+): ComputerLocalApproval {
   return {
     runId: "run-1",
-    ownerSessionId: "session-1",
+    state,
+    version: state === "paused" ? 5 : 3,
+    actionCount: state === "paused" ? 1 : 0,
+    limits: { maxActions: 8 },
+    controlDisposition: extras.controlDisposition ?? (state === "paused" ? "paused" : "agent_owned"),
     target: {
       appId: "com.grokptah.computer-use-simulator",
-      windowId: "demo-form",
-      generation: 1,
       displayName: "Computer Use Simulator",
-      sensitivity: "none",
     },
-    state,
-    controlDisposition: state === "paused" ? "paused" : "agent_owned",
-    controlEpoch: state === "paused" ? 1 : 0,
-    version: state === "paused" ? 5 : 3,
-    createdAt: "2026-08-13T10:00:00Z",
-    updatedAt: "2026-08-13T10:00:01Z",
-    limits: { maxActions: 8, maxDurationSecs: 600 },
-    actionCount: state === "paused" ? 1 : 0,
-    currentObservation:
+    observation:
       state === "ready"
         ? {
             observationId: "observation-1",
             sequence: 1,
             capturedAt: "2026-08-13T10:00:01Z",
-            target: {
-              appId: "com.grokptah.computer-use-simulator",
-              windowId: "demo-form",
-              generation: 1,
-              displayName: "Computer Use Simulator",
-              sensitivity: "none",
-            },
             elements: [
               {
                 elementId: "observation-1-name",
                 role: "text_field",
                 label: "Name",
                 enabled: true,
-                focused: false,
-                sensitivity: "none",
                 actions: ["set_value"],
               },
               {
@@ -105,8 +99,6 @@ function run(state = "ready"): ComputerRun {
                 role: "button",
                 label: "Submit",
                 enabled: false,
-                focused: false,
-                sensitivity: "none",
                 actions: ["invoke"],
               },
               {
@@ -114,18 +106,13 @@ function run(state = "ready"): ComputerRun {
                 role: "status",
                 label: "Not submitted",
                 enabled: true,
-                focused: false,
-                sensitivity: "none",
                 actions: [],
               },
             ],
-            elementsTruncated: false,
           }
         : null,
     grant: {
-      grantId: "grant-1",
       expiresAt: "2026-08-13T10:02:00Z",
-      usesRemaining: state === "paused" ? 0 : 1,
       revokedAt: state === "paused" ? "2026-08-13T10:00:02Z" : null,
       actionClasses: ["semantic", "text_entry"],
     },
@@ -133,10 +120,13 @@ function run(state = "ready"): ComputerRun {
       {
         sequence: 1,
         at: "2026-08-13T10:00:00Z",
+        surfaceEvent: "run_created",
         operation: "create_run",
         disposition: "accepted",
       },
     ],
+    lastError: null,
+    ...extras,
   };
 }
 
@@ -147,76 +137,85 @@ const TERMINAL_STATES = ["completed", "failed", "cancelled", "interrupted", "lim
  * authoritative shape the host actually sends, rather than a snapshot missing
  * the projection the cockpit renders its status from.
  */
-function projectionFor(runValue: ComputerRun): ComputerRunProjection {
+function projectionFor(local: ComputerLocalApproval): ComputerRunProjection {
   return {
-    runId: runValue.runId,
-    ownerSessionId: runValue.ownerSessionId,
+    runId: local.runId,
+    ownerSessionId: "session-1",
     parentRunId: null,
     campaignId: null,
-    target: runValue.target,
-    state: runValue.state,
-    controlDisposition: runValue.controlDisposition ?? "agent_owned",
-    controlEpoch: runValue.controlEpoch ?? 0,
-    version: runValue.version,
-    agentActive: ["observing", "acting"].includes(runValue.state),
-    terminal: TERMINAL_STATES.includes(runValue.state),
-    createdAt: runValue.createdAt,
-    updatedAt: runValue.updatedAt,
-    startedAt: runValue.startedAt ?? null,
-    endedAt: runValue.endedAt ?? null,
+    target: {
+      appId: local.target.appId,
+      windowId: "demo-form",
+      generation: 1,
+      displayName: local.target.displayName,
+      sensitivity: "none",
+    },
+    state: local.state,
+    controlDisposition: local.controlDisposition ?? "agent_owned",
+    controlEpoch:
+      local.controlDisposition === "operator_takeover"
+        ? 2
+        : local.controlDisposition === "paused"
+          ? 1
+          : 0,
+    version: local.version,
+    agentActive: ["observing", "acting"].includes(local.state),
+    terminal: TERMINAL_STATES.includes(local.state),
+    createdAt: "2026-08-13T10:00:00Z",
+    updatedAt: "2026-08-13T10:00:01Z",
+    startedAt: "2026-08-13T10:00:01Z",
+    endedAt: null,
     progress: {
-      actionCount: runValue.actionCount,
-      maxActions: runValue.limits.maxActions,
+      actionCount: local.actionCount,
+      maxActions: local.limits.maxActions,
       evidenceBytes: 0,
       maxEvidenceBytes: 8 * 1024 * 1024,
       elapsedMillis: 1000,
-      maxDurationSecs: runValue.limits.maxDurationSecs,
+      maxDurationSecs: 600,
       durationExceeded: false,
     },
-    grant: runValue.grant
+    grant: local.grant
       ? {
-          grantId: runValue.grant.grantId,
-          actionClasses: runValue.grant.actionClasses,
+          grantId: "grant-1",
+          actionClasses: local.grant.actionClasses,
           issuedBy: "local_user",
-          issuedAt: runValue.createdAt,
-          expiresAt: runValue.grant.expiresAt,
-          usesRemaining: runValue.grant.usesRemaining ?? null,
-          revoked: Boolean(runValue.grant.revokedAt),
+          issuedAt: "2026-08-13T10:00:00Z",
+          expiresAt: local.grant.expiresAt,
+          usesRemaining: local.grant.revokedAt ? 0 : 1,
+          revoked: Boolean(local.grant.revokedAt),
           expired: false,
         }
       : null,
-    observation: runValue.currentObservation
+    observation: local.observation
       ? {
-          observationId: runValue.currentObservation.observationId,
-          sequence: runValue.currentObservation.sequence,
-          capturedAt: runValue.currentObservation.capturedAt,
-          elementCount: runValue.currentObservation.elements.length,
-          elementsTruncated: runValue.currentObservation.elementsTruncated,
+          observationId: local.observation.observationId,
+          sequence: local.observation.sequence,
+          capturedAt: local.observation.capturedAt,
+          elementCount: local.observation.elements.length,
+          elementsTruncated: false,
           sensitivity: "none",
           hasScreenshot: false,
           screenshotRedacted: null,
           stale: false,
         }
       : null,
-    lastOutcome: runValue.lastOutcome
-      ? { expectedPostconditionMet: runValue.lastOutcome.expectedPostconditionMet ?? null }
-      : null,
-    lastError: runValue.lastError ? { code: runValue.lastError.code } : null,
-    eventRange: runValue.audit.length
+    lastOutcome: null,
+    lastError: local.lastError ? { code: local.lastError.code } : null,
+    eventRange: local.audit.length
       ? {
-          startSeq: runValue.audit[0].sequence,
-          endSeq: runValue.audit[runValue.audit.length - 1].sequence,
+          startSeq: local.audit[0].sequence,
+          endSeq: local.audit[local.audit.length - 1].sequence,
         }
       : null,
   };
 }
 
-function snapshot(runValue: ComputerRun | null = null): ComputerCockpitSnapshot {
+function snapshot(local: ComputerLocalApproval | null = null): ComputerCockpitSnapshot {
   return {
     backend,
     origin: "desktop",
-    projection: runValue ? projectionFor(runValue) : null,
-    run: runValue,
+    projection: local ? projectionFor(local) : null,
+    local,
     pendingApproval: null,
   };
 }
@@ -253,6 +252,52 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ComputerCockpit", () => {
+  it("reopens only the exact app-owned Run binding", async () => {
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
+    const onSnapshot = vi.fn();
+    render(
+      <ComputerCockpit
+        {...props}
+        boundRunId="run-1"
+        onSnapshot={onSnapshot}
+      />,
+    );
+
+    await screen.findByText("Frame 1");
+    expect(mocks.snapshot).toHaveBeenCalledWith("session-1", "run-1");
+    expect(onSnapshot).toHaveBeenCalledWith(
+      "session-1",
+      expect.objectContaining({ local: expect.objectContaining({ runId: "run-1" }) }),
+    );
+  });
+
+  it("renders typed replay events and keeps emergency controls usable across a history gap", async () => {
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
+    mocks.stop.mockResolvedValue(snapshot(localView("cancelled")));
+    render(
+      <ComputerCockpit
+        {...props}
+        eventReplay={{
+          runId: "run-1",
+          cursor: 9,
+          gapDetected: true,
+          replayedEntries: 2,
+          lastEvent: "permission_revoked",
+        }}
+      />,
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Event history is incomplete",
+    );
+    expect(screen.getByText("Run Created")).toBeTruthy();
+    expect(screen.getByText(/Permission Revoked · through #9/)).toBeTruthy();
+    const stop = screen.getByRole("button", { name: "Stop" });
+    expect(stop).toBeEnabled();
+    fireEvent.click(stop);
+    await waitFor(() => expect(mocks.stop).toHaveBeenCalledWith("session-1", "run-1"));
+  });
+
   it("keeps Computer Run ownership visible beyond the focused tab", async () => {
     render(
       <ComputerCockpit
@@ -277,8 +322,38 @@ describe("ComputerCockpit", () => {
     expect(scope).toHaveTextContent("Run No active Run");
   });
 
+  it("explains durable inter-agent surface queueing without exposing lease handles", async () => {
+    const next = snapshot(localView());
+    next.coordination = {
+      state: "queued",
+      queuePosition: 2,
+      queueDepth: 3,
+      ownsSurface: false,
+      blockedByUncertainOutcome: false,
+      active: {
+        agentId: "agent-reviewer",
+        workId: "work-review",
+        runId: "run-review",
+      },
+      expiresAt: "2026-08-13T10:01:00Z",
+      updatedAt: "2026-08-13T10:00:05Z",
+    };
+    mocks.snapshot.mockResolvedValue(next);
+
+    render(<ComputerCockpit {...props} />);
+
+    const status = await screen.findByRole("region", {
+      name: "Waiting for the shared surface",
+    });
+    expect(status).toHaveTextContent("Agent agent-reviewer is using it");
+    expect(status).toHaveTextContent("2 of 3");
+    expect(status).toHaveTextContent("agent-reviewer");
+    expect(status).not.toHaveTextContent("lease-");
+    expect(status).not.toHaveTextContent("attempt-");
+  });
+
   it("requires exact scope review before a run starts", async () => {
-    mocks.start.mockResolvedValue(snapshot(run()));
+    mocks.start.mockResolvedValue(snapshot(localView()));
     render(<ComputerCockpit {...props} />);
 
     const start = await screen.findByRole("button", { name: "Start Computer Run" });
@@ -317,7 +392,7 @@ describe("ComputerCockpit", () => {
         minimized: false,
       },
     ]);
-    mocks.startNative.mockResolvedValue(snapshot(run()));
+    mocks.startNative.mockResolvedValue(snapshot(localView()));
     render(<ComputerCockpit {...props} />);
 
     fireEvent.click(await screen.findByRole("button", { name: "macOS app" }));
@@ -339,6 +414,119 @@ describe("ComputerCockpit", () => {
         "com.example.fixture",
       ),
     );
+  });
+
+  it("calibrates and binds one exact measured-background text-entry run", async () => {
+    mocks.targets.mockResolvedValue([
+      {
+        selectionToken: "selection-background",
+        target: {
+          appId: "com.example.disposable",
+          windowId: "macos-window-background",
+          generation: 9,
+          displayName: "Disposable Background Fixture",
+          sensitivity: "none",
+        },
+        geometry: { x: 0, y: 0, width: 720, height: 520, scaleFactor: 1 },
+        onScreen: true,
+        active: false,
+        minimized: false,
+      },
+    ]);
+    mocks.measureBackground.mockResolvedValue({
+      measurementToken: "measurement-1",
+      target: {
+        appId: "com.example.disposable",
+        windowId: "macos-window-background",
+        generation: 9,
+        displayName: "Disposable Background Fixture",
+        sensitivity: "none",
+      },
+      supportedActionClasses: ["text_entry"],
+      validForMillis: 120_000,
+    });
+    mocks.startBackground.mockResolvedValue(snapshot(localView()));
+    render(<ComputerCockpit {...props} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "macOS app" }));
+    const findTargets = screen.getByRole("button", { name: "Find eligible windows" });
+    await waitFor(() => expect(findTargets).toBeEnabled());
+    fireEvent.click(findTargets);
+    fireEvent.click(
+      await screen.findByRole("radio", { name: /Disposable Background Fixture/ }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Measured background text" }),
+    );
+    expect(screen.getByRole("button", { name: "Start Computer Run" })).toBeDisabled();
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "This exact target is disposable and may be changed and restored",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Calibrate and restore" }));
+    await waitFor(() =>
+      expect(mocks.measureBackground).toHaveBeenCalledWith(
+        "session-1",
+        "selection-background",
+        "com.example.disposable",
+        "Project label",
+        "grokptah-background-probe",
+        true,
+      ),
+    );
+    expect(await screen.findByText("Measured for this exact target")).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "I reviewed this exact target and one-action scope",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Start Computer Run" }));
+    await waitFor(() =>
+      expect(mocks.startBackground).toHaveBeenCalledWith(
+        "session-1",
+        "selection-background",
+        "measurement-1",
+        "com.example.disposable",
+      ),
+    );
+  });
+
+  it("does not calibrate a background target while it is active", async () => {
+    mocks.targets.mockResolvedValue([
+      {
+        selectionToken: "selection-active",
+        target: {
+          appId: "com.example.active",
+          windowId: "macos-window-active",
+          generation: 10,
+          displayName: "Active Fixture",
+          sensitivity: "none",
+        },
+        geometry: { x: 0, y: 0, width: 720, height: 520, scaleFactor: 1 },
+        onScreen: true,
+        active: true,
+        minimized: false,
+      },
+    ]);
+    render(<ComputerCockpit {...props} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "macOS app" }));
+    const findTargets = screen.getByRole("button", { name: "Find eligible windows" });
+    await waitFor(() => expect(findTargets).toBeEnabled());
+    fireEvent.click(findTargets);
+    fireEvent.click(await screen.findByRole("radio", { name: /Active Fixture/ }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Measured background text" }),
+    );
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "This exact target is disposable and may be changed and restored",
+      }),
+    );
+    expect(screen.getByRole("button", { name: "Calibrate and restore" })).toBeDisabled();
+    expect(screen.getByText(/Put another app in front/)).toBeTruthy();
+    expect(mocks.measureBackground).not.toHaveBeenCalled();
   });
 
   it("blocks native discovery until required permissions are granted", async () => {
@@ -381,7 +569,7 @@ describe("ComputerCockpit", () => {
   });
 
   it("shows an exact one-use approval and requires reauthorization after action", async () => {
-    const ready = snapshot(run());
+    const ready = snapshot(localView());
     const pending = {
       ...ready,
       pendingApproval: {
@@ -398,27 +586,44 @@ describe("ComputerCockpit", () => {
         },
         actionSummary: "Enter visible text in Name",
         risk: "Text entry",
+        proposalOrigin: "operator" as const,
         createdAt: "2026-08-13T10:00:01Z",
       },
     };
     mocks.snapshot.mockResolvedValue(ready);
     mocks.stage.mockResolvedValue(pending);
-    mocks.approve.mockResolvedValue(snapshot(run("paused")));
+    mocks.approve.mockResolvedValue(snapshot(localView("paused")));
     render(<ComputerCockpit {...props} />);
 
     fireEvent.click(await screen.findByRole("button", { name: "Stage text entry" }));
     expect(await screen.findByText("Ada Lovelace")).toBeTruthy();
     expect(screen.getByText("Frame 1 · one use")).toBeTruthy();
+    expect(screen.queryByTestId("computer-agent-cursor")).toBeNull();
+    const approvalDialog = screen.getByRole("dialog", { name: "Enter visible text in Name" });
+    const reject = screen.getByRole("button", { name: "Reject" });
+    const approve = screen.getByRole("button", { name: "Approve once" });
+    expect(reject).toHaveFocus();
+    approve.focus();
+    fireEvent.keyDown(approvalDialog, { key: "Tab" });
+    expect(reject).toHaveFocus();
+    reject.focus();
+    fireEvent.keyDown(approvalDialog, { key: "Tab", shiftKey: true });
+    expect(approve).toHaveFocus();
     fireEvent.click(screen.getByRole("button", { name: "Approve once" }));
 
     expect(
       await screen.findByRole("button", { name: "Reauthorize and observe" }),
     ).toBeTruthy();
-    expect(mocks.approve).toHaveBeenCalledTimes(1);
+    expect(mocks.approve).toHaveBeenCalledWith(
+      "session-1",
+      "run-1",
+      "approval-1",
+      expect.any(String),
+    );
   });
 
   it("shows measured model eligibility without expanding local approval", async () => {
-    mocks.snapshot.mockResolvedValue(snapshot(run()));
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
     render(
       <ComputerCockpit
         {...props}
@@ -431,12 +636,48 @@ describe("ComputerCockpit", () => {
     expect(screen.getByText("One action authorized")).toBeTruthy();
   });
 
+  it("lets keyboard users reject a pending approval with Escape", async () => {
+    const ready = snapshot(localView());
+    const pending = {
+      ...ready,
+      pendingApproval: {
+        approvalId: "approval-escape",
+        ownerSessionId: "session-1",
+        runId: "run-1",
+        runVersion: 3,
+        observationId: "observation-1",
+        targetLabel: "Computer Use Simulator",
+        action: {
+          type: "set_value" as const,
+          element_id: "observation-1-name",
+          text: "Ada Lovelace",
+        },
+        actionSummary: "Enter visible text in Name",
+        risk: "Text entry",
+        proposalOrigin: "operator" as const,
+        createdAt: "2026-08-13T10:00:01Z",
+      },
+    };
+    mocks.snapshot.mockResolvedValue(ready);
+    mocks.stage.mockResolvedValue(pending);
+    mocks.discard.mockResolvedValue(ready);
+    render(<ComputerCockpit {...props} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stage text entry" }));
+    const dialog = await screen.findByRole("dialog", { name: "Enter visible text in Name" });
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    await waitFor(() =>
+      expect(mocks.discard).toHaveBeenCalledWith("session-1", "run-1"),
+    );
+    expect(screen.queryByRole("dialog", { name: "Enter visible text in Name" })).toBeNull();
+  });
+
   it("does not offer reauthorization after operator takeover", async () => {
     mocks.snapshot.mockResolvedValue(
       snapshot({
-        ...run("paused"),
+        ...localView("paused"),
         controlDisposition: "operator_takeover",
-        controlEpoch: 2,
       }),
     );
     render(<ComputerCockpit {...props} />);
@@ -446,8 +687,46 @@ describe("ComputerCockpit", () => {
     expect(screen.queryByRole("button", { name: "Reauthorize and observe" })).toBeNull();
   });
 
+  it("requires an explicit bounded note before releasing an uncertain surface fence", async () => {
+    const uncertain = snapshot({
+      ...localView("failed"),
+      controlDisposition: "uncertain_outcome",
+      lastError: { code: "uncertain_outcome" },
+    });
+    uncertain.reconciliation = {
+      leaseId: "lease-uncertain",
+      expectedRevision: 4,
+      surfaceId: "surface-1",
+      incarnation: "incarnation-1",
+    };
+    mocks.snapshot.mockResolvedValue(uncertain);
+    mocks.reconcile.mockResolvedValue(snapshot(localView("failed")));
+    render(<ComputerCockpit {...props} />);
+
+    expect(await screen.findByRole("heading", { name: "Outcome needs local confirmation" })).toBeTruthy();
+    const release = screen.getByRole("button", { name: "Quarantine and release fence" });
+    expect(release).toBeDisabled();
+    fireEvent.change(screen.getByRole("textbox", { name: "Operator confirmation note" }), {
+      target: { value: "I verified this exact surface is clear." },
+    });
+    expect(release).toBeEnabled();
+    fireEvent.click(release);
+
+    await waitFor(() =>
+      expect(mocks.reconcile).toHaveBeenCalledWith(
+        "session-1",
+        "run-1",
+        "lease-uncertain",
+        4,
+        "surface-1",
+        "incarnation-1",
+        "I verified this exact surface is clear.",
+      ),
+    );
+  });
+
   it("qualifies an unknown model before offering agent proposals", async () => {
-    mocks.snapshot.mockResolvedValue(snapshot(run()));
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
     mocks.qualifyAgent.mockResolvedValue({
       model: "grok-4.5",
       tier: "semantic_act",
@@ -465,11 +744,49 @@ describe("ComputerCockpit", () => {
   });
 
   it("stages one model proposal for the existing local approval", async () => {
-    const active = snapshot(run());
+    const active = snapshot(localView());
     mocks.snapshot.mockResolvedValue(active);
     mocks.proposeAgent.mockResolvedValue({
       snapshot: {
         ...active,
+        local: {
+          ...active.local!,
+          audit: [
+            ...active.local!.audit,
+            {
+              sequence: 2,
+              at: "2026-08-13T10:00:02Z",
+              surfaceEvent: "action_proposed",
+              operation: "action_proposed",
+              disposition: "staged",
+              actionClass: "text_entry",
+              observationId: "observation-1",
+            },
+            {
+              sequence: 3,
+              at: "2026-08-13T10:00:02Z",
+              surfaceEvent: "attention_moved",
+              attention: {
+                xBasisPoints: 3000,
+                yBasisPoints: 1700,
+                target: "semantic_element",
+              },
+              operation: "attention",
+              disposition: "moved",
+              actionClass: "text_entry",
+              observationId: "observation-1",
+            },
+            {
+              sequence: 4,
+              at: "2026-08-13T10:00:02Z",
+              surfaceEvent: "approval_required",
+              operation: "approval",
+              disposition: "required",
+              actionClass: "text_entry",
+              observationId: "observation-1",
+            },
+          ],
+        },
         pendingApproval: {
           approvalId: "approval-model",
           ownerSessionId: "session-1",
@@ -484,6 +801,7 @@ describe("ComputerCockpit", () => {
           },
           actionSummary: "Enter visible text in Name",
           risk: "Text entry",
+          proposalOrigin: "agent",
           createdAt: "2026-08-13T10:00:02Z",
         },
       },
@@ -503,14 +821,152 @@ describe("ComputerCockpit", () => {
         "Enter Ada Lovelace in the Name field, then submit the form.",
       ),
     );
-    expect(await screen.findByRole("dialog", { name: "Approve Computer Use action" })).toBeTruthy();
+    const dialog = await screen.findByRole("dialog", { name: "Enter visible text in Name" });
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(dialog.getAttribute("aria-labelledby")).toBe("computer-approval-title");
+    expect(dialog.getAttribute("aria-describedby")).toBe("computer-approval-details");
     expect(screen.getByText("Enter the requested visible name", { exact: false })).toBeTruthy();
+    expect(screen.getByText("Agent attention · Name")).toBeTruthy();
+    expect(
+      screen.getByText(/Agent attention is on Name inside the authorized GrokPtah surface/),
+    ).toBeTruthy();
+    const marker = screen.getByTestId("computer-agent-cursor");
+    expect(marker).toHaveStyle({ left: "30%", top: "17%" });
+
+    mocks.discard.mockResolvedValue(active);
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    await waitFor(() => expect(mocks.discard).toHaveBeenCalledWith("session-1", "run-1"));
+    expect(screen.queryByTestId("computer-agent-cursor")).toBeNull();
+  });
+
+  it("marks the exact native semantic row without drawing a fake pointer", async () => {
+    const local = localView();
+    local.target = { appId: "com.example.editor", displayName: "Example Editor" };
+    local.audit.push({
+      sequence: 2,
+      at: "2026-08-13T10:00:02Z",
+      surfaceEvent: "attention_moved",
+      attention: {
+        xBasisPoints: 3000,
+        yBasisPoints: 1700,
+        target: "semantic_element",
+      },
+      operation: "attention",
+      disposition: "moved",
+      actionClass: "text_entry",
+      observationId: "observation-1",
+    });
+    const active = snapshot(local);
+    active.pendingApproval = {
+      approvalId: "approval-native-model",
+      ownerSessionId: "session-1",
+      runId: "run-1",
+      runVersion: 3,
+      observationId: "observation-1",
+      targetLabel: "Example Editor",
+      action: {
+        type: "set_value",
+        element_id: "observation-1-name",
+        text: "Ada Lovelace",
+      },
+      actionSummary: "Enter visible text in Name",
+      risk: "Text entry",
+      proposalOrigin: "agent",
+      createdAt: "2026-08-13T10:00:02Z",
+    };
+    mocks.snapshot.mockResolvedValue(active);
+
+    render(<ComputerCockpit {...props} />);
+
+    expect(await screen.findByText("Agent attention · Name")).toBeTruthy();
+    expect(screen.getByText("↖ Agent")).toBeTruthy();
+    expect(screen.queryByTestId("computer-agent-cursor")).toBeNull();
+  });
+
+  it("does not reuse an old attention point for a newer geometry-free proposal", async () => {
+    const local = localView();
+    local.audit.push(
+      {
+        sequence: 2,
+        at: "2026-08-13T10:00:02Z",
+        surfaceEvent: "action_proposed",
+        operation: "action_proposed",
+        disposition: "staged",
+        actionClass: "text_entry",
+        observationId: "observation-1",
+      },
+      {
+        sequence: 3,
+        at: "2026-08-13T10:00:02Z",
+        surfaceEvent: "attention_moved",
+        attention: {
+          xBasisPoints: 3000,
+          yBasisPoints: 1700,
+          target: "semantic_element",
+        },
+        operation: "attention",
+        disposition: "moved",
+        actionClass: "text_entry",
+        observationId: "observation-1",
+      },
+      {
+        sequence: 4,
+        at: "2026-08-13T10:00:03Z",
+        surfaceEvent: "approval_rejected",
+        operation: "approval",
+        disposition: "rejected",
+        actionClass: "text_entry",
+        observationId: "observation-1",
+      },
+      {
+        sequence: 5,
+        at: "2026-08-13T10:00:04Z",
+        surfaceEvent: "action_proposed",
+        operation: "action_proposed",
+        disposition: "staged",
+        actionClass: "text_entry",
+        observationId: "observation-1",
+      },
+      {
+        sequence: 6,
+        at: "2026-08-13T10:00:04Z",
+        surfaceEvent: "approval_required",
+        operation: "approval",
+        disposition: "required",
+        actionClass: "text_entry",
+        observationId: "observation-1",
+      },
+    );
+    const active = snapshot(local);
+    active.pendingApproval = {
+      approvalId: "approval-without-point",
+      ownerSessionId: "session-1",
+      runId: "run-1",
+      runVersion: 3,
+      observationId: "observation-1",
+      targetLabel: "Computer Use Simulator",
+      action: {
+        type: "set_value",
+        element_id: "observation-1-name",
+        text: "Ada Lovelace",
+      },
+      actionSummary: "Enter visible text in Name",
+      risk: "Text entry",
+      proposalOrigin: "agent",
+      createdAt: "2026-08-13T10:00:04Z",
+    };
+    mocks.snapshot.mockResolvedValue(active);
+
+    render(<ComputerCockpit {...props} />);
+
+    expect(await screen.findByText("Agent attention · Name")).toBeTruthy();
+    expect(screen.queryByTestId("computer-agent-cursor")).toBeNull();
   });
 
   it("keeps Stop available while model inference is pending", async () => {
-    mocks.snapshot.mockResolvedValue(snapshot(run()));
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
     mocks.proposeAgent.mockReturnValue(new Promise(() => {}));
-    mocks.stop.mockResolvedValue(snapshot(run("cancelled")));
+    mocks.stop.mockResolvedValue(snapshot(localView("cancelled")));
     render(<ComputerCockpit {...props} computerUseTier="semantic_act" computerCapabilitySource="measured" />);
 
     fireEvent.click(await screen.findByRole("button", { name: "Propose next action" }));
@@ -519,6 +975,80 @@ describe("ComputerCockpit", () => {
     expect(stop).toBeEnabled();
     fireEvent.click(stop);
     await waitFor(() => expect(mocks.stop).toHaveBeenCalledWith("session-1", "run-1"));
+  });
+
+  it("keeps Stop and Take over actionable while an approved action is still in flight", async () => {
+    const pending = snapshot(localView());
+    pending.pendingApproval = {
+      approvalId: "approval-inflight",
+      ownerSessionId: "session-1",
+      runId: "run-1",
+      runVersion: 3,
+      observationId: "observation-1",
+      targetLabel: "Computer Use Simulator",
+      action: {
+        type: "set_value",
+        element_id: "observation-1-name",
+        text: "Ada Lovelace",
+      },
+      actionSummary: "Enter visible text in Name",
+      risk: "Text entry",
+      createdAt: "2026-08-13T10:00:02Z",
+    };
+    mocks.snapshot.mockResolvedValue(pending);
+    let rejectApprove: (reason: Error) => void = () => {};
+    mocks.approve.mockReturnValue(
+      new Promise((_resolve, reject) => {
+        rejectApprove = reject;
+      }),
+    );
+    mocks.takeOver.mockResolvedValue(
+      snapshot(
+        localView("paused", {
+          controlDisposition: "operator_takeover",
+        }),
+      ),
+    );
+    mocks.stop.mockResolvedValue(snapshot(localView("cancelled")));
+    render(<ComputerCockpit {...props} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Approve once" }));
+    await waitFor(() => expect(mocks.approve).toHaveBeenCalledTimes(1));
+
+    const takeOver = screen.getByRole("button", { name: "Take over" });
+    const stop = screen.getByRole("button", { name: "Stop" });
+    expect(takeOver).toBeEnabled();
+    expect(stop).toBeEnabled();
+    expect(takeOver).toHaveAttribute("aria-keyshortcuts", "Control+Shift+T");
+    expect(stop).toHaveAttribute("aria-keyshortcuts", "Control+Shift+S");
+
+    fireEvent.click(takeOver);
+    await waitFor(() =>
+      expect(mocks.takeOver).toHaveBeenCalledWith("session-1", "run-1"),
+    );
+    await act(async () => {
+      rejectApprove(new Error("late action result must not replace takeover"));
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("late action result must not replace takeover")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    await waitFor(() => expect(mocks.stop).toHaveBeenCalledWith("session-1", "run-1"));
+  });
+
+  it("provides out-of-band keyboard paths for Stop and Take over", async () => {
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
+    mocks.takeOver.mockReturnValue(new Promise(() => {}));
+    mocks.stop.mockReturnValue(new Promise(() => {}));
+    render(<ComputerCockpit {...props} />);
+    await screen.findByText("Frame 1");
+
+    fireEvent.keyDown(window, { key: "T", ctrlKey: true, shiftKey: true });
+    fireEvent.keyDown(window, { key: "S", ctrlKey: true, shiftKey: true });
+
+    await waitFor(() => {
+      expect(mocks.takeOver).toHaveBeenCalledWith("session-1", "run-1");
+      expect(mocks.stop).toHaveBeenCalledWith("session-1", "run-1");
+    });
   });
 
   it("discards a stale response after the owning session changes", async () => {
@@ -536,7 +1066,7 @@ describe("ComputerCockpit", () => {
       <ComputerCockpit {...props} sessionId="session-2" sessionTitle="Other build" />,
     );
     await screen.findByText("Scope review");
-    resolveOld(snapshot(run()));
+    resolveOld(snapshot(localView()));
 
     await waitFor(() => {
       expect(screen.queryByText("Frame 1")).toBeNull();
@@ -545,7 +1075,7 @@ describe("ComputerCockpit", () => {
   });
 
   it("does not carry a model objective into another session", async () => {
-    mocks.snapshot.mockResolvedValue(snapshot(run()));
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
     const view = render(
       <ComputerCockpit
         {...props}
@@ -574,7 +1104,7 @@ describe("ComputerCockpit", () => {
   });
 
   it("keeps steering non-cancelling and session-bound", async () => {
-    mocks.snapshot.mockResolvedValue(snapshot(run()));
+    mocks.snapshot.mockResolvedValue(snapshot(localView()));
     render(<ComputerCockpit {...props} sessionBusy />);
     fireEvent.change(await screen.findByPlaceholderText("Guide the agent at its next safe step"), {
       target: { value: "Verify the postcondition before continuing" },
@@ -596,7 +1126,7 @@ describe("ComputerCockpit", () => {
           resolveSteer = resolve;
         }),
     );
-    mocks.snapshot.mockResolvedValueOnce(snapshot(run())).mockResolvedValueOnce(snapshot());
+    mocks.snapshot.mockResolvedValueOnce(snapshot(localView())).mockResolvedValueOnce(snapshot());
     const view = render(<ComputerCockpit {...props} sessionBusy />);
 
     fireEvent.change(await screen.findByPlaceholderText("Guide the agent at its next safe step"), {

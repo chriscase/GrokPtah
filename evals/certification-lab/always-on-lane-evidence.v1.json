@@ -1,0 +1,118 @@
+{
+  "schema": "grokptah.always_on_lane_evidence_fixture.v1",
+  "schemaVersion": 1,
+  "boundFixtureSchema": "grokptah.always_on_grokbot_fixture.v1",
+  "boundFixtureVersion": 2,
+  "claim": "loopback-send-state-causality-and-per-home-decision-evidence",
+  "providerNetwork": "loopback-fake-only-never-xai-grok-bot",
+  "laneSelection": "semantic-no-at-send-lane-carrier",
+  "atSendCarriers": [
+    "manager",
+    "home"
+  ],
+  "carrierRequirements": {
+    "setup": [
+      "manager",
+      "home"
+    ],
+    "step-a": [
+      "manager",
+      "home"
+    ],
+    "step-b": [
+      "manager",
+      "home"
+    ],
+    "step-b-fix": [
+      "manager",
+      "home"
+    ],
+    "manager-decision": [
+      "home"
+    ]
+  },
+  "setupLane": {
+    "work": 0,
+    "runs": 1,
+    "intents": 0,
+    "providerPosts": 1,
+    "runPurpose": "execution"
+  },
+  "planLane": {
+    "work": 1,
+    "runs": 0,
+    "intents": 0,
+    "workKind": "manager-plan"
+  },
+  "managerDecision": {
+    "stepId": "__manager_decision__",
+    "workKind": "manager-decision",
+    "runPurpose": "manager_proposal",
+    "terminalWorkState": "succeeded"
+  },
+  "homes": {
+    "home_a": {
+      "sendStates": {
+        "setup": "sent",
+        "step-a": "sent",
+        "step-b": "sent",
+        "step-b-fix": "sent",
+        "manager-decision": "sent"
+      },
+      "chains": {
+        "step-a": {
+          "workState": "succeeded",
+          "runState": "completed",
+          "runPurpose": "execution"
+        },
+        "step-b": {
+          "workState": "failed",
+          "runState": "completed",
+          "runPurpose": "execution"
+        },
+        "step-b-fix": {
+          "workState": "succeeded",
+          "runState": "completed",
+          "runPurpose": "execution"
+        },
+        "__manager_decision__": {
+          "workState": "succeeded",
+          "runState": "completed",
+          "runPurpose": "manager_proposal"
+        }
+      },
+      "restarts": 0
+    },
+    "home_b": {
+      "sendStates": {
+        "setup": "sent",
+        "step-a": "uncertain",
+        "step-b": "known_not_sent",
+        "step-b-fix": "known_not_sent",
+        "manager-decision": "sent"
+      },
+      "chains": {
+        "step-a": {
+          "workState": "failed",
+          "runState": "interrupted",
+          "runPurpose": "execution"
+        },
+        "__manager_decision__": {
+          "workState": "succeeded",
+          "runState": "completed",
+          "runPurpose": "manager_proposal"
+        }
+      },
+      "restarts": 2
+    }
+  },
+  "restartTraceEvents": {
+    "disconnectPerRestart": 1,
+    "restartPerRestart": 1,
+    "reconnectPerRestart": 1
+  },
+  "boundedEvidence": {
+    "maxSendAttemptsPerHome": 8,
+    "maxChainsPerHome": 8
+  }
+}

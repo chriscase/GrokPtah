@@ -17,6 +17,7 @@ fn main() {
         "ApplicationServices",
         "CoreGraphics",
         "Foundation",
+        "Security",
     ] {
         println!("cargo:rustc-link-lib=framework={framework}");
     }

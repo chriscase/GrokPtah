@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
 use grokptah_agent_bridge::{
-    desktop_auto_update_enabled, AuthState, BackgroundTask, ComputerAction, ComputerPermission,
-    ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate, EffortLevel,
-    JournalPage, McpServerInfo, ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry,
-    PromptQueueRunNextResult, PromptQueueSnapshot, PromptQueueTakeResult, ProviderDeadlineClass,
-    ProviderProfileUpdate, ProviderQualificationReport, RunExecutionMode, RunReview, RunState,
+    computer_isolated_visual_status, desktop_auto_update_enabled, AuthState, BackgroundTask,
+    ComputerAction, ComputerIsolatedVisualStatus, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus, ComputerTargetCandidate, EffortLevel, JournalPage, McpServerInfo,
+    ModelInfo, PermissionDecision, PluginInfo, PromptQueueEntry, PromptQueueRunNextResult,
+    PromptQueueSnapshot, PromptQueueTakeResult, ProviderDeadlineClass, ProviderProfileUpdate,
+    ProviderQualificationReport, PublicRun, PublicRunPage, RunExecutionMode, RunReview, RunState,
     SearchHit, SearchQuery, SessionCompletion, SessionKind, SessionSummary, SkillInfo,
     SteeringReceipt, SubagentInfo, TranscriptEntry, WorkspaceUiState, BRIDGE_VERSION, PRODUCT_NAME,
 };
@@ -145,9 +146,7 @@ pub async fn remote_service_task_submit(
 }
 
 #[tauri::command]
-pub async fn remote_service_run_list(
-    state: State<'_, AppState>,
-) -> Result<Vec<grokptah_agent_bridge::RunRecord>, String> {
+pub async fn remote_service_run_list(state: State<'_, AppState>) -> Result<PublicRunPage, String> {
     state
         .remote_service
         .list_runs()
@@ -596,7 +595,7 @@ pub async fn remote_service_run_get(
     session_id: String,
     workspace: String,
     run_id: String,
-) -> Result<grokptah_agent_bridge::RunRecord, String> {
+) -> Result<PublicRun, String> {
     let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
     state
         .remote_service
@@ -802,6 +801,11 @@ pub fn computer_use_status(state: State<'_, AppState>) -> ComputerPlatformStatus
 }
 
 #[tauri::command]
+pub fn computer_use_isolated_visual_status() -> ComputerIsolatedVisualStatus {
+    computer_isolated_visual_status()
+}
+
+#[tauri::command]
 pub async fn computer_use_request_permission(
     state: State<'_, AppState>,
     permission: String,
@@ -861,10 +865,27 @@ fn computer_work_owner(state: &AppState, session_id: &str) -> Result<Uuid, Strin
 pub fn computer_use_cockpit_snapshot(
     state: State<'_, AppState>,
     session_id: String,
+    run_id: Option<String>,
 ) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
     state
         .computer_use
-        .cockpit_snapshot(computer_owner(&state, &session_id)?)
+        .cockpit_snapshot(computer_owner(&state, &session_id)?, run_id.as_deref())
+}
+
+#[tauri::command]
+pub fn computer_use_cockpit_events(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    after_seq: Option<u64>,
+    limit: Option<usize>,
+) -> Result<grokptah_agent_bridge::ComputerRunEventPage, String> {
+    state.computer_use.cockpit_events(
+        computer_owner(&state, &session_id)?,
+        &run_id,
+        after_seq,
+        limit.unwrap_or(100),
+    )
 }
 
 #[tauri::command]
@@ -960,6 +981,48 @@ pub async fn computer_use_cockpit_start_native(
 }
 
 #[tauri::command]
+pub async fn computer_use_measure_background_text_entry(
+    state: State<'_, AppState>,
+    session_id: String,
+    selection_token: String,
+    reviewed_target_app_id: String,
+    element_label: String,
+    probe_text: String,
+    disposable_target_acknowledged: bool,
+) -> Result<grokptah_agent_bridge::ComputerBackgroundSafetyReceipt, String> {
+    let _owner = computer_work_owner(&state, &session_id)?;
+    state
+        .computer_use
+        .measure_background_text_entry(
+            &selection_token,
+            &reviewed_target_app_id,
+            &element_label,
+            &probe_text,
+            disposable_target_acknowledged,
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn computer_use_cockpit_start_measured_background(
+    state: State<'_, AppState>,
+    session_id: String,
+    selection_token: String,
+    measurement_token: String,
+    reviewed_target_app_id: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    state
+        .computer_use
+        .start_measured_background(
+            computer_work_owner(&state, &session_id)?,
+            &selection_token,
+            &measurement_token,
+            &reviewed_target_app_id,
+        )
+        .await
+}
+
+#[tauri::command]
 pub async fn computer_use_cockpit_refresh(
     state: State<'_, AppState>,
     session_id: String,
@@ -1001,6 +1064,7 @@ pub async fn computer_use_cockpit_stage_action(
 pub async fn computer_use_cockpit_approve(
     state: State<'_, AppState>,
     session_id: String,
+    run_id: String,
     approval_id: String,
     request_id: String,
 ) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
@@ -1008,6 +1072,7 @@ pub async fn computer_use_cockpit_approve(
         .computer_use
         .approve_simulator_action(
             computer_work_owner(&state, &session_id)?,
+            &run_id,
             &approval_id,
             &request_id,
         )
@@ -1018,10 +1083,11 @@ pub async fn computer_use_cockpit_approve(
 pub fn computer_use_cockpit_discard_approval(
     state: State<'_, AppState>,
     session_id: String,
+    run_id: String,
 ) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
     state
         .computer_use
-        .discard_simulator_approval(computer_owner(&state, &session_id)?)
+        .discard_simulator_approval(computer_owner(&state, &session_id)?, &run_id)
 }
 
 #[tauri::command]
@@ -1029,14 +1095,10 @@ pub async fn computer_use_cockpit_pause(
     state: State<'_, AppState>,
     session_id: String,
     run_id: String,
-    expected_version: u64,
 ) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
     let owner = computer_owner(&state, &session_id)?;
     state.host.cancel_computer_agent(owner);
-    state
-        .computer_use
-        .pause_simulator(owner, &run_id, expected_version)
-        .await
+    state.computer_use.pause_simulator(owner, &run_id).await
 }
 
 #[tauri::command]
@@ -1044,14 +1106,33 @@ pub async fn computer_use_cockpit_take_over(
     state: State<'_, AppState>,
     session_id: String,
     run_id: String,
-    expected_version: u64,
 ) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
     let owner = computer_owner(&state, &session_id)?;
     state.host.cancel_computer_agent(owner);
-    state
-        .computer_use
-        .take_over_simulator(owner, &run_id, expected_version)
-        .await
+    state.computer_use.take_over_simulator(owner, &run_id).await
+}
+
+#[tauri::command]
+pub fn computer_use_cockpit_reconcile_uncertain_surface(
+    state: State<'_, AppState>,
+    session_id: String,
+    run_id: String,
+    lease_id: String,
+    expected_revision: u64,
+    surface_id: String,
+    incarnation: String,
+    note: String,
+) -> Result<crate::computer_use::ComputerCockpitSnapshot, String> {
+    let owner = computer_owner(&state, &session_id)?;
+    state.computer_use.reconcile_uncertain_surface_lease(
+        owner,
+        &run_id,
+        &lease_id,
+        expected_revision,
+        &surface_id,
+        &incarnation,
+        &note,
+    )
 }
 
 #[tauri::command]
@@ -1510,10 +1591,16 @@ pub async fn session_completion_history(
 pub async fn run_list(
     state: State<'_, AppState>,
     session_id: String,
-) -> Result<Vec<grokptah_agent_bridge::RunRecord>, String> {
+    cursor: Option<String>,
+    limit: Option<usize>,
+) -> Result<PublicRunPage, String> {
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    run_blocking(move || host.list_session_runs(id).map_err(map_err)).await
+    run_blocking(move || {
+        host.list_public_session_runs_page(id, cursor.as_deref(), limit)
+            .map_err(map_err)
+    })
+    .await
 }
 
 /// Read one durable Build run, scoped to its owning session.
@@ -1522,10 +1609,10 @@ pub async fn run_get(
     state: State<'_, AppState>,
     session_id: String,
     run_id: String,
-) -> Result<Option<grokptah_agent_bridge::RunRecord>, String> {
+) -> Result<Option<PublicRun>, String> {
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    run_blocking(move || host.get_session_run(id, &run_id).map_err(map_err)).await
+    run_blocking(move || host.get_public_session_run(id, &run_id).map_err(map_err)).await
 }
 
 /// Read the bounded, durable event journal for one run.
@@ -1555,7 +1642,7 @@ pub async fn run_review(
 ) -> Result<RunReview, String> {
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    run_blocking(move || host.review_run(id, &run_id).map_err(map_err)).await
+    run_blocking(move || host.review_public_run(id, &run_id).map_err(map_err)).await
 }
 
 /// Persist an exact-scope approval for an MCP-owned isolated run. The desktop
@@ -1567,7 +1654,7 @@ pub async fn run_approve(
     session_id: String,
     run_id: String,
     ttl_ms: Option<u64>,
-) -> Result<grokptah_agent_bridge::RunRecord, String> {
+) -> Result<PublicRun, String> {
     let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
     let (orch, token) = desktop_mcp_orchestration(&state)?;
     let auth = orch
@@ -1579,7 +1666,7 @@ pub async fn run_approve(
     }
     let source = state
         .host
-        .get_session_run(session_id, &run_id)
+        .get_public_session_run(session_id, &run_id)
         .map_err(map_err)?
         .ok_or_else(|| "unknown run for this session".to_string())?;
     if source.client_id.as_deref() != Some("mcp") {
@@ -1611,7 +1698,7 @@ pub async fn run_approve(
     .map_err(map_err)?;
     state
         .host
-        .get_session_run(session_id, &run_id)
+        .get_public_session_run(session_id, &run_id)
         .map_err(map_err)?
         .ok_or_else(|| "run disappeared after approval".into())
 }
@@ -1622,20 +1709,22 @@ pub async fn run_promote(
     state: State<'_, AppState>,
     session_id: String,
     run_id: String,
-) -> Result<grokptah_agent_bridge::RunRecord, String> {
+) -> Result<PublicRun, String> {
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     run_blocking(move || {
         let run = host
-            .get_session_run(id, &run_id)
+            .get_public_session_run(id, &run_id)
             .map_err(map_err)?
             .ok_or_else(|| "unknown run for this session".to_string())?;
-        match run.approval.as_ref() {
-            Some(approval) => host
-                .promote_run_with_approval(id, &run_id, Some(&approval.approval_id))
-                .map_err(map_err),
-            None => host.promote_run(id, &run_id).map_err(map_err),
-        }
+        host.promote_public_session_run(
+            id,
+            &run_id,
+            run.approval
+                .as_ref()
+                .map(|approval| approval.approval_id.as_str()),
+        )
+        .map_err(map_err)
     })
     .await
 }
@@ -1646,10 +1735,14 @@ pub async fn run_discard(
     state: State<'_, AppState>,
     session_id: String,
     run_id: String,
-) -> Result<grokptah_agent_bridge::RunRecord, String> {
+) -> Result<PublicRun, String> {
     let host = state.host.clone();
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    run_blocking(move || host.discard_run(id, &run_id).map_err(map_err)).await
+    run_blocking(move || {
+        host.discard_public_session_run(id, &run_id)
+            .map_err(map_err)
+    })
+    .await
 }
 
 /// Explicitly retry an interrupted MCP-owned run through the shared
@@ -1673,7 +1766,7 @@ pub async fn run_retry(
     }
     let source = state
         .host
-        .get_session_run(session_id, &run_id)
+        .get_public_session_run(session_id, &run_id)
         .map_err(map_err)?
         .ok_or_else(|| "unknown run for this session".to_string())?;
     if source.client_id.as_deref() != Some("mcp") {
@@ -1718,7 +1811,7 @@ pub async fn run_steer(
     }
     let source = state
         .host
-        .get_session_run(session_id, &run_id)
+        .get_public_session_run(session_id, &run_id)
         .map_err(map_err)?
         .ok_or_else(|| "unknown run for this session".to_string())?;
     if source.client_id.as_deref() != Some("mcp") {
@@ -1757,7 +1850,7 @@ pub async fn run_cancel(
     }
     let source = state
         .host
-        .get_session_run(session_id, &run_id)
+        .get_public_session_run(session_id, &run_id)
         .map_err(map_err)?
         .ok_or_else(|| "unknown run for this session".to_string())?;
     if source.client_id.as_deref() != Some("mcp") {
@@ -2114,6 +2207,15 @@ pub fn schedule_background_task(state: State<'_, AppState>, title: String) -> Ba
 #[tauri::command]
 pub fn settings_snapshot(state: State<'_, AppState>) -> serde_json::Value {
     state.host.settings_snapshot()
+}
+
+#[tauri::command]
+pub fn native_coding_readiness(
+    state: State<'_, AppState>,
+    provider_id: String,
+    model_id: String,
+) -> grokptah_agent_bridge::NativeCodingReadinessProjection {
+    state.host.native_coding_readiness(&provider_id, &model_id)
 }
 
 #[tauri::command]

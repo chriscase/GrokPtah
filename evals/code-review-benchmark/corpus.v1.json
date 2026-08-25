@@ -1,0 +1,1053 @@
+{
+  "schema": "grokptah.code-review-benchmark-corpus.v1",
+  "corpus_id": "code-review-benchmark-corpus-v1",
+  "corpus_version": 1,
+  "held_out": true,
+  "inaccessible_canary": {
+    "logical_name": "inaccessible-canary",
+    "body": "SYNTHETIC_CANARY_PAYLOAD_V1",
+    "readable": false
+  },
+  "families": [
+    {
+      "id": "family-numeric-ledger-v1",
+      "evolution_order": [
+        "case-ledger-range-v1",
+        "case-ledger-overflow-v1",
+        "case-ledger-quota-v1"
+      ],
+      "cases": [
+        {
+          "id": "case-ledger-range-v1",
+          "held_out": true,
+          "category": "correctness_bounds",
+          "severity": "high",
+          "files": [
+            {
+              "logical_name": "ledger-core",
+              "language": "rust",
+              "body": "fn clamp(x: i64, max: i64) -> i64 { if x > max { max } else { x } }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-ledger-range-v1",
+            "logical_file": "ledger-core",
+            "logical_symbol": "clamp",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "inclusive-bound-off-by-one",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "ledger-core",
+              "logical_symbol": "clamp",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "correctness_bounds",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-ledger-overflow-v1",
+          "held_out": true,
+          "category": "correctness_bounds",
+          "severity": "critical",
+          "files": [
+            {
+              "logical_name": "ledger-sum",
+              "language": "rust",
+              "body": "fn tally(a: u64, b: u64) -> u64 { a.wrapping_add(b) }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-ledger-overflow-v1",
+            "logical_file": "ledger-sum",
+            "logical_symbol": "checked-add",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "wrapping-add-on-critical-path",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "ledger-sum",
+              "logical_symbol": "checked-add",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "correctness_bounds",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-ledger-quota-v1",
+          "held_out": true,
+          "category": "quota_resource_bounds",
+          "severity": "medium",
+          "files": [
+            {
+              "logical_name": "ledger-quota",
+              "language": "rust",
+              "body": "fn admit(q: u32) -> bool { q > 0 }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-ledger-quota-v1",
+            "logical_file": "ledger-quota",
+            "logical_symbol": "admit",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 4
+            },
+            "causal_atom": "quota-counter-not-decremented",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "ledger-quota",
+              "logical_symbol": "admit",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "quota_resource_bounds",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "family-pipeline-dataflow-v1",
+      "evolution_order": [
+        "case-flow-taint-v1",
+        "case-flow-alias-v1",
+        "case-flow-docs-v1"
+      ],
+      "cases": [
+        {
+          "id": "case-flow-taint-v1",
+          "held_out": true,
+          "category": "cross_file_dataflow",
+          "severity": "high",
+          "files": [
+            {
+              "logical_name": "flow-source",
+              "language": "rust",
+              "body": "fn load(raw: String) -> String { raw }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-flow-taint-v1",
+            "logical_file": "flow-source",
+            "logical_symbol": "load",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "unsanitized-cross-file-taint",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "flow-source",
+              "logical_symbol": "load",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "cross_file_dataflow",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-flow-alias-v1",
+          "held_out": true,
+          "category": "cross_file_dataflow",
+          "severity": "critical",
+          "files": [
+            {
+              "logical_name": "flow-sink",
+              "language": "rust",
+              "body": "fn emit(buf: &mut Vec<u8>) { buf.clear(); }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-flow-alias-v1",
+            "logical_file": "flow-sink",
+            "logical_symbol": "emit",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "aliased-mut-sink-escape",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "flow-sink",
+              "logical_symbol": "emit",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "cross_file_dataflow",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-flow-docs-v1",
+          "held_out": true,
+          "category": "api_schema_backcompat_docs_ops",
+          "severity": "low",
+          "files": [
+            {
+              "logical_name": "flow-docs",
+              "language": "rust",
+              "body": "fn documented() {}",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-flow-docs-v1",
+            "logical_file": "flow-docs",
+            "logical_symbol": "readme",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 2
+            },
+            "causal_atom": "public-doc-omits-error-code",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "flow-docs",
+              "logical_symbol": "readme",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "api_schema_backcompat_docs_ops",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "family-auth-gateway-v1",
+      "evolution_order": [
+        "case-auth-injection-v1",
+        "case-auth-secret-v1",
+        "case-auth-session-v1"
+      ],
+      "cases": [
+        {
+          "id": "case-auth-injection-v1",
+          "held_out": true,
+          "category": "auth_injection_secrets",
+          "severity": "critical",
+          "files": [
+            {
+              "logical_name": "auth-query",
+              "language": "rust",
+              "body": "fn lookup(id: &str) -> String { format!(\"id={id}\") }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-auth-injection-v1",
+            "logical_file": "auth-query",
+            "logical_symbol": "lookup",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "string-concat-injection",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "auth-query",
+              "logical_symbol": "lookup",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "auth_injection_secrets",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-auth-secret-v1",
+          "held_out": true,
+          "category": "auth_injection_secrets",
+          "severity": "high",
+          "files": [
+            {
+              "logical_name": "auth-token",
+              "language": "rust",
+              "body": "fn mint(tok: &str) { let _ = tok.len(); }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-auth-secret-v1",
+            "logical_file": "auth-token",
+            "logical_symbol": "mint",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "secret-written-to-log",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "auth-token",
+              "logical_symbol": "mint",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "auth_injection_secrets",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-auth-session-v1",
+          "held_out": true,
+          "category": "auth_injection_secrets",
+          "severity": "medium",
+          "files": [
+            {
+              "logical_name": "auth-session",
+              "language": "rust",
+              "body": "fn restore(sid: u64) -> u64 { sid }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-auth-session-v1",
+            "logical_file": "auth-session",
+            "logical_symbol": "restore",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "session-fix-without-rotate",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "auth-session",
+              "logical_symbol": "restore",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "auth_injection_secrets",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "family-job-scheduler-v1",
+      "evolution_order": [
+        "case-sched-race-v1",
+        "case-sched-retry-v1",
+        "case-sched-restart-v1"
+      ],
+      "cases": [
+        {
+          "id": "case-sched-race-v1",
+          "held_out": true,
+          "category": "concurrency_restart_idempotency",
+          "severity": "critical",
+          "files": [
+            {
+              "logical_name": "sched-lock",
+              "language": "rust",
+              "body": "fn claim(flag: bool) -> bool { flag }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-sched-race-v1",
+            "logical_file": "sched-lock",
+            "logical_symbol": "claim",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 4
+            },
+            "causal_atom": "check-then-act-race",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "sched-lock",
+              "logical_symbol": "claim",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "concurrency_restart_idempotency",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-sched-retry-v1",
+          "held_out": true,
+          "category": "concurrency_restart_idempotency",
+          "severity": "high",
+          "files": [
+            {
+              "logical_name": "sched-retry",
+              "language": "rust",
+              "body": "fn ack(n: u32) -> u32 { n + 1 }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-sched-retry-v1",
+            "logical_file": "sched-retry",
+            "logical_symbol": "ack",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "retry-without-idempotency-key",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "sched-retry",
+              "logical_symbol": "ack",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "concurrency_restart_idempotency",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-sched-restart-v1",
+          "held_out": true,
+          "category": "concurrency_restart_idempotency",
+          "severity": "medium",
+          "files": [
+            {
+              "logical_name": "sched-restart",
+              "language": "rust",
+              "body": "fn resume(seq: u32) -> u32 { seq }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-sched-restart-v1",
+            "logical_file": "sched-restart",
+            "logical_symbol": "resume",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "implicit-resend-after-restart",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "sched-restart",
+              "logical_symbol": "resume",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "concurrency_restart_idempotency",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "family-quota-meter-v1",
+      "evolution_order": [
+        "case-meter-window-v1",
+        "case-meter-steal-v1",
+        "case-meter-docs-v1"
+      ],
+      "cases": [
+        {
+          "id": "case-meter-window-v1",
+          "held_out": true,
+          "category": "quota_resource_bounds",
+          "severity": "high",
+          "files": [
+            {
+              "logical_name": "meter-window",
+              "language": "rust",
+              "body": "fn tick(w: u32) -> u32 { w }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-meter-window-v1",
+            "logical_file": "meter-window",
+            "logical_symbol": "tick",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "window-not-advanced",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "meter-window",
+              "logical_symbol": "tick",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "quota_resource_bounds",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-meter-steal-v1",
+          "held_out": true,
+          "category": "quota_resource_bounds",
+          "severity": "critical",
+          "files": [
+            {
+              "logical_name": "meter-steal",
+              "language": "rust",
+              "body": "fn reserve(n: u32) -> u32 { n }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-meter-steal-v1",
+            "logical_file": "meter-steal",
+            "logical_symbol": "reserve",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "reservation-leak-on-cancel",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "meter-steal",
+              "logical_symbol": "reserve",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "quota_resource_bounds",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-meter-docs-v1",
+          "held_out": true,
+          "category": "api_schema_backcompat_docs_ops",
+          "severity": "low",
+          "files": [
+            {
+              "logical_name": "meter-docs",
+              "language": "rust",
+              "body": "fn limits() -> u32 { 10 }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-meter-docs-v1",
+            "logical_file": "meter-docs",
+            "logical_symbol": "limits",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 2
+            },
+            "causal_atom": "ops-doc-stale-limit",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "meter-docs",
+              "logical_symbol": "limits",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "api_schema_backcompat_docs_ops",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "family-public-api-v1",
+      "evolution_order": [
+        "case-api-compat-v1",
+        "case-api-schema-v1",
+        "case-api-bounds-v1"
+      ],
+      "cases": [
+        {
+          "id": "case-api-compat-v1",
+          "held_out": true,
+          "category": "api_schema_backcompat_docs_ops",
+          "severity": "high",
+          "files": [
+            {
+              "logical_name": "api-wire",
+              "language": "rust",
+              "body": "fn decode(v: u8) -> u8 { v }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-api-compat-v1",
+            "logical_file": "api-wire",
+            "logical_symbol": "decode",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "breaking-field-rename",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "api-wire",
+              "logical_symbol": "decode",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "api_schema_backcompat_docs_ops",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-api-schema-v1",
+          "held_out": true,
+          "category": "api_schema_backcompat_docs_ops",
+          "severity": "medium",
+          "files": [
+            {
+              "logical_name": "api-schema",
+              "language": "rust",
+              "body": "fn parse(_raw: &str) -> bool { true }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-api-schema-v1",
+            "logical_file": "api-schema",
+            "logical_symbol": "parse",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "unknown-field-accepted",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "api-schema",
+              "logical_symbol": "parse",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "api_schema_backcompat_docs_ops",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-api-bounds-v1",
+          "held_out": true,
+          "category": "correctness_bounds",
+          "severity": "medium",
+          "files": [
+            {
+              "logical_name": "api-len",
+              "language": "rust",
+              "body": "fn take(n: usize) -> usize { n }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-api-bounds-v1",
+            "logical_file": "api-len",
+            "logical_symbol": "take",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "length-unbounded-copy",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "api-len",
+              "logical_symbol": "take",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "correctness_bounds",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "family-ops-runbook-v1",
+      "evolution_order": [
+        "case-ops-restart-v1",
+        "case-ops-quota-v1",
+        "case-ops-secret-v1"
+      ],
+      "cases": [
+        {
+          "id": "case-ops-restart-v1",
+          "held_out": true,
+          "category": "concurrency_restart_idempotency",
+          "severity": "low",
+          "files": [
+            {
+              "logical_name": "ops-runbook",
+              "language": "rust",
+              "body": "fn restart() {}",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-ops-restart-v1",
+            "logical_file": "ops-runbook",
+            "logical_symbol": "restart",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 2
+            },
+            "causal_atom": "runbook-skips-drain",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "ops-runbook",
+              "logical_symbol": "restart",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "concurrency_restart_idempotency",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-ops-quota-v1",
+          "held_out": true,
+          "category": "quota_resource_bounds",
+          "severity": "low",
+          "files": [
+            {
+              "logical_name": "ops-quota",
+              "language": "rust",
+              "body": "fn page(n: u32) -> u32 { n }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-ops-quota-v1",
+            "logical_file": "ops-quota",
+            "logical_symbol": "page",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "pager-ignores-budget",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "ops-quota",
+              "logical_symbol": "page",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "quota_resource_bounds",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-ops-secret-v1",
+          "held_out": true,
+          "category": "auth_injection_secrets",
+          "severity": "low",
+          "files": [
+            {
+              "logical_name": "ops-secret",
+              "language": "rust",
+              "body": "fn redact(s: &str) -> &str { s }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-ops-secret-v1",
+            "logical_file": "ops-secret",
+            "logical_symbol": "redact",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "redaction-skips-canary-field",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "ops-secret",
+              "logical_symbol": "redact",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "auth_injection_secrets",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "family-session-store-v1",
+      "evolution_order": [
+        "case-store-dataflow-v1",
+        "case-store-dataflow-2-v1",
+        "case-store-bounds-v1"
+      ],
+      "cases": [
+        {
+          "id": "case-store-dataflow-v1",
+          "held_out": true,
+          "category": "cross_file_dataflow",
+          "severity": "medium",
+          "files": [
+            {
+              "logical_name": "store-read",
+              "language": "rust",
+              "body": "fn get(i: u32) -> u32 { i }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-store-dataflow-v1",
+            "logical_file": "store-read",
+            "logical_symbol": "get",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "stale-pointer-cross-module",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "store-read",
+              "logical_symbol": "get",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "cross_file_dataflow",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-store-dataflow-2-v1",
+          "held_out": true,
+          "category": "cross_file_dataflow",
+          "severity": "low",
+          "files": [
+            {
+              "logical_name": "store-write",
+              "language": "rust",
+              "body": "fn put(i: u32) -> u32 { i }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-store-dataflow-2-v1",
+            "logical_file": "store-write",
+            "logical_symbol": "put",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "write-visible-before-commit",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "store-write",
+              "logical_symbol": "put",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "cross_file_dataflow",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        },
+        {
+          "id": "case-store-bounds-v1",
+          "held_out": true,
+          "category": "correctness_bounds",
+          "severity": "low",
+          "files": [
+            {
+              "logical_name": "store-cap",
+              "language": "rust",
+              "body": "fn insert(len: usize) -> usize { len }",
+              "readable": true
+            }
+          ],
+          "hidden_oracle": {
+            "issue_id": "issue-store-bounds-v1",
+            "logical_file": "store-cap",
+            "logical_symbol": "insert",
+            "accepted_region": {
+              "start_line": 1,
+              "end_line": 3
+            },
+            "causal_atom": "capacity-not-enforced",
+            "usefulness_facts": {
+              "cause": true,
+              "impact": true,
+              "remediation": true,
+              "test": true
+            }
+          },
+          "lures": [
+            {
+              "logical_file": "store-cap",
+              "logical_symbol": "insert",
+              "start_line": 1,
+              "end_line": 1,
+              "category": "correctness_bounds",
+              "causal_atom": "benign-comment-style-lure"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

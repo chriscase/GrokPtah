@@ -188,6 +188,27 @@ impl LiveCredentialAttestation {
         &self.binding_id
     }
 
+    /// Stable secret-free fingerprint used to bind a provider-quota receipt
+    /// to this exact credential/model/session attestation.
+    pub fn credential_fingerprint(&self) -> String {
+        sha256_hex(self.binding_id.as_str())
+    }
+
+    /// Stable secret-free route/model binding used by live campaign evidence.
+    pub fn route_binding_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        for value in [
+            "grokptah.live-route-binding.v1",
+            self.endpoint_fingerprint.as_str(),
+            self.requested_model.as_str(),
+            self.wire_model.as_str(),
+        ] {
+            hasher.update(value.as_bytes());
+            hasher.update([0]);
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
     pub const fn client_policy(&self) -> ClientPolicyState {
         self.client_policy
     }

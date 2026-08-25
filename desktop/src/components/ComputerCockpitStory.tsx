@@ -3,9 +3,10 @@ import { api } from "../lib/api";
 import type {
   ComputerAction,
   ComputerCockpitSnapshot,
-  ComputerRun,
+  ComputerLocalApproval,
 } from "../lib/protocol";
 import { ComputerCockpit } from "./ComputerCockpit";
+import { PersistentComputerRuns } from "./PersistentComputerRuns";
 
 const target = {
   appId: "com.grokptah.computer-use-simulator",
@@ -27,24 +28,23 @@ function observedRun(
   sequence: number,
   name = "",
   submitted = false,
-): ComputerRun {
+): ComputerLocalApproval {
   const observationId = `story-observation-${sequence}`;
   return {
     runId: "story-run",
-    ownerSessionId: "story-session",
-    target,
     state: "ready",
     version: sequence * 2 + 1,
-    createdAt: new Date(Date.now() - 22_000).toISOString(),
-    updatedAt: new Date().toISOString(),
-    startedAt: new Date(Date.now() - 20_000).toISOString(),
-    limits: { maxActions: 8, maxDurationSecs: 600 },
     actionCount: Math.max(0, sequence - 1),
-    currentObservation: {
+    limits: { maxActions: 8 },
+    controlDisposition: "agent_owned",
+    target: {
+      appId: target.appId,
+      displayName: target.displayName,
+    },
+    observation: {
       observationId,
       sequence,
       capturedAt: new Date().toISOString(),
-      target,
       elements: [
         {
           elementId: `${observationId}-name`,
@@ -52,8 +52,6 @@ function observedRun(
           label: "Name",
           value: name || null,
           enabled: true,
-          focused: false,
-          sensitivity: "none",
           actions: ["set_value"],
         },
         {
@@ -61,8 +59,6 @@ function observedRun(
           role: "button",
           label: "Submit",
           enabled: Boolean(name),
-          focused: false,
-          sensitivity: "none",
           actions: ["invoke"],
         },
         {
@@ -70,17 +66,12 @@ function observedRun(
           role: "status",
           label: submitted ? `Submitted for ${name}` : "Not submitted",
           enabled: true,
-          focused: false,
-          sensitivity: "none",
           actions: [],
         },
       ],
-      elementsTruncated: false,
     },
     grant: {
-      grantId: `story-grant-${sequence}`,
       expiresAt: new Date(Date.now() + 120_000).toISOString(),
-      usesRemaining: 1,
       revokedAt: null,
       actionClasses: ["semantic", "text_entry"],
     },
@@ -88,36 +79,42 @@ function observedRun(
       {
         sequence: 1,
         at: new Date(Date.now() - 22_000).toISOString(),
+        surfaceEvent: "run_created",
         operation: "create_run",
         disposition: "accepted",
       },
       {
         sequence: 2,
         at: new Date(Date.now() - 21_000).toISOString(),
+        surfaceEvent: "authorization_granted",
         operation: "authorize",
         disposition: "granted",
       },
       {
         sequence: 3,
         at: new Date(Date.now() - 20_000).toISOString(),
+        surfaceEvent: "observation_ready",
         operation: "observe",
         disposition: "completed",
         observationId,
       },
     ],
+    lastError: null,
   };
 }
 
-function nativeObservedRun(sequence: number, name = "public-demo-value", submittedValue = false): ComputerRun {
+function nativeObservedRun(sequence: number, name = "public-demo-value", submittedValue = false): ComputerLocalApproval {
   const observationId = `native-observation-${sequence}`;
   return {
     ...observedRun(sequence, name, submittedValue),
-    target: nativeTarget,
-    currentObservation: {
+    target: {
+      appId: nativeTarget.appId,
+      displayName: nativeTarget.displayName,
+    },
+    observation: {
       observationId,
       sequence,
       capturedAt: new Date().toISOString(),
-      target: nativeTarget,
       elements: [
         {
           elementId: `${observationId}-element-3`,
@@ -125,8 +122,6 @@ function nativeObservedRun(sequence: number, name = "public-demo-value", submitt
           label: "Project label",
           value: name,
           enabled: true,
-          focused: false,
-          sensitivity: "none",
           actions: ["set_value"],
         },
         {
@@ -135,8 +130,6 @@ function nativeObservedRun(sequence: number, name = "public-demo-value", submitt
           label: "Priority",
           value: "Normal",
           enabled: true,
-          focused: false,
-          sensitivity: "none",
           actions: ["select"],
         },
         {
@@ -144,8 +137,6 @@ function nativeObservedRun(sequence: number, name = "public-demo-value", submitt
           role: "AXButton",
           label: "Submit fixture",
           enabled: true,
-          focused: false,
-          sensitivity: "none",
           actions: ["invoke"],
         },
         {
@@ -153,8 +144,6 @@ function nativeObservedRun(sequence: number, name = "public-demo-value", submitt
           role: "AXStaticText",
           label: submittedValue ? `Submitted ${name} at Normal` : "Not submitted",
           enabled: true,
-          focused: false,
-          sensitivity: "none",
           actions: [],
         },
         {
@@ -162,12 +151,9 @@ function nativeObservedRun(sequence: number, name = "public-demo-value", submitt
           role: "AXScrollArea",
           label: "Accessible demo rows",
           enabled: true,
-          focused: false,
-          sensitivity: "none",
           actions: ["scroll"],
         },
       ],
-      elementsTruncated: false,
     },
   };
 }
@@ -179,6 +165,7 @@ const backend = {
   textEntry: true,
   keyChords: false,
   pointerFallback: false,
+  foregroundConflictCapacity: 1,
 };
 
 const nativeBackend = {
@@ -189,47 +176,35 @@ const nativeBackend = {
 let current: ComputerCockpitSnapshot = {
   backend,
   origin: "desktop",
-  run: null,
+  local: null,
   pendingApproval: null,
 };
 let currentName = "";
 let submitted = false;
 let agentQualified = false;
 
-function setRun(run: ComputerRun | null): ComputerCockpitSnapshot {
-  current = { ...current, run, pendingApproval: null };
+function setRun(run: ComputerLocalApproval | null): ComputerCockpitSnapshot {
+  current = { ...current, local: run, pendingApproval: null };
   return structuredClone(current);
 }
 
-function pausedAfter(action: ComputerAction): ComputerRun {
-  const run = structuredClone(current.run!);
+function pausedAfter(action: ComputerAction): ComputerLocalApproval {
+  const run = structuredClone(current.local!);
   if (action.type === "set_value") currentName = action.text;
   if (action.type === "invoke") submitted = true;
   run.state = "paused";
   run.version += 1;
   run.actionCount += 1;
-  run.currentObservation = null;
+  run.observation = null;
   run.grant = run.grant
-    ? { ...run.grant, usesRemaining: 0, revokedAt: new Date().toISOString() }
+    ? { ...run.grant, revokedAt: new Date().toISOString() }
     : null;
-  run.lastOutcome = {
-    summary:
-      action.type === "set_value"
-        ? "set visible demo text"
-        : action.type === "activate_target"
-          ? "activated the authorized application"
-          : action.type === "invoke"
-            ? "invoked the selected element"
-            : action.type === "select"
-              ? "selected the chosen value"
-              : "scrolled the selected element into view",
-    expectedPostconditionMet: true,
-  };
   run.audit = [
     ...run.audit,
     {
       sequence: run.audit.length + 1,
       at: new Date().toISOString(),
+      surfaceEvent: "postcondition_recorded",
       operation: "act",
       disposition: "completed",
       actionClass: action.type === "set_value" ? "text_entry" : "semantic",
@@ -289,7 +264,7 @@ api.computerUseCockpitStageAction = async (
 ) => {
   const actionElementLabel =
     "element_id" in action
-      ? current.run?.currentObservation?.elements.find(
+      ? current.local?.observation?.elements.find(
           (element) => element.elementId === action.element_id,
         )?.label
       : null;
@@ -301,7 +276,7 @@ api.computerUseCockpitStageAction = async (
       runId,
       runVersion: expectedVersion,
       observationId,
-      targetLabel: current.run?.target.displayName ?? target.displayName,
+      targetLabel: current.local?.target.displayName ?? target.displayName,
       action,
       actionSummary:
         action.type === "set_value"
@@ -315,6 +290,7 @@ api.computerUseCockpitStageAction = async (
           : action.type === "activate_target"
             ? "Application focus"
             : "Semantic action",
+      proposalOrigin: "operator",
       createdAt: new Date().toISOString(),
     },
   };
@@ -326,7 +302,7 @@ api.computerUseCockpitProposeAgentAction = async (
   expectedVersion,
   observationId,
 ) => {
-  const elementId = current.run?.currentObservation?.elements.find(
+  const elementId = current.local?.observation?.elements.find(
     (element) => element.actions.includes("set_value"),
   )?.elementId;
   if (!elementId) throw new Error("No visible text field is available");
@@ -337,8 +313,55 @@ api.computerUseCockpitProposeAgentAction = async (
     observationId,
     { type: "set_value", element_id: elementId, text: "Ada Lovelace" },
   );
+  const nextSequence = (snapshot.local?.audit.at(-1)?.sequence ?? 0) + 1;
+  current = {
+    ...snapshot,
+    pendingApproval: snapshot.pendingApproval
+      ? { ...snapshot.pendingApproval, proposalOrigin: "agent" }
+      : null,
+    local: snapshot.local
+      ? {
+          ...snapshot.local,
+          audit: [
+            ...snapshot.local.audit,
+            {
+              sequence: nextSequence,
+              at: new Date().toISOString(),
+              surfaceEvent: "action_proposed",
+              operation: "action_proposed",
+              disposition: "staged",
+              actionClass: "text_entry",
+              observationId,
+            },
+            {
+              sequence: nextSequence + 1,
+              at: new Date().toISOString(),
+              surfaceEvent: "attention_moved",
+              attention: {
+                xBasisPoints: 3000,
+                yBasisPoints: 1700,
+                target: "semantic_element",
+              },
+              operation: "attention",
+              disposition: "moved",
+              actionClass: "text_entry",
+              observationId,
+            },
+            {
+              sequence: nextSequence + 2,
+              at: new Date().toISOString(),
+              surfaceEvent: "approval_required",
+              operation: "approval",
+              disposition: "required",
+              actionClass: "text_entry",
+              observationId,
+            },
+          ],
+        }
+      : null,
+  };
   return {
-    snapshot,
+    snapshot: structuredClone(current),
     summary: "Enter the requested name in the visible field",
     completed: false,
   };
@@ -351,48 +374,62 @@ api.computerUseCockpitDiscardApproval = async () => {
 };
 api.computerUseCockpitRefresh = async () =>
   setRun(
-    current.run?.target.appId === nativeTarget.appId
-      ? nativeObservedRun((current.run?.actionCount ?? 0) + 1, currentName || "public-demo-value", submitted)
-      : observedRun((current.run?.actionCount ?? 0) + 1, currentName, submitted),
+    current.local?.target.appId === nativeTarget.appId
+      ? nativeObservedRun((current.local?.actionCount ?? 0) + 1, currentName || "public-demo-value", submitted)
+      : observedRun((current.local?.actionCount ?? 0) + 1, currentName, submitted),
   );
 api.computerUseCockpitPause = async () => {
-  const run = structuredClone(current.run!);
+  const run = structuredClone(current.local!);
   run.state = "paused";
   run.version += 1;
-  run.currentObservation = null;
+  run.observation = null;
   if (run.grant) run.grant.revokedAt = new Date().toISOString();
   return setRun(run);
 };
 api.computerUseCockpitTakeOver = api.computerUseCockpitPause;
 api.computerUseCockpitStop = async () => {
-  const run = structuredClone(current.run!);
+  const run = structuredClone(current.local!);
   run.state = "cancelled";
   run.version += 1;
-  run.currentObservation = null;
-  run.endedAt = new Date().toISOString();
+  run.observation = null;
   return setRun(run);
 };
 
 export function ComputerCockpitStory() {
   const [closed, setClosed] = useState(false);
-  if (closed) {
-    return (
-      <main className="computer-story-closed">
-        <button type="button" onClick={() => setClosed(false)}>Open Computer Run</button>
-      </main>
-    );
-  }
+  const [appSnapshot, setAppSnapshot] = useState<ComputerCockpitSnapshot>(current);
   return (
     <main className="computer-story-shell">
-      <ComputerCockpit
-        sessionId="story-session"
-        sessionTitle="Disposable demo build"
-        model="grok-4.5"
-        effort="high"
-        sessionBusy
-        onClose={() => setClosed(true)}
-        onSteer={async () => "Steering will apply at the next safe step."}
+      <PersistentComputerRuns
+        runs={[
+          {
+            sessionId: "story-session",
+            sessionTitle: "Disposable demo build",
+            snapshot: appSnapshot,
+          },
+        ]}
+        preferredSessionId="story-session"
+        onSnapshot={(_sessionId, snapshot) => setAppSnapshot(snapshot)}
+        onOpen={() => setClosed(false)}
       />
+      {closed ? (
+        <div className="computer-story-closed">
+          <button type="button" onClick={() => setClosed(false)}>Open Computer Run</button>
+        </div>
+      ) : (
+        <ComputerCockpit
+          sessionId="story-session"
+          boundRunId={appSnapshot.local?.runId ?? null}
+          sessionTitle="Disposable demo build"
+          model="grok-4.5"
+          effort="high"
+          sessionBusy
+          emergencyKeysManaged
+          onClose={() => setClosed(true)}
+          onSnapshot={(_sessionId, snapshot) => setAppSnapshot(snapshot)}
+          onSteer={async () => "Steering will apply at the next safe step."}
+        />
+      )}
     </main>
   );
 }

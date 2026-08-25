@@ -1,0 +1,408 @@
+# Isolated visual runtime-session source evidence
+
+Status: source-level progress only; this record does not qualify a packaged
+Computer Use backend or satisfy the #288 release gate.
+
+## Candidate identity
+
+- Branch: `codex/cu-isolated-guest-bootstrap-v1`
+- Source head at evidence cutoff: `baa28f748c13a6ceda381e068004cd46aea2658c`
+- Bundle: `/private/tmp/grokptah-cu-isolated-visual-v12.bundle`
+- Bundle SHA-256: `5e96b4021857c37a0b07d7ab174f2cd6927f0919a458cd03dfc2cb4c04d1bc5a`
+- Bundle verification: complete history; `git bundle verify` passed.
+- Base checkout: main remains clean at `6409645cb7d0fe6d75585f0610366340f808b8ec`
+
+Current bundled source head: `baa28f748c13a6ceda381e068004cd46aea2658c`.
+
+The earlier v1, v2, v3, v4, v5, and v6 bundles remain retained as historical source-only
+evidence: `/private/tmp/grokptah-cu-isolated-visual-v1.bundle` (cutoff
+`3a88fb41e29a55aeabb54defe82761b129b6ab11`) and
+`/private/tmp/grokptah-cu-isolated-visual-v2.bundle` (cutoff
+`4ea37f3a223f74817f629f0b844c76d4916b895c`) and
+`/private/tmp/grokptah-cu-isolated-visual-v3.bundle` (cutoff
+`d69c6f82d706273c701c7056b0df135e2b386201`), and
+`/private/tmp/grokptah-cu-isolated-visual-v4.bundle` (cutoff
+`207d023b029a1ed9a04bcd62de729a1784baa332`) and
+`/private/tmp/grokptah-cu-isolated-visual-v5.bundle` (cutoff
+`ab8542584fb96313f6dc927b0e745411ee67edd1`). They must not be used for a new
+qualification campaign now that the candidate contains later security fixes.
+The superseded v6 bundle is `/private/tmp/grokptah-cu-isolated-visual-v6.bundle`
+(cutoff `6ccd05b50fb47320c56c077cf4a9f596a342baf8`; SHA-256
+`1680a24ee2274a04ee80b42cbd8e28b7fd8cc913ab3454a967255d6248b994ce`).
+
+The later guest-input validation extension is sealed at:
+
+- Commit: `5c5f21457d200b45dcad9ddd9d5bede0500344fd`
+- Bundle: `/private/tmp/grokptah-cu-stage13-guest-input-validation-v1.bundle`
+- Bundle SHA-256: `5c9e8c98e9e23d93cf926b32c456eb08339db9f527c5614534622e41bec8c67f`
+
+The guest held-input enforcement extension is sealed at:
+
+- Commit: `d34f7654fceb29e5164468108e74b6a414a51aa4`
+- Bundle: `/private/tmp/grokptah-cu-stage14-guest-input-state-v1.bundle`
+- Bundle SHA-256: `16abf1113ae91dbcc436e0999a2412313d1d2191bb6e96638ef3f19c09e9a123`
+
+The runtime-driver integration extension is sealed at:
+
+- Commit: `7823283284a484f5586edfc79a9dd2109d2a98b1`
+- Bundle: `/private/tmp/grokptah-cu-stage15-runtime-driver-v1.bundle`
+- Bundle SHA-256: `5b0f3ca91c9c62b34e500a82a9ad0878541ae2e0714003c8cd6b6786ccdaa8ca`
+
+The helper relay extension is sealed at:
+
+- Commit: `c195ea5b6a5fb4f3f2a12911738baaff4abb6143`
+- Bundle: `/private/tmp/grokptah-cu-stage16-helper-relay-v1.bundle`
+- Bundle SHA-256: `f06788d22d3c49b4cbf981f20ad050cda00ba21362231541c7b0e3f6b01bc8b3`
+
+The guest framebuffer-capture extension is sealed at:
+
+- Commit: `203de561e7189b8e19f17bc515b094450aa6387b`
+- Bundle: `/private/tmp/grokptah-cu-stage17-guest-frame-capture-v1.bundle`
+- Bundle SHA-256: `c7c8e1f45b70743e7dfbec19cde73dfec156e851238d29e1df43b5d4b19ac0a8`
+
+The deterministic guest-fixture rendering extension is sealed at:
+
+- Commit: `bf1e1b7f0c27598ce155e2d734a23a6f095010ea`
+- Bundle: `/private/tmp/grokptah-cu-stage18-guest-fixture-v1.bundle`
+- Bundle SHA-256: `15d033f19c615c53e663ef9257c29e1ee4574ea137decdfe23a6ee80d111c401`
+
+The private guest-challenge channel extension is sealed at:
+
+- Commit: `cadcbff96e663c81117241e8e372c59c2f7da6cd`
+- Bundle: `/private/tmp/grokptah-cu-stage19-challenge-channel-v1.bundle`
+- Bundle SHA-256: `e0ae9b2a8a0d311e0571c96c33239b47c5ab9cf612ddded1e3f83b461865e870`
+
+The bounded packaged-supervisor source extension is sealed at:
+
+- Commit: `eb9892e1ba5606c73b66abe60067fea5ae7eafb6`
+- Bundle: `/private/tmp/grokptah-cu-stage32-packaged-supervisor-v1.bundle`
+- Bundle SHA-256: `6c27796170c209c832fe7c6d0dc8f9c1233779ee2e6546e6704f7935a48dadb1`
+
+The helper/guest contract-documentation synchronization is sealed at:
+
+- Commit: `5a51d69a57a66ad72139402fc2a2e3fd9080b9e1`
+- Bundle: `/private/tmp/grokptah-cu-stage33-contract-docs-v1.bundle`
+- Bundle SHA-256: `3611489a7263f4901e681befed1c49d86fed40a98bd83f30fd1c63b88194f29d`
+
+The measured-descriptor spawn hardening is sealed at:
+
+- Commit: `e733c5016f9131f01a8167afcbad5eb37973a06d`
+- Bundle: `/private/tmp/grokptah-cu-stage34-measured-descriptor-spawn-v1.bundle`
+- Bundle SHA-256: `02c99b875f45839b7fde168e9ced3079ab2670e04a0710bc2df3bbeb85727b9b`
+
+The close-on-exec artifact gate is sealed at:
+
+- Commit: `cbd5baf6c85a561e61db12ddb61cd43f7b50d96b`
+- Bundle: `/private/tmp/grokptah-cu-stage35-cloexec-artifact-gate-v1.bundle`
+- Bundle SHA-256: `fae478dfe6ae6cf865cc5a3f59a72f5ce738464ce07f1858c7ef53c994a9e6b8`
+
+The bounded FD9 challenge-read hardening is sealed at:
+
+- Commit: `dc0aea97d49278055fa007f073a00f1bd39b0e48`
+- Bundle: `/private/tmp/grokptah-cu-stage36-bounded-challenge-read-v1.bundle`
+- Bundle SHA-256: `a49c13cb97f7ceea4c5993ecf56622d96b108fc4ab66833ac2d00f355cdcbd36`
+
+The bounded guest-frame read hardening is sealed at:
+
+- Commit: `f24a6a42da7e1eaa64e6f37330c55aa486843970`
+- Bundle: `/private/tmp/grokptah-cu-stage37-bounded-frame-read-v1.bundle`
+- Bundle SHA-256: `f1b81f9b10ff81628da526d38d547416a6f9738ab6f37eb6b93e84a448bb75f0`
+
+The bounded guest-input write hardening is sealed at:
+
+- Commit: `c95524032269abfabc95ba57f04152aba64fc061`
+- Bundle: `/private/tmp/grokptah-cu-stage38-bounded-input-write-v1.bundle`
+- Bundle SHA-256: `7f00f8fd38cff1c4390253557657012b0e7131d5b81fcce4b27a5c808ee44ebd`
+
+The bounded helper-control write hardening is sealed at:
+
+- Commit: `ad7901a5eab5078e9a64adc7b00524622322d63c`
+- Bundle: `/private/tmp/grokptah-cu-stage39-bounded-control-write-v1.bundle`
+- Bundle SHA-256: `61fc261f44405d95a2f5d8ce3f230fe0e0b71283ddf6f804cb70b90c024ffc5c`
+
+The bounded forced-reap hardening is sealed at:
+
+- Commit: `ab922776f8ff0f47c426e2dc423b7224ba38f032`
+- Bundle: `/private/tmp/grokptah-cu-stage40-bounded-forced-reap-v1.bundle`
+- Bundle SHA-256: `f789c57ef73ceeae576f372f9b947d8fc8a09b584bf07f8bfff27f0b083519bb`
+
+The raw-reader channel alignment is sealed at:
+
+- Commit: `a454357a46a61800c8dd993c2b837402bb7ff586`
+- Bundle: `/private/tmp/grokptah-cu-stage41-raw-polled-channels-v1.bundle`
+- Bundle SHA-256: `5b18f786ee1962a8ea4085a170422db5e28d6ba02fda6a500d44165610bc2518`
+
+The monotonic VM-deadline hardening extension is sealed at:
+
+- Commit: `15c127d514679ff412c6d47d0e1b44cc4ffd19f8`
+- Bundle: not created; this remains a source-only extension pending the
+  credentialed packaged-runtime campaign.
+
+The bounded guest/helper transport and supervisor-reap hardening extensions are
+sealed at:
+
+- Commits: `a2d76f3849a2999cb95735037d7632948df84a3b`,
+  `91dfce8c9c4f9a09d3648c3d3a8f4abf051a0338`,
+  `078d2c22002534d38b112445b6dcd2afb3e86a3f`,
+  `3782716fb652181220e93ce38284b5d4ab1acd6a`, and
+  `d2a578ff3a91907da308c03bdc78b4d35d933dc5`.
+- Bundle: not created; these remain source-only extensions pending the
+  credentialed packaged-runtime campaign.
+
+The package-bundle path hardening extension is sealed at:
+
+- Commit: `5c432f5f479656e2d9ae159b62d41f856bacaf6b`.
+- Bundle: not created; this remains a source-only extension pending the
+  credentialed packaged-runtime campaign.
+
+The staged-package publication extension is sealed at:
+
+- Commit: `2631aa0b7f911ee3f2a08a659d0501e8f9c84441`.
+- Bundle: not created; this remains a source-only extension pending the
+  credentialed packaged-runtime campaign.
+
+The clean isolated-resource-tree extension is sealed at:
+
+- Commit: `878ab78ecd67795715836ccdec1d1d16bf68211a`.
+- Bundle: not created; this remains a source-only extension pending the
+  credentialed packaged-runtime campaign.
+
+The fail-closed entitlement-inspection extension is sealed at:
+
+- Commit: `b1e5ff5eaa4dc85b90e3ef29c27328dc5b9e6e08`.
+- Bundle: not created; this remains a source-only extension pending the
+  credentialed packaged-runtime campaign.
+
+The atomic guest-artifact publication extension is sealed at:
+
+- Commit: `d2cd5aaa97dbcaa653df1270b7252dd7d3df9a15`.
+- Bundle: not created; this remains a source-only extension pending the
+  credentialed packaged-runtime campaign.
+
+The bounded kernel-source fetch extension is sealed at:
+
+- Commit: `f8b9ea8eecd2d4b20e4dcaa70377c337278b2589`.
+- Bundle: not created; this remains a source-only extension pending the
+  credentialed packaged-runtime campaign.
+
+The kernel-source download-size cap extension is sealed at:
+
+- Commit: `c6373c3e97f505db37420f9b520270c9dbad51d9`.
+- Bundle: not created; this remains a source-only extension pending the
+  credentialed packaged-runtime campaign.
+
+The disposable helper-compiler-cache extension is sealed at:
+
+- Commit: `44f3d13ba0f2161a3a379a108519072c3cbb8064`.
+- Bundle: not created; this remains a source-only extension pending the
+  credentialed packaged-runtime campaign.
+
+The shellcheck-clean verifier extension is sealed at:
+
+- Commit: `cabd4b623a4ca2383ed5283eb4d2830f7480b3e2`.
+- Included in the current source bundle above; no signed runtime claim is
+  implied.
+
+## What this candidate proves
+
+- The helper control ABI has an explicit `bind` command and authenticated
+  `bound` event between guest readiness and terminal stop.
+- The freestanding guest accepts the length-bounded binding packet and emits
+  an authenticated binding acknowledgement; the helper source validates and
+  relays that packet over its private control/VSOCK seam.
+- `IsolatedVisualRuntimeSession` couples helper event order to the durable
+  lifecycle, challenge-derived frame/input channels, frame freshness, input
+  admission, restart poisoning, and cleanup evidence. Debug output redacts the
+  challenge and carriers remain outside model-facing projections.
+- `IsolatedVisualStream` provides a bounded length-delimited private transport
+  seam: it refuses oversized allocations, maps mid-packet EOF to a terminal
+  condition, delegates frame authentication/freshness to the runtime session,
+  and writes only authenticated input packets.
+- `IsolatedVisualHelperControl` binds inherited control/event descriptors to
+  the same coordinator, serializing only the start/bind/stop controls and
+  accepting only decoded fixed-size helper events.
+- `IsolatedVisualRuntimeDriver` joins the helper control adapter and private
+  frame/input stream behind one lifecycle-owned API. It prevents a future
+  supervisor from advancing those seams through unrelated state machines,
+  while still deliberately accepting inherited descriptors rather than
+  spawning a process or claiming a packaged VM capability.
+- The signed-helper source now validates private FD7/FD8 relay descriptors,
+  forwards only bounded host input packets to the guest VSOCK, and forwards
+  only bounded guest frame packets to the host. This proves relay plumbing and
+  fail-closed bounds, not a rendered frame or a working model-facing Computer
+  Use run.
+- The freestanding guest now has a bounded `/dev/fb0` capture path: it reads a
+  fixed 1280×800×4-byte surface, hashes it, emits authenticated 64 KiB frame
+  chunks with fresh UUIDv4 nonces, and advances the frame freshness fence. This
+  is source-level capture plumbing only; no reviewed guest image, GUI surface,
+  or packaged rendered frame has been qualified.
+- The guest fixture renderer now writes a bounded deterministic surface through
+  the guest framebuffer before capture. Validated pointer, button, and scroll
+  packets update only that fixture's cursor/state; this is a qualification
+  surface, not arbitrary guest GUI support or a packaged render proof.
+- The helper now writes the generated per-launch challenge to a private FD9
+  channel, and the Rust host adapter reads a complete nonzero challenge without
+  serializing it. This closes the host-binding input seam while leaving process
+  launch and package qualification explicitly unclaimed.
+- The native macOS shim now consumes the exact helper, guest-image, and
+  configuration descriptors returned by the Rust measurement/receipt verifier,
+  rejects descriptors without close-on-exec, rechecks helper identity immediately
+  before `posix_spawn`, creates only the five private parent/child channels, and maps the fixed descriptor contract under
+  `POSIX_SPAWN_CLOEXEC_DEFAULT`, and routes child stdio to `/dev/null`. The
+  macOS Rust supervisor owns the returned PID and descriptors, consumes FD9,
+  drives the bounded Prepared → Running → Bound lifecycle, bounds the FD9
+  challenge read as well as each helper-event wait, force-cleans an
+  unresponsive helper with a bounded forced reap, bounds guest frame reads,
+  host input writes, and helper control writes, and creates every runtime pipe
+  with close-on-exec set in the parent. Packaged channels use raw file readers
+  so polling and consumption cannot disagree through hidden user-space buffers.
+  This is a packaged-
+  supervisor **source candidate**; no signed app has launched it and no VM
+  boot/render/input/cleanup result is claimed.
+- The packaged supervisor exposes read-only runtime inspection while keeping
+  lifecycle-state mutation behind its driver; callers cannot obtain a public
+  mutable session reference and bypass the ordered helper protocol.
+- The helper's VM lifetime is governed by a checked monotonic deadline and a
+  bounded poll timeout rather than by the number of I/O loop iterations. A
+  continuously readable guest frame channel therefore cannot consume the
+  configured duration early, and a failed or overflowing clock calculation
+  fails closed before the VM lifecycle proceeds.
+- The same checked deadline constructor is used by every helper descriptor and
+  VSOCK read/write wrapper; a later clock failure cannot turn a bounded wait
+  into an unbounded one.
+- Fixed-size helper lifecycle events also use that bounded writer, so a stalled
+  host event reader cannot pin the helper indefinitely before its VM cleanup
+  path runs.
+- The credentialed package assembler now audits signed entitlements after both
+  helper and outer-app signing: only the helper must carry App Sandbox plus
+  Virtualization, while helper and outer app reject VM networking and
+  `get-task-allow`.
+- The package assembler rejects symlinked or non-canonical `Contents`,
+  `Info.plist`, `MacOS`, and `Resources` paths before installing the helper,
+  guest image, configuration, or manifest, and creates the isolated resource
+  directory only beneath those verified parents. It also rejects an input app
+  that already contains an `isolated-visual` directory, preventing unrelated
+  files from entering the signed package.
+- Assembly and signing now happen under a disposable staging directory; the
+  requested output path is published only after deep signature, identity, and
+  entitlement checks pass, so a failed attempt cannot leave a partial app at
+  the caller's output path.
+- Entitlement inspection now fails closed if `codesign` cannot produce the
+  signed XML; a pipeline failure can no longer be mistaken for a forbidden
+  entitlement being absent.
+- The Linux guest builder now stages the kernel image and manifest together,
+  publishing both only after manifest generation and output-path rechecks;
+  failed qualification builds do not leave partial output artifacts behind,
+  including a rollback if the two final renames do not both succeed.
+- Pinned kernel-source fetching now rejects non-HTTPS redirects, bounds connect
+  and transfer time/size, verifies the locked digest before publication, and
+  moves the verified tarball atomically into its final path.
+- Helper compilation now uses a per-build disposable Clang module cache rather
+  than a shared mutable cache, preventing concurrent qualification lanes from
+  reusing stale compiler-module state.
+- Package assembly also requires the exact GrokPtah bundle identifier and
+  matching signed team identity for the helper and outer app; a misidentified
+  or cross-team artifact fails before it can be used as a runtime candidate.
+- The packaged runtime launcher is crate-private until qualification completes;
+  it is no longer re-exported as a public provider/plugin API, so an unproven
+  helper cannot be started by an external caller or model-facing surface.
+- Supervisor teardown checks child ownership with `waitpid(WNOHANG)` before
+  signaling and treats an already-reaped child as complete, preventing a late
+  destructor from signaling a recycled PID.
+- Cleanup evidence is now host-created and serialization-only: its fields are
+  private, it cannot be deserialized from a coordinator/model payload, and
+  cleanup completion is crate-private until the supervisor has performed the
+  exact checks.
+- Guest VSOCK reads and writes now pass through one poll-budgeted I/O helper;
+  the retry budget covers each whole protocol operation, so a stalled or
+  trickling host channel cannot leave freestanding guest PID 1 in an
+  unbounded blocking syscall. Terminal poll errors, hangups, and invalid
+  descriptors fail immediately instead of consuming the temporary-stall budget.
+- The helper's control, guest-socket, and input relays treat an interrupted
+  `poll`/`read` as a bounded transport failure rather than retrying inside an
+  unbounded signal loop; the outer lifecycle can therefore perform its normal
+  cleanup and report the original failure.
+- Guest connection backoff likewise treats an interrupted `nanosleep` as a
+  failed attempt, so signal interruption cannot extend the finite connection
+  retry budget indefinitely.
+- The guest and helper source verifiers now reject regressions that reintroduce
+  signal-retry loops around transport `poll`/`read` or guest reconnect sleep.
+- Supervisor child waits now treat `waitpid` interruption as a bounded retry,
+  while preserving the pre-signal ownership check that prevents a recycled PID
+  from being signaled during cleanup.
+- The stop boundary now rejects held keyboard/button state, waits for the
+  helper to exit, and leaves the lifecycle in `CleanupPending` until explicit
+  per-surface process, handle, overlay, and frame-cache evidence completes it.
+- Startup protocol, helper-I/O, and guest-event failures now transition the
+  session to failure/cleanup-pending and reap or force-stop the child before
+  returning the original error; they cannot leave a half-started helper behind.
+- Frame-authentication, frame-stream, and input-wire failures take the same
+  poison-and-reap path. A user-level held-input stop rejection remains
+  retryable because no terminal transition has been committed yet.
+- The lifecycle transition from `Stopping` to `CleanupPending` now accepts the
+  already-recorded terminal disposition, matching the intended stop/cleanup
+  protocol and its deterministic test.
+- Before native spawn, the Rust launch seam now opens the exact package through
+  the existing read-only measurement/receipt verifier and binds the caller's
+  manifest to helper, guest-image, configuration, and designated-requirement
+  digests. It passes those still-open measured descriptors to the native shim
+  instead of allowing a second path-based artifact open; a structurally valid
+  but mismatched manifest therefore cannot reach the child process, and the
+  native shim repeats the helper path/signature check immediately before spawn.
+- The freestanding guest source validates the authenticated input packet,
+  sequence fence, identity-bound HMAC, coordinate/key/text bounds, and closed
+  message kind set after binding. Input remains fail-closed until a reviewed
+  packaged guest capture establishes the frame-freshness fence.
+- The guest independently tracks held mouse-button and key state: duplicate
+  downs, mismatched releases, invalid key transitions, and shutdown with any
+  held input fail closed. Binding resets the held-state fence, and the
+  protocol self-test covers both button and key transitions.
+- Source tests exercise the bound transition, frame-carrier round trip,
+  frame-fenced input packet, stop transition, and pre-binding rejection paths.
+
+## Safe validation performed
+
+- `rustfmt --edition 2021 --check` on each changed Rust source file
+- `cargo fmt --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml --all -- --check`
+  (reports pre-existing unrelated `xai-grok-pager` whitespace; no such file was
+  changed here)
+- `cargo metadata --locked --offline --no-deps --format-version=1`
+- `desktop/src-tauri/macos/isolated-visual-guest/verify-guest-source.sh`
+- `desktop/src-tauri/macos/isolated-visual-helper/verify-helper-source.sh`
+- `npm exec -- vitest run src/components/ComputerCockpit.test.tsx
+  src/components/SettingsPanel.computerUse.test.tsx` from the isolated desktop
+  checkout: 2 files / 27 tests passed. The checkout temporarily referenced
+  the main checkout's read-only `desktop/node_modules` tree for this command;
+  that link was removed immediately afterward.
+- `git diff --check`
+
+The changed Rust files were rustfmt-clean. The guest verifier reported its
+protocol self-test and closed-source checks passing. The helper verifier linked
+an arm64 Mach-O against `Virtualization.framework` and passed its
+entitlement/configuration/source checks, including a native-shim object link and
+the exported spawn/free symbols. Its invalid-start smoke now supplies a separate
+bounded regular guest descriptor rather than reusing the configuration file.
+The repository-wide formatter still reports pre-existing unrelated whitespace
+in the xai-grok-pager crate; that code was not modified by this candidate.
+
+## Explicit nonclaims
+
+No local cargo test/check/clippy campaign was run under the controlled build
+policy. No packaged helper, signed app, reviewed guest image, VM launch, socket
+frame renderer, input dispatch, hardware matrix, soak campaign, or `HostNative`
+capability claim exists yet. A host process-supervisor **source candidate** now
+exists, but it has not been exercised against a signed package. The bundle is a
+reviewable source candidate, not release evidence; the framebuffer extension
+proves only bounded source-level capture and frame authentication.
+
+## Next required gates
+
+1. Produce and review the deterministic guest image, signed helper, and exact
+   packaged app on a credentialed macOS host.
+2. Exercise `IsolatedVisualPackagedRuntime` against that package: launch, boot,
+   challenge/bind, render, input, stop, crash, restart, resource, and exact
+   overlay/handle cleanup.
+3. Run the security, hardware, accessibility, and recurring expert-UI
+   campaigns; retain the packaged evidence and independent review.
+4. Enable `HostNative` only after the #288 acceptance criteria and the
+   controlled Rust qualification campaign pass.

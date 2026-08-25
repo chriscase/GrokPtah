@@ -52,6 +52,9 @@ authorization, reconnect, desktop receipts) is documented in
 [`HEADLESS_SERVICE.md`](./HEADLESS_SERVICE.md). Runtime, storage, capability,
 and authority boundaries are normative in
 [`ADR-002-runtime-boundaries.md`](./ADR-002-runtime-boundaries.md).
+Supported vs Experimental vs Planned vs Explicitly unsupported capabilities
+are the [`CAPABILITY_MATRIX.md`](./CAPABILITY_MATRIX.md); the path to a
+trustworthy 100% claim is [`ROADMAP_TO_100.md`](./ROADMAP_TO_100.md).
 
 ## Why a bridge crate
 
@@ -75,8 +78,8 @@ The bridge:
 - Runs **local tools** (read/list/grep, shell, write with permission) in-process
 - **Build sessions** run a multi-round **tool-calling agent loop** (list/read/grep/glob/write/apply_patch/shell) with permissions; **Chat sessions** are single-shot completions
 - Injects project instructions (`AGENTS.md`, etc.) into Build context; sends effort on the wire
-- When OIDC/`~/.grok/auth.json` or an xAI API key is present, calls cli-chat-proxy / API for model steps
-- Discovers MCP servers from `~/.grokptah/mcp.json` / project `.mcp.json`, skills under `~/.grokptah/skills` and project skill dirs, plugins under `~/.grokptah/plugins` + local catalog (MCP **dispatch** into the loop is Phase 15)
+- When `XAI_API_KEY`, an OS keychain API key, `GROKPTAH_TOKEN_COMMAND`, or OIDC/`~/.grok/auth.json` is present (executable order: env key → keychain → token command → Grok Build session), calls cli-chat-proxy / API for model steps. Session/gateway **routing is Supported**; compatible gateway requests consume provider quota; GrokPtah does not sync a Grok Build account balance; a named secret-free provider-quota receipt is a mandatory unmet 100% exit (“not observed” fails); account-balance sync is not implemented and not required; the PR #352 local host quota ledger is pending until merged; exact live certification remains a distinct question ([`CAPABILITY_MATRIX.md`](./CAPABILITY_MATRIX.md)).
+- Discovers MCP servers from `~/.grokptah/mcp.json` / project `.mcp.json` and dispatches enabled **stdio** MCP tools into the Build loop as `mcp__server__tool` (`mcp_runtime.rs`). Skills live under `~/.grokptah/skills` and project skill dirs; plugins under `~/.grokptah/plugins` plus a local catalog. The authenticated control plane is a **separate** MCP surface (`CONTROL_TOOLS`). Computer Use MCP **mutations** remain unsupported ([#271](https://github.com/chriscase/GrokPtah/issues/271)); read-only Computer Run tools (`ptah_list_computer_runs`, `ptah_get_computer_run`, `ptah_get_computer_run_events`, `ptah_get_computer_capacity`) are on main. Isolated visual Computer Use ([#288](https://github.com/chriscase/GrokPtah/issues/288)) is a mandatory unmet 100% exit, not an unsupported alternative.
 - Background tasks run real async work (directory walk) via `tokio::spawn`
 - Integrated terminal PTYs forward stdout to the UI (`pty://output`) with multi-tab backlog replay
 
@@ -106,10 +109,21 @@ the React layer receives only typed run events and recovery notices.
 For non-loopback use, TLS, a trusted encrypted tunnel, or a trusted TLS
 terminator is mandatory, and the service runs under a dedicated account with
 host-level filesystem/process confinement. The workspace allowlist selects
-exact authorized project identities; it is not an OS sandbox. The current
-single service bearer is operator-equivalent for the full MCP surface,
-including isolated-run approval and promotion; scoped principal tiers are a
-required boundary before durable worker leases ship.
+exact authorized project identities; it is not an OS sandbox. **Every
+configured remote bearer can approve and promote within service scope**
+(`ptah_approve_run`, `ptah_promote_run`). Bearer authentication is not an
+Observer role. Least-privilege `LocalOperator` / `RemoteCoordinator` /
+`Observer` tiers are Planned and must precede any production-shaped 72-hour
+soak. Hosts are not assumed to
+have identical capabilities; declared host-capability advertisement and
+hosted-service CI are not on `origin/main` (see the matrix). Shipped
+ManagerSupervisor is not hosted Grokbot certification. “Grokbot” in
+ADR-002 / [#301](https://github.com/chriscase/GrokPtah/issues/301) is hosted
+always-on language, not a shipped binary name. Independent long-running
+workers ([#305](https://github.com/chriscase/GrokPtah/issues/305)) and
+selected packaged-desktop UX ([#308](https://github.com/chriscase/GrokPtah/issues/308))
+are mandatory unmet 100% exits; they cannot be descoped or waived as
+Explicitly unsupported for the core product outcome.
 
 ```sh
 # CLI / TUI (root workspace)

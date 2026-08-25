@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "kernelVersion": "6.12.104",
+  "architecture": "arm64",
+  "sourceUrl": "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.104.tar.xz",
+  "sourceSha256": "949d166a1263bd0cf0c5aab44eeb57869615099e7c48bf88d0e4adb77379b999"
+}

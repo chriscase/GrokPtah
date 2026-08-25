@@ -9,13 +9,15 @@ tested in xAI's **Bazel** monorepo; this fork verifies the code it owns with
 ## Supported paths (what CI runs, and what you should run)
 
 All are runnable from a clean clone with caches disabled
-(`CARGO_INCREMENTAL=0`, `RUSTC_WRAPPER` unset). See `.github/workflows/desktop.yml`.
+(`CARGO_INCREMENTAL=0`, `RUSTC_WRAPPER` unset). See `.github/workflows/desktop.yml`. Hosted-service CI is `.github/workflows/hosted-service.yml`
+and runs when the service crate, the shared bridge contract, lockfiles, or that workflow change.
 
 | Area | Command | Working dir |
 |------|---------|-------------|
 | Frontend | `npm ci && npm run typecheck && npm test` | `desktop` |
 | Desktop shell | `cargo test --locked` | `desktop/src-tauri` |
 | Agent bridge | `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked -- --test-threads=1` | `crates/codegen/grokptah-agent-bridge` |
+| Hosted service | `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked -- --test-threads=1` | `crates/codegen/grokptah-service` |
 | Offline oracles | `cargo test --locked eval_oracle -- --nocapture` | `crates/codegen/grokptah-agent-bridge` |
 | Focused upstream support | `cargo fmt -p xai-grok-env -p xai-grok-shell-base -- --check && cargo clippy -p xai-grok-env -p xai-grok-shell-base --all-targets --all-features --locked -- -D warnings && cargo test -p xai-grok-shell-base --all-features --locked` | repository root |
 
@@ -34,6 +36,12 @@ For the report-producing operator command and scenario matrix, see
 The manually dispatched `Desktop Release Build` workflow builds the reviewed
 commit on a GitHub-hosted macOS runner and uploads an unsigned app/DMG bundle
 for seven days. It does not sign, notarize, publish, or use release secrets.
+Regular Desktop CI and this workflow syntax-check and link the isolated-visual
+helper candidate and validate the guest source, but deliberately do not embed
+that unsigned helper or a guest image in the uploaded app. The separate
+`Isolated Visual Guest Candidate` workflow builds the pinned Linux guest twice
+and compares the image/manifest outputs. These source/build checks are not
+packaged identity, boot, or VM lifecycle evidence.
 
 The workflow keeps `CARGO_HOME` and `CARGO_TARGET_DIR` under the runner's
 private temporary directory. Its cache key includes the OS, architecture,

@@ -582,7 +582,16 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
                 ));
             }
         }
-        report.probes.push(result.expect("probe result assigned"));
+        let mut result = result.expect("probe result assigned");
+        // Bind the always-on evidence to the repository and commit this
+        // campaign is reporting on, so a summary lifted from another run
+        // cannot be presented as this one's.
+        if let Some(summary) = result.always_on_summary.as_mut() {
+            summary.manifest.clone_from(&report.manifest_sha256);
+            summary.commit.clone_from(&report.repository_commit);
+            summary.dirty = report.repository_dirty;
+        }
+        report.probes.push(result);
         report.finished_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
         report.recompute_summary()?;
         report.truncation.bytes_written = artifacts.used_bytes()?;
@@ -1433,6 +1442,60 @@ mod tests {
             .iter()
             .any(|value| { value.kind == crate::report::DurableIdKind::Run }));
         assert!(execution.provider_run.is_some());
+        client.close_session().await.unwrap();
+        drop(recorder);
+        transport.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manager_plan_probe_drives_the_offline_public_plan_lifecycle() {
+        if !crate::local_service::loopback_test_available() {
+            return;
+        }
+        let repository =
+            dunce::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
+        let manifest = CampaignManifest::bundled().unwrap();
+        let options = default_options(&repository);
+        let (transport, recorder) = start_transport(&options, &manifest, None).await.unwrap();
+        let workspace = transport.workspace().unwrap().to_owned();
+        let mut client = transport.client();
+        client.initialize().await.unwrap();
+        let definition = manifest.probe("manager-plan-lifecycle-v1").unwrap();
+        let execution =
+            execute_minimal_probe(definition, &mut client, &workspace, None, recorder.as_ref())
+                .await;
+        assert_eq!(
+            execution.result.status,
+            ProbeStatus::Passed,
+            "diagnostics: {:?}",
+            execution.result.diagnostics
+        );
+        assert!(
+            execution
+                .result
+                .opaque_ids
+                .iter()
+                .any(|value| { value.kind == crate::report::DurableIdKind::ManagerPlan }),
+            "probe must retain the durable plan identity"
+        );
+        // The plan must be observed reaching terminal success after an
+        // explicit replan, not merely reaching needs_replan.
+        assert!(
+            execution.result.transitions.iter().any(|transition| {
+                transition.entity == crate::report::EntityKind::ManagerPlan
+                    && transition.from == crate::report::DurableStateCode::NeedsReplan
+                    && transition.to == crate::report::DurableStateCode::Succeeded
+            }),
+            "transitions: {:?}",
+            execution.result.transitions
+        );
+        assert!(
+            execution.result.transitions.iter().any(|transition| {
+                transition.entity == crate::report::EntityKind::ManagerStep
+                    && transition.to == crate::report::DurableStateCode::Superseded
+            }),
+            "the failed step must be superseded by the replan"
+        );
         client.close_session().await.unwrap();
         drop(recorder);
         transport.stop().await;

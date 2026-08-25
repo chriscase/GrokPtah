@@ -53,7 +53,12 @@ async fn independent_worker_recovers_assignment_and_messages() {
     );
     orch.set_auth_credentials(vec![
         AuthCredential::new("primary", "coord-token-307").unwrap(),
-        AuthCredential::new("worker", "worker-token-307").unwrap(),
+        AuthCredential::new("worker", "worker-token-307")
+            .unwrap()
+            .with_agent_binding(worker.agent_id.clone())
+            .unwrap()
+            .with_workspace_roots([workspace.path().to_path_buf()])
+            .unwrap(),
     ])
     .unwrap();
     let server = start_control_server(orch.clone(), 0).await.unwrap();
@@ -91,6 +96,24 @@ async fn independent_worker_recovers_assignment_and_messages() {
         )
         .await
         .unwrap();
+    let impersonation = worker_client
+        .call_tool(
+            "ptah_heartbeat_worker",
+            json!({
+                "request_id": "hb-worker-impersonation",
+                "session_id": lane.id,
+                "workspace": workspace_text,
+                "agent_id": manager.agent_id,
+                "host_kind": "service"
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        impersonation.contains("forbidden_scope") || impersonation.contains("403"),
+        "bound worker bearer must not heartbeat another identity: {impersonation}"
+    );
     let workers = coordinator
         .call_tool(
             "ptah_list_workers",

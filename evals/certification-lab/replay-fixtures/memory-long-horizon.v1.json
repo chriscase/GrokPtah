@@ -1,0 +1,50 @@
+{
+  "schema": "grokptah.memory_long_horizon_fixture.v2",
+  "fixture_id": "memory-long-horizon-v1",
+  "kind": "deterministic_logical_years",
+  "epoch": "2000-01-01T00:00:00.000Z",
+  "logical_years": 10,
+  "logical_year_days": 365,
+  "seed": 1296386353,
+  "scopes": {
+    "private_agent_id": "horizon-agent",
+    "team_id": "horizon-team"
+  },
+  "declared_bounds": {
+    "max_facts": 80,
+    "max_fact_chars": 800,
+    "max_tags": 16,
+    "max_tag_chars": 64,
+    "max_id_chars": 128,
+    "max_key_chars": 128,
+    "max_source_actor_chars": 128,
+    "max_query_chars": 256,
+    "max_hot_store_bytes": 131072,
+    "max_receipts": 512,
+    "max_persisted_bytes": 196608,
+    "max_scope_footprint_bytes": 393216,
+    "max_scope_files": 24,
+    "max_critical_facts": 16,
+    "max_critical_bytes": 16384,
+    "schema": "grokptah.memory.v2"
+  },
+  "workload": {
+    "critical_invariants_per_scope": 3,
+    "min_critical_sample": 9,
+    "preference_revisions": 2,
+    "expiring_status_ttl_days": 30,
+    "conflict_pairs": 1,
+    "writes_per_year": 3,
+    "lexical_topk": 5
+  },
+  "oracle": {
+    "critical_recall_pct": 100,
+    "stale_as_current_pct": 0,
+    "conflict_recall_pct": 100,
+    "conflict_false_positive_pct": 0,
+    "duplicate_rate_pct": 0,
+    "hot_store_within_byte_bound": true,
+    "repeated_read_reopen_deterministic": true
+  },
+  "product_claim": "safe_v2_hot_store_core"
+}

@@ -492,6 +492,55 @@ export interface DurableRunEventPage {
   cursorExpired: boolean;
 }
 
+export interface ProviderExecutionProjection {
+  route: {
+    providerId: string;
+    kind: "xai" | "open_ai_compatible";
+    dialect: "xai_chat_completions" | "open_ai_chat_completions";
+    modelId: string;
+    wireModelId: string;
+    capabilitySource: "declared" | "measured" | "unknown";
+    qualificationSchema?: string | null;
+    deadlineClass: "interactive" | "standard" | "extended";
+    effort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+    snapshotHash: string;
+  };
+  quota?: {
+    reservationId: string;
+    poolId: string;
+    class: "coding_execution" | "manager_proposal" | "qualification" | "computer_session";
+    state: "reserved" | "consumed" | "refunded" | "expired";
+    tokensReserved: number;
+    tokensConsumed: number;
+    requestsReserved: number;
+    requestsConsumed: number;
+    windowStartedAt: string;
+    limits: {
+      windowMs: number;
+      maxInFlightReservations: number;
+      maxTokensPerWindow: number;
+      maxRequestsPerWindow: number;
+    };
+    updatedAt: string;
+  } | null;
+  attempts: Array<{
+    attemptId: string;
+    ordinal: number;
+    state: "admitted" | "finished";
+    sendCertainty?: "known_not_sent" | "known_accepted" | "uncertain_accept" | null;
+    retryClass?: "same_run_safe" | "explicit_new_run_only" | null;
+    httpStatus?: number | null;
+    usage?: CompletionEvidence["usage"] | null;
+    createdAt: string;
+    updatedAt: string;
+    finishedAt?: string | null;
+  }>;
+  attemptCount: number;
+  attemptsTruncated: boolean;
+  usageComplete: boolean;
+  pendingRequests: number;
+}
+
 export interface DurableRun {
   runId: string;
   sessionId: string;
@@ -556,6 +605,18 @@ export interface DurableRun {
   } | null;
   execution?: RunExecution | null;
   approval?: RunApproval | null;
+  /** Secret-free operator projection derived from the route/quota/attempt ledgers.
+   * The frozen providerRoute snapshot is not part of this public contract.
+   * Omitting it in TypeScript does not remove it from a raw RunRecord payload.
+   */
+  providerExecution?: ProviderExecutionProjection | null;
+}
+
+export interface DurableRunPage {
+  runs: DurableRun[];
+  totalCount: number;
+  truncated: boolean;
+  nextCursor?: string | null;
 }
 
 export type SessionUpdate =
@@ -853,6 +914,54 @@ export interface ProviderQualificationReport {
   computerUseTier: ComputerUseTier;
 }
 
+export type QualificationEvidence = "measured" | "declared" | "stale" | "unknown";
+
+export type AdmissionEligibility =
+  | "measured_eligible"
+  | "declared_unmeasured"
+  | "requalify_required"
+  | "discussion_only"
+  | "credential_missing"
+  | "unknown"
+  | "configuration_incomplete";
+
+export type AdmissionReasonCode =
+  | "measured_eligible"
+  | "declared_first_use"
+  | "requalify_required"
+  | "tools_not_permitted"
+  | "chat_eligible"
+  | "unknown_capabilities"
+  | "chat_not_permitted"
+  | "credential_missing"
+  | "configuration_incomplete";
+
+export interface PurposeAdmission {
+  eligibility: AdmissionEligibility;
+  permitted: boolean;
+  reasonCode: AdmissionReasonCode;
+}
+
+export interface ComputerUseAdmission {
+  tier: ComputerUseTier;
+  source: "declared" | "measured" | "unknown";
+  enabled: boolean;
+}
+
+export interface NativeCodingReadinessProjection {
+  schema: "grokptah.native-coding-readiness.v1" | string;
+  ownerId: string;
+  providerId: string;
+  modelId: string;
+  qualificationEvidence: QualificationEvidence;
+  execution: PurposeAdmission;
+  managerProposal: PurposeAdmission;
+  computerUse: ComputerUseAdmission;
+  credentialPresent: boolean;
+  configurationComplete: boolean;
+  managedByEnv: boolean;
+}
+
 export type ComputerUseTier =
   | "none"
   | "observe"
@@ -883,6 +992,28 @@ export interface ComputerPlatformStatus {
   detail?: string | null;
 }
 
+export interface ComputerIsolatedVisualStatus {
+  platformId: string;
+  available: boolean;
+  hostCapable: boolean;
+  minimumOsVersion: string;
+  operatingSystemSupported: boolean;
+  virtualizationFrameworkAvailable: boolean;
+  helperVirtualizationEntitlementVerified: boolean;
+  backendPackaged: boolean;
+  guestImageMeasured: boolean;
+  launchAttempted: boolean;
+  blocker?:
+    | "unsupported_platform"
+    | "minimum_os"
+    | "framework_unavailable"
+    | "backend_not_packaged"
+    | "helper_entitlement_unverified"
+    | "guest_image_not_measured"
+    | null;
+  detail: string;
+}
+
 export interface ComputerTargetCandidate {
   selectionToken: string;
   target: {
@@ -902,6 +1033,13 @@ export interface ComputerTargetCandidate {
   onScreen: boolean;
   active: boolean;
   minimized: boolean;
+}
+
+export interface ComputerBackgroundSafetyReceipt {
+  measurementToken: string;
+  target: ComputerTargetCandidate["target"];
+  supportedActionClasses: Array<"semantic" | "text_entry" | "key_chord" | "pointer_fallback">;
+  validForMillis: number;
 }
 
 export interface ComputerObservationPreview {
@@ -939,7 +1077,109 @@ export type ComputerAction =
       element_id: string;
       delta_x: number;
       delta_y: number;
-    };
+    }
+  | {
+      type: "key_chord";
+      keys: Array<
+        | "enter"
+        | "escape"
+        | "tab"
+        | "arrow_up"
+        | "arrow_down"
+        | "arrow_left"
+        | "arrow_right"
+        | "space"
+        | "backspace"
+        | "delete"
+        | "home"
+        | "end"
+        | "page_up"
+        | "page_down"
+        | "shift"
+        | "control"
+        | "alt"
+        | "meta"
+      >;
+    }
+  | {
+      type: "pointer_click";
+      x: number;
+      y: number;
+      button: "primary" | "secondary";
+    }
+  | { type: "pointer_move"; x: number; y: number }
+  | {
+      type: "pointer_button";
+      x: number;
+      y: number;
+      button: "primary" | "secondary";
+      state: "down" | "up";
+    }
+  | { type: "text_input"; text: string }
+  | { type: "wait"; millis: number };
+
+export type ComputerSurfaceEvent =
+  | "unknown"
+  | "run_created"
+  | "authorization_granted"
+  | "observation_started"
+  | "observation_ready"
+  | "action_proposed"
+  | "approval_required"
+  | "approval_rejected"
+  | "attention_moved"
+  | "dispatch_started"
+  | "postcondition_recorded"
+  | "paused"
+  | "stopped"
+  | "takeover"
+  | "steering"
+  | "target_drift"
+  | "permission_revoked"
+  | "disconnected"
+  | "restart_interrupted"
+  | "terminal"
+  | "denied";
+
+export interface ComputerAttentionPoint {
+  xBasisPoints: number;
+  yBasisPoints: number;
+  target: "surface" | "semantic_element";
+}
+
+export interface ComputerSurfaceEventEntry {
+  sequence: number;
+  at: string;
+  surfaceEvent: ComputerSurfaceEvent;
+  attention?: ComputerAttentionPoint | null;
+  operation: string;
+  disposition: string;
+  actionClass?: string | null;
+  observationId?: string | null;
+  errorCode?: string | null;
+}
+
+export interface ComputerRunEventPage {
+  runId: string;
+  entries: ComputerSurfaceEventEntry[];
+  nextCursor?: number | null;
+  cursorExpired: boolean;
+  range?: { startSeq: number; endSeq: number } | null;
+}
+
+/**
+ * App-shell recovery evidence for one exact session/Run binding. A history gap
+ * is sticky for the lifetime of that Run, including across app reloads: later
+ * retained events can restore live awareness, but cannot prove that missing
+ * events never happened.
+ */
+export interface ComputerRunReplayStatus {
+  runId: string;
+  cursor: number | null;
+  gapDetected: boolean;
+  replayedEntries: number;
+  lastEvent?: ComputerSurfaceEvent | null;
+}
 
 export interface ComputerSemanticElement {
   elementId: string;
@@ -996,15 +1236,7 @@ export interface ComputerRun {
     expectedPostconditionMet?: boolean | null;
   } | null;
   lastError?: { code: string; message: string } | null;
-  audit: Array<{
-    sequence: number;
-    at: string;
-    operation: string;
-    disposition: string;
-    actionClass?: string | null;
-    observationId?: string | null;
-    errorCode?: string | null;
-  }>;
+  audit: ComputerSurfaceEventEntry[];
 }
 
 export interface PendingComputerApproval {
@@ -1017,6 +1249,7 @@ export interface PendingComputerApproval {
   action: ComputerAction;
   actionSummary: string;
   risk: string;
+  proposalOrigin: "operator" | "agent";
   createdAt: string;
 }
 
@@ -1035,7 +1268,7 @@ export type ComputerControlDisposition =
  * outside observer about run state, control disposition, or epoch.
  *
  * Observed element labels, values, and evidence tokens are deliberately
- * absent — those stay on `ComputerRun`, which is local-only. Action summary
+ * absent — those stay on the local approval DTO. Action summary
  * text and error messages are likewise local-only; the projection carries
  * only structured last-outcome / last-error summaries.
  */
@@ -1099,21 +1332,85 @@ export interface ComputerRunProjection {
   eventRange?: { startSeq: number; endSeq: number } | null;
 }
 
+export interface ComputerBackendPublicView {
+  backendId: string;
+  observe: boolean;
+  semanticActions: boolean;
+  textEntry: boolean;
+  keyChords: boolean;
+  pointerFallback: boolean;
+  /** Host-global foreground conflict-domain capacity. Stage 1 is always 1. */
+  foregroundConflictCapacity: number;
+}
+
+export interface ComputerLocalElement {
+  elementId: string;
+  role: string;
+  label?: string | null;
+  value?: string | null;
+  enabled: boolean;
+  actions: string[];
+}
+
+export interface ComputerLocalObservation {
+  observationId: string;
+  sequence: number;
+  capturedAt: string;
+  elements: ComputerLocalElement[];
+}
+
+export interface ComputerLocalApproval {
+  runId: string;
+  state: string;
+  version: number;
+  actionCount: number;
+  limits: { maxActions: number };
+  controlDisposition: ComputerControlDisposition | string;
+  target: { appId: string; displayName: string };
+  observation?: ComputerLocalObservation | null;
+  grant?: {
+    expiresAt: string;
+    revokedAt?: string | null;
+    actionClasses: string[];
+  } | null;
+  audit: ComputerSurfaceEventEntry[];
+  lastError?: { code: string } | null;
+}
+
 export interface ComputerCockpitSnapshot {
-  backend: {
-    backendId: string;
-    observe: boolean;
-    semanticActions: boolean;
-    textEntry: boolean;
-    keyChords: boolean;
-    pointerFallback: boolean;
-  };
+  backend: ComputerBackendPublicView;
   origin: "desktop" | "mcp" | string;
-  /** Authoritative projection; prefer this over `run` for status rendering. */
+  /** Authoritative projection; prefer this over `local` for status rendering. */
   projection?: ComputerRunProjection | null;
-  /** Local-only detail retained for approval rendering. */
-  run?: ComputerRun | null;
+  /** Allowlisted local approval/observation DTO. */
+  local?: ComputerLocalApproval | null;
   pendingApproval?: PendingComputerApproval | null;
+  /** Local-only, secret-free explanation of shared physical-surface ownership. */
+  coordination?: ComputerSurfaceCoordination | null;
+  reconciliation?: ComputerUncertainSurfaceLease | null;
+}
+
+export interface ComputerSurfaceCoordination {
+  state: "queued" | "granted" | "dispatching" | "uncertain";
+  queuePosition?: number | null;
+  queueDepth: number;
+  ownsSurface: boolean;
+  blockedByUncertainOutcome: boolean;
+  active?: {
+    agentId: string;
+    workId: string;
+    runId: string;
+  } | null;
+  expiresAt: string;
+  updatedAt: string;
+}
+
+/** Exact opaque handles shown only to the owning local operator. */
+export interface ComputerUncertainSurfaceLease {
+  leaseId: string;
+  expectedRevision: number;
+  surfaceId: string;
+  incarnation: string;
 }
 
 export interface ComputerAgentEligibility {

@@ -16,6 +16,13 @@ use grokptah_agent_bridge::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::always_on::{
+    assert_provider_lanes, AlwaysOnFixture, AlwaysOnHappyShape, LoopbackProviderLane,
+};
+use crate::lane_evidence::{
+    assert_certification_summary, assert_shape_matches_joins, assert_summary_binding,
+    AlwaysOnCertificationSummary, LaneEvidenceFixture,
+};
 use crate::manifest::{
     CampaignManifest, DurableEntity, DurableState, OracleCode, ProbeAction, ProbeDefinition,
     ProbeScope, MAX_MANIFEST_BYTES,
@@ -159,6 +166,8 @@ pub enum EntityKind {
     Cursor,
     Permission,
     ExecutionIntent,
+    ManagerPlan,
+    ManagerStep,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -199,6 +208,8 @@ pub enum DurableStateCode {
     Deduplicated,
     Expired,
     Acknowledged,
+    NeedsReplan,
+    Superseded,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -213,6 +224,7 @@ pub enum DurableIdKind {
     Routine,
     Activation,
     Message,
+    ManagerPlan,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -311,6 +323,81 @@ pub struct ProbeResult {
     pub trace: Option<ArtifactReference>,
     pub capture_refs: Vec<CaptureReference>,
     pub elapsed_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_observation: Option<LoopbackProviderObservation>,
+    /// Per-home loopback provider observations, kept separable so the evidence
+    /// backing each home's oracles stays reconstructable from the report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_lanes: Vec<LoopbackProviderLane>,
+    /// The exact fixture-derived identity shape the always-on probe proved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_on_shape: Option<AlwaysOnHappyShape>,
+    /// Per-home send ledgers, causal chains and decision evidence, bound to
+    /// the fixture digests and to this report's contract and commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_on_summary: Option<AlwaysOnCertificationSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LoopbackProviderObservation {
+    pub accepted_posts: u64,
+    pub rejected_auth: u64,
+    pub records: Vec<LoopbackProviderRecord>,
+}
+
+/// What the sender can know about one send attempt against the loopback
+/// provider.
+///
+/// The public MCP contract does not project provider attempts (the fixture
+/// records `providerAttemptProjection: absent-on-base-main`), so this is the
+/// lab's own durable observation of the transport, not a product claim.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum SendState {
+    /// No bytes for this send attempt ever reached the provider. The sender
+    /// still holds its one-shot budget: it may send once.
+    KnownNotSent,
+    /// Bytes reached the provider and no terminal disposition was reached.
+    Sending,
+    /// The provider accepted the request but no complete response was
+    /// delivered. The sender cannot distinguish committed from not committed,
+    /// so it must never re-send.
+    Uncertain,
+    /// The provider accepted the request and a complete response was
+    /// delivered.
+    Sent,
+}
+
+impl SendState {
+    /// True only when the sender knows nothing left the process, which is the
+    /// one state in which sending once more is still permitted.
+    pub fn may_send_once(self) -> bool {
+        matches!(self, Self::KnownNotSent)
+    }
+
+    /// True when bytes were observed or may have been committed, so no restart
+    /// may resume the attempt.
+    pub fn forbids_resume(self) -> bool {
+        matches!(self, Self::Sending | Self::Uncertain | Self::Sent)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LoopbackProviderRecord {
+    pub ordinal: u64,
+    pub method: String,
+    pub path: String,
+    pub semantic_id: String,
+    pub body_digest: String,
+    pub auth_accepted: bool,
+    pub route_ok: bool,
+    pub send_state: SendState,
+    /// Opaque manager Agent identity observed in the request at send time.
+    pub carrier_manager: Option<String>,
+    /// Opaque isolated-home identity observed in the request at send time.
+    pub carrier_home: Option<String>,
 }
 
 impl ProbeResult {
@@ -342,6 +429,10 @@ impl ProbeResult {
             trace: None,
             capture_refs: Vec::new(),
             elapsed_millis: 0,
+            provider_observation: None,
+            provider_lanes: Vec::new(),
+            always_on_shape: None,
+            always_on_summary: None,
         }
     }
 
@@ -591,6 +682,22 @@ impl CampaignReport {
         let mut capture_count = 0_u32;
         for (definition, probe) in selected.into_iter().zip(&self.probes) {
             validate_probe_against_definition(probe, definition)?;
+            // Per-home evidence is only this campaign's evidence if it is
+            // stamped with this campaign's contract and commit. A summary
+            // lifted from another run carries another commit and is refused.
+            if let Some(summary) = &probe.always_on_summary {
+                assert_summary_binding(
+                    summary,
+                    &self.manifest_sha256,
+                    &self.repository_commit,
+                    self.repository_dirty,
+                )
+                .map_err(|code| {
+                    anyhow::anyhow!(
+                        "always-on summary is not bound to this campaign's contract and commit: {code:?}"
+                    )
+                })?;
+            }
             if let Some(trace_ref) = &probe.trace {
                 if !artifact_paths.insert(trace_ref.relative_path.as_str()) {
                     bail!("report references an artifact path more than once");
@@ -878,6 +985,11 @@ pub enum TraceOperationCode {
     AuthorizeWorkExecution,
     ResolveWorkInput,
     ListExecutionIntents,
+    CreateManagerPlan,
+    GetManagerPlan,
+    AdvanceManagerPlan,
+    TickManagerPlan,
+    ReplanManagerPlan,
     Oracle,
 }
 
@@ -909,6 +1021,9 @@ pub enum ArgumentFieldCode {
     ExpectedRevision,
     AfterSequence,
     Limit,
+    PlanId,
+    Steps,
+    Reason,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -922,6 +1037,10 @@ pub struct TraceRecord {
     pub diagnostic: Option<DiagnosticCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opaque_entity_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1194,6 +1313,53 @@ fn validate_probe_against_definition(
     {
         bail!("passing restart probe lacks recovered state or observed implicit execution");
     }
+    if definition.id == "always-on-grokbot-lifecycle-v1" && probe.status == ProbeStatus::Passed {
+        match &probe.provider_observation {
+            Some(observation)
+                if !observation.records.is_empty() && observation.accepted_posts > 0 => {}
+            _ => bail!("always-on passing probe omitted observed loopback provider records"),
+        }
+        // Home A proves plan success, the three native causal joins and both
+        // idempotency oracles; Home B proves the restart fences. A pass that
+        // carries only one home's provider records is claiming oracles whose
+        // evidence the report cannot reconstruct, so require both lanes and
+        // hold each to the fixture's exact semantic counts.
+        let fixture = AlwaysOnFixture::load()
+            .map_err(|code| anyhow::anyhow!("always-on fixture is invalid: {code:?}"))?;
+        assert_provider_lanes(&fixture, &probe.provider_lanes).map_err(|code| {
+            anyhow::anyhow!("always-on provider lanes do not match the fixture: {code:?}")
+        })?;
+        if crate::always_on::merge_provider_lanes(&probe.provider_lanes).as_ref()
+            != probe.provider_observation.as_ref()
+        {
+            bail!("always-on merged provider observation disagrees with its per-home lanes");
+        }
+        match &probe.always_on_shape {
+            Some(shape) if shape.manager_decision_binding.is_bound() => {}
+            Some(_) => bail!("always-on passing probe left the manager-decision binding unproven"),
+            None => bail!("always-on passing probe omitted its exact identity shape"),
+        }
+        // Both homes must publish their send ledger, their causal chains and a
+        // decision chain bound to the same run, attempt and request.
+        let lanes = LaneEvidenceFixture::load()
+            .map_err(|code| anyhow::anyhow!("always-on lane fixture is invalid: {code:?}"))?;
+        let Some(summary) = &probe.always_on_summary else {
+            bail!("always-on passing probe omitted its per-home certification summary");
+        };
+        assert_certification_summary(&lanes, summary).map_err(|code| {
+            anyhow::anyhow!("always-on certification summary does not match the fixture: {code:?}")
+        })?;
+        // The identity shape and the provider joins are produced from
+        // different sources; requiring them to name the same identities means
+        // neither can be edited on its own.
+        let shape = probe
+            .always_on_shape
+            .as_ref()
+            .expect("always-on shape checked above");
+        assert_shape_matches_joins(shape, summary).map_err(|code| {
+            anyhow::anyhow!("always-on identity shape does not match its provider joins: {code:?}")
+        })?;
+    }
     if definition.scope == ProbeScope::ProviderStructural
         && probe.status == ProbeStatus::Passed
         && probe.capture_refs.is_empty()
@@ -1226,6 +1392,8 @@ fn map_entity(value: DurableEntity) -> EntityKind {
         DurableEntity::Cursor => EntityKind::Cursor,
         DurableEntity::Permission => EntityKind::Permission,
         DurableEntity::ExecutionIntent => EntityKind::ExecutionIntent,
+        DurableEntity::ManagerPlan => EntityKind::ManagerPlan,
+        DurableEntity::ManagerStep => EntityKind::ManagerStep,
     }
 }
 
@@ -1263,6 +1431,8 @@ fn map_state(value: DurableState) -> DurableStateCode {
         DurableState::Failed => DurableStateCode::Failed,
         DurableState::Cancelled => DurableStateCode::Cancelled,
         DurableState::Interrupted => DurableStateCode::Interrupted,
+        DurableState::NeedsReplan => DurableStateCode::NeedsReplan,
+        DurableState::Superseded => DurableStateCode::Superseded,
     }
 }
 
@@ -1838,6 +2008,8 @@ mod tests {
                 argument_fields: vec![],
                 diagnostic: Some(DiagnosticCode::Ok),
                 sequence: None,
+                result_digest: None,
+                opaque_entity_id: None,
             }],
             truncated: false,
             dropped_records: 0,
@@ -1899,10 +2071,163 @@ mod tests {
             }),
             capture_refs: Vec::new(),
             elapsed_millis: 1,
+            provider_observation: None,
+            provider_lanes: Vec::new(),
+            always_on_shape: None,
+            always_on_summary: None,
         }];
         value.recompute_summary().unwrap();
         value.certified = true;
         assert!(value.validate_at(root.path()).is_err());
+    }
+
+    fn always_on_record(semantic: &str, digest: &str) -> crate::report::LoopbackProviderRecord {
+        crate::report::LoopbackProviderRecord {
+            ordinal: 1,
+            send_state: crate::report::SendState::Sent,
+            carrier_manager: Some(opaque_durable_id("carrier-manager")),
+            carrier_home: Some(opaque_durable_id("carrier-home")),
+            method: "POST".into(),
+            path: "/v1/chat/completions".into(),
+            semantic_id: semantic.into(),
+            body_digest: digest.into(),
+            auth_accepted: true,
+            route_ok: true,
+        }
+    }
+
+    fn always_on_lanes() -> Vec<LoopbackProviderLane> {
+        vec![
+            LoopbackProviderLane {
+                home: crate::always_on::AlwaysOnHome::HomeA,
+                accepted_posts: 5,
+                rejected_auth: 0,
+                records: vec![
+                    always_on_record("setup", "d-setup-a"),
+                    always_on_record("step-a", "d-step-a"),
+                    always_on_record("step-b", "d-step-b"),
+                    always_on_record("manager-decision", "d-decision"),
+                    always_on_record("step-b-fix", "d-step-b-fix"),
+                ],
+            },
+            LoopbackProviderLane {
+                home: crate::always_on::AlwaysOnHome::HomeB,
+                accepted_posts: 3,
+                rejected_auth: 0,
+                records: vec![
+                    always_on_record("setup", "d-setup-b"),
+                    always_on_record("step-a", "d-step-a-held"),
+                    always_on_record("manager-decision", "d-decision-b"),
+                ],
+            },
+        ]
+    }
+
+    fn passing_always_on_probe(definition: &ProbeDefinition) -> ProbeResult {
+        let mut probe = ProbeResult::skipped(
+            definition.id.clone(),
+            definition.catalog_scenario_ids.clone(),
+            DiagnosticCode::Ok,
+        );
+        probe.status = ProbeStatus::Passed;
+        probe.supported = true;
+        probe.failure_class = FailureClass::None;
+        probe.diagnostics = vec![DiagnosticCode::Ok];
+        probe.verified_actions = definition.actions.clone();
+        probe.verified_oracles = definition.oracle_codes.clone();
+        probe.phases = vec![PhaseResult {
+            phase: PhaseCode::Oracle,
+            status: ProbeStatus::Passed,
+            elapsed_millis: 1,
+            diagnostics: vec![DiagnosticCode::Ok],
+        }];
+        probe.transitions = definition
+            .expected_transitions
+            .iter()
+            .map(|expected| TransitionEvidence {
+                entity: map_entity(expected.entity),
+                from: map_state(expected.from),
+                to: map_state(expected.to),
+                opaque_id: None,
+            })
+            .collect();
+        probe.restart.attempted = true;
+        probe.restart.host_owned = true;
+        probe.restart.durable_read_recovered = true;
+        probe.trace = Some(ArtifactReference {
+            relative_path: "traces/always-on.json".into(),
+            sha256: format!("{:x}", Sha256::digest(b"always-on")),
+            bytes: 9,
+        });
+        probe.elapsed_millis = 1;
+        probe.provider_lanes = always_on_lanes();
+        probe.provider_observation = crate::always_on::merge_provider_lanes(&probe.provider_lanes);
+        let summary = crate::lane_evidence::sample_summary(
+            &LaneEvidenceFixture::load().expect("lane fixture"),
+        );
+        probe.always_on_shape = Some(crate::lane_evidence::sample_shape(&summary));
+        probe.always_on_summary = Some(summary);
+        probe
+    }
+
+    #[test]
+    fn always_on_pass_requires_both_home_provider_lanes_and_a_bound_decision() {
+        let manifest = CampaignManifest::bundled().unwrap();
+        let definition = manifest.probe("always-on-grokbot-lifecycle-v1").unwrap();
+        let complete = passing_always_on_probe(definition);
+        validate_probe_against_definition(&complete, definition)
+            .expect("the complete always-on evidence set must validate");
+
+        // Home A dropped: every Home-A oracle would rest on records the
+        // published report no longer contains.
+        let mut home_b_only = passing_always_on_probe(definition);
+        home_b_only.provider_lanes.remove(0);
+        home_b_only.provider_observation =
+            crate::always_on::merge_provider_lanes(&home_b_only.provider_lanes);
+        assert!(validate_probe_against_definition(&home_b_only, definition).is_err());
+
+        // Home B dropped.
+        let mut home_a_only = passing_always_on_probe(definition);
+        home_a_only.provider_lanes.pop();
+        home_a_only.provider_observation =
+            crate::always_on::merge_provider_lanes(&home_a_only.provider_lanes);
+        assert!(validate_probe_against_definition(&home_a_only, definition).is_err());
+
+        // Lanes present but the merged field was tampered with.
+        let mut tampered = passing_always_on_probe(definition);
+        tampered
+            .provider_observation
+            .as_mut()
+            .unwrap()
+            .records
+            .pop();
+        assert!(validate_probe_against_definition(&tampered, definition).is_err());
+
+        // A duplicated Home-A record breaks the fixture's exact semantics.
+        let mut duplicated = passing_always_on_probe(definition);
+        duplicated.provider_lanes[0]
+            .records
+            .push(always_on_record("step-a", "d-step-a-again"));
+        duplicated.provider_lanes[0].accepted_posts += 1;
+        duplicated.provider_observation =
+            crate::always_on::merge_provider_lanes(&duplicated.provider_lanes);
+        assert!(validate_probe_against_definition(&duplicated, definition).is_err());
+
+        // The identity shape is mandatory, and an unproven manager-decision
+        // binding must never pass.
+        let mut shapeless = passing_always_on_probe(definition);
+        shapeless.always_on_shape = None;
+        assert!(validate_probe_against_definition(&shapeless, definition).is_err());
+        let mut unbound = passing_always_on_probe(definition);
+        unbound
+            .always_on_shape
+            .as_mut()
+            .unwrap()
+            .manager_decision_binding =
+            crate::always_on::ManagerDecisionBinding::PurposeNotProjected {
+                work: opaque_durable_id("work-d"),
+            };
+        assert!(validate_probe_against_definition(&unbound, definition).is_err());
     }
 
     #[test]
@@ -1965,6 +2290,8 @@ mod tests {
                 argument_fields: vec![],
                 diagnostic: Some(DiagnosticCode::Ok),
                 sequence: None,
+                result_digest: None,
+                opaque_entity_id: None,
             }],
             truncated: false,
             dropped_records: 0,

@@ -302,6 +302,10 @@ impl OpaqueIdentity {
         }
         Ok(Self(value.to_owned()))
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Debug for OpaqueIdentity {
@@ -320,6 +324,10 @@ impl EndpointFingerprint {
             return Err(ObservationError::InvalidFingerprint);
         }
         Ok(Self(value.to_ascii_lowercase()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 

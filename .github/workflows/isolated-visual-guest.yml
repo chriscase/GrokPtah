@@ -1,0 +1,70 @@
+name: Isolated Visual Guest Candidate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "desktop/src-tauri/macos/isolated-visual-guest/**"
+      - ".github/workflows/isolated-visual-guest.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: isolated-visual-guest-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  reproducible-linux-arm64-source:
+    name: Reproducible Linux arm64 guest source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned guest build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            clang lld llvm make cpio xz-utils jq python3 file
+
+      - name: Validate guest source and closed fragment
+        run: desktop/src-tauri/macos/isolated-visual-guest/verify-guest-source.sh
+
+      - name: Fetch pinned Linux source
+        run: |
+          mkdir -p "$RUNNER_TEMP/grokptah-guest-input"
+          desktop/src-tauri/macos/isolated-visual-guest/fetch-kernel-source.sh \
+            "$RUNNER_TEMP/grokptah-guest-input/linux.tar.xz"
+
+      - name: Build two isolated guest images
+        env:
+          JOBS: "2"
+        run: |
+          mkdir -p "$RUNNER_TEMP/grokptah-guest-output/a" "$RUNNER_TEMP/grokptah-guest-output/b"
+          guest=desktop/src-tauri/macos/isolated-visual-guest
+          source="$RUNNER_TEMP/grokptah-guest-input/linux.tar.xz"
+          "$guest/build-guest-image.sh" "$source" \
+            "$RUNNER_TEMP/grokptah-guest-output/a/Image" \
+            "$RUNNER_TEMP/grokptah-guest-output/a/manifest.json"
+          "$guest/build-guest-image.sh" "$source" \
+            "$RUNNER_TEMP/grokptah-guest-output/b/Image" \
+            "$RUNNER_TEMP/grokptah-guest-output/b/manifest.json"
+          cmp "$RUNNER_TEMP/grokptah-guest-output/a/Image" \
+            "$RUNNER_TEMP/grokptah-guest-output/b/Image"
+          cmp "$RUNNER_TEMP/grokptah-guest-output/a/manifest.json" \
+            "$RUNNER_TEMP/grokptah-guest-output/b/manifest.json"
+          sha256sum "$RUNNER_TEMP/grokptah-guest-output/a/Image" \
+            "$RUNNER_TEMP/grokptah-guest-output/a/manifest.json" \
+            > "$RUNNER_TEMP/grokptah-guest-output/SHA256SUMS"
+
+      - name: Upload un-packaged guest candidate evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: grokptah-isolated-visual-guest-candidate-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/grokptah-guest-output/a/Image
+            ${{ runner.temp }}/grokptah-guest-output/a/manifest.json
+            ${{ runner.temp }}/grokptah-guest-output/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7

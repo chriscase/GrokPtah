@@ -2153,6 +2153,107 @@
       "incomplete_evidence": "mark_indeterminate"
     },
     {
+      "id": "manager-plan-lifecycle-v1",
+      "description": "Drive one manager plan from creation through dependency-ordered advance, fenced observation, a failed step, and an explicit replan that reaches terminal success, and prove its root container is never executable.",
+      "catalog_scenario_ids": [
+        "endurance-finite-runs-001",
+        "resume-idempotency-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_create_manager_plan",
+        "ptah_get_manager_plan",
+        "ptah_advance_manager_plan",
+        "ptah_tick_manager_plan",
+        "ptah_replan_manager_plan",
+        "ptah_get_work",
+        "ptah_claim_work",
+        "ptah_complete_work",
+        "ptah_fail_work",
+        "ptah_cancel_work"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "preexisting_test_agents"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": true,
+        "attach_access": "explicit_mutation_opt_in"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 120,
+        "max_rounds": 24,
+        "max_run_tokens": 1000,
+        "max_total_tokens": 1000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 262144,
+        "max_artifact_bytes": 1048576
+      },
+      "actions": [
+        "create_test_agents",
+        "create_manager_plan",
+        "inspect_work",
+        "advance_manager_plan",
+        "claim_work",
+        "complete_work",
+        "tick_manager_plan",
+        "fail_work",
+        "cancel_work",
+        "replan_manager_plan",
+        "inspect_manager_plan"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "manager_plan",
+          "from": "absent",
+          "to": "created"
+        },
+        {
+          "entity": "manager_step",
+          "from": "created",
+          "to": "advanced"
+        },
+        {
+          "entity": "manager_plan",
+          "from": "active",
+          "to": "needs_replan"
+        },
+        {
+          "entity": "manager_step",
+          "from": "failed",
+          "to": "superseded"
+        },
+        {
+          "entity": "manager_plan",
+          "from": "needs_replan",
+          "to": "succeeded"
+        }
+      ],
+      "oracle_codes": [
+        "manager_container_not_executable",
+        "manager_advance_respects_dependencies",
+        "manager_notification_fenced_by_work_revision",
+        "manager_stale_plan_revision_rejected",
+        "manager_replan_supersedes_and_succeeds"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
       "id": "soak-bounded-cycles-restart-v1",
       "description": "Repeat bounded Work, Routine, and message cycles with scheduled owned restarts, reconnects, invariant snapshots, and leak checks.",
       "catalog_scenario_ids": [
@@ -2234,6 +2335,103 @@
         "growth_within_artifact_budget",
         "no_live_lease_leak",
         "no_live_cursor_leak",
+        "restart_reconnect_observed"
+      ],
+      "missing_requirement": "skip_as_unsupported",
+      "incomplete_evidence": "not_applicable"
+    },
+    {
+      "id": "always-on-grokbot-lifecycle-v1",
+      "description": "Bounded process smoke and one accepted-request restart fence against standalone grokptah-service: poll authenticated MCP until an autonomous Manager DAG succeeds with exact Work/intent/attempt/Run/provider identities, replay request ids, then prove a held provider POST plus two same-home SIGKILL recoveries do not resend. This does not certify durable always-on, UncertainAccept, quota, or soak. Proposal-only enforcement is unverified pending PR 352 plus provider-attempt/quota integration. Timing is bounded and race-controlled; there is no FakeClock seam.",
+      "catalog_scenario_ids": [
+        "managed-work-run-001",
+        "interrupt-recover-001",
+        "restart-between-runs-001",
+        "endurance-finite-runs-001"
+      ],
+      "scope": "service_contract",
+      "effect": "mutating",
+      "required_tools": [
+        "ptah_create_session",
+        "ptah_submit_task",
+        "ptah_cancel",
+        "ptah_get_run",
+        "ptah_list_persistent_agents",
+        "ptah_set_managed_execution",
+        "ptah_create_manager_plan",
+        "ptah_tick_manager_plan",
+        "ptah_get_manager_plan",
+        "ptah_list_work",
+        "ptah_get_work",
+        "ptah_list_runs",
+        "ptah_list_execution_intents",
+        "ptah_get_capacity"
+      ],
+      "required_capabilities": [
+        "mcp_streamable_http",
+        "disposable_workspace",
+        "client_reconnect",
+        "local_restart_control"
+      ],
+      "eligibility": {
+        "offline": true,
+        "live": true,
+        "local_launch": true,
+        "attach": false,
+        "attach_access": "not_allowed"
+      },
+      "workspace_fixture": "synthetic-disposable-v1",
+      "bounds": {
+        "bound_profile": "smoke",
+        "max_duration_seconds": 360,
+        "max_rounds": 32,
+        "max_run_tokens": 8000,
+        "max_total_tokens": 40000,
+        "max_provider_requests": 40,
+        "max_continuations": 4,
+        "max_response_bytes_per_request": 1048576,
+        "max_output_bytes": 262144,
+        "max_artifact_bytes": 2097152
+      },
+      "actions": [
+        "create_autonomous_manager_plan",
+        "inspect_manager_plan",
+        "inspect_work_set",
+        "inspect_work_attempts",
+        "inspect_run_set",
+        "inspect_execution_intent",
+        "replay_request",
+        "replay_changed_payload",
+        "tick_manager_plan",
+        "disconnect_client",
+        "restart_service",
+        "reconnect_client"
+      ],
+      "expected_transitions": [
+        {
+          "entity": "work",
+          "from": "queued",
+          "to": "succeeded"
+        },
+        {
+          "entity": "run",
+          "from": "running",
+          "to": "interrupted"
+        },
+        {
+          "entity": "work",
+          "from": "running",
+          "to": "failed"
+        }
+      ],
+      "oracle_codes": [
+        "always_on_plan_succeeded",
+        "no_duplicate_native_run",
+        "request_replay_same_resource",
+        "changed_payload_conflict",
+        "interrupted_run_not_readmitted_within_window",
+        "durable_read_after_restart",
+        "no_implicit_invocation_resume",
         "restart_reconnect_observed"
       ],
       "missing_requirement": "skip_as_unsupported",
