@@ -40,6 +40,20 @@ const AMBIENT_CREDENTIAL_ENV: &[&str] = &[
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupExpect {
+    pub work: u64,
+    pub attempts: u64,
+    pub runs: u64,
+    pub intents: u64,
+    pub provider_sends: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManagerPlanExpect {
+    pub work: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FailClosedExpect {
     pub run_state: String,
     pub stop_cause: String,
@@ -103,6 +117,8 @@ pub struct Fixture {
     pub proposal_runs: u64,
     pub native_work_by_step: BTreeMap<String, u64>,
     pub posts_by_semantic: BTreeMap<String, u64>,
+    pub setup: SetupExpect,
+    pub manager_plan: ManagerPlanExpect,
     pub fail_closed: BTreeMap<String, FailClosedExpect>,
     pub ceilings: ResourceCeilings,
     pub artifact_scan: ArtifactScan,
@@ -121,6 +137,16 @@ impl Fixture {
         self.fail_closed
             .get(name)
             .unwrap_or_else(|| panic!("fixture missing failClosed.{name}"))
+    }
+
+    pub fn posts_for(&self, semantic: &str) -> u64 {
+        if semantic == "setup" {
+            return self.setup.provider_sends;
+        }
+        *self
+            .posts_by_semantic
+            .get(semantic)
+            .unwrap_or_else(|| panic!("fixture missing providerPostsBySemanticId.{semantic}"))
     }
 }
 
@@ -189,12 +215,29 @@ pub fn parse_fixture(bytes: &[u8]) -> Result<Fixture, String> {
     if !posts_by_semantic.contains_key("manager-decision") {
         return Err("happyPath.providerPostsBySemanticId missing manager-decision".into());
     }
+    let setup = take_setup(&mut root)?;
+    let manager_plan = take_manager_plan(&mut root)?;
     let fail_closed = take_fail_closed(&mut root)?;
     let ceilings = take_ceilings(&mut root)?;
     let artifact_scan = take_artifact_scan(&mut root)?;
     let required_assertions = take_string_array(&mut root, "requiredAssertions")?;
     if required_assertions.len() != required_assertions.iter().collect::<BTreeSet<_>>().len() {
         return Err("requiredAssertions must be unique".into());
+    }
+    if setup.runs == 0 {
+        return Err("setup.runs must be greater than zero".into());
+    }
+    if setup.provider_sends == 0 {
+        return Err("setup.providerSends must be greater than zero".into());
+    }
+    if setup.work == 0 && setup.attempts != 0 {
+        return Err("setup.attempts must be 0 when setup.work is 0".into());
+    }
+    if setup.work == 0 && setup.intents != 0 {
+        return Err("setup.intents must be 0 when setup.work is 0".into());
+    }
+    if manager_plan.work != 1 {
+        return Err("managerPlan.work must be exactly 1".into());
     }
     deny_unknown(root, "fixture")?;
     Ok(Fixture {
@@ -230,6 +273,8 @@ pub fn parse_fixture(bytes: &[u8]) -> Result<Fixture, String> {
         proposal_runs,
         native_work_by_step,
         posts_by_semantic,
+        setup,
+        manager_plan,
         fail_closed,
         ceilings,
         artifact_scan,
@@ -296,6 +341,28 @@ fn take_string_array(map: &mut Map<String, Value>, key: &str) -> Result<Vec<Stri
         Some(other) => Err(format!("{key} must be an array, got {other}")),
         None => Err(format!("missing {key}")),
     }
+}
+
+fn take_setup(root: &mut Map<String, Value>) -> Result<SetupExpect, String> {
+    let mut map = take_object(root, "setup")?;
+    let setup = SetupExpect {
+        work: take_u64(&mut map, "work")?,
+        attempts: take_u64(&mut map, "attempts")?,
+        runs: take_u64(&mut map, "runs")?,
+        intents: take_u64(&mut map, "intents")?,
+        provider_sends: take_u64(&mut map, "providerSends")?,
+    };
+    deny_unknown(map, "setup")?;
+    Ok(setup)
+}
+
+fn take_manager_plan(root: &mut Map<String, Value>) -> Result<ManagerPlanExpect, String> {
+    let mut map = take_object(root, "managerPlan")?;
+    let plan = ManagerPlanExpect {
+        work: take_u64(&mut map, "work")?,
+    };
+    deny_unknown(map, "managerPlan")?;
+    Ok(plan)
 }
 
 fn take_fail_closed(
@@ -2103,6 +2170,7 @@ pub fn require_causal_join(
     provider: &FakeProvider,
     step_id: &str,
     semantic_id: &str,
+    expected_posts: u64,
 ) -> CausalJoin {
     causal_join(
         work,
@@ -2112,6 +2180,7 @@ pub fn require_causal_join(
         provider,
         step_id,
         semantic_id,
+        expected_posts,
     )
     .unwrap_or_else(|error| panic!("{error}"))
 }
@@ -2124,6 +2193,7 @@ pub fn causal_join(
     provider: &FakeProvider,
     step_id: &str,
     semantic_id: &str,
+    expected_posts: u64,
 ) -> Result<CausalJoin, String> {
     let items = work_for_step(work, step_id);
     if items.len() != 1 {
@@ -2239,16 +2309,16 @@ pub fn causal_join(
         .into_iter()
         .filter(|record| record.auth_accepted && record.semantic_id == semantic_id)
         .collect();
-    if accepted.len() != 1 {
+    if accepted.len() as u64 != expected_posts {
         return Err(format!(
-            "step {step_id} must have exactly one accepted provider record for {semantic_id}: {:?}",
+            "step {step_id} must have exactly {expected_posts} accepted provider record(s) for {semantic_id}: {:?}",
             provider.records()
         ));
     }
     let provider_posts = provider.count_for(semantic_id);
-    if provider_posts != 1 {
+    if provider_posts != expected_posts {
         return Err(format!(
-            "semantic POST count for {semantic_id} must be 1, found {provider_posts}"
+            "semantic POST count for {semantic_id} must be {expected_posts}, found {provider_posts}"
         ));
     }
     Ok(CausalJoin {
@@ -2492,6 +2562,12 @@ mod fixture_schema_tests {
         let mut extra_happy = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
         extra_happy["happyPath"]["bonus"] = serde_json::json!(1);
         assert!(parse_fixture(&serde_json::to_vec(&extra_happy).unwrap()).is_err());
+        let mut extra_setup = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
+        extra_setup["setup"]["bonus"] = serde_json::json!(1);
+        assert!(parse_fixture(&serde_json::to_vec(&extra_setup).unwrap()).is_err());
+        let mut extra_plan = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
+        extra_plan["managerPlan"]["bonus"] = serde_json::json!(1);
+        assert!(parse_fixture(&serde_json::to_vec(&extra_plan).unwrap()).is_err());
         let mut extra_ceil = serde_json::from_slice::<Value>(FIXTURE_BYTES).unwrap();
         extra_ceil["resourceCeilings"]["bonus"] = serde_json::json!(1);
         assert!(parse_fixture(&serde_json::to_vec(&extra_ceil).unwrap()).is_err());
@@ -2510,6 +2586,8 @@ mod fixture_schema_tests {
             "soak10m",
             "soak24h",
             "happyPath",
+            "setup",
+            "managerPlan",
             "failClosed",
             "resourceCeilings",
             "artifactScan",

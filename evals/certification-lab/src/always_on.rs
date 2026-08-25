@@ -32,8 +32,6 @@ pub const MANAGER_DECISION_KIND: &str = "manager-decision";
 /// no step id and no attempts, and is observed in `ptah_list_work` alongside
 /// the step lanes.
 pub const MANAGER_PLAN_KIND: &str = "manager-plan";
-/// Work rows one manager plan contributes on top of its step lanes.
-const MANAGER_PLAN_WORK_ROWS: usize = 1;
 /// Public `purpose` discriminator for the manager proposal Run.
 pub const MANAGER_PROPOSAL_PURPOSE: &str = "manager_proposal";
 /// Loopback provider semantic id for the bootstrap submit.
@@ -139,6 +137,25 @@ pub struct FailClosedExpect {
     pub posts: u64,
 }
 
+/// Exact bootstrap-lane cardinalities. These replace every implicit `1`, `+1`,
+/// and zero-or-one setup baseline: a home that materialises a different setup
+/// Work/attempt/intent/Run/provider-send shape than the fixture declared fails
+/// instead of being absorbed as "whatever the first snapshot contained".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SetupExpect {
+    pub work: u64,
+    pub attempts: u64,
+    pub runs: u64,
+    pub intents: u64,
+    pub provider_sends: u64,
+}
+
+/// Work rows the manager plan itself occupies, distinct from every step lane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManagerPlanExpect {
+    pub work: u64,
+}
+
 /// Bounded resource ceilings declared by the fixture.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResourceCeilings {
@@ -200,6 +217,8 @@ pub struct AlwaysOnFixture {
     pub proposal_runs: u64,
     pub native_work_by_step: BTreeMap<String, u64>,
     pub provider_posts_by_semantic: BTreeMap<String, u64>,
+    pub setup: SetupExpect,
+    pub manager_plan: ManagerPlanExpect,
     pub fail_closed: BTreeMap<String, FailClosedExpect>,
     pub ceilings: ResourceCeilings,
     pub artifact_scan: ArtifactScan,
@@ -280,6 +299,8 @@ impl AlwaysOnFixture {
         let provider_posts_by_semantic = take_u64_map(&mut happy, "providerPostsBySemanticId")?;
         deny_unknown(happy, "happyPath")?;
 
+        let setup = take_setup(&mut root)?;
+        let manager_plan = take_manager_plan(&mut root)?;
         let fail_closed = take_fail_closed(&mut root)?;
         let ceilings = take_ceilings(&mut root)?;
         let artifact_scan = take_artifact_scan(&mut root)?;
@@ -316,6 +337,8 @@ impl AlwaysOnFixture {
             proposal_runs,
             native_work_by_step,
             provider_posts_by_semantic,
+            setup,
+            manager_plan,
             fail_closed,
             ceilings,
             artifact_scan,
@@ -395,6 +418,21 @@ impl AlwaysOnFixture {
         if self.proposal_runs != 1 {
             return Err("happyPath.proposalRunsObserved must be exactly 1".into());
         }
+        if self.setup.runs == 0 {
+            return Err("setup.runs must be greater than zero".into());
+        }
+        if self.setup.provider_sends == 0 {
+            return Err("setup.providerSends must be greater than zero".into());
+        }
+        if self.setup.work == 0 && self.setup.attempts != 0 {
+            return Err("setup.attempts must be 0 when setup.work is 0".into());
+        }
+        if self.setup.work == 0 && self.setup.intents != 0 {
+            return Err("setup.intents must be 0 when setup.work is 0".into());
+        }
+        if self.manager_plan.work != 1 {
+            return Err("managerPlan.work must be exactly 1".into());
+        }
         Ok(())
     }
 
@@ -412,12 +450,32 @@ impl AlwaysOnFixture {
         self.provider_posts_by_semantic.get(semantic_id).copied()
     }
 
-    /// Total provider POSTs across every declared semantic id plus the single
-    /// bootstrap `setup` POST, which is not a plan step.
+    /// Total provider POSTs across every declared semantic id plus the fixture
+    /// `setup.providerSends` count. Setup is not a plan step and must not be
+    /// smuggled in as a hardcoded `+1`.
     pub fn expected_total_posts(&self) -> Result<u64, DiagnosticCode> {
         self.provider_posts_by_semantic
             .values()
-            .try_fold(1_u64, |total, count| total.checked_add(*count))
+            .try_fold(self.setup.provider_sends, |total, count| {
+                total.checked_add(*count)
+            })
+            .ok_or(DiagnosticCode::FixtureInvalid)
+    }
+
+    /// Home B never reaches the dependent step or its replacement. Its accepted
+    /// POSTs are exactly setup + the held first step + the single manager
+    /// reaction, all fixture-declared.
+    pub fn expected_home_b_posts(&self) -> Result<u64, DiagnosticCode> {
+        let held = self
+            .posts_for(&self.step_first)
+            .ok_or(DiagnosticCode::FixtureInvalid)?;
+        let decision = self
+            .posts_for(MANAGER_DECISION_KIND)
+            .ok_or(DiagnosticCode::FixtureInvalid)?;
+        self.setup
+            .provider_sends
+            .checked_add(held)
+            .and_then(|total| total.checked_add(decision))
             .ok_or(DiagnosticCode::FixtureInvalid)
     }
 }
@@ -493,6 +551,28 @@ fn take_string_array(map: &mut Map<String, Value>, key: &str) -> Result<Vec<Stri
         Some(other) => Err(format!("{key} must be an array, got {other}")),
         None => Err(format!("missing {key}")),
     }
+}
+
+fn take_setup(root: &mut Map<String, Value>) -> Result<SetupExpect, String> {
+    let mut map = take_object(root, "setup")?;
+    let setup = SetupExpect {
+        work: take_u64(&mut map, "work")?,
+        attempts: take_u64(&mut map, "attempts")?,
+        runs: take_u64(&mut map, "runs")?,
+        intents: take_u64(&mut map, "intents")?,
+        provider_sends: take_u64(&mut map, "providerSends")?,
+    };
+    deny_unknown(map, "setup")?;
+    Ok(setup)
+}
+
+fn take_manager_plan(root: &mut Map<String, Value>) -> Result<ManagerPlanExpect, String> {
+    let mut map = take_object(root, "managerPlan")?;
+    let plan = ManagerPlanExpect {
+        work: take_u64(&mut map, "work")?,
+    };
+    deny_unknown(map, "managerPlan")?;
+    Ok(plan)
 }
 
 fn take_fail_closed(
@@ -602,6 +682,10 @@ pub struct AlwaysOnCardinality {
 #[serde(deny_unknown_fields)]
 pub struct AttemptIdentity {
     pub attempt_id: String,
+    pub work_id: String,
+    pub ordinal: u64,
+    pub claimant_id: String,
+    pub state: Option<String>,
     pub linked_run_ids: Vec<String>,
 }
 
@@ -611,7 +695,10 @@ pub struct AttemptIdentity {
 pub struct WorkIdentity {
     pub work_id: String,
     pub kind: Option<String>,
+    pub source_manager_plan_id: Option<String>,
     pub source_manager_step_id: Option<String>,
+    pub revision: u64,
+    pub assigned_agent_id: Option<String>,
     pub state: Option<String>,
     pub attempts: Vec<AttemptIdentity>,
 }
@@ -628,6 +715,8 @@ pub struct IntentIdentity {
     pub input_hash: String,
     pub work_revision: u64,
     pub agent_spec_revision: u64,
+    pub agent_id: Option<String>,
+    pub state: Option<String>,
 }
 
 /// One public Run row.
@@ -638,6 +727,12 @@ pub struct RunIdentity {
     pub request_id: String,
     pub purpose: Option<String>,
     pub state: Option<String>,
+    pub agent_id: Option<String>,
+    pub retry_of: Option<String>,
+    pub parent_run_id: Option<String>,
+    pub agent_spec_revision: Option<u64>,
+    pub provider_attempt_id: Option<String>,
+    pub provider_attempt_ordinal: Option<u64>,
 }
 
 /// A deterministic, fully ordered projection of every durable identity the
@@ -690,6 +785,10 @@ impl AlwaysOnSnapshot {
                 }
                 attempts.push(AttemptIdentity {
                     attempt_id,
+                    work_id: non_empty(&attempt["workId"])?,
+                    ordinal: require_u64(&attempt["attemptNumber"])?,
+                    claimant_id: non_empty(&attempt["claimantId"])?,
+                    state: optional_string(&attempt["state"]),
                     linked_run_ids,
                 });
             }
@@ -703,7 +802,10 @@ impl AlwaysOnSnapshot {
             work_rows.push(WorkIdentity {
                 work_id,
                 kind: optional_string(&item["kind"]),
+                source_manager_plan_id: optional_string(&item["sourceManagerPlanId"]),
                 source_manager_step_id: optional_string(&item["sourceManagerStepId"]),
+                revision: require_u64(&item["revision"])?,
+                assigned_agent_id: optional_string(&item["assignedAgentId"]),
                 state: optional_string(&item["state"]),
                 attempts,
             });
@@ -730,6 +832,8 @@ impl AlwaysOnSnapshot {
                 agent_spec_revision: intent["agentSpecRevision"]
                     .as_u64()
                     .ok_or(DiagnosticCode::McpResultMalformed)?,
+                agent_id: optional_string(&intent["agentId"]),
+                state: optional_string(&intent["state"]),
             });
         }
         intent_rows.sort();
@@ -747,6 +851,12 @@ impl AlwaysOnSnapshot {
                 request_id: non_empty(&run["requestId"])?,
                 purpose: optional_string(&run["purpose"]),
                 state: optional_string(&run["state"]),
+                agent_id: optional_string(&run["agentId"]),
+                retry_of: optional_string(&run["retryOf"]),
+                parent_run_id: optional_string(&run["parentRunId"]),
+                agent_spec_revision: optional_u64(&run["agentSpecRevision"]),
+                provider_attempt_id: provider_attempt_id(run),
+                provider_attempt_ordinal: provider_attempt_ordinal(run),
             });
         }
         run_rows.sort();
@@ -881,33 +991,71 @@ fn optional_string(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn require_u64(value: &Value) -> Result<u64, DiagnosticCode> {
+    value
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or(DiagnosticCode::McpResultMalformed)
+}
+
+fn optional_u64(value: &Value) -> Option<u64> {
+    value.as_u64()
+}
+
+fn first_provider_attempt(run: &Value) -> Option<&Value> {
+    run.get("providerExecution")
+        .and_then(|execution| execution.get("attempts"))
+        .and_then(Value::as_array)
+        .and_then(|attempts| attempts.first())
+}
+
+fn provider_attempt_id(run: &Value) -> Option<String> {
+    first_provider_attempt(run).and_then(|attempt| optional_string(&attempt["attemptId"]))
+}
+
+fn provider_attempt_ordinal(run: &Value) -> Option<u64> {
+    first_provider_attempt(run).and_then(|attempt| attempt["ordinal"].as_u64())
+}
+
 // ---------------------------------------------------------------------------
 // Bootstrap baseline
 // ---------------------------------------------------------------------------
 
-/// Assert that a freshly bootstrapped home contains exactly the bootstrap lane
-/// and nothing else.
+/// Assert that a freshly bootstrapped home contains exactly the fixture's
+/// setup lane and nothing else.
 ///
 /// The always-on probe submits one setup task before creating the manager
-/// plan, so the session is not empty when the plan starts. Treating whatever
-/// happens to be present as "the baseline" would let a polluted home — a
-/// leftover Work, a resurrected Run, a stray intent — be absorbed into the
-/// accepted starting state and never fail. Instead the baseline must be closed
-/// over the single setup Run whose id the probe already holds: exactly one Run
-/// and that Run is the setup Run, at most one Work and it links only to the
-/// setup Run, at most one intent and it points at both.
+/// plan. The fixture declares the exact Work/attempt/Run/intent counts that
+/// submit is allowed to leave behind; a zero-or-one "whatever is present"
+/// baseline would absorb leftover identities into the accepted starting
+/// state. The single setup Run id the probe already holds must occupy the
+/// declared setup Run slots.
 pub fn assert_bootstrap_baseline(
     baseline: &AlwaysOnSnapshot,
     fixture: &AlwaysOnFixture,
     setup_run_id: &str,
 ) -> Result<(), DiagnosticCode> {
-    let [run] = baseline.runs.as_slice() else {
-        return Err(DiagnosticCode::StateTransitionMismatch);
-    };
-    if run.run_id != setup_run_id {
+    if baseline.work.len() as u64 != fixture.setup.work
+        || baseline.intents.len() as u64 != fixture.setup.intents
+        || baseline.runs.len() as u64 != fixture.setup.runs
+    {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
-    if baseline.work.len() > 1 || baseline.intents.len() > 1 {
+    let attempts = baseline
+        .work
+        .iter()
+        .map(|item| item.attempts.len() as u64)
+        .try_fold(0_u64, |total, count| total.checked_add(count))
+        .ok_or(DiagnosticCode::BoundExceeded)?;
+    if attempts != fixture.setup.attempts {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    let matching_setup_runs = baseline
+        .runs
+        .iter()
+        .filter(|run| run.run_id == setup_run_id)
+        .count();
+    if matching_setup_runs != 1 {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
     let reserved: BTreeSet<String> = fixture
@@ -921,10 +1069,11 @@ pub fn assert_bootstrap_baseline(
             .as_deref()
             .is_some_and(|step| reserved.contains(step))
             || item.kind.as_deref() == Some(MANAGER_DECISION_KIND)
+            || item.kind.as_deref() == Some(MANAGER_PLAN_KIND)
         {
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
-        if item.attempts.is_empty() {
+        if fixture.setup.attempts > 0 && item.attempts.is_empty() {
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
         if item
@@ -1028,6 +1177,32 @@ pub struct AlwaysOnHappyShape {
     pub native_lanes: Vec<AlwaysOnLaneEvidence>,
     pub decision_lane: AlwaysOnLaneEvidence,
     pub manager_decision_binding: ManagerDecisionBinding,
+}
+
+/// Home B's reconstructable decision shape: the held first-step lane plus the
+/// single manager reaction bound to the manager proposal Run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlwaysOnHomeBShape {
+    pub held_lane: AlwaysOnLaneEvidence,
+    pub decision_lane: AlwaysOnLaneEvidence,
+    pub manager_decision_binding: ManagerDecisionBinding,
+}
+
+/// One loopback POST joined to the public Work/attempt/intent/Run identities
+/// it drove, including the body digest. Counts and semantic ids alone cannot
+/// reconstruct which POST belonged to which durable chain.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlwaysOnProviderJoin {
+    pub home: AlwaysOnHome,
+    pub semantic_id: String,
+    pub body_digest: String,
+    pub correlation: String,
+    pub work: Option<String>,
+    pub attempt: Option<String>,
+    pub intent: Option<String>,
+    pub run: String,
 }
 
 /// The terminal public Work state the fixture's DAG requires for `step_id`.
@@ -1241,7 +1416,7 @@ pub fn expected_happy_cardinality(
     Ok(AlwaysOnCardinality {
         work: sum(
             baseline.work,
-            sum(sum(native, decision)?, MANAGER_PLAN_WORK_ROWS)?,
+            sum(sum(native, decision)?, widen(fixture.manager_plan.work)?)?,
         )?,
         runs: sum(baseline.runs, sum(native, proposal)?)?,
         intents: sum(baseline.intents, sum(native, decision)?)?,
@@ -1262,7 +1437,7 @@ pub fn expected_pre_restart_cardinality(
             .ok_or(DiagnosticCode::FixtureInvalid)?,
     )?;
     Ok(AlwaysOnCardinality {
-        work: sum(baseline.work, sum(held, MANAGER_PLAN_WORK_ROWS)?)?,
+        work: sum(baseline.work, sum(held, widen(fixture.manager_plan.work)?)?)?,
         runs: sum(baseline.runs, held)?,
         intents: sum(baseline.intents, held)?,
     })
@@ -1418,6 +1593,26 @@ pub fn assert_post_restart_shape(
     Ok(decision_lane)
 }
 
+/// Publish Home B's reconstructable held-lane and manager-decision shapes.
+///
+/// Counts and semantic ids cannot reconstruct which Work/attempt/intent/Run
+/// chain the held step and the single manager reaction occupied after restart.
+pub fn published_home_b_shape(
+    fixture: &AlwaysOnFixture,
+    snapshot: &AlwaysOnSnapshot,
+) -> Result<AlwaysOnHomeBShape, DiagnosticCode> {
+    let held = resolve_lane(snapshot, &fixture.step_first)?;
+    let (decision, binding) = bind_manager_decision(snapshot)?;
+    if !binding.is_bound() {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    Ok(AlwaysOnHomeBShape {
+        held_lane: held.evidence(),
+        decision_lane: decision.evidence(),
+        manager_decision_binding: binding,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Loopback provider lanes
 // ---------------------------------------------------------------------------
@@ -1450,6 +1645,8 @@ pub struct LoopbackProviderLane {
     pub accepted_posts: u64,
     pub rejected_auth: u64,
     pub records: Vec<LoopbackProviderRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub joins: Vec<AlwaysOnProviderJoin>,
 }
 
 impl LoopbackProviderLane {
@@ -1459,7 +1656,35 @@ impl LoopbackProviderLane {
             accepted_posts: observation.accepted_posts,
             rejected_auth: observation.rejected_auth,
             records: observation.records,
+            joins: Vec::new(),
         }
+    }
+
+    /// Bind this home's provider records to the public identities in `snapshot`.
+    ///
+    /// Each accepted POST is joined to Work/attempt/intent/Run (setup may omit
+    /// Work/attempt/intent when the fixture declared those counts as zero) and
+    /// carries a nonsecret correlation generated from the durable Run and the
+    /// public provider-attempt identity when the projection exposes one.
+    pub fn bind(
+        mut self,
+        fixture: &AlwaysOnFixture,
+        snapshot: &AlwaysOnSnapshot,
+    ) -> Result<Self, DiagnosticCode> {
+        let mut joins = Vec::new();
+        for record in &mut self.records {
+            if !(record.auth_accepted && record.route_ok) {
+                continue;
+            }
+            let join = join_provider_record(self.home, record, fixture, snapshot)?;
+            record.correlation = join.correlation.clone();
+            joins.push(join);
+        }
+        if joins.len() as u64 != self.accepted_posts {
+            return Err(DiagnosticCode::StateTransitionMismatch);
+        }
+        self.joins = joins;
+        Ok(self)
     }
 
     /// Accepted, correctly routed POSTs carrying `semantic_id`.
@@ -1471,6 +1696,112 @@ impl LoopbackProviderLane {
             })
             .count() as u64
     }
+}
+
+/// Nonsecret correlation generated from the durable Run and its provider
+/// attempt. When the public Run projects a provider-attempt id/ordinal those
+/// are included; otherwise the fixture's declared send count for that
+/// semantic stands in so the value is never an implicit `1`.
+pub fn provider_attempt_correlation(
+    run: &RunIdentity,
+    fixture_sends: u64,
+) -> Result<String, DiagnosticCode> {
+    if fixture_sends == 0 {
+        return Err(DiagnosticCode::FixtureInvalid);
+    }
+    let material = match (
+        run.provider_attempt_id.as_deref(),
+        run.provider_attempt_ordinal,
+    ) {
+        (Some(attempt_id), Some(ordinal)) => {
+            format!("{}:{attempt_id}:{ordinal}", run.run_id)
+        }
+        (Some(attempt_id), None) => format!("{}:{attempt_id}", run.run_id),
+        (None, Some(ordinal)) => format!("{}:ordinal:{ordinal}", run.run_id),
+        (None, None) => format!("{}:fixture-sends:{fixture_sends}", run.run_id),
+    };
+    Ok(opaque_durable_id(&material))
+}
+
+fn join_provider_record(
+    home: AlwaysOnHome,
+    record: &LoopbackProviderRecord,
+    fixture: &AlwaysOnFixture,
+    snapshot: &AlwaysOnSnapshot,
+) -> Result<AlwaysOnProviderJoin, DiagnosticCode> {
+    if record.body_digest.is_empty() {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    if record.semantic_id == SETUP_SEMANTIC_ID {
+        return join_setup_record(home, record, fixture, snapshot);
+    }
+    let step_id = if record.semantic_id == MANAGER_DECISION_KIND {
+        MANAGER_DECISION_STEP_ID
+    } else if fixture
+        .native_steps()
+        .iter()
+        .any(|step| step.as_str() == record.semantic_id)
+    {
+        record.semantic_id.as_str()
+    } else {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    };
+    let lane = resolve_lane(snapshot, step_id)?;
+    let run = snapshot.run(&lane.run_id)?;
+    let sends = fixture
+        .posts_for(&record.semantic_id)
+        .ok_or(DiagnosticCode::FixtureInvalid)?;
+    Ok(AlwaysOnProviderJoin {
+        home,
+        semantic_id: record.semantic_id.clone(),
+        body_digest: record.body_digest.clone(),
+        correlation: provider_attempt_correlation(run, sends)?,
+        work: Some(opaque_durable_id(&lane.work_id)),
+        attempt: Some(opaque_durable_id(&lane.attempt_id)),
+        intent: Some(opaque_durable_id(&lane.intent_id)),
+        run: opaque_durable_id(&lane.run_id),
+    })
+}
+
+fn join_setup_record(
+    home: AlwaysOnHome,
+    record: &LoopbackProviderRecord,
+    fixture: &AlwaysOnFixture,
+    snapshot: &AlwaysOnSnapshot,
+) -> Result<AlwaysOnProviderJoin, DiagnosticCode> {
+    let used: BTreeSet<&str> = snapshot
+        .work
+        .iter()
+        .flat_map(|item| {
+            item.attempts
+                .iter()
+                .flat_map(|attempt| attempt.linked_run_ids.iter().map(String::as_str))
+        })
+        .collect();
+    let leftover: Vec<&RunIdentity> = snapshot
+        .runs
+        .iter()
+        .filter(|run| !used.contains(run.run_id.as_str()))
+        .collect();
+    if leftover.len() as u64 != fixture.setup.runs {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    let [run] = leftover.as_slice() else {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    };
+    if fixture.setup.work != 0 || fixture.setup.attempts != 0 || fixture.setup.intents != 0 {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    Ok(AlwaysOnProviderJoin {
+        home,
+        semantic_id: record.semantic_id.clone(),
+        body_digest: record.body_digest.clone(),
+        correlation: provider_attempt_correlation(run, fixture.setup.provider_sends)?,
+        work: None,
+        attempt: None,
+        intent: None,
+        run: opaque_durable_id(&run.run_id),
+    })
 }
 
 /// Merge every home's lane into the single public observation field.
@@ -1521,7 +1852,7 @@ pub fn assert_provider_lanes(
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
     }
-    if home_a.accepted_for(SETUP_SEMANTIC_ID) != 1
+    if home_a.accepted_for(SETUP_SEMANTIC_ID) != fixture.setup.provider_sends
         || home_a.accepted_posts != fixture.expected_total_posts()?
     {
         return Err(DiagnosticCode::StateTransitionMismatch);
@@ -1532,7 +1863,7 @@ pub fn assert_provider_lanes(
     let decision = fixture
         .posts_for(MANAGER_DECISION_KIND)
         .ok_or(DiagnosticCode::FixtureInvalid)?;
-    if home_b.accepted_for(SETUP_SEMANTIC_ID) != 1
+    if home_b.accepted_for(SETUP_SEMANTIC_ID) != fixture.setup.provider_sends
         || home_b.accepted_for(&fixture.step_first) != held
         || home_b.accepted_for(MANAGER_DECISION_KIND) != decision
     {
@@ -1548,13 +1879,63 @@ pub fn assert_provider_lanes(
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
     }
-    if home_b.accepted_posts
-        != held
-            .checked_add(decision)
-            .and_then(|total| total.checked_add(1))
-            .ok_or(DiagnosticCode::FixtureInvalid)?
-    {
+    if home_b.accepted_posts != fixture.expected_home_b_posts()? {
         return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    assert_lane_joins(home_a)?;
+    assert_lane_joins(home_b)?;
+    assert_no_cross_home_join_swap(home_a, home_b)?;
+    Ok(())
+}
+
+fn assert_lane_joins(lane: &LoopbackProviderLane) -> Result<(), DiagnosticCode> {
+    let accepted: Vec<&LoopbackProviderRecord> = lane
+        .records
+        .iter()
+        .filter(|record| record.auth_accepted && record.route_ok)
+        .collect();
+    if lane.joins.len() != accepted.len() {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    let mut seen_digests = BTreeSet::new();
+    let mut seen_correlations = BTreeSet::new();
+    for (record, join) in accepted.iter().zip(lane.joins.iter()) {
+        if join.home != lane.home
+            || join.semantic_id != record.semantic_id
+            || join.body_digest != record.body_digest
+            || join.correlation != record.correlation
+            || join.correlation.is_empty()
+            || join.body_digest.is_empty()
+            || join.run.is_empty()
+        {
+            return Err(DiagnosticCode::StateTransitionMismatch);
+        }
+        if !seen_digests.insert(&join.body_digest) || !seen_correlations.insert(&join.correlation) {
+            return Err(DiagnosticCode::StateTransitionMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn assert_no_cross_home_join_swap(
+    home_a: &LoopbackProviderLane,
+    home_b: &LoopbackProviderLane,
+) -> Result<(), DiagnosticCode> {
+    let mut seen = BTreeSet::new();
+    for join in home_a.joins.iter().chain(home_b.joins.iter()) {
+        if !seen.insert((join.home, join.body_digest.as_str())) {
+            return Err(DiagnosticCode::StateTransitionMismatch);
+        }
+    }
+    for join_a in &home_a.joins {
+        for join_b in &home_b.joins {
+            if join_a.body_digest == join_b.body_digest {
+                return Err(DiagnosticCode::StateTransitionMismatch);
+            }
+            if join_a.home != AlwaysOnHome::HomeA || join_b.home != AlwaysOnHome::HomeB {
+                return Err(DiagnosticCode::StateTransitionMismatch);
+            }
+        }
     }
     Ok(())
 }
@@ -1670,33 +2051,27 @@ mod tests {
         let mut intents = Vec::new();
         let mut runs = Vec::new();
         if with_baseline {
-            work.push(json!({
-                "workId": SETUP_WORK,
-                "kind": "native",
-                "state": "succeeded"
-            }));
-            details.insert(
-                SETUP_WORK.to_owned(),
-                json!({
-                    "work": {"workId": SETUP_WORK},
-                    "attempts": [{
-                        "attemptId": SETUP_ATTEMPT,
-                        "linkedRunIds": [SETUP_RUN]
-                    }]
-                }),
-            );
+            // Canonical fixture: setup materialises one Run and no Work/intents.
             runs.push(json!({
                 "runId": SETUP_RUN,
                 "requestId": "req-setup",
-                "purpose": "native",
-                "state": "completed"
+                "purpose": "execution",
+                "state": "completed",
+                "agentSpecRevision": 1,
+                "providerExecution": {
+                    "attempts": [{
+                        "attemptId": "prov-setup",
+                        "ordinal": 1
+                    }]
+                }
             }));
         }
         if with_plan {
             work.push(json!({
                 "workId": PLAN_WORK,
                 "kind": MANAGER_PLAN_KIND,
-                "state": "blocked"
+                "state": "blocked",
+                "revision": 1
             }));
             details.insert(
                 PLAN_WORK.to_owned(),
@@ -1707,7 +2082,10 @@ mod tests {
             work.push(json!({
                 "workId": lane.work,
                 "kind": lane.kind,
+                "sourceManagerPlanId": "plan-1",
                 "sourceManagerStepId": lane.step,
+                "revision": 1,
+                "assignedAgentId": "agent-1",
                 "state": lane.state
             }));
             details.insert(
@@ -1716,6 +2094,10 @@ mod tests {
                     "work": {"workId": lane.work},
                     "attempts": [{
                         "attemptId": lane.attempt,
+                        "workId": lane.work,
+                        "attemptNumber": 1,
+                        "claimantId": "claimant-1",
+                        "state": "completed",
                         "linkedRunIds": [lane.run]
                     }]
                 }),
@@ -1727,13 +2109,23 @@ mod tests {
                 "runId": lane.run,
                 "inputHash": format!("hash-{}", lane.work),
                 "workRevision": 1,
-                "agentSpecRevision": 1
+                "agentSpecRevision": 1,
+                "agentId": "agent-1",
+                "state": "consumed"
             }));
             runs.push(json!({
                 "runId": lane.run,
                 "requestId": lane.intent,
                 "purpose": lane.purpose,
-                "state": "completed"
+                "state": "completed",
+                "agentId": "agent-1",
+                "agentSpecRevision": 1,
+                "providerExecution": {
+                    "attempts": [{
+                        "attemptId": format!("prov-{}", lane.run),
+                        "ordinal": 1
+                    }]
+                }
             }));
         }
         (
@@ -1776,16 +2168,36 @@ mod tests {
             (
                 "work id replaced",
                 mutated(|work, details, intents, _| {
-                    work["work"][2]["workId"] = json!("work-a-prime");
-                    let detail = details.remove("work-a").unwrap();
-                    details.insert(
-                        "work-a-prime".into(),
-                        json!({
-                            "work": {"workId": "work-a-prime"},
-                            "attempts": detail["attempts"].clone()
-                        }),
-                    );
+                    work["work"][1]["workId"] = json!("work-a-prime");
+                    let mut detail = details.remove("work-a").unwrap();
+                    detail["work"]["workId"] = json!("work-a-prime");
+                    detail["attempts"][0]["workId"] = json!("work-a-prime");
+                    details.insert("work-a-prime".into(), detail);
                     intents["intents"][0]["workId"] = json!("work-a-prime");
+                }),
+            ),
+            (
+                "work source manager plan replaced",
+                mutated(|work, _, _, _| {
+                    work["work"][1]["sourceManagerPlanId"] = json!("plan-substituted");
+                }),
+            ),
+            (
+                "work revision replaced",
+                mutated(|work, _, _, _| {
+                    work["work"][1]["revision"] = json!(9);
+                }),
+            ),
+            (
+                "work assigned agent replaced",
+                mutated(|work, _, _, _| {
+                    work["work"][1]["assignedAgentId"] = json!("agent-substituted");
+                }),
+            ),
+            (
+                "work state replaced",
+                mutated(|work, _, _, _| {
+                    work["work"][1]["state"] = json!("failed");
                 }),
             ),
             (
@@ -1794,6 +2206,32 @@ mod tests {
                     details.get_mut("work-a").unwrap()["attempts"][0]["attemptId"] =
                         json!("attempt-a-prime");
                     intents["intents"][0]["attemptId"] = json!("attempt-a-prime");
+                }),
+            ),
+            (
+                "attempt work identity replaced",
+                mutated(|_, details, _, _| {
+                    details.get_mut("work-a").unwrap()["attempts"][0]["workId"] =
+                        json!("work-substituted");
+                }),
+            ),
+            (
+                "attempt ordinal replaced",
+                mutated(|_, details, _, _| {
+                    details.get_mut("work-a").unwrap()["attempts"][0]["attemptNumber"] = json!(2);
+                }),
+            ),
+            (
+                "attempt claimant replaced",
+                mutated(|_, details, _, _| {
+                    details.get_mut("work-a").unwrap()["attempts"][0]["claimantId"] =
+                        json!("claimant-substituted");
+                }),
+            ),
+            (
+                "attempt state replaced",
+                mutated(|_, details, _, _| {
+                    details.get_mut("work-a").unwrap()["attempts"][0]["state"] = json!("failed");
                 }),
             ),
             (
@@ -1808,6 +2246,12 @@ mod tests {
                 mutated(|_, _, intents, runs| {
                     intents["intents"][0]["intentId"] = json!("intent-a-prime");
                     runs["runs"][1]["requestId"] = json!("intent-a-prime");
+                }),
+            ),
+            (
+                "intent work identity replaced",
+                mutated(|_, _, intents, _| {
+                    intents["intents"][0]["workId"] = json!("work-substituted");
                 }),
             ),
             (
@@ -1835,6 +2279,18 @@ mod tests {
                 }),
             ),
             (
+                "intent agent replaced",
+                mutated(|_, _, intents, _| {
+                    intents["intents"][0]["agentId"] = json!("agent-substituted");
+                }),
+            ),
+            (
+                "intent state replaced",
+                mutated(|_, _, intents, _| {
+                    intents["intents"][0]["state"] = json!("failed");
+                }),
+            ),
+            (
                 "run id replaced",
                 mutated(|_, _, _, runs| {
                     runs["runs"][1]["runId"] = json!("run-a-prime");
@@ -1859,15 +2315,52 @@ mod tests {
                 }),
             ),
             (
+                "run agent replaced",
+                mutated(|_, _, _, runs| {
+                    runs["runs"][1]["agentId"] = json!("agent-substituted");
+                }),
+            ),
+            (
+                "run retry_of replaced",
+                mutated(|_, _, _, runs| {
+                    runs["runs"][1]["retryOf"] = json!("run-origin");
+                }),
+            ),
+            (
+                "run parent replaced",
+                mutated(|_, _, _, runs| {
+                    runs["runs"][1]["parentRunId"] = json!("run-parent");
+                }),
+            ),
+            (
+                "run agent spec revision replaced",
+                mutated(|_, _, _, runs| {
+                    runs["runs"][1]["agentSpecRevision"] = json!(9);
+                }),
+            ),
+            (
+                "run provider attempt replaced",
+                mutated(|_, _, _, runs| {
+                    runs["runs"][1]["providerExecution"]["attempts"][0]["attemptId"] =
+                        json!("prov-substituted");
+                }),
+            ),
+            (
+                "run provider attempt ordinal replaced",
+                mutated(|_, _, _, runs| {
+                    runs["runs"][1]["providerExecution"]["attempts"][0]["ordinal"] = json!(2);
+                }),
+            ),
+            (
                 "work kind rewritten",
                 mutated(|work, _, _, _| {
-                    work["work"][5]["kind"] = json!("native");
+                    work["work"][4]["kind"] = json!("native");
                 }),
             ),
             (
                 "work step reassigned",
                 mutated(|work, _, _, _| {
-                    work["work"][3]["sourceManagerStepId"] = json!("step-substituted");
+                    work["work"][2]["sourceManagerStepId"] = json!("step-substituted");
                 }),
             ),
         ];
@@ -1968,12 +2461,32 @@ mod tests {
             assert_bootstrap_baseline(&baseline(), &fixture, SETUP_RUN),
             Ok(())
         );
-        // A home with no Work or intents at all is still a valid bootstrap
-        // lane, so the oracle does not depend on whether a direct submit
-        // materialises Work.
-        let bare = AlwaysOnSnapshot::build(
-            &json!({"work": []}),
-            &BTreeMap::new(),
+        assert_eq!(baseline().counts.work, 0);
+        assert_eq!(baseline().counts.intents, 0);
+        assert_eq!(baseline().counts.runs, 1);
+        // A home that materialises setup Work when the fixture declared zero
+        // is polluted, not an alternative baseline.
+        let with_work = AlwaysOnSnapshot::build(
+            &json!({"work": [{
+                "workId": SETUP_WORK,
+                "kind": "native",
+                "revision": 1,
+                "state": "succeeded"
+            }]}),
+            &BTreeMap::from([(
+                SETUP_WORK.to_owned(),
+                json!({
+                    "work": {"workId": SETUP_WORK},
+                    "attempts": [{
+                        "attemptId": SETUP_ATTEMPT,
+                        "workId": SETUP_WORK,
+                        "attemptNumber": 1,
+                        "claimantId": "claimant-1",
+                        "state": "completed",
+                        "linkedRunIds": [SETUP_RUN]
+                    }]
+                }),
+            )]),
             &json!({"intents": []}),
             &json!({"runs": [{
                 "runId": SETUP_RUN, "requestId": "req-setup", "state": "completed"
@@ -1981,8 +2494,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            assert_bootstrap_baseline(&bare, &fixture, SETUP_RUN),
-            Ok(())
+            assert_bootstrap_baseline(&with_work, &fixture, SETUP_RUN),
+            Err(DiagnosticCode::StateTransitionMismatch)
         );
     }
 
@@ -1999,14 +2512,21 @@ mod tests {
 
         let mut extra_work = work.clone();
         extra_work["work"].as_array_mut().unwrap().push(json!({
-            "workId": "work-stale", "kind": "native", "state": "succeeded"
+            "workId": "work-stale", "kind": "native", "revision": 1, "state": "succeeded"
         }));
         let mut extra_details = details.clone();
         extra_details.insert(
             "work-stale".into(),
             json!({
                 "work": {"workId": "work-stale"},
-                "attempts": [{"attemptId": "attempt-stale", "linkedRunIds": ["run-stale"]}]
+                "attempts": [{
+                    "attemptId": "attempt-stale",
+                    "workId": "work-stale",
+                    "attemptNumber": 1,
+                    "claimantId": "claimant-1",
+                    "state": "completed",
+                    "linkedRunIds": ["run-stale"]
+                }]
             }),
         );
         let mut two_runs = runs.clone();
@@ -2016,20 +2536,43 @@ mod tests {
         let polluted_work =
             AlwaysOnSnapshot::build(&extra_work, &extra_details, &intents, &two_runs).unwrap();
 
-        let mut foreign_details = details.clone();
-        foreign_details.get_mut(SETUP_WORK).unwrap()["attempts"][0]["linkedRunIds"] =
-            json!(["run-elsewhere"]);
-        let foreign_link =
-            AlwaysOnSnapshot::build(&work, &foreign_details, &intents, &runs).unwrap();
+        let leftover_plan = {
+            let (work, details, intents, runs) = projection_with(&[], true, true);
+            AlwaysOnSnapshot::build(&work, &details, &intents, &runs).unwrap()
+        };
 
-        let mut plan_work = work.clone();
-        plan_work["work"][0]["sourceManagerStepId"] = json!("step-a");
-        let leftover_plan = AlwaysOnSnapshot::build(&plan_work, &details, &intents, &runs).unwrap();
-
-        let mut decision_work = work.clone();
-        decision_work["work"][0]["kind"] = json!(MANAGER_DECISION_KIND);
-        let leftover_decision =
-            AlwaysOnSnapshot::build(&decision_work, &details, &intents, &runs).unwrap();
+        let mut decision_parts = projection_with(&[], true, false);
+        decision_parts.0["work"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "workId": "work-d",
+                "kind": MANAGER_DECISION_KIND,
+                "sourceManagerStepId": MANAGER_DECISION_STEP_ID,
+                "revision": 1,
+                "state": "succeeded"
+            }));
+        decision_parts.1.insert(
+            "work-d".into(),
+            json!({
+                "work": {"workId": "work-d"},
+                "attempts": [{
+                    "attemptId": "attempt-d",
+                    "workId": "work-d",
+                    "attemptNumber": 1,
+                    "claimantId": "claimant-1",
+                    "state": "completed",
+                    "linkedRunIds": [SETUP_RUN]
+                }]
+            }),
+        );
+        let leftover_decision = AlwaysOnSnapshot::build(
+            &decision_parts.0,
+            &decision_parts.1,
+            &decision_parts.2,
+            &decision_parts.3,
+        )
+        .unwrap();
 
         let stray_intent = AlwaysOnSnapshot::build(
             &work,
@@ -2038,7 +2581,7 @@ mod tests {
                 "intentId": "intent-stale",
                 "workId": SETUP_WORK,
                 "attemptId": SETUP_ATTEMPT,
-                "runId": "run-elsewhere",
+                "runId": SETUP_RUN,
                 "inputHash": "hash-stale",
                 "workRevision": 1,
                 "agentSpecRevision": 1
@@ -2050,7 +2593,6 @@ mod tests {
         for (label, polluted) in [
             ("extra Run", polluted_run),
             ("extra Work", polluted_work),
-            ("attempt linked off-lane", foreign_link),
             ("leftover plan Work", leftover_plan),
             ("leftover decision Work", leftover_decision),
             ("stray intent", stray_intent),
@@ -2061,8 +2603,6 @@ mod tests {
                 "{label} must not become the accepted baseline"
             );
         }
-        // A baseline whose single Run is not the known setup Run is a
-        // different session entirely.
         assert_eq!(
             assert_bootstrap_baseline(&baseline(), &fixture, "run-other"),
             Err(DiagnosticCode::StateTransitionMismatch)
@@ -2075,9 +2615,6 @@ mod tests {
         let mut running = baseline();
         running.runs[0].state = Some("running".into());
         assert!(!baseline_is_settled(&running));
-        let mut leased = baseline();
-        leased.work[0].state = Some("leased".into());
-        assert!(!baseline_is_settled(&leased));
     }
 
     // -- Home-B pre-restart shape --------------------------------------------
@@ -2087,14 +2624,24 @@ mod tests {
         work["work"].as_array_mut().unwrap().push(json!({
             "workId": "work-a",
             "kind": "native",
+            "sourceManagerPlanId": "plan-1",
             "sourceManagerStepId": "step-a",
+            "revision": 1,
+            "assignedAgentId": "agent-1",
             "state": "running"
         }));
         details.insert(
             "work-a".into(),
             json!({
                 "work": {"workId": "work-a"},
-                "attempts": [{"attemptId": "attempt-a", "linkedRunIds": ["run-a"]}]
+                "attempts": [{
+                    "attemptId": "attempt-a",
+                    "workId": "work-a",
+                    "attemptNumber": 1,
+                    "claimantId": "claimant-1",
+                    "state": "leased",
+                    "linkedRunIds": ["run-a"]
+                }]
             }),
         );
         intents["intents"].as_array_mut().unwrap().push(json!({
@@ -2104,10 +2651,18 @@ mod tests {
             "runId": "run-a",
             "inputHash": "hash-work-a",
             "workRevision": 1,
-            "agentSpecRevision": 1
+            "agentSpecRevision": 1,
+            "agentId": "agent-1"
         }));
         runs["runs"].as_array_mut().unwrap().push(json!({
-            "runId": "run-a", "requestId": "intent-a", "purpose": "native", "state": "running"
+            "runId": "run-a",
+            "requestId": "intent-a",
+            "purpose": "native",
+            "state": "running",
+            "agentSpecRevision": 1,
+            "providerExecution": {
+                "attempts": [{"attemptId": "prov-run-a", "ordinal": 1}]
+            }
         }));
         (work, details, intents, runs)
     }
@@ -2143,13 +2698,20 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(json!({
-                "workId": "work-stale", "kind": "native", "state": "succeeded"
+                "workId": "work-stale", "kind": "native", "revision": 1, "state": "succeeded"
             }));
         extra_work_json.1.insert(
             "work-stale".into(),
             json!({
                 "work": {"workId": "work-stale"},
-                "attempts": [{"attemptId": "attempt-stale", "linkedRunIds": ["run-stale"]}]
+                "attempts": [{
+                    "attemptId": "attempt-stale",
+                    "workId": "work-stale",
+                    "attemptNumber": 1,
+                    "claimantId": "claimant-1",
+                    "state": "completed",
+                    "linkedRunIds": ["run-stale"]
+                }]
             }),
         );
         extra_work_json.3["runs"]
@@ -2188,7 +2750,9 @@ mod tests {
             .push(json!({
                 "workId": "work-b",
                 "kind": "native",
+                "sourceManagerPlanId": "plan-1",
                 "sourceManagerStepId": "step-b",
+                "revision": 1,
                 "state": "queued"
             }));
         dependent_json.1.insert(
@@ -2200,7 +2764,9 @@ mod tests {
         decision_json.0["work"].as_array_mut().unwrap().push(json!({
             "workId": "work-d",
             "kind": MANAGER_DECISION_KIND,
+            "sourceManagerPlanId": "plan-1",
             "sourceManagerStepId": MANAGER_DECISION_STEP_ID,
+            "revision": 1,
             "state": "succeeded"
         }));
         decision_json.1.insert(
@@ -2290,7 +2856,7 @@ mod tests {
         assert_eq!(
             expected_happy_cardinality(&fixture, baseline().counts).unwrap(),
             AlwaysOnCardinality {
-                work: 6,
+                work: 5,
                 runs: 5,
                 intents: 4
             }
@@ -2298,7 +2864,7 @@ mod tests {
         assert_eq!(
             happy().counts,
             AlwaysOnCardinality {
-                work: 6,
+                work: 5,
                 runs: 5,
                 intents: 4
             }
@@ -2377,7 +2943,7 @@ mod tests {
         // Each step's terminal state is part of the oracle: a forced-failure
         // step that reports success, or a step that should succeed reporting
         // failure, must both be rejected.
-        for (index, state) in [(3usize, "succeeded"), (2, "failed"), (4, "failed")] {
+        for (index, state) in [(2usize, "succeeded"), (1, "failed"), (3, "failed")] {
             let mut parts = projection(&happy_lanes(), true);
             parts.0["work"][index]["state"] = json!(state);
             let snapshot = AlwaysOnSnapshot::build(&parts.0, &parts.1, &parts.2, &parts.3).unwrap();
@@ -2389,7 +2955,7 @@ mod tests {
         }
         // The manager-decision lane must have succeeded.
         let mut decision = projection(&happy_lanes(), true);
-        decision.0["work"][5]["state"] = json!("failed");
+        decision.0["work"][4]["state"] = json!("failed");
         let decision =
             AlwaysOnSnapshot::build(&decision.0, &decision.1, &decision.2, &decision.3).unwrap();
         assert_eq!(
@@ -2444,7 +3010,7 @@ mod tests {
         // A decision Work whose public kind does not agree with its reserved
         // step id is not the decision lane.
         let mut mislabelled = projection(&happy_lanes(), true);
-        mislabelled.0["work"][5]["kind"] = json!("native");
+        mislabelled.0["work"][4]["kind"] = json!("native");
         let mislabelled = AlwaysOnSnapshot::build(
             &mislabelled.0,
             &mislabelled.1,
@@ -2506,7 +3072,9 @@ mod tests {
         duplicated.0["work"].as_array_mut().unwrap().push(json!({
             "workId": "work-a2",
             "kind": "native",
+            "sourceManagerPlanId": "plan-1",
             "sourceManagerStepId": "step-a",
+            "revision": 1,
             "state": "succeeded"
         }));
         duplicated.1.insert(
@@ -2543,7 +3111,7 @@ mod tests {
 
         // A baseline the final snapshot no longer contains byte for byte.
         let mut drifted = base.clone();
-        drifted.work[0].state = Some("failed".into());
+        drifted.runs[0].state = Some("failed".into());
         assert_eq!(
             assert_happy_shape(&fixture, &drifted, &happy()),
             Err(DiagnosticCode::StateTransitionMismatch)
@@ -2556,7 +3124,11 @@ mod tests {
     /// Run, plus the manager's single decision lane.
     fn post_restart() -> AlwaysOnSnapshot {
         let (mut work, mut details, mut intents, mut runs) = held_projection();
-        work["work"][2]["state"] = json!("failed");
+        for item in work["work"].as_array_mut().unwrap() {
+            if item["workId"] == json!("work-a") {
+                item["state"] = json!("failed");
+            }
+        }
         for run in runs["runs"].as_array_mut().unwrap() {
             if run["runId"] == json!("run-a") {
                 run["state"] = json!("interrupted");
@@ -2565,14 +3137,24 @@ mod tests {
         work["work"].as_array_mut().unwrap().push(json!({
             "workId": "work-d",
             "kind": MANAGER_DECISION_KIND,
+            "sourceManagerPlanId": "plan-1",
             "sourceManagerStepId": MANAGER_DECISION_STEP_ID,
+            "revision": 1,
+            "assignedAgentId": "agent-1",
             "state": "succeeded"
         }));
         details.insert(
             "work-d".into(),
             json!({
                 "work": {"workId": "work-d"},
-                "attempts": [{"attemptId": "attempt-d", "linkedRunIds": ["run-d"]}]
+                "attempts": [{
+                    "attemptId": "attempt-d",
+                    "workId": "work-d",
+                    "attemptNumber": 1,
+                    "claimantId": "claimant-1",
+                    "state": "completed",
+                    "linkedRunIds": ["run-d"]
+                }]
             }),
         );
         intents["intents"].as_array_mut().unwrap().push(json!({
@@ -2582,13 +3164,18 @@ mod tests {
             "runId": "run-d",
             "inputHash": "hash-work-d",
             "workRevision": 1,
-            "agentSpecRevision": 1
+            "agentSpecRevision": 1,
+            "agentId": "agent-1"
         }));
         runs["runs"].as_array_mut().unwrap().push(json!({
             "runId": "run-d",
             "requestId": "intent-d",
             "purpose": MANAGER_PROPOSAL_PURPOSE,
-            "state": "completed"
+            "state": "completed",
+            "agentSpecRevision": 1,
+            "providerExecution": {
+                "attempts": [{"attemptId": "prov-run-d", "ordinal": 1}]
+            }
         }));
         AlwaysOnSnapshot::build(&work, &details, &intents, &runs).expect("post-restart snapshot")
     }
@@ -2655,6 +3242,12 @@ mod tests {
             request_id: "req-extra".into(),
             purpose: Some("execution".into()),
             state: Some("running".into()),
+            agent_id: None,
+            retry_of: None,
+            parent_run_id: None,
+            agent_spec_revision: None,
+            provider_attempt_id: None,
+            provider_attempt_ordinal: None,
         });
         grown.runs.sort();
         grown.counts.runs += 1;
@@ -2683,6 +3276,10 @@ mod tests {
             .attempts
             .push(AttemptIdentity {
                 attempt_id: "attempt-plan".into(),
+                work_id: PLAN_WORK.into(),
+                ordinal: 1,
+                claimant_id: "claimant-1".into(),
+                state: Some("leased".into()),
                 linked_run_ids: vec!["run-plan".into()],
             });
         assert_eq!(
@@ -2717,6 +3314,7 @@ mod tests {
             body_digest: digest.into(),
             auth_accepted: true,
             route_ok: true,
+            correlation: String::new(),
         }
     }
 
@@ -2732,7 +3330,10 @@ mod tests {
                 record(MANAGER_DECISION_KIND, "d-decision"),
                 record("step-b-fix", "d-step-b-fix"),
             ],
+            joins: Vec::new(),
         }
+        .bind(&fixture(), &happy())
+        .expect("home A joins")
     }
 
     fn home_b_lane() -> LoopbackProviderLane {
@@ -2743,10 +3344,12 @@ mod tests {
             records: vec![
                 record(SETUP_SEMANTIC_ID, "d-setup-b"),
                 record("step-a", "d-step-a-held"),
-                // The manager's single reaction to the held step failing.
                 record(MANAGER_DECISION_KIND, "d-decision-b"),
             ],
+            joins: Vec::new(),
         }
+        .bind(&fixture(), &post_restart())
+        .expect("home B joins")
     }
 
     #[test]
@@ -2761,6 +3364,61 @@ mod tests {
         // Home A's records come first and stay reconstructable.
         assert_eq!(merged.records[0].body_digest, "d-setup-a");
         assert_eq!(merged.records[5].body_digest, "d-setup-b");
+        let home_a = home_a_lane();
+        let home_b = home_b_lane();
+        assert_eq!(home_a.joins.len(), 5);
+        assert_eq!(home_b.joins.len(), 3);
+        let setup_a = home_a
+            .joins
+            .iter()
+            .find(|join| join.semantic_id == SETUP_SEMANTIC_ID)
+            .expect("home A setup join");
+        assert!(setup_a.work.is_none() && setup_a.attempt.is_none() && setup_a.intent.is_none());
+        assert_eq!(setup_a.run, opaque_durable_id(SETUP_RUN));
+        assert_eq!(setup_a.body_digest, "d-setup-a");
+        assert!(!setup_a.correlation.is_empty());
+        let decision_a = home_a
+            .joins
+            .iter()
+            .find(|join| join.semantic_id == MANAGER_DECISION_KIND)
+            .expect("home A decision join");
+        assert_eq!(decision_a.work, Some(opaque_durable_id("work-d")));
+        assert_eq!(decision_a.attempt, Some(opaque_durable_id("attempt-d")));
+        assert_eq!(decision_a.intent, Some(opaque_durable_id("intent-d")));
+        assert_eq!(decision_a.run, opaque_durable_id("run-d"));
+        assert_eq!(decision_a.body_digest, "d-decision");
+        let setup_b = home_b
+            .joins
+            .iter()
+            .find(|join| join.semantic_id == SETUP_SEMANTIC_ID)
+            .expect("home B setup join");
+        assert_eq!(setup_b.body_digest, "d-setup-b");
+        assert_ne!(setup_a.correlation, setup_b.correlation);
+        assert_ne!(setup_a.body_digest, setup_b.body_digest);
+        let held_b = home_b
+            .joins
+            .iter()
+            .find(|join| join.semantic_id == "step-a")
+            .expect("home B held join");
+        assert_eq!(held_b.work, Some(opaque_durable_id("work-a")));
+        assert_eq!(held_b.body_digest, "d-step-a-held");
+        let decision_b = home_b
+            .joins
+            .iter()
+            .find(|join| join.semantic_id == MANAGER_DECISION_KIND)
+            .expect("home B decision join");
+        assert_eq!(decision_b.work, Some(opaque_durable_id("work-d")));
+        assert_eq!(decision_b.body_digest, "d-decision-b");
+        let home_b_shape = published_home_b_shape(&fixture, &post_restart()).expect("home B shape");
+        assert_eq!(home_b_shape.held_lane.step_id, "step-a");
+        assert_eq!(home_b_shape.held_lane.work, opaque_durable_id("work-a"));
+        assert_eq!(home_b_shape.decision_lane.step_id, MANAGER_DECISION_STEP_ID);
+        assert_eq!(home_b_shape.decision_lane.work, opaque_durable_id("work-d"));
+        assert!(home_b_shape.manager_decision_binding.is_bound());
+        grokptah_agent_bridge::scan_value_for_forbidden_data(
+            &serde_json::to_value(&home_b_shape).unwrap(),
+        )
+        .expect("published Home B shape must survive the redaction scan");
         assert_eq!(merge_provider_lanes(&[]), None);
         // Lane order in the input does not change the merged evidence.
         assert_eq!(
@@ -2862,6 +3520,16 @@ mod tests {
             assert_provider_lanes(&fixture, &[home_a_lane(), no_decision]),
             Err(DiagnosticCode::StateTransitionMismatch)
         );
+        let mut duplicate_decision = home_b_lane();
+        duplicate_decision
+            .records
+            .push(record(MANAGER_DECISION_KIND, "d-decision-b-again"));
+        duplicate_decision.accepted_posts += 1;
+        assert_eq!(
+            assert_provider_lanes(&fixture, &[home_a_lane(), duplicate_decision]),
+            Err(DiagnosticCode::StateTransitionMismatch),
+            "a duplicated Home B manager-decision POST must fail"
+        );
         // Home B missing or duplicating its held step.
         let mut missing_held = home_b_lane();
         missing_held
@@ -2902,6 +3570,13 @@ mod tests {
         assert_eq!(fixture.proposal_runs, 1);
         assert_eq!(fixture.zero_growth_window, Duration::from_millis(4000));
         assert_eq!(fixture.expected_total_posts().unwrap(), 5);
+        assert_eq!(fixture.setup.work, 0);
+        assert_eq!(fixture.setup.attempts, 0);
+        assert_eq!(fixture.setup.runs, 1);
+        assert_eq!(fixture.setup.intents, 0);
+        assert_eq!(fixture.setup.provider_sends, 1);
+        assert_eq!(fixture.manager_plan.work, 1);
+        assert_eq!(fixture.expected_home_b_posts().unwrap(), 3);
     }
 
     #[test]
@@ -2911,6 +3586,9 @@ mod tests {
             vec!["sentinels"],
             vec!["steps"],
             vec!["happyPath"],
+            vec!["setup"],
+            vec!["managerPlan"],
+            vec!["failClosed", "cancel"],
             vec!["resourceCeilings"],
             vec!["artifactScan"],
         ] {
@@ -3086,5 +3764,128 @@ mod tests {
         let mut posts = canonical_value();
         posts["failClosed"]["cancel"]["posts"] = json!(2);
         assert!(AlwaysOnFixture::from_value(posts).is_err());
+    }
+
+    #[test]
+    fn fixture_parser_rejects_each_fail_closed_row_field_mutation() {
+        for case in ["cancel", "malformed", "disconnect", "status500", "slow"] {
+            for field in ["runState", "stopCause", "errorCode"] {
+                let mut mutant = canonical_value();
+                mutant["failClosed"][case][field] = json!("");
+                assert!(
+                    AlwaysOnFixture::from_value(mutant).is_err(),
+                    "failClosed.{case}.{field} empty must fail"
+                );
+            }
+            let mut missing_field = canonical_value();
+            missing_field["failClosed"][case]
+                .as_object_mut()
+                .unwrap()
+                .remove("posts");
+            assert!(
+                AlwaysOnFixture::from_value(missing_field).is_err(),
+                "failClosed.{case} missing posts must fail"
+            );
+            let mut extra_field = canonical_value();
+            extra_field["failClosed"][case]["bonus"] = json!(1);
+            assert!(
+                AlwaysOnFixture::from_value(extra_field).is_err(),
+                "failClosed.{case} unknown field must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_parser_rejects_each_setup_and_manager_plan_field_mutation() {
+        for field in ["work", "attempts", "runs", "intents", "providerSends"] {
+            let mut missing = canonical_value();
+            missing["setup"].as_object_mut().unwrap().remove(field);
+            assert!(
+                AlwaysOnFixture::from_value(missing).is_err(),
+                "setup.{field} missing must fail"
+            );
+            let mut extra = canonical_value();
+            extra["setup"]["bonus"] = json!(1);
+            assert!(AlwaysOnFixture::from_value(extra).is_err());
+        }
+        let mut zero_runs = canonical_value();
+        zero_runs["setup"]["runs"] = json!(0);
+        assert!(AlwaysOnFixture::from_value(zero_runs)
+            .expect_err("zero setup.runs")
+            .contains("greater than zero"));
+        let mut zero_sends = canonical_value();
+        zero_sends["setup"]["providerSends"] = json!(0);
+        assert!(AlwaysOnFixture::from_value(zero_sends)
+            .expect_err("zero setup.providerSends")
+            .contains("greater than zero"));
+        let mut workless_attempts = canonical_value();
+        workless_attempts["setup"]["attempts"] = json!(1);
+        assert!(AlwaysOnFixture::from_value(workless_attempts).is_err());
+        let mut workless_intents = canonical_value();
+        workless_intents["setup"]["intents"] = json!(1);
+        assert!(AlwaysOnFixture::from_value(workless_intents).is_err());
+        let mut missing_plan = canonical_value();
+        missing_plan.as_object_mut().unwrap().remove("managerPlan");
+        assert!(AlwaysOnFixture::from_value(missing_plan).is_err());
+        let mut zero_plan = canonical_value();
+        zero_plan["managerPlan"]["work"] = json!(0);
+        assert!(AlwaysOnFixture::from_value(zero_plan).is_err());
+        let mut extra_plan = canonical_value();
+        extra_plan["managerPlan"]["bonus"] = json!(1);
+        assert!(AlwaysOnFixture::from_value(extra_plan).is_err());
+    }
+
+    #[test]
+    fn provider_lanes_reject_unknown_semantics_digest_correlation_and_cross_home_swaps() {
+        let fixture = fixture();
+        let mut unknown = home_a_lane();
+        unknown.records.push(record("other", "d-unknown"));
+        unknown.accepted_posts += 1;
+        assert_eq!(
+            assert_provider_lanes(&fixture, &[unknown, home_b_lane()]),
+            Err(DiagnosticCode::StateTransitionMismatch),
+            "unknown provider semantic must fail"
+        );
+        let mut empty_corr = home_a_lane();
+        empty_corr.records[1].correlation.clear();
+        empty_corr.joins[1].correlation.clear();
+        assert_eq!(
+            assert_provider_lanes(&fixture, &[empty_corr, home_b_lane()]),
+            Err(DiagnosticCode::StateTransitionMismatch),
+            "empty correlation must fail"
+        );
+
+        let mut digest_swap = home_a_lane();
+        digest_swap.joins[1].body_digest = "d-swapped".into();
+        assert_eq!(
+            assert_provider_lanes(&fixture, &[digest_swap, home_b_lane()]),
+            Err(DiagnosticCode::StateTransitionMismatch),
+            "digest swap must fail"
+        );
+        let mut correlation_swap = home_a_lane();
+        let stolen = correlation_swap.joins[2].correlation.clone();
+        correlation_swap.joins[1].correlation = stolen.clone();
+        correlation_swap.records[1].correlation = stolen;
+        assert_eq!(
+            assert_provider_lanes(&fixture, &[correlation_swap, home_b_lane()]),
+            Err(DiagnosticCode::StateTransitionMismatch),
+            "correlation swap must fail uniqueness or binding"
+        );
+
+        let mut cross_home = home_b_lane();
+        cross_home.records[1].body_digest = "d-step-a".into();
+        cross_home.joins[1].body_digest = "d-step-a".into();
+        assert_eq!(
+            assert_provider_lanes(&fixture, &[home_a_lane(), cross_home]),
+            Err(DiagnosticCode::StateTransitionMismatch),
+            "cross-home digest swap must fail"
+        );
+        let mut mislabelled = home_b_lane();
+        mislabelled.joins[2].home = AlwaysOnHome::HomeA;
+        assert_eq!(
+            assert_provider_lanes(&fixture, &[home_a_lane(), mislabelled]),
+            Err(DiagnosticCode::StateTransitionMismatch),
+            "Home B decision join labelled as Home A must fail"
+        );
     }
 }

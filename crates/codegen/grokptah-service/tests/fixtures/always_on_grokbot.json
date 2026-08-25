@@ -45,6 +45,16 @@
       "step-b-fix": 1
     }
   },
+  "setup": {
+    "work": 0,
+    "attempts": 0,
+    "runs": 1,
+    "intents": 0,
+    "providerSends": 1
+  },
+  "managerPlan": {
+    "work": 1
+  },
   "failClosed": {
     "cancel": {
       "runState": "cancelled",

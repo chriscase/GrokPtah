@@ -15,9 +15,10 @@ use uuid::Uuid;
 use crate::always_on::{
     assert_bootstrap_baseline, assert_exact_snapshot, assert_happy_shape,
     assert_home_b_pre_restart_shape, assert_post_restart_shape, assert_provider_lanes,
-    baseline_is_settled, exact_array, expected_step_state, merge_provider_lanes, work_items,
-    AlwaysOnFixture, AlwaysOnHappyShape, AlwaysOnHome, AlwaysOnSnapshot, LoopbackProviderLane,
-    MANAGER_DECISION_KIND, SETUP_SEMANTIC_ID,
+    baseline_is_settled, exact_array, expected_step_state, merge_provider_lanes,
+    published_home_b_shape, work_items, AlwaysOnFixture, AlwaysOnHappyShape, AlwaysOnHome,
+    AlwaysOnHomeBShape, AlwaysOnSnapshot, LoopbackProviderLane, MANAGER_DECISION_KIND,
+    SETUP_SEMANTIC_ID,
 };
 use crate::local_service::LocalService;
 use crate::manifest::{OracleCode, ProbeAction, ProbeDefinition};
@@ -94,6 +95,7 @@ struct ProbeBuilder<'a> {
     capture_attempt_start: Option<u32>,
     provider_lanes: Vec<LoopbackProviderLane>,
     always_on_shape: Option<AlwaysOnHappyShape>,
+    always_on_home_b_shape: Option<AlwaysOnHomeBShape>,
 }
 
 impl<'a> ProbeBuilder<'a> {
@@ -115,6 +117,7 @@ impl<'a> ProbeBuilder<'a> {
             capture_attempt_start: None,
             provider_lanes: Vec::new(),
             always_on_shape: None,
+            always_on_home_b_shape: None,
         }
     }
 
@@ -320,6 +323,7 @@ impl<'a> ProbeBuilder<'a> {
                 provider_observation: merge_provider_lanes(&self.provider_lanes),
                 provider_lanes: self.provider_lanes,
                 always_on_shape: self.always_on_shape,
+                always_on_home_b_shape: self.always_on_home_b_shape,
             },
             trace: StructuralTrace {
                 schema: LAB_TRACE_SCHEMA.into(),
@@ -891,7 +895,7 @@ fn assert_happy_path_shape(
         .posts_for(MANAGER_DECISION_KIND)
         .ok_or(DiagnosticCode::FixtureInvalid)?;
     if service.provider.count_for(MANAGER_DECISION_KIND) != decision_posts
-        || service.provider.count_for(SETUP_SEMANTIC_ID) != 1
+        || service.provider.count_for(SETUP_SEMANTIC_ID) != fixture.setup.provider_sends
         || service.send_count() != fixture.expected_total_posts()?
     {
         return Err(DiagnosticCode::StateTransitionMismatch);
@@ -1523,10 +1527,10 @@ async fn always_on_home_a(
         &after_post_success_tick,
         &runs,
     )?);
-    probe.provider_lanes.push(LoopbackProviderLane::new(
-        AlwaysOnHome::HomeA,
-        service.provider.observation(),
-    ));
+    probe.provider_lanes.push(
+        LoopbackProviderLane::new(AlwaysOnHome::HomeA, service.provider.observation())
+            .bind(fixture, &after_post_success_tick)?,
+    );
     service
         .scan_artifacts()
         .map_err(|_| DiagnosticCode::OracleMismatch)?;
@@ -1640,9 +1644,11 @@ async fn always_on_home_b(
     let pre_plan_steps = pre_plan["plan"]["steps"].clone();
     let pre_plan_hash = plan_identity_hash(&pre_plan);
     let pid0 = service.pid();
+    probe.push_trace(TraceOperationCode::Disconnect, vec![], None)?;
     drop(client);
     probe.observe_action(ProbeAction::DisconnectClient);
     probe.reconnect.attempted = true;
+    probe.push_trace(TraceOperationCode::Restart, vec![], None)?;
     probe.observe_action(ProbeAction::RestartService);
     probe.restart.attempted = true;
     probe.restart.host_owned = true;
@@ -1657,6 +1663,7 @@ async fn always_on_home_b(
     if service.pid() == pid0 {
         return Err(DiagnosticCode::RestartRecoveryFailed);
     }
+    probe.push_trace(TraceOperationCode::Reconnect, vec![], None)?;
     client = service
         .client()
         .await
@@ -1702,7 +1709,9 @@ async fn always_on_home_b(
         return Err(DiagnosticCode::RestartRecoveryFailed);
     }
     let pid1 = service.pid();
+    probe.push_trace(TraceOperationCode::Disconnect, vec![], None)?;
     drop(client);
+    probe.push_trace(TraceOperationCode::Restart, vec![], None)?;
     probe.counters.restarts = probe
         .counters
         .restarts
@@ -1714,6 +1723,7 @@ async fn always_on_home_b(
     if service.pid() == pid1 || service.pid() == pid0 {
         return Err(DiagnosticCode::RestartRecoveryFailed);
     }
+    probe.push_trace(TraceOperationCode::Reconnect, vec![], None)?;
     client = service
         .client()
         .await
@@ -1760,10 +1770,11 @@ async fn always_on_home_b(
     probe.observe_oracle(OracleCode::NoImplicitInvocationResume);
     // Home B used to assign this field outright, discarding Home A's records
     // and leaving every Home-A oracle unbacked in the published report.
-    probe.provider_lanes.push(LoopbackProviderLane::new(
-        AlwaysOnHome::HomeB,
-        service.provider.observation(),
-    ));
+    probe.always_on_home_b_shape = Some(published_home_b_shape(fixture, &second_steady)?);
+    probe.provider_lanes.push(
+        LoopbackProviderLane::new(AlwaysOnHome::HomeB, service.provider.observation())
+            .bind(fixture, &second_steady)?,
+    );
     service
         .scan_artifacts()
         .map_err(|_| DiagnosticCode::OracleMismatch)?;
@@ -6380,6 +6391,23 @@ mod tests {
         assert_eq!(
             execution.result.diagnostics,
             vec![DiagnosticCode::ProbeImplementationUnavailable]
+        );
+    }
+
+    #[test]
+    fn process_service_lifecycle_failure_remains_a_hard_failure() {
+        let diagnostic =
+            process_service_spawn_diagnostic(anyhow::anyhow!("spawn grokptah-service failed"));
+        assert_eq!(diagnostic, DiagnosticCode::RestartControlUnavailable);
+        let manifest = CampaignManifest::bundled().unwrap();
+        let definition = manifest
+            .probe("always-on-grokbot-lifecycle-v1")
+            .expect("manifest always-on probe");
+        let execution = ProbeBuilder::new(definition).finish(ProbeStatus::Failed, diagnostic);
+        assert_eq!(execution.result.status, ProbeStatus::Failed);
+        assert_eq!(
+            execution.result.failure_class,
+            crate::report::FailureClass::Oracle
         );
     }
 

@@ -532,6 +532,7 @@ async fn join_step(
     provider: &FakeProvider,
     step_id: &str,
     semantic_id: &str,
+    expected_posts: u64,
 ) -> CausalJoin {
     let work_id = require_unique_step_work(work, step_id)["workId"]
         .as_str()
@@ -546,6 +547,7 @@ async fn join_step(
         provider,
         step_id,
         semantic_id,
+        expected_posts,
     )
 }
 
@@ -556,6 +558,7 @@ async fn wait_in_flight_join(
     provider: &FakeProvider,
     step_id: &str,
     semantic_id: &str,
+    expected_posts: u64,
 ) -> CausalJoin {
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut last = String::new();
@@ -578,6 +581,7 @@ async fn wait_in_flight_join(
                     provider,
                     step_id,
                     semantic_id,
+                    expected_posts,
                 ) {
                     Ok(join)
                         if matches!(join.work_state.as_str(), "running" | "leased")
@@ -1412,6 +1416,7 @@ async fn exact_happy_path_oracle(campaign: &mut Campaign, plan_id: &str) {
             &campaign.provider,
             step,
             step,
+            expected_posts,
         )
         .await;
         assert_eq!(join.provider_posts, expected_posts);
@@ -1500,7 +1505,10 @@ async fn assert_zero_growth_window(campaign: &mut Campaign, join: &CausalJoin, s
         "plan growth during zero-growth window"
     );
     assert_eq!(campaign.provider.count_for(semantic), posts);
-    assert_eq!(campaign.provider.count_for(semantic), 1);
+    assert_eq!(
+        campaign.provider.count_for(semantic),
+        campaign.fixture.posts_for(semantic)
+    );
     let work = list_work(&mut campaign.client, campaign.session, &campaign.workspace).await;
     let runs = list_runs(&mut campaign.client, campaign.session, &campaign.workspace).await;
     let intents = list_intents(&mut campaign.client, campaign.session, &campaign.workspace).await;
@@ -1529,13 +1537,14 @@ async fn assert_zero_growth_window(campaign: &mut Campaign, join: &CausalJoin, s
         &campaign.provider,
         step_id,
         semantic,
+        campaign.fixture.posts_for(semantic),
     );
     assert_eq!(again.work_id, join.work_id);
     assert_eq!(again.attempt_id, join.attempt_id);
     assert_eq!(again.intent_id, join.intent_id);
     assert_eq!(again.run_id, join.run_id);
     assert_eq!(again.provider_digest, join.provider_digest);
-    assert_eq!(again.provider_posts, 1);
+    assert_eq!(again.provider_posts, campaign.fixture.posts_for(semantic));
     assert_ne!(again.work_state, "queued");
 }
 
@@ -1556,7 +1565,10 @@ async fn assert_interrupted_fence(campaign: &mut Campaign, join: &CausalJoin, se
     .await;
     assert_eq!(run["state"].as_str(), Some("interrupted"));
     assert_eq!(pending_usage(&run), 0);
-    assert_eq!(campaign.provider.count_for(semantic), 1);
+    assert_eq!(
+        campaign.provider.count_for(semantic),
+        campaign.fixture.posts_for(semantic)
+    );
     let detailed = poll_json(
         &mut campaign.client,
         "ptah_get_work",
@@ -1583,6 +1595,7 @@ async fn assert_interrupted_fence(campaign: &mut Campaign, join: &CausalJoin, se
         &campaign.provider,
         semantic,
         semantic,
+        campaign.fixture.posts_for(semantic),
     );
     assert_eq!(recovered.work_id, join.work_id);
     assert_eq!(recovered.attempt_id, join.attempt_id);
@@ -1590,7 +1603,10 @@ async fn assert_interrupted_fence(campaign: &mut Campaign, join: &CausalJoin, se
     assert_eq!(recovered.run_id, join.run_id);
     assert_eq!(recovered.run_request_id, join.run_request_id);
     assert_eq!(recovered.provider_digest, join.provider_digest);
-    assert_eq!(recovered.provider_posts, 1);
+    assert_eq!(
+        recovered.provider_posts,
+        campaign.fixture.posts_for(semantic)
+    );
     assert_ne!(recovered.work_state, "queued");
 }
 
@@ -1636,6 +1652,12 @@ async fn fixture_schema_is_consumed() {
     assert_eq!(fixture.posts_by_semantic.get("step-a"), Some(&1));
     assert_eq!(fixture.posts_by_semantic.get("step-b-fix"), Some(&1));
     assert_eq!(fixture.posts_by_semantic.get("manager-decision"), Some(&1));
+    assert_eq!(fixture.setup.work, 0);
+    assert_eq!(fixture.setup.attempts, 0);
+    assert_eq!(fixture.setup.runs, 1);
+    assert_eq!(fixture.setup.intents, 0);
+    assert_eq!(fixture.setup.provider_sends, 1);
+    assert_eq!(fixture.manager_plan.work, 1);
     let malformed = fixture.fail_closed_case("malformed");
     assert_eq!(malformed.run_state, "limit_reached");
     assert_eq!(malformed.stop_cause, "token_accounting_unavailable");
@@ -1840,6 +1862,7 @@ async fn scheduler_window_restart_observations_keep_exact_identities() {
                     &campaign.provider,
                     step_id,
                     semantic,
+                    campaign.fixture.posts_for(semantic),
                 )
                 .await,
             )
@@ -1901,7 +1924,7 @@ async fn scheduler_window_restart_observations_keep_exact_identities() {
             for key in ["step-a", "step-b", "manager-decision", "step-b-fix"] {
                 assert_eq!(
                     campaign.provider.count_for(key),
-                    1,
+                    campaign.fixture.posts_for(key),
                     "{key} posts after {name}: {:?}",
                     campaign.provider.records()
                 );
@@ -1917,6 +1940,7 @@ async fn scheduler_window_restart_observations_keep_exact_identities() {
                 &campaign.provider,
                 step_id,
                 semantic,
+                campaign.fixture.posts_for(semantic),
             )
             .await;
             assert_eq!(after.work_id, before.work_id, "{name} work id changed");
@@ -1954,6 +1978,7 @@ async fn scheduler_window_restart_observations_keep_exact_identities() {
                     &campaign.provider,
                     step_id,
                     semantic,
+                    campaign.fixture.posts_for(semantic),
                 )
                 .await;
                 assert_eq!(
@@ -2025,7 +2050,10 @@ async fn two_same_home_restarts_keep_held_request_identities() {
     campaign
         .provider
         .wait_accepted(&campaign.fixture.step_first, Duration::from_secs(90));
-    assert_eq!(campaign.provider.count_for(&campaign.fixture.step_first), 1);
+    assert_eq!(
+        campaign.provider.count_for(&campaign.fixture.step_first),
+        campaign.fixture.posts_for(&campaign.fixture.step_first)
+    );
     let pid0 = campaign.service.pid();
     let join = wait_in_flight_join(
         &mut campaign.client,
@@ -2034,6 +2062,7 @@ async fn two_same_home_restarts_keep_held_request_identities() {
         &campaign.provider,
         &campaign.fixture.step_first,
         &campaign.fixture.step_first,
+        campaign.fixture.posts_for(&campaign.fixture.step_first),
     )
     .await;
     campaign.reopen().await;
@@ -2545,7 +2574,10 @@ async fn soak_assert_interrupted_hold(
     .await;
     assert_eq!(recovered["state"].as_str(), Some("interrupted"));
     assert_eq!(pending_usage(&recovered), 0);
-    assert_eq!(campaign.provider.count_for(semantic), 1);
+    assert_eq!(
+        campaign.provider.count_for(semantic),
+        campaign.fixture.posts_for(semantic)
+    );
     let window = campaign.fixture.supervisor_period
         * u32::try_from(campaign.fixture.zero_growth_periods).expect("periods");
     tokio::time::sleep(window).await;
@@ -2553,7 +2585,10 @@ async fn soak_assert_interrupted_hold(
         cardinalities(&mut campaign.client, campaign.session, &campaign.workspace).await,
         *before
     );
-    assert_eq!(campaign.provider.count_for(semantic), 1);
+    assert_eq!(
+        campaign.provider.count_for(semantic),
+        campaign.fixture.posts_for(semantic)
+    );
 }
 
 async fn barrier_restart_on_campaign(campaign: &mut Campaign) -> CausalJoin {
@@ -2572,6 +2607,7 @@ async fn barrier_restart_on_campaign(campaign: &mut Campaign) -> CausalJoin {
         &campaign.provider,
         &campaign.fixture.step_first,
         &campaign.fixture.step_first,
+        campaign.fixture.posts_for(&campaign.fixture.step_first),
     )
     .await;
     let step = campaign.fixture.step_first.clone();

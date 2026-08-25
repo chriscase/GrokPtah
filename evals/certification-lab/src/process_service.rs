@@ -173,6 +173,7 @@ impl FakeProvider {
                     body_digest: record.body_digest,
                     auth_accepted: record.auth_accepted,
                     route_ok: record.route_ok,
+                    correlation: String::new(),
                 })
                 .collect(),
         }

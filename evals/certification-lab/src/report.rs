@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::always_on::{
-    assert_provider_lanes, AlwaysOnFixture, AlwaysOnHappyShape, LoopbackProviderLane,
+    assert_provider_lanes, AlwaysOnFixture, AlwaysOnHappyShape, AlwaysOnHomeBShape,
+    LoopbackProviderLane,
 };
 use crate::manifest::{
     CampaignManifest, DurableEntity, DurableState, OracleCode, ProbeAction, ProbeDefinition,
@@ -328,6 +329,9 @@ pub struct ProbeResult {
     /// The exact fixture-derived identity shape the always-on probe proved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub always_on_shape: Option<AlwaysOnHappyShape>,
+    /// Home B's reconstructable held-lane and manager-decision shapes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_on_home_b_shape: Option<AlwaysOnHomeBShape>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -347,6 +351,10 @@ pub struct LoopbackProviderRecord {
     pub body_digest: String,
     pub auth_accepted: bool,
     pub route_ok: bool,
+    /// Nonsecret correlation generated from the durable Run and provider
+    /// attempt. Empty until the always-on probe binds the record to a snapshot.
+    #[serde(default)]
+    pub correlation: String,
 }
 
 impl ProbeResult {
@@ -381,6 +389,7 @@ impl ProbeResult {
             provider_observation: None,
             provider_lanes: Vec::new(),
             always_on_shape: None,
+            always_on_home_b_shape: None,
         }
     }
 
@@ -1271,6 +1280,13 @@ fn validate_probe_against_definition(
             Some(_) => bail!("always-on passing probe left the manager-decision binding unproven"),
             None => bail!("always-on passing probe omitted its exact identity shape"),
         }
+        match &probe.always_on_home_b_shape {
+            Some(shape)
+                if shape.manager_decision_binding.is_bound()
+                    && shape.held_lane.step_id == fixture.step_first => {}
+            Some(_) => bail!("always-on passing probe left the Home B decision binding unproven"),
+            None => bail!("always-on passing probe omitted its Home B identity shape"),
+        }
     }
     if definition.scope == ProbeScope::ProviderStructural
         && probe.status == ProbeStatus::Passed
@@ -1727,6 +1743,7 @@ fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::always_on::{AlwaysOnHome, AlwaysOnProviderJoin};
 
     fn skipped_probe() -> ProbeResult {
         ProbeResult::skipped(
@@ -1986,6 +2003,7 @@ mod tests {
             provider_observation: None,
             provider_lanes: Vec::new(),
             always_on_shape: None,
+            always_on_home_b_shape: None,
         }];
         value.recompute_summary().unwrap();
         value.certified = true;
@@ -2000,13 +2018,35 @@ mod tests {
             body_digest: digest.into(),
             auth_accepted: true,
             route_ok: true,
+            correlation: format!("corr-{semantic}-{digest}"),
+        }
+    }
+
+    fn always_on_join(
+        home: AlwaysOnHome,
+        semantic: &str,
+        digest: &str,
+        work: Option<&str>,
+        attempt: Option<&str>,
+        intent: Option<&str>,
+        run: &str,
+    ) -> AlwaysOnProviderJoin {
+        AlwaysOnProviderJoin {
+            home,
+            semantic_id: semantic.into(),
+            body_digest: digest.into(),
+            correlation: format!("corr-{semantic}-{digest}"),
+            work: work.map(opaque_durable_id),
+            attempt: attempt.map(opaque_durable_id),
+            intent: intent.map(opaque_durable_id),
+            run: opaque_durable_id(run),
         }
     }
 
     fn always_on_lanes() -> Vec<LoopbackProviderLane> {
         vec![
             LoopbackProviderLane {
-                home: crate::always_on::AlwaysOnHome::HomeA,
+                home: AlwaysOnHome::HomeA,
                 accepted_posts: 5,
                 rejected_auth: 0,
                 records: vec![
@@ -2016,15 +2056,91 @@ mod tests {
                     always_on_record("manager-decision", "d-decision"),
                     always_on_record("step-b-fix", "d-step-b-fix"),
                 ],
+                joins: vec![
+                    always_on_join(
+                        AlwaysOnHome::HomeA,
+                        "setup",
+                        "d-setup-a",
+                        None,
+                        None,
+                        None,
+                        "run-setup-a",
+                    ),
+                    always_on_join(
+                        AlwaysOnHome::HomeA,
+                        "step-a",
+                        "d-step-a",
+                        Some("work-a"),
+                        Some("attempt-a"),
+                        Some("intent-a"),
+                        "run-a",
+                    ),
+                    always_on_join(
+                        AlwaysOnHome::HomeA,
+                        "step-b",
+                        "d-step-b",
+                        Some("work-b"),
+                        Some("attempt-b"),
+                        Some("intent-b"),
+                        "run-b",
+                    ),
+                    always_on_join(
+                        AlwaysOnHome::HomeA,
+                        "manager-decision",
+                        "d-decision",
+                        Some("work-d"),
+                        Some("attempt-d"),
+                        Some("intent-d"),
+                        "run-d",
+                    ),
+                    always_on_join(
+                        AlwaysOnHome::HomeA,
+                        "step-b-fix",
+                        "d-step-b-fix",
+                        Some("work-c"),
+                        Some("attempt-c"),
+                        Some("intent-c"),
+                        "run-c",
+                    ),
+                ],
             },
             LoopbackProviderLane {
-                home: crate::always_on::AlwaysOnHome::HomeB,
+                home: AlwaysOnHome::HomeB,
                 accepted_posts: 3,
                 rejected_auth: 0,
                 records: vec![
                     always_on_record("setup", "d-setup-b"),
                     always_on_record("step-a", "d-step-a-held"),
                     always_on_record("manager-decision", "d-decision-b"),
+                ],
+                joins: vec![
+                    always_on_join(
+                        AlwaysOnHome::HomeB,
+                        "setup",
+                        "d-setup-b",
+                        None,
+                        None,
+                        None,
+                        "run-setup-b",
+                    ),
+                    always_on_join(
+                        AlwaysOnHome::HomeB,
+                        "step-a",
+                        "d-step-a-held",
+                        Some("work-a-held"),
+                        Some("attempt-a-held"),
+                        Some("intent-a-held"),
+                        "run-a-held",
+                    ),
+                    always_on_join(
+                        AlwaysOnHome::HomeB,
+                        "manager-decision",
+                        "d-decision-b",
+                        Some("work-d-b"),
+                        Some("attempt-d-b"),
+                        Some("intent-d-b"),
+                        "run-d-b",
+                    ),
                 ],
             },
         ]
@@ -2081,6 +2197,27 @@ mod tests {
             decision_lane: decision_lane.clone(),
             manager_decision_binding: crate::always_on::ManagerDecisionBinding::Bound {
                 lane: decision_lane,
+            },
+        });
+        let held_lane = crate::always_on::AlwaysOnLaneEvidence {
+            step_id: "step-a".into(),
+            work: opaque_durable_id("work-a-held"),
+            attempt: opaque_durable_id("attempt-a-held"),
+            intent: opaque_durable_id("intent-a-held"),
+            run: opaque_durable_id("run-a-held"),
+        };
+        let home_b_decision = crate::always_on::AlwaysOnLaneEvidence {
+            step_id: "__manager_decision__".into(),
+            work: opaque_durable_id("work-d-b"),
+            attempt: opaque_durable_id("attempt-d-b"),
+            intent: opaque_durable_id("intent-d-b"),
+            run: opaque_durable_id("run-d-b"),
+        };
+        probe.always_on_home_b_shape = Some(AlwaysOnHomeBShape {
+            held_lane,
+            decision_lane: home_b_decision.clone(),
+            manager_decision_binding: crate::always_on::ManagerDecisionBinding::Bound {
+                lane: home_b_decision,
             },
         });
         probe
@@ -2144,6 +2281,69 @@ mod tests {
                 work: opaque_durable_id("work-d"),
             };
         assert!(validate_probe_against_definition(&unbound, definition).is_err());
+
+        let mut shapeless_home_b = passing_always_on_probe(definition);
+        shapeless_home_b.always_on_home_b_shape = None;
+        assert!(validate_probe_against_definition(&shapeless_home_b, definition).is_err());
+        let mut unbound_home_b = passing_always_on_probe(definition);
+        unbound_home_b
+            .always_on_home_b_shape
+            .as_mut()
+            .unwrap()
+            .manager_decision_binding =
+            crate::always_on::ManagerDecisionBinding::PurposeNotProjected {
+                work: opaque_durable_id("work-d-b"),
+            };
+        assert!(validate_probe_against_definition(&unbound_home_b, definition).is_err());
+
+        let mut missing_home_b_decision = passing_always_on_probe(definition);
+        missing_home_b_decision.provider_lanes[1]
+            .records
+            .retain(|record| record.semantic_id != "manager-decision");
+        missing_home_b_decision.provider_lanes[1]
+            .joins
+            .retain(|join| join.semantic_id != "manager-decision");
+        missing_home_b_decision.provider_lanes[1].accepted_posts -= 1;
+        missing_home_b_decision.provider_observation =
+            crate::always_on::merge_provider_lanes(&missing_home_b_decision.provider_lanes);
+        assert!(validate_probe_against_definition(&missing_home_b_decision, definition).is_err());
+
+        let mut duplicate_home_b_decision = passing_always_on_probe(definition);
+        duplicate_home_b_decision.provider_lanes[1]
+            .records
+            .push(always_on_record("manager-decision", "d-decision-b-again"));
+        duplicate_home_b_decision.provider_lanes[1]
+            .joins
+            .push(always_on_join(
+                AlwaysOnHome::HomeB,
+                "manager-decision",
+                "d-decision-b-again",
+                Some("work-d-b-again"),
+                Some("attempt-d-b-again"),
+                Some("intent-d-b-again"),
+                "run-d-b-again",
+            ));
+        duplicate_home_b_decision.provider_lanes[1].accepted_posts += 1;
+        duplicate_home_b_decision.provider_observation =
+            crate::always_on::merge_provider_lanes(&duplicate_home_b_decision.provider_lanes);
+        assert!(validate_probe_against_definition(&duplicate_home_b_decision, definition).is_err());
+
+        let mut digest_swap = passing_always_on_probe(definition);
+        digest_swap.provider_lanes[0].joins[1].body_digest = "d-swapped".into();
+        assert!(validate_probe_against_definition(&digest_swap, definition).is_err());
+
+        let mut correlation_swap = passing_always_on_probe(definition);
+        let stolen = correlation_swap.provider_lanes[0].joins[2]
+            .correlation
+            .clone();
+        correlation_swap.provider_lanes[0].joins[1].correlation = stolen.clone();
+        correlation_swap.provider_lanes[0].records[1].correlation = stolen;
+        assert!(validate_probe_against_definition(&correlation_swap, definition).is_err());
+
+        let mut cross_home = passing_always_on_probe(definition);
+        cross_home.provider_lanes[1].records[1].body_digest = "d-step-a".into();
+        cross_home.provider_lanes[1].joins[1].body_digest = "d-step-a".into();
+        assert!(validate_probe_against_definition(&cross_home, definition).is_err());
     }
 
     #[test]
