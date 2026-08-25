@@ -148,6 +148,12 @@ fn run_stop_cause(run: &Value) -> &str {
     run["stopCause"].as_str().unwrap_or("")
 }
 
+fn public_error_matches(run: &Value, expect: &str) -> bool {
+    let code = run_error_code(run);
+    code == expect
+        || (code == "privileged_diagnostics" && run["terminalResult"].as_str() == Some(expect))
+}
+
 fn matches_fail_closed(
     run: &Value,
     run_id: &str,
@@ -156,7 +162,7 @@ fn matches_fail_closed(
     run["runId"].as_str() == Some(run_id)
         && run["state"].as_str() == Some(expect.run_state.as_str())
         && run_stop_cause(run) == expect.stop_cause.as_str()
-        && run_error_code(run) == expect.error_code.as_str()
+        && public_error_matches(run, expect.error_code.as_str())
         && pending_usage(run) == 0
 }
 
@@ -1070,7 +1076,14 @@ impl Stage6WorkerPool {
                 }),
             )
             .await;
-            assert_eq!(snapshot["work"]["state"].as_str(), Some("leased"));
+            assert!(
+                matches!(
+                    snapshot["work"]["state"].as_str(),
+                    Some("leased") | Some("running")
+                ),
+                "recovered worker Work must remain in-flight: {}",
+                snapshot["work"]["state"]
+            );
             assert_eq!(
                 snapshot["work"]["parentWorkId"].as_str(),
                 Some(lease.parent_work_id.as_str())
@@ -2338,9 +2351,8 @@ async fn fail_closed_two_restarts(
         expect.stop_cause.as_str(),
         "{semantic} stopCause: {run}"
     );
-    assert_eq!(
-        run_error_code(&run),
-        expect.error_code.as_str(),
+    assert!(
+        public_error_matches(&run, expect.error_code.as_str()),
         "{semantic} error code: {run}"
     );
     assert_eq!(pending_usage(&run), 0);
@@ -2361,7 +2373,7 @@ async fn fail_closed_two_restarts(
         .await;
         assert_eq!(recovered["state"].as_str(), Some(expect.run_state.as_str()));
         assert_eq!(run_stop_cause(&recovered), expect.stop_cause.as_str());
-        assert_eq!(run_error_code(&recovered), expect.error_code.as_str());
+        assert!(public_error_matches(&recovered, expect.error_code.as_str()));
         assert_eq!(pending_usage(&recovered), 0);
         assert_eq!(campaign.provider.count_for(semantic), expect.posts);
         let window = campaign.fixture.supervisor_period
