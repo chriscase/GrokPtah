@@ -92,6 +92,18 @@ describe("GrokPtahBrokerClient", () => {
       .rejects.toMatchObject({ code: "invalid_response" });
   });
 
+  it("rejects oversized broker JSON responses before exposing them", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify("x".repeat(4 * 1_048_576)), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const client = new GrokPtahBrokerClient({ baseUrl: "https://contextdesk.example", fetcher });
+    await expect(client.getRun("binding-1", "run-1"))
+      .rejects.toMatchObject({ code: "invalid_response" });
+  });
+
   it("validates binding responses before exposing capabilities", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
       bindingId: "binding-1",
@@ -143,6 +155,20 @@ describe("GrokPtahBrokerClient", () => {
       client.submitRun("binding-1", { prompt: "review" }, "intent-1"),
     ).rejects.toMatchObject<GrokPtahBrokerError>({ code: "csrf_required" });
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("bounds CSRF configuration and oversized error bodies", async () => {
+    expect(() => new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      csrfToken: "x".repeat(257),
+    })).toThrowError(/CSRF token exceeds/);
+
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response("x".repeat(64 * 1_024 + 1), { status: 500 }),
+    );
+    const client = new GrokPtahBrokerClient({ baseUrl: "https://contextdesk.example", fetcher });
+    await expect(client.getRun("binding-1", "run-1"))
+      .rejects.toMatchObject({ status: 500, code: "http_error" });
   });
 
   it("requires a non-empty idempotency key for every mutation", async () => {

@@ -46,6 +46,9 @@ const MAX_BROKER_CAPABILITY_ID_BYTES = 128;
 const MAX_BROKER_CHANGED_FILES = 256;
 const MAX_BROKER_FINGERPRINT_BYTES = 256;
 const MAX_BROKER_PATH_BYTES = 512;
+const MAX_BROKER_JSON_RESPONSE_BYTES = 4 * 1_048_576;
+const MAX_BROKER_ERROR_RESPONSE_BYTES = 64 * 1_024;
+const MAX_BROKER_CSRF_BYTES = 256;
 const BROKER_CAPABILITY_ID = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9_]*)+$/;
 
 const BROKER_AVAILABILITIES: ReadonlySet<GrokPtahBrokerCapability["availability"]> = new Set([
@@ -271,6 +274,9 @@ export class GrokPtahBrokerClient {
     this.fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
     this.credentials = options.credentials ?? "include";
     const csrfToken = options.csrfToken?.trim();
+    if (csrfToken && new TextEncoder().encode(csrfToken).byteLength > MAX_BROKER_CSRF_BYTES) {
+      throw new GrokPtahBrokerError(0, "invalid_request", "Broker CSRF token exceeds the byte ceiling");
+    }
     this.csrfToken = csrfToken || undefined;
   }
 
@@ -537,6 +543,13 @@ export class GrokPtahBrokerClient {
     });
     if (!response.ok) await throwBrokerError(response);
     const text = await response.text();
+    if (new TextEncoder().encode(text).byteLength > MAX_BROKER_JSON_RESPONSE_BYTES) {
+      throw new GrokPtahBrokerError(
+        response.status,
+        "invalid_response",
+        "Broker JSON response exceeds the byte ceiling",
+      );
+    }
     if (!text) return undefined as T;
     try {
       return JSON.parse(text) as T;
@@ -730,9 +743,12 @@ function validateBoundedText(value: unknown, label: string): asserts value is st
 async function throwBrokerError(response: Response): Promise<never> {
   let body: Record<string, unknown> = {};
   try {
-    const parsed: unknown = await response.json();
-    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
-      body = parsed as Record<string, unknown>;
+    const text = await response.text();
+    if (new TextEncoder().encode(text).byteLength <= MAX_BROKER_ERROR_RESPONSE_BYTES) {
+      const parsed: unknown = JSON.parse(text);
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+        body = parsed as Record<string, unknown>;
+      }
     }
   } catch {
     // Preserve the stable HTTP status even when a proxy emits no JSON body.
