@@ -1010,13 +1010,13 @@ fn assert_happy_path_counts(
         if work_for_step(work, step).len() as u64 != fixture.native_work_by_step[step] {
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
-        if service.count_for(step) != fixture.provider_posts_by_semantic[step] {
+        if service.provider.count_for(step) != fixture.provider_posts_by_semantic[step] {
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
     }
-    if service.count_for("manager-decision")
+    if service.provider.count_for("manager-decision")
         != fixture.provider_posts_by_semantic["manager-decision"]
-        || service.count_for("setup") != 1
+        || service.provider.count_for("setup") != 1
     {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
@@ -1476,7 +1476,7 @@ async fn always_on_home_a(
             .as_array()
             .ok_or(DiagnosticCode::McpResultMalformed)?
             .iter()
-            .filter(|run| run["runId"].as_str() == Some(run_id))
+            .filter(|run| run["runId"].as_str() == Some(run_id.as_str()))
             .collect();
         if campaign_runs.len() != 1 {
             return Err(DiagnosticCode::StateTransitionMismatch);
@@ -1556,7 +1556,7 @@ async fn always_on_home_a(
         return Err(DiagnosticCode::IdempotencyReplayMismatch);
     }
     let after_replay = always_on_snapshot(probe, &mut client, &session_id, &workspace).await?;
-    assert_exact_cardinality(after_post_success_tick, after_replay)?;
+    assert_exact_cardinality(before_post_success_tick, after_replay)?;
     probe.observe_action(ProbeAction::ReplayRequest);
     probe.observe_oracle(OracleCode::RequestReplaySameResource);
 
