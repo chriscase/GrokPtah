@@ -9,7 +9,9 @@ pub const MAX_REQUEST_ID_BYTES: usize = 256;
 /// Maximum UTF-8 bytes in a durable prompt preview.
 pub const MAX_PROMPT_PREVIEW_BYTES: usize = 512;
 /// Maximum serialized bytes in one public event update.
-pub const MAX_EVENT_UPDATE_BYTES: usize = 256 * 1024;
+pub const MAX_EVENT_UPDATE_BYTES: usize = 8 * 1024;
+/// Maximum UTF-8 bytes in a redacted event detail string.
+pub const MAX_EVENT_DETAIL_BYTES: usize = 2_048;
 /// Maximum UTF-8 bytes in a review diff projection.
 pub const MAX_REVIEW_DIFF_BYTES: usize = 2 * 1024 * 1024;
 
@@ -184,25 +186,100 @@ impl DurableRun {
     }
 }
 
-/// One durable event journal entry.
+/// Bounded, redacted durable-run event payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunEvent {
-    /// Strictly increasing journal sequence.
-    pub seq: u64,
-    /// RFC3339 event timestamp.
-    pub ts: String,
-    /// Redacted state update.
-    pub update: serde_json::Value,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunEventUpdate {
+    /// Share-safe event type such as `progress` or `turn_complete`.
+    #[serde(rename = "type")]
+    pub event_type: String,
+    /// Optional redacted progress or state detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Optional current model round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u16>,
+    /// Optional configured round ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u16>,
+    /// Optional last tool name; never command output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool: Option<String>,
+    /// Optional durable lifecycle state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<DurableRunState>,
+    /// Optional share-safe terminal result label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_result: Option<String>,
+    /// Optional share-safe error code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// Optional RFC3339 timestamp for this update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
 
-impl RunEvent {
-    /// Validate the bounded serialized event projection.
+impl RunEventUpdate {
+    /// Validate the share-safe, bounded event update projection.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.ts.trim().is_empty() {
-            return Err("event timestamp must not be empty");
+        if !crate::redact::is_share_safe_event_type(&self.event_type) {
+            return Err("event type must be a bounded share-safe label");
         }
-        let bytes =
-            serde_json::to_vec(&self.update).map_err(|_| "event update is not serializable")?;
+        if let Some(detail) = &self.detail {
+            crate::redact::reject_bounded_text(
+                detail,
+                MAX_EVENT_DETAIL_BYTES,
+                "event detail must be non-empty and bounded",
+                "event detail contains privileged data",
+            )?;
+        }
+        if self.round.is_some_and(|round| round > MAX_ROUNDS) {
+            return Err("round must be at most 24");
+        }
+        if self
+            .max_rounds
+            .is_some_and(|max_rounds| max_rounds > MAX_ROUNDS)
+        {
+            return Err("max_rounds must be at most 24");
+        }
+        if let (Some(round), Some(max_rounds)) = (self.round, self.max_rounds) {
+            if round > max_rounds {
+                return Err("round must not exceed max_rounds");
+            }
+        }
+        if let Some(last_tool) = &self.last_tool {
+            crate::redact::reject_bounded_text(
+                last_tool,
+                256,
+                "last_tool must be non-empty and bounded",
+                "last_tool contains privileged data",
+            )?;
+        }
+        if let Some(terminal_result) = &self.terminal_result {
+            crate::redact::reject_bounded_text(
+                terminal_result,
+                512,
+                "terminal_result must be non-empty and bounded",
+                "terminal_result contains privileged data",
+            )?;
+        }
+        if let Some(error_code) = &self.error_code {
+            crate::redact::reject_bounded_text(
+                error_code,
+                128,
+                "error_code must be non-empty and bounded",
+                "error_code contains privileged data",
+            )?;
+        }
+        if let Some(updated_at) = &self.updated_at {
+            crate::redact::reject_bounded_text(
+                updated_at,
+                128,
+                "updated_at must be non-empty and bounded",
+                "updated_at contains privileged data",
+            )?;
+        }
+        let bytes = serde_json::to_vec(self).map_err(|_| "event update is not serializable")?;
         if bytes.len() > MAX_EVENT_UPDATE_BYTES {
             return Err("event update exceeds its byte bound");
         }
@@ -210,9 +287,34 @@ impl RunEvent {
     }
 }
 
+/// One durable event journal entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunEvent {
+    /// Strictly increasing journal sequence.
+    pub seq: u64,
+    /// RFC3339 event timestamp.
+    pub ts: String,
+    /// Redacted state update.
+    pub update: RunEventUpdate,
+}
+
+impl RunEvent {
+    /// Validate the bounded serialized event projection.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        crate::redact::reject_bounded_text(
+            &self.ts,
+            128,
+            "event timestamp must not be empty",
+            "event timestamp contains privileged data",
+        )?;
+        self.update.validate()
+    }
+}
+
 /// Cursor-paged durable events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunEventPage {
     /// Retained entries in sequence order.
     pub entries: Vec<RunEvent>,
@@ -356,29 +458,105 @@ mod tests {
 
     #[test]
     fn public_contract_validators_reject_unbounded_values() {
-        assert!(Bounds {
-            max_rounds: Some(25),
-            ..Bounds::default()
-        }
-        .validate()
-        .is_err());
-        assert!(RunEvent {
+        assert!(
+            Bounds {
+                max_rounds: Some(25),
+                ..Bounds::default()
+            }
+            .validate()
+            .is_err()
+        );
+        let event = RunEvent {
             seq: 1,
             ts: "2026-01-01T00:00:00Z".into(),
-            update: serde_json::json!({"text": "x"}),
-        }
-        .validate()
-        .is_ok());
-        assert!(ReviewReceipt {
-            changed_files: vec![ChangedFile {
-                path: "../secret".into(),
-                summary: "x".into()
-            }],
-            diff: String::new(),
-            diff_truncated: false,
-            fingerprint: "fp".into(),
-        }
-        .validate()
-        .is_err());
+            update: RunEventUpdate {
+                event_type: "progress".into(),
+                detail: Some("checking tests".into()),
+                round: Some(1),
+                max_rounds: Some(8),
+                last_tool: None,
+                state: Some(DurableRunState::Running),
+                terminal_result: None,
+                error_code: None,
+                updated_at: None,
+            },
+        };
+        event.validate().expect("share-safe run event validates");
+        let value = serde_json::to_value(&event).expect("run event serializes");
+        assert_eq!(value["update"]["type"], "progress");
+        assert_eq!(value["update"]["detail"], "checking tests");
+        assert_eq!(value["update"]["maxRounds"], 8);
+        assert!(value["update"].get("authorization").is_none());
+        assert!(
+            serde_json::from_value::<RunEvent>(serde_json::json!({
+                "seq": 1,
+                "ts": "2026-01-01T00:00:00Z",
+                "update": { "type": "progress", "authorization": "Bearer secret" }
+            }))
+            .is_err(),
+            "run event update must deny unknown fields"
+        );
+        assert!(
+            serde_json::from_value::<RunEvent>(serde_json::json!({
+                "seq": 1,
+                "ts": "2026-01-01T00:00:00Z",
+                "update": { "text": "x" }
+            }))
+            .is_err(),
+            "run event update must not accept an unparsed JSON value"
+        );
+        assert!(
+            RunEvent {
+                seq: 1,
+                ts: "2026-01-01T00:00:00Z".into(),
+                update: RunEventUpdate {
+                    event_type: "progress".into(),
+                    detail: Some("/private/secret".into()),
+                    round: None,
+                    max_rounds: None,
+                    last_tool: None,
+                    state: None,
+                    terminal_result: None,
+                    error_code: None,
+                    updated_at: None,
+                },
+            }
+            .validate()
+            .is_err(),
+            "run event update must reject privileged text"
+        );
+        assert!(
+            RunEvent {
+                seq: 1,
+                ts: "2026-01-01T00:00:00Z".into(),
+                update: RunEventUpdate {
+                    event_type: "progress".into(),
+                    detail: None,
+                    round: Some(13),
+                    max_rounds: Some(12),
+                    last_tool: None,
+                    state: None,
+                    terminal_result: None,
+                    error_code: None,
+                    updated_at: None,
+                },
+            }
+            .validate()
+            .is_err(),
+            "run event update must reject impossible round bounds"
+        );
+        assert!(
+            ReviewReceipt {
+                changed_files: vec![ChangedFile {
+                    path: "../secret".into(),
+                    summary: "x".into()
+                }],
+                diff: String::new(),
+                diff_truncated: false,
+                fingerprint: "fp".into(),
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

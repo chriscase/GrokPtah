@@ -154,6 +154,12 @@ if (utf8Query?.includeArchived !== false) {
 if (parseExternalWorkerListQuery({ includeArchived: null }) !== null) {
   fail("consumer list query parser accepted JSON null includeArchived");
 }
+if (parseExternalWorkerListQuery({})?.includeArchived !== false) {
+  fail("consumer list query parser omitted includeArchived instead of explicit false");
+}
+if (uiCoreParseListQuery({})?.includeArchived !== false) {
+  fail("ui-core list query parser omitted includeArchived instead of explicit false");
+}
 
 if (parseExternalWorkerSummary({
   provider: "cursor_cloud",

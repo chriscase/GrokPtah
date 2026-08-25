@@ -80,8 +80,29 @@
       "required": ["seq", "ts", "update"],
       "properties": {
         "seq": { "type": "integer", "minimum": 0 },
-        "ts": { "type": "string", "minLength": 1 },
-        "update": {}
+        "ts": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "update": { "$ref": "#/$defs/eventUpdate" }
+      }
+    },
+    "eventUpdate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9_.-]{0,63}$"
+        },
+        "detail": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "round": { "type": "integer", "minimum": 0, "maximum": 24 },
+        "maxRounds": { "type": "integer", "minimum": 0, "maximum": 24 },
+        "lastTool": { "type": ["string", "null"], "minLength": 1, "maxLength": 256 },
+        "state": { "$ref": "#/$defs/runState" },
+        "terminalResult": { "type": ["string", "null"], "minLength": 1, "maxLength": 512 },
+        "errorCode": { "type": ["string", "null"], "minLength": 1, "maxLength": 128 },
+        "updatedAt": { "type": "string", "minLength": 1, "maxLength": 128 }
       }
     },
     "runEventPage": {
@@ -183,9 +204,19 @@
       "required": ["seq", "ts", "kind", "detail"],
       "properties": {
         "seq": { "type": "integer", "minimum": 0 },
-        "ts": { "type": "string", "minLength": 1 },
-        "kind": { "type": "string", "minLength": 1 },
-        "detail": {}
+        "ts": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "kind": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "detail": { "$ref": "#/$defs/computerEventDetail" }
+      }
+    },
+    "computerEventDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["disposition"],
+      "properties": {
+        "disposition": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "observationId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "errorCode": { "type": "string", "minLength": 1, "maxLength": 128 }
       }
     },
     "notification": {
