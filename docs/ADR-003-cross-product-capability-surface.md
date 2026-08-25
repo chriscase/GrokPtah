@@ -192,8 +192,9 @@ changing the authority boundary:
   to the server's own authorization.
 - `desktop/src/lib/grokptahBrokerClient.ts` is a separate browser-safe shape
   for ContextDesk War Room: it has no bearer-token option, uses the user's
-  broker session, accepts only opaque binding/run ids, and enforces cursor-aware
-  redacted SSE recovery.
+  broker session, accepts only opaque binding/run ids, validates binding/run
+  response envelopes before exposing them to consumers, and enforces
+  cursor-aware redacted SSE recovery.
 - `docs/schemas/grokptah-run.v1.schema.json` pins the shared run, event,
   recovery, and review-receipt JSON shapes used by non-Rust consumers.
 - `docs/WEB_BROKER_PROTOCOL.md` is the concrete server-side contract for
