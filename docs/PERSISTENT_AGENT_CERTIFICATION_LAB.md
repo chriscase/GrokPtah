@@ -81,6 +81,97 @@ cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
   run --repository "$PWD"
 ```
 
+### Exact-head Stage 3 authority campaign
+
+The `authority` command is the deny-unknown integrated exit runner for roadmap
+stage 3. It requires one clean Git checkout and binds the report to that exact
+40-character commit. Seven ordered gate families cover the closed role registry,
+credential/workspace/worker narrowing, the read-only Computer Use MCP surface,
+behavioral Computer-read session/workspace isolation, public MCP role filtering
+and authority-bound idempotency, bound-worker impersonation denial, and
+standalone-service token/session/workspace authorization. Together they
+require 22 exact green tests. The authority family also proves that host
+capability profiles are stable, role-separated, and hash-bound. The behavioral
+Computer-read, public MCP, worker,
+and service gates require a host that permits loopback listeners.
+
+Run it serially with the mandatory shared compiler cache and external target:
+
+```sh
+export RUSTC_WRAPPER=/opt/homebrew/bin/sccache
+export SCCACHE_DIR=/Users/chriscase/Library/Caches/grokptah/sccache
+export CARGO_TARGET_DIR=/Users/chriscase/Library/Caches/grokptah/targets/rust-1.92.0-stage5-memory-default
+
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  authority --repository "$PWD"
+```
+
+The target key is shared with Stage 5 because both campaigns use Rust 1.92.0
+and the same bridge/certification-lab default-feature family. It must be owned
+by only one campaign at a time. Record disk, process/open-handle, target-size,
+and sccache evidence before and after the run. Never fall back to an
+in-checkout target.
+
+A failed gate writes one bounded digest checkpoint and leaves the campaign
+incomplete; it cannot write `report.json` or a completion seal. A passing run
+writes beneath `evals/runs/authority-stage3-cert/<campaign-id>/`. Verify it
+independently with:
+
+```sh
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  inspect --campaign "$PWD/evals/runs/authority-stage3-cert/<campaign-id>"
+```
+
+The sealed report binds the four required authority roles, the exact
+RemoteCoordinator/Observer denial contract, authority-bound idempotency,
+worker identity, session/workspace-scoped Computer reads, ordered command
+digests, and exact test cardinalities. It retains no bearer, credential,
+workspace path, raw transcript, or remote body.
+
+### Exact-head Stage 5 memory campaign
+
+The `memory` command is the deny-unknown integrated exit runner for roadmap
+stage 5. It requires one clean Git checkout and binds the report to that exact
+40-character commit. It executes the ordered logical-years, crash/cutpoint,
+compaction/reopen, cross-process restart, scope-isolation, Manager attribution,
+Manager objective, Manager-store restart, supervisor loopback, and native
+proposal gates. A missing, reordered, failed, cardinality-mismatched, or
+candidate-drifted gate leaves an incomplete campaign and cannot create a
+completion seal or certification claim.
+
+Run it serially with the pinned shared compiler cache and a compatibility-keyed
+external target. These variables are mandatory; do not create another target
+inside the checkout:
+
+```sh
+export RUSTC_WRAPPER=/opt/homebrew/bin/sccache
+export SCCACHE_DIR=/Users/chriscase/Library/Caches/grokptah/sccache
+export CARGO_TARGET_DIR=/Users/chriscase/Library/Caches/grokptah/targets/rust-1.92.0-stage5-memory-default
+
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  memory --repository "$PWD"
+```
+
+Owner: the single Stage 5 campaign process. Reuse that target only for this
+Rust 1.92.0/default-feature family and never concurrently. Before the command,
+record disk headroom and verify that no other process owns the target. After
+the command, record the target size, cache statistics, and owner state. Retain
+the shared target for the next serial compatible run; delete only a separately
+named incompatible/concurrent target after final process and open-handle
+checks.
+
+A passing run writes a sealed report beneath
+`evals/runs/memory-stage5-cert/<campaign-id>/`. Independently verify it with:
+
+```sh
+cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+  inspect --campaign "$PWD/evals/runs/memory-stage5-cert/<campaign-id>"
+```
+
+The sealed report retains command/output digests and exact test cardinalities,
+not raw transcripts or credentials. This accelerated logical-years campaign is
+separate from the stage-6 72-hour operational soak.
+
 The default run selects the seven deterministic probes above, creates a
 disposable runtime home and workspace, uses the offline provider path, and
 writes under `evals/runs/persistent-agent-cert/<campaign-id>/`. Override
@@ -320,6 +411,7 @@ failure. A second forced interrupt may terminate with the platform's standard
 | Routines | Manual activation implemented; schedule/dedupe/lifecycle/recovery declared | Scheduled timing requires deterministic clock support. |
 | Coordinator/messages | Parent/child implemented; workers/messages/cursors/expiry/scope declared | Fixed message expiry without clock control is skipped. |
 | Native managed execution | Default-off policy, Work-to-Run, permission parking, duplicate suppression, restart adoption, and interruption retry implemented | Public discovery, default policy, and `nativeExecutor` health are verified. All five live probes use public MCP oracles; restart/retry additionally require an owned local restart and explicit reconnect. Payload-free capture is bound to a successful provider-capture Run, while interrupted/failed scenario Runs are now retained as explicitly labelled recovery evidence. |
+| Manager plans | Plan lifecycle implemented | One offline vertical slice: creation, a non-executable root container, dependency-ordered advance, revision-fenced observation, a failed step, and an explicit replan that reaches terminal success. |
 | Soak | Declared, bounded, not implemented by the minimal runner | Existing coordinator/continuity/soak suites remain complementary evidence. |
 
 On the merged native-executor main, discovery looks only for the audited public tools
@@ -353,6 +445,31 @@ repeated-tick no-duplicate evidence counts the public Work, attempts, intent,
 and linked Runs; it does not invent a `deduplicated` Run state. The
 newest-200-of-500 message prompt assembly is likewise not externally observable
 and remains indeterminate until a public evidence seam exists.
+
+### Manager plan coverage
+
+`manager-plan-lifecycle-v1` is the first manager probe. It runs offline
+against the local service and asserts only public MCP evidence:
+
+- The plan's root Work reports `isContainer` and refuses a claim, so the
+  coordination container can never execute. This is asserted against the
+  host's refusal, not against prompt text.
+- The first `advance` materializes only the step whose dependencies have
+  succeeded; the dependent step stays `pending`. Replaying that one advance
+  request returns the same Work rather than a second item.
+- An `advance` carrying a superseded plan revision is refused.
+- `ptah_tick_manager_plan` projects the terminal child outcome into one
+  durable notification, and repeating the tick notifies nothing further for
+  the same Work revision. The tick advances the active plan before it
+  observes, so the dependent step's Work is read from the durable plan
+  projection rather than from a second `advance`.
+- A failed child leaves the plan `needs_replan` and creates no replacement
+  Work. Only an explicit `ptah_replan_manager_plan` supersedes the failed step
+  and its blocked descendants, after which the plan reaches `succeeded`.
+
+The probe does not exercise the autonomous supervisor, `manager-decision`
+Runs, or proposal-only capability enforcement; those need native managed
+execution and remain uncovered.
 
 ## Adding a probe or fixture
 

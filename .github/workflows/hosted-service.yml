@@ -1,0 +1,68 @@
+name: Hosted Service
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/codegen/grokptah-service/**"
+      - "crates/codegen/grokptah-agent-bridge/**"
+      - "crates/codegen/grokptah-service/Cargo.lock"
+      - "crates/codegen/grokptah-agent-bridge/Cargo.lock"
+      - ".github/workflows/hosted-service.yml"
+  pull_request:
+    paths:
+      - "crates/codegen/grokptah-service/**"
+      - "crates/codegen/grokptah-agent-bridge/**"
+      - "crates/codegen/grokptah-service/Cargo.lock"
+      - "crates/codegen/grokptah-agent-bridge/Cargo.lock"
+      - ".github/workflows/hosted-service.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-service-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  hosted-service:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'READ_ONLY' || 'READ_WRITE' }}
+    defaults:
+      run:
+        working-directory: crates/codegen/grokptah-service
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+      - name: Configure compiler-cache namespace
+        env:
+          SCCACHE_NAMESPACE: grokptah-service-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.92-${{ hashFiles('crates/codegen/grokptah-service/Cargo.lock', 'crates/codegen/grokptah-agent-bridge/Cargo.lock') }}
+        run: echo "SCCACHE_GHA_VERSION=${SCCACHE_NAMESPACE}" >> "$GITHUB_ENV"
+      - name: Install compiler cache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: "v0.16.0"
+      - name: Install Linux keyring build deps
+        # The bridge's keyring crate needs libdbus on Ubuntu. Desktop CI is
+        # macOS and does not substitute for this hosted-service job.
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+      - name: Format, clippy, and complete hosted-service tests
+        # Always run this crate's own suite. Compiling the bridge in another
+        # workflow is not a substitute for hosted-service tests.
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked -- --test-threads=1

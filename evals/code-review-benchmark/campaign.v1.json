@@ -1,0 +1,225 @@
+{
+  "schema": "grokptah.code-review-benchmark-campaign.v1",
+  "campaign_id": "code-review-benchmark-v1",
+  "suite_id": "code-review-benchmark-suite-v1",
+  "held_out": true,
+  "live_replicate_count": 2,
+  "corpus": {
+    "relative_path": "corpus.v1.json",
+    "schema": "grokptah.code-review-benchmark-corpus.v1",
+    "corpus_id": "code-review-benchmark-corpus-v1",
+    "corpus_version": 1
+  },
+  "fake_provider": {
+    "relative_path": "fake-provider.v1.json",
+    "schema": "grokptah.code-review-benchmark-fake-provider.v1",
+    "provider_id": "code-review-benchmark-fake-provider-v1",
+    "provider_version": 1
+  },
+  "pairing": {
+    "same_deployment": true,
+    "same_route": true,
+    "same_credential": true,
+    "same_model": true,
+    "same_effort": true,
+    "same_decoding": true,
+    "same_corpus_digest": true,
+    "same_prompt_cap": true,
+    "same_response_cap": true
+  },
+  "prompt_cap_bytes": 32768,
+  "response_cap_bytes": 8192,
+  "arms": [
+    {
+      "id": "baseline",
+      "session_policy": "fresh_per_case",
+      "max_requests_per_case": 1,
+      "max_tokens_per_case": 8000,
+      "max_duration_seconds_per_case": 120,
+      "tools_allowed": [],
+      "memory_allowed": false
+    },
+    {
+      "id": "grokptah",
+      "session_policy": "persistent_per_family",
+      "max_requests_per_case": 6,
+      "max_tokens_per_case": 24000,
+      "max_duration_seconds_per_case": 600,
+      "tools_allowed": [
+        "manifest_read",
+        "search",
+        "scoped_memory"
+      ],
+      "memory_allowed": true
+    }
+  ],
+  "denied_tools": [
+    "shell",
+    "write",
+    "mcp",
+    "computer",
+    "publish"
+  ],
+  "bounds": {
+    "max_provider_requests": 400,
+    "max_authoritative_tokens": 1250000,
+    "max_duration_seconds": 28800,
+    "max_continuations": 8,
+    "max_artifact_bytes": 134217728
+  },
+  "thresholds": {
+    "precision": 0.75,
+    "weighted_recall": 0.75,
+    "high_critical_recall": 0.85,
+    "usefulness": 0.7,
+    "brier": 0.2,
+    "ece": 0.15,
+    "paired_weighted_utility_lift": 0.15,
+    "paired_weighted_utility_lift_ci_lower": 0.08,
+    "recall_lift": 0.15,
+    "recall_lift_ci_lower": 0.05,
+    "family_wins": 6,
+    "family_count": 8,
+    "family_max_worse": 0.1,
+    "token_ratio": 6.0,
+    "request_ratio": 6.0,
+    "wall_ratio": 5.0
+  },
+  "workspace_policy": {
+    "kind": "synthetic_disposable",
+    "writable": false,
+    "disposable_required": true,
+    "max_seed_bytes": 65536
+  },
+  "actions": [
+    "materialize_synthetic_workspace",
+    "snapshot_workspace_pre",
+    "bind_paired_arms",
+    "run_baseline_arm",
+    "run_grokptah_arm",
+    "restart_after_durable_admission",
+    "observe_route_drift",
+    "observe_quota_one_under",
+    "observe_quota_exhausted",
+    "observe_quota_window_advance",
+    "deny_mutators_and_publish",
+    "prove_inaccessible_canary_absent",
+    "snapshot_workspace_post",
+    "score_one_to_one",
+    "seal_public_report"
+  ],
+  "oracles": [
+    "workspace_merkle_unchanged",
+    "git_refs_unchanged",
+    "remote_publication_unchanged",
+    "baseline_exactly_one_request",
+    "grokptah_request_bound",
+    "paired_binding_identical",
+    "no_forbidden_tools",
+    "restart_no_implicit_resend",
+    "restart_no_duplicate_finding",
+    "route_drift_freezes_inflight",
+    "route_drift_blocks_until_requalified",
+    "quota_one_under_admits",
+    "quota_exhausted_blocks",
+    "quota_window_advance_resets",
+    "mutators_denied",
+    "publish_denied",
+    "canary_absent_from_requests",
+    "canary_absent_from_evidence",
+    "fake_quality_ineligible",
+    "authoritative_usage_present",
+    "public_redaction_passed",
+    "scorer_one_to_one",
+    "scripted_findings_consumed",
+    "declared_cases_consumed"
+  ],
+  "artifacts": [
+    {
+      "id": "report",
+      "relative_path": "report.json",
+      "role": "sealed_public_report"
+    },
+    {
+      "id": "campaign",
+      "relative_path": "contract/campaign.json",
+      "role": "suite_manifest"
+    },
+    {
+      "id": "fingerprint",
+      "relative_path": "contract/fingerprint.json",
+      "role": "digest_fingerprint"
+    },
+    {
+      "id": "implementation",
+      "relative_path": "contract/implementation.json",
+      "role": "implementation_identity"
+    }
+  ],
+  "families": [
+    {
+      "id": "family-numeric-ledger-v1",
+      "case_ids": [
+        "case-ledger-range-v1",
+        "case-ledger-overflow-v1",
+        "case-ledger-quota-v1"
+      ]
+    },
+    {
+      "id": "family-pipeline-dataflow-v1",
+      "case_ids": [
+        "case-flow-taint-v1",
+        "case-flow-alias-v1",
+        "case-flow-docs-v1"
+      ]
+    },
+    {
+      "id": "family-auth-gateway-v1",
+      "case_ids": [
+        "case-auth-injection-v1",
+        "case-auth-secret-v1",
+        "case-auth-session-v1"
+      ]
+    },
+    {
+      "id": "family-job-scheduler-v1",
+      "case_ids": [
+        "case-sched-race-v1",
+        "case-sched-retry-v1",
+        "case-sched-restart-v1"
+      ]
+    },
+    {
+      "id": "family-quota-meter-v1",
+      "case_ids": [
+        "case-meter-window-v1",
+        "case-meter-steal-v1",
+        "case-meter-docs-v1"
+      ]
+    },
+    {
+      "id": "family-public-api-v1",
+      "case_ids": [
+        "case-api-compat-v1",
+        "case-api-schema-v1",
+        "case-api-bounds-v1"
+      ]
+    },
+    {
+      "id": "family-ops-runbook-v1",
+      "case_ids": [
+        "case-ops-restart-v1",
+        "case-ops-quota-v1",
+        "case-ops-secret-v1"
+      ]
+    },
+    {
+      "id": "family-session-store-v1",
+      "case_ids": [
+        "case-store-dataflow-v1",
+        "case-store-dataflow-2-v1",
+        "case-store-bounds-v1"
+      ]
+    }
+  ]
+}

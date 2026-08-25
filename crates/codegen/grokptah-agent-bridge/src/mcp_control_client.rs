@@ -402,13 +402,8 @@ impl McpControlClient {
         if let Some(session_id) = response_session_id {
             self.session_id = Some(session_id);
         }
-        if let Some(err) = v.get("error") {
-            let data_code = err
-                .get("data")
-                .and_then(|data| data.get("code"))
-                .and_then(Value::as_str)
-                .and_then(normalize_remote_error_code);
-            return Err(McpRemoteError { data_code }.into());
+        if let Some(error) = mcp_remote_error_from_json(&v) {
+            return Err(error);
         }
         if !status.is_success() {
             return Err(McpHttpStatusError.into());
@@ -443,6 +438,9 @@ impl McpControlClient {
             .json(&body);
         if with_auth {
             req = req.header("Authorization", format!("Bearer {}", self.token));
+        }
+        if let Some(session_id) = &self.session_id {
+            req = req.header("mcp-session-id", session_id);
         }
         bounded_non_streaming(self.operation_timeout, async move {
             let resp = req.send().await.map_err(|_| McpTransportError)?;
@@ -578,6 +576,10 @@ impl McpControlClient {
             .map_err(|_| McpTransportError)?
             .map_err(|_| McpTransportError)?;
         if !response.status().is_success() {
+            let value = bounded_response_json(response).await.unwrap_or(Value::Null);
+            if let Some(error) = mcp_remote_error_from_json(&value) {
+                return Err(error);
+            }
             return Err(McpHttpStatusError.into());
         }
         let content_type = response
@@ -713,11 +715,33 @@ fn append_bounded_response_chunk(bytes: &mut Vec<u8>, chunk: &[u8]) -> anyhow::R
     Ok(())
 }
 
+fn mcp_remote_error_from_json(value: &Value) -> Option<anyhow::Error> {
+    value.get("error").map(|err| {
+        let data_code = err
+            .get("data")
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str)
+            .and_then(normalize_remote_error_code);
+        McpRemoteError { data_code }.into()
+    })
+}
+
 fn normalize_remote_error_code(value: &str) -> Option<String> {
     match value {
-        "unauthenticated" | "forbidden_scope" | "workspace_mismatch" | "session_busy"
-        | "capacity_exhausted" | "stale_version" | "cursor_expired" | "internal" | "timeout"
-        | "invalid_request" | "unsupported" | "conflict" => Some(value.to_owned()),
+        "unauthenticated"
+        | "forbidden_scope"
+        | "workspace_mismatch"
+        | "session_busy"
+        | "capacity_exhausted"
+        | "stale_version"
+        | "cursor_expired"
+        | "internal"
+        | "timeout"
+        | "invalid_request"
+        | "unknown_session"
+        | "unsupported"
+        | "conflict"
+        | "admission_uncertain" => Some(value.to_owned()),
         _ => None,
     }
 }
@@ -764,7 +788,8 @@ mod tests {
     use crate::host::{AgentHost, HostConfig};
     use crate::mcp_control::start_control_server;
     use crate::orchestration::{
-        OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+        AuthCredential, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
+        WorkspaceAllowlist,
     };
     use crate::{home_override_serial, set_grokptah_home_override};
     use axum::body::Body;
@@ -853,6 +878,57 @@ mod tests {
         set_grokptah_home_override(None);
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn rpc_raw_attaches_established_session_id() {
+        let _guard = home_override_serial();
+        let home = tempdir().unwrap();
+        set_grokptah_home_override(Some(home.path().join(".grokptah")));
+        let ws = tempdir().unwrap();
+        let host = AgentHost::create(HostConfig {
+            always_approve: true,
+            ..HostConfig::default()
+        });
+        let orch = OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            OrchStore::open(home.path().join("orch")).unwrap(),
+            OrchestrationConfig {
+                bearer_token: "unused-primary".into(),
+                allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+                max_concurrent_runs: 2,
+                bounds: RunBounds::default(),
+            },
+        );
+        orch.set_auth_credentials(vec![
+            AuthCredential::new("primary", "rpc-raw-a").unwrap(),
+            AuthCredential::new("secondary", "rpc-raw-b").unwrap(),
+        ])
+        .unwrap();
+        let server = start_control_server(orch, 0).await.unwrap();
+        let mut client = McpControlClient::new(format!("http://{}", server.addr), "rpc-raw-a");
+        client.initialize().await.unwrap();
+        let session_id = client.session_id().unwrap().to_string();
+
+        let (status, _) = client
+            .rpc_raw("2.0", "ping", json!({}), true)
+            .await
+            .unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK);
+
+        client.token = "rpc-raw-b".into();
+        assert_eq!(client.session_id(), Some(session_id.as_str()));
+        let (status, body) = client
+            .rpc_raw("2.0", "ping", json!({}), true)
+            .await
+            .unwrap();
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["data"]["code"], "unauthenticated");
+
+        server.stop();
+        set_grokptah_home_override(None);
+    }
+
     #[test]
     fn schema_validation_rejects_extra_and_missing() {
         let schema = json!({
@@ -871,6 +947,14 @@ mod tests {
         assert_eq!(
             normalize_remote_error_code("conflict").as_deref(),
             Some("conflict")
+        );
+        assert_eq!(
+            normalize_remote_error_code("admission_uncertain").as_deref(),
+            Some("admission_uncertain")
+        );
+        assert_eq!(
+            normalize_remote_error_code("unknown_session").as_deref(),
+            Some("unknown_session")
         );
         assert!(normalize_remote_error_code("xai_private_token_material_123456789").is_none());
         assert!(normalize_remote_error_code("unknown_future_code").is_none());

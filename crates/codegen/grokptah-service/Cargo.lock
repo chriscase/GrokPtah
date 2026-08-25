@@ -506,6 +506,7 @@ dependencies = [
  "parking_lot",
  "regex",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -525,11 +526,21 @@ dependencies = [
  "chrono",
  "dunce",
  "grokptah-agent-bridge",
+ "grokptah-test-gateway",
  "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "grokptah-test-gateway"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

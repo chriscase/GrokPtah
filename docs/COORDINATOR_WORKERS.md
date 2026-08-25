@@ -18,11 +18,20 @@ from:
 A live heartbeat is not a lease. Lease ownership is only an active
 `WorkAttempt` whose claimant is that Agent.
 
+Lease-scoped renew, link, progress, release, completion, and failure calls
+also re-check the durable attempt claimant for a bound credential; possession
+of a lease token alone cannot turn one worker bearer into another worker.
+
 ### Authenticated principal versus Agent resource
 
 Named control-plane credentials (`AuthCredential`) share one service account
-(`owner_id`) and are **operator-equivalent** in this slice. They are not bound
-to a specific Agent. Per-principal worker credentials are deferred.
+(`owner_id`). A credential may remain coordinator-scoped, or may be bound to
+exactly one durable Agent with `with_agent_binding`. Bound credentials cannot
+name another Agent, and omitted worker identities resolve to their bound
+identity. This narrows impersonation without treating a bearer as proof that
+the Agent resource exists; the normal session/workspace/active-identity checks
+still apply. Production-shaped credential issuance and the long-running
+multi-worker evidence remain open.
 
 That does not let a caller invent or impersonate an Agent identity:
 
@@ -31,10 +40,10 @@ That does not let a caller invent or impersonate an Agent identity:
 | `from_actor` / `actor_id` / `credential_id` | authenticated `token_id` | The bearer that performed the mutation |
 | `from_agent_id` / `to_agent_id` / `actor_agent_id` / `agent_id` | request, then store | Durable Agent **resource** the principal named |
 
-The service never copies a caller-supplied Agent id into `from_actor`. A
-worker credential that names `from_agent_id` of another in-scope Agent is
-recorded as that credential **acting on behalf of** the Agent, not as the
-Agent itself.
+The service never copies a caller-supplied Agent id into `from_actor`. An
+unbound coordinator credential that names `from_agent_id` is recorded as that
+credential **acting on behalf of** the Agent, not as the Agent itself. A bound
+worker credential cannot make that cross-identity request.
 
 Every referenced Agent is loaded under the store lock and must:
 
@@ -135,14 +144,16 @@ returns the original Work or message and creates no duplicate.
 
 ## Follow-up
 
-- **Per-principal worker credentials.** Bind a credential to one Agent so a
-  worker bearer cannot name another Agent as `from_agent_id` / `agent_id`.
-  Until that exists, operator-equivalent bearers may act on behalf of any
-  in-scope Agent, and the durable record always stores the authenticated
-  principal separately.
+- **Production-shaped worker credential issuance.** The runtime supports
+  host-issued credentials and service configuration supports externally
+  managed credentials bound to one Agent and scoped to the final workspace
+  allowlist. In-process and restart-based rotation reject the retired bearer.
+  The candidate Stage 6 process runner exercises issuance, restart rotation,
+  cross-identity denial, two simultaneous leases, and retained records, but a
+  completed 72-hour exact-head artifact is still required before release.
 - **Coordinator-only versus worker-only tools.** Keep the current
-  operator-equivalent bearer model until that binding exists; do not split
-  the control-plane credential set in this slice.
+  explicit credential set and scope; the primary bearer remains the
+  coordinator path while issued worker bearers are narrower.
 - **`WorkDecision` attribution on block / reprioritize / review.** Populate
   `actor_agent_id` and `policy_revision` once those APIs accept an optional
   acting Agent. They remain absent here because the request has no Agent

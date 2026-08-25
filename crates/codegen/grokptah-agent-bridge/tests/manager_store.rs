@@ -1,7 +1,8 @@
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
-    ManagerDecisionRecord, ManagerDecisionState, ManagerPlan, ManagerStepSpec, OrchStore, WorkItem,
-    WorkPolicy, WorkState, MANAGER_SCHEMA_VERSION,
+    AgentMemoryPolicy, ManagerDecisionRecord, ManagerDecisionState, ManagerMemoryAttribution,
+    ManagerPlan, ManagerStepSpec, OrchStore, WorkItem, WorkPolicy, WorkState,
+    MANAGER_SCHEMA_VERSION,
 };
 use grokptah_agent_bridge::{AgentRecord, AgentState};
 use tempfile::tempdir;
@@ -173,10 +174,21 @@ fn decision_occurrence_and_work_replay_once_after_restart() {
         expected_plan_revision: 3,
         manager_agent_id: "manager".into(),
         agent_spec_revision: 1,
+        memory_attribution: ManagerMemoryAttribution::new(
+            "manager",
+            1,
+            workspace,
+            &AgentMemoryPolicy::default(),
+            "",
+        )
+        .unwrap(),
         triggering_work_ids: vec!["failed-work".into()],
         triggering_message_ids: vec![],
         input_snapshot_hash: "snapshot-hash".into(),
         decision_work_id: work.work_id.clone(),
+        decision_work_objective_digest: grokptah_agent_bridge::orchestration::hash_payload(
+            &serde_json::json!({"objective": work.objective}),
+        ),
         run_id: None,
         state: ManagerDecisionState::AwaitingResult,
         proposed_directive: None,

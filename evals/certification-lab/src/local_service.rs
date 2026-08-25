@@ -8,17 +8,26 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use chrono::Utc;
 use grokptah_agent_bridge::provider_observation::ProviderObservationSession;
 use grokptah_agent_bridge::{
-    home_override_serial, start_control_server_with, AgentHost, AgentHostHandle,
-    ControlServerHandle, ControlServerLimits, HostConfig, McpControlClient, OrchestrationConfig,
-    OrchestrationService, RunBounds, RuntimeHome, WorkspaceAllowlist,
+    admit_enterprise_review_with_trust, home_override_serial, start_control_server_with, AgentHost,
+    AgentHostHandle, AuthCredential, ControlServerHandle, ControlServerLimits,
+    EnterpriseGatewayTrust, EnterpriseReviewEvidence, EnterpriseReviewLease,
+    EnterpriseReviewPolicy, HostConfig, McpControlClient, OrchestrationConfig,
+    OrchestrationService, RunBounds, RuntimeHome, WorkspaceAllowlist, FORBIDDEN_TOOLS,
 };
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const OFFLINE_ENV: &str = "GROKPTAH_AGENT_OFFLINE";
+const ENTERPRISE_REVIEW_LEASE_ENV: &str = "GROKPTAH_ENTERPRISE_REVIEW_LEASE";
+const ENTERPRISE_REVIEW_TRUST_ENV: &str = "GROKPTAH_ENTERPRISE_REVIEW_TRUST";
+const MAX_ENTERPRISE_REVIEW_LEASE_BYTES: u64 = 64 * 1024;
+const MAX_ENTERPRISE_REVIEW_TRUST_BYTES: u64 = 8 * 1024;
 pub const DEFAULT_LIVE_MODEL: &str = "grok-build";
 
 /// Whether locally hosted model turns use the deterministic offline runtime or
@@ -202,6 +211,11 @@ impl LocalService {
     }
 
     async fn shutdown_parts(&mut self) {
+        if let Some(host) = self.host.as_ref() {
+            // Signal host-owned turns before awaiting the control-plane
+            // shutdown so finalizers can release the runtime-home lock.
+            let _ = host.stop();
+        }
         if let Some(server) = self.server.take() {
             server.stop_and_wait().await;
         }
@@ -273,6 +287,12 @@ async fn bootstrap(
             bounds,
         },
     );
+    // The owned certification lane intentionally exercises protected
+    // orchestration controls. Make that authority explicit instead of relying
+    // on the product's safe coordinator default for ordinary bearer tokens.
+    orchestration
+        .set_auth_credentials(vec![AuthCredential::operator("primary", token)?])
+        .context("install isolated certification operator credential")?;
     let limits = ControlServerLimits {
         max_concurrent: config.max_concurrent,
         ..ControlServerLimits::default()
@@ -297,6 +317,353 @@ fn generated_token() -> String {
         Uuid::new_v4().simple(),
         Uuid::new_v4().simple()
     )
+}
+
+/// Live enterprise-gateway attach for the code-review benchmark.
+///
+/// The host accepts only a broker-issued, short-lived lease file. It does not
+/// mint leases, discover ambient gateways, or install a compatible-gateway
+/// bypass. Missing, stale, malformed, or broadened evidence remains refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnterpriseReviewLiveGap {
+    pub disposable_lease: bool,
+    pub gateway_signed_deployment_attestation: bool,
+    pub egress_firewall_attestation: bool,
+}
+
+/// Load and re-admit the operator-owned enterprise review lease.
+///
+/// The broker hands the lab paths to a short-lived, secret-free JSON lease and
+/// an operator-selected public-key trust record;
+/// bearer tokens, endpoint URLs, and provider responses never cross this
+/// boundary. The file must be a regular file under the caller's control and
+/// is bounded before parsing. A valid lease still only proves admission: the
+/// live review runner remains indeterminate until real provider observations,
+/// usage receipts, and paired quality evidence exist.
+pub fn enterprise_review_live_evidence() -> Result<EnterpriseReviewEvidence, EnterpriseReviewLiveGap>
+{
+    let path = std::env::var_os(ENTERPRISE_REVIEW_LEASE_ENV).ok_or(EnterpriseReviewLiveGap {
+        disposable_lease: false,
+        gateway_signed_deployment_attestation: false,
+        egress_firewall_attestation: false,
+    })?;
+    let trust_path =
+        std::env::var_os(ENTERPRISE_REVIEW_TRUST_ENV).ok_or(EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        })?;
+    let path = PathBuf::from(path);
+    let trust_path = PathBuf::from(trust_path);
+    if !path.is_absolute() || !trust_path.is_absolute() {
+        return Err(EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        });
+    }
+    let metadata = std::fs::symlink_metadata(&path).map_err(|_| EnterpriseReviewLiveGap {
+        disposable_lease: false,
+        gateway_signed_deployment_attestation: false,
+        egress_firewall_attestation: false,
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_ENTERPRISE_REVIEW_LEASE_BYTES {
+        return Err(EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        });
+    }
+    let bytes = std::fs::read(&path).map_err(|_| EnterpriseReviewLiveGap {
+        disposable_lease: false,
+        gateway_signed_deployment_attestation: false,
+        egress_firewall_attestation: false,
+    })?;
+    if bytes.len() as u64 > MAX_ENTERPRISE_REVIEW_LEASE_BYTES {
+        return Err(EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        });
+    }
+    let trust_metadata =
+        std::fs::symlink_metadata(&trust_path).map_err(|_| EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        })?;
+    if !trust_metadata.file_type().is_file()
+        || trust_metadata.len() > MAX_ENTERPRISE_REVIEW_TRUST_BYTES
+    {
+        return Err(EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        });
+    }
+    let trust_bytes = std::fs::read(&trust_path).map_err(|_| EnterpriseReviewLiveGap {
+        disposable_lease: false,
+        gateway_signed_deployment_attestation: false,
+        egress_firewall_attestation: false,
+    })?;
+    if trust_bytes.len() as u64 > MAX_ENTERPRISE_REVIEW_TRUST_BYTES {
+        return Err(EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        });
+    }
+    let lease: EnterpriseReviewLease =
+        serde_json::from_slice(&bytes).map_err(|_| EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        })?;
+    let trust: EnterpriseGatewayTrust =
+        serde_json::from_slice(&trust_bytes).map_err(|_| EnterpriseReviewLiveGap {
+            disposable_lease: false,
+            gateway_signed_deployment_attestation: false,
+            egress_firewall_attestation: false,
+        })?;
+    let evidence = admit_enterprise_review_with_trust(
+        &lease,
+        &EnterpriseReviewPolicy::default(),
+        Utc::now(),
+        &trust,
+    )
+    .map_err(|_| EnterpriseReviewLiveGap {
+        disposable_lease: false,
+        gateway_signed_deployment_attestation: false,
+        egress_firewall_attestation: false,
+    })?;
+    evidence.validate().map_err(|_| EnterpriseReviewLiveGap {
+        disposable_lease: false,
+        gateway_signed_deployment_attestation: false,
+        egress_firewall_attestation: false,
+    })?;
+    Ok(evidence)
+}
+
+pub fn enterprise_review_live_attach() -> Result<(), EnterpriseReviewLiveGap> {
+    enterprise_review_live_evidence().map(|_| ())
+}
+
+/// Observed denials from the public MCP control-plane allowlist.
+///
+/// This is not a GrokPtah Agent review turn and does not observe a live
+/// provider. It records that scripted malicious wire names were refused by
+/// the first real control-plane authorization boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewControlPlaneEvidence {
+    pub listed_tool_count: u32,
+    pub forbidden_tools_listed: u32,
+    pub denied_wire_calls: u32,
+    pub successful_denied_wire_calls: u32,
+    pub restart_count: u32,
+}
+
+/// Whether this process can bind a loopback listener for the isolated control plane.
+pub(crate) fn loopback_bind_available() -> bool {
+    match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)) {
+        Ok(listener) => {
+            drop(listener);
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => false,
+        Err(error) => panic!("unexpected loopback availability failure: {error}"),
+    }
+}
+
+/// Drive scripted malicious wire names through [`LocalService`] + [`McpControlClient`].
+///
+/// `always_approve` stays false. Successful dispatch of a denied wire name is a
+/// contract failure. Restart reopens the same durable home and must still omit
+/// [`FORBIDDEN_TOOLS`].
+pub async fn exercise_review_control_plane(
+    workspace: &Path,
+    runtime_home: &Path,
+    wire_names: &[String],
+) -> Result<ReviewControlPlaneEvidence> {
+    if !loopback_bind_available() {
+        bail!("review_loopback_bind_unavailable");
+    }
+    if wire_names.is_empty() {
+        bail!("review control plane requires scripted malicious wire names");
+    }
+    let config = LocalServiceConfig::new(
+        runtime_home,
+        vec![workspace.to_path_buf()],
+        LocalServiceMode::Offline,
+        1,
+        3,
+        60_000,
+        8_000,
+    );
+    let mut service = LocalService::start(config).await?;
+    let mut client = service.client();
+    client
+        .initialize()
+        .await
+        .context("initialize review control-plane client")?;
+    let listed = client
+        .list_tools()
+        .await
+        .context("list review control-plane tools")?;
+    let listed_names: HashSet<&str> = listed.iter().map(|tool| tool.name.as_str()).collect();
+    let mut forbidden_tools_listed = 0u32;
+    for forbidden in FORBIDDEN_TOOLS {
+        if listed_names.contains(*forbidden) {
+            forbidden_tools_listed = forbidden_tools_listed.saturating_add(1);
+        }
+    }
+    if forbidden_tools_listed > 0 {
+        service.stop().await;
+        bail!("forbidden tool listed on the review control plane");
+    }
+    let mut denied_wire_calls = 0u32;
+    let mut successful_denied_wire_calls = 0u32;
+    for name in wire_names {
+        match client.call_tool(name, serde_json::json!({})).await {
+            Ok(result) if !result.is_error => {
+                successful_denied_wire_calls = successful_denied_wire_calls.saturating_add(1);
+            }
+            Ok(_) | Err(_) => {
+                denied_wire_calls = denied_wire_calls.saturating_add(1);
+            }
+        }
+    }
+    service
+        .restart()
+        .await
+        .context("restart review control plane")?;
+    let mut client = service.client();
+    client
+        .initialize()
+        .await
+        .context("reinitialize review control-plane client")?;
+    let listed_after = client
+        .list_tools()
+        .await
+        .context("list review control-plane tools after restart")?;
+    for forbidden in FORBIDDEN_TOOLS {
+        if listed_after.iter().any(|tool| tool.name == *forbidden) {
+            service.stop().await;
+            bail!("forbidden tool listed on the review control plane after restart");
+        }
+    }
+    let listed_tool_count =
+        u32::try_from(listed_after.len()).context("listed tool count overflow")?;
+    service.stop().await;
+    if successful_denied_wire_calls > 0 {
+        bail!("malicious control-plane call succeeded");
+    }
+    if denied_wire_calls != u32::try_from(wire_names.len()).context("wire name count")? {
+        bail!("control plane did not deny every scripted malicious wire name");
+    }
+    Ok(ReviewControlPlaneEvidence {
+        listed_tool_count,
+        forbidden_tools_listed: 0,
+        denied_wire_calls,
+        successful_denied_wire_calls: 0,
+        restart_count: 1,
+    })
+}
+
+/// Merkle root over a directory tree. Symbolic links fail closed. Relative
+/// paths are mixed into the digest but never returned.
+pub fn workspace_merkle_root(root: &Path) -> Result<String> {
+    let mut entries = Vec::new();
+    collect_merkle_entries(root, root, &mut entries)?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    for (relative, digest, bytes) in entries {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(digest.as_bytes());
+        hasher.update(bytes.to_le_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRefSnapshot {
+    pub head_digest: String,
+    pub refs_digest: String,
+    pub remote_publication_count: u32,
+}
+
+/// Snapshot git HEAD, refs, and remote-tracking publication count. The raw
+/// refs never leave this function; only SHA-256 fingerprints are returned.
+pub fn git_ref_snapshot(root: &Path) -> Result<GitRefSnapshot> {
+    let head = git_stdout(root, &["rev-parse", "HEAD"])?;
+    let refs = git_stdout(root, &["show-ref", "--head"])?;
+    let remotes = git_stdout(
+        root,
+        &["for-each-ref", "--format=%(refname)", "refs/remotes"],
+    )?;
+    let remote_publication_count =
+        u32::try_from(remotes.lines().filter(|line| !line.is_empty()).count())
+            .context("remote publication count overflow")?;
+    Ok(GitRefSnapshot {
+        head_digest: format!("{:x}", Sha256::digest(head.as_bytes())),
+        refs_digest: format!("{:x}", Sha256::digest(refs.as_bytes())),
+        remote_publication_count,
+    })
+}
+
+fn collect_merkle_entries(
+    root: &Path,
+    directory: &Path,
+    entries: &mut Vec<(String, String, u64)>,
+) -> Result<()> {
+    let mut children = Vec::new();
+    for child in std::fs::read_dir(directory).context("read workspace tree")? {
+        children.push(child.context("read workspace entry")?);
+    }
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        let path = child.path();
+        let metadata = std::fs::symlink_metadata(&path).context("stat workspace entry")?;
+        if metadata.file_type().is_symlink() {
+            bail!("workspace tree contains a symbolic link");
+        }
+        if child.file_name() == ".git" {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .context("workspace path escaped its root")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if metadata.is_dir() {
+            collect_merkle_entries(root, &path, entries)?;
+        } else if metadata.is_file() {
+            let bytes = std::fs::read(&path).context("read workspace file")?;
+            entries.push((
+                relative,
+                format!("{:x}", Sha256::digest(&bytes)),
+                bytes.len() as u64,
+            ));
+        } else {
+            bail!("workspace tree contains a non-regular entry");
+        }
+    }
+    Ok(())
+}
+
+fn git_stdout(root: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .context("invoke git for workspace snapshot")?;
+    if !output.status.success() {
+        bail!("git workspace snapshot failed");
+    }
+    String::from_utf8(output.stdout).context("git snapshot was not UTF-8")
 }
 
 pub(crate) fn validate_public_model(model: &str) -> Result<()> {
@@ -351,21 +718,24 @@ impl Drop for ProcessEnvironment {
 
 #[cfg(test)]
 pub(crate) fn loopback_test_available() -> bool {
-    match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)) {
-        Ok(listener) => {
-            drop(listener);
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!("loopback integration skipped: execution sandbox forbids listeners");
-            false
-        }
-        Err(error) => panic!("unexpected loopback availability failure: {error}"),
+    if loopback_bind_available() {
+        true
+    } else {
+        eprintln!("loopback integration skipped: execution sandbox forbids listeners");
+        false
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Duration, Utc};
+    use grokptah_agent_bridge::{
+        attestation_signing_bytes, expected_lease_binding_digest, expected_route_binding_digest,
+        EnterpriseGatewayAttestation, EnterpriseGatewayTrust, EnterpriseModelTier,
+        ENTERPRISE_REVIEW_ATTESTATION_SCHEMA, ENTERPRISE_REVIEW_LEASE_SCHEMA,
+        ENTERPRISE_REVIEW_TRUST_SCHEMA, MAX_ENTERPRISE_REVIEW_DURATION_MS,
+        MAX_ENTERPRISE_REVIEW_REQUESTS, MAX_ENTERPRISE_REVIEW_TOKENS,
+    };
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -452,5 +822,190 @@ mod tests {
         );
         assert!(config.clone().with_model("opaque-private-route").is_err());
         assert!(config.with_model("grok-build").is_ok());
+    }
+
+    fn valid_enterprise_lease() -> EnterpriseReviewLease {
+        let now = Utc::now();
+        let mut lease = EnterpriseReviewLease {
+            schema: ENTERPRISE_REVIEW_LEASE_SCHEMA.to_owned(),
+            lease_id: "lease-certification".to_owned(),
+            credential_id: "credential-certification".to_owned(),
+            route_id: "company-gateway".to_owned(),
+            endpoint_fingerprint: "a".repeat(64),
+            credential_fingerprint: format!("v1-sha256:{}", "b".repeat(64)),
+            model_id: "modest-review-v1".to_owned(),
+            model_tier: EnterpriseModelTier::Modest,
+            issued_at: now - Duration::minutes(1),
+            expires_at: now + Duration::hours(1),
+            route_binding_digest: String::new(),
+            read_only: true,
+            allow_network: false,
+            allow_workspace_writes: false,
+            allow_publication: false,
+            max_requests: MAX_ENTERPRISE_REVIEW_REQUESTS,
+            max_tokens: MAX_ENTERPRISE_REVIEW_TOKENS,
+            max_duration_ms: MAX_ENTERPRISE_REVIEW_DURATION_MS,
+            attestation: EnterpriseGatewayAttestation {
+                schema: ENTERPRISE_REVIEW_ATTESTATION_SCHEMA.to_owned(),
+                route_id: "company-gateway".to_owned(),
+                endpoint_fingerprint: "a".repeat(64),
+                credential_fingerprint: format!("v1-sha256:{}", "b".repeat(64)),
+                model_id: "modest-review-v1".to_owned(),
+                model_tier: EnterpriseModelTier::Modest,
+                deployment_revision: "deployment-certification".to_owned(),
+                issued_at: now - Duration::minutes(1),
+                expires_at: now + Duration::hours(1),
+                no_premium_fallback: true,
+                egress_firewall_attested: true,
+                lease_binding_digest: String::new(),
+                signing_key_id: None,
+                signature: None,
+            },
+        };
+        lease.route_binding_digest = expected_route_binding_digest(&lease);
+        lease.attestation.lease_binding_digest = expected_lease_binding_digest(&lease);
+        lease
+    }
+
+    fn signed_enterprise_lease() -> (EnterpriseReviewLease, EnterpriseGatewayTrust) {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let mut lease = valid_enterprise_lease();
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&[7u8; 32]).unwrap();
+        let trust = EnterpriseGatewayTrust {
+            schema: ENTERPRISE_REVIEW_TRUST_SCHEMA.to_owned(),
+            key_id: "broker-key-1".to_owned(),
+            public_key_hex: key_pair
+                .public_key()
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        };
+        lease.attestation.signing_key_id = Some(trust.key_id.clone());
+        lease.attestation.signature = Some(
+            key_pair
+                .sign(&attestation_signing_bytes(&lease.attestation))
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        );
+        (lease, trust)
+    }
+
+    #[test]
+    fn enterprise_review_live_attach_requires_broker_lease_file() {
+        let _serial = home_override_serial();
+        let previous = std::env::var_os(ENTERPRISE_REVIEW_LEASE_ENV);
+        let previous_trust = std::env::var_os(ENTERPRISE_REVIEW_TRUST_ENV);
+        // SAFETY: the home-override serialization guard prevents concurrent
+        // certification tests from observing this process-local override.
+        unsafe {
+            std::env::remove_var(ENTERPRISE_REVIEW_LEASE_ENV);
+            std::env::remove_var(ENTERPRISE_REVIEW_TRUST_ENV);
+        }
+        let error = enterprise_review_live_attach().unwrap_err();
+        assert!(!error.disposable_lease);
+        assert!(!error.gateway_signed_deployment_attestation);
+        assert!(!error.egress_firewall_attestation);
+        // SAFETY: see the guard above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, value),
+                None => std::env::remove_var(ENTERPRISE_REVIEW_LEASE_ENV),
+            }
+            match previous_trust {
+                Some(value) => std::env::set_var(ENTERPRISE_REVIEW_TRUST_ENV, value),
+                None => std::env::remove_var(ENTERPRISE_REVIEW_TRUST_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn enterprise_review_live_attach_validates_secret_free_lease_file() {
+        let _serial = home_override_serial();
+        let root = tempdir().expect("lease root");
+        let lease_path = root.path().join("lease.json");
+        let trust_path = root.path().join("trust.json");
+        let (lease, trust) = signed_enterprise_lease();
+        std::fs::write(&lease_path, serde_json::to_vec(&lease).expect("lease JSON"))
+            .expect("write lease");
+        std::fs::write(&trust_path, serde_json::to_vec(&trust).expect("trust JSON"))
+            .expect("write trust");
+        let previous = std::env::var_os(ENTERPRISE_REVIEW_LEASE_ENV);
+        let previous_trust = std::env::var_os(ENTERPRISE_REVIEW_TRUST_ENV);
+        // SAFETY: the home-override serialization guard prevents concurrent
+        // certification tests from observing this process-local override.
+        unsafe {
+            std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, &lease_path);
+            std::env::set_var(ENTERPRISE_REVIEW_TRUST_ENV, &trust_path);
+        }
+        let evidence = enterprise_review_live_evidence().expect("valid lease evidence");
+        assert!(evidence.secret_free);
+        assert_eq!(evidence.route_id, "company-gateway");
+        assert!(!serde_json::to_string(&evidence)
+            .expect("evidence JSON")
+            .contains("https://"));
+        // SAFETY: see the guard above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, value),
+                None => std::env::remove_var(ENTERPRISE_REVIEW_LEASE_ENV),
+            }
+            match previous_trust {
+                Some(value) => std::env::set_var(ENTERPRISE_REVIEW_TRUST_ENV, value),
+                None => std::env::remove_var(ENTERPRISE_REVIEW_TRUST_ENV),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn enterprise_review_live_attach_rejects_symlinked_lease_file() {
+        let _serial = home_override_serial();
+        let root = tempdir().expect("lease root");
+        let target = root.path().join("target.json");
+        let link = root.path().join("lease.json");
+        let trust_path = root.path().join("trust.json");
+        let (lease, trust) = signed_enterprise_lease();
+        std::fs::write(&target, serde_json::to_vec(&lease).expect("lease JSON"))
+            .expect("write lease");
+        std::fs::write(&trust_path, serde_json::to_vec(&trust).expect("trust JSON"))
+            .expect("write trust");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink lease");
+        let previous = std::env::var_os(ENTERPRISE_REVIEW_LEASE_ENV);
+        let previous_trust = std::env::var_os(ENTERPRISE_REVIEW_TRUST_ENV);
+        // SAFETY: the home-override serialization guard prevents concurrent
+        // certification tests from observing this process-local override.
+        unsafe {
+            std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, &link);
+            std::env::set_var(ENTERPRISE_REVIEW_TRUST_ENV, &trust_path);
+        }
+        assert!(enterprise_review_live_evidence().is_err());
+        // SAFETY: see the guard above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(ENTERPRISE_REVIEW_LEASE_ENV, value),
+                None => std::env::remove_var(ENTERPRISE_REVIEW_LEASE_ENV),
+            }
+            match previous_trust {
+                Some(value) => std::env::set_var(ENTERPRISE_REVIEW_TRUST_ENV, value),
+                None => std::env::remove_var(ENTERPRISE_REVIEW_TRUST_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_merkle_is_stable_and_rejects_symlinks() {
+        let root = tempdir().unwrap();
+        let workspace = root.path().join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("a.txt"), b"one").unwrap();
+        let first = workspace_merkle_root(&workspace).unwrap();
+        let second = workspace_merkle_root(&workspace).unwrap();
+        assert_eq!(first, second);
+        std::fs::write(workspace.join("a.txt"), b"two").unwrap();
+        assert_ne!(first, workspace_merkle_root(&workspace).unwrap());
     }
 }

@@ -80,14 +80,17 @@ async function tool(id, name, args, options = {}) {
 
 // Wire-level redaction pins: these must match the Rust structural pins.
 const PROJECTION_KEYS = [
-  "agentActive", "campaignId", "controlDisposition", "controlEpoch",
-  "createdAt", "endedAt", "eventRange", "grant", "lastError", "lastOutcome",
-  "observation", "ownerSessionId", "parentRunId", "progress", "runId",
-  "startedAt", "state", "target", "terminal", "updatedAt", "version",
+  "agentActive", "authorityEpoch", "campaignId", "capabilityTier",
+  "controlDisposition", "controlEpoch", "createdAt", "endedAt", "eventRange",
+  "grant", "initiatingPrincipalKind", "lastError", "lastOutcome", "observation",
+  "ownerSessionId", "parentRunId", "progress", "runId", "startedAt", "state",
+  "surfaceId", "surfaceIncarnation", "target", "terminal", "updatedAt",
+  "version",
 ];
 const OBSERVATION_KEYS = [
-  "capturedAt", "elementCount", "elementsTruncated", "hasScreenshot",
-  "observationId", "screenshotRedacted", "sensitivity", "sequence", "stale",
+  "capturedAt", "elementCount", "elementsTruncated", "frameEpoch",
+  "hasScreenshot", "observationId", "screenshotRedacted", "sensitivity",
+  "sequence", "stale", "surfaceId",
 ];
 const LAST_OUTCOME_KEYS = ["expectedPostconditionMet"];
 const LAST_ERROR_KEYS = ["code"];
