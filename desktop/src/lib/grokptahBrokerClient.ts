@@ -591,6 +591,8 @@ export class GrokPtahBrokerClient {
       { method: "POST", idempotencyKey, body: request },
     );
     if (
+      result.worker.provider !== request.provider ||
+      result.worker.providerId !== request.providerId ||
       result.worker.externalAgentId !== result.run.externalAgentId ||
       result.worker.repository !== request.repository ||
       result.worker.startingRef !== request.startingRef
