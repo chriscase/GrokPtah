@@ -1291,6 +1291,262 @@ mod tests {
         );
     }
 
+    /// Reopen the same durable root with the same registry, as a restarted
+    /// process does. Dropping the previous host releases its owner lock, which
+    /// is what makes the recovery path treat the claim as orphaned.
+    fn restart(host: ExternalWorkerHost, dir: &tempfile::TempDir) -> ExternalWorkerHost {
+        let registry = host.registry.clone();
+        drop(host);
+        ExternalWorkerHost::open(registry, dir.path()).unwrap()
+    }
+
+    /// Crash cut: before anything was transmitted.
+    ///
+    /// The claim is durable and the provider was never contacted, so a restart
+    /// may retry. Marking this Uncertain — as every interrupted claim used to
+    /// be — turns an ordinary crash into work that needs a human.
+    #[tokio::test]
+    async fn crash_cut_before_send_retries_without_duplicating() {
+        let (host, state, dir) = host_with_fake(FakeCursorState::default()).await;
+        let request = launch_request("req-cut", "do the work");
+        let hash = canonical_launch_payload_hash(&request).unwrap();
+        host.ledger
+            .claim(ExternalWorkerOperation::Launch, &request.request_id, &hash)
+            .unwrap();
+        assert!(state.launch_requests.lock().unwrap().is_empty());
+
+        let host = restart(host, &dir);
+        host.launch(&principal(), "gp-run-1", 1, &request)
+            .await
+            .expect("an un-sent claim retries after a restart");
+        assert_eq!(
+            state.launch_requests.lock().unwrap().len(),
+            1,
+            "exactly one physical provider request",
+        );
+    }
+
+    /// Crash cut: mid-send. The future is dropped while the request is in
+    /// flight, which is what a process death looks like to the ledger.
+    #[tokio::test]
+    async fn crash_cut_during_send_is_uncertain_and_never_duplicates() {
+        let state = FakeCursorState::default();
+        state.config.lock().unwrap().create_delay_ms = 400;
+        let (host, state, dir) = host_with_fake(state).await;
+        let request = launch_request("req-cut", "do the work");
+
+        // Cut the launch off while the provider is still holding the request.
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_millis(60),
+            host.launch(&principal(), "gp-run-1", 1, &request),
+        )
+        .await;
+        assert!(cut.is_err(), "the launch must still have been in flight");
+
+        let host = restart(host, &dir);
+        let error = host
+            .launch(&principal(), "gp-run-1", 1, &request)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ExternalWorkerAdapterError::Uncertain),
+            "a cut mid-send may have been applied, got {error:?}",
+        );
+        // And a second restart does not decay into a fresh attempt.
+        let host = restart(host, &dir);
+        assert!(matches!(
+            host.launch(&principal(), "gp-run-1", 1, &request)
+                .await
+                .unwrap_err(),
+            ExternalWorkerAdapterError::Uncertain
+        ));
+        assert!(
+            state.launch_requests.lock().unwrap().len() <= 1,
+            "an uncertain request must never be re-sent",
+        );
+    }
+
+    /// Crash cut: the provider accepted the request, but no usable receipt
+    /// reached this host. This is the case that duplicates work if it is
+    /// treated as a plain failure.
+    #[tokio::test]
+    async fn crash_cut_after_provider_acceptance_never_creates_a_second_worker() {
+        let state = FakeCursorState::default();
+        {
+            let mut config = state.config.lock().unwrap();
+            // Accepted and recorded by the provider, then a body this host
+            // refuses to read whole.
+            config.create_status = 200;
+            config.create_body_padding_bytes =
+                crate::external_worker::cursor::MAX_PROVIDER_RESPONSE_BYTES as usize + 1024;
+        }
+        let (host, state, dir) = host_with_fake(state).await;
+        let request = launch_request("req-accepted", "do the work");
+
+        let error = host
+            .launch(&principal(), "gp-run-1", 1, &request)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ExternalWorkerAdapterError::Uncertain));
+        assert_eq!(
+            state.launch_requests.lock().unwrap().len(),
+            1,
+            "the provider did accept the request",
+        );
+
+        // Restart and retry: still uncertain, still exactly one physical
+        // request on the wire.
+        let host = restart(host, &dir);
+        assert!(matches!(
+            host.launch(&principal(), "gp-run-1", 1, &request)
+                .await
+                .unwrap_err(),
+            ExternalWorkerAdapterError::Uncertain
+        ));
+        assert_eq!(state.launch_requests.lock().unwrap().len(), 1);
+    }
+
+    /// Crash cut: cancel. A cut cancel must not become a second cancel, and
+    /// must not be mistaken for a successful one.
+    #[tokio::test]
+    async fn crash_cut_during_cancel_does_not_double_cancel() {
+        let state = FakeCursorState::default();
+        state.config.lock().unwrap().cancel_status = 500;
+        let (host, state, dir) = host_with_fake(state).await;
+        host.launch(
+            &principal(),
+            "gp-run-1",
+            1,
+            &launch_request("req-1", "do the work"),
+        )
+        .await
+        .unwrap();
+
+        let error = host
+            .cancel(&principal(), CURSOR, "req-cancel", FAKE_AGENT, FAKE_RUN)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ExternalWorkerAdapterError::Uncertain));
+        let attempts = *state.cancel_calls.lock().unwrap();
+
+        let host = restart(host, &dir);
+        assert!(matches!(
+            host.cancel(&principal(), CURSOR, "req-cancel", FAKE_AGENT, FAKE_RUN)
+                .await
+                .unwrap_err(),
+            ExternalWorkerAdapterError::Uncertain
+        ));
+        assert_eq!(
+            *state.cancel_calls.lock().unwrap(),
+            attempts,
+            "an uncertain cancel must not be retried on the wire",
+        );
+    }
+
+    /// Reconcile is the operator's way out of an uncertain outcome: it reports
+    /// what the provider actually has, without mutating anything.
+    #[tokio::test]
+    async fn reconcile_after_an_uncertain_launch_reports_provider_truth() {
+        let (host, state, _dir) = host_with_fake(FakeCursorState::default()).await;
+        let launched = host
+            .launch(
+                &principal(),
+                "gp-run-1",
+                1,
+                &launch_request("req-1", "do the work"),
+            )
+            .await
+            .unwrap();
+        let before = state.launch_requests.lock().unwrap().len();
+
+        let report = host
+            .reconcile(&principal(), CURSOR, &launched.worker.external_agent_id)
+            .await
+            .unwrap();
+        assert_eq!(report.request_id, "req-1");
+        assert!(report.provider_owned);
+        assert_eq!(
+            state.launch_requests.lock().unwrap().len(),
+            before,
+            "reconcile must not mutate the provider",
+        );
+    }
+
+    /// The disposable campaign: create, follow up, cancel, read artifacts,
+    /// list, archive, restart — end to end through the real host and the fake
+    /// provider, with the grant re-checked at every step.
+    #[tokio::test]
+    async fn full_lifecycle_campaign_survives_a_restart() {
+        let (host, state, dir) = host_with_fake(FakeCursorState::default()).await;
+
+        let launched = host
+            .launch(
+                &principal(),
+                "gp-run-1",
+                1,
+                &launch_request("req-launch", "do the work"),
+            )
+            .await
+            .unwrap();
+        let agent = launched.worker.external_agent_id.clone();
+
+        let follow_up = host
+            .follow_up(
+                &principal(),
+                CURSOR,
+                &agent,
+                &ExternalWorkerFollowUpRequest {
+                    request_id: "req-follow".into(),
+                    prompt: "re-check the focused change".into(),
+                    bounds: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        host.cancel(&principal(), CURSOR, "req-cancel", &agent, FAKE_RUN)
+            .await
+            .unwrap();
+
+        let artifacts = host
+            .list_artifacts(&principal(), CURSOR, &agent, FAKE_RUN)
+            .await
+            .unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert!(artifacts[0].digest.starts_with("sha256:"));
+
+        assert_eq!(host.list_workers(&principal()).unwrap().len(), 1);
+        host.archive(&principal(), CURSOR, &agent, "2026-08-25T02:00:00Z")
+            .unwrap();
+
+        // Restart: the grant, its runs, and its archived state are all durable.
+        let host = restart(host, &dir);
+        let listed = host.list_workers(&principal()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].external_agent_id, agent);
+        assert_eq!(listed[0].state, super::super::AuthorityState::Archived);
+        assert!(
+            listed[0]
+                .external_run_ids
+                .contains(&follow_up.external_run_id),
+            "the follow-up run must still be covered after a restart",
+        );
+
+        // A foreign scope still sees nothing, and still cannot act.
+        let mut foreign = principal();
+        foreign.tenant = "tenant-b".into();
+        assert!(host.list_workers(&foreign).unwrap().is_empty());
+        assert!(host
+            .list_artifacts(&foreign, CURSOR, &agent, FAKE_RUN)
+            .await
+            .is_err());
+
+        // Exactly one physical provider request per logical mutation.
+        assert_eq!(state.launch_requests.lock().unwrap().len(), 1);
+        assert_eq!(state.follow_up_requests.lock().unwrap().len(), 1);
+        assert_eq!(*state.cancel_calls.lock().unwrap(), 1);
+    }
+
     #[tokio::test]
     async fn provider_5xx_is_uncertain_and_retry_does_not_create_again() {
         let state = FakeCursorState::default();
