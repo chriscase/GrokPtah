@@ -112,6 +112,7 @@ struct AdmissionGuard {
     host: AgentHostHandle,
     store: OrchStore,
     run_id: String,
+    session_id: Uuid,
     attempt_id: String,
     owner_instance_id: String,
     model_abort: tokio::task::AbortHandle,
@@ -124,33 +125,66 @@ impl Drop for AdmissionGuard {
             return;
         }
         self.model_abort.abort();
-        let _ = self.store.update_run(&self.run_id, |run| {
-            if !run.state.is_terminal() {
-                run.state = RunState::Interrupted;
-                run.queue_position = None;
-                run.terminal_result = Some("interrupted".into());
-                run.error_code = Some("supervisor_aborted".into());
-                run.final_response = Some("model supervisor was cancelled".into());
-                run.updated_at = Utc::now();
-            }
-            Ok(())
-        });
-        if let Some(attempt) = self.store.load_attempt(&self.run_id).ok().flatten() {
-            if attempt.attempt_id == self.attempt_id
-                && attempt.owner_instance_id == self.owner_instance_id
-                && attempt.phase.is_active()
-            {
-                let _ = self.store.finalize_attempt(
-                    &self.run_id,
-                    &self.attempt_id,
-                    &self.owner_instance_id,
-                    attempt.revision,
-                    AttemptPhase::Interrupted,
-                    Utc::now(),
-                );
-            }
+        let host = self.host.clone();
+        let store = self.store.clone();
+        let run_id = self.run_id.clone();
+        let session_id = self.session_id;
+        let attempt_id = self.attempt_id.clone();
+        let owner_instance_id = self.owner_instance_id.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = tokio::time::timeout(
+                    SUPERVISOR_TEARDOWN_DEADLINE,
+                    host.cancel_turn_and_await(Some(session_id)),
+                )
+                .await;
+                let _ = tokio::time::timeout(
+                    SUPERVISOR_TEARDOWN_DEADLINE,
+                    host.wait_turn_idle(session_id),
+                )
+                .await;
+                let _ = store.update_run(&run_id, |run| {
+                    if !run.state.is_terminal() {
+                        run.state = RunState::Interrupted;
+                        run.queue_position = None;
+                        run.terminal_result = Some("interrupted".into());
+                        run.error_code = Some("supervisor_aborted".into());
+                        run.final_response = Some("model supervisor was cancelled".into());
+                        run.updated_at = Utc::now();
+                    }
+                    Ok(())
+                });
+                if let Some(attempt) = store.load_attempt(&run_id).ok().flatten() {
+                    if attempt.attempt_id == attempt_id
+                        && attempt.owner_instance_id == owner_instance_id
+                        && attempt.phase.is_active()
+                    {
+                        let _ = store.finalize_attempt(
+                            &run_id,
+                            &attempt_id,
+                            &owner_instance_id,
+                            attempt.revision,
+                            AttemptPhase::Interrupted,
+                            Utc::now(),
+                        );
+                    }
+                }
+                host.release_orchestration_turn(&run_id);
+            });
+        } else {
+            let _ = self.store.update_run(&self.run_id, |run| {
+                if !run.state.is_terminal() {
+                    run.state = RunState::Interrupted;
+                    run.queue_position = None;
+                    run.terminal_result = Some("interrupted".into());
+                    run.error_code = Some("supervisor_aborted".into());
+                    run.final_response = Some("model supervisor was cancelled".into());
+                    run.updated_at = Utc::now();
+                }
+                Ok(())
+            });
+            self.host.release_orchestration_turn(&self.run_id);
         }
-        self.host.release_orchestration_turn(&self.run_id);
     }
 }
 
@@ -644,7 +678,7 @@ impl OrchestrationService {
                         &workspace,
                         OrchError::new(OrchErrorCode::Internal, error.to_string()),
                     );
-                    eprintln!("[grokptah] queued run start deferred: {error}");
+                    eprintln!("[grokptah] queued run admission failed closed: {error}");
                     return;
                 }
             }
@@ -779,6 +813,13 @@ impl OrchestrationService {
                     self.live_attempts.lock().insert(run_id.clone(), live);
                 }
             }
+            if let Some(run) = self.store.load_run(&run_id).ok().flatten() {
+                let _ = tokio::time::timeout(
+                    SUPERVISOR_TEARDOWN_DEADLINE,
+                    self.host.wait_turn_idle(run.session_id),
+                )
+                .await;
+            }
             if let Err(error) = self.store.update_run(&run_id, |run| {
                 if !run.state.is_terminal() {
                     run.state = RunState::Interrupted;
@@ -892,9 +933,6 @@ impl OrchestrationService {
     }
 
     fn stale_queued_replay(&self, value: &serde_json::Value) -> Option<OrchError> {
-        if value.get("state").and_then(serde_json::Value::as_str) != Some("queued") {
-            return None;
-        }
         let run_id = value.get("runId").and_then(serde_json::Value::as_str)?;
         let admission_lost = self
             .store
@@ -959,7 +997,7 @@ impl OrchestrationService {
                     run.state = RunState::Failed;
                     run.queue_position = None;
                     run.terminal_result = Some("failed".into());
-                    run.error_code = Some(error.code.as_str().into());
+                    run.error_code = Some("admission_lost".into());
                     run.final_response = Some("accepted work failed before dispatch".into());
                     run.updated_at = Utc::now();
                 }
@@ -1003,7 +1041,10 @@ impl OrchestrationService {
             }
         }
         if let Err(update) = self.store.update_run(run_id, |run| {
-            if !run.state.is_terminal() || run.error_code.as_deref() == Some("interrupted") {
+            if !matches!(
+                run.state,
+                RunState::Cancelled | RunState::Completed | RunState::LimitReached
+            ) {
                 run.state = RunState::Interrupted;
                 run.queue_position = None;
                 run.terminal_result = Some("interrupted".into());
@@ -3206,7 +3247,11 @@ impl OrchestrationService {
         let response = json!({
             "runId": run_id,
             "sessionId": session_id,
-            "state": RunState::Queued,
+            "state": if queued {
+                RunState::Queued
+            } else {
+                RunState::Running
+            },
             "requestId": request_id,
             "executionMode": execution_mode,
             "queuedPosition": queued_position,
@@ -3467,12 +3512,15 @@ impl OrchestrationService {
         let live_model_abort = model_abort.clone();
         let supervisor_run_id = rid.clone();
         let supervisor_attempt_id = attempt_id.clone();
+        let task_run_id = rid.clone();
+        let task_attempt_id = attempt_id.clone();
 
         let join = tokio::spawn(async move {
             let admission_guard = AdmissionGuard {
                 host: host.clone(),
                 store: store.clone(),
                 run_id: supervisor_run_id,
+                session_id,
                 attempt_id: supervisor_attempt_id,
                 owner_instance_id: owner_instance_id.clone(),
                 model_abort,
@@ -3515,8 +3563,8 @@ impl OrchestrationService {
                     }
                     _ = heartbeat.tick() => {
                         match store.heartbeat_attempt(
-                            &rid,
-                            &attempt_id,
+                            &task_run_id,
+                            &task_attempt_id,
                             &owner_instance_id,
                             revision,
                             Utc::now(),
@@ -3559,7 +3607,7 @@ impl OrchestrationService {
             let _ = agg_task.await;
 
             let end_seq = bus.current_seq();
-            let reconciliation = collect_run_updates(&bus, &store, &rid, end_seq);
+            let reconciliation = collect_run_updates(&bus, &store, &task_run_id, end_seq);
             let durable_result = match &result {
                 Ok(text) => Ok(bus.redact_text(text, 8_000)),
                 Err(error) => Err(bus.redact_text(&error.to_string(), 2_000)),
@@ -3567,13 +3615,13 @@ impl OrchestrationService {
             let incomplete_stop = result
                 .as_ref()
                 .is_ok_and(|text| crate::host_helpers::is_incomplete_stop_message(text));
-            let mut candidate = store.load_run(&rid).ok().flatten().unwrap_or(run);
+            let mut candidate = store.load_run(&task_run_id).ok().flatten().unwrap_or(run);
             let reaped = store
-                .load_attempt(&rid)
+                .load_attempt(&task_run_id)
                 .ok()
                 .flatten()
                 .is_some_and(|current| {
-                    current.attempt_id == attempt_id && current.phase == AttemptPhase::Reaped
+                    current.attempt_id == task_attempt_id && current.phase == AttemptPhase::Reaped
                 });
             for update in &reconciliation {
                 fold_run_update(&mut candidate, update);
@@ -3677,14 +3725,14 @@ impl OrchestrationService {
                     }
                 }
             }
-            if let Some(current) = store.load_attempt(&rid).ok().flatten() {
-                if current.attempt_id == attempt_id
+            if let Some(current) = store.load_attempt(&task_run_id).ok().flatten() {
+                if current.attempt_id == task_attempt_id
                     && current.owner_instance_id == owner_instance_id
                     && current.phase == AttemptPhase::Running
                 {
                     let _ = store.begin_attempt_finalization(
-                        &rid,
-                        &attempt_id,
+                        &task_run_id,
+                        &task_attempt_id,
                         &owner_instance_id,
                         current.revision,
                         Utc::now(),
@@ -3712,7 +3760,9 @@ impl OrchestrationService {
                                 detail: bus.redact_text(&error.to_string(), 500),
                             };
                             let _ = store.enqueue_audit(entry);
-                            eprintln!("[grokptah] run {rid} finalization retrying: {error}");
+                            eprintln!(
+                                "[grokptah] run {task_run_id} finalization retrying: {error}"
+                            );
                         }
                         if tokio::time::Instant::now() >= finalization_deadline {
                             break;
@@ -3725,7 +3775,7 @@ impl OrchestrationService {
             }
             if !persisted {
                 store.mark_health_degraded(&format!(
-                    "run {rid} finalization moved to bounded recovery"
+                    "run {task_run_id} finalization moved to bounded recovery"
                 ));
                 if let Err(error) = store.ensure_finalization_intent(&candidate) {
                     let entry = AuditEntry {
@@ -3740,7 +3790,7 @@ impl OrchestrationService {
                     };
                     let _ = store.enqueue_audit(entry);
                     store.mark_health_degraded(&format!(
-                        "run {rid} finalization recovery unavailable: {error}"
+                        "run {task_run_id} finalization recovery unavailable: {error}"
                     ));
                 }
             }
@@ -3752,14 +3802,14 @@ impl OrchestrationService {
                     RunState::Interrupted => AttemptPhase::Interrupted,
                     _ => AttemptPhase::Failed,
                 };
-                if let Some(current) = store.load_attempt(&rid).ok().flatten() {
-                    if current.attempt_id == attempt_id
+                if let Some(current) = store.load_attempt(&task_run_id).ok().flatten() {
+                    if current.attempt_id == task_attempt_id
                         && current.owner_instance_id == owner_instance_id
                         && current.phase == AttemptPhase::Finalizing
                     {
                         let _ = store.finalize_attempt(
-                            &rid,
-                            &attempt_id,
+                            &task_run_id,
+                            &task_attempt_id,
                             &owner_instance_id,
                             current.revision,
                             terminal_phase,
@@ -3768,9 +3818,9 @@ impl OrchestrationService {
                     }
                 }
             }
-            if let Err(error) = store.settle_acceptance_intent(&rid) {
+            if let Err(error) = store.settle_acceptance_intent(&task_run_id) {
                 store.mark_health_degraded(&format!(
-                    "acceptance intent cleanup failed for {rid}: {error}"
+                    "acceptance intent cleanup failed for {task_run_id}: {error}"
                 ));
             }
             // Release capacity before waking the scheduler, so a queued task

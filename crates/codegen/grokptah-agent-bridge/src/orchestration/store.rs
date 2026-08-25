@@ -570,10 +570,9 @@ impl OrchStore {
         let attempt_path = self
             .attempt_path(run_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let attempt: AttemptRecord = serde_json::from_str(
-            &fs::read_to_string(&attempt_path)
-                .map_err(|_| anyhow::anyhow!("attempt is missing"))?,
-        )?;
+        let attempt = self
+            .read_attempt_path(&attempt_path)?
+            .ok_or_else(|| anyhow::anyhow!("attempt is missing"))?;
         check_attempt_owner(
             &attempt,
             attempt_id,
@@ -711,13 +710,7 @@ impl OrchStore {
             .attempt_path(run_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let _g = self.inner.lock.lock();
-        let current = if path.is_file() {
-            Some(serde_json::from_str::<AttemptRecord>(&fs::read_to_string(
-                &path,
-            )?)?)
-        } else {
-            None
-        };
+        let current = self.read_attempt_path(&path)?;
         let next_revision = match (current, expected_revision) {
             (Some(current), Some(expected)) if current.revision != expected => {
                 anyhow::bail!("stale attempt revision")
@@ -1629,7 +1622,7 @@ impl OrchStore {
                     && run.session_id == intent.session_id
                     && run.request_id == intent.request_id
                     && run.workspace == intent.workspace
-                    && self.receipt_acknowledged(&intent.request_id)
+                    && self.receipt_acknowledged(&intent)
             }) {
                 survivors.insert(intent.run_id);
             } else {
@@ -1673,11 +1666,15 @@ impl OrchStore {
         Ok(retired)
     }
 
-    fn receipt_acknowledged(&self, request_id: &str) -> bool {
+    fn receipt_acknowledged(&self, intent: &AcceptanceIntent) -> bool {
         matches!(
-            self.load_idempotency(request_id),
+            self.load_idempotency(&intent.request_id),
             Ok(Some(receipt)) if receipt.status == "complete"
-                && receipt.request_id == request_id
+                && receipt.request_id == intent.request_id
+                && receipt.payload_hash == intent.payload_hash
+                && receipt.tool == intent.tool
+                && receipt.run_id.as_deref() == Some(intent.run_id.as_str())
+                && receipt.response == intent.response
         )
     }
 
@@ -2590,22 +2587,30 @@ mod tests {
             "runId": run_id,
             "state": RunState::Queued,
         });
+        let prompt = format!("private full prompt {run_id}");
+        let payload_hash = super::super::types::hash_payload(&serde_json::json!({
+            "sessionId": run.session_id,
+            "workspace": &run.workspace,
+            "prompt": &prompt,
+            "bounds": &run.bounds,
+            "executionMode": super::super::types::RunExecutionMode::Shared,
+            "allowQueue": true,
+            "retryOf": &run.retry_of,
+        }));
         let intent = AcceptanceIntent {
             admission_id: format!("admission-{run_id}"),
             sequence,
             run_id: run_id.into(),
             request_id: run.request_id.clone(),
-            payload_hash: format!("hash-{run_id}"),
+            payload_hash,
             tool: "ptah_submit_task".into(),
             session_id: run.session_id,
             workspace: run.workspace.clone(),
             execution_mode: super::super::types::RunExecutionMode::Shared,
             allow_queue: true,
             attempt_id: None,
-            prompt: Some(format!("private full prompt {run_id}")),
-            prompt_hash: super::super::types::hash_payload(&serde_json::json!(format!(
-                "private full prompt {run_id}"
-            ))),
+            prompt: Some(prompt.clone()),
+            prompt_hash: super::super::types::hash_payload(&serde_json::json!(prompt)),
             bounds: run.bounds.clone(),
             run: run.clone(),
             response,
