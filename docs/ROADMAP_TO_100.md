@@ -52,7 +52,7 @@ the same candidate release:
   start another Cargo build wave on its shared target.
 - Keep the current TypeScript/desktop verification attached to the same reviewable
   candidate: the Help Center integration (`45441d1f`) and follow-up
-  hardening/corpus/public-consumer commits through `d263b29d` pass 47 test files /
+  hardening/corpus/public-consumer commits through `84aea3c2` pass 47 test files /
   264 tests, typecheck, the production Vite build, and `npm run verify:public`.
   The public check includes generated export/authority-boundary checks and a
   normal `node_modules/@grokptah/client` consumer smoke fixture. The package
