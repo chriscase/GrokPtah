@@ -13,6 +13,7 @@ import {
   searchHelp,
   validateHelpAssistantAnswer,
   validateHelpSemanticAnswer,
+  type HelpArticle,
 } from "./helpCenter";
 import { HELP_RETRIEVAL_FIXTURES } from "./helpCenter.fixtures";
 
@@ -36,6 +37,16 @@ describe("offline Help Center corpus", () => {
     expect(new Set(HELP_INDEX.map((entry) => entry.article.id)).size).toBe(
       HELP_INDEX.length,
     );
+  });
+
+  it("freezes the exported corpus and nested evidence metadata", () => {
+    expect(Object.isFrozen(HELP_ARTICLES)).toBe(true);
+    expect(Object.isFrozen(HELP_ARTICLES[0])).toBe(true);
+    expect(Object.isFrozen(HELP_ARTICLES[0]?.aliases)).toBe(true);
+    expect(Object.isFrozen(HELP_ARTICLES[0]?.keywords)).toBe(true);
+    expect(Object.isFrozen(HELP_ARTICLES[0]?.sources)).toBe(true);
+    expect(Object.isFrozen(HELP_ARTICLES[0]?.sources[0])).toBe(true);
+    expect(() => (HELP_ARTICLES as HelpArticle[]).push(HELP_ARTICLES[0]!)).toThrow();
   });
 
   it("keeps every source citation resolvable to a real heading", () => {

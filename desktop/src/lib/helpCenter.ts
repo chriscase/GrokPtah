@@ -1,23 +1,23 @@
 export type HelpTopic = "getting-started" | "providers" | "computer-use" | "operations";
 
 export type HelpSource = {
-  id: string;
-  path: string;
-  heading: string;
+  readonly id: string;
+  readonly path: string;
+  readonly heading: string;
 };
 
 export const HELP_CORPUS_VERSION = "product-corpus-v1";
 export type HelpRetrievalMode = "offline-lexical" | "provider-semantic";
 
 export type HelpArticle = {
-  id: string;
-  title: string;
-  topic: HelpTopic;
-  summary: string;
-  body: string;
-  aliases: string[];
-  keywords: string[];
-  sources: HelpSource[];
+  readonly id: string;
+  readonly title: string;
+  readonly topic: HelpTopic;
+  readonly summary: string;
+  readonly body: string;
+  readonly aliases: readonly string[];
+  readonly keywords: readonly string[];
+  readonly sources: readonly HelpSource[];
 };
 
 /**
@@ -27,7 +27,7 @@ export type HelpArticle = {
  * embedding model. A later semantic-index slice can replace the scorer while
  * preserving these stable article IDs and exact-match behavior.
  */
-export const HELP_ARTICLES: HelpArticle[] = [
+const HELP_ARTICLE_DATA: HelpArticle[] = [
   {
     id: "getting-started.sessions",
     title: "Sessions, builds, and chats",
@@ -237,6 +237,20 @@ export const HELP_ARTICLES: HelpArticle[] = [
   },
 ];
 
+function freezeHelpArticle(article: HelpArticle): HelpArticle {
+  return Object.freeze({
+    ...article,
+    aliases: Object.freeze([...article.aliases]),
+    keywords: Object.freeze([...article.keywords]),
+    sources: Object.freeze(article.sources.map((source) => Object.freeze({ ...source }))),
+  });
+}
+
+/** Immutable source-of-truth corpus for desktop and external consumers. */
+export const HELP_ARTICLES: readonly HelpArticle[] = Object.freeze(
+  HELP_ARTICLE_DATA.map(freezeHelpArticle),
+);
+
 export type HelpSearchResult = {
   article: HelpArticle;
   score: number;
@@ -416,7 +430,7 @@ function terms(value: string): string[] {
 }
 
 /** Build the deterministic local index that a future semantic index can replace. */
-export function buildHelpIndex(articles: HelpArticle[] = HELP_ARTICLES): HelpIndexEntry[] {
+export function buildHelpIndex(articles: readonly HelpArticle[] = HELP_ARTICLES): HelpIndexEntry[] {
   return articles.map((article) => ({
     article,
     title: terms(article.title),
@@ -462,7 +476,7 @@ export function buildHelpAssistantRequest(
 /** Build a metadata-only request for optional provider-backed semantic ranking. */
 export function buildHelpSemanticRequest(
   query: string,
-  articles: HelpArticle[] = HELP_ARTICLES,
+  articles: readonly HelpArticle[] = HELP_ARTICLES,
 ): HelpSemanticRequest {
   return {
     schema: "grokptah.help-semantic-search.v1",
