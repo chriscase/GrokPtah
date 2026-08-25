@@ -1404,9 +1404,8 @@ fn public_error_code(code: &OrchErrorCode) -> PublicErrorCode {
             PublicErrorCode::StaleOrRecovery
         }
         OrchErrorCode::Timeout => PublicErrorCode::Internal,
-        OrchErrorCode::InvalidRequest | OrchErrorCode::Unsupported | OrchErrorCode::Conflict => {
-            PublicErrorCode::InvalidRequest
-        }
+        OrchErrorCode::Unsupported => PublicErrorCode::Unsupported,
+        OrchErrorCode::InvalidRequest | OrchErrorCode::Conflict => PublicErrorCode::InvalidRequest,
         OrchErrorCode::Internal => PublicErrorCode::Internal,
     }
 }

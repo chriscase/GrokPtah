@@ -540,6 +540,7 @@ struct CursorAgent {
     #[serde(default)]
     repos: Vec<CursorRepo>,
     #[serde(default)]
+    #[serde(alias = "autoCreatePR")]
     auto_create_pr: Option<bool>,
     #[serde(default)]
     work_on_current_branch: Option<bool>,
@@ -923,14 +924,18 @@ mod tests {
     #[test]
     fn live_adapter_requires_safe_base_and_explicit_allowlist() {
         assert!(CursorCloudAdapter::with_base_url("https://127.0.0.1", "key").is_err());
-        assert!(CursorCloudAdapter::with_base_url("https://api.cursor.com", "key")
-            .unwrap()
-            .with_repository_allowlist(["chriscase/GrokPtah"])
-            .is_ok());
-        assert!(CursorCloudAdapter::with_base_url("https://api.cursor.com", "key")
-            .unwrap()
-            .with_repository_allowlist(std::iter::empty::<&str>())
-            .is_err());
+        assert!(
+            CursorCloudAdapter::with_base_url("https://api.cursor.com", "key")
+                .unwrap()
+                .with_repository_allowlist(["chriscase/GrokPtah"])
+                .is_ok()
+        );
+        assert!(
+            CursorCloudAdapter::with_base_url("https://api.cursor.com", "key")
+                .unwrap()
+                .with_repository_allowlist(std::iter::empty::<&str>())
+                .is_err()
+        );
     }
 
     #[test]
@@ -987,7 +992,10 @@ mod tests {
         assert_eq!(safe_terminal_result("wrote /Users/alice/project"), None);
         assert_eq!(safe_terminal_result("Authorization: Bearer token"), None);
         assert_eq!(safe_terminal_result("password=secret"), None);
-        assert_eq!(safe_terminal_result("wrote C:\\Users\\alice\\project"), None);
+        assert_eq!(
+            safe_terminal_result("wrote C:\\Users\\alice\\project"),
+            None
+        );
     }
 
     #[tokio::test]

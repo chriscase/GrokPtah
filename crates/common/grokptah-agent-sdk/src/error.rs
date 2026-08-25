@@ -20,6 +20,8 @@ pub enum ErrorCode {
     Capacity,
     /// The desktop authority is asleep, locked, or unavailable.
     AuthorityUnavailable,
+    /// The requested capability is not available in this deployment.
+    Unsupported,
     /// Unexpected failure with no privileged detail.
     Internal,
 }
