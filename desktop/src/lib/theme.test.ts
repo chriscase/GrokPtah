@@ -176,6 +176,18 @@ describe("Help overlay and small-label contract", () => {
     expect(contrastRatio(darkLabel!, darkButtonBg)).toBeGreaterThanOrEqual(4.5);
     expect(contrastRatio(darkLabel!, darkPanel!)).toBeGreaterThanOrEqual(4.5);
     expect(contrastRatio(darkFocus!, darkPanel!)).toBeGreaterThanOrEqual(3);
+
+    for (const name of ["amber", "teal", "violet"] as const) {
+      const accent = themeBlock(css, `html[data-accent="${name}"]`);
+      const color = accent.match(/--accent:\s*(#[0-9a-fA-F]{6})/)?.[1];
+      const overlay = accent.match(/--accent-bg:\s*rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([0-9.]+)\s*\)/);
+      expect(color && overlay).toBeTruthy();
+      expect(accent).not.toMatch(/--accent-label:/);
+      const lightComposite = mixOver(color!, Number(overlay![4]), lightPanel!);
+      const darkComposite = mixOver(color!, Number(overlay![4]), darkPanel!);
+      expect(contrastRatio(lightLabel!, lightComposite)).toBeGreaterThanOrEqual(4.5);
+      expect(contrastRatio(darkLabel!, darkComposite)).toBeGreaterThanOrEqual(4.5);
+    }
   });
 
   it("sizes Help chrome, labels, and details relative to the existing type-scale mode", () => {
@@ -188,6 +200,9 @@ describe("Help overlay and small-label contract", () => {
     expect(help).toMatch(/\.help-search label,\s*\n\.help-topic-label \{[\s\S]*?font-size:\s*calc\(11\s*\/\s*13\.5\s*\*\s*1em\)/);
     expect(help).toMatch(/\.help-confirm-details \{[\s\S]*?max-height:\s*11em;/);
     expect(help).toMatch(/\.help-confirm-details \{[\s\S]*?font-size:\s*calc\(11\s*\/\s*12\s*\*\s*1em\)/);
+    expect(help).toMatch(/\.help-article h3 \{[\s\S]*?font-size:\s*1\.7em;/);
+    expect(help).toMatch(/@media \(max-width:\s*720px\) \{[\s\S]*?\.help-article h3 \{[\s\S]*?font-size:\s*1\.2em;/);
+    expect(help).not.toMatch(/font-size:[^;}]*vw/);
     expect(help).toMatch(/min-height:\s*44px/);
   });
 
@@ -200,7 +215,13 @@ describe("Help overlay and small-label contract", () => {
     expect(forced).toMatch(/border-color:\s*CanvasText/);
     expect(forced).toMatch(/background:\s*Canvas/);
     expect(forced).toMatch(/color:\s*CanvasText/);
-    expect(forced).toMatch(/\.help-list-item\.is-selected,[\s\S]*?outline:\s*2px solid Highlight/);
+    expect(forced).toMatch(
+      /\.help-list-item:hover \{\n    border-color:\s*Highlight;\n    background:\s*Canvas;\n    color:\s*CanvasText;\n    outline:\s*1px solid Highlight;/,
+    );
+    expect(forced).toMatch(
+      /\.help-list-item\.is-selected,\s*\n\s*\.help-list-item\.is-selected:hover \{\n    border-color:\s*Highlight;\n    background:\s*Highlight;\n    color:\s*HighlightText;\n    outline:\s*2px solid Highlight;/,
+    );
+    expect(forced).not.toMatch(/\.help-list-item\.is-selected,\s*\n\s*\.help-list-item:hover \{/);
     expect(forced).toMatch(/outline:\s*2px solid Highlight/);
     expect(forced).toMatch(/\.help-semantic-search:disabled,[\s\S]*?color:\s*GrayText;[\s\S]*?border-color:\s*GrayText;[\s\S]*?opacity:\s*1;/);
   });
