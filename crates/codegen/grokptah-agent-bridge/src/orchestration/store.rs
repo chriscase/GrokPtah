@@ -10,6 +10,7 @@ use chrono::{Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
 
+use super::admission::{AcceptanceIntent, AttemptLease, AttemptLeaseState, ATTEMPT_LEASE_VERSION};
 use super::types::{
     safe_id_filename, AgentRecord, AgentState, AuditEntry, ContinuationCheckpoint,
     IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunRecord, RunState,
@@ -93,6 +94,11 @@ impl OrchStore {
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
+        // Private execution input and attempt leases. These hold the only
+        // durable copy of a queued prompt, so they are created with owner-only
+        // permissions and are never widened afterwards.
+        create_private_dir(&root.join("inputs"))?;
+        create_private_dir(&root.join("leases"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -139,6 +145,11 @@ impl OrchStore {
             }),
         };
         store.recover_finalization_intents()?;
+        // Opening the ledger takes an exclusive advisory lock, so reaching
+        // this point proves no other process owns these runs. Every attempt
+        // lease on disk therefore belongs to an instance that is gone, and is
+        // released so recovery does not have to wait out its TTL.
+        store.release_orphaned_attempt_leases()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
         // Cleanup is best-effort at the record level, but directory access
@@ -578,6 +589,324 @@ impl OrchStore {
         result.map(|_| final_run)
     }
 
+    // ── durable execution input (acceptance intents) ───────────────────
+
+    fn intent_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(run_id)?;
+        Ok(self.inner.root.join("inputs").join(format!("{safe}.json")))
+    }
+
+    fn lease_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(run_id)?;
+        Ok(self.inner.root.join("leases").join(format!("{safe}.json")))
+    }
+
+    /// Persist the sealed, private, bounded execution input for one accepted
+    /// run. This must land (and fsync) **before** the idempotency receipt is
+    /// completed: a receipt that says "accepted" always has a durable input
+    /// behind it.
+    pub fn save_acceptance_intent(&self, intent: &AcceptanceIntent) -> Result<(), OrchError> {
+        intent.validate()?;
+        let path = self.intent_path(&intent.run_id)?;
+        let _guard = self.inner.lock.lock();
+        write_private_json(&self.inner.root, &path, intent)
+    }
+
+    /// Load and re-verify a sealed input. The digest is recomputed on every
+    /// load, so a parseable tamper fails closed instead of executing.
+    pub fn load_acceptance_intent(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<AcceptanceIntent>, OrchError> {
+        let path = self.intent_path(run_id)?;
+        let _guard = self.inner.lock.lock();
+        self.load_acceptance_intent_unlocked(&path, run_id)
+    }
+
+    fn load_acceptance_intent_unlocked(
+        &self,
+        path: &Path,
+        run_id: &str,
+    ) -> Result<Option<AcceptanceIntent>, OrchError> {
+        let Some(text) = read_private_string(&self.inner.root, path)? else {
+            return Ok(None);
+        };
+        let intent: AcceptanceIntent = serde_json::from_str(&text).map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("acceptance intent is unreadable: {error}"),
+            )
+        })?;
+        intent.validate()?;
+        if intent.run_id != run_id {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "acceptance intent does not belong to this run",
+            ));
+        }
+        Ok(Some(intent))
+    }
+
+    /// Every run id that currently has durable input on disk, including ones
+    /// whose sealed record no longer verifies. Recovery needs the unreadable
+    /// ones too so it can tombstone them rather than leave them behind.
+    pub fn list_acceptance_intent_run_ids(&self) -> anyhow::Result<Vec<(String, Option<String>)>> {
+        let dir = self.inner.root.join("inputs");
+        let mut out = Vec::new();
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        let _guard = self.inner.lock.lock();
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            // The filename is a hash, so the run id itself comes from the
+            // verified body. An unreadable body yields the hash alone, which
+            // is enough to remove the garbage.
+            let text = match read_private_string(&self.inner.root, &path) {
+                Ok(Some(text)) => Some(text),
+                Ok(None) => None,
+                Err(_) => None,
+            };
+            let run_id = text
+                .and_then(|text| serde_json::from_str::<AcceptanceIntent>(&text).ok())
+                .filter(|intent| intent.validate().is_ok())
+                .map(|intent| intent.run_id);
+            out.push((stem.to_string(), run_id));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Drop durable input. Callers must never do this for a run that is still
+    /// admitted and not yet confirmed dispatched: the input is the only copy.
+    pub fn remove_acceptance_intent(&self, run_id: &str) -> Result<bool, OrchError> {
+        let path = self.intent_path(run_id)?;
+        let _guard = self.inner.lock.lock();
+        ensure_private_path(&self.inner.root, &path)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        }
+    }
+
+    /// Remove an input file by its on-disk stem. Used only by recovery, for
+    /// garbage whose body no longer names a run.
+    pub fn remove_acceptance_intent_file(&self, stem: &str) -> Result<bool, OrchError> {
+        if stem.len() != 64 || !stem.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "acceptance intent file name is not a store-generated digest",
+            ));
+        }
+        let path = self.inner.root.join("inputs").join(format!("{stem}.json"));
+        let _guard = self.inner.lock.lock();
+        ensure_private_path(&self.inner.root, &path)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        }
+    }
+
+    // ── attempt leases ─────────────────────────────────────────────────
+
+    pub fn load_attempt_lease(&self, run_id: &str) -> Result<Option<AttemptLease>, OrchError> {
+        let path = self.lease_path(run_id)?;
+        let _guard = self.inner.lock.lock();
+        self.load_attempt_lease_unlocked(&path, run_id)
+    }
+
+    fn load_attempt_lease_unlocked(
+        &self,
+        path: &Path,
+        run_id: &str,
+    ) -> Result<Option<AttemptLease>, OrchError> {
+        let Some(text) = read_private_string(&self.inner.root, path)? else {
+            return Ok(None);
+        };
+        let lease: AttemptLease = serde_json::from_str(&text).map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("attempt lease is unreadable: {error}"),
+            )
+        })?;
+        lease.validate()?;
+        if lease.run_id != run_id {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "attempt lease does not belong to this run",
+            ));
+        }
+        Ok(Some(lease))
+    }
+
+    /// Compare-and-swap the single attempt authorized to dispatch `run_id`.
+    ///
+    /// Succeeds only when there is no lease, when the current lease was
+    /// released, or when it is expired against its own durable heartbeat.
+    /// Each success mints a new attempt id and bumps the attempt number, so a
+    /// previous holder that comes back can never renew, release, or be
+    /// mistaken for the current attempt.
+    pub fn acquire_attempt_lease(
+        &self,
+        run_id: &str,
+        owner_id: &str,
+        session_id: uuid::Uuid,
+        intent_digest: &str,
+        ttl_ms: u64,
+    ) -> Result<AttemptLease, OrchError> {
+        let path = self.lease_path(run_id)?;
+        let _guard = self.inner.lock.lock();
+        let now = Utc::now();
+        // A lease that no longer verifies is not a licence to run beside an
+        // unknown holder; `?` refuses rather than overwriting it.
+        let previous = self.load_attempt_lease_unlocked(&path, run_id)?;
+        let next_attempt = match &previous {
+            Some(lease) if lease.is_active(now) => {
+                return Err(OrchError::with_data(
+                    OrchErrorCode::Conflict,
+                    "run already has an active attempt",
+                    serde_json::json!({
+                        "runId": run_id,
+                        "attempt": lease.attempt,
+                        "ownerId": lease.owner_id,
+                    }),
+                ));
+            }
+            Some(lease) => lease.attempt.saturating_add(1),
+            None => 1,
+        };
+        let lease = AttemptLease {
+            lease_version: ATTEMPT_LEASE_VERSION,
+            run_id: run_id.to_string(),
+            attempt: next_attempt,
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            owner_id: owner_id.to_string(),
+            session_id,
+            intent_digest: intent_digest.to_string(),
+            acquired_at: now,
+            heartbeat_at: now,
+            lease_ttl_ms: ttl_ms.max(1),
+            state: AttemptLeaseState::Held,
+            digest: String::new(),
+        }
+        .seal();
+        lease.validate()?;
+        write_private_json(&self.inner.root, &path, &lease)?;
+        Ok(lease)
+    }
+
+    /// Extend a lease this exact attempt still holds. A stale attempt id or a
+    /// different owner is refused rather than silently reviving the lease.
+    pub fn renew_attempt_lease(
+        &self,
+        run_id: &str,
+        attempt_id: &str,
+        owner_id: &str,
+    ) -> Result<AttemptLease, OrchError> {
+        let path = self.lease_path(run_id)?;
+        let _guard = self.inner.lock.lock();
+        let Some(current) = self.load_attempt_lease_unlocked(&path, run_id)? else {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "attempt lease is missing",
+            ));
+        };
+        if current.attempt_id != attempt_id || current.owner_id != owner_id {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "attempt lease is held by another attempt",
+            ));
+        }
+        if current.state != AttemptLeaseState::Held {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "attempt lease is no longer held",
+            ));
+        }
+        let renewed = AttemptLease {
+            heartbeat_at: Utc::now(),
+            digest: String::new(),
+            ..current
+        }
+        .seal();
+        write_private_json(&self.inner.root, &path, &renewed)?;
+        Ok(renewed)
+    }
+
+    /// Release a lease this exact attempt holds. Idempotent for the holder,
+    /// refused for anyone else.
+    pub fn release_attempt_lease(
+        &self,
+        run_id: &str,
+        attempt_id: &str,
+        owner_id: &str,
+    ) -> Result<bool, OrchError> {
+        let path = self.lease_path(run_id)?;
+        let _guard = self.inner.lock.lock();
+        let Some(current) = self.load_attempt_lease_unlocked(&path, run_id)? else {
+            return Ok(false);
+        };
+        if current.attempt_id != attempt_id || current.owner_id != owner_id {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "attempt lease is held by another attempt",
+            ));
+        }
+        if current.state == AttemptLeaseState::Released {
+            return Ok(false);
+        }
+        let released = AttemptLease {
+            state: AttemptLeaseState::Released,
+            heartbeat_at: Utc::now(),
+            digest: String::new(),
+            ..current
+        }
+        .seal();
+        write_private_json(&self.inner.root, &path, &released)?;
+        Ok(true)
+    }
+
+    /// Drop a lease record entirely. Only for a run that is already terminal.
+    pub fn remove_attempt_lease(&self, run_id: &str) -> Result<bool, OrchError> {
+        let path = self.lease_path(run_id)?;
+        let _guard = self.inner.lock.lock();
+        ensure_private_path(&self.inner.root, &path)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        }
+    }
+
+    /// Leave a bounded, durable, recoverable finalization intent without
+    /// installing it.
+    ///
+    /// This is the last-resort path for an outer supervisor that is being torn
+    /// down (panic, abort, shutdown) or that cannot install its terminal
+    /// record. The intent is replayed by [`OrchStore::open`], so the run is
+    /// terminalized on the next start even if this process never gets another
+    /// chance to write.
+    pub fn stage_finalization_intent(&self, candidate: &RunRecord) -> anyhow::Result<()> {
+        if !candidate.state.is_terminal() {
+            anyhow::bail!("finalization candidate must be terminal");
+        }
+        let _guard = self.inner.lock.lock();
+        let intent_path = self
+            .finalization_path(&candidate.run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let result = atomic_write_json(&intent_path, candidate);
+        *self.inner.last_run_error.lock() = result.as_ref().err().map(ToString::to_string);
+        result
+    }
+
     pub fn save_idempotency(&self, receipt: &IdempotencyReceipt) -> anyhow::Result<()> {
         let _g = self.inner.lock.lock();
         let path = self
@@ -777,25 +1106,55 @@ impl OrchStore {
         self.inner.last_run_error.lock().clone()
     }
 
+    /// Recover the run ledger after a restart.
+    ///
+    /// * `Running` runs are always terminalized `Interrupted`. Model work is
+    ///   never resumed implicitly: the transcript, the tool state, and the
+    ///   provider stream are all gone, so continuing would be a guess. An
+    ///   explicit `ptah_retry_run` is the only way to carry that work forward.
+    /// * `Queued` runs survive **only** when their admission is provably
+    ///   complete: a sealed, verifying [`AcceptanceIntent`] on disk *and* a
+    ///   `complete` idempotency receipt for the same request. That is exactly
+    ///   the state the accept path guarantees before it answers the caller,
+    ///   so a queued task that was truly accepted is still executed, exactly
+    ///   once, after any number of restarts.
+    /// * Every other `Queued` run is tombstoned `Interrupted` with
+    ///   `admission_lost`. A crash between the durable input and the receipt
+    ///   therefore never executes, and a failed request is never resurrected.
+    ///
+    /// Returns the number of runs terminalized by this sweep.
     pub fn mark_unfinished_interrupted(&self) -> anyhow::Result<usize> {
         let mut n = 0;
         let mut interrupted_agents = Vec::new();
         for mut run in self.list_runs()? {
-            if matches!(run.state, RunState::Queued | RunState::Running) {
-                run.state = RunState::Interrupted;
-                run.queue_position = None;
-                run.updated_at = Utc::now();
-                run.terminal_result = Some("interrupted".into());
-                run.error_code = Some("interrupted".into());
-                if let Some(execution) = run.execution.as_mut() {
-                    execution.promotion_state = PromotionState::Conflicted;
-                }
-                self.save_run(&run)?;
-                if let Some(agent_id) = run.agent_id.clone() {
-                    interrupted_agents.push((agent_id, run.run_id.clone()));
-                }
-                n += 1;
+            let tombstone_code = match run.state {
+                RunState::Running => Some("interrupted"),
+                RunState::Queued => match self.queued_admission_disposition(&run) {
+                    QueuedAdmission::Recoverable => None,
+                    QueuedAdmission::Lost => Some("admission_lost"),
+                    QueuedAdmission::Tampered => Some("admission_tampered"),
+                },
+                _ => continue,
+            };
+            let Some(error_code) = tombstone_code else {
+                // Keep the durable input; the service re-admits from it.
+                continue;
+            };
+            run.state = RunState::Interrupted;
+            run.queue_position = None;
+            run.updated_at = Utc::now();
+            run.terminal_result = Some("interrupted".into());
+            run.error_code = Some(error_code.into());
+            if let Some(execution) = run.execution.as_mut() {
+                execution.promotion_state = PromotionState::Conflicted;
             }
+            self.save_run(&run)?;
+            // A tombstoned admission must never keep executable input around.
+            let _ = self.remove_acceptance_intent(&run.run_id);
+            if let Some(agent_id) = run.agent_id.clone() {
+                interrupted_agents.push((agent_id, run.run_id.clone()));
+            }
+            n += 1;
         }
         for (agent_id, run_id) in interrupted_agents {
             let _ = self.update_agent(&agent_id, |agent| {
@@ -828,6 +1187,44 @@ impl OrchStore {
         Ok(n)
     }
 
+    /// A queued admission may only survive a restart when both halves of the
+    /// accept cut are durably present: the sealed input **and** the completed
+    /// receipt that promised the caller it would run.
+    fn queued_admission_disposition(&self, run: &RunRecord) -> QueuedAdmission {
+        let intent = match self.load_acceptance_intent(&run.run_id) {
+            Ok(Some(intent)) => intent,
+            Ok(None) => return QueuedAdmission::Lost,
+            // Present but not what was accepted: a parseable tamper, a widened
+            // permission, a symlink. Never runs, and is named as such.
+            Err(_) => return QueuedAdmission::Tampered,
+        };
+        if intent.request_id != run.request_id
+            || intent.session_id != run.session_id
+            || intent.workspace != run.workspace
+        {
+            return QueuedAdmission::Tampered;
+        }
+        let receipt = match self.load_idempotency(&run.request_id) {
+            Ok(Some(receipt)) => receipt,
+            Ok(None) => return QueuedAdmission::Lost,
+            Err(_) => return QueuedAdmission::Tampered,
+        };
+        // An explicit failure, or a claim that never settled, can never
+        // become execution. Only a completed receipt admits work.
+        if receipt.status != "complete" || receipt.error.is_some() {
+            return QueuedAdmission::Lost;
+        }
+        if receipt.payload_hash != intent.payload_hash || receipt.tool != intent.tool {
+            return QueuedAdmission::Tampered;
+        }
+        // The receipt must name this exact run; a receipt for other work can
+        // never be used to justify running this record.
+        if receipt.run_id.as_deref() != Some(run.run_id.as_str()) {
+            return QueuedAdmission::Tampered;
+        }
+        QueuedAdmission::Recoverable
+    }
+
     fn recover_finalization_intents(&self) -> anyhow::Result<usize> {
         let dir = self.inner.root.join("finalization");
         let mut recovered = 0;
@@ -842,6 +1239,50 @@ impl OrchStore {
             recovered += 1;
         }
         Ok(recovered)
+    }
+
+    /// Release every attempt lease left behind by a previous instance.
+    ///
+    /// Safe only because [`OrchStore::open`] holds the store's exclusive
+    /// advisory lock: no other process can be executing these attempts. A
+    /// lease that cannot be parsed or verified is removed outright — a
+    /// tampered lease must not be able to block a run forever, and it cannot
+    /// authorize one either, since dispatch always mints a fresh lease.
+    fn release_orphaned_attempt_leases(&self) -> anyhow::Result<usize> {
+        let dir = self.inner.root.join("leases");
+        if !dir.is_dir() {
+            return Ok(0);
+        }
+        let mut released = 0;
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let parsed = read_private_string(&self.inner.root, &path)
+                .ok()
+                .flatten()
+                .and_then(|text| serde_json::from_str::<AttemptLease>(&text).ok())
+                .filter(|lease| lease.validate().is_ok());
+            let Some(lease) = parsed else {
+                let _ = fs::remove_file(&path);
+                continue;
+            };
+            if lease.state == AttemptLeaseState::Released {
+                continue;
+            }
+            let released_lease = AttemptLease {
+                state: AttemptLeaseState::Released,
+                heartbeat_at: Utc::now(),
+                digest: String::new(),
+                ..lease
+            }
+            .seal();
+            write_private_json(&self.inner.root, &path, &released_lease)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            released += 1;
+        }
+        Ok(released)
     }
 
     fn fail_orphaned_idempotency_claims(&self) -> anyhow::Result<usize> {
@@ -939,10 +1380,170 @@ fn append_audit_entry(root: &Path, entry: &AuditEntry) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Why a queued admission may or may not survive a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuedAdmission {
+    /// Sealed input and a completed receipt naming this exact run both exist.
+    Recoverable,
+    /// The admission never completed, so it must never execute.
+    Lost,
+    /// Durable evidence exists but is not what was accepted.
+    Tampered,
+}
+
 pub enum IdempotencyClaim {
     Perform,
     Pending,
     Replay(Result<serde_json::Value, OrchError>),
+}
+
+/// Owner-only permissions for every durable record that can carry private
+/// execution input. Anything wider is treated as tampering, not as a
+/// convenience to be repaired silently.
+#[cfg(unix)]
+const PRIVATE_FILE_MODE: u32 = 0o600;
+#[cfg(unix)]
+const PRIVATE_DIR_MODE: u32 = 0o700;
+
+fn create_private_dir(path: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIR_MODE))?;
+    }
+    Ok(())
+}
+
+/// Reject a path that is (or traverses) a symlink, and one that escapes the
+/// store root. Both are checked before any read, so a swapped-in symlink can
+/// never redirect a load to an attacker-controlled file.
+fn ensure_private_path(root: &Path, path: &Path) -> Result<(), OrchError> {
+    let contained = path.strip_prefix(root).is_ok();
+    if !contained
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "durable record path escapes the store root",
+        ));
+    }
+    // Every component between the root and the leaf must be a real directory.
+    let mut walked = root.to_path_buf();
+    let Ok(relative) = path.strip_prefix(root) else {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "durable record path escapes the store root",
+        ));
+    };
+    for component in relative.components() {
+        walked.push(component);
+        match fs::symlink_metadata(&walked) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(OrchError::new(
+                        OrchErrorCode::InvalidRequest,
+                        "durable record path is a symlink",
+                    ));
+                }
+            }
+            // A component that does not exist yet is fine for a write; the
+            // exclusive/atomic write below is what creates it.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(OrchError::new(OrchErrorCode::Internal, error.to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read a private durable record, failing closed on a symlink, on an escaped
+/// path, and on permissions that would expose private execution input.
+fn read_private_string(root: &Path, path: &Path) -> Result<Option<String>, OrchError> {
+    ensure_private_path(root, path)?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "durable record is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "durable record permissions are wider than owner-only",
+            ));
+        }
+    }
+    fs::read_to_string(path)
+        .map(Some)
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+}
+
+/// Atomically install a private durable record with owner-only permissions.
+/// The temp file is created private, so the content is never briefly readable.
+fn write_private_json<T: serde::Serialize>(
+    root: &Path,
+    path: &Path,
+    value: &T,
+) -> Result<(), OrchError> {
+    ensure_private_path(root, path)?;
+    let internal =
+        |error: std::io::Error| OrchError::new(OrchErrorCode::Internal, error.to_string());
+    if let Some(parent) = path.parent() {
+        create_private_dir(parent)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    ensure_private_path(root, &tmp)?;
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+    {
+        use std::io::Write;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(PRIVATE_FILE_MODE);
+        }
+        let mut file = options.open(&tmp).map_err(internal)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+                .map_err(internal)?;
+        }
+        let write = file
+            .write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(internal);
+        if write.is_err() {
+            let _ = fs::remove_file(&tmp);
+            write?;
+        }
+    }
+    if let Err(error) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(internal(error));
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(internal)?;
+    }
+    Ok(())
 }
 
 fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {

@@ -1,6 +1,6 @@
 //! Orchestration service: reads + bounded mutations over AgentHostHandle (#196).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -8,6 +8,7 @@ use std::time::Duration;
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::event_bus::{CursorExpiredError, EventBus, EventReceiver, JournalPage};
@@ -15,6 +16,10 @@ use crate::host::AgentHostHandle;
 use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
 use crate::session::{SessionKind, WorkspaceStatus};
 
+use super::admission::{
+    AcceptanceIntent, AttemptLease, LiveWorker, SealedBounds, WorkerLiveness, WorkerLivenessGuard,
+    ACCEPTANCE_INTENT_VERSION, DEFAULT_ATTEMPT_LEASE_TTL_MS, DEFAULT_TEARDOWN_BUDGET,
+};
 use super::authz::{canonical_workspace, require_workspace_match, AuthContext, WorkspaceAllowlist};
 use super::store::{IdempotencyClaim, OrchStore};
 use super::types::*;
@@ -23,16 +28,30 @@ use super::types::*;
 /// queued submissions into an unbounded in-memory prompt store.
 const MAX_PENDING_ADMISSIONS: usize = 32;
 
+/// Execution spec revision sealed into every acceptance intent. Bump this
+/// when the meaning of a sealed field changes, so intents accepted under the
+/// old contract stop verifying instead of running under the new one.
+const EXECUTION_SPEC_REVISION: &str = "grokptah-agent-bridge/orchestration/1";
+
+/// How often a live attempt refreshes its durable lease heartbeat.
+const ATTEMPT_HEARTBEAT_INTERVAL: Duration =
+    Duration::from_millis(DEFAULT_ATTEMPT_LEASE_TTL_MS / 3);
+
+/// Bounded number of finished attempts whose worker liveness stays queryable.
+const MAX_REMEMBERED_LIVENESS: usize = 256;
+
 #[derive(Default)]
 struct AdmissionQueueState {
     pending: VecDeque<PendingRun>,
 }
 
+/// A queued admission. The prompt is deliberately **not** held here: the
+/// sealed [`AcceptanceIntent`] on disk is the only source of execution input,
+/// so a restart loses nothing and an untrusted coordinator cannot grow an
+/// in-memory prompt store.
 struct PendingRun {
     run_id: String,
     session_id: Uuid,
-    prompt: String,
-    execution_mode: RunExecutionMode,
 }
 
 #[derive(Clone)]
@@ -62,8 +81,20 @@ pub struct OrchestrationService {
     self_ref: Weak<OrchestrationService>,
     pending_admissions: Mutex<AdmissionQueueState>,
     scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Join handles for in-flight runs (prevents forget + unbounded leaks).
-    join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Authoritative registry of every dispatched attempt that can still run.
+    ///
+    /// An entry exists from the moment a worker is spawned until its capacity
+    /// has been released, and it owns the cancel token plus the abort handles
+    /// for the nested worker/aggregator tasks. Nothing may release a run's
+    /// capacity, promote another attempt, or report the run terminal while its
+    /// entry is still live.
+    live_workers: Mutex<HashMap<String, Arc<LiveWorker>>>,
+    /// Bounded post-mortem liveness of recent attempts, so callers can ask
+    /// whether the *worker future itself* is gone rather than trusting the
+    /// ledger.
+    remembered_liveness: Mutex<VecDeque<(String, Arc<WorkerLiveness>)>>,
+    /// Identity of this process instance for attempt-lease ownership.
+    owner_id: String,
 }
 
 /// Authorized bounds for a live run event stream.
@@ -80,6 +111,30 @@ impl Drop for OrchestrationService {
         if let Some(watcher) = self.scheduler_watcher.get_mut().take() {
             watcher.abort();
         }
+        // Shutdown is an outer-supervisor exit like any other: every live
+        // attempt must end with a durable terminal record or a bounded
+        // recoverable finalization intent, never with a run left `Running`
+        // and no evidence of why.
+        let live: Vec<Arc<LiveWorker>> = self
+            .live_workers
+            .get_mut()
+            .drain()
+            .map(|(_, e)| e)
+            .collect();
+        for entry in live {
+            entry.cancel.cancel();
+            entry.abort_nested();
+            if entry.settle_once() {
+                stage_supervisor_exit(&self.store, &entry.run_id, "shutdown");
+                release_settled_attempt(
+                    &self.store,
+                    &self.host,
+                    &entry.run_id,
+                    &entry.attempt_id,
+                    &self.owner_id,
+                );
+            }
+        }
         let pending = self
             .pending_admissions
             .get_mut()
@@ -93,14 +148,153 @@ impl Drop for OrchestrationService {
     }
 }
 
-struct AdmissionGuard {
-    host: AgentHostHandle,
-    run_id: String,
+/// Release everything one settled attempt still owns.
+///
+/// Called exactly once per attempt, by whichever exit path won
+/// [`LiveWorker::settle_once`]. Ordering is deliberate: the durable lease and
+/// the durable input go first, because both are only safe to drop once the run
+/// is terminal; host capacity goes last, because releasing it is what allows
+/// another attempt to start.
+fn release_settled_attempt(
+    store: &OrchStore,
+    host: &AgentHostHandle,
+    run_id: &str,
+    attempt_id: &str,
+    owner_id: &str,
+) {
+    let _ = store.release_attempt_lease(run_id, attempt_id, owner_id);
+    // Safe only now: the run is terminal, so no recovery pass can ever need
+    // this input again.
+    let _ = store.remove_acceptance_intent(run_id);
+    host.release_orchestration_turn(run_id);
 }
 
-impl Drop for AdmissionGuard {
+/// Record that one outer supervisor exited without installing a terminal
+/// record, leaving a bounded recoverable finalization intent behind.
+///
+/// A run that is already terminal is left exactly as it is: an explicit
+/// cancel that raced this teardown keeps its `cancelled` outcome. Everything
+/// else becomes `interrupted`, which is the honest live-reaper outcome.
+fn stage_supervisor_exit(store: &OrchStore, run_id: &str, reason: &str) {
+    let Ok(Some(mut candidate)) = store.load_run(run_id) else {
+        return;
+    };
+    if candidate.state.is_terminal() {
+        return;
+    }
+    candidate.state = RunState::Interrupted;
+    candidate.queue_position = None;
+    candidate.terminal_result = Some("interrupted".into());
+    candidate.error_code = Some(reason.into());
+    candidate.updated_at = Utc::now();
+    if let Some(execution) = candidate.execution.as_mut() {
+        execution.promotion_state = PromotionState::Conflicted;
+    }
+    if store.persist_finalization(&candidate).is_err() {
+        // Bounded, recoverable: replayed by the next `OrchStore::open`.
+        if let Err(error) = store.stage_finalization_intent(&candidate) {
+            eprintln!("[grokptah] run {run_id} supervisor exit could not be recorded: {error}");
+        }
+    }
+}
+
+/// The single exit path for one dispatched attempt.
+///
+/// This guard is uniquely owned by the outer supervisor, and its `Drop` runs
+/// on **every** way that supervisor can end: a normal return, an early return,
+/// a panic unwind, an abort landing on any await point, and runtime shutdown.
+/// Under one compare-and-swap latch it performs, exactly once:
+///
+/// 1. durable terminalization — or, if that cannot land, a bounded recoverable
+///    finalization intent that the next `OrchStore::open` replays;
+/// 2. release of the durable attempt lease held by this exact attempt;
+/// 3. removal of the durable input, which is now provably unnecessary because
+///    the run is terminal;
+/// 4. deregistration from the live-worker registry;
+/// 5. release of host admission capacity, and only then a scheduler wake.
+///
+/// Steps 4 and 5 come last on purpose. Capacity is what lets another attempt
+/// start, so it is released only after this attempt's futures are gone.
+struct SupervisorExitGuard {
+    store: OrchStore,
+    host: AgentHostHandle,
+    service: Weak<OrchestrationService>,
+    entry: Arc<LiveWorker>,
+    run_id: String,
+    attempt_id: String,
+    owner_id: String,
+    /// The terminal record the supervisor computed, when it got that far.
+    candidate: Option<RunRecord>,
+}
+
+/// Bounded attempts to install a terminal record before falling back to a
+/// staged intent. Unbounded retrying here would hold admission capacity for as
+/// long as the disk stays full.
+const FINALIZATION_ATTEMPTS: u32 = 3;
+
+impl Drop for SupervisorExitGuard {
     fn drop(&mut self) {
-        self.host.release_orchestration_turn(&self.run_id);
+        if !self.entry.settle_once() {
+            // Another path already settled this attempt.
+            return;
+        }
+
+        match self.candidate.take() {
+            Some(candidate) => {
+                let mut installed = false;
+                let mut last_error = None;
+                for _ in 0..FINALIZATION_ATTEMPTS {
+                    match self.store.persist_finalization(&candidate) {
+                        Ok(_) => {
+                            installed = true;
+                            break;
+                        }
+                        Err(error) => last_error = Some(error.to_string()),
+                    }
+                }
+                if !installed {
+                    // Bounded recoverable finalization intent: replayed at the
+                    // next store open, so the run is never left non-terminal
+                    // with no record of why.
+                    if let Err(error) = self.store.stage_finalization_intent(&candidate) {
+                        eprintln!(
+                            "[grokptah] run {} finalization could not be staged: {error}",
+                            self.run_id
+                        );
+                    }
+                    let detail = last_error.unwrap_or_else(|| "unknown".into());
+                    let _ = self.store.enqueue_audit(AuditEntry {
+                        ts: Utc::now(),
+                        tool: "run_finalization".into(),
+                        request_id: None,
+                        session_id: Some(candidate.session_id),
+                        workspace: None,
+                        outcome: "deferred".into(),
+                        error_code: Some("run_persistence_failed".into()),
+                        detail,
+                    });
+                }
+            }
+            // The supervisor never reached a terminal decision: it panicked,
+            // was aborted, or the process is shutting down.
+            None => stage_supervisor_exit(&self.store, &self.run_id, "supervisor_exit"),
+        }
+
+        if let Some(service) = self.service.upgrade() {
+            service.live_workers.lock().remove(&self.run_id);
+        }
+        release_settled_attempt(
+            &self.store,
+            &self.host,
+            &self.run_id,
+            &self.attempt_id,
+            &self.owner_id,
+        );
+        if let Some(service) = self.service.upgrade() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                service.pump_pending();
+            }
+        }
     }
 }
 
@@ -202,10 +396,152 @@ impl OrchestrationService {
             self_ref: self_ref.clone(),
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
             scheduler_watcher: Mutex::new(None),
-            join_handles: Mutex::new(Vec::new()),
+            live_workers: Mutex::new(HashMap::new()),
+            remembered_liveness: Mutex::new(VecDeque::new()),
+            owner_id: Uuid::new_v4().to_string(),
         });
         service.start_scheduler_watcher();
+        // Re-admit work that was durably accepted before the last restart,
+        // before any new submission can take its capacity.
+        service.recover_admissions();
         service
+    }
+
+    /// Re-admit every durably accepted, not-yet-executed task after a restart.
+    ///
+    /// This is deliberately narrow. It re-admits **only** runs the ledger
+    /// already records as `Queued` — which `OrchStore::open` has already
+    /// reduced to those with a verifying sealed input *and* a completed
+    /// receipt naming that exact run. It never invents a run: an input whose
+    /// run record is missing, failed, or terminal is reclaimed as garbage, so
+    /// a submission that ended in an explicit `Err` can never come back as
+    /// executable work.
+    fn recover_admissions(&self) {
+        let mut recovered: Vec<RunRecord> = match self.store.list_runs() {
+            Ok(runs) => runs
+                .into_iter()
+                .filter(|run| run.state == RunState::Queued)
+                .collect(),
+            Err(error) => {
+                eprintln!("[grokptah] admission recovery could not read the ledger: {error}");
+                Vec::new()
+            }
+        };
+        // Deterministic, arrival-ordered promotion across restarts.
+        recovered.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then(a.run_id.cmp(&b.run_id))
+        });
+
+        let mut readmitted = Vec::new();
+        for run in recovered {
+            // The sealed input is re-verified here as well as in the store
+            // sweep, so a tamper landed between the two still cannot execute.
+            match self.store.load_acceptance_intent(&run.run_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    self.tombstone_admission(&run.run_id, "admission_lost");
+                    continue;
+                }
+                Err(error) => {
+                    self.audit(
+                        "admission_recovery",
+                        Some(&run.request_id),
+                        Some(run.session_id),
+                        Some(&run.workspace),
+                        "rejected",
+                        Some(error.code.as_str()),
+                        "sealed acceptance intent failed verification",
+                    );
+                    self.tombstone_admission(&run.run_id, "admission_tampered");
+                    continue;
+                }
+            }
+            match self.enqueue_pending(PendingRun {
+                run_id: run.run_id.clone(),
+                session_id: run.session_id,
+            }) {
+                Ok(_) => readmitted.push(run.run_id.clone()),
+                Err(error) => {
+                    // The bounded queue is full. The record stays `Queued`
+                    // with its input intact, so a later restart or a freed
+                    // slot re-admits it; it is never silently dropped.
+                    eprintln!(
+                        "[grokptah] queued run {} deferred during recovery: {}",
+                        run.run_id, error.message
+                    );
+                }
+            }
+        }
+
+        // Reclaim durable input that no longer belongs to an admitted run.
+        self.reclaim_orphaned_inputs();
+
+        if !readmitted.is_empty() {
+            self.audit(
+                "admission_recovery",
+                None,
+                None,
+                None,
+                "accepted",
+                None,
+                &format!("re-admitted {} queued task(s)", readmitted.len()),
+            );
+        }
+        if tokio::runtime::Handle::try_current().is_ok() {
+            self.pump_pending();
+        }
+    }
+
+    /// Permanently fail one admission. The run can never later recover or
+    /// execute: its durable input is destroyed in the same step, so no
+    /// recovery pass can find anything to run.
+    fn tombstone_admission(&self, run_id: &str, error_code: &str) {
+        let _ = self.store.update_run(run_id, |run| {
+            if run.state.is_terminal() {
+                return Ok(());
+            }
+            run.state = RunState::Failed;
+            run.queue_position = None;
+            run.terminal_result = Some("failed".into());
+            run.error_code = Some(error_code.into());
+            run.updated_at = Utc::now();
+            Ok(())
+        });
+        let _ = self.store.remove_acceptance_intent(run_id);
+        let _ = self.store.remove_attempt_lease(run_id);
+        self.remove_pending(run_id);
+    }
+
+    /// Remove sealed input that is not backed by an admitted, non-terminal
+    /// run. This is the only cleanup path that may touch input for a run that
+    /// was never dispatched, and it only ever *removes*: it can promote
+    /// nothing.
+    fn reclaim_orphaned_inputs(&self) {
+        let Ok(entries) = self.store.list_acceptance_intent_run_ids() else {
+            return;
+        };
+        for (stem, run_id) in entries {
+            let Some(run_id) = run_id else {
+                // Unreadable or non-verifying input: garbage by definition.
+                let _ = self.store.remove_acceptance_intent_file(&stem);
+                continue;
+            };
+            match self.store.load_run(&run_id) {
+                // Never synthesize a run from an input. A missing run record
+                // means the admission never completed; the input is garbage.
+                Ok(None) => {
+                    let _ = self.store.remove_acceptance_intent(&run_id);
+                    let _ = self.store.remove_attempt_lease(&run_id);
+                }
+                Ok(Some(run)) if run.state.is_terminal() => {
+                    let _ = self.store.remove_acceptance_intent(&run_id);
+                    let _ = self.store.remove_attempt_lease(&run_id);
+                }
+                Ok(Some(_)) | Err(_) => {}
+            }
+        }
     }
 
     fn start_scheduler_watcher(&self) {
@@ -360,6 +696,89 @@ impl OrchestrationService {
         self.pump_pending();
     }
 
+    /// Remember a finished attempt's worker liveness so callers can prove the
+    /// worker future is actually gone. Bounded so it cannot grow without end.
+    fn remember_liveness(&self, run_id: &str, liveness: Arc<WorkerLiveness>) {
+        let mut remembered = self.remembered_liveness.lock();
+        remembered.retain(|(id, _)| id != run_id);
+        remembered.push_back((run_id.to_string(), liveness));
+        while remembered.len() > MAX_REMEMBERED_LIVENESS {
+            remembered.pop_front();
+        }
+    }
+
+    /// Whether the worker future dispatched for `run_id` can still execute.
+    ///
+    /// `Some(false)` means a future for this run is live — capacity must not
+    /// be reused and no other attempt may be promoted. `Some(true)` means the
+    /// future is provably gone (it ended, or it was cancelled before it was
+    /// ever polled). `None` means this process never dispatched the run, or
+    /// the record has aged out of the bounded post-mortem window.
+    ///
+    /// This reads the worker's own liveness guard, not the run ledger. A run
+    /// can be recorded `cancelled` while its future is still running; only
+    /// this answers whether the work actually stopped.
+    pub fn worker_future_finished(&self, run_id: &str) -> Option<bool> {
+        if let Some(entry) = self.live_workers.lock().get(run_id) {
+            return Some(entry.liveness.quiescent());
+        }
+        self.remembered_liveness
+            .lock()
+            .iter()
+            .find(|(id, _)| id == run_id)
+            .map(|(_, liveness)| liveness.quiescent())
+    }
+
+    /// Run ids with a dispatched attempt that has not yet settled.
+    ///
+    /// A run listed here still owns admission capacity, so no second attempt
+    /// for it may be promoted and its slot may not be handed to another run.
+    pub fn live_run_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .live_workers
+            .lock()
+            .iter()
+            .filter(|(_, entry)| !entry.is_settled())
+            .map(|(run_id, _)| run_id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The durable attempt identity currently dispatched for `run_id`, as
+    /// `(attempt_id, attempt_number)`. Exactly one attempt is ever live.
+    pub fn live_attempt(&self, run_id: &str) -> Option<(String, u64)> {
+        self.live_workers
+            .lock()
+            .get(run_id)
+            .map(|entry| (entry.attempt_id.clone(), entry.attempt))
+    }
+
+    /// Cancel, abort, and bounded-await the live attempt for `run_id`.
+    ///
+    /// Returns `None` when this process has no live attempt for the run.
+    /// Otherwise the outcome says whether the worker and supervisor are
+    /// confirmed gone; only a confirmed teardown lets capacity be reused.
+    async fn reap_live_attempt(
+        &self,
+        run_id: &str,
+    ) -> Option<super::admission::TerminationOutcome> {
+        let entry = self.live_workers.lock().get(run_id).cloned()?;
+        let outcome = entry.terminate(DEFAULT_TEARDOWN_BUDGET).await;
+        if !outcome.may_release_capacity() {
+            self.audit(
+                "run_teardown",
+                None,
+                Some(entry.session_id),
+                None,
+                "rejected",
+                Some("teardown_incomplete"),
+                &format!("run {run_id} teardown incomplete: {outcome:?}"),
+            );
+        }
+        Some(outcome)
+    }
+
     /// Keep the durable records aligned with the host-global scheduler. The
     /// prompt itself remains in memory by design; this metadata is only for
     /// honest operator/coordinator visibility while the run is pending.
@@ -479,6 +898,49 @@ impl OrchestrationService {
                 continue;
             }
 
+            // The sealed input is the only source of execution material and
+            // is re-verified at every promotion, so a tamper landed while the
+            // task sat in the queue fails closed instead of running.
+            let intent = match self.store.load_acceptance_intent(&pending.run_id) {
+                Ok(Some(intent)) => intent,
+                Ok(None) => {
+                    self.host.release_orchestration_turn(&pending.run_id);
+                    self.tombstone_admission(&pending.run_id, "admission_lost");
+                    continue;
+                }
+                Err(error) => {
+                    self.host.release_orchestration_turn(&pending.run_id);
+                    self.audit(
+                        "run_promotion",
+                        Some(&current.request_id),
+                        Some(current.session_id),
+                        Some(&current.workspace),
+                        "rejected",
+                        Some(error.code.as_str()),
+                        "sealed acceptance intent failed verification",
+                    );
+                    self.tombstone_admission(&pending.run_id, "admission_tampered");
+                    continue;
+                }
+            };
+
+            // Mandatory attempt lease. A run whose previous attempt is still
+            // live in this process is never promoted a second time.
+            let lease = match self.acquire_dispatch_lease(&current, &intent) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    self.host.release_orchestration_turn(&pending.run_id);
+                    eprintln!(
+                        "[grokptah] queued run {} could not take an attempt lease: {}",
+                        pending.run_id, error.message
+                    );
+                    // The record stays `Queued` with its input intact; a later
+                    // pump or restart re-admits it. Nothing is lost, nothing
+                    // runs twice.
+                    continue;
+                }
+            };
+
             let start_seq = self.bus.next_seq();
             let transitioned = self.store.update_run(&pending.run_id, |run| {
                 if run.state != RunState::Queued {
@@ -491,8 +953,13 @@ impl OrchestrationService {
                 Ok(())
             });
             match transitioned {
-                Ok(Some(run)) => self.spawn_run(run, pending.prompt, pending.execution_mode),
+                Ok(Some(run)) => self.dispatch_attempt(run, intent, lease),
                 Ok(None) | Err(_) => {
+                    let _ = self.store.release_attempt_lease(
+                        &pending.run_id,
+                        &lease.attempt_id,
+                        &self.owner_id,
+                    );
                     self.host.release_orchestration_turn(&pending.run_id);
                     if let Err(error) = self
                         .host
@@ -509,6 +976,30 @@ impl OrchestrationService {
                 }
             }
         }
+    }
+
+    /// Acquire the mandatory compare-and-swap attempt lease that authorizes
+    /// dispatch. Refuses while this process still has a live attempt for the
+    /// run, so capacity freed by a partial teardown cannot start a second
+    /// worker beside the first.
+    fn acquire_dispatch_lease(
+        &self,
+        run: &RunRecord,
+        intent: &AcceptanceIntent,
+    ) -> Result<AttemptLease, OrchError> {
+        if self.live_workers.lock().contains_key(&run.run_id) {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "run already has a live attempt in this process",
+            ));
+        }
+        self.store.acquire_attempt_lease(
+            &run.run_id,
+            &self.owner_id,
+            run.session_id,
+            &intent.digest,
+            DEFAULT_ATTEMPT_LEASE_TTL_MS,
+        )
     }
 
     async fn begin_idempotency(
@@ -602,11 +1093,6 @@ impl OrchestrationService {
             &error,
         );
         lease.fail(run_id, error)
-    }
-
-    fn reaping_handles(&self) {
-        let mut h = self.join_handles.lock();
-        h.retain(|j| !j.is_finished());
     }
 
     /// Load run and verify workspace ownership against allowlist + session.
@@ -2651,7 +3137,56 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, e));
             }
         }
-        let start_seq = (!queued).then(|| self.bus.next_seq());
+
+        // ── crash-safe cut C2: private bounded input, sealed ───────────
+        //
+        // Every accepted task — immediate execution included — gets its
+        // durable input written and fsynced here, *before* the receipt can
+        // say "accepted". A crash from this point on can only produce
+        // "tombstoned, never ran" or "ran exactly once".
+        let intent = AcceptanceIntent {
+            intent_version: ACCEPTANCE_INTENT_VERSION,
+            run_id: run_id.clone(),
+            request_id: request_id.into(),
+            payload_hash: phash.clone(),
+            tool: tool.into(),
+            session_id,
+            session_revision: session_revision_of(&session),
+            workspace: claimed.display().to_string(),
+            workspace_revision: workspace_revision_of(&session),
+            agent_id: session.agent_id.clone(),
+            agent_revision: session.message_count as u64,
+            spec_revision: EXECUTION_SPEC_REVISION.into(),
+            prompt: prompt.clone(),
+            bounds: SealedBounds::from(&bounds),
+            execution_mode,
+            allow_queue,
+            retry_of: retry_of.map(str::to_string),
+            parent_run_id: None,
+            created_at: Utc::now(),
+            digest: String::new(),
+        }
+        .seal();
+        if let Err(e) = self.store.save_acceptance_intent(&intent) {
+            if !queued {
+                self.host.release_turn_reservation(session_id, &run_id);
+                self.release_capacity(&run_id);
+            }
+            // Nothing durable claims this run yet; fail the admission for good.
+            let _ = self.store.remove_acceptance_intent(&run_id);
+            return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
+        }
+
+        // ── crash-safe cut C3: the run record ──────────────────────────
+        //
+        // Always `Queued` first, even for immediate execution. `Running` is
+        // reached only after the mandatory attempt lease is held, so a crash
+        // can never leave a run that looks dispatched but never was.
+        let reported_state = if queued {
+            RunState::Queued
+        } else {
+            RunState::Running
+        };
         let run = RunRecord {
             run_id: run_id.clone(),
             session_id,
@@ -2661,18 +3196,14 @@ impl OrchestrationService {
             // desktop can surface external activity without guessing from
             // transport timing.
             client_id: Some("mcp".into()),
-            state: if queued {
-                RunState::Queued
-            } else {
-                RunState::Running
-            },
+            state: RunState::Queued,
             agent_id: None,
             retry_of: retry_of.map(str::to_string),
             parent_run_id: None,
             queue_position: None,
             bounds: bounds.clone(),
             prompt_preview: self.bus.redact_text(&prompt_preview(&prompt), 500),
-            start_seq,
+            start_seq: None,
             end_seq: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -2689,6 +3220,7 @@ impl OrchestrationService {
                 self.host.release_turn_reservation(session_id, &run_id);
                 self.release_capacity(&run_id);
             }
+            let _ = self.store.remove_acceptance_intent(&run_id);
             let e = OrchError::new(OrchErrorCode::Internal, e.to_string());
             return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
         }
@@ -2697,19 +3229,10 @@ impl OrchestrationService {
             match self.enqueue_pending(PendingRun {
                 run_id: run_id.clone(),
                 session_id,
-                prompt: prompt.clone(),
-                execution_mode,
             }) {
                 Ok(position) => Some(position),
                 Err(error) => {
-                    let _ = self.store.update_run(&run_id, |current| {
-                        current.state = RunState::Failed;
-                        current.queue_position = None;
-                        current.terminal_result = Some("failed".into());
-                        current.error_code = Some(error.code.as_str().into());
-                        current.updated_at = Utc::now();
-                        Ok(())
-                    });
+                    self.tombstone_admission(&run_id, error.code.as_str());
                     return Err(self.fail_claim(
                         &mut lease,
                         Some(run_id),
@@ -2726,24 +3249,25 @@ impl OrchestrationService {
         let response = json!({
             "runId": run_id,
             "sessionId": session_id,
-            "state": run.state,
+            "state": reported_state,
             "requestId": request_id,
             "executionMode": execution_mode,
             "queuedPosition": queued_position,
         });
+
+        // ── crash-safe cut C4: the receipt ─────────────────────────────
+        //
+        // Only now may the caller be told the work is accepted, because the
+        // input behind that promise is already durable.
         if let Err(e) = lease.complete(Some(run_id.clone()), response.clone()) {
-            let _ = self.store.update_run(&run_id, |r| {
-                r.state = RunState::Failed;
-                r.terminal_result = Some("failed".into());
-                r.error_code = Some("receipt_persistence_failed".into());
-                r.updated_at = Utc::now();
-                Ok(())
-            });
+            // The promise was never made, so the admission is failed for good
+            // and its input destroyed: it can never later recover or execute.
             self.remove_pending(&run_id);
             if !queued {
                 self.host.release_turn_reservation(session_id, &run_id);
                 self.release_capacity(&run_id);
             }
+            self.tombstone_admission(&run_id, "receipt_persistence_failed");
             return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
         }
         self.audit(
@@ -2755,15 +3279,79 @@ impl OrchestrationService {
             None,
             if queued { "run queued" } else { "run started" },
         );
-        if !queued {
-            self.spawn_run(run, prompt, execution_mode);
-        } else {
+
+        if queued {
             // A capacity release can race the enqueue; this also makes an
             // immediately available slot visible without requiring polling.
             self.pump_pending();
+            return Ok(response);
+        }
+
+        // ── crash-safe cut C5: mandatory attempt lease before dispatch ──
+        match self.acquire_dispatch_lease(&run, &intent) {
+            Ok(attempt) => {
+                // ── crash-safe cut C6: Queued -> Running ───────────────
+                let start_seq = self.bus.next_seq();
+                match self.store.update_run(&run_id, |current| {
+                    if current.state != RunState::Queued {
+                        anyhow::bail!("run is no longer queued");
+                    }
+                    current.state = RunState::Running;
+                    current.start_seq = Some(start_seq);
+                    current.updated_at = Utc::now();
+                    Ok(())
+                }) {
+                    Ok(Some(running)) => self.dispatch_attempt(running, intent, attempt),
+                    Ok(None) | Err(_) => {
+                        let _ = self.store.release_attempt_lease(
+                            &run_id,
+                            &attempt.attempt_id,
+                            &self.owner_id,
+                        );
+                        self.defer_accepted_run(&run_id, session_id);
+                    }
+                }
+            }
+            Err(error) => {
+                // The receipt is already durable, so this admission must still
+                // happen: fall back to the bounded queue instead of losing it.
+                eprintln!(
+                    "[grokptah] accepted run {run_id} deferred to the queue: {}",
+                    error.message
+                );
+                self.defer_accepted_run(&run_id, session_id);
+            }
         }
 
         Ok(response)
+    }
+
+    /// Hand an already-accepted run back to the bounded queue.
+    ///
+    /// Used when dispatch cannot proceed *after* the receipt is durable. The
+    /// run keeps its sealed input and stays `Queued`, so it is executed later
+    /// by the pump or by restart recovery — exactly once, never zero times.
+    fn defer_accepted_run(&self, run_id: &str, session_id: Uuid) {
+        let _ = self.store.update_run(run_id, |current| {
+            if current.state == RunState::Running {
+                current.state = RunState::Queued;
+                current.start_seq = None;
+                current.updated_at = Utc::now();
+            }
+            Ok(())
+        });
+        self.host.release_turn_reservation(session_id, run_id);
+        self.host.release_orchestration_turn(run_id);
+        if let Err(error) = self.enqueue_pending(PendingRun {
+            run_id: run_id.to_string(),
+            session_id,
+        }) {
+            eprintln!(
+                "[grokptah] accepted run {run_id} could not be re-queued: {}",
+                error.message
+            );
+        }
+        self.pump_pending();
     }
 
     /// Explicitly create a bounded replacement for one interrupted run.
@@ -2895,18 +3483,75 @@ impl OrchestrationService {
     }
 
     /// Start a run whose host admission has already been reserved.
-    fn spawn_run(&self, run: RunRecord, prompt: String, execution_mode: RunExecutionMode) {
+    /// Dispatch one authorized attempt.
+    ///
+    /// Three tasks are created and all three are registered before any of them
+    /// can matter: the *worker* (the model turn), the *aggregator* (journal
+    /// fold), and the *supervisor* (deadline, heartbeat, terminalization).
+    /// Registration is the dispatch gate — a run that already has a live entry
+    /// is refused rather than started twice.
+    ///
+    /// The durable input is **not** removed here. It survives until the run is
+    /// terminal, so a crash between "spawn confirmed" and "turn finished"
+    /// still leaves exactly one recoverable copy of the accepted work.
+    fn dispatch_attempt(&self, run: RunRecord, intent: AcceptanceIntent, lease: AttemptLease) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            // No runtime to own the worker. Leave the record `Queued` with its
+            // durable input intact rather than losing the admission.
+            let _ =
+                self.store
+                    .release_attempt_lease(&run.run_id, &lease.attempt_id, &self.owner_id);
+            let _ = self.store.update_run(&run.run_id, |current| {
+                if current.state == RunState::Running {
+                    current.state = RunState::Queued;
+                    current.start_seq = None;
+                    current.updated_at = Utc::now();
+                }
+                Ok(())
+            });
+            self.host.release_orchestration_turn(&run.run_id);
+            return;
+        }
+
         let host = self.host.clone();
         let store = self.store.clone();
         let bus = self.bus.clone();
         let service_ref = self.self_ref.clone();
+        let owner_id = self.owner_id.clone();
         let session_id = run.session_id;
         let rid = run.run_id.clone();
         let max_ms = run.bounds.max_duration_ms;
         let max_rounds = run.bounds.max_rounds;
+        let prompt = intent.prompt.clone();
+        let execution_mode = intent.execution_mode;
 
-        // Dedicated aggregator task: must not share a biased select with the
-        // duration deadline (chatty ShellOutput must not starve max_duration_ms).
+        let cancel = CancellationToken::new();
+        let liveness = Arc::new(WorkerLiveness::default());
+        let entry = Arc::new(LiveWorker::new(
+            rid.clone(),
+            lease.attempt_id.clone(),
+            lease.attempt,
+            session_id,
+            cancel.clone(),
+            liveness.clone(),
+        ));
+
+        // ── one active attempt ─────────────────────────────────────────
+        {
+            let mut live = self.live_workers.lock();
+            if live.contains_key(&rid) {
+                drop(live);
+                eprintln!("[grokptah] refusing a second live attempt for run {rid}");
+                let _ = self
+                    .store
+                    .release_attempt_lease(&rid, &lease.attempt_id, &owner_id);
+                return;
+            }
+            live.insert(rid.clone(), entry.clone());
+        }
+        self.remember_liveness(&rid, liveness.clone());
+
+        // ── nested aggregator ──────────────────────────────────────────
         let mut agg_rx = bus.subscribe();
         let store_agg = store.clone();
         let rid_agg = rid.clone();
@@ -2915,47 +3560,123 @@ impl OrchestrationService {
                 apply_run_aggregate(&store_agg, &rid_agg, session_id, &update);
             }
         });
+        entry.attach_aggregator(agg_task.abort_handle());
 
-        let join = tokio::spawn(async move {
-            let admission_guard = AdmissionGuard {
+        // ── nested worker ──────────────────────────────────────────────
+        // The liveness guard lives *inside* the worker future, so it drops
+        // when the future actually ends — including on abort. That is the only
+        // signal that proves the work is gone; ledger state is not evidence.
+        let host_worker = host.clone();
+        let rid_worker = rid.clone();
+        let liveness_worker = liveness.clone();
+        let worker = tokio::spawn(async move {
+            let _live = WorkerLivenessGuard::new(liveness_worker);
+            host_worker
+                .session_prompt_reserved_with_max_rounds_for_run(
+                    session_id,
+                    prompt,
+                    Some(max_rounds.max(1)),
+                    &rid_worker,
+                    &rid_worker,
+                    execution_mode,
+                )
+                .await
+        });
+        entry.attach_worker(worker.abort_handle());
+
+        // ── outer supervisor ───────────────────────────────────────────
+        // The supervisor's join handle is registered before its body starts,
+        // so a reaper can always bounded-await the supervisor it is tearing
+        // down rather than racing its registration.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let entry_sup = entry.clone();
+        let lease_sup = lease.clone();
+        let supervisor = tokio::spawn(async move {
+            let _ = started_rx.await;
+            // Armed for every exit: normal return, `?`, panic unwind, abort.
+            let mut exit = SupervisorExitGuard {
+                store: store.clone(),
                 host: host.clone(),
+                service: service_ref.clone(),
+                entry: entry_sup.clone(),
                 run_id: rid.clone(),
+                attempt_id: lease_sup.attempt_id.clone(),
+                owner_id: owner_id.clone(),
+                candidate: None,
             };
-            let prompt_fut = host.session_prompt_reserved_with_max_rounds_for_run(
-                session_id,
-                prompt,
-                Some(max_rounds.max(1)),
-                &rid,
-                &rid,
-                execution_mode,
-            );
-            tokio::pin!(prompt_fut);
+
             let deadline = tokio::time::sleep(Duration::from_millis(max_ms.max(1)));
             tokio::pin!(deadline);
+            let mut heartbeat = tokio::time::interval(ATTEMPT_HEARTBEAT_INTERVAL);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heartbeat.tick().await; // the first tick is immediate
+            tokio::pin!(worker);
 
-            // Cancellation and teardown are bounded. A backend that ignores its
-            // token cannot hold admission capacity forever.
-            let (timed_out, result): (bool, Result<String, anyhow::Error>) = tokio::select! {
-                biased;
-                _ = &mut deadline => {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        host.cancel_turn_and_await(Some(session_id)),
-                    ).await;
-                    let settled = tokio::time::timeout(
-                        Duration::from_secs(1),
-                        &mut prompt_fut,
-                    ).await;
-                    let result = match settled {
-                        Ok(result) => result,
-                        Err(_) => Err(anyhow::anyhow!(
-                            "turn did not stop within the teardown deadline"
-                        )),
-                    };
-                    (true, result)
+            enum Exit {
+                Joined(Result<Result<String, anyhow::Error>, tokio::task::JoinError>),
+                TimedOut,
+                Reaped,
+            }
+
+            // Cancellation and teardown are bounded. A backend that ignores
+            // its token cannot hold admission capacity forever.
+            let exit_reason = loop {
+                tokio::select! {
+                    biased;
+                    _ = entry_sup.cancel.cancelled() => break Exit::Reaped,
+                    _ = &mut deadline => break Exit::TimedOut,
+                    joined = &mut worker => break Exit::Joined(joined),
+                    _ = heartbeat.tick() => {
+                        // A heartbeat that no longer belongs to this attempt
+                        // means the lease was taken; stop rather than keep
+                        // running beside the new owner.
+                        if store
+                            .renew_attempt_lease(&rid, &lease_sup.attempt_id, &owner_id)
+                            .is_err()
+                        {
+                            break Exit::Reaped;
+                        }
+                    }
                 }
-                r = &mut prompt_fut => (false, r),
             };
+
+            let (timed_out, reaped, result): (bool, bool, Result<String, anyhow::Error>) =
+                match exit_reason {
+                    Exit::Joined(Ok(result)) => (false, false, result),
+                    Exit::Joined(Err(join_error)) => (
+                        false,
+                        true,
+                        Err(anyhow::anyhow!("run worker did not complete: {join_error}")),
+                    ),
+                    Exit::TimedOut | Exit::Reaped => {
+                        let timed_out = matches!(exit_reason, Exit::TimedOut);
+                        let _ = tokio::time::timeout(
+                            DEFAULT_TEARDOWN_BUDGET,
+                            host.cancel_turn_and_await(Some(session_id)),
+                        )
+                        .await;
+                        // Bounded-await the real worker, then abort it and
+                        // await the abort. Capacity is released only after
+                        // this, so no second attempt can overlap the first.
+                        let settled =
+                            tokio::time::timeout(Duration::from_secs(1), &mut worker).await;
+                        let result = match settled {
+                            Ok(Ok(result)) => result,
+                            Ok(Err(join_error)) => {
+                                Err(anyhow::anyhow!("run worker did not complete: {join_error}"))
+                            }
+                            Err(_) => {
+                                worker.abort();
+                                let _ = tokio::time::timeout(DEFAULT_TEARDOWN_BUDGET, &mut worker)
+                                    .await;
+                                Err(anyhow::anyhow!(
+                                    "turn did not stop within the teardown deadline"
+                                ))
+                            }
+                        };
+                        (timed_out, !timed_out, result)
+                    }
+                };
 
             // Stop aggregator; then reconcile aggregates from the journal range
             // so late FileEdit/test events are not lost if the task was aborted mid-drain.
@@ -2983,6 +3704,17 @@ impl OrchestrationService {
                     candidate.terminal_result = Some("limit_reached".into());
                     candidate.error_code = Some("limit_reached".into());
                     if let Ok(text) = &durable_result {
+                        candidate.final_response = Some(text.clone());
+                    }
+                } else if reaped {
+                    // A live reaper (expiry, explicit teardown, lost lease)
+                    // ends the run `Interrupted`. This is a real terminal
+                    // outcome, not a placeholder: the model turn is gone and
+                    // is never resumed implicitly.
+                    candidate.state = RunState::Interrupted;
+                    candidate.terminal_result = Some("interrupted".into());
+                    candidate.error_code = Some("interrupted".into());
+                    if let Err(text) = &durable_result {
                         candidate.final_response = Some(text.clone());
                     }
                 } else {
@@ -3063,41 +3795,15 @@ impl OrchestrationService {
                     }
                 }
             }
-            let mut attempt = 0u32;
-            loop {
-                let error = match store.persist_finalization(&candidate) {
-                    Ok(_) => break,
-                    Err(error) => error.to_string(),
-                };
-                if attempt == 0 {
-                    let entry = AuditEntry {
-                        ts: Utc::now(),
-                        tool: "run_finalization".into(),
-                        request_id: None,
-                        session_id: Some(session_id),
-                        workspace: None,
-                        outcome: "retrying".into(),
-                        error_code: Some("run_persistence_failed".into()),
-                        detail: bus.redact_text(&error, 500),
-                    };
-                    let _ = store.enqueue_audit(entry);
-                    eprintln!("[grokptah] run {rid} finalization retrying: {error}");
-                }
-                attempt = attempt.saturating_add(1);
-                let shift = attempt.min(6);
-                let backoff_ms = 25u64.saturating_mul(1u64 << shift).min(1_000);
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            }
 
-            // Release capacity before waking the scheduler, so a queued task
-            // can be promoted immediately and fairly.
-            drop(admission_guard);
-            if let Some(service) = service_ref.upgrade() {
-                service.pump_pending();
-            }
+            // Hand the terminal record to the exit guard. From here every exit
+            // path — including an abort landing on the next line — installs it
+            // or leaves a bounded recoverable finalization intent.
+            exit.candidate = Some(candidate);
+            drop(exit);
         });
-        self.reaping_handles();
-        self.join_handles.lock().push(join);
+        entry.attach_supervisor(supervisor);
+        let _ = started_tx.send(());
     }
 
     pub async fn queue_prompt(
@@ -3444,16 +4150,29 @@ impl OrchestrationService {
         }
 
         let was_pending = self.remove_pending(rid);
-        let reservation_released = self.host.release_turn_reservation(session_id, rid);
-        let teardown_complete = if was_pending || reservation_released {
-            true
-        } else {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                let _ = self.host.cancel_turn_and_await(Some(session_id)).await;
-                self.host.wait_turn_idle(session_id).await;
-            })
-            .await
-            .is_ok()
+        // A cancelled admission must not keep executable input around: it can
+        // never legitimately run again.
+        let _ = self.store.remove_acceptance_intent(rid);
+
+        // Teardown must abort and bounded-await the *actual* worker and its
+        // supervisor before this run's capacity can be reused. Reporting
+        // `teardownComplete` from a ledger write alone would let a second
+        // attempt start beside a future that can still execute.
+        let teardown_complete = match self.reap_live_attempt(rid).await {
+            Some(outcome) => outcome.may_release_capacity(),
+            None => {
+                let reservation_released = self.host.release_turn_reservation(session_id, rid);
+                if was_pending || reservation_released {
+                    true
+                } else {
+                    tokio::time::timeout(DEFAULT_TEARDOWN_BUDGET, async {
+                        let _ = self.host.cancel_turn_and_await(Some(session_id)).await;
+                        self.host.wait_turn_idle(session_id).await;
+                    })
+                    .await
+                    .is_ok()
+                }
+            }
         };
 
         let response = json!({
@@ -3488,6 +4207,32 @@ impl OrchestrationService {
 /// `Unauthorized` covers unknown, cross-session, cross-workspace, unbound, and
 /// traversal-shaped reads with one shared message, so this mapping must stay
 /// single-valued to preserve that indistinguishability on the wire.
+/// Session revision sealed into an acceptance intent.
+///
+/// This is an observation, not a lock: it records which session state the work
+/// was accepted against so a later load can tell that the sealed record has
+/// not been re-pointed at a different session's history.
+fn session_revision_of(session: &crate::session::SessionSummary) -> String {
+    format!(
+        "{}:{}",
+        session.updated_at.timestamp_millis(),
+        session.message_count
+    )
+}
+
+/// Workspace revision sealed into an acceptance intent: the execution policy
+/// and readiness the work was admitted under.
+fn workspace_revision_of(session: &crate::session::SessionSummary) -> String {
+    format!(
+        "{}:{}",
+        session.workspace_status.as_str(),
+        match session.execution_mode {
+            RunExecutionMode::Shared => "shared",
+            RunExecutionMode::IsolatedWorktree => "isolated_worktree",
+        }
+    )
+}
+
 fn computer_scope_denied() -> OrchError {
     OrchError::new(
         OrchErrorCode::ForbiddenScope,
@@ -3679,5 +4424,190 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         | PromptQueueChanged { session_id, .. }
         | ComputerApprovalRequired { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::AgentHost;
+    use crate::HostConfig;
+
+    fn queued_run(run_id: &str) -> RunRecord {
+        RunRecord {
+            run_id: run_id.into(),
+            session_id: Uuid::new_v4(),
+            workspace: "/tmp/project".into(),
+            request_id: format!("req-{run_id}"),
+            client_id: Some("mcp".into()),
+            state: RunState::Running,
+            agent_id: None,
+            retry_of: None,
+            parent_run_id: None,
+            queue_position: None,
+            bounds: RunBounds::default(),
+            prompt_preview: "preview".into(),
+            start_seq: Some(1),
+            end_seq: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            terminal_result: None,
+            final_response: None,
+            error_code: None,
+            aggregates: RunAggregates::default(),
+            progress: None,
+            execution: None,
+            approval: None,
+        }
+    }
+
+    fn guard_for(
+        store: &OrchStore,
+        host: &AgentHostHandle,
+        run: &RunRecord,
+    ) -> (Arc<LiveWorker>, SupervisorExitGuard) {
+        let entry = Arc::new(LiveWorker::new(
+            run.run_id.clone(),
+            "attempt-1".into(),
+            1,
+            run.session_id,
+            CancellationToken::new(),
+            Arc::new(WorkerLiveness::default()),
+        ));
+        let guard = SupervisorExitGuard {
+            store: store.clone(),
+            host: host.clone(),
+            service: Weak::new(),
+            entry: entry.clone(),
+            run_id: run.run_id.clone(),
+            attempt_id: "attempt-1".into(),
+            owner_id: "owner-1".into(),
+            candidate: None,
+        };
+        (entry, guard)
+    }
+
+    /// A supervisor that unwinds must still leave the run durably terminal.
+    /// The guard's `Drop` is the only terminalization path, so this is the
+    /// panic case of "every outer-supervisor exit terminalizes".
+    #[test]
+    fn supervisor_panic_still_terminalizes_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let host = AgentHost::create(HostConfig::default());
+        let run = queued_run("panic-run");
+        store.save_run(&run).unwrap();
+
+        let (entry, guard) = guard_for(&store, &host, &run);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = guard;
+            panic!("supervisor exploded");
+        }));
+        assert!(result.is_err(), "the panic must actually propagate");
+
+        let reloaded = store.load_run(&run.run_id).unwrap().expect("run record");
+        assert_eq!(reloaded.state, RunState::Interrupted);
+        assert_eq!(reloaded.error_code.as_deref(), Some("supervisor_exit"));
+        assert!(entry.is_settled(), "the panic path must settle the attempt");
+    }
+
+    /// A supervisor that computed a terminal record installs exactly that
+    /// record, and settles exactly once even if a second exit path races it.
+    #[test]
+    fn supervisor_exit_installs_its_candidate_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let host = AgentHost::create(HostConfig::default());
+        let run = queued_run("completed-run");
+        store.save_run(&run).unwrap();
+
+        let (entry, mut guard) = guard_for(&store, &host, &run);
+        let mut candidate = run.clone();
+        candidate.state = RunState::Completed;
+        candidate.terminal_result = Some("completed".into());
+        candidate.final_response = Some("done".into());
+        guard.candidate = Some(candidate);
+        drop(guard);
+
+        let reloaded = store.load_run(&run.run_id).unwrap().expect("run record");
+        assert_eq!(reloaded.state, RunState::Completed);
+        assert_eq!(reloaded.final_response.as_deref(), Some("done"));
+
+        // A second exit path for the same attempt must be a no-op: it must
+        // not re-terminalize the run or release capacity a second time.
+        let (_, second) = SupervisorExitGuardPair::same_entry(&store, &host, &run, entry.clone());
+        drop(second);
+        let after = store.load_run(&run.run_id).unwrap().expect("run record");
+        assert_eq!(after.state, RunState::Completed);
+        assert_eq!(after.final_response.as_deref(), Some("done"));
+    }
+
+    /// When the terminal record cannot be installed, the guard must still
+    /// leave a bounded recoverable finalization intent for the next start.
+    #[test]
+    fn finalization_failure_leaves_a_recoverable_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let host = AgentHost::create(HostConfig::default());
+        let run = queued_run("undrainable-run");
+        store.save_run(&run).unwrap();
+
+        // Block the run record's atomic-write staging path so every install
+        // attempt fails the way a full or read-only volume would.
+        let safe = safe_id_filename(&run.run_id).unwrap();
+        let blocked = dir.path().join("runs").join(format!("{safe}.json.tmp"));
+        std::fs::create_dir_all(&blocked).unwrap();
+
+        let (entry, mut guard) = guard_for(&store, &host, &run);
+        let mut candidate = run.clone();
+        candidate.state = RunState::Failed;
+        candidate.terminal_result = Some("failed".into());
+        candidate.error_code = Some("internal".into());
+        guard.candidate = Some(candidate);
+        drop(guard);
+        assert!(entry.is_settled());
+
+        // The run record itself could not be rewritten...
+        let stuck = store.load_run(&run.run_id).unwrap().expect("run record");
+        assert_eq!(stuck.state, RunState::Running);
+        // ...but a durable finalization intent is waiting for the next start.
+        let intent = dir.path().join("finalization").join(format!("{safe}.json"));
+        assert!(
+            intent.is_file(),
+            "a bounded recoverable finalization intent must exist"
+        );
+
+        // Unblock and reopen: the intent is replayed and the run terminalizes.
+        std::fs::remove_dir_all(&blocked).unwrap();
+        drop(store);
+        let reopened = OrchStore::open(dir.path()).unwrap();
+        let recovered = reopened.load_run(&run.run_id).unwrap().expect("run record");
+        assert_eq!(recovered.state, RunState::Failed);
+        assert!(!intent.is_file(), "the intent must be consumed");
+    }
+
+    /// Helper so the exactly-once assertion can build a second guard over the
+    /// same live entry without duplicating the field list.
+    struct SupervisorExitGuardPair;
+
+    impl SupervisorExitGuardPair {
+        fn same_entry(
+            store: &OrchStore,
+            host: &AgentHostHandle,
+            run: &RunRecord,
+            entry: Arc<LiveWorker>,
+        ) -> (Arc<LiveWorker>, SupervisorExitGuard) {
+            let guard = SupervisorExitGuard {
+                store: store.clone(),
+                host: host.clone(),
+                service: Weak::new(),
+                entry: entry.clone(),
+                run_id: run.run_id.clone(),
+                attempt_id: "attempt-1".into(),
+                owner_id: "owner-1".into(),
+                candidate: None,
+            };
+            (entry, guard)
+        }
     }
 }

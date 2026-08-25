@@ -2,11 +2,17 @@
 //!
 //! Pure policy + durable records live here; the MCP transport is a thin adapter.
 
+mod admission;
 mod authz;
 mod service;
 mod store;
 mod types;
 
+pub use admission::{
+    AcceptanceIntent, AttemptLease, AttemptLeaseState, SealedBounds, TerminationOutcome,
+    ACCEPTANCE_INTENT_VERSION, ATTEMPT_LEASE_VERSION, DEFAULT_ATTEMPT_LEASE_TTL_MS,
+    DEFAULT_TEARDOWN_BUDGET, MAX_INTENT_PROMPT_BYTES,
+};
 pub use authz::{canonical_workspace, constant_time_eq, AuthContext, WorkspaceAllowlist};
 pub(crate) use service::apply_run_aggregate;
 pub use service::{OrchestrationConfig, OrchestrationService};
