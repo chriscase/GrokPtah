@@ -677,10 +677,9 @@ impl SwarmController {
     /// Record a dispatch *before* the child is spawned.
     ///
     /// Replay-safe: if the identity is already on record the stored record is
-    /// returned unchanged, and no counter moves. Callers must spawn only when
-    /// the returned record's state is [`DispatchState::Requested`] — a replay
-    /// after recovery legitimately returns an `Uncertain` record, which must
-    /// not be respawned.
+    /// returned unchanged, and no counter moves. Callers must then win
+    /// [`Self::claim_dispatch_spawn`] before spawning. A replay after recovery
+    /// legitimately returns an `Uncertain` record, which must not be respawned.
     pub fn record_dispatch_requested(
         &mut self,
         intent: &DispatchIntent,

@@ -72,7 +72,8 @@ require Computer Use is also refused.
 
 **Restart safety without guessing.** Dispatch is two-phase. Planning is a pure
 projection that writes nothing; `record_dispatch_requested` writes the durable
-record, and only then may the caller spawn. Dispatch identity is derived from
+record, and the caller must win the durable spawn claim before spawning.
+Dispatch identity is derived from
 `(swarm, task, attempt)`, so replaying a planning pass proposes the identifier
 already on disk instead of minting a second one, and replaying the write returns
 the stored record without moving a counter.

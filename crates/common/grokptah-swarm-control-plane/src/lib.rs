@@ -35,8 +35,9 @@
 //!
 //! Dispatch is two-phase. [`SwarmController::plan_dispatches`] proposes;
 //! [`SwarmController::record_dispatch_requested`] writes the durable record,
-//! and only then may the caller spawn a child. Dispatch identities are derived
-//! from `(swarm, task, attempt)`, so replaying a planning pass proposes the
+//! [`SwarmController::claim_dispatch_spawn`] gives one caller the spawn right,
+//! and only that winner may spawn a child. Dispatch identities are derived from
+//! `(swarm, task, attempt)`, so replaying a planning pass proposes the
 //! identifier already on disk instead of minting a second one.
 //!
 //! A crash between the write and the spawn leaves a `Requested` record with no
@@ -58,8 +59,10 @@
 //! for intent in swarm.plan_dispatches(now) {
 //!     // Durable write happens first; the child is spawned only afterwards.
 //!     let record = swarm.record_dispatch_requested(&intent, None, now)?;
-//!     // `record.state` is `Requested` here — spawn, then acknowledge.
-//!     let _ = record;
+//!     let claim = swarm.claim_dispatch_spawn(&record.dispatch_id, now)?;
+//!     if claim.won {
+//!         // Spawn, then acknowledge the claimed dispatch.
+//!     }
 //! }
 //! # Ok(())
 //! # }

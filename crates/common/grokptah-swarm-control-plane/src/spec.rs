@@ -295,6 +295,13 @@ impl ProviderCatalogEntry {
                 "catalog entry must measure a capability mode",
             ));
         }
+        for (index, mode) in self.capability_modes.iter().enumerate() {
+            if self.capability_modes[..index].contains(mode) {
+                return Err(SwarmError::invalid(
+                    "catalog entry must not repeat a capability mode",
+                ));
+            }
+        }
         Ok(())
     }
 

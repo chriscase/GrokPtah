@@ -4,7 +4,7 @@ mod support;
 
 use grokptah_swarm_control_plane::{
     IsolationRequirement, ProviderCatalog, QuorumRule, SubagentCapabilityMode, SwarmController,
-    SwarmErrorCode, TaskKind, WorkerCapability, validate_swarm_spec,
+    SwarmErrorCode, TaskKind, TaskOutcome, WorkerCapability, validate_swarm_spec,
 };
 use support::*;
 
@@ -396,6 +396,23 @@ fn a_synthesis_task_must_declare_a_review_quorum() {
     spec.tasks[5].review_gate = None;
     let message = expect_rejected(spec, SwarmErrorCode::InvalidSpec);
     assert!(message.contains("review quorum"), "{message}");
+}
+
+#[test]
+fn runtime_payloads_reject_unknown_fields() {
+    let parsed =
+        serde_json::from_str::<TaskOutcome>(r#"{"result":"succeeded","unexpected":"must fail"}"#);
+    assert!(parsed.is_err(), "terminal payloads must fail closed");
+}
+
+#[test]
+fn a_catalog_entry_must_not_repeat_a_capability_mode() {
+    let mut spec = single_task_spec();
+    spec.catalog.entries[0]
+        .capability_modes
+        .push(SubagentCapabilityMode::ReadWrite);
+    let message = expect_rejected(spec, SwarmErrorCode::InvalidSpec);
+    assert!(message.contains("repeat a capability mode"), "{message}");
 }
 
 #[test]

@@ -158,7 +158,7 @@ pub enum TaskResult {
 
 /// One bounded piece of evidence a worker produced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EvidenceEntry {
     pub label: String,
     pub detail: String,
@@ -180,7 +180,7 @@ impl EvidenceEntry {
 
 /// A terminal report from a worker, tied to the dispatch that produced it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskOutcome {
     pub result: TaskResult,
     /// Required for review tasks, rejected for every other kind.
@@ -250,7 +250,7 @@ impl TaskOutcome {
 
 /// Durable per-task state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskRecord {
     pub task_id: TaskId,
     pub state: TaskState,
@@ -289,7 +289,7 @@ impl TaskRecord {
 
 /// Durable per-dispatch state. This is the duplicate-suppression record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DispatchRecord {
     pub dispatch_id: DispatchId,
     pub task_id: TaskId,
@@ -318,7 +318,7 @@ pub struct DispatchRecord {
 /// been spawned until the caller hands it back to
 /// `SwarmController::record_dispatch_requested`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DispatchIntent {
     pub dispatch_id: DispatchId,
     pub task_id: TaskId,
@@ -339,7 +339,7 @@ pub struct DispatchIntent {
 /// Only positive evidence resolves uncertainty. [`DispatchProbe::Unknown`]
 /// leaves the dispatch uncertain rather than guessing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "probe")]
+#[serde(rename_all = "camelCase", tag = "probe", deny_unknown_fields)]
 pub enum DispatchProbe {
     /// Proven never to have started. Only this verdict makes a resend safe.
     NotStarted,
@@ -368,7 +368,7 @@ pub fn derive_dispatch_id(
 
 /// The complete durable record for one swarm.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SwarmState {
     pub schema_version: u32,
     pub spec: SwarmSpec,
