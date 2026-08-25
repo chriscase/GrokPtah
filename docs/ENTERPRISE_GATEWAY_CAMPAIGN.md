@@ -44,11 +44,16 @@ The deterministic verifier and loopback fake gateway prove that:
    substitute.
 5. **Weak or unavailable providers return honest bounded errors.** Public
    `ErrorEnvelope` text is needle-free: no `api_key`, `authorization`,
-   `bearer`, URLs, credential fragments, or `[redacted]` placeholders.
-   Internal diagnostics may still be redacted for operators, but they are not
-   copied into the public envelope. `collect_offline_campaign` retains failed
-   and replayed unavailable receipts so `verify_campaign` can prove
-   fail-closed behavior instead of discarding that evidence.
+   `bearer`, `credential`, `credential_ref`, provider URLs, or `[redacted]`
+   placeholders. Bounded provider errors may be redacted, but privileged
+   diagnostics are currently discarded rather than exposed through an
+   operator channel. The loopback HTTP harness preserves the public error
+   taxonomy (`invalid_request` vs provider-unavailable) without privileged
+   text; pending/uncertain retries stay HTTP-status stable and keep the
+   uncertain envelope. `collect_offline_campaign` retains failed and
+   replayed unavailable receipts from `probe` so `verify_campaign` can
+   prove fail-closed behavior. It does not invent a `replayed` outcome
+   from a discarded error.
 
 ## What this slice does not prove (still required)
 

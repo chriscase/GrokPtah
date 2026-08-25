@@ -12,8 +12,10 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
 use grokptah_agent_bridge::{
-    verify_campaign, AttemptOutcome, EvidenceKind, FakeQuotaMode, FakeRestrictedGateway,
-    ENTERPRISE_GATEWAY_CAMPAIGN_SCHEMA,
+    public_attempt_http_status, public_error_http_status, public_text_leaks_secret,
+    verify_campaign, AttemptOutcome, CampaignBundle, EvidenceKind, FakeQuotaMode,
+    FakeRestrictedGateway, GatewayIdentityRecord, ENTERPRISE_GATEWAY_CAMPAIGN_SCHEMA,
+    PUBLIC_SECRET_NEEDLES,
 };
 use serde_json::json;
 
@@ -29,16 +31,24 @@ async fn probe_handler(
     let request_id = body["request_id"].as_str().unwrap_or_default();
     let payload = body["payload"].as_str().unwrap_or_default();
     match state.gateway.probe(request_id, payload) {
-        Ok((identity, quota, attempt)) => (
-            StatusCode::OK,
-            Json(json!({
-                "identity": identity,
-                "quota": quota,
-                "attempt": attempt,
-            })),
-        )
-            .into_response(),
-        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, Json(error)).into_response(),
+        Ok((identity, quota, attempt)) => {
+            let status = StatusCode::from_u16(public_attempt_http_status(&attempt))
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (
+                status,
+                Json(json!({
+                    "identity": identity,
+                    "quota": quota,
+                    "attempt": attempt,
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            let status = StatusCode::from_u16(public_error_http_status(&error))
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(error)).into_response()
+        }
     }
 }
 
@@ -75,22 +85,64 @@ async fn http_probe(
 }
 
 fn public_json_is_needle_free(value: &serde_json::Value) {
-    let serialized = value.to_string().to_ascii_lowercase();
-    for needle in [
-        "api_key",
-        "authorization",
-        "bearer",
-        "[redacted]",
-        "sk-",
-        "http://",
-        "https://",
-        "evil.example",
-    ] {
+    fn check_envelope(envelope: &serde_json::Value) {
+        if let Some(message) = envelope["message"].as_str() {
+            assert!(
+                !public_text_leaks_secret(message),
+                "public envelope message leaked a secret: {envelope}"
+            );
+        }
+        if let Some(reason) = envelope["reasonCode"].as_str() {
+            assert!(
+                !public_text_leaks_secret(reason),
+                "public envelope reason leaked a secret: {envelope}"
+            );
+        }
+        let serialized = envelope.to_string().to_ascii_lowercase();
+        for needle in PUBLIC_SECRET_NEEDLES {
+            assert!(
+                !serialized.contains(*needle),
+                "public envelope contained needle `{needle}`: {envelope}"
+            );
+        }
         assert!(
-            !serialized.contains(needle),
-            "public envelope contained needle `{needle}`: {value}"
+            !serialized.contains("://"),
+            "public envelope contained a provider URL: {envelope}"
         );
     }
+
+    if value.get("code").is_some() && value.get("message").is_some() {
+        check_envelope(value);
+    }
+    if value["error"].is_object() {
+        check_envelope(&value["error"]);
+    }
+    if value["attempt"]["error"].is_object() {
+        check_envelope(&value["attempt"]["error"]);
+    }
+}
+
+fn campaign_bundle_from_http(
+    request_id: &str,
+    requested: GatewayIdentityRecord,
+    first: &serde_json::Value,
+    retry: &serde_json::Value,
+) -> CampaignBundle {
+    serde_json::from_value(json!({
+        "schema": ENTERPRISE_GATEWAY_CAMPAIGN_SCHEMA,
+        "requestId": request_id,
+        "requested": requested,
+        "observed": first["identity"],
+        "quota": first["quota"],
+        "attempts": [first["attempt"], retry["attempt"]],
+        "cursorAccount": { "provider": "cursor_cloud", "kind": "absent" },
+        "promotion": {
+            "liveGateway": "absent",
+            "liveQuota": "absent",
+            "liveCursorAccount": "absent"
+        }
+    }))
+    .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -238,8 +290,9 @@ async fn loopback_http_unknown_quota_and_unavailable_stay_fail_closed_and_needle
     let down = FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:0/v1")
         .with_unavailable()
         .with_leaked_secret(secret);
+    let requested = down.requested_identity();
     let (base, server) = start_fake_gateway(down).await;
-    let (status, error) = http_probe(&client, &base, "req-http-down", "review")
+    let (status, first) = http_probe(&client, &base, "req-http-down", "review")
         .await
         .unwrap();
     let (retry_status, retry) = http_probe(&client, &base, "req-http-down", "review")
@@ -247,13 +300,29 @@ async fn loopback_http_unknown_quota_and_unavailable_stay_fail_closed_and_needle
         .unwrap();
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(retry_status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(error["code"], "authority_unavailable");
-    assert_eq!(error["reasonCode"], "provider_unavailable");
-    assert_eq!(error["message"], "The requested provider is unavailable.");
-    assert_eq!(retry["code"], error["code"]);
-    assert_eq!(retry["message"], error["message"]);
-    public_json_is_needle_free(&error);
+    assert_eq!(first["attempt"]["outcome"], "failed");
+    assert_eq!(first["attempt"]["error"]["code"], "authority_unavailable");
+    assert_eq!(
+        first["attempt"]["error"]["reasonCode"],
+        "provider_unavailable"
+    );
+    assert_eq!(
+        first["attempt"]["error"]["message"],
+        "The requested provider is unavailable."
+    );
+    assert_eq!(retry["attempt"]["outcome"], "replayed");
+    assert_eq!(retry["attempt"]["error"], first["attempt"]["error"]);
+    public_json_is_needle_free(&first);
     public_json_is_needle_free(&retry);
+    let bundle = campaign_bundle_from_http("req-http-down", requested, &first, &retry);
+    let verdict = verify_campaign(&bundle);
+    assert!(!verdict.qualified_for_release);
+    let redaction = verdict
+        .checks
+        .iter()
+        .find(|check| check.name == "bounded_errors_and_redaction")
+        .unwrap();
+    assert!(redaction.passed, "{verdict:#?}");
     server.abort();
 }
 
@@ -284,26 +353,130 @@ async fn loopback_http_canonical_duplicate_retry_and_failure_replay() {
 
     let down =
         FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:0/v1").with_unavailable();
-    let bundle = down
-        .collect_offline_campaign("req-http-fail-replay", left)
+    let requested = down.requested_identity();
+    let (base, server) = start_fake_gateway(down).await;
+    let (first_status, first) = http_probe(&client, &base, "req-http-fail-replay", left)
+        .await
         .unwrap();
+    let (retry_status, retry) = http_probe(&client, &base, "req-http-fail-replay", left)
+        .await
+        .unwrap();
+    assert_eq!(first_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(retry_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(first["attempt"]["outcome"], "failed");
+    assert_eq!(retry["attempt"]["outcome"], "replayed");
+    assert_eq!(first["attempt"]["error"], retry["attempt"]["error"]);
+    public_json_is_needle_free(&first);
+    public_json_is_needle_free(&retry);
+    let bundle = campaign_bundle_from_http("req-http-fail-replay", requested, &first, &retry);
     assert_eq!(bundle.attempts[0].outcome, AttemptOutcome::Failed);
     assert_eq!(bundle.attempts[1].outcome, AttemptOutcome::Replayed);
     assert_eq!(bundle.attempts[0].error, bundle.attempts[1].error);
     let verdict = verify_campaign(&bundle);
     assert!(!verdict.qualified_for_release);
-    let retry = verdict
+    let retry_check = verdict
         .checks
         .iter()
         .find(|check| check.name == "idempotent_retry_receipts")
         .unwrap();
-    assert!(retry.passed, "{verdict:#?}");
+    assert!(retry_check.passed, "{verdict:#?}");
     let redaction = verdict
         .checks
         .iter()
         .find(|check| check.name == "bounded_errors_and_redaction")
         .unwrap();
     assert!(redaction.passed, "{verdict:#?}");
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn loopback_http_invalid_request_stays_distinct_from_unavailable() {
+    let (base, server) = start_fake_gateway(FakeRestrictedGateway::restricted_loopback(
+        "http://127.0.0.1:0/v1",
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let (first_status, first) = http_probe(&client, &base, "req-http-drift", "first")
+        .await
+        .unwrap();
+    let (drift_status, drift) = http_probe(&client, &base, "req-http-drift", "second")
+        .await
+        .unwrap();
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(first["attempt"]["outcome"], "succeeded");
+    assert_eq!(drift_status, StatusCode::BAD_REQUEST);
+    assert_ne!(drift_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(drift["code"], "invalid_request");
+    assert_eq!(drift["reasonCode"], "invalid_request");
+    assert_eq!(drift["message"], "The request is invalid.");
+    public_json_is_needle_free(&drift);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn loopback_http_pending_and_uncertain_keep_status_and_uncertainty() {
+    let pending =
+        FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:0/v1").with_pending();
+    let requested = pending.requested_identity();
+    let (base, server) = start_fake_gateway(pending).await;
+    let client = reqwest::Client::new();
+    let (first_status, first) = http_probe(&client, &base, "req-http-pending", "review")
+        .await
+        .unwrap();
+    let (retry_status, retry) = http_probe(&client, &base, "req-http-pending", "review")
+        .await
+        .unwrap();
+    assert_eq!(first_status, StatusCode::ACCEPTED);
+    assert_eq!(retry_status, StatusCode::ACCEPTED);
+    assert_eq!(first["attempt"]["outcome"], "pending");
+    assert_eq!(retry["attempt"]["outcome"], "replayed");
+    assert_eq!(first["attempt"]["error"]["reasonCode"], "pending");
+    assert_eq!(retry["attempt"]["error"], first["attempt"]["error"]);
+    public_json_is_needle_free(&first);
+    public_json_is_needle_free(&retry);
+    let bundle = campaign_bundle_from_http("req-http-pending", requested, &first, &retry);
+    let verdict = verify_campaign(&bundle);
+    assert!(!verdict.contract_passed);
+    assert!(!verdict.qualified_for_release);
+    let retry_check = verdict
+        .checks
+        .iter()
+        .find(|check| check.name == "idempotent_retry_receipts")
+        .unwrap();
+    assert!(!retry_check.passed);
+    assert!(retry_check.detail.contains("pending"));
+    server.abort();
+
+    let uncertain =
+        FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:0/v1").with_uncertain();
+    let requested = uncertain.requested_identity();
+    let (base, server) = start_fake_gateway(uncertain).await;
+    let (first_status, first) = http_probe(&client, &base, "req-http-uncertain", "review")
+        .await
+        .unwrap();
+    let (retry_status, retry) = http_probe(&client, &base, "req-http-uncertain", "review")
+        .await
+        .unwrap();
+    assert_eq!(first_status, StatusCode::CONFLICT);
+    assert_eq!(retry_status, StatusCode::CONFLICT);
+    assert_ne!(first_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(first["attempt"]["outcome"], "uncertain");
+    assert_eq!(retry["attempt"]["outcome"], "replayed");
+    assert_eq!(first["attempt"]["error"]["reasonCode"], "uncertain");
+    assert_eq!(retry["attempt"]["error"], first["attempt"]["error"]);
+    public_json_is_needle_free(&first);
+    public_json_is_needle_free(&retry);
+    let bundle = campaign_bundle_from_http("req-http-uncertain", requested, &first, &retry);
+    let verdict = verify_campaign(&bundle);
+    assert!(!verdict.contract_passed);
+    let retry_check = verdict
+        .checks
+        .iter()
+        .find(|check| check.name == "idempotent_retry_receipts")
+        .unwrap();
+    assert!(!retry_check.passed);
+    assert!(retry_check.detail.contains("uncertain"));
+    server.abort();
 }
 
 #[test]

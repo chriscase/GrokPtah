@@ -24,12 +24,17 @@ use crate::gateway_config::{
 /// Contract identifier for enterprise-gateway campaign bundles.
 pub const ENTERPRISE_GATEWAY_CAMPAIGN_SCHEMA: &str = "grokptah.enterprise-gateway-campaign.v1";
 
-const PUBLIC_ERROR_NEEDLES: &[&str] = &[
+/// Canonical secret needles for public envelopes and serialized campaign bundles.
+///
+/// Provider URLs (`://`) are rejected on public envelopes only; bundle identity
+/// records may still carry loopback `base_url` values.
+pub const PUBLIC_SECRET_NEEDLES: &[&str] = &[
     "api_key",
     "authorization",
     "bearer",
-    "[redacted]",
     "credential",
+    "credential_ref",
+    "[redacted]",
     "sk-",
     "keychain:",
     "cursor_api",
@@ -359,9 +364,6 @@ impl FakeRestrictedGateway {
                 outcome: AttemptOutcome::Replayed,
                 error: prior.error.clone(),
             };
-            if let Some(error) = prior.error.clone() {
-                return Err(error);
-            }
             return Ok((self.identity.clone(), prior.quota.clone(), attempt));
         }
 
@@ -380,16 +382,23 @@ impl FakeRestrictedGateway {
                     self.leak_secret.as_deref(),
                 );
                 let quota = self.route_bound_quota(request_id, QuotaTruth::Unknown);
+                let attempt = AttemptReceipt {
+                    request_id: request_id.into(),
+                    attempt: 1,
+                    payload_hash: payload_hash.clone(),
+                    outcome: AttemptOutcome::Failed,
+                    error: Some(error.clone()),
+                };
                 attempts.insert(
                     request_id.into(),
                     StoredAttempt {
-                        payload_hash: payload_hash.clone(),
-                        quota,
-                        error: Some(error.clone()),
+                        payload_hash,
+                        quota: quota.clone(),
+                        error: Some(error),
                         count: 1,
                     },
                 );
-                return Err(error);
+                return Ok((self.identity.clone(), quota, attempt));
             }
             FakeLedgerMode::Pending | FakeLedgerMode::Uncertain => {
                 let outcome = if self.ledger_mode == FakeLedgerMode::Pending {
@@ -473,7 +482,9 @@ impl FakeRestrictedGateway {
     ///
     /// Unavailable, pending, and uncertain probes are retained as attempt
     /// receipts so [`verify_campaign`] can prove fail-closed behavior. Only
-    /// invalid request identity fails this collector.
+    /// invalid request identity fails this collector. Identical retries must
+    /// return a real [`AttemptOutcome::Replayed`] receipt from [`Self::probe`];
+    /// this collector never invents a replay from a discarded error.
     pub fn collect_offline_campaign(
         &self,
         request_id: &str,
@@ -483,36 +494,16 @@ impl FakeRestrictedGateway {
             bounded_provider_error(ErrorCode::InvalidRequest, message, request_id, None)
         })?;
         let requested = self.requested_identity();
-        let payload_hash = campaign_payload_hash(request_id, payload);
-        let first_probe = self.probe(request_id, payload);
-        let retry_probe = self.probe(request_id, payload);
-        let (observed, quota, first) = match first_probe {
-            Ok(result) => result,
-            Err(error) => {
-                let first = AttemptReceipt {
-                    request_id: request_id.into(),
-                    attempt: 1,
-                    payload_hash: payload_hash.clone(),
-                    outcome: AttemptOutcome::Failed,
-                    error: Some(error),
-                };
-                (
-                    self.identity.clone(),
-                    self.route_bound_quota(request_id, QuotaTruth::Unknown),
-                    first,
-                )
-            }
-        };
-        let retry = match retry_probe {
-            Ok((_, _, retry)) => retry,
-            Err(error) => AttemptReceipt {
-                request_id: request_id.into(),
-                attempt: 2,
-                payload_hash,
-                outcome: AttemptOutcome::Replayed,
-                error: Some(error),
-            },
-        };
+        let (observed, quota, first) = self.probe(request_id, payload)?;
+        let (_, _, retry) = self.probe(request_id, payload)?;
+        if retry.outcome != AttemptOutcome::Replayed {
+            return Err(bounded_provider_error(
+                ErrorCode::Internal,
+                "identical retry did not replay",
+                request_id,
+                None,
+            ));
+        }
         Ok(CampaignBundle {
             schema: ENTERPRISE_GATEWAY_CAMPAIGN_SCHEMA.into(),
             request_id: request_id.into(),
@@ -566,6 +557,7 @@ pub fn bounded_provider_error(
     request_id: &str,
     leaked_secret: Option<&str>,
 ) -> ErrorEnvelope {
+    // Privileged diagnostics are discarded; this module has no operator channel.
     let _ = redact_internal_diagnostics(message, leaked_secret);
     ErrorEnvelope {
         code,
@@ -580,6 +572,37 @@ pub fn bounded_provider_error(
             _ => Some("provider_error".into()),
         },
         event_range: None,
+    }
+}
+
+/// Share-safe HTTP status for a public campaign error. Never encodes privileged text.
+pub fn public_error_http_status(error: &ErrorEnvelope) -> u16 {
+    match error.reason_code.as_deref() {
+        Some("pending") => 202,
+        Some("uncertain") => 409,
+        _ => match error.code {
+            ErrorCode::InvalidRequest => 400,
+            ErrorCode::Unauthenticated => 401,
+            ErrorCode::ForbiddenScope => 403,
+            ErrorCode::NotFound => 404,
+            ErrorCode::StaleOrRecovery => 409,
+            ErrorCode::Capacity => 429,
+            ErrorCode::AuthorityUnavailable => 503,
+            ErrorCode::Internal => 500,
+        },
+    }
+}
+
+/// Share-safe HTTP status for an attempt receipt. Replays keep the original taxonomy.
+pub fn public_attempt_http_status(attempt: &AttemptReceipt) -> u16 {
+    if let Some(error) = &attempt.error {
+        return public_error_http_status(error);
+    }
+    match attempt.outcome {
+        AttemptOutcome::Succeeded | AttemptOutcome::Replayed => 200,
+        AttemptOutcome::Pending => 202,
+        AttemptOutcome::Uncertain => 409,
+        AttemptOutcome::Failed => 503,
     }
 }
 
@@ -815,6 +838,12 @@ fn retry_idempotency_check(bundle: &CampaignBundle) -> CampaignCheck {
             "no request/attempt/outcome receipts were recorded",
         );
     }
+    if bundle.attempts.len() < 2 {
+        return CampaignCheck::fail(
+            "idempotent_retry_receipts",
+            "idempotent retry requires an original attempt and an actual replay receipt",
+        );
+    }
     let mut seen_attempts = HashMap::<u32, &AttemptReceipt>::new();
     let expected_id = bundle.request_id.as_str();
     let mut first_hash: Option<&str> = None;
@@ -930,15 +959,7 @@ fn redaction_least_privilege_check(bundle: &CampaignBundle) -> CampaignCheck {
         }
     };
     let lowered = serialized.to_ascii_lowercase();
-    for needle in [
-        "api_key",
-        "authorization",
-        "bearer ",
-        "credential_ref",
-        "keychain:",
-        "sk-",
-        "cursor_api",
-    ] {
+    for needle in PUBLIC_SECRET_NEEDLES {
         if lowered.contains(needle) {
             return CampaignCheck::fail(
                 "bounded_errors_and_redaction",
@@ -1113,7 +1134,7 @@ fn validate_live_cursor_receipt(
         .filter(|value| !value.is_empty())
         .ok_or("live Cursor receipts require a stable run/campaign identifier")?;
     validate_stable_campaign_id(campaign_id)?;
-    if public_text_contains_needle(campaign_id) {
+    if public_text_leaks_secret(campaign_id) {
         return Err("Cursor campaign id must be secret-free".into());
     }
     Ok(())
@@ -1208,22 +1229,26 @@ fn redact_internal_diagnostics(text: &str, leaked_secret: Option<&str>) -> Strin
     out
 }
 
-fn public_text_contains_needle(text: &str) -> bool {
+fn secret_needles_in(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
-    PUBLIC_ERROR_NEEDLES
+    PUBLIC_SECRET_NEEDLES
         .iter()
         .any(|needle| lowered.contains(needle))
-        || text.contains("://")
+}
+
+/// True when public text contains a canonical secret needle or a provider URL.
+pub fn public_text_leaks_secret(text: &str) -> bool {
+    secret_needles_in(text) || text.to_ascii_lowercase().contains("://")
 }
 
 fn public_error_is_needle_free(error: &ErrorEnvelope) -> Result<(), String> {
-    if public_text_contains_needle(&error.message) {
+    if public_text_leaks_secret(&error.message) {
         return Err("public ErrorEnvelope message must be needle-free".into());
     }
     if error
         .reason_code
         .as_deref()
-        .is_some_and(public_text_contains_needle)
+        .is_some_and(public_text_leaks_secret)
     {
         return Err("public ErrorEnvelope reason must be needle-free".into());
     }
@@ -1431,6 +1456,7 @@ mod tests {
         assert_eq!(error.code, ErrorCode::InvalidRequest);
         assert_eq!(error.reason_code.as_deref(), Some("invalid_request"));
         assert_eq!(error.message, "The request is invalid.");
+        assert_eq!(public_error_http_status(&error), 400);
         assert!(public_error_is_needle_free(&error).is_ok());
     }
 
@@ -1440,15 +1466,23 @@ mod tests {
         let gateway = FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:9/v1")
             .with_unavailable()
             .with_leaked_secret(secret);
-        let error = gateway.probe("req-down", "review").unwrap_err();
+        let (_identity, _quota, attempt) = gateway.probe("req-down", "review").unwrap();
+        assert_eq!(attempt.outcome, AttemptOutcome::Failed);
+        let error = attempt.error.as_ref().unwrap();
         assert_eq!(error.code, ErrorCode::AuthorityUnavailable);
         assert_eq!(error.reason_code.as_deref(), Some("provider_unavailable"));
         assert_eq!(error.message, "The requested provider is unavailable.");
-        assert!(public_error_is_needle_free(&error).is_ok());
+        assert!(public_error_is_needle_free(error).is_ok());
         assert!(!error.message.contains(secret));
         assert!(!error.message.contains("[redacted]"));
-        let retry = gateway.probe("req-down", "review").unwrap_err();
-        assert_eq!(retry, error);
+        let retry = gateway.probe("req-down", "review").unwrap();
+        assert_eq!(retry.2.outcome, AttemptOutcome::Replayed);
+        assert_eq!(retry.2.error.as_ref(), Some(error));
+        assert_eq!(
+            public_attempt_http_status(&attempt),
+            public_attempt_http_status(&retry.2)
+        );
+        assert_eq!(public_attempt_http_status(&attempt), 503);
     }
 
     #[test]
@@ -1754,5 +1788,162 @@ mod tests {
             .unwrap();
         assert!(retry.detail.contains("uncertain"));
         assert!(public_error_is_needle_free(uncertain.attempts[0].error.as_ref().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn public_error_taxonomy_keeps_invalid_request_distinct_from_unavailable() {
+        let invalid = bounded_provider_error(
+            ErrorCode::InvalidRequest,
+            "request_id reused with a different payload",
+            "req-tax",
+            None,
+        );
+        let unavailable = bounded_provider_error(
+            ErrorCode::AuthorityUnavailable,
+            "upstream 503 api_key=sk-live Authorization: Bearer sk-live https://evil.example/v1",
+            "req-tax",
+            Some("sk-live"),
+        );
+        assert_eq!(public_error_http_status(&invalid), 400);
+        assert_eq!(public_error_http_status(&unavailable), 503);
+        assert_ne!(
+            public_error_http_status(&invalid),
+            public_error_http_status(&unavailable)
+        );
+        assert_eq!(invalid.reason_code.as_deref(), Some("invalid_request"));
+        assert_eq!(
+            unavailable.reason_code.as_deref(),
+            Some("provider_unavailable")
+        );
+        assert!(public_error_is_needle_free(&invalid).is_ok());
+        assert!(public_error_is_needle_free(&unavailable).is_ok());
+        assert!(!public_text_leaks_secret(&invalid.message));
+        assert!(!public_text_leaks_secret(&unavailable.message));
+    }
+
+    #[test]
+    fn pending_and_uncertain_replay_keeps_http_status_and_uncertainty() {
+        let pending_gateway =
+            FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:9/v1").with_pending();
+        let (_, _, first) = pending_gateway.probe("req-pending-http", "review").unwrap();
+        let (_, _, retry) = pending_gateway.probe("req-pending-http", "review").unwrap();
+        assert_eq!(first.outcome, AttemptOutcome::Pending);
+        assert_eq!(retry.outcome, AttemptOutcome::Replayed);
+        assert_eq!(first.error, retry.error);
+        assert_eq!(
+            first.error.as_ref().unwrap().reason_code.as_deref(),
+            Some("pending")
+        );
+        assert_eq!(public_attempt_http_status(&first), 202);
+        assert_eq!(
+            public_attempt_http_status(&first),
+            public_attempt_http_status(&retry)
+        );
+
+        let uncertain_gateway =
+            FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:9/v1").with_uncertain();
+        let (_, _, first) = uncertain_gateway
+            .probe("req-uncertain-http", "review")
+            .unwrap();
+        let (_, _, retry) = uncertain_gateway
+            .probe("req-uncertain-http", "review")
+            .unwrap();
+        assert_eq!(first.outcome, AttemptOutcome::Uncertain);
+        assert_eq!(retry.outcome, AttemptOutcome::Replayed);
+        assert_eq!(first.error, retry.error);
+        assert_eq!(
+            first.error.as_ref().unwrap().reason_code.as_deref(),
+            Some("uncertain")
+        );
+        assert_eq!(public_attempt_http_status(&first), 409);
+        assert_eq!(
+            public_attempt_http_status(&first),
+            public_attempt_http_status(&retry)
+        );
+        assert_ne!(public_attempt_http_status(&first), 503);
+        assert_ne!(public_attempt_http_status(&first), 400);
+    }
+
+    #[test]
+    fn public_and_bundle_secret_needle_policy_is_canonical() {
+        for needle in [
+            "bearer",
+            "credential",
+            "credential_ref",
+            "api_key",
+            "authorization",
+        ] {
+            assert!(
+                PUBLIC_SECRET_NEEDLES.iter().any(|item| *item == needle),
+                "canonical policy missing `{needle}`"
+            );
+            assert!(public_text_leaks_secret(needle), "{needle}");
+            let mut error =
+                bounded_provider_error(ErrorCode::Internal, "public", "req-needles", None);
+            error.message = format!("leaked {needle}");
+            assert!(public_error_is_needle_free(&error).is_err(), "{needle}");
+
+            let gateway = FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:9/v1");
+            let mut bundle = gateway
+                .collect_offline_campaign(&format!("req-needles-{needle}"), "review")
+                .unwrap();
+            bundle.attempts[0].error = Some(error);
+            let verdict = verify_campaign(&bundle);
+            let redaction = verdict
+                .checks
+                .iter()
+                .find(|check| check.name == "bounded_errors_and_redaction")
+                .unwrap();
+            assert!(!redaction.passed, "{needle}: {verdict:#?}");
+        }
+
+        assert!(public_text_leaks_secret("https://evil.example/v1"));
+        let mut url_error =
+            bounded_provider_error(ErrorCode::Internal, "public", "req-url-needle", None);
+        url_error.message = "see https://evil.example/v1".into();
+        assert!(public_error_is_needle_free(&url_error).is_err());
+        let gateway = FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:9/v1");
+        let mut bundle = gateway
+            .collect_offline_campaign("req-url-needle", "review")
+            .unwrap();
+        bundle.attempts[0].error = Some(url_error);
+        let verdict = verify_campaign(&bundle);
+        let redaction = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "bounded_errors_and_redaction")
+            .unwrap();
+        assert!(!redaction.passed, "{verdict:#?}");
+        let retry = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "idempotent_retry_receipts")
+            .unwrap();
+        assert!(!retry.passed);
+    }
+
+    #[test]
+    fn one_attempt_bundle_cannot_pass_idempotent_retry_without_replay() {
+        let gateway = FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:9/v1");
+        let mut bundle = gateway
+            .collect_offline_campaign("req-one-attempt", "review")
+            .unwrap();
+        bundle.attempts.truncate(1);
+        assert_eq!(bundle.attempts.len(), 1);
+        assert_eq!(bundle.attempts[0].outcome, AttemptOutcome::Succeeded);
+        let verdict = verify_campaign(&bundle);
+        assert!(!verdict.contract_passed);
+        assert!(!verdict.qualified_for_release);
+        let retry = verdict
+            .checks
+            .iter()
+            .find(|check| check.name == "idempotent_retry_receipts")
+            .unwrap();
+        assert!(!retry.passed);
+        assert!(
+            retry.detail.contains("actual replay") || retry.detail.contains("retry"),
+            "{}",
+            retry.detail
+        );
     }
 }

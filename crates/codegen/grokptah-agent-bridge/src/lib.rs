@@ -114,10 +114,12 @@ pub use discover::{
     set_grokptah_home_override, set_project_mcp_trusted,
 };
 pub use enterprise_gateway_campaign::{
-    bounded_provider_error, campaign_payload_hash, verify_campaign, AttemptOutcome, AttemptReceipt,
-    CampaignBundle, CampaignCheck, CampaignVerdict, CursorAccountEvidence, EvidenceKind,
-    FakeQuotaMode, FakeRestrictedGateway, GatewayClass, GatewayIdentityRecord, QuotaReceipt,
-    QuotaTruth, ReleasePromotionEvidence, ENTERPRISE_GATEWAY_CAMPAIGN_SCHEMA,
+    bounded_provider_error, campaign_payload_hash, public_attempt_http_status,
+    public_error_http_status, public_text_leaks_secret, verify_campaign, AttemptOutcome,
+    AttemptReceipt, CampaignBundle, CampaignCheck, CampaignVerdict, CursorAccountEvidence,
+    EvidenceKind, FakeQuotaMode, FakeRestrictedGateway, GatewayClass, GatewayIdentityRecord,
+    QuotaReceipt, QuotaTruth, ReleasePromotionEvidence, ENTERPRISE_GATEWAY_CAMPAIGN_SCHEMA,
+    PUBLIC_SECRET_NEEDLES,
 };
 pub use event_bus::{EventBus, EventReceiver, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
