@@ -36,7 +36,8 @@ use crate::computer_use::ComputerClientIdentity;
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
     AuthContext, ChangeRecord, OrchError, OrchErrorCode, OrchestrationConfig, OrchestrationService,
-    RunExecutionMode, WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    PersistentAgentResumeRequest, RunExecutionMode, WorkspaceAllowlist, CONTROL_TOOLS,
+    FORBIDDEN_TOOLS,
 };
 use crate::{EventReceiver, JournalPage, SessionUpdate};
 
@@ -1363,7 +1364,7 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
         reason_code: Some(e.code.as_str().into()),
         event_range,
     };
-    let mut data = serde_json::to_value(public).unwrap_or_else(|_| {
+    let data = serde_json::to_value(public).unwrap_or_else(|_| {
         json!({
             "code": "internal",
             "message": "The operation failed.",
@@ -2035,12 +2036,14 @@ async fn dispatch_tool(
             require_nonempty(&args.agent_id, "agent_id")?;
             orch.resume_persistent_agent(
                 auth,
-                &args.request_id,
-                args.session_id,
-                &args.workspace,
-                &args.agent_id,
-                args.prompt,
-                args.max_rounds,
+                PersistentAgentResumeRequest {
+                    request_id: &args.request_id,
+                    session_id: args.session_id,
+                    workspace: &args.workspace,
+                    agent_id: &args.agent_id,
+                    prompt: args.prompt,
+                    max_rounds: args.max_rounds,
+                },
             )
             .await
         }

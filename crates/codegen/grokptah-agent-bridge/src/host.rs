@@ -1061,11 +1061,11 @@ impl AgentHostHandle {
     }
 
     pub fn list_persistent_agents(&self) -> Result<Vec<AgentRecord>> {
-        Ok(self.ensure_orchestration_store()?.list_agents()?)
+        self.ensure_orchestration_store()?.list_agents()
     }
 
     pub fn get_persistent_agent(&self, agent_id: &str) -> Result<Option<AgentRecord>> {
-        Ok(self.ensure_orchestration_store()?.load_agent(agent_id)?)
+        self.ensure_orchestration_store()?.load_agent(agent_id)
     }
 
     /// Validate a manual continuation against the durable agent, session, and

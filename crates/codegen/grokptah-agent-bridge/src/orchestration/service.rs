@@ -66,6 +66,16 @@ pub struct OrchestrationService {
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
+/// Identity, workspace claim, and bounded payload for a verified persistent-agent resume.
+pub struct PersistentAgentResumeRequest<'a> {
+    pub request_id: &'a str,
+    pub session_id: Uuid,
+    pub workspace: &'a Path,
+    pub agent_id: &'a str,
+    pub prompt: String,
+    pub max_rounds: Option<u32>,
+}
+
 /// Authorized bounds for a live run event stream.
 #[derive(Debug, Clone)]
 pub(crate) struct LiveRunScope {
@@ -720,13 +730,16 @@ impl OrchestrationService {
     pub async fn resume_persistent_agent(
         &self,
         _auth: &AuthContext,
-        request_id: &str,
-        session_id: Uuid,
-        workspace: &Path,
-        agent_id: &str,
-        prompt: String,
-        max_rounds: Option<u32>,
+        request: PersistentAgentResumeRequest<'_>,
     ) -> Result<serde_json::Value, OrchError> {
+        let PersistentAgentResumeRequest {
+            request_id,
+            session_id,
+            workspace,
+            agent_id,
+            prompt,
+            max_rounds,
+        } = request;
         let tool = "ptah_resume_persistent_agent";
         let (agent, claimed) =
             match self.authorize_persistent_agent_request(session_id, workspace, agent_id) {
