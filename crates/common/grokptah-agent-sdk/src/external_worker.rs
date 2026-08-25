@@ -199,7 +199,11 @@ impl ExternalWorkerRecord {
         if let Some(url) = &self.worker_url {
             validate_worker_url(url, self.provider)?;
         }
-        if self.created_at.trim().is_empty() || self.updated_at.trim().is_empty() {
+        if self.created_at.trim().is_empty()
+            || self.updated_at.trim().is_empty()
+            || contains_control(&self.created_at)
+            || contains_control(&self.updated_at)
+        {
             return Err("worker timestamps must not be empty");
         }
         Ok(())
@@ -235,7 +239,11 @@ impl ExternalWorkerRunRecord {
         if let Some(result) = &self.terminal_result {
             validate_detail(result, "terminal_result")?;
         }
-        if self.created_at.trim().is_empty() || self.updated_at.trim().is_empty() {
+        if self.created_at.trim().is_empty()
+            || self.updated_at.trim().is_empty()
+            || contains_control(&self.created_at)
+            || contains_control(&self.updated_at)
+        {
             return Err("run timestamps must not be empty");
         }
         Ok(())
@@ -281,7 +289,11 @@ pub struct ExternalWorkerEvent {
 impl ExternalWorkerEvent {
     /// Validate a redacted event before it crosses a broker boundary.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.ts.trim().is_empty() || self.kind.trim().is_empty() {
+        if self.ts.trim().is_empty()
+            || self.kind.trim().is_empty()
+            || contains_control(&self.ts)
+            || contains_control(&self.kind)
+        {
             return Err("worker event metadata must not be empty");
         }
         if self.kind.len() > 128 {
@@ -335,13 +347,16 @@ fn validate_identity(value: &str, field: &str) -> Result<(), &'static str> {
     if value.len() > MAX_EXTERNAL_WORKER_ID_BYTES {
         return Err("worker identity exceeds its byte bound");
     }
-    if value
-        .chars()
-        .any(|character| character.is_control() || character == '\u{7f}')
-    {
+    if contains_control(value) {
         return Err("worker identity contains a control character");
     }
     Ok(())
+}
+
+fn contains_control(value: &str) -> bool {
+    value
+        .chars()
+        .any(|character| character.is_control() || character == '\u{7f}')
 }
 
 fn validate_worker_url(value: &str, provider: ExternalWorkerProvider) -> Result<(), &'static str> {
@@ -385,10 +400,7 @@ fn validate_ref(value: &str, field: &str) -> Result<(), &'static str> {
             _ => "worker ref must not be empty",
         });
     }
-    if value
-        .chars()
-        .any(|character| character.is_control() || character == '\u{7f}')
-    {
+    if contains_control(value) {
         return Err("worker identity contains a control character");
     }
     if value.len() > MAX_EXTERNAL_WORKER_REF_BYTES
