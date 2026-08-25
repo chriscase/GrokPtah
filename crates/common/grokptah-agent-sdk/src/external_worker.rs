@@ -282,10 +282,11 @@ pub struct ExternalWorkerListQuery {
 impl ExternalWorkerListQuery {
     /// Validate list query bounds before they reach a provider adapter.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if let Some(limit) = self.limit {
-            if !(1..=MAX_EXTERNAL_WORKER_LIST_LIMIT).contains(&limit) {
-                return Err("list limit must be between 1 and 100");
-            }
+        if self
+            .limit
+            .is_some_and(|limit| !(1..=MAX_EXTERNAL_WORKER_LIST_LIMIT).contains(&limit))
+        {
+            return Err("list limit must be between 1 and 100");
         }
         if let Some(cursor) = &self.cursor {
             validate_identity(cursor, "cursor")?;
