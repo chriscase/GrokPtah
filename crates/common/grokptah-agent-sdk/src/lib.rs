@@ -13,6 +13,8 @@ pub mod capability;
 pub mod computer;
 /// Stable cross-product error categories.
 pub mod error;
+/// Provider-neutral contracts for external cloud or host-owned workers.
+pub mod external_worker;
 /// Durable run, review, and event types.
 pub mod run;
 
@@ -25,6 +27,11 @@ pub use computer::{
     ComputerEventPage, ComputerRunScope,
 };
 pub use error::{ErrorCode, ErrorEnvelope, ErrorEventRange};
+pub use external_worker::{
+    ExternalWorkerArtifact, ExternalWorkerEvent, ExternalWorkerExecutionMode,
+    ExternalWorkerLaunchRequest, ExternalWorkerProvider, ExternalWorkerRecord,
+    ExternalWorkerRunRecord, ExternalWorkerState, EXTERNAL_WORKER_CONTRACT_VERSION,
+};
 pub use run::{
     Bounds, ChangedFile, DurableRun, DurableRunState, ExecutionMode, IdempotencyKey, ReviewReceipt,
     RunEvent, RunEventPage, RunNotification, RunScope, SubmitTaskRequest,

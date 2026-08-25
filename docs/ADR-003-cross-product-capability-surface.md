@@ -61,7 +61,10 @@ Git ref, follow up, stream and poll status, cancel, collect bounded artifacts,
 and archive the worker. The API key remains server-side; a browser sees only
 the same redacted run projections, review receipts, and approval gates used for
 local runs. This is a planned adapter, not a claim that Cursor Cloud is
-currently integrated or qualified. See [`CURSOR_CLOUD_INTEGRATION.md`](./CURSOR_CLOUD_INTEGRATION.md).
+currently integrated or qualified. The reusable launch/status/event/artifact
+DTOs now live in `grokptah-agent-sdk::external_worker` and have a matching
+versioned JSON Schema; the provider adapter and live qualification remain open.
+See [`CURSOR_CLOUD_INTEGRATION.md`](./CURSOR_CLOUD_INTEGRATION.md).
 
 ## Public contract layers
 

@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokptah:schema:external-worker:v1",
+  "title": "GrokPtah External Worker Contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "launchRequest", "worker", "run"],
+  "properties": {
+    "contract": { "const": "grokptah.external-workers.v1" },
+    "launchRequest": { "$ref": "#/$defs/launchRequest" },
+    "worker": { "$ref": "#/$defs/worker" },
+    "run": { "$ref": "#/$defs/run" },
+    "events": { "type": "array", "items": { "$ref": "#/$defs/event" } },
+    "artifacts": { "type": "array", "items": { "$ref": "#/$defs/artifact" } }
+  },
+  "$defs": {
+    "provider": {
+      "enum": ["cursor_cloud", "claude_code_cloud", "local_worker", "custom"]
+    },
+    "state": {
+      "enum": ["provisioning", "ready", "running", "completed", "failed", "cancelled", "archived", "unknown"]
+    },
+    "identity": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000-\\u001f\\r\\n]+$"
+    },
+    "ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[^/\\\\][^\\u0000-\\u001f\\r\\n]*$"
+    },
+    "bounds": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxPromptBytes": { "type": "integer", "minimum": 1 },
+        "maxRounds": { "type": "integer", "minimum": 1, "maximum": 24 },
+        "maxDurationMs": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "launchRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestId", "provider", "repository", "startingRef", "prompt", "executionMode", "autoCreatePr"],
+      "properties": {
+        "requestId": { "$ref": "#/$defs/identity" },
+        "provider": { "$ref": "#/$defs/provider" },
+        "providerId": { "$ref": "#/$defs/identity" },
+        "repository": { "$ref": "#/$defs/ref" },
+        "startingRef": { "$ref": "#/$defs/ref" },
+        "prompt": { "type": "string", "minLength": 1, "maxLength": 1048576 },
+        "model": { "$ref": "#/$defs/identity" },
+        "executionMode": { "const": "isolated" },
+        "autoCreatePr": { "type": "boolean" },
+        "bounds": { "$ref": "#/$defs/bounds" }
+      }
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "externalAgentId", "repository", "startingRef", "state", "createdAt", "updatedAt"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/provider" },
+        "providerId": { "$ref": "#/$defs/identity" },
+        "externalAgentId": { "$ref": "#/$defs/identity" },
+        "repository": { "$ref": "#/$defs/ref" },
+        "startingRef": { "$ref": "#/$defs/ref" },
+        "state": { "$ref": "#/$defs/state" },
+        "branch": { "$ref": "#/$defs/ref" },
+        "workerUrl": { "type": "string", "maxLength": 512, "pattern": "^https://" },
+        "createdAt": { "type": "string", "minLength": 1 },
+        "updatedAt": { "type": "string", "minLength": 1 }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["externalAgentId", "externalRunId", "state", "lastSeq", "createdAt", "updatedAt"],
+      "properties": {
+        "externalAgentId": { "$ref": "#/$defs/identity" },
+        "externalRunId": { "$ref": "#/$defs/identity" },
+        "state": { "$ref": "#/$defs/state" },
+        "lastSeq": { "type": "integer", "minimum": 0 },
+        "terminalResult": { "type": "string", "maxLength": 4096 },
+        "createdAt": { "type": "string", "minLength": 1 },
+        "updatedAt": { "type": "string", "minLength": 1 }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seq", "ts", "kind", "detail"],
+      "properties": {
+        "seq": { "type": "integer", "minimum": 0 },
+        "ts": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "detail": { "type": "string", "maxLength": 4096 }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "digest"],
+      "properties": {
+        "path": { "$ref": "#/$defs/ref" },
+        "digest": { "$ref": "#/$defs/identity" },
+        "sizeBytes": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

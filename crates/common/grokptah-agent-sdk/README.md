@@ -15,6 +15,8 @@ The crate covers:
 - cursor-paged events and explicit recovery notifications;
 - isolated-run review receipts and stable error categories;
 - lease- and revision-fenced Computer Use control requests.
+- provider-neutral external-worker launch, lifecycle, event, and artifact
+  projections for cloud coding agents.
 
 The boundary DTOs that accept caller-controlled data expose a `validate()`
 method. Consumers should call those validators before crossing a process or

@@ -18,6 +18,22 @@ Never import `trusted.ts` into a browser bundle. A browser must not connect to
 the loopback MCP endpoint, receive a GrokPtah token, or provide raw workspace
 paths and Computer Use details.
 
+## External cloud workers
+
+Products that want GrokPtah to launch and monitor an external coding agent
+should import the `external_worker` contracts from `grokptah-agent-sdk` rather
+than inventing provider-specific DTOs. The contract covers an exact-ref,
+isolated launch request, opaque worker/run identities, redacted event updates,
+and bounded relative artifact references. The provider adapter keeps its API
+key and network client in the trusted service; the desktop and War Room UI
+receive only the redacted projections and existing review/approval receipts.
+
+The JSON representation is versioned at
+[`grokptah-external-worker.v1.schema.json`](./schemas/grokptah-external-worker.v1.schema.json).
+The initial Cursor Cloud adapter remains a qualification task; the contract is
+already reusable by ContextDesk, another Rust service, or a future TypeScript
+broker adapter.
+
 ## Browser / War Room example
 
 The browser receives only an authenticated broker session and opaque ids:

@@ -64,10 +64,10 @@ This is **not** an official xAI product. It is a personal/community fork for des
   confirmation-gated semantic ranking, and a bounded citation-validated assistant
 - **Reusable surfaces** — browser-safe broker client and Tauri-free headless
   UI primitives for desktop products and War Room integrations ([embedding guide](docs/EMBEDDING.md))
-- **Agentic harness workers (planned)** — provider-neutral orchestration for
-  external cloud coding agents such as Cursor Cloud, with exact refs, durable
-  status, review receipts, and the same approval/promotion gates ([Cursor Cloud
-  design](docs/CURSOR_CLOUD_INTEGRATION.md))
+- **Agentic harness workers (contract shipped; adapter planned)** — provider-
+  neutral SDK contracts for external cloud coding agents such as Cursor Cloud,
+  with exact refs, durable status, redacted events/artifacts, review receipts,
+  and the same approval/promotion gates ([Cursor Cloud design](docs/CURSOR_CLOUD_INTEGRATION.md))
 
 
 - **Project** — open folder (native dialog); rules discovery (`AGENTS.md`, etc.)  

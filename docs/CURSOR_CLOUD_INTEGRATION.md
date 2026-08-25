@@ -1,6 +1,7 @@
 # Cursor Cloud agents from GrokPtah
 
-**Status:** planned adapter; not yet shipped or live-qualified.
+**Status:** provider-neutral external-worker contract shipped in
+`grokptah-agent-sdk`; Cursor adapter not yet shipped or live-qualified.
 
 GrokPtah can manage Cursor's Cloud Agents as an external execution provider.
 This is separate from controlling a local Cursor desktop window. Cursor's
@@ -44,6 +45,12 @@ GrokPtah's provider-neutral run state, retain the exact repository and starting
 ref, and persist the Cursor agent/run IDs as opaque external IDs. A Cursor
 follow-up is a new run on the same agent; it is not an implicit resume of a
 cancelled run.
+
+The reusable DTO boundary is `grokptah-agent-sdk::external_worker`. It exposes
+validated launch requests plus redacted worker, run, event, and artifact
+projections. It deliberately has no provider credentials or network client, so
+another product can import the same contracts from a desktop adapter, service,
+or browser-safe broker without importing GrokPtah's authority implementation.
 
 ## Safety contract
 
