@@ -4810,10 +4810,13 @@ struct AlwaysOnCardinality {
     intents: usize,
 }
 
+/// Public terminal Run states. A Run completes as `completed`; `succeeded` is
+/// a Work state, not a Run state, and treating it as one leaves every wait
+/// spinning until the probe's bound.
 fn always_on_terminal_run(state: Option<&str>) -> bool {
     matches!(
         state,
-        Some("succeeded" | "failed" | "cancelled" | "interrupted" | "limit_reached")
+        Some("completed" | "failed" | "cancelled" | "interrupted")
     )
 }
 
@@ -4822,6 +4825,7 @@ fn always_on_state_code(state: Option<&str>) -> DurableStateCode {
         Some("queued") => DurableStateCode::Queued,
         Some("running") => DurableStateCode::Running,
         Some("succeeded") => DurableStateCode::Succeeded,
+        Some("completed") => DurableStateCode::Completed,
         Some("failed") => DurableStateCode::Failed,
         Some("cancelled") => DurableStateCode::Cancelled,
         Some("interrupted") => DurableStateCode::Interrupted,
@@ -5531,23 +5535,73 @@ async fn always_on_assert_interrupted_fence(
     Ok(())
 }
 
-/// Nothing may grow while the supervisor runs its window: no new Work, Run, or
-/// execution intent, and no resend of the held request.
+/// Across a full supervisor window the held unit must not be readmitted: the
+/// step keeps exactly one Work row with the same work, attempt and Run
+/// identity, it is never returned to `queued`, and the held request is never
+/// posted a second time.
+///
+/// This deliberately bounds the *target step* rather than the whole campaign.
+/// The Manager may legitimately keep planning around a failed unit; what the
+/// oracle forbids is that unit coming back.
 async fn always_on_assert_zero_growth(
     probe: &mut ProbeBuilder<'_>,
     service: &ProcessService,
     client: &mut McpControlClient,
     lane: &AlwaysOnLane,
     fixture: &AlwaysOnFixture,
+    join: &AlwaysOnHeldJoin,
     semantic: &str,
 ) -> Result<(), DiagnosticCode> {
-    let before = always_on_snapshot(probe, client, lane).await?;
     let posts = service.provider.count_for(semantic);
     tokio::time::sleep(fixture.zero_growth_window).await;
-    if always_on_snapshot(probe, client, lane).await? != before {
+    if service.provider.count_for(semantic) != posts || posts != 1 {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
-    if service.provider.count_for(semantic) != posts || posts != 1 {
+    let work = probe
+        .call(
+            client,
+            TraceOperationCode::ListWork,
+            "ptah_list_work",
+            json!({ "session_id": lane.session, "workspace": lane.workspace }),
+            vec![ArgumentFieldCode::SessionId, ArgumentFieldCode::Workspace],
+        )
+        .await?;
+    let rows = always_on_work_for_step(&work, semantic);
+    if rows.len() != 1 || rows[0]["workId"].as_str() != Some(join.work_id.as_str()) {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    let detailed = probe
+        .call(
+            client,
+            TraceOperationCode::GetWork,
+            "ptah_get_work",
+            json!({
+                "session_id": lane.session,
+                "workspace": lane.workspace,
+                "work_id": join.work_id
+            }),
+            vec![
+                ArgumentFieldCode::SessionId,
+                ArgumentFieldCode::Workspace,
+                ArgumentFieldCode::WorkId,
+            ],
+        )
+        .await?;
+    if detailed["work"]["state"].as_str() == Some("queued") {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    let attempts = detailed["attempts"]
+        .as_array()
+        .ok_or(DiagnosticCode::McpResultMalformed)?;
+    if attempts.len() != 1 || attempts[0]["attemptId"].as_str() != Some(join.attempt_id.as_str()) {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    if attempts[0]["linkedRunIds"]
+        .as_array()
+        .and_then(|runs| runs.first())
+        .and_then(Value::as_str)
+        != Some(join.run_id.as_str())
+    {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
     Ok(())
@@ -5643,6 +5697,7 @@ async fn always_on_restart_fence(
             &mut client,
             &lane,
             fixture,
+            &join,
             &fixture.step_first,
         )
         .await?;
