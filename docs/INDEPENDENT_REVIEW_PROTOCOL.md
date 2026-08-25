@@ -26,6 +26,16 @@ The reviewer must inspect these files and their dependency boundaries:
 - `desktop/src/lib/grokptahClient.ts`
 - `desktop/src/lib/grokptahOperations.ts`
 - `desktop/src/lib/grokptahBrokerClient.ts`
+- `desktop/src/lib/help.ts`
+- `desktop/src/lib/helpCenter.ts`
+- `desktop/src/lib/uiCore.ts`
+- `desktop/src/lib/public.ts`
+- `desktop/src/components/HelpCenter.tsx`
+- `desktop/public-package.json`
+- `desktop/vite.library.config.ts`
+- `desktop/tsconfig.lib.json`
+- `desktop/scripts/verify-public.mjs`
+- `desktop/scripts/run-public-consumer-smoke.mjs`
 - `docs/WEB_BROKER_PROTOCOL.md`
 - `docs/schemas/grokptah-capabilities.v1.schema.json`
 
@@ -48,6 +58,11 @@ The handoff must answer each item with file/line evidence:
 7. Are promotion and Computer Use controls visibly gated rather than merely
    hidden by the consumer UI?
 8. Do tests cover both successful replay and recovery/error paths?
+9. Does every source-cited Help article resolve to a real heading, remain
+   immutable to consumers, and stay inside the selected topic/corpus contract?
+10. Does the generated `@grokptah/client/ui-core` subpath remain Tauri-free,
+    broker-free, authority-free, and importable through normal package
+    resolution?
 
 ## Completion rule
 
@@ -73,7 +88,9 @@ or touch any other task. Inspect only the listed integration files and direct
 dependencies. Verify every item in docs/INDEPENDENT_REVIEW_PROTOCOL.md with
 file/line evidence. Pay special attention to browser-vs-MCP authority,
 session/workspace/run scope, idempotency, cursor replay/recovery, redaction,
-approval/lease fencing, and host-neutral SDK dependency direction.
+approval/lease fencing, host-neutral SDK dependency direction, source-heading
+integrity, corpus immutability, provider-response bounds, and the generated
+`./ui-core` package boundary.
 
 Return PASS, PASS_WITH_FINDINGS, or FAIL. Include exact SHAs, changed-file
 allowlist, commands actually run, severity-ranked findings, and explicit
