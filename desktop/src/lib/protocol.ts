@@ -499,6 +499,8 @@ export interface ProviderExecutionProjection {
     dialect: "xai_chat_completions" | "open_ai_chat_completions";
     modelId: string;
     wireModelId: string;
+    /** Credential class this run's usage is attributed to. */
+    credentialMethod: GrokCredentialMethod;
     capabilitySource: "declared" | "measured" | "unknown";
     qualificationSchema?: string | null;
     deadlineClass: "interactive" | "standard" | "extended";
@@ -968,10 +970,57 @@ export type ComputerUseTier =
   | "semantic_act"
   | "visual_fallback_act";
 
+/**
+ * Closed credential vocabulary shared with `grokptah_agent_bridge::grok_account`.
+ * Wire names match the Rust `GrokCredentialMethod` exactly.
+ */
+export type GrokCredentialMethod =
+  | "grok_build_oidc"
+  | "xai_api_key"
+  | "gateway_managed"
+  | "gateway_api_key"
+  | "unknown";
+
+/** Validity of the resolved credential. */
+export type GrokSessionState =
+  | "active"
+  | "expiring"
+  | "expired"
+  | "no_expiry"
+  | "unknown"
+  | "absent";
+
+/**
+ * Secret-free account status. Mirrors
+ * `grokptah_agent_bridge::grok_account::PublicGrokAccountStatus`.
+ *
+ * Carries no bearer, refresh token, API key, raw account address, or host path.
+ * `accountLabel` is masked at the source; `accountRef` is a one-way handle over
+ * durable principal fields only.
+ */
+export interface PublicGrokAccountStatus {
+  schema: string;
+  providerId: string;
+  method: GrokCredentialMethod;
+  session: GrokSessionState;
+  /** Whether a run may start on this credential right now. */
+  usable: boolean;
+  accountRef?: string | null;
+  accountLabel?: string | null;
+  expiresAt?: string | null;
+  expiresInSeconds?: number | null;
+}
+
 export interface AuthState {
   signed_in: boolean;
   display_name?: string | null;
   method?: string | null;
+  /**
+   * Accurate account view. `signed_in` only reports that a credential
+   * resolved — gate runs on `account.usable`, which is false for an expired
+   * Grok Build session. Absent on payloads from older builds.
+   */
+  account?: PublicGrokAccountStatus | null;
 }
 
 export type ComputerPermissionStatus =

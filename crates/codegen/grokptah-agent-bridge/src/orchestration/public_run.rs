@@ -18,6 +18,7 @@ use crate::completion::{
 use crate::gateway_config::{
     CapabilitySource, ProviderDeadlineClass, ProviderDialect, ProviderKind,
 };
+use crate::grok_account::GrokCredentialMethod;
 use crate::types::EffortLevel;
 
 use super::provider_attempt::{
@@ -64,6 +65,7 @@ const FORBIDDEN_PUBLIC_RUN_KEYS: &[&str] = &[
 /// Exact public `providerExecution.route` key allowlist.
 pub const PUBLIC_PROVIDER_ROUTE_KEYS: &[&str] = &[
     "capabilitySource",
+    "credentialMethod",
     "deadlineClass",
     "dialect",
     "effort",
@@ -182,6 +184,18 @@ pub struct PublicProviderRouteSummary {
     pub dialect: ProviderDialect,
     pub model_id: String,
     pub wire_model_id: String,
+    /// Which credential class this Run actually executed on.
+    ///
+    /// Attributes the Run's usage counters to the user's Grok Build session, a
+    /// host-managed xAI key, or a compatible gateway key, without putting the
+    /// credential reference or its fingerprint on the wire — both stay on the
+    /// forbidden list because they are derived from credential material and
+    /// would let a holder of a candidate key confirm it. This carries only the
+    /// *shape* of `credential_ref`, so a `keychain:` profile name never
+    /// escapes. Legacy receipts written before this field decode as
+    /// [`GrokCredentialMethod::Unknown`].
+    #[serde(default)]
+    pub credential_method: GrokCredentialMethod,
     pub capability_source: CapabilitySource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qualification_schema: Option<String>,
@@ -788,6 +802,7 @@ fn project_route_summary(route: &ProviderRouteSnapshot) -> PublicProviderRouteSu
         dialect: route.dialect,
         model_id: route.model_id.clone(),
         wire_model_id: route.wire_model_id.clone(),
+        credential_method: GrokCredentialMethod::from_credential_ref(&route.credential_ref),
         capability_source: route.capabilities.source,
         qualification_schema: route.capabilities.qualification_schema.clone(),
         deadline_class: route.deadline_class,

@@ -24,6 +24,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::grok_account::{project_grok_account_status, GrokAccountFacts, GrokCredentialMethod};
 use crate::types::AuthState;
 
 const SERVICE: &str = "grokptah-desktop";
@@ -187,6 +188,48 @@ impl WireCredentials {
             update_fingerprint_field(&mut digest, "api_key", Some(&self.bearer));
         }
         format!("v1-sha256:{:x}", digest.finalize())
+    }
+
+    /// Classify this credential into the closed editor vocabulary.
+    ///
+    /// Derived from structured fields, never from [`Self::method`] for the xAI
+    /// profile: that string is built from `auth_mode` inside `auth.json`, so it
+    /// is file-controlled and must not select an authority class. Compatible
+    /// profiles use the two method strings this crate writes itself; anything
+    /// else fails closed to [`GrokCredentialMethod::Unknown`].
+    pub(crate) fn account_method(&self) -> GrokCredentialMethod {
+        if self.provider_id == crate::gateway_config::XAI_PROVIDER_ID {
+            if self.oidc_token_auth {
+                GrokCredentialMethod::GrokBuildOidc
+            } else {
+                GrokCredentialMethod::XaiApiKey
+            }
+        } else {
+            match self.method.as_str() {
+                "provider_env" => GrokCredentialMethod::GatewayManaged,
+                "provider_keychain" => GrokCredentialMethod::GatewayApiKey,
+                _ => GrokCredentialMethod::Unknown,
+            }
+        }
+    }
+
+    /// Non-secret account facts for the public status projection.
+    ///
+    /// Copies only account identifiers and the expiry. `bearer` and
+    /// `refresh_token` have no field to land in on [`GrokAccountFacts`].
+    pub(crate) fn account_facts(&self) -> GrokAccountFacts {
+        GrokAccountFacts {
+            provider_id: self.provider_id.clone(),
+            method: self.account_method(),
+            display_name: Some(self.display_name.clone()),
+            oidc_issuer: self.oidc_issuer.clone(),
+            oidc_client_id: self.oidc_client_id.clone(),
+            principal_type: self.principal_type.clone(),
+            principal_id: self.principal_id.clone(),
+            user_id: self.user_id.clone(),
+            team_id: self.team_id.clone(),
+            expires_at: self.expires_at,
+        }
     }
 }
 
@@ -1183,10 +1226,16 @@ impl Drop for ExactTempCleanup {
 
 pub fn load_auth_state() -> AuthState {
     if let Some(w) = resolve_wire_credentials() {
+        // `signed_in` keeps its existing meaning — a credential resolved — so
+        // older desktop clients are unaffected. `account` is the accurate view:
+        // a resolved-but-expired Grok Build session reports `session: expired`
+        // and `usable: false` there, which is what a run gate must read.
+        let account = project_grok_account_status(&w.account_facts(), Utc::now());
         return AuthState {
             signed_in: true,
             display_name: Some(w.display_name),
             method: Some(w.method),
+            account: Some(account),
         };
     }
     AuthState::default()
@@ -1202,6 +1251,15 @@ pub fn store_api_key(api_key: &str, display_name: &str) -> Result<AuthState, Str
         signed_in: true,
         display_name: Some(display_name.into()),
         method: Some("api_key".into()),
+        account: Some(project_grok_account_status(
+            &GrokAccountFacts {
+                provider_id: crate::gateway_config::XAI_PROVIDER_ID.into(),
+                method: GrokCredentialMethod::XaiApiKey,
+                display_name: Some(display_name.into()),
+                ..GrokAccountFacts::default()
+            },
+            Utc::now(),
+        )),
     })
 }
 

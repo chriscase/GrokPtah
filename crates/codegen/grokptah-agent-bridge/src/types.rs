@@ -118,6 +118,15 @@ pub struct AuthState {
     pub signed_in: bool,
     pub display_name: Option<String>,
     pub method: Option<String>,
+    /// Secret-free account status for the resolved credential.
+    ///
+    /// `signed_in` only reports that *a* credential resolved. This carries the
+    /// classified method, the session validity, and the run gate
+    /// (`account.usable`), so an expired Grok Build session is visible before a
+    /// run spends a round on a `401`. `None` on records written by older
+    /// builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<crate::grok_account::PublicGrokAccountStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

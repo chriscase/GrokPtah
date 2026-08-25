@@ -5588,6 +5588,8 @@ impl AgentHostHandle {
             signed_in: true,
             display_name: Some(display_name),
             method: Some("local".into()),
+            // Display-only: no credential resolved, so the run gate stays shut.
+            account: Some(crate::grok_account::PublicGrokAccountStatus::absent()),
         };
         g.auth.clone()
     }
@@ -12734,6 +12736,7 @@ mod computer_agent_host_tests {
             signed_in: true,
             display_name: Some("stale Grok Build session".into()),
             method: Some("grok_build:oidc".into()),
+            account: None,
         };
         let projected = host
             .models()

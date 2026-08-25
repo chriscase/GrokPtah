@@ -18,6 +18,7 @@ pub mod event_bus;
 mod events;
 mod exec_risk;
 mod gateway_config;
+pub mod grok_account;
 mod hooks;
 mod host;
 mod host_helpers;
@@ -99,6 +100,12 @@ pub use gateway_config::{
     ModelCapabilities, ModelSelection, ProviderDeadlineClass, ProviderDialect, ProviderKind,
     ProviderModel, ProviderProfile, ProviderProfileUpdate,
     ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA,
+};
+pub use grok_account::{
+    account_ref_from_principal, mask_account_email, project_grok_account_status,
+    session_state as grok_session_state, GrokAccountFacts, GrokCredentialMethod, GrokSessionState,
+    PublicGrokAccountStatus, GROK_ACCOUNT_EXPIRY_WARN_SECONDS, GROK_ACCOUNT_STATUS_KEYS,
+    GROK_ACCOUNT_STATUS_SCHEMA,
 };
 pub use isolation::prepare_isolation_cwd;
 pub use live_attestation::{
