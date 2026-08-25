@@ -34,6 +34,12 @@ export type GrokPtahBrokerRunRequest = {
   allowQueue?: boolean;
 };
 
+const BROKER_AVAILABILITIES: ReadonlySet<GrokPtahBrokerCapability["availability"]> = new Set([
+  "available",
+  "gated",
+  "unavailable",
+]);
+
 /** The exact review evidence a broker must bind before issuing approval. */
 export type GrokPtahBrokerChangedFile = {
   /** Repository-relative path from the authoritative review receipt. */
@@ -77,6 +83,63 @@ export type GrokPtahBrokerRecovery = {
 };
 
 export type GrokPtahBrokerNotification = GrokPtahBrokerEvent | GrokPtahBrokerRecovery;
+
+function boundedString(value: unknown, maxBytes: number): value is string {
+  return typeof value === "string" && value.length > 0 && new TextEncoder().encode(value).byteLength <= maxBytes;
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, keys: ReadonlySet<string>): boolean {
+  return Object.keys(value).every((key) => keys.has(key));
+}
+
+/** Parse a broker binding without trusting a response's structural shape. */
+export function parseBrokerBinding(value: unknown): GrokPtahBrokerBinding | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (!hasOnlyKeys(record, new Set(["bindingId", "contract", "expiresAt", "capabilities"]))) return null;
+  if (
+    !boundedString(record.bindingId, 256) ||
+    !boundedString(record.contract, 128) ||
+    !boundedString(record.expiresAt, 128) ||
+    !Array.isArray(record.capabilities) ||
+    record.capabilities.length > 64
+  ) return null;
+  const capabilities: GrokPtahBrokerCapability[] = [];
+  for (const value of record.capabilities) {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    const capability = value as Record<string, unknown>;
+    if (!hasOnlyKeys(capability, new Set(["id", "availability"]))) return null;
+    if (
+      !boundedString(capability.id, 128) ||
+      typeof capability.availability !== "string" ||
+      !BROKER_AVAILABILITIES.has(capability.availability as GrokPtahBrokerCapability["availability"])
+    ) return null;
+    capabilities.push({
+      id: capability.id,
+      availability: capability.availability as GrokPtahBrokerCapability["availability"],
+    });
+  }
+  const ids = capabilities.map(({ id }) => id);
+  if (new Set(ids).size !== ids.length) return null;
+  return {
+    bindingId: record.bindingId,
+    contract: record.contract,
+    expiresAt: record.expiresAt,
+    capabilities,
+  };
+}
+
+/** Parse an opaque broker run envelope without trusting a response's shape. */
+export function parseBrokerRun(value: unknown): GrokPtahBrokerRun | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (
+    !hasOnlyKeys(record, new Set(["brokerRunId", "bindingId"])) ||
+    !boundedString(record.brokerRunId, 256) ||
+    !boundedString(record.bindingId, 256)
+  ) return null;
+  return { brokerRunId: record.brokerRunId, bindingId: record.bindingId };
+}
 
 export class GrokPtahBrokerError extends Error {
   readonly status: number;
@@ -130,7 +193,7 @@ export class GrokPtahBrokerClient {
     requestedCapabilities: string[],
     idempotencyKey: string,
   ): Promise<GrokPtahBrokerBinding> {
-    return this.request<GrokPtahBrokerBinding>("/bindings", {
+    return this.requestValidated("/bindings", parseBrokerBinding, {
       method: "POST",
       idempotencyKey,
       body: { investigationId, workspace, requestedCapabilities },
@@ -145,12 +208,12 @@ export class GrokPtahBrokerClient {
     return this.request<T>(`/bindings/${segment(bindingId)}/capacity`);
   }
 
-  async submitRun<T = GrokPtahBrokerRun>(
+  async submitRun(
     bindingId: string,
     request: GrokPtahBrokerRunRequest,
     idempotencyKey: string,
-  ): Promise<T> {
-    return this.request<T>(`/bindings/${segment(bindingId)}/runs`, {
+  ): Promise<GrokPtahBrokerRun> {
+    return this.requestValidated(`/bindings/${segment(bindingId)}/runs`, parseBrokerRun, {
       method: "POST",
       idempotencyKey,
       body: request,
@@ -363,6 +426,23 @@ export class GrokPtahBrokerClient {
     const text = await response.text();
     if (!text) return undefined as T;
     return JSON.parse(text) as T;
+  }
+
+  private async requestValidated<T>(
+    path: string,
+    parser: (value: unknown) => T | null,
+    options: {
+      method?: "GET" | "POST";
+      body?: unknown;
+      idempotencyKey?: string;
+    },
+  ): Promise<T> {
+    const value = await this.request<unknown>(path, options);
+    const parsed = parser(value);
+    if (parsed === null) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "Broker response shape is invalid");
+    }
+    return parsed;
   }
 }
 

@@ -3,6 +3,8 @@ import {
   type GrokPtahBrokerApprovalRequest,
   GrokPtahBrokerClient,
   GrokPtahBrokerError,
+  parseBrokerBinding,
+  parseBrokerRun,
 } from "./grokptahBrokerClient";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -14,7 +16,9 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 describe("GrokPtahBrokerClient", () => {
   it("uses opaque broker ids and browser credentials without a bearer token", async () => {
-    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ brokerRunId: "run/1" }));
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse({ brokerRunId: "run/1", bindingId: "binding/1" }),
+    );
     const client = new GrokPtahBrokerClient({
       baseUrl: "https://contextdesk.example",
       fetcher,
@@ -39,6 +43,55 @@ describe("GrokPtahBrokerClient", () => {
       },
     });
     expect(fetcher.mock.calls[0][1]?.headers).not.toHaveProperty("Authorization");
+  });
+
+  it("fails closed when a typed binding or run envelope is malformed", async () => {
+    expect(parseBrokerBinding({
+      bindingId: "binding-1",
+      contract: "grokptah.broker.v1",
+      expiresAt: "2026-08-24T00:00:00Z",
+      capabilities: [{ id: "run.review", availability: "gated" }],
+    })).not.toBeNull();
+    expect(parseBrokerBinding({
+      bindingId: "binding-1",
+      contract: "grokptah.broker.v1",
+      expiresAt: "2026-08-24T00:00:00Z",
+      capabilities: [{ id: "run.review", availability: "gated" }, { id: "run.review", availability: "gated" }],
+    })).toBeNull();
+    expect(parseBrokerRun({ brokerRunId: "run-1", bindingId: "binding-1" })).not.toBeNull();
+    expect(parseBrokerRun({ brokerRunId: "run-1", bindingId: "binding-1", workspace: "/secret" })).toBeNull();
+  });
+
+  it("rejects malformed run responses before exposing them to a consumer", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ brokerRunId: "run-1" }));
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    await expect(client.submitRun("binding-1", { prompt: "review" }, "intent-1"))
+      .rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  it("validates binding responses before exposing capabilities", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
+      bindingId: "binding-1",
+      contract: "grokptah.capabilities.v1",
+      expiresAt: "2026-08-24T23:00:00Z",
+      capabilities: [{ id: "run.review", availability: "available" }],
+    }));
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    const binding = await client.createBinding(
+      "war-room-1",
+      "approved-workspace",
+      ["run.review"],
+      "bind-1",
+    );
+    expect(binding.capabilities[0]?.id).toBe("run.review");
   });
 
   it("fails closed before a mutating request without a broker CSRF token", async () => {
@@ -175,7 +228,9 @@ describe("GrokPtahBrokerClient", () => {
   });
 
   it("trims a broker CSRF token before sending it", async () => {
-    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ ok: true }));
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse({ brokerRunId: "run-1", bindingId: "binding-1" }),
+    );
     const client = new GrokPtahBrokerClient({
       baseUrl: "https://contextdesk.example",
       fetcher,
