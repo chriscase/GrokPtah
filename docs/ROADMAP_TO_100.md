@@ -19,7 +19,7 @@ enough to close a stage.
 | 5. Safe Computer Use | Redacted observation, semantic action, isolation, leases, stale-frame rejection, coordination | [Computer Use design](./COMPUTER_USE.md); source proof exists, packaged VM/hardware proof remains | In progress |
 | 6. Operator UX | Fast power-user workflows, keyboard/screen-reader correctness, understandable approvals and recovery | The integrated Help Center at `45441d1f` adds focus trapping, Escape/focus restoration, responsive layout, reduced-motion and forced-colors handling; full desktop suite is 47 files / 274 tests; independent expert acceptance remains | In progress |
 | 7. Semantic help | Searchable in-app help with contextual guidance and an optional assistant boundary | [`HelpCenter`](../desktop/src/components/HelpCenter.tsx) and [`helpCenter.ts`](../desktop/src/lib/helpCenter.ts) provide 18 stable source-cited articles spanning core operation, recovery, queue steering, MCP, broker embedding, Computer Use, and providers, with deterministic paraphrase search, explicit offline/provider retrieval labels, confirmation-gated semantic ranking, bounded assistant context and provider-response ceilings, strict answer validation, and helper-session cleanup; live provider/corpus qualification remains | In progress |
-| 8. Embeddable platform | Stable Rust DTOs, desktop adapter, browser-safe broker, reusable UI primitives | [Cross-product ADR](./ADR-003-cross-product-capability-surface.md), [embedding guide](./EMBEDDING.md), [broker protocol](./WEB_BROKER_PROTOCOL.md), [SDK](../crates/common/grokptah-agent-sdk/README.md) | Contract, response-validation, headless UI, source-cited Help Center exports (`c7800a46`), hardened browser authority checks (`b17e901f`), installable Tauri-free package staging including the `./ui-core` subpath, and normal `node_modules` consumer smoke checks are verified; publication and cross-repository integration remain |
+| 8. Embeddable platform | Stable Rust DTOs, desktop adapter, browser-safe broker, reusable UI primitives | [Cross-product ADR](./ADR-003-cross-product-capability-surface.md), [embedding guide](./EMBEDDING.md), [broker protocol](./WEB_BROKER_PROTOCOL.md), [SDK](../crates/common/grokptah-agent-sdk/README.md) | Contract, response-validation, headless UI, source-cited Help Center exports (`c7800a46`), hardened browser authority checks (`b17e901f`), installable Tauri-free package staging including the `./ui-core` subpath, and an installed `npm pack` consumer smoke check are verified; publication and cross-repository integration remain |
 | 9. Independent qualification | Strongest-model code/security/UI review, cross-language conformance, soak, gateway, packaged-CU, and recovery evidence | [Independent review protocol](./INDEPENDENT_REVIEW_PROTOCOL.md) | Pending exact candidate head |
 | 10. Release and adoption | Versioned packages, examples, migration docs, reproducible builds, signed artifacts, release runbook | Public TypeScript package staging and packaging instructions exist; signed artifacts, hosted-service release, migration/changelog, and final runbook remain | In progress |
 
@@ -57,7 +57,8 @@ the same candidate release:
   pass 47 test files / 274 tests, typecheck, the production Vite build, and
   `npm run verify:public`.
   The public check includes generated export/authority-boundary checks and a
-  normal `node_modules/@grokptah/client` consumer smoke fixture. The package
+  installed `npm pack` archive plus normal `node_modules/@grokptah/client`
+  consumer smoke fixture. The package
   remains a release candidate until publication and a real cross-repository
   consumer integration are green.
 - Put the current integration changes on an exact reviewable candidate, then

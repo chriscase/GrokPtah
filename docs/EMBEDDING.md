@@ -120,8 +120,9 @@ The generated artifact contains the browser-safe broker client and headless
 primitives only; it does not contain `trusted.ts`, Tauri APIs, bearer tokens,
 provider API-key markers, absolute host paths, `GROKPTAH_HOME`, or native
 Computer Use authority. The same command then installs that generated manifest
-into a disposable external-consumer fixture and imports it through normal
-`node_modules/@grokptah/client` package resolution. That fixture exercises the
+into a disposable external-consumer fixture, installs the generated `npm pack`
+archive, and imports it through normal `node_modules/@grokptah/client` package
+resolution. That fixture exercises the
 Help Center corpus, queue reducer, stream helper, broker constructor, and the
 separate `@grokptah/client/ui-core` import, so a direct bundle import cannot
 masquerade as a consumer integration. The fixture is deleted after the check.

@@ -35,8 +35,8 @@ live provider qualification, and 100% release qualification remain open.
 - `npm run typecheck`: passed.
 - `npm run build`: passed; Vite production bundle emitted.
 - `npm run verify:public`: passed; browser-safe public bundle, authority checks,
-  and a disposable external-consumer import through normal `node_modules`
-  resolution remained green, including `searchHelpArticles`, the exported
+  an installed `npm pack` archive, and a disposable external-consumer import
+  through normal `node_modules` resolution remained green, including `searchHelpArticles`, the exported
   `HELP_ARTICLES` corpus, and the separate `@grokptah/client/ui-core` subpath.
 - `git diff --check`: passed.
 
