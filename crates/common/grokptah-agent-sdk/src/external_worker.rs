@@ -131,6 +131,13 @@ impl ExternalWorkerLaunchRequest {
         if self.provider == ExternalWorkerProvider::Custom && self.provider_id.is_none() {
             return Err("custom workers require provider_id");
         }
+        // Enforced here rather than in one adapter, so a second adapter cannot
+        // reach a provider with this set. Promotion stays a separate,
+        // explicitly approved action; the message matches the one the Cursor
+        // adapter has always returned so durable ledger labels are unchanged.
+        if self.auto_create_pr {
+            return Err("pull-request creation requires a separate approval action");
+        }
         if let Some(bounds) = &self.bounds {
             bounds.validate()?;
         }
@@ -209,16 +216,15 @@ impl ExternalWorkerRecord {
         if let Some(branch) = &self.branch {
             validate_ref(branch, "branch")?;
         }
-        if let Some(url) = &self.worker_url {
-            if url.trim().is_empty()
+        if self.worker_url.as_ref().is_some_and(|url| {
+            url.trim().is_empty()
                 || url.len() > MAX_EXTERNAL_WORKER_REF_BYTES
                 || !url.starts_with("https://")
                 || url
                     .chars()
                     .any(|character| matches!(character, '\n' | '\r' | '\0'))
-            {
-                return Err("worker_url must be a bounded https URL");
-            }
+        }) {
+            return Err("worker_url must be a bounded https URL");
         }
         if self.created_at.trim().is_empty() || self.updated_at.trim().is_empty() {
             return Err("worker timestamps must not be empty");
@@ -525,9 +531,53 @@ mod tests {
         assert!(event.validate().is_ok());
     }
 
+    /// The one value every layer accepts. `true` was rejected only inside the
+    /// Cursor adapter, so the contract type itself admitted a request that
+    /// asks a provider to open a pull request.
+    #[test]
+    fn auto_create_pr_is_refused_by_the_contract_not_only_by_an_adapter() {
+        let mut request = launch();
+        assert!(request.validate().is_ok());
+        request.auto_create_pr = true;
+        assert_eq!(
+            request.validate(),
+            Err("pull-request creation requires a separate approval action")
+        );
+    }
+
+    /// `null` is not a bounded boolean and must not decode. A missing field
+    /// decodes to `false`, which is the only value the contract allows.
+    #[test]
+    fn auto_create_pr_rejects_null_and_defaults_missing_to_false() {
+        let mut value = serde_json::to_value(launch()).expect("request serializes");
+        value["autoCreatePr"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<ExternalWorkerLaunchRequest>(value.clone()).is_err(),
+            "a null autoCreatePr must not decode as a boolean"
+        );
+
+        value
+            .as_object_mut()
+            .expect("request is an object")
+            .remove("autoCreatePr");
+        let decoded: ExternalWorkerLaunchRequest =
+            serde_json::from_value(value).expect("a missing autoCreatePr defaults");
+        assert!(!decoded.auto_create_pr);
+        assert!(decoded.validate().is_ok());
+
+        // And a request that asks for a pull request never round-trips into a
+        // valid one.
+        let mut asking = launch();
+        asking.auto_create_pr = true;
+        let decoded: ExternalWorkerLaunchRequest =
+            serde_json::from_value(serde_json::to_value(&asking).expect("serializes"))
+                .expect("round-trips");
+        assert!(decoded.validate().is_err());
+    }
+
     #[test]
     fn unsupported_streams_must_not_synthesize_a_zero_cursor() {
-        assert!(!EXTERNAL_WORKER_STREAMING_SUPPORTED);
+        const { assert!(!EXTERNAL_WORKER_STREAMING_SUPPORTED) };
         let mut run = ExternalWorkerRunRecord {
             external_agent_id: "agent-1".into(),
             external_run_id: "run-1".into(),

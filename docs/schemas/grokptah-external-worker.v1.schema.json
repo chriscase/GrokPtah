@@ -54,7 +54,7 @@
         "prompt": { "type": "string", "minLength": 1, "maxLength": 1048576 },
         "model": { "$ref": "#/$defs/identity" },
         "executionMode": { "const": "isolated" },
-        "autoCreatePr": { "type": "boolean" },
+        "autoCreatePr": { "const": false },
         "bounds": { "$ref": "#/$defs/bounds" }
       }
     },

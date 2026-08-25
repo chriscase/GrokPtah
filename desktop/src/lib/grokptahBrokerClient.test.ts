@@ -918,6 +918,35 @@ describe("GrokPtahBrokerClient", () => {
     }, "request-1")).rejects.toMatchObject({ code: "invalid_response" });
   });
 
+  it("never sends a launch that asks the provider to open a pull request", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    const request = {
+      requestId: "request-1",
+      provider: "cursor_cloud",
+      repository: "org/repo",
+      startingRef: "main",
+      prompt: "Review the exact candidate",
+      executionMode: "isolated",
+    } as const;
+    for (const autoCreatePr of [true, null, undefined]) {
+      await expect(
+        client.launchExternalWorker(
+          "binding-1",
+          { ...request, autoCreatePr } as never,
+          "request-1",
+        ),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+    }
+    // Refused before any network call: promotion is a separate approval and
+    // must never reach the broker as part of a launch.
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("rejects follow-up on unknown, failed, cancelled, or archived workers before posting", async () => {
     for (const state of ["unknown", "failed", "cancelled", "archived"] as const) {
       const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({

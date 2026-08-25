@@ -58,6 +58,30 @@ describe("external worker UI contract", () => {
     })).toBeNull();
   });
 
+  it("refuses every autoCreatePr value except false", () => {
+    const base = {
+      requestId: "req-1",
+      provider: "cursor_cloud",
+      repository: "chriscase/GrokPtah",
+      startingRef: "refs/heads/codex/review",
+      prompt: "Review the exact candidate",
+      executionMode: "isolated",
+    };
+    // false is the only accepted value: promotion stays a separate approval.
+    expect(parseExternalWorkerLaunchRequest({ ...base, autoCreatePr: false })).not.toBeNull();
+    // Asking the provider to open a pull request is refused outright.
+    expect(parseExternalWorkerLaunchRequest({ ...base, autoCreatePr: true })).toBeNull();
+    // Nothing truthy, absent, or loosely typed may stand in for false.
+    for (const autoCreatePr of [null, undefined, 0, 1, "false", "true", {}, []]) {
+      expect(
+        parseExternalWorkerLaunchRequest({ ...base, autoCreatePr }),
+        `autoCreatePr ${JSON.stringify(autoCreatePr) ?? "undefined"} must be refused`,
+      ).toBeNull();
+    }
+    // Omitting the field entirely is refused too; the contract requires it.
+    expect(parseExternalWorkerLaunchRequest(base)).toBeNull();
+  });
+
   it("parses redacted records and relative artifacts only", () => {
     expect(parseExternalWorkerRecord({
       provider: "cursor_cloud",
