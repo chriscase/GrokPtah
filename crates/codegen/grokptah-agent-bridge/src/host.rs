@@ -1174,6 +1174,7 @@ impl AgentHostHandle {
                             &request_id,
                             &payload_hash,
                             None,
+                            None,
                             serde_json::Value::String(response.clone()),
                         )?;
                         Ok(response)
@@ -1495,6 +1496,9 @@ impl AgentHostHandle {
             retry_of: None,
             parent_run_id,
             queue_position: None,
+            // Desktop turns are not admitted through the orchestration
+            // control plane, so they carry no execution specification.
+            spec_key: None,
             bounds,
             prompt_preview: self
                 .inner

@@ -52,6 +52,7 @@ fn seed_run(
             retry_of: None,
             parent_run_id: None,
             queue_position: None,
+            spec_key: None,
             bounds: RunBounds {
                 max_prompt_bytes: 10_000,
                 max_rounds: 8,

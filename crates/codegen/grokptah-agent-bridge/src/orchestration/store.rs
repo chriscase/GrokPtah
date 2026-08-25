@@ -10,7 +10,11 @@ use chrono::{Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
 
-use super::admission::{AcceptanceIntent, AttemptLease, AttemptLeaseState, ATTEMPT_LEASE_VERSION};
+use super::admission::{
+    AcceptanceIntent, AttemptLease, AttemptLeaseState, ProviderSendFailure, ProviderSendRecord,
+    ProviderSendState, ATTEMPT_LEASE_VERSION, PROVIDER_SEND_VERSION,
+};
+use super::ledger_io::LedgerDir;
 use super::types::{
     safe_id_filename, AgentRecord, AgentState, AuditEntry, ContinuationCheckpoint,
     IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunRecord, RunState,
@@ -23,6 +27,13 @@ pub struct OrchStore {
 
 struct OrchStoreInner {
     root: PathBuf,
+    /// Open directory handles for every ledger that can hold private
+    /// execution material. All reads and writes below go through these, so a
+    /// name swapped for a link between check and use cannot be followed.
+    inputs: LedgerDir,
+    leases: LedgerDir,
+    sends: LedgerDir,
+    tombstones: LedgerDir,
     _store_lock: fs::File,
     lock: Mutex<()>,
     last_run_error: Mutex<Option<String>>,
@@ -94,11 +105,15 @@ impl OrchStore {
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
-        // Private execution input and attempt leases. These hold the only
-        // durable copy of a queued prompt, so they are created with owner-only
-        // permissions and are never widened afterwards.
+        // Private execution input, attempt leases, provider-send evidence, and
+        // idempotency tombstones. These hold the only durable copy of a queued
+        // prompt and the only record of whether work reached a provider, so
+        // each is opened as an owner-only directory handle and every access
+        // below is handle-relative and refuses to follow links.
         create_private_dir(&root.join("inputs"))?;
         create_private_dir(&root.join("leases"))?;
+        create_private_dir(&root.join("sends"))?;
+        create_private_dir(&root.join("tombstones"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -130,9 +145,20 @@ impl OrchStore {
                     }
                 }
             })?;
+        let open_ledger = |root: &Path, name: &str| -> anyhow::Result<LedgerDir> {
+            LedgerDir::open(&root.join(name)).map_err(|error| anyhow::anyhow!(error.to_string()))
+        };
+        let inputs = open_ledger(&root, "inputs")?;
+        let leases = open_ledger(&root, "leases")?;
+        let sends = open_ledger(&root, "sends")?;
+        let tombstones = open_ledger(&root, "tombstones")?;
         let store = Self {
             inner: Arc::new(OrchStoreInner {
                 root,
+                inputs,
+                leases,
+                sends,
+                tombstones,
                 _store_lock: store_lock,
                 lock: Mutex::new(()),
                 last_run_error: Mutex::new(None),
@@ -591,14 +617,10 @@ impl OrchStore {
 
     // ── durable execution input (acceptance intents) ───────────────────
 
-    fn intent_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
-        let safe = safe_id_filename(run_id)?;
-        Ok(self.inner.root.join("inputs").join(format!("{safe}.json")))
-    }
-
-    fn lease_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
-        let safe = safe_id_filename(run_id)?;
-        Ok(self.inner.root.join("leases").join(format!("{safe}.json")))
+    /// Ledger file name for one record id. The name is a store-generated
+    /// digest, so it is always a safe single path component.
+    fn record_name(id: &str) -> Result<String, OrchError> {
+        Ok(format!("{}.json", safe_id_filename(id)?))
     }
 
     /// Persist the sealed, private, bounded execution input for one accepted
@@ -607,9 +629,11 @@ impl OrchStore {
     /// behind it.
     pub fn save_acceptance_intent(&self, intent: &AcceptanceIntent) -> Result<(), OrchError> {
         intent.validate()?;
-        let path = self.intent_path(&intent.run_id)?;
+        let name = Self::record_name(&intent.run_id)?;
+        let bytes = serde_json::to_vec_pretty(intent)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         let _guard = self.inner.lock.lock();
-        write_private_json(&self.inner.root, &path, intent)
+        self.inner.inputs.write_private(&name, &bytes)
     }
 
     /// Load and re-verify a sealed input. The digest is recomputed on every
@@ -618,17 +642,17 @@ impl OrchStore {
         &self,
         run_id: &str,
     ) -> Result<Option<AcceptanceIntent>, OrchError> {
-        let path = self.intent_path(run_id)?;
+        let name = Self::record_name(run_id)?;
         let _guard = self.inner.lock.lock();
-        self.load_acceptance_intent_unlocked(&path, run_id)
+        self.load_acceptance_intent_unlocked(&name, run_id)
     }
 
     fn load_acceptance_intent_unlocked(
         &self,
-        path: &Path,
+        name: &str,
         run_id: &str,
     ) -> Result<Option<AcceptanceIntent>, OrchError> {
-        let Some(text) = read_private_string(&self.inner.root, path)? else {
+        let Some(text) = self.inner.inputs.read_private(name)? else {
             return Ok(None);
         };
         let intent: AcceptanceIntent = serde_json::from_str(&text).map_err(|error| {
@@ -647,88 +671,62 @@ impl OrchStore {
         Ok(Some(intent))
     }
 
-    /// Every run id that currently has durable input on disk, including ones
-    /// whose sealed record no longer verifies. Recovery needs the unreadable
-    /// ones too so it can tombstone them rather than leave them behind.
+    /// Every input record on disk, as `(file name, verified run id)`. The run
+    /// id is `None` for a record that no longer verifies; recovery needs those
+    /// too, so it can remove them rather than leave them behind.
     pub fn list_acceptance_intent_run_ids(&self) -> anyhow::Result<Vec<(String, Option<String>)>> {
-        let dir = self.inner.root.join("inputs");
-        let mut out = Vec::new();
-        if !dir.is_dir() {
-            return Ok(out);
-        }
         let _guard = self.inner.lock.lock();
-        for entry in fs::read_dir(&dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            // The filename is a hash, so the run id itself comes from the
-            // verified body. An unreadable body yields the hash alone, which
-            // is enough to remove the garbage.
-            let text = match read_private_string(&self.inner.root, &path) {
-                Ok(Some(text)) => Some(text),
-                Ok(None) => None,
-                Err(_) => None,
-            };
-            let run_id = text
+        let names = self
+            .inner
+            .inputs
+            .list("json")
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let mut out = Vec::new();
+        for name in names {
+            let run_id = self
+                .inner
+                .inputs
+                .read_private(&name)
+                .ok()
+                .flatten()
                 .and_then(|text| serde_json::from_str::<AcceptanceIntent>(&text).ok())
                 .filter(|intent| intent.validate().is_ok())
                 .map(|intent| intent.run_id);
-            out.push((stem.to_string(), run_id));
+            out.push((name, run_id));
         }
         out.sort();
         Ok(out)
     }
 
     /// Drop durable input. Callers must never do this for a run that is still
-    /// admitted and not yet confirmed dispatched: the input is the only copy.
+    /// admitted and not yet terminal: the input is the only copy.
     pub fn remove_acceptance_intent(&self, run_id: &str) -> Result<bool, OrchError> {
-        let path = self.intent_path(run_id)?;
+        let name = Self::record_name(run_id)?;
         let _guard = self.inner.lock.lock();
-        ensure_private_path(&self.inner.root, &path)?;
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
-        }
+        self.inner.inputs.remove(&name)
     }
 
-    /// Remove an input file by its on-disk stem. Used only by recovery, for
+    /// Remove an input record by its on-disk name. Used only by recovery, for
     /// garbage whose body no longer names a run.
-    pub fn remove_acceptance_intent_file(&self, stem: &str) -> Result<bool, OrchError> {
-        if stem.len() != 64 || !stem.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(OrchError::new(
-                OrchErrorCode::InvalidRequest,
-                "acceptance intent file name is not a store-generated digest",
-            ));
-        }
-        let path = self.inner.root.join("inputs").join(format!("{stem}.json"));
+    pub fn remove_acceptance_intent_file(&self, name: &str) -> Result<bool, OrchError> {
         let _guard = self.inner.lock.lock();
-        ensure_private_path(&self.inner.root, &path)?;
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
-        }
+        self.inner.inputs.remove(name)
     }
 
     // ── attempt leases ─────────────────────────────────────────────────
 
     pub fn load_attempt_lease(&self, run_id: &str) -> Result<Option<AttemptLease>, OrchError> {
-        let path = self.lease_path(run_id)?;
+        let name = Self::record_name(run_id)?;
         let _guard = self.inner.lock.lock();
-        self.load_attempt_lease_unlocked(&path, run_id)
+        self.load_attempt_lease_unlocked(&name, run_id)
     }
 
     fn load_attempt_lease_unlocked(
         &self,
-        path: &Path,
+        name: &str,
         run_id: &str,
     ) -> Result<Option<AttemptLease>, OrchError> {
-        let Some(text) = read_private_string(&self.inner.root, path)? else {
+        let Some(text) = self.inner.leases.read_private(name)? else {
             return Ok(None);
         };
         let lease: AttemptLease = serde_json::from_str(&text).map_err(|error| {
@@ -747,6 +745,16 @@ impl OrchStore {
         Ok(Some(lease))
     }
 
+    fn write_attempt_lease_unlocked(
+        &self,
+        name: &str,
+        lease: &AttemptLease,
+    ) -> Result<(), OrchError> {
+        let bytes = serde_json::to_vec_pretty(lease)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.inner.leases.write_private(name, &bytes)
+    }
+
     /// Compare-and-swap the single attempt authorized to dispatch `run_id`.
     ///
     /// Succeeds only when there is no lease, when the current lease was
@@ -762,12 +770,12 @@ impl OrchStore {
         intent_digest: &str,
         ttl_ms: u64,
     ) -> Result<AttemptLease, OrchError> {
-        let path = self.lease_path(run_id)?;
+        let name = Self::record_name(run_id)?;
         let _guard = self.inner.lock.lock();
         let now = Utc::now();
         // A lease that no longer verifies is not a licence to run beside an
         // unknown holder; `?` refuses rather than overwriting it.
-        let previous = self.load_attempt_lease_unlocked(&path, run_id)?;
+        let previous = self.load_attempt_lease_unlocked(&name, run_id)?;
         let next_attempt = match &previous {
             Some(lease) if lease.is_active(now) => {
                 return Err(OrchError::with_data(
@@ -799,21 +807,26 @@ impl OrchStore {
         }
         .seal();
         lease.validate()?;
-        write_private_json(&self.inner.root, &path, &lease)?;
+        self.write_attempt_lease_unlocked(&name, &lease)?;
         Ok(lease)
     }
 
-    /// Extend a lease this exact attempt still holds. A stale attempt id or a
-    /// different owner is refused rather than silently reviving the lease.
+    /// Extend a lease this exact attempt still holds.
+    ///
+    /// Refused for a different owner, for a stale attempt id, for a lease that
+    /// is no longer held, and — critically — for one that has already expired.
+    /// An expired holder must not be able to heartbeat its way back in: the
+    /// reconciler may already have handed the run to a new attempt, and two
+    /// live holders is exactly the state the lease exists to prevent.
     pub fn renew_attempt_lease(
         &self,
         run_id: &str,
         attempt_id: &str,
         owner_id: &str,
     ) -> Result<AttemptLease, OrchError> {
-        let path = self.lease_path(run_id)?;
+        let name = Self::record_name(run_id)?;
         let _guard = self.inner.lock.lock();
-        let Some(current) = self.load_attempt_lease_unlocked(&path, run_id)? else {
+        let Some(current) = self.load_attempt_lease_unlocked(&name, run_id)? else {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
                 "attempt lease is missing",
@@ -831,13 +844,19 @@ impl OrchStore {
                 "attempt lease is no longer held",
             ));
         }
+        if current.is_expired(Utc::now()) {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "attempt lease has expired and cannot be renewed",
+            ));
+        }
         let renewed = AttemptLease {
             heartbeat_at: Utc::now(),
             digest: String::new(),
             ..current
         }
         .seal();
-        write_private_json(&self.inner.root, &path, &renewed)?;
+        self.write_attempt_lease_unlocked(&name, &renewed)?;
         Ok(renewed)
     }
 
@@ -849,9 +868,9 @@ impl OrchStore {
         attempt_id: &str,
         owner_id: &str,
     ) -> Result<bool, OrchError> {
-        let path = self.lease_path(run_id)?;
+        let name = Self::record_name(run_id)?;
         let _guard = self.inner.lock.lock();
-        let Some(current) = self.load_attempt_lease_unlocked(&path, run_id)? else {
+        let Some(current) = self.load_attempt_lease_unlocked(&name, run_id)? else {
             return Ok(false);
         };
         if current.attempt_id != attempt_id || current.owner_id != owner_id {
@@ -870,20 +889,286 @@ impl OrchStore {
             ..current
         }
         .seal();
-        write_private_json(&self.inner.root, &path, &released)?;
+        self.write_attempt_lease_unlocked(&name, &released)?;
         Ok(true)
+    }
+
+    /// Reclaim one expired lease so a fresh attempt can take the run.
+    ///
+    /// Used only by the expired-lease reconciler, and only after it has
+    /// established that no live worker in this process still owns the run.
+    /// Returns the reclaimed lease, or `None` when nothing needed reclaiming.
+    pub fn reclaim_expired_attempt_lease(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<AttemptLease>, OrchError> {
+        let name = Self::record_name(run_id)?;
+        let _guard = self.inner.lock.lock();
+        let Some(current) = self.load_attempt_lease_unlocked(&name, run_id)? else {
+            return Ok(None);
+        };
+        if current.state != AttemptLeaseState::Held || !current.is_expired(Utc::now()) {
+            return Ok(None);
+        }
+        let reclaimed = AttemptLease {
+            state: AttemptLeaseState::Released,
+            heartbeat_at: Utc::now(),
+            digest: String::new(),
+            ..current
+        }
+        .seal();
+        self.write_attempt_lease_unlocked(&name, &reclaimed)?;
+        Ok(Some(reclaimed))
+    }
+
+    /// Every lease on disk, verified. Records that no longer verify are
+    /// returned by name only so the caller can remove them.
+    pub fn list_attempt_leases(&self) -> Result<Vec<(String, Option<AttemptLease>)>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let names = self.inner.leases.list("json")?;
+        let mut out = Vec::new();
+        for name in names {
+            let lease = self
+                .inner
+                .leases
+                .read_private(&name)
+                .ok()
+                .flatten()
+                .and_then(|text| serde_json::from_str::<AttemptLease>(&text).ok())
+                .filter(|lease| lease.validate().is_ok());
+            out.push((name, lease));
+        }
+        Ok(out)
     }
 
     /// Drop a lease record entirely. Only for a run that is already terminal.
     pub fn remove_attempt_lease(&self, run_id: &str) -> Result<bool, OrchError> {
-        let path = self.lease_path(run_id)?;
+        let name = Self::record_name(run_id)?;
         let _guard = self.inner.lock.lock();
-        ensure_private_path(&self.inner.root, &path)?;
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        self.inner.leases.remove(&name)
+    }
+
+    // ── provider send evidence ─────────────────────────────────────────
+
+    /// Mint a durable send identity in the `KnownNotSent` state.
+    ///
+    /// Written before anything is transmitted, so the very existence of this
+    /// record marks the point after which "nothing happened" stops being a
+    /// safe assumption.
+    pub fn open_provider_send(
+        &self,
+        run_id: &str,
+        attempt_id: &str,
+        spec_key: &str,
+    ) -> Result<ProviderSendRecord, OrchError> {
+        let name = Self::record_name(run_id)?;
+        let _guard = self.inner.lock.lock();
+        let now = Utc::now();
+        let record = ProviderSendRecord {
+            send_version: PROVIDER_SEND_VERSION,
+            send_id: uuid::Uuid::new_v4().to_string(),
+            run_id: run_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            spec_key: spec_key.to_string(),
+            state: ProviderSendState::KnownNotSent,
+            failure: None,
+            detail: None,
+            created_at: now,
+            updated_at: now,
+            digest: String::new(),
         }
+        .seal();
+        record.validate()?;
+        self.write_provider_send_unlocked(&name, &record)?;
+        Ok(record)
+    }
+
+    pub fn load_provider_send(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<ProviderSendRecord>, OrchError> {
+        let name = Self::record_name(run_id)?;
+        let _guard = self.inner.lock.lock();
+        self.load_provider_send_unlocked(&name, run_id)
+    }
+
+    fn load_provider_send_unlocked(
+        &self,
+        name: &str,
+        run_id: &str,
+    ) -> Result<Option<ProviderSendRecord>, OrchError> {
+        let Some(text) = self.inner.sends.read_private(name)? else {
+            return Ok(None);
+        };
+        let record: ProviderSendRecord = serde_json::from_str(&text).map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("provider send record is unreadable: {error}"),
+            )
+        })?;
+        record.validate()?;
+        if record.run_id != run_id {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "provider send record does not belong to this run",
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    fn write_provider_send_unlocked(
+        &self,
+        name: &str,
+        record: &ProviderSendRecord,
+    ) -> Result<(), OrchError> {
+        let bytes = serde_json::to_vec_pretty(record)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.inner.sends.write_private(name, &bytes)
+    }
+
+    /// Advance one send record along its state machine.
+    ///
+    /// Only forward transitions are accepted, and only for the exact attempt
+    /// and send identity that opened the record, so evidence can become more
+    /// definite but never weaker and never reattributed.
+    pub fn advance_provider_send(
+        &self,
+        run_id: &str,
+        send_id: &str,
+        attempt_id: &str,
+        next: ProviderSendState,
+        failure: Option<ProviderSendFailure>,
+        detail: Option<String>,
+    ) -> Result<ProviderSendRecord, OrchError> {
+        let name = Self::record_name(run_id)?;
+        let _guard = self.inner.lock.lock();
+        let Some(current) = self.load_provider_send_unlocked(&name, run_id)? else {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "provider send record is missing",
+            ));
+        };
+        if current.send_id != send_id || current.attempt_id != attempt_id {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "provider send record belongs to another attempt",
+            ));
+        }
+        if current.state == next && failure == current.failure {
+            return Ok(current);
+        }
+        if !current.may_transition_to(next) {
+            return Err(OrchError::with_data(
+                OrchErrorCode::Conflict,
+                "provider send state cannot move backwards",
+                serde_json::json!({
+                    "from": current.state.as_str(),
+                    "to": next.as_str(),
+                }),
+            ));
+        }
+        let updated = ProviderSendRecord {
+            state: next,
+            failure,
+            detail,
+            updated_at: Utc::now(),
+            digest: String::new(),
+            ..current
+        }
+        .seal();
+        updated.validate()?;
+        self.write_provider_send_unlocked(&name, &updated)?;
+        Ok(updated)
+    }
+
+    pub fn remove_provider_send(&self, run_id: &str) -> Result<bool, OrchError> {
+        let name = Self::record_name(run_id)?;
+        let _guard = self.inner.lock.lock();
+        self.inner.sends.remove(&name)
+    }
+
+    // ── idempotency tombstones ─────────────────────────────────────────
+
+    /// Record, durably and compactly, that one request identity has already
+    /// been decided.
+    ///
+    /// Receipts are pruned by retention; tombstones are not. Without them,
+    /// pruning a failed receipt would silently reopen the request for a fresh
+    /// attempt — a failed submission would become executable simply by waiting
+    /// out the retention horizon. The tombstone is tiny by design so keeping
+    /// it far longer than the receipt costs almost nothing.
+    pub fn write_idempotency_tombstone(
+        &self,
+        request_id: &str,
+        tool: &str,
+        payload_hash: &str,
+        outcome: &str,
+        run_id: Option<&str>,
+    ) -> Result<(), OrchError> {
+        let name = Self::record_name(request_id)?;
+        let _guard = self.inner.lock.lock();
+        let record = serde_json::json!({
+            "tombstoneVersion": 1,
+            "requestId": request_id,
+            "tool": tool,
+            "payloadHash": payload_hash,
+            "outcome": outcome,
+            "runId": run_id,
+            "recordedAt": Utc::now().to_rfc3339(),
+        });
+        let bytes = serde_json::to_vec_pretty(&record)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        self.inner.tombstones.write_private(&name, &bytes)
+    }
+
+    /// The recorded decision for a request identity, if any.
+    pub fn load_idempotency_tombstone(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<IdempotencyTombstone>, OrchError> {
+        let name = Self::record_name(request_id)?;
+        let _guard = self.inner.lock.lock();
+        let Some(text) = self.inner.tombstones.read_private(&name)? else {
+            return Ok(None);
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("idempotency tombstone is unreadable: {error}"),
+            )
+        })?;
+        let field = |key: &str| -> Option<String> {
+            value.get(key).and_then(|v| v.as_str()).map(str::to_string)
+        };
+        let (Some(recorded_request), Some(tool), Some(payload_hash), Some(outcome)) = (
+            field("requestId"),
+            field("tool"),
+            field("payloadHash"),
+            field("outcome"),
+        ) else {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "idempotency tombstone is missing required fields",
+            ));
+        };
+        if recorded_request != request_id {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "idempotency tombstone does not belong to this request",
+            ));
+        }
+        Ok(Some(IdempotencyTombstone {
+            request_id: recorded_request,
+            tool,
+            payload_hash,
+            outcome,
+            run_id: field("runId"),
+        }))
+    }
+
+    pub fn list_idempotency_tombstones(&self) -> Result<Vec<String>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.inner.tombstones.list("json")
     }
 
     /// Leave a bounded, durable, recoverable finalization intent without
@@ -939,6 +1224,28 @@ impl OrchStore {
         payload_hash: &str,
     ) -> Result<IdempotencyClaim, OrchError> {
         let path = self.idemp_path(request_id)?;
+        // A decision that outlived its receipt is still a decision. Checked
+        // before the claim so a pruned request cannot be re-performed simply
+        // because its receipt aged out.
+        if let Some(tombstone) = self.load_idempotency_tombstone(request_id)? {
+            if !path.is_file() {
+                if tombstone.tool != tool || tombstone.payload_hash != payload_hash {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Conflict,
+                        "request_id reused with different payload",
+                    ));
+                }
+                return Err(OrchError::with_data(
+                    OrchErrorCode::Conflict,
+                    "request_id was already decided and its receipt has been retired",
+                    serde_json::json!({
+                        "requestId": tombstone.request_id,
+                        "outcome": tombstone.outcome,
+                        "runId": tombstone.run_id,
+                    }),
+                ));
+            }
+        }
         let _g = self.inner.lock.lock();
         if path.is_file() {
             let text = fs::read_to_string(&path)
@@ -967,6 +1274,7 @@ impl OrchStore {
             request_id: request_id.into(),
             payload_hash: payload_hash.into(),
             run_id: None,
+            spec_key: None,
             tool: tool.into(),
             response: serde_json::Value::Null,
             error: None,
@@ -982,12 +1290,14 @@ impl OrchStore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn complete_idempotency(
         &self,
         tool: &str,
         request_id: &str,
         payload_hash: &str,
         run_id: Option<String>,
+        spec_key: Option<String>,
         response: serde_json::Value,
     ) -> Result<(), OrchError> {
         self.finish_idempotency(
@@ -995,6 +1305,7 @@ impl OrchStore {
             request_id,
             payload_hash,
             run_id,
+            spec_key,
             response,
             None,
             "complete",
@@ -1014,6 +1325,7 @@ impl OrchStore {
             request_id,
             payload_hash,
             run_id,
+            None,
             serde_json::Value::Null,
             Some(error),
             "failed",
@@ -1027,6 +1339,7 @@ impl OrchStore {
         request_id: &str,
         payload_hash: &str,
         run_id: Option<String>,
+        spec_key: Option<String>,
         response: serde_json::Value,
         error: Option<OrchError>,
         status: &str,
@@ -1058,10 +1371,12 @@ impl OrchStore {
                 format!("idempotency claim is already {}", previous.status),
             ));
         }
+        let run_id_for_tombstone = run_id.clone();
         let receipt = IdempotencyReceipt {
             request_id: request_id.into(),
             payload_hash: payload_hash.into(),
             run_id,
+            spec_key,
             tool: tool.into(),
             response,
             error,
@@ -1069,7 +1384,18 @@ impl OrchStore {
             status: status.into(),
         };
         atomic_write_json(&path, &receipt)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        // The tombstone outlives the receipt. Retention prunes receipts; if
+        // the decision went with them, waiting out the horizon would turn a
+        // refused request back into an executable one.
+        drop(_g);
+        self.write_idempotency_tombstone(
+            request_id,
+            tool,
+            payload_hash,
+            status,
+            run_id_for_tombstone.as_deref(),
+        )
     }
 
     pub fn append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
@@ -1204,6 +1530,12 @@ impl OrchStore {
         {
             return QueuedAdmission::Tampered;
         }
+        // The run names one execution specification. Input that verifies as
+        // some *other* specification — a resealed forgery — is not this run's
+        // input, however internally consistent it is.
+        if run.spec_key.as_deref() != Some(intent.spec_key()) {
+            return QueuedAdmission::Tampered;
+        }
         let receipt = match self.load_idempotency(&run.request_id) {
             Ok(Some(receipt)) => receipt,
             Ok(None) => return QueuedAdmission::Lost,
@@ -1249,23 +1581,16 @@ impl OrchStore {
     /// tampered lease must not be able to block a run forever, and it cannot
     /// authorize one either, since dispatch always mints a fresh lease.
     fn release_orphaned_attempt_leases(&self) -> anyhow::Result<usize> {
-        let dir = self.inner.root.join("leases");
-        if !dir.is_dir() {
-            return Ok(0);
-        }
+        let leases = self
+            .list_attempt_leases()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let mut released = 0;
-        for entry in fs::read_dir(&dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let parsed = read_private_string(&self.inner.root, &path)
-                .ok()
-                .flatten()
-                .and_then(|text| serde_json::from_str::<AttemptLease>(&text).ok())
-                .filter(|lease| lease.validate().is_ok());
-            let Some(lease) = parsed else {
-                let _ = fs::remove_file(&path);
+        for (name, lease) in leases {
+            let Some(lease) = lease else {
+                // A lease that cannot be parsed or verified must not be able
+                // to block a run forever, and cannot authorize one either:
+                // dispatch always mints a fresh lease.
+                let _ = self.inner.leases.remove(&name);
                 continue;
             };
             if lease.state == AttemptLeaseState::Released {
@@ -1278,7 +1603,7 @@ impl OrchStore {
                 ..lease
             }
             .seal();
-            write_private_json(&self.inner.root, &path, &released_lease)
+            self.write_attempt_lease_unlocked(&name, &released_lease)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             released += 1;
         }
@@ -1391,17 +1716,26 @@ enum QueuedAdmission {
     Tampered,
 }
 
+/// A durable record that one request identity has already been decided.
+/// Survives receipt retention, so a pruned failure cannot become a success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyTombstone {
+    pub request_id: String,
+    pub tool: String,
+    pub payload_hash: String,
+    /// `complete` or `failed` — the decision that was reached.
+    pub outcome: String,
+    pub run_id: Option<String>,
+}
+
 pub enum IdempotencyClaim {
     Perform,
     Pending,
     Replay(Result<serde_json::Value, OrchError>),
 }
 
-/// Owner-only permissions for every durable record that can carry private
-/// execution input. Anything wider is treated as tampering, not as a
-/// convenience to be repaired silently.
-#[cfg(unix)]
-const PRIVATE_FILE_MODE: u32 = 0o600;
+/// Owner-only permissions for the ledger directories. Records themselves are
+/// written through `LedgerDir`, which owns the file-level guarantees.
 #[cfg(unix)]
 const PRIVATE_DIR_MODE: u32 = 0o700;
 
@@ -1411,137 +1745,6 @@ fn create_private_dir(path: &Path) -> anyhow::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_DIR_MODE))?;
-    }
-    Ok(())
-}
-
-/// Reject a path that is (or traverses) a symlink, and one that escapes the
-/// store root. Both are checked before any read, so a swapped-in symlink can
-/// never redirect a load to an attacker-controlled file.
-fn ensure_private_path(root: &Path, path: &Path) -> Result<(), OrchError> {
-    let contained = path.strip_prefix(root).is_ok();
-    if !contained
-        || path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        return Err(OrchError::new(
-            OrchErrorCode::InvalidRequest,
-            "durable record path escapes the store root",
-        ));
-    }
-    // Every component between the root and the leaf must be a real directory.
-    let mut walked = root.to_path_buf();
-    let Ok(relative) = path.strip_prefix(root) else {
-        return Err(OrchError::new(
-            OrchErrorCode::InvalidRequest,
-            "durable record path escapes the store root",
-        ));
-    };
-    for component in relative.components() {
-        walked.push(component);
-        match fs::symlink_metadata(&walked) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    return Err(OrchError::new(
-                        OrchErrorCode::InvalidRequest,
-                        "durable record path is a symlink",
-                    ));
-                }
-            }
-            // A component that does not exist yet is fine for a write; the
-            // exclusive/atomic write below is what creates it.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(error) => {
-                return Err(OrchError::new(OrchErrorCode::Internal, error.to_string()));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Read a private durable record, failing closed on a symlink, on an escaped
-/// path, and on permissions that would expose private execution input.
-fn read_private_string(root: &Path, path: &Path) -> Result<Option<String>, OrchError> {
-    ensure_private_path(root, path)?;
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
-    };
-    if !metadata.file_type().is_file() {
-        return Err(OrchError::new(
-            OrchErrorCode::InvalidRequest,
-            "durable record is not a regular file",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(OrchError::new(
-                OrchErrorCode::Conflict,
-                "durable record permissions are wider than owner-only",
-            ));
-        }
-    }
-    fs::read_to_string(path)
-        .map(Some)
-        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
-}
-
-/// Atomically install a private durable record with owner-only permissions.
-/// The temp file is created private, so the content is never briefly readable.
-fn write_private_json<T: serde::Serialize>(
-    root: &Path,
-    path: &Path,
-    value: &T,
-) -> Result<(), OrchError> {
-    ensure_private_path(root, path)?;
-    let internal =
-        |error: std::io::Error| OrchError::new(OrchErrorCode::Internal, error.to_string());
-    if let Some(parent) = path.parent() {
-        create_private_dir(parent)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    ensure_private_path(root, &tmp)?;
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
-    {
-        use std::io::Write;
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(PRIVATE_FILE_MODE);
-        }
-        let mut file = options.open(&tmp).map_err(internal)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))
-                .map_err(internal)?;
-        }
-        let write = file
-            .write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(internal);
-        if write.is_err() {
-            let _ = fs::remove_file(&tmp);
-            write?;
-        }
-    }
-    if let Err(error) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(internal(error));
-    }
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        fs::File::open(parent)
-            .and_then(|dir| dir.sync_all())
-            .map_err(internal)?;
     }
     Ok(())
 }
@@ -1598,6 +1801,7 @@ mod tests {
             retry_of: None,
             parent_run_id: None,
             queue_position: None,
+            spec_key: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
             start_seq: Some(1),
@@ -1648,6 +1852,7 @@ mod tests {
             retry_of: None,
             parent_run_id: None,
             queue_position: None,
+            spec_key: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
             start_seq: Some(1),
@@ -1772,6 +1977,7 @@ mod tests {
             retry_of: None,
             parent_run_id: None,
             queue_position: None,
+            spec_key: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
             start_seq: Some(1),
@@ -1805,7 +2011,7 @@ mod tests {
             _ => panic!("first claim should perform"),
         }
         store
-            .complete_idempotency("t", "req", "h", None, serde_json::json!({"ok": true}))
+            .complete_idempotency("t", "req", "h", None, None, serde_json::json!({"ok": true}))
             .unwrap();
         match store.claim_idempotency("t", "req", "h").unwrap() {
             IdempotencyClaim::Replay(Ok(v)) => assert_eq!(v["ok"], true),
@@ -1827,7 +2033,14 @@ mod tests {
             .fail_idempotency("t", "failed", "h", None, error.clone())
             .unwrap();
         assert!(store
-            .complete_idempotency("t", "failed", "h", None, serde_json::json!({"ok": true}))
+            .complete_idempotency(
+                "t",
+                "failed",
+                "h",
+                None,
+                None,
+                serde_json::json!({"ok": true})
+            )
             .is_err());
         match store.claim_idempotency("t", "failed", "h").unwrap() {
             IdempotencyClaim::Replay(Err(replayed)) => {
@@ -1882,6 +2095,7 @@ mod tests {
                 request_id: "old-receipt".into(),
                 payload_hash: "hash".into(),
                 run_id: None,
+                spec_key: None,
                 tool: "ptah_submit_task".into(),
                 response: serde_json::json!({"runId": "old-shared"}),
                 error: None,
@@ -1940,6 +2154,7 @@ mod tests {
                 request_id: "unknown-status".into(),
                 payload_hash: "hash".into(),
                 run_id: None,
+                spec_key: None,
                 tool: "ptah_queue_prompt".into(),
                 response: serde_json::Value::Null,
                 error: None,
@@ -2000,6 +2215,7 @@ mod tests {
             retry_of: None,
             parent_run_id: None,
             queue_position: None,
+            spec_key: None,
             bounds: RunBounds::default(),
             prompt_preview: "hi".into(),
             start_seq: Some(1),

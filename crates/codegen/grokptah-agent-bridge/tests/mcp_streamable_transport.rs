@@ -920,7 +920,10 @@ async fn http_submit_allow_queue_and_cancel_queued_run() {
         .await
         .unwrap();
     assert!(!first.is_error);
-    assert_eq!(first.structured["state"], "running");
+    // A submission receipt is honestly `queued`: at the moment it is issued
+    // no handle is registered, no worker has acknowledged, and nothing has
+    // reached a provider. `running` is reached by worker acknowledgement.
+    assert_eq!(first.structured["state"], "queued");
 
     let queued = client
         .call_tool(
@@ -1211,6 +1214,7 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
             retry_of: None,
             parent_run_id: None,
             queue_position: None,
+            spec_key: None,
             bounds: RunBounds {
                 max_prompt_bytes: 10_000,
                 max_rounds: 6,

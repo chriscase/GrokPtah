@@ -532,6 +532,7 @@ fn soak_restart_recovery_matrix() {
         retry_of: None,
         parent_run_id: None,
         queue_position: None,
+        spec_key: None,
         bounds: RunBounds::default(),
         prompt_preview: "partial".into(),
         start_seq: Some(1),

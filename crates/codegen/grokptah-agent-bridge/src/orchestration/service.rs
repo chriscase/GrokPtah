@@ -17,8 +17,10 @@ use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
 use crate::session::{SessionKind, WorkspaceStatus};
 
 use super::admission::{
-    AcceptanceIntent, AttemptLease, LiveWorker, SealedBounds, WorkerLiveness, WorkerLivenessGuard,
-    ACCEPTANCE_INTENT_VERSION, DEFAULT_ATTEMPT_LEASE_TTL_MS, DEFAULT_TEARDOWN_BUDGET,
+    AcceptanceIntent, AttemptLease, AuthorizationSnapshot, LiveWorker, ProviderSendFailure,
+    ProviderSendState, SealedBounds, SpecBinding, SpecHolder, StartGate, WorkerLiveness,
+    WorkerLivenessGuard, ACCEPTANCE_INTENT_VERSION, DEFAULT_ATTEMPT_LEASE_TTL_MS,
+    DEFAULT_TEARDOWN_BUDGET,
 };
 use super::authz::{canonical_workspace, require_workspace_match, AuthContext, WorkspaceAllowlist};
 use super::store::{IdempotencyClaim, OrchStore};
@@ -39,6 +41,13 @@ const ATTEMPT_HEARTBEAT_INTERVAL: Duration =
 
 /// Bounded number of finished attempts whose worker liveness stays queryable.
 const MAX_REMEMBERED_LIVENESS: usize = 256;
+
+/// How often the expired-lease reconciler sweeps. Comfortably shorter than a
+/// lease lifetime so a dead holder is reclaimed within one TTL.
+const LEASE_RECONCILE_INTERVAL: Duration = Duration::from_millis(DEFAULT_ATTEMPT_LEASE_TTL_MS / 4);
+
+/// How often durable queued work is re-derived from the ledger.
+const QUEUE_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Default)]
 struct AdmissionQueueState {
@@ -95,6 +104,74 @@ pub struct OrchestrationService {
     remembered_liveness: Mutex<VecDeque<(String, Arc<WorkerLiveness>)>>,
     /// Identity of this process instance for attempt-lease ownership.
     owner_id: String,
+    /// The one place teardown is performed. Every path that wants an attempt
+    /// stopped sends a request here instead of tearing it down itself, so
+    /// there is exactly one owner of the abort-then-prove-quiescence sequence
+    /// and exactly one place that may release capacity.
+    teardown_tx: tokio::sync::mpsc::UnboundedSender<TeardownRequest>,
+    teardown_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Independent reconcilers: expired attempt leases, and durable queued
+    /// runs that no live pump is tracking.
+    reconcilers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+/// Why an attempt is being torn down. Carried through so the terminal record
+/// and the audit trail can name the cause rather than inferring it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TeardownReason {
+    /// The supervisor finished normally and its terminal record is installed.
+    Completed,
+    /// An explicit cancel from the control plane.
+    Cancelled,
+    /// The attempt's wall-clock bound elapsed.
+    Deadline,
+    /// The durable lease expired or was taken by another attempt.
+    LeaseLost,
+    /// The supervisor exited without installing a terminal record.
+    SupervisorExit,
+    /// Authorization changed after acceptance.
+    AuthorizationDrift,
+}
+
+impl TeardownReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Deadline => "deadline",
+            Self::LeaseLost => "lease_lost",
+            Self::SupervisorExit => "supervisor_exit",
+            Self::AuthorizationDrift => "authorization_drift",
+        }
+    }
+}
+
+/// A snapshot of one live attempt's teardown state, for callers that need to
+/// reason about capacity rather than about run outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttemptStatus {
+    pub attempt: u64,
+    /// Every handle is in the registry and the start gate has opened.
+    pub registered: bool,
+    /// Cancellation is signalled and the nested futures are aborted. Says
+    /// nothing about whether anything has stopped.
+    pub fenced: bool,
+    /// The terminal record has been installed or staged.
+    pub finalized: bool,
+    /// Host capacity has been given back. Only ever true after quiescence was
+    /// proved.
+    pub capacity_released: bool,
+    /// A bounded teardown could not prove the work stopped. Lease and capacity
+    /// are retained while this holds.
+    pub escaped: bool,
+    /// The worker future itself can no longer execute.
+    pub worker_quiescent: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TeardownRequest {
+    run_id: String,
+    reason: TeardownReason,
 }
 
 /// Authorized bounds for a live run event stream.
@@ -198,33 +275,100 @@ fn stage_supervisor_exit(store: &OrchStore, run_id: &str, reason: &str) {
     }
 }
 
-/// The single exit path for one dispatched attempt.
+/// Why a worker future did not return a turn result.
+///
+/// The classification is durable evidence, not a log line: `send_failure`
+/// decides what the provider-send ledger records, and `error_code` decides
+/// what the run's terminal record says. Collapsing these into one opaque error
+/// is how "the local task failed" gets mistaken for "the work never ran".
+#[derive(Debug, Clone)]
+pub(crate) struct WorkerOutcome {
+    pub message: String,
+    pub error_code: &'static str,
+    pub send_failure: Option<ProviderSendFailure>,
+}
+
+impl WorkerOutcome {
+    /// Refused before the turn began; nothing was transmitted.
+    fn refused(error: OrchError) -> Self {
+        Self {
+            message: error.message,
+            error_code: "authorization_drift",
+            send_failure: Some(ProviderSendFailure::PreflightRejected),
+        }
+    }
+
+    /// The durable send ledger could not be advanced.
+    fn send_failed(failure: ProviderSendFailure, error: OrchError) -> Self {
+        Self {
+            message: error.message,
+            error_code: match failure.resulting_state() {
+                ProviderSendState::Uncertain => "provider_send_uncertain",
+                _ => "provider_send_blocked",
+            },
+            send_failure: Some(failure),
+        }
+    }
+
+    /// The turn itself returned an error after transmission began.
+    fn turn_failed(error: anyhow::Error) -> Self {
+        Self {
+            message: error.to_string(),
+            error_code: "internal",
+            send_failure: None,
+        }
+    }
+
+    /// The worker task did not complete: a panic or an abort.
+    fn panicked(detail: String) -> Self {
+        Self {
+            message: format!("run worker did not complete: {detail}"),
+            error_code: "worker_lost",
+            send_failure: Some(ProviderSendFailure::AttemptTornDown),
+        }
+    }
+}
+
+/// Allocate a journal sequence through the service, when it is still alive.
+fn bus_next_seq_for(service: &Weak<OrchestrationService>) -> Option<u64> {
+    service.upgrade().map(|service| service.bus.next_seq())
+}
+
+/// Redact through the shared bus so worker detail can never carry a secret.
+fn redact_for(service: &Weak<OrchestrationService>, text: &str) -> String {
+    match service.upgrade() {
+        Some(service) => service.bus.redact_text(text, 500),
+        None => String::new(),
+    }
+}
+
+/// The synchronous exit fence for one dispatched attempt.
 ///
 /// This guard is uniquely owned by the outer supervisor, and its `Drop` runs
 /// on **every** way that supervisor can end: a normal return, an early return,
 /// a panic unwind, an abort landing on any await point, and runtime shutdown.
-/// Under one compare-and-swap latch it performs, exactly once:
 ///
-/// 1. durable terminalization — or, if that cannot land, a bounded recoverable
-///    finalization intent that the next `OrchStore::open` replays;
-/// 2. release of the durable attempt lease held by this exact attempt;
-/// 3. removal of the durable input, which is now provably unnecessary because
-///    the run is terminal;
-/// 4. deregistration from the live-worker registry;
-/// 5. release of host admission capacity, and only then a scheduler wake.
+/// What it may do is deliberately narrow. `Drop` is synchronous, so it cannot
+/// await anything, which means it can never prove that the worker future has
+/// stopped. It therefore:
 ///
-/// Steps 4 and 5 come last on purpose. Capacity is what lets another attempt
-/// start, so it is released only after this attempt's futures are gone.
+/// 1. **fences** the attempt — signals cancellation, aborts the nested futures;
+/// 2. **stages** durable terminal evidence — the computed terminal record, or
+///    a bounded recoverable finalization intent the next store open replays;
+/// 3. **hands off** to the async teardown owner.
+///
+/// It does **not** release host capacity, and it does not release the durable
+/// attempt lease. Both of those would authorize a second attempt, and an abort
+/// request is not evidence that the first one stopped. Only the teardown
+/// owner, which can await, is allowed to draw that conclusion.
 struct SupervisorExitGuard {
     store: OrchStore,
-    host: AgentHostHandle,
     service: Weak<OrchestrationService>,
     entry: Arc<LiveWorker>,
     run_id: String,
-    attempt_id: String,
-    owner_id: String,
     /// The terminal record the supervisor computed, when it got that far.
     candidate: Option<RunRecord>,
+    reason: TeardownReason,
 }
 
 /// Bounded attempts to install a terminal record before falling back to a
@@ -234,66 +378,56 @@ const FINALIZATION_ATTEMPTS: u32 = 3;
 
 impl Drop for SupervisorExitGuard {
     fn drop(&mut self) {
-        if !self.entry.settle_once() {
-            // Another path already settled this attempt.
-            return;
-        }
+        // Stop the attempt from progressing. Synchronous and immediate; it
+        // claims nothing about whether anything has actually stopped yet.
+        self.entry.fence();
 
-        match self.candidate.take() {
-            Some(candidate) => {
-                let mut installed = false;
-                let mut last_error = None;
-                for _ in 0..FINALIZATION_ATTEMPTS {
-                    match self.store.persist_finalization(&candidate) {
-                        Ok(_) => {
-                            installed = true;
-                            break;
+        if self.entry.claim_finalization() {
+            match self.candidate.take() {
+                Some(candidate) => {
+                    let mut installed = false;
+                    let mut last_error = None;
+                    for _ in 0..FINALIZATION_ATTEMPTS {
+                        match self.store.persist_finalization(&candidate) {
+                            Ok(_) => {
+                                installed = true;
+                                break;
+                            }
+                            Err(error) => last_error = Some(error.to_string()),
                         }
-                        Err(error) => last_error = Some(error.to_string()),
+                    }
+                    if !installed {
+                        // Bounded recoverable finalization intent: replayed at
+                        // the next store open, so the run is never left
+                        // non-terminal with no record of why.
+                        if let Err(error) = self.store.stage_finalization_intent(&candidate) {
+                            eprintln!(
+                                "[grokptah] run {} finalization could not be staged: {error}",
+                                self.run_id
+                            );
+                        }
+                        let detail = last_error.unwrap_or_else(|| "unknown".into());
+                        let _ = self.store.enqueue_audit(AuditEntry {
+                            ts: Utc::now(),
+                            tool: "run_finalization".into(),
+                            request_id: None,
+                            session_id: Some(candidate.session_id),
+                            workspace: None,
+                            outcome: "deferred".into(),
+                            error_code: Some("run_persistence_failed".into()),
+                            detail,
+                        });
                     }
                 }
-                if !installed {
-                    // Bounded recoverable finalization intent: replayed at the
-                    // next store open, so the run is never left non-terminal
-                    // with no record of why.
-                    if let Err(error) = self.store.stage_finalization_intent(&candidate) {
-                        eprintln!(
-                            "[grokptah] run {} finalization could not be staged: {error}",
-                            self.run_id
-                        );
-                    }
-                    let detail = last_error.unwrap_or_else(|| "unknown".into());
-                    let _ = self.store.enqueue_audit(AuditEntry {
-                        ts: Utc::now(),
-                        tool: "run_finalization".into(),
-                        request_id: None,
-                        session_id: Some(candidate.session_id),
-                        workspace: None,
-                        outcome: "deferred".into(),
-                        error_code: Some("run_persistence_failed".into()),
-                        detail,
-                    });
-                }
+                // The supervisor never reached a terminal decision: it
+                // panicked, was aborted, or the process is shutting down.
+                None => stage_supervisor_exit(&self.store, &self.run_id, "supervisor_exit"),
             }
-            // The supervisor never reached a terminal decision: it panicked,
-            // was aborted, or the process is shutting down.
-            None => stage_supervisor_exit(&self.store, &self.run_id, "supervisor_exit"),
         }
 
+        // Hand off to the one owner allowed to prove quiescence and release.
         if let Some(service) = self.service.upgrade() {
-            service.live_workers.lock().remove(&self.run_id);
-        }
-        release_settled_attempt(
-            &self.store,
-            &self.host,
-            &self.run_id,
-            &self.attempt_id,
-            &self.owner_id,
-        );
-        if let Some(service) = self.service.upgrade() {
-            if tokio::runtime::Handle::try_current().is_ok() {
-                service.pump_pending();
-            }
+            service.request_teardown(&self.run_id, self.reason);
         }
     }
 }
@@ -308,6 +442,8 @@ struct IdempotencyLease {
     tool: String,
     request_id: String,
     payload_hash: String,
+    /// The execution specification this receipt admits, once one exists.
+    spec_key: Option<String>,
     settled: bool,
 }
 
@@ -322,6 +458,7 @@ impl IdempotencyLease {
             &self.request_id,
             &self.payload_hash,
             run_id,
+            self.spec_key.clone(),
             response,
         )?;
         self.settled = true;
@@ -388,6 +525,7 @@ impl OrchestrationService {
         }
         config.max_concurrent_runs =
             host.configure_orchestration_capacity(config.max_concurrent_runs);
+        let (teardown_tx, teardown_rx) = tokio::sync::mpsc::unbounded_channel();
         let service = Arc::new_cyclic(|self_ref| Self {
             host,
             bus,
@@ -399,12 +537,391 @@ impl OrchestrationService {
             live_workers: Mutex::new(HashMap::new()),
             remembered_liveness: Mutex::new(VecDeque::new()),
             owner_id: Uuid::new_v4().to_string(),
+            teardown_tx,
+            teardown_task: Mutex::new(None),
+            reconcilers: Mutex::new(Vec::new()),
         });
         service.start_scheduler_watcher();
+        service.start_teardown_owner(teardown_rx);
+        service.start_reconcilers();
         // Re-admit work that was durably accepted before the last restart,
         // before any new submission can take its capacity.
         service.recover_admissions();
         service
+    }
+
+    /// Start the single async owner of teardown.
+    ///
+    /// Everything that wants an attempt stopped — an explicit cancel, a
+    /// deadline, a lost lease, a supervisor exit, a shutdown — sends a request
+    /// here. Concentrating it means the abort-then-bounded-await sequence
+    /// happens once per attempt, in an async context that can actually await,
+    /// and that capacity release has exactly one caller which can only reach
+    /// it through proved quiescence.
+    fn start_teardown_owner(&self, mut rx: tokio::sync::mpsc::UnboundedReceiver<TeardownRequest>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let service_ref = self.self_ref.clone();
+        let task = runtime.spawn(async move {
+            while let Some(request) = rx.recv().await {
+                let Some(service) = service_ref.upgrade() else {
+                    break;
+                };
+                service.perform_teardown(request).await;
+            }
+        });
+        *self.teardown_task.lock() = Some(task);
+    }
+
+    /// Abort, prove quiescence, and only then release.
+    ///
+    /// The order here is the whole point. Capacity is what lets another
+    /// attempt start, and the durable lease is what lets another *process*
+    /// start one, so neither is given up until the worker's own liveness guard
+    /// has confirmed the future is gone. When it cannot be confirmed, both are
+    /// deliberately retained: an escaped worker holding a slot is a bounded
+    /// capacity loss, while an escaped worker whose slot was reused is
+    /// unbounded duplicate execution.
+    async fn perform_teardown(&self, request: TeardownRequest) {
+        let Some(entry) = self.live_workers.lock().get(&request.run_id).cloned() else {
+            return;
+        };
+        let outcome = entry.terminate(DEFAULT_TEARDOWN_BUDGET).await;
+        if !entry.claim_capacity_release_after(outcome) {
+            if !outcome.may_release_capacity() {
+                self.audit(
+                    "run_teardown",
+                    None,
+                    Some(entry.session_id),
+                    None,
+                    "rejected",
+                    Some("teardown_incomplete"),
+                    &format!(
+                        "run {} escaped teardown ({outcome:?}); lease and capacity retained",
+                        request.run_id
+                    ),
+                );
+            }
+            return;
+        }
+
+        // Proved quiescent. The run is terminal by now (the supervisor's exit
+        // guard installs or stages it), so its lease and its private input can
+        // finally be dropped.
+        let _ =
+            self.store
+                .release_attempt_lease(&request.run_id, &entry.attempt_id, &self.owner_id);
+        let _ = self.store.remove_acceptance_intent(&request.run_id);
+        self.live_workers.lock().remove(&request.run_id);
+        self.remove_pending(&request.run_id);
+        self.host.release_orchestration_turn(&request.run_id);
+        self.audit(
+            "run_teardown",
+            None,
+            Some(entry.session_id),
+            None,
+            "accepted",
+            None,
+            &format!(
+                "run {} torn down ({})",
+                request.run_id,
+                request.reason.as_str()
+            ),
+        );
+        self.pump_pending();
+    }
+
+    /// Ask the teardown owner to stop one attempt. Never blocks, never tears
+    /// anything down itself, and is safe from a `Drop`.
+    pub(crate) fn request_teardown(&self, run_id: &str, reason: TeardownReason) {
+        let _ = self.teardown_tx.send(TeardownRequest {
+            run_id: run_id.to_string(),
+            reason,
+        });
+    }
+
+    /// Start the two independent reconcilers.
+    ///
+    /// They exist because the fast paths can all be interrupted. A pump that
+    /// never runs, a lease whose holder died mid-teardown, a queued run whose
+    /// in-memory entry was lost — each is invisible to the code that normally
+    /// would have handled it. The reconcilers re-derive both facts from the
+    /// durable ledger alone, so recovery does not depend on any in-process
+    /// state surviving.
+    fn start_reconcilers(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut tasks = Vec::new();
+
+        let lease_ref = self.self_ref.clone();
+        tasks.push(runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(LEASE_RECONCILE_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(service) = lease_ref.upgrade() else {
+                    break;
+                };
+                service.reconcile_expired_leases();
+            }
+        }));
+
+        let queued_ref = self.self_ref.clone();
+        tasks.push(runtime.spawn(async move {
+            let mut ticker = tokio::time::interval(QUEUE_RECONCILE_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(service) = queued_ref.upgrade() else {
+                    break;
+                };
+                service.reconcile_durable_queued();
+            }
+        }));
+
+        *self.reconcilers.lock() = tasks;
+    }
+
+    /// Capture every authorization input, as fingerprints, right now.
+    ///
+    /// Called once at admission to seal into the specification, and again at
+    /// action time to compare. Nothing here returns a secret: each field is a
+    /// digest, so a drifting credential is detectable without the credential
+    /// ever being stored.
+    pub(crate) fn authorization_snapshot(
+        &self,
+        session: &crate::session::SessionSummary,
+        agent_id: Option<&str>,
+    ) -> AuthorizationSnapshot {
+        let (allowlist, ceiling, token) = {
+            let config = self.config.lock();
+            (
+                config.allowlist.clone(),
+                config.bounds.clone(),
+                config.bearer_token.clone(),
+            )
+        };
+        // The principal is identified by a digest of its credential and the
+        // capability set that credential carries, never by the credential.
+        let principal_revision = hash_payload(&json!({
+            "credential": hash_payload(&json!(token)),
+            "capabilities": CONTROL_TOOLS,
+            "authenticated": !token.is_empty(),
+        }));
+        let policy_revision = hash_payload(&json!({
+            "allowlist": allowlist.fingerprint(),
+            "ceiling": {
+                "maxPromptBytes": ceiling.max_prompt_bytes,
+                "maxRounds": ceiling.max_rounds,
+                "maxDurationMs": ceiling.max_duration_ms,
+            },
+            "maxConcurrentRuns": self.host.orchestration_capacity_limit(),
+        }));
+        // Provider, model, route, and credential material as one fingerprint.
+        // Offline execution is a route in its own right, not an absence of one.
+        let offline = std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some();
+        let route_revision = hash_payload(&json!({
+            "offline": offline,
+            "provider": if offline { "offline" } else { "wire" },
+            "route": session.kind,
+            "executionMode": session.execution_mode,
+            "credentialsPresent": offline || provider_credentials_present(session),
+        }));
+        // The continuation revision of a persistent agent, when the work
+        // belongs to one. Work with no agent has no continuation lineage, and
+        // must not borrow the session's message count as a stand-in: that
+        // would advance on every unrelated turn.
+        let agent_revision = self.agent_continuation_revision(agent_id).unwrap_or(0);
+        AuthorizationSnapshot {
+            principal_revision,
+            policy_revision,
+            session_revision: session_revision_of(session),
+            workspace_revision: workspace_revision_of(session),
+            agent_revision,
+            route_revision,
+        }
+    }
+
+    /// Continuation revision of a persistent agent, when the work belongs to
+    /// one. A resumed agent whose lineage advanced is not the same work.
+    fn agent_continuation_revision(&self, agent_id: Option<&str>) -> Option<u64> {
+        let agent_id = agent_id?;
+        self.store
+            .load_agent(agent_id)
+            .ok()
+            .flatten()
+            .map(|agent| agent.continuation_ordinal)
+    }
+
+    /// Re-answer "may this run?" at the moment of action.
+    ///
+    /// Admission can be arbitrarily far in the past — a queue wait, a restart,
+    /// an operator revoking a scope in between. Every authorization input is
+    /// recomputed and compared against what the specification sealed, and any
+    /// drift refuses the dispatch rather than executing under authority that
+    /// no longer exists.
+    pub(crate) fn reauthorize_for_action(&self, spec: &AcceptanceIntent) -> Result<(), OrchError> {
+        // Session, project, and capability must still resolve at all.
+        let session = self.require_build_session(spec.session_id)?;
+        let allowlist = self.config.lock().allowlist.clone();
+        let workspace = PathBuf::from(&spec.workspace);
+        if !allowlist.contains(&workspace) {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "workspace is no longer authorized",
+            ));
+        }
+        let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
+        require_workspace_match(&allowlist, cwd.as_deref(), &workspace)?;
+        // A persistent agent that has moved on is not this work's owner.
+        if let Some(agent_id) = spec.agent_id.as_deref() {
+            let agent = self
+                .store
+                .load_agent(agent_id)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+                .ok_or_else(|| {
+                    OrchError::new(
+                        OrchErrorCode::ForbiddenScope,
+                        "persistent agent no longer exists",
+                    )
+                })?;
+            if agent.session_id != spec.session_id {
+                return Err(OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "persistent agent is bound to a different session",
+                ));
+            }
+        }
+        self.authorization_snapshot(&session, spec.agent_id.as_deref())
+            .reauthorize(spec)
+    }
+
+    /// Reclaim leases whose holder stopped heartbeating.
+    ///
+    /// A lease still owned by a live worker in this process is a teardown
+    /// problem, not a reclamation problem: reclaiming it would authorize a
+    /// second attempt beside a future that is still running. Those are handed
+    /// to the teardown owner instead, and only genuinely ownerless leases are
+    /// released.
+    /// Returns how many leases this sweep reclaimed. Public so a caller can
+    /// drive one sweep deterministically instead of waiting on the ticker.
+    pub fn reconcile_expired_leases(&self) -> usize {
+        let Ok(leases) = self.store.list_attempt_leases() else {
+            return 0;
+        };
+        let now = Utc::now();
+        let mut reclaimed = 0;
+        for (_, lease) in leases {
+            let Some(lease) = lease else { continue };
+            if !lease.is_expired(now) || lease.state != super::admission::AttemptLeaseState::Held {
+                continue;
+            }
+            if self.live_workers.lock().contains_key(&lease.run_id) {
+                self.request_teardown(&lease.run_id, TeardownReason::LeaseLost);
+                continue;
+            }
+            match self.store.reclaim_expired_attempt_lease(&lease.run_id) {
+                Ok(Some(_)) => {
+                    reclaimed += 1;
+                    self.audit(
+                        "lease_reconciler",
+                        None,
+                        Some(lease.session_id),
+                        None,
+                        "accepted",
+                        None,
+                        &format!(
+                            "reclaimed expired attempt {} for run {}",
+                            lease.attempt, lease.run_id
+                        ),
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!(
+                        "[grokptah] expired lease for run {} could not be reclaimed: {}",
+                        lease.run_id, error.message
+                    );
+                }
+            }
+        }
+        if reclaimed > 0 {
+            self.pump_pending();
+        }
+        reclaimed
+    }
+
+    /// Re-admit durable queued work that nothing in this process is tracking.
+    ///
+    /// Derived purely from the ledger, so a queued run is executed even if the
+    /// pump, the scheduler watcher, and the recovery pass all missed it.
+    /// Returns how many runs this sweep re-admitted. Public so a caller can
+    /// drive one sweep deterministically instead of waiting on the ticker.
+    pub fn reconcile_durable_queued(&self) -> usize {
+        let Ok(runs) = self.store.list_runs() else {
+            return 0;
+        };
+        let mut queued: Vec<RunRecord> = runs
+            .into_iter()
+            .filter(|run| run.state == RunState::Queued)
+            .collect();
+        queued.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then(a.run_id.cmp(&b.run_id))
+        });
+
+        let mut readmitted = 0;
+        for run in queued {
+            {
+                let pending = self.pending_admissions.lock();
+                if pending.pending.iter().any(|p| p.run_id == run.run_id) {
+                    continue;
+                }
+            }
+            if self.live_workers.lock().contains_key(&run.run_id) {
+                continue;
+            }
+            // An active durable lease means some attempt already owns this
+            // run, in this process or another. Re-admitting it would race a
+            // dispatch that has not finished registering yet.
+            if matches!(
+                self.store.load_attempt_lease(&run.run_id),
+                Ok(Some(ref lease)) if lease.is_active(Utc::now())
+            ) {
+                continue;
+            }
+            // Only input that verifies *and* is bound to this exact run may be
+            // re-admitted.
+            if self.load_bound_intent(&run).is_err() {
+                self.tombstone_admission(&run.run_id, "admission_tampered");
+                continue;
+            }
+            if self
+                .enqueue_pending(PendingRun {
+                    run_id: run.run_id.clone(),
+                    session_id: run.session_id,
+                })
+                .is_ok()
+            {
+                readmitted += 1;
+            }
+        }
+        if readmitted > 0 {
+            self.audit(
+                "queue_reconciler",
+                None,
+                None,
+                None,
+                "accepted",
+                None,
+                &format!("re-admitted {readmitted} durable queued run(s)"),
+            );
+            self.pump_pending();
+        }
+        readmitted
     }
 
     /// Re-admit every durably accepted, not-yet-executed task after a restart.
@@ -436,27 +953,21 @@ impl OrchestrationService {
 
         let mut readmitted = Vec::new();
         for run in recovered {
-            // The sealed input is re-verified here as well as in the store
-            // sweep, so a tamper landed between the two still cannot execute.
-            match self.store.load_acceptance_intent(&run.run_id) {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    self.tombstone_admission(&run.run_id, "admission_lost");
-                    continue;
-                }
-                Err(error) => {
-                    self.audit(
-                        "admission_recovery",
-                        Some(&run.request_id),
-                        Some(run.session_id),
-                        Some(&run.workspace),
-                        "rejected",
-                        Some(error.code.as_str()),
-                        "sealed acceptance intent failed verification",
-                    );
-                    self.tombstone_admission(&run.run_id, "admission_tampered");
-                    continue;
-                }
+            // The input is re-verified *and re-bound* here as well as in the
+            // store sweep, so neither a tamper nor a resealed forgery landed
+            // between the two can execute.
+            if let Err(error) = self.load_bound_intent(&run) {
+                self.audit(
+                    "admission_recovery",
+                    Some(&run.request_id),
+                    Some(run.session_id),
+                    Some(&run.workspace),
+                    "rejected",
+                    Some(error.code.as_str()),
+                    &error.message,
+                );
+                self.tombstone_admission(&run.run_id, "admission_tampered");
+                continue;
             }
             match self.enqueue_pending(PendingRun {
                 run_id: run.run_id.clone(),
@@ -754,29 +1265,45 @@ impl OrchestrationService {
             .map(|entry| (entry.attempt_id.clone(), entry.attempt))
     }
 
-    /// Cancel, abort, and bounded-await the live attempt for `run_id`.
+    /// Wait, within a bound, for the teardown owner to prove one attempt is
+    /// gone.
     ///
-    /// Returns `None` when this process has no live attempt for the run.
-    /// Otherwise the outcome says whether the worker and supervisor are
-    /// confirmed gone; only a confirmed teardown lets capacity be reused.
-    async fn reap_live_attempt(
-        &self,
-        run_id: &str,
-    ) -> Option<super::admission::TerminationOutcome> {
-        let entry = self.live_workers.lock().get(run_id).cloned()?;
-        let outcome = entry.terminate(DEFAULT_TEARDOWN_BUDGET).await;
-        if !outcome.may_release_capacity() {
-            self.audit(
-                "run_teardown",
-                None,
-                Some(entry.session_id),
-                None,
-                "rejected",
-                Some("teardown_incomplete"),
-                &format!("run {run_id} teardown incomplete: {outcome:?}"),
-            );
+    /// Answers the question a caller actually has — "can this run's slot be
+    /// reused yet?" — from the worker's own liveness guard rather than from a
+    /// ledger write. Returns `false` when the attempt escaped its budget,
+    /// which is the honest answer and the one that keeps its capacity held.
+    async fn await_quiescence(&self, run_id: &str, budget: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if !self.live_workers.lock().contains_key(run_id) {
+                return true;
+            }
+            if self.worker_future_finished(run_id) == Some(true) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        Some(outcome)
+    }
+
+    /// Where one dispatched attempt currently stands.
+    ///
+    /// Reports registration, fencing, capacity, and escape as separate facts
+    /// because they are separate: an attempt can be fenced without being gone,
+    /// and gone without having released capacity.
+    pub fn attempt_status(&self, run_id: &str) -> Option<AttemptStatus> {
+        let entry = self.live_workers.lock().get(run_id).cloned()?;
+        Some(AttemptStatus {
+            attempt: entry.attempt,
+            registered: entry.is_registered(),
+            fenced: entry.is_fenced(),
+            finalized: entry.is_finalized(),
+            capacity_released: entry.capacity_released(),
+            escaped: entry.has_escaped(),
+            worker_quiescent: entry.liveness.quiescent(),
+        })
     }
 
     /// Keep the durable records aligned with the host-global scheduler. The
@@ -862,10 +1389,16 @@ impl OrchestrationService {
                 return;
             }
             let candidates: Vec<(String, Uuid)> = {
+                let live = self.live_workers.lock();
                 let queue = self.pending_admissions.lock();
                 queue
                     .pending
                     .iter()
+                    // A run that already has a live attempt is not a
+                    // promotion candidate. Without this the loser of a race
+                    // reaches the failure paths below and releases the
+                    // *winner's* capacity.
+                    .filter(|pending| !live.contains_key(&pending.run_id))
                     .map(|pending| (pending.run_id.clone(), pending.session_id))
                     .collect()
             };
@@ -890,26 +1423,21 @@ impl OrchestrationService {
             // Cancellation can win after the task left the queue but before
             // promotion. Treat terminal records as a normal, safe skip.
             let Some(current) = self.store.load_run(&pending.run_id).ok().flatten() else {
-                self.host.release_orchestration_turn(&pending.run_id);
+                self.release_turn_if_not_live(&pending.run_id);
                 continue;
             };
             if current.state != RunState::Queued {
-                self.host.release_orchestration_turn(&pending.run_id);
+                self.release_turn_if_not_live(&pending.run_id);
                 continue;
             }
 
             // The sealed input is the only source of execution material and
             // is re-verified at every promotion, so a tamper landed while the
             // task sat in the queue fails closed instead of running.
-            let intent = match self.store.load_acceptance_intent(&pending.run_id) {
-                Ok(Some(intent)) => intent,
-                Ok(None) => {
-                    self.host.release_orchestration_turn(&pending.run_id);
-                    self.tombstone_admission(&pending.run_id, "admission_lost");
-                    continue;
-                }
+            let intent = match self.load_bound_intent(&current) {
+                Ok(intent) => intent,
                 Err(error) => {
-                    self.host.release_orchestration_turn(&pending.run_id);
+                    self.release_turn_if_not_live(&pending.run_id);
                     self.audit(
                         "run_promotion",
                         Some(&current.request_id),
@@ -917,7 +1445,7 @@ impl OrchestrationService {
                         Some(&current.workspace),
                         "rejected",
                         Some(error.code.as_str()),
-                        "sealed acceptance intent failed verification",
+                        &error.message,
                     );
                     self.tombstone_admission(&pending.run_id, "admission_tampered");
                     continue;
@@ -929,7 +1457,7 @@ impl OrchestrationService {
             let lease = match self.acquire_dispatch_lease(&current, &intent) {
                 Ok(lease) => lease,
                 Err(error) => {
-                    self.host.release_orchestration_turn(&pending.run_id);
+                    self.release_turn_if_not_live(&pending.run_id);
                     eprintln!(
                         "[grokptah] queued run {} could not take an attempt lease: {}",
                         pending.run_id, error.message
@@ -941,41 +1469,59 @@ impl OrchestrationService {
                 }
             };
 
-            let start_seq = self.bus.next_seq();
-            let transitioned = self.store.update_run(&pending.run_id, |run| {
-                if run.state != RunState::Queued {
-                    anyhow::bail!("queued run is no longer pending");
-                }
-                run.state = RunState::Running;
-                run.queue_position = None;
-                run.start_seq = Some(start_seq);
-                run.updated_at = Utc::now();
-                Ok(())
-            });
-            match transitioned {
-                Ok(Some(run)) => self.dispatch_attempt(run, intent, lease),
-                Ok(None) | Err(_) => {
-                    let _ = self.store.release_attempt_lease(
-                        &pending.run_id,
-                        &lease.attempt_id,
-                        &self.owner_id,
-                    );
-                    self.host.release_orchestration_turn(&pending.run_id);
-                    if let Err(error) = self
-                        .host
-                        .reserve_orchestration_queue_slot(&pending.run_id, pending.session_id)
-                    {
-                        eprintln!("[grokptah] queued run could not be re-registered: {error}");
-                    } else {
-                        let mut queue = self.pending_admissions.lock();
-                        queue.pending.push_front(pending);
-                        drop(queue);
-                        self.sync_pending_positions();
-                        return;
-                    }
-                }
-            }
+            // The promotion hands the run to a dispatched attempt; the
+            // worker itself performs `queued -> running` once it starts.
+            self.dispatch_attempt(current, intent, lease);
         }
+    }
+
+    /// Release a promotion's turn reservation, unless a live attempt owns it.
+    ///
+    /// A failed promotion must undo only its own reservation. Releasing one
+    /// that a registered attempt is using would hand its slot to another run
+    /// while its worker is still executing — the exact overlap the capacity
+    /// accounting exists to prevent.
+    fn release_turn_if_not_live(&self, run_id: &str) {
+        if self.live_workers.lock().contains_key(run_id) {
+            return;
+        }
+        self.host.release_orchestration_turn(run_id);
+    }
+
+    /// Load the durable input for a run **and** prove it is the input that run
+    /// was admitted with.
+    ///
+    /// Validating the sealed record on its own is not enough. A forgery can be
+    /// resealed: change the prompt, recompute the digest, and the record
+    /// verifies perfectly — as a *different* execution specification. What
+    /// exposes it is that the run, the receipt, and the lease are each bound
+    /// to the original key, and the forgery matches none of them.
+    ///
+    /// Every path that turns durable input into execution goes through here.
+    fn load_bound_intent(&self, run: &RunRecord) -> Result<AcceptanceIntent, OrchError> {
+        let intent = self
+            .store
+            .load_acceptance_intent(&run.run_id)?
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "run has no durable execution input",
+                )
+            })?;
+        let receipt = self
+            .store
+            .load_idempotency(&run.request_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        let receipt_key = receipt.as_ref().and_then(|r| r.spec_key.as_deref());
+        let lease = self.store.load_attempt_lease(&run.run_id).ok().flatten();
+        SpecBinding {
+            run: run.spec_key.as_deref(),
+            receipt: receipt_key,
+            lease: lease.as_ref().map(|lease| lease.intent_digest.as_str()),
+            ..SpecBinding::default()
+        }
+        .verify(&intent, &[SpecHolder::Run])?;
+        Ok(intent)
     }
 
     /// Acquire the mandatory compare-and-swap attempt lease that authorizes
@@ -1019,6 +1565,7 @@ impl OrchestrationService {
                         tool: tool.into(),
                         request_id: request_id.into(),
                         payload_hash: payload_hash.into(),
+                        spec_key: None,
                         settled: false,
                     }));
                 }
@@ -3138,6 +3685,11 @@ impl OrchestrationService {
             }
         }
 
+        // The authorization that admits this work, captured as fingerprints
+        // and sealed into the specification, so action time can re-answer the
+        // same question instead of trusting this moment forever.
+        let authorization = self.authorization_snapshot(&session, session.agent_id.as_deref());
+
         // ── crash-safe cut C2: private bounded input, sealed ───────────
         //
         // Every accepted task — immediate execution included — gets its
@@ -3151,12 +3703,15 @@ impl OrchestrationService {
             payload_hash: phash.clone(),
             tool: tool.into(),
             session_id,
-            session_revision: session_revision_of(&session),
+            session_revision: authorization.session_revision.clone(),
             workspace: claimed.display().to_string(),
-            workspace_revision: workspace_revision_of(&session),
+            workspace_revision: authorization.workspace_revision.clone(),
             agent_id: session.agent_id.clone(),
-            agent_revision: session.message_count as u64,
+            agent_revision: authorization.agent_revision,
             spec_revision: EXECUTION_SPEC_REVISION.into(),
+            principal_revision: authorization.principal_revision.clone(),
+            policy_revision: authorization.policy_revision.clone(),
+            route_revision: authorization.route_revision.clone(),
             prompt: prompt.clone(),
             bounds: SealedBounds::from(&bounds),
             execution_mode,
@@ -3179,14 +3734,16 @@ impl OrchestrationService {
 
         // ── crash-safe cut C3: the run record ──────────────────────────
         //
-        // Always `Queued` first, even for immediate execution. `Running` is
-        // reached only after the mandatory attempt lease is held, so a crash
-        // can never leave a run that looks dispatched but never was.
-        let reported_state = if queued {
-            RunState::Queued
-        } else {
-            RunState::Running
-        };
+        // Always `Queued`, for every accepted task — immediate execution
+        // included. The receipt is issued from here, and at this point nothing
+        // has started: no handle is registered, no worker has acknowledged,
+        // and no byte has reached a provider. Reporting `running` would be a
+        // claim about the future rather than a record of the present, and a
+        // crash one instruction later would make it false forever.
+        //
+        // The run reaches `running` as the worker's own first durable act,
+        // once the start gate has opened and every handle is registered.
+        let reported_state = RunState::Queued;
         let run = RunRecord {
             run_id: run_id.clone(),
             session_id,
@@ -3201,6 +3758,7 @@ impl OrchestrationService {
             retry_of: retry_of.map(str::to_string),
             parent_run_id: None,
             queue_position: None,
+            spec_key: Some(intent.spec_key().to_string()),
             bounds: bounds.clone(),
             prompt_preview: self.bus.redact_text(&prompt_preview(&prompt), 500),
             start_seq: None,
@@ -3257,6 +3815,11 @@ impl OrchestrationService {
 
         // ── crash-safe cut C4: the receipt ─────────────────────────────
         //
+        // The receipt records the same specification key the run and the input
+        // already carry, so a receipt can never be replayed against different
+        // work than the one it admitted.
+        lease.spec_key = Some(intent.spec_key().to_string());
+        //
         // Only now may the caller be told the work is accepted, because the
         // input behind that promise is already durable.
         if let Err(e) = lease.complete(Some(run_id.clone()), response.clone()) {
@@ -3288,30 +3851,12 @@ impl OrchestrationService {
         }
 
         // ── crash-safe cut C5: mandatory attempt lease before dispatch ──
+        //
+        // Cut C6 (`queued -> running`) now belongs to the worker, not to this
+        // path: the transition *is* the acknowledgement, so it can only be
+        // written by the thing that actually started.
         match self.acquire_dispatch_lease(&run, &intent) {
-            Ok(attempt) => {
-                // ── crash-safe cut C6: Queued -> Running ───────────────
-                let start_seq = self.bus.next_seq();
-                match self.store.update_run(&run_id, |current| {
-                    if current.state != RunState::Queued {
-                        anyhow::bail!("run is no longer queued");
-                    }
-                    current.state = RunState::Running;
-                    current.start_seq = Some(start_seq);
-                    current.updated_at = Utc::now();
-                    Ok(())
-                }) {
-                    Ok(Some(running)) => self.dispatch_attempt(running, intent, attempt),
-                    Ok(None) | Err(_) => {
-                        let _ = self.store.release_attempt_lease(
-                            &run_id,
-                            &attempt.attempt_id,
-                            &self.owner_id,
-                        );
-                        self.defer_accepted_run(&run_id, session_id);
-                    }
-                }
-            }
+            Ok(attempt) => self.dispatch_attempt(run, intent, attempt),
             Err(error) => {
                 // The receipt is already durable, so this admission must still
                 // happen: fall back to the bounded queue instead of losing it.
@@ -3485,15 +4030,17 @@ impl OrchestrationService {
     /// Start a run whose host admission has already been reserved.
     /// Dispatch one authorized attempt.
     ///
-    /// Three tasks are created and all three are registered before any of them
-    /// can matter: the *worker* (the model turn), the *aggregator* (journal
-    /// fold), and the *supervisor* (deadline, heartbeat, terminalization).
-    /// Registration is the dispatch gate — a run that already has a live entry
-    /// is refused rather than started twice.
+    /// Three tasks make up an attempt — the *worker* (the model turn), the
+    /// *aggregator* (journal fold), and the *supervisor* (deadline, heartbeat,
+    /// terminalization). All three are created behind one **closed start
+    /// gate**, every handle is registered in a single registry mutation, and
+    /// only then is the gate opened. Nothing can therefore run before teardown
+    /// is able to find and abort it.
     ///
-    /// The durable input is **not** removed here. It survives until the run is
-    /// terminal, so a crash between "spawn confirmed" and "turn finished"
-    /// still leaves exactly one recoverable copy of the accepted work.
+    /// The durable input is **not** removed here. It survives until the
+    /// teardown owner has proved the attempt is quiescent, so a crash between
+    /// "spawn confirmed" and "turn finished" still leaves exactly one
+    /// recoverable copy of the accepted work.
     fn dispatch_attempt(&self, run: RunRecord, intent: AcceptanceIntent, lease: AttemptLease) {
         if tokio::runtime::Handle::try_current().is_err() {
             // No runtime to own the worker. Leave the record `Queued` with its
@@ -3501,14 +4048,6 @@ impl OrchestrationService {
             let _ =
                 self.store
                     .release_attempt_lease(&run.run_id, &lease.attempt_id, &self.owner_id);
-            let _ = self.store.update_run(&run.run_id, |current| {
-                if current.state == RunState::Running {
-                    current.state = RunState::Queued;
-                    current.start_seq = None;
-                    current.updated_at = Utc::now();
-                }
-                Ok(())
-            });
             self.host.release_orchestration_turn(&run.run_id);
             return;
         }
@@ -3537,6 +4076,8 @@ impl OrchestrationService {
         ));
 
         // ── one active attempt ─────────────────────────────────────────
+        // Reserve the registry slot before anything is spawned, so a second
+        // dispatch for the same run cannot interleave with this one.
         {
             let mut live = self.live_workers.lock();
             if live.contains_key(&rid) {
@@ -3551,16 +4092,21 @@ impl OrchestrationService {
         }
         self.remember_liveness(&rid, liveness.clone());
 
+        // ── the closed start gate ──────────────────────────────────────
+        let gate = StartGate::new();
+
         // ── nested aggregator ──────────────────────────────────────────
         let mut agg_rx = bus.subscribe();
         let store_agg = store.clone();
         let rid_agg = rid.clone();
+        let gate_agg = gate.clone();
         let agg_task = tokio::spawn(async move {
+            gate_agg.wait().await;
             while let Some(update) = agg_rx.recv().await {
                 apply_run_aggregate(&store_agg, &rid_agg, session_id, &update);
             }
         });
-        entry.attach_aggregator(agg_task.abort_handle());
+        let agg_task_abort = agg_task.abort_handle();
 
         // ── nested worker ──────────────────────────────────────────────
         // The liveness guard lives *inside* the worker future, so it drops
@@ -3569,9 +4115,81 @@ impl OrchestrationService {
         let host_worker = host.clone();
         let rid_worker = rid.clone();
         let liveness_worker = liveness.clone();
+        let store_worker = store.clone();
+        let service_worker = service_ref.clone();
+        let gate_worker = gate.clone();
+        let attempt_id_worker = lease.attempt_id.clone();
+        let spec_worker = intent.clone();
         let worker = tokio::spawn(async move {
+            gate_worker.wait().await;
             let _live = WorkerLivenessGuard::new(liveness_worker);
-            host_worker
+
+            // Action-time reauthorization. The worker re-checks for itself
+            // rather than trusting the dispatcher's earlier answer, because
+            // the gate, the queue, and a restart can all sit between them.
+            if let Some(service) = service_worker.upgrade() {
+                if let Err(error) = service.reauthorize_for_action(&spec_worker) {
+                    let _ = store_worker.open_provider_send(
+                        &rid_worker,
+                        &attempt_id_worker,
+                        spec_worker.spec_key(),
+                    );
+                    return Err(WorkerOutcome::refused(error));
+                }
+            }
+
+            // Worker acknowledgement: the run becomes `Running` only now, as
+            // the worker's own first durable act. Until this lands the receipt
+            // honestly says queued, because nothing has started.
+            let start_seq = bus_next_seq_for(&service_worker);
+            let acknowledged = store_worker.update_run(&rid_worker, |current| {
+                if current.state != RunState::Queued {
+                    anyhow::bail!("run is no longer queued");
+                }
+                current.state = RunState::Running;
+                current.queue_position = None;
+                current.start_seq = start_seq;
+                current.updated_at = Utc::now();
+                Ok(())
+            });
+            if !matches!(acknowledged, Ok(Some(_))) {
+                return Err(WorkerOutcome::refused(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "run was no longer queued at worker acknowledgement",
+                )));
+            }
+
+            // ── durable provider send identity ─────────────────────────
+            // Opened before anything is transmitted, so a crash from here on
+            // can never be mistaken for "nothing happened".
+            let send = match store_worker.open_provider_send(
+                &rid_worker,
+                &attempt_id_worker,
+                spec_worker.spec_key(),
+            ) {
+                Ok(send) => send,
+                Err(error) => {
+                    return Err(WorkerOutcome::send_failed(
+                        ProviderSendFailure::LedgerUnavailable,
+                        error,
+                    ));
+                }
+            };
+            if let Err(error) = store_worker.advance_provider_send(
+                &rid_worker,
+                &send.send_id,
+                &attempt_id_worker,
+                ProviderSendState::Sending,
+                None,
+                None,
+            ) {
+                return Err(WorkerOutcome::send_failed(
+                    ProviderSendFailure::LedgerUnavailable,
+                    error,
+                ));
+            }
+
+            let result = host_worker
                 .session_prompt_reserved_with_max_rounds_for_run(
                     session_id,
                     prompt,
@@ -3580,29 +4198,49 @@ impl OrchestrationService {
                     &rid_worker,
                     execution_mode,
                 )
-                .await
+                .await;
+
+            // Classify the outcome into durable evidence. A returned error is
+            // not proof that nothing was transmitted, so it settles as
+            // `Uncertain` unless the turn provably never began.
+            let (state, failure) = match &result {
+                Ok(_) => (ProviderSendState::Sent, None),
+                Err(_) => (
+                    ProviderSendState::Uncertain,
+                    Some(ProviderSendFailure::ResponseUnobserved),
+                ),
+            };
+            let detail = result
+                .as_ref()
+                .err()
+                .map(|error| redact_for(&service_worker, &error.to_string()));
+            let _ = store_worker.advance_provider_send(
+                &rid_worker,
+                &send.send_id,
+                &attempt_id_worker,
+                state,
+                failure,
+                detail,
+            );
+            result.map_err(WorkerOutcome::turn_failed)
         });
-        entry.attach_worker(worker.abort_handle());
+        let worker_abort = worker.abort_handle();
 
         // ── outer supervisor ───────────────────────────────────────────
-        // The supervisor's join handle is registered before its body starts,
-        // so a reaper can always bounded-await the supervisor it is tearing
-        // down rather than racing its registration.
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
         let entry_sup = entry.clone();
         let lease_sup = lease.clone();
+        let gate_sup = gate.clone();
+        let spec_sup = intent.clone();
         let supervisor = tokio::spawn(async move {
-            let _ = started_rx.await;
+            gate_sup.wait().await;
             // Armed for every exit: normal return, `?`, panic unwind, abort.
             let mut exit = SupervisorExitGuard {
                 store: store.clone(),
-                host: host.clone(),
                 service: service_ref.clone(),
                 entry: entry_sup.clone(),
                 run_id: rid.clone(),
-                attempt_id: lease_sup.attempt_id.clone(),
-                owner_id: owner_id.clone(),
                 candidate: None,
+                reason: TeardownReason::SupervisorExit,
             };
 
             let deadline = tokio::time::sleep(Duration::from_millis(max_ms.max(1)));
@@ -3613,7 +4251,7 @@ impl OrchestrationService {
             tokio::pin!(worker);
 
             enum Exit {
-                Joined(Result<Result<String, anyhow::Error>, tokio::task::JoinError>),
+                Joined(Result<Result<String, WorkerOutcome>, tokio::task::JoinError>),
                 TimedOut,
                 Reaped,
             }
@@ -3634,43 +4272,55 @@ impl OrchestrationService {
                             .renew_attempt_lease(&rid, &lease_sup.attempt_id, &owner_id)
                             .is_err()
                         {
+                            exit.reason = TeardownReason::LeaseLost;
                             break Exit::Reaped;
                         }
                     }
                 }
             };
 
-            let (timed_out, reaped, result): (bool, bool, Result<String, anyhow::Error>) =
+            let (timed_out, reaped, result): (bool, bool, Result<String, WorkerOutcome>) =
                 match exit_reason {
                     Exit::Joined(Ok(result)) => (false, false, result),
                     Exit::Joined(Err(join_error)) => (
                         false,
                         true,
-                        Err(anyhow::anyhow!("run worker did not complete: {join_error}")),
+                        Err(WorkerOutcome::panicked(join_error.to_string())),
                     ),
                     Exit::TimedOut | Exit::Reaped => {
                         let timed_out = matches!(exit_reason, Exit::TimedOut);
+                        if timed_out {
+                            exit.reason = TeardownReason::Deadline;
+                        }
                         let _ = tokio::time::timeout(
                             DEFAULT_TEARDOWN_BUDGET,
                             host.cancel_turn_and_await(Some(session_id)),
                         )
                         .await;
                         // Bounded-await the real worker, then abort it and
-                        // await the abort. Capacity is released only after
-                        // this, so no second attempt can overlap the first.
+                        // await the abort. Capacity is not released here: the
+                        // teardown owner does that, and only after proving the
+                        // future is gone.
                         let settled =
                             tokio::time::timeout(Duration::from_secs(1), &mut worker).await;
                         let result = match settled {
                             Ok(Ok(result)) => result,
                             Ok(Err(join_error)) => {
-                                Err(anyhow::anyhow!("run worker did not complete: {join_error}"))
+                                Err(WorkerOutcome::panicked(join_error.to_string()))
                             }
                             Err(_) => {
                                 worker.abort();
                                 let _ = tokio::time::timeout(DEFAULT_TEARDOWN_BUDGET, &mut worker)
                                     .await;
-                                Err(anyhow::anyhow!(
-                                    "turn did not stop within the teardown deadline"
+                                // Torn down mid-flight: whether the provider
+                                // saw the request is unknown, and must be
+                                // recorded as unknown.
+                                Err(WorkerOutcome::send_failed(
+                                    ProviderSendFailure::AttemptTornDown,
+                                    OrchError::new(
+                                        OrchErrorCode::Timeout,
+                                        "turn did not stop within the teardown deadline",
+                                    ),
                                 ))
                             }
                         };
@@ -3683,11 +4333,28 @@ impl OrchestrationService {
             agg_task.abort();
             let _ = agg_task.await;
 
+            // A torn-down send must leave `Uncertain` evidence even though the
+            // worker future never got to write it.
+            if let Err(outcome) = &result {
+                if let Some(failure) = outcome.send_failure {
+                    if let Ok(Some(send)) = store.load_provider_send(&rid) {
+                        let _ = store.advance_provider_send(
+                            &rid,
+                            &send.send_id,
+                            &lease_sup.attempt_id,
+                            failure.resulting_state(),
+                            Some(failure),
+                            None,
+                        );
+                    }
+                }
+            }
+
             let end_seq = bus.current_seq();
             let reconciliation = collect_run_updates(&bus, &store, &rid, end_seq);
             let durable_result = match &result {
                 Ok(text) => Ok(bus.redact_text(text, 8_000)),
-                Err(error) => Err(bus.redact_text(&error.to_string(), 2_000)),
+                Err(outcome) => Err(bus.redact_text(&outcome.message, 2_000)),
             };
             let incomplete_stop = result
                 .as_ref()
@@ -3698,6 +4365,16 @@ impl OrchestrationService {
             }
             candidate.end_seq = candidate.end_seq.or(Some(end_seq));
             candidate.updated_at = Utc::now();
+
+            // Completion is gated on durable send evidence. A run whose work
+            // is not known to have reached the provider can never be recorded
+            // `Completed`, however cleanly the local future returned.
+            let send_state = store
+                .load_provider_send(&rid)
+                .ok()
+                .flatten()
+                .map(|send| send.state);
+
             if !candidate.state.is_terminal() {
                 if timed_out {
                     candidate.state = RunState::LimitReached;
@@ -3713,14 +4390,31 @@ impl OrchestrationService {
                     // is never resumed implicitly.
                     candidate.state = RunState::Interrupted;
                     candidate.terminal_result = Some("interrupted".into());
-                    candidate.error_code = Some("interrupted".into());
+                    candidate.error_code = Some(
+                        result
+                            .as_ref()
+                            .err()
+                            .map(|outcome| outcome.error_code)
+                            .unwrap_or("interrupted")
+                            .to_string(),
+                    );
                     if let Err(text) = &durable_result {
                         candidate.final_response = Some(text.clone());
                     }
                 } else {
                     match &durable_result {
                         Ok(text) => {
-                            if incomplete_stop {
+                            let provider_confirmed = send_state
+                                .map(ProviderSendState::permits_completion)
+                                .unwrap_or(false);
+                            if !provider_confirmed {
+                                // Refusing to fabricate a success: the turn
+                                // returned, but nothing durably says the work
+                                // reached the provider.
+                                candidate.state = RunState::Failed;
+                                candidate.terminal_result = Some("failed".into());
+                                candidate.error_code = Some("provider_send_unconfirmed".into());
+                            } else if incomplete_stop {
                                 candidate.state = RunState::LimitReached;
                                 candidate.terminal_result = Some("limit_reached".into());
                                 candidate.error_code = Some("limit_reached".into());
@@ -3733,7 +4427,14 @@ impl OrchestrationService {
                         Err(error) => {
                             candidate.state = RunState::Failed;
                             candidate.terminal_result = Some("failed".into());
-                            candidate.error_code = Some("internal".into());
+                            candidate.error_code = Some(
+                                result
+                                    .as_ref()
+                                    .err()
+                                    .map(|outcome| outcome.error_code)
+                                    .unwrap_or("internal")
+                                    .to_string(),
+                            );
                             candidate.final_response = Some(error.clone());
                         }
                     }
@@ -3796,14 +4497,45 @@ impl OrchestrationService {
                 }
             }
 
+            // The specification must still be the one every holder agreed on.
+            let binding = SpecBinding {
+                run: candidate.spec_key.as_deref(),
+                lease: Some(lease_sup.intent_digest.as_str()),
+                worker: Some(spec_sup.spec_key()),
+                ..SpecBinding::default()
+            };
+            if let Err(error) = binding.verify(
+                &spec_sup,
+                &[SpecHolder::Run, SpecHolder::Lease, SpecHolder::Worker],
+            ) {
+                candidate.state = RunState::Failed;
+                candidate.terminal_result = Some("failed".into());
+                candidate.error_code = Some("spec_binding_mismatch".into());
+                candidate.final_response = Some(bus.redact_text(&error.message, 500));
+            }
+
             // Hand the terminal record to the exit guard. From here every exit
             // path — including an abort landing on the next line — installs it
             // or leaves a bounded recoverable finalization intent.
+            if exit.reason == TeardownReason::SupervisorExit {
+                exit.reason = if candidate.error_code.as_deref() == Some("authorization_drift") {
+                    TeardownReason::AuthorizationDrift
+                } else if candidate.state.is_terminal() {
+                    TeardownReason::Completed
+                } else {
+                    TeardownReason::SupervisorExit
+                };
+            }
             exit.candidate = Some(candidate);
             drop(exit);
         });
+
+        // ── atomic registration, then open the gate ────────────────────
+        entry.attach_aggregator(agg_task_abort);
+        entry.attach_worker(worker_abort);
         entry.attach_supervisor(supervisor);
-        let _ = started_tx.send(());
+        entry.mark_registered();
+        gate.open();
     }
 
     pub async fn queue_prompt(
@@ -4158,20 +4890,26 @@ impl OrchestrationService {
         // supervisor before this run's capacity can be reused. Reporting
         // `teardownComplete` from a ledger write alone would let a second
         // attempt start beside a future that can still execute.
-        let teardown_complete = match self.reap_live_attempt(rid).await {
-            Some(outcome) => outcome.may_release_capacity(),
-            None => {
-                let reservation_released = self.host.release_turn_reservation(session_id, rid);
-                if was_pending || reservation_released {
-                    true
-                } else {
-                    tokio::time::timeout(DEFAULT_TEARDOWN_BUDGET, async {
-                        let _ = self.host.cancel_turn_and_await(Some(session_id)).await;
-                        self.host.wait_turn_idle(session_id).await;
-                    })
-                    .await
-                    .is_ok()
-                }
+        //
+        // Cancellation does not tear anything down itself: it asks the single
+        // teardown owner to, then waits for that owner's own proof. Two
+        // callers racing the same abort-and-await sequence is exactly the
+        // duplication this design removes.
+        let live = self.live_workers.lock().contains_key(rid);
+        let teardown_complete = if live {
+            self.request_teardown(rid, TeardownReason::Cancelled);
+            self.await_quiescence(rid, DEFAULT_TEARDOWN_BUDGET).await
+        } else {
+            let reservation_released = self.host.release_turn_reservation(session_id, rid);
+            if was_pending || reservation_released {
+                true
+            } else {
+                tokio::time::timeout(DEFAULT_TEARDOWN_BUDGET, async {
+                    let _ = self.host.cancel_turn_and_await(Some(session_id)).await;
+                    self.host.wait_turn_idle(session_id).await;
+                })
+                .await
+                .is_ok()
             }
         };
 
@@ -4207,30 +4945,48 @@ impl OrchestrationService {
 /// `Unauthorized` covers unknown, cross-session, cross-workspace, unbound, and
 /// traversal-shaped reads with one shared message, so this mapping must stay
 /// single-valued to preserve that indistinguishability on the wire.
-/// Session revision sealed into an acceptance intent.
+/// Whether usable provider credentials currently resolve for this session's
+/// route.
 ///
-/// This is an observation, not a lock: it records which session state the work
-/// was accepted against so a later load can tell that the sealed record has
-/// not been re-pointed at a different session's history.
-fn session_revision_of(session: &crate::session::SessionSummary) -> String {
-    format!(
-        "{}:{}",
-        session.updated_at.timestamp_millis(),
-        session.message_count
-    )
+/// Only presence is reported, never the material. Credentials being revoked
+/// between admission and action is a route change, and must refuse the
+/// dispatch rather than fail deep inside a turn.
+fn provider_credentials_present(session: &crate::session::SessionSummary) -> bool {
+    let _ = session;
+    let model = crate::models_catalog::resolve_default_model();
+    crate::auth_store::resolve_wire_credentials_for_model(&model)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
-/// Workspace revision sealed into an acceptance intent: the execution policy
-/// and readiness the work was admitted under.
+/// Session revision sealed into an acceptance intent.
+///
+/// This captures what *authorizes* the session, not what has happened in it.
+/// Message count and last-updated deliberately do not appear: a queued task
+/// exists precisely so other turns can run first, so treating ordinary
+/// conversational progress as authorization drift would make queueing on a
+/// busy session impossible. What does appear is everything that would change
+/// where or under what policy the work executes — the session being re-pointed
+/// at another directory, archived, switched out of Build, or switched between
+/// shared and isolated execution.
+fn session_revision_of(session: &crate::session::SessionSummary) -> String {
+    hash_payload(&json!({
+        "sessionId": session.id,
+        "kind": session.kind,
+        "cwd": session.cwd,
+        "executionMode": session.execution_mode,
+        "archived": session.archived,
+    }))
+}
+
+/// Workspace revision sealed into an acceptance intent: the workspace the work
+/// was admitted against and whether it was ready to be written to.
 fn workspace_revision_of(session: &crate::session::SessionSummary) -> String {
-    format!(
-        "{}:{}",
-        session.workspace_status.as_str(),
-        match session.execution_mode {
-            RunExecutionMode::Shared => "shared",
-            RunExecutionMode::IsolatedWorktree => "isolated_worktree",
-        }
-    )
+    hash_payload(&json!({
+        "cwd": session.cwd,
+        "workspaceStatus": session.workspace_status.as_str(),
+    }))
 }
 
 fn computer_scope_denied() -> OrchError {
@@ -4430,8 +5186,6 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::AgentHost;
-    use crate::HostConfig;
 
     fn queued_run(run_id: &str) -> RunRecord {
         RunRecord {
@@ -4445,6 +5199,7 @@ mod tests {
             retry_of: None,
             parent_run_id: None,
             queue_position: None,
+            spec_key: None,
             bounds: RunBounds::default(),
             prompt_preview: "preview".into(),
             start_seq: Some(1),
@@ -4461,11 +5216,7 @@ mod tests {
         }
     }
 
-    fn guard_for(
-        store: &OrchStore,
-        host: &AgentHostHandle,
-        run: &RunRecord,
-    ) -> (Arc<LiveWorker>, SupervisorExitGuard) {
+    fn guard_for(store: &OrchStore, run: &RunRecord) -> (Arc<LiveWorker>, SupervisorExitGuard) {
         let entry = Arc::new(LiveWorker::new(
             run.run_id.clone(),
             "attempt-1".into(),
@@ -4476,13 +5227,11 @@ mod tests {
         ));
         let guard = SupervisorExitGuard {
             store: store.clone(),
-            host: host.clone(),
             service: Weak::new(),
             entry: entry.clone(),
             run_id: run.run_id.clone(),
-            attempt_id: "attempt-1".into(),
-            owner_id: "owner-1".into(),
             candidate: None,
+            reason: TeardownReason::SupervisorExit,
         };
         (entry, guard)
     }
@@ -4494,11 +5243,10 @@ mod tests {
     fn supervisor_panic_still_terminalizes_the_run() {
         let dir = tempfile::tempdir().unwrap();
         let store = OrchStore::open(dir.path()).unwrap();
-        let host = AgentHost::create(HostConfig::default());
         let run = queued_run("panic-run");
         store.save_run(&run).unwrap();
 
-        let (entry, guard) = guard_for(&store, &host, &run);
+        let (entry, guard) = guard_for(&store, &run);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = guard;
             panic!("supervisor exploded");
@@ -4517,11 +5265,10 @@ mod tests {
     fn supervisor_exit_installs_its_candidate_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
         let store = OrchStore::open(dir.path()).unwrap();
-        let host = AgentHost::create(HostConfig::default());
         let run = queued_run("completed-run");
         store.save_run(&run).unwrap();
 
-        let (entry, mut guard) = guard_for(&store, &host, &run);
+        let (entry, mut guard) = guard_for(&store, &run);
         let mut candidate = run.clone();
         candidate.state = RunState::Completed;
         candidate.terminal_result = Some("completed".into());
@@ -4535,7 +5282,7 @@ mod tests {
 
         // A second exit path for the same attempt must be a no-op: it must
         // not re-terminalize the run or release capacity a second time.
-        let (_, second) = SupervisorExitGuardPair::same_entry(&store, &host, &run, entry.clone());
+        let (_, second) = SupervisorExitGuardPair::same_entry(&store, &run, entry.clone());
         drop(second);
         let after = store.load_run(&run.run_id).unwrap().expect("run record");
         assert_eq!(after.state, RunState::Completed);
@@ -4548,7 +5295,6 @@ mod tests {
     fn finalization_failure_leaves_a_recoverable_intent() {
         let dir = tempfile::tempdir().unwrap();
         let store = OrchStore::open(dir.path()).unwrap();
-        let host = AgentHost::create(HostConfig::default());
         let run = queued_run("undrainable-run");
         store.save_run(&run).unwrap();
 
@@ -4558,7 +5304,7 @@ mod tests {
         let blocked = dir.path().join("runs").join(format!("{safe}.json.tmp"));
         std::fs::create_dir_all(&blocked).unwrap();
 
-        let (entry, mut guard) = guard_for(&store, &host, &run);
+        let (entry, mut guard) = guard_for(&store, &run);
         let mut candidate = run.clone();
         candidate.state = RunState::Failed;
         candidate.terminal_result = Some("failed".into());
@@ -4593,19 +5339,16 @@ mod tests {
     impl SupervisorExitGuardPair {
         fn same_entry(
             store: &OrchStore,
-            host: &AgentHostHandle,
             run: &RunRecord,
             entry: Arc<LiveWorker>,
         ) -> (Arc<LiveWorker>, SupervisorExitGuard) {
             let guard = SupervisorExitGuard {
                 store: store.clone(),
-                host: host.clone(),
                 service: Weak::new(),
                 entry: entry.clone(),
                 run_id: run.run_id.clone(),
-                attempt_id: "attempt-1".into(),
-                owner_id: "owner-1".into(),
                 candidate: None,
+                reason: TeardownReason::SupervisorExit,
             };
             (entry, guard)
         }

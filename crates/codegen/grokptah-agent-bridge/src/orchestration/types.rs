@@ -352,6 +352,13 @@ pub struct RunRecord {
     /// Cleared when the run starts, is cancelled, or is interrupted on restart.
     #[serde(default)]
     pub queue_position: Option<usize>,
+    /// The immutable execution specification this run is bound to.
+    ///
+    /// Optional only for records written before the specification was keyed;
+    /// every run admitted since carries it, and dispatch refuses a run whose
+    /// key does not match the sealed input it is about to execute.
+    #[serde(default)]
+    pub spec_key: Option<String>,
     pub bounds: RunBounds,
     pub prompt_preview: String,
     pub start_seq: Option<u64>,
@@ -566,6 +573,10 @@ pub struct IdempotencyReceipt {
     pub request_id: String,
     pub payload_hash: String,
     pub run_id: Option<String>,
+    /// The execution specification this receipt admitted, when it admitted
+    /// one. A receipt and a run that disagree here are not the same work.
+    #[serde(default)]
+    pub spec_key: Option<String>,
     pub tool: String,
     pub response: serde_json::Value,
     /// Durable rejected/failed outcome. Exact retries replay this error.

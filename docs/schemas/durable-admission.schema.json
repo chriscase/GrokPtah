@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grokptah.dev/schemas/durable-admission.schema.json",
+  "title": "Durable admission projections",
+  "description": "The public shape of one admitted unit of agent work, shared by the SDK, the MCP control plane, the web broker, and the desktop. This is a narrowing of the durable ledger, never a re-serialization of it: execution input, credential fingerprints, and internal identities are absent by construction. Enforced against the Rust type and the TypeScript declaration by grokptah-agent-bridge::orchestration::projection.",
+  "type": "object",
+  "$defs": {
+    "RunState": {
+      "type": "string",
+      "enum": ["queued", "running", "completed", "failed", "cancelled", "interrupted", "limit_reached"]
+    },
+    "AttemptProjectionState": {
+      "type": "string",
+      "description": "Public form of an attempt lease's state. `expired` is distinct from `held` because it is the state a reconciler acts on.",
+      "enum": ["held", "released", "expired"]
+    },
+    "ProviderSendProjectionState": {
+      "type": "string",
+      "description": "What is durably known about whether the work reached the provider. `known_not_sent` and `uncertain` must never be merged: only the first is safe to attempt again.",
+      "enum": ["known_not_sent", "sending", "uncertain", "sent"]
+    },
+    "AdmissionProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projectionVersion",
+        "runId",
+        "sessionId",
+        "workspace",
+        "state",
+        "promptPreview",
+        "createdAt",
+        "updatedAt"
+      ],
+      "properties": {
+        "projectionVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Contract version, bumped whenever a field is added, removed, or changes meaning."
+        },
+        "runId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "sessionId": { "type": "string", "format": "uuid" },
+        "workspace": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "state": { "$ref": "#/$defs/RunState" },
+        "specKey": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Immutable execution specification key. Safe to publish: it is a digest, and it distinguishes identical work from merely similar work."
+        },
+        "queuePosition": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "One-based position in the bounded admission queue, while queued."
+        },
+        "attempt": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Monotonic attempt number. Never reused, never decreases."
+        },
+        "attemptState": {
+          "oneOf": [{ "$ref": "#/$defs/AttemptProjectionState" }, { "type": "null" }]
+        },
+        "providerSendState": {
+          "oneOf": [{ "$ref": "#/$defs/ProviderSendProjectionState" }, { "type": "null" }]
+        },
+        "promptPreview": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Bounded, redacted preview. Never the execution input."
+        },
+        "terminalResult": { "type": ["string", "null"], "maxLength": 100 },
+        "errorCode": { "type": ["string", "null"], "maxLength": 100 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      }
+    }
+  },
+  "$ref": "#/$defs/AdmissionProjection"
+}

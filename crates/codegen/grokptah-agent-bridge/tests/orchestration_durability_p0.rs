@@ -23,7 +23,8 @@ use std::time::Duration;
 
 use grokptah_agent_bridge::orchestration::{
     hash_payload, AcceptanceIntent, AttemptLeaseState, AuthContext, OrchStore, OrchestrationConfig,
-    OrchestrationService, RunBounds, SealedBounds, WorkspaceAllowlist, ACCEPTANCE_INTENT_VERSION,
+    OrchestrationService, ProviderSendState, RunBounds, SealedBounds, WorkspaceAllowlist,
+    ACCEPTANCE_INTENT_VERSION,
 };
 use grokptah_agent_bridge::{
     safe_id_filename, set_grokptah_home_override, AgentHost, AgentHostHandle, HostConfig,
@@ -309,7 +310,9 @@ async fn thirty_two_queued_tasks_survive_restart_and_run_exactly_once() {
         )
         .await
         .expect("the blocker must be accepted");
-    assert_eq!(blocker["state"], "running");
+    // The receipt is honestly `queued`: nothing has started at the moment it
+    // is issued. The run reaches `running` when its worker acknowledges.
+    assert_eq!(blocker["state"], "queued");
 
     let mut queued_markers = Vec::new();
     let mut queued_runs = Vec::new();
@@ -682,6 +685,9 @@ async fn recovery_never_synthesizes_a_run_from_orphaned_input() {
         agent_id: None,
         agent_revision: 0,
         spec_revision: "grokptah-agent-bridge/orchestration/1".into(),
+        principal_revision: hash_payload(&json!({"principal": "test"})),
+        policy_revision: hash_payload(&json!({"policy": "test"})),
+        route_revision: hash_payload(&json!({"route": "test"})),
         prompt: marker_prompt("orphan-marker"),
         bounds: SealedBounds {
             max_prompt_bytes: 50_000,
@@ -829,6 +835,9 @@ async fn input_left_behind_after_terminalization_never_reruns() {
         agent_id: None,
         agent_revision: 0,
         spec_revision: "grokptah-agent-bridge/orchestration/1".into(),
+        principal_revision: hash_payload(&json!({"principal": "test"})),
+        policy_revision: hash_payload(&json!({"policy": "test"})),
+        route_revision: hash_payload(&json!({"route": "test"})),
         prompt: marker_prompt("cleanup-marker"),
         bounds: SealedBounds {
             max_prompt_bytes: 50_000,
@@ -1102,7 +1111,10 @@ async fn capacity_is_not_reused_until_the_worker_future_is_gone() {
         .await
         .unwrap();
     let long_id = long["runId"].as_str().unwrap().to_string();
-    assert_eq!(long["state"], "running");
+    assert_eq!(
+        long["state"], "queued",
+        "the receipt reports what is true now"
+    );
 
     let queued = rig
         .orch
@@ -1326,5 +1338,50 @@ async fn public_surfaces_never_expose_the_private_prompt() {
         !intent_file(&store_root, &run_id).is_file(),
         "a terminal run must not keep its private input"
     );
+    set_grokptah_home_override(None);
+}
+
+/// A completed run must carry `Sent` provider evidence, and a run without it
+/// must never be reported completed. This is the "no fake Completed" rule seen
+/// from the outside: the ledger and the outcome have to agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_completed_run_carries_sent_provider_evidence() {
+    let rig = Rig::new(2).await;
+    let auth = rig.auth();
+
+    let response = rig
+        .orch
+        .submit_task(
+            &auth,
+            "send-evidence",
+            rig.session,
+            rig.ws.path(),
+            marker_prompt("send-evidence-marker"),
+            None,
+        )
+        .await
+        .unwrap();
+    let run_id = response["runId"].as_str().unwrap().to_string();
+    wait_all_terminal(&rig, &[run_id.clone()], Duration::from_secs(60)).await;
+
+    let run = rig.orch.store().load_run(&run_id).unwrap().expect("run");
+    let send = rig
+        .orch
+        .store()
+        .load_provider_send(&run_id)
+        .unwrap()
+        .expect("a dispatched attempt must leave provider-send evidence");
+    assert_eq!(
+        send.state,
+        ProviderSendState::Sent,
+        "a completed run must be backed by an observed provider response"
+    );
+    assert_eq!(
+        rig.markers().get("send-evidence-marker").copied(),
+        Some(1),
+        "the work must actually have run"
+    );
+    assert_eq!(run.state, RunState::Completed, "error={:?}", run.error_code);
     set_grokptah_home_override(None);
 }

@@ -24,6 +24,21 @@ impl WorkspaceAllowlist {
         }
     }
 
+    /// A stable fingerprint of exactly which roots are authorized.
+    ///
+    /// Used as the policy revision sealed into an execution specification, so
+    /// widening or narrowing the allowlist after admission is detected at
+    /// action time instead of silently taking effect.
+    pub fn fingerprint(&self) -> String {
+        let mut roots: Vec<String> = self
+            .roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect();
+        roots.sort();
+        super::types::hash_payload(&serde_json::json!({ "roots": roots }))
+    }
+
     pub fn contains(&self, workspace: &Path) -> bool {
         let Ok(c) = canonical_workspace(workspace) else {
             return false;

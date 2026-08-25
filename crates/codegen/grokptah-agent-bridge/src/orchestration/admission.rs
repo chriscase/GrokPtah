@@ -54,7 +54,7 @@ use super::types::{
 
 /// Version of the [`AcceptanceIntent`] seal. A record produced by a different
 /// version is rejected rather than reinterpreted.
-pub const ACCEPTANCE_INTENT_VERSION: u32 = 1;
+pub const ACCEPTANCE_INTENT_VERSION: u32 = 2;
 
 /// Version of the [`AttemptLease`] seal.
 pub const ATTEMPT_LEASE_VERSION: u32 = 1;
@@ -143,6 +143,15 @@ pub struct AcceptanceIntent {
     pub agent_revision: u64,
     /// Execution spec revision (bridge contract the input was accepted under).
     pub spec_revision: String,
+    /// Fingerprint of the authenticated principal and the capabilities it
+    /// held at acceptance. Never the credential itself.
+    pub principal_revision: String,
+    /// Fingerprint of the authorization policy in force at acceptance: the
+    /// workspace allowlist and the server bounds ceiling.
+    pub policy_revision: String,
+    /// Fingerprint of the provider, model, route, and credential material
+    /// that would have served this work at acceptance.
+    pub route_revision: String,
     /// The full, bounded, private execution input. Never public, never
     /// journaled, never included in a receipt.
     pub prompt: String,
@@ -175,6 +184,9 @@ impl AcceptanceIntent {
             "agentId": self.agent_id,
             "agentRevision": self.agent_revision,
             "specRevision": self.spec_revision,
+            "principalRevision": self.principal_revision,
+            "policyRevision": self.policy_revision,
+            "routeRevision": self.route_revision,
             "promptSha256": hash_payload(&serde_json::Value::String(self.prompt.clone())),
             "promptBytes": self.prompt.len(),
             "bounds": {
@@ -224,6 +236,9 @@ impl AcceptanceIntent {
         validate_bounded_allow_empty(&self.session_revision, "session_revision")?;
         validate_bounded_allow_empty(&self.workspace_revision, "workspace_revision")?;
         validate_bounded(&self.spec_revision, "spec_revision")?;
+        validate_hex_digest(&self.principal_revision, "principal_revision")?;
+        validate_hex_digest(&self.policy_revision, "policy_revision")?;
+        validate_hex_digest(&self.route_revision, "route_revision")?;
         self.bounds.validate()?;
         if self.prompt.is_empty() {
             return Err(OrchError::new(
@@ -256,6 +271,211 @@ impl AcceptanceIntent {
     /// The bounds this input executes under, as a run record carries them.
     pub fn run_bounds(&self) -> RunBounds {
         RunBounds::from(self.bounds)
+    }
+
+    /// The immutable key of this execution specification.
+    ///
+    /// The key *is* the integrity digest, so it is content-addressed: two
+    /// specifications with the same key are byte-identical in every
+    /// execution-relevant field, and any edit — however well-formed — produces
+    /// a different key. Every durable holder stores this key and re-checks it,
+    /// so a resealed forgery is a *different* specification rather than a
+    /// substituted one, and is refused because no holder is bound to it.
+    pub fn spec_key(&self) -> &str {
+        &self.digest
+    }
+}
+
+/// Everything that authorized this work, captured as fingerprints.
+///
+/// Admission answers "may this run?" once. Dispatch can happen much later —
+/// after a restart, after a queue wait, after an operator revoked a scope — so
+/// the answer is recomputed at action time and compared against what was
+/// sealed. Fingerprints, not values: none of these fields may carry a token, a
+/// key, or a prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizationSnapshot {
+    pub principal_revision: String,
+    pub policy_revision: String,
+    pub session_revision: String,
+    pub workspace_revision: String,
+    pub agent_revision: u64,
+    pub route_revision: String,
+}
+
+/// Which authorization input drifted between acceptance and action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorizationDrift {
+    Principal,
+    Policy,
+    Session,
+    Workspace,
+    Agent,
+    Route,
+}
+
+impl AuthorizationDrift {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Principal => "principal",
+            Self::Policy => "policy",
+            Self::Session => "session",
+            Self::Workspace => "workspace",
+            Self::Agent => "agent",
+            Self::Route => "route",
+        }
+    }
+}
+
+impl AuthorizationSnapshot {
+    /// Compare an action-time snapshot against what admission sealed.
+    ///
+    /// Returns every input that drifted, not just the first: an operator
+    /// diagnosing a refusal needs the whole picture, and reporting one cause
+    /// at a time turns a single revocation into a sequence of retries.
+    pub fn drift_from(&self, spec: &AcceptanceIntent) -> Vec<AuthorizationDrift> {
+        let mut drift = Vec::new();
+        if self.principal_revision != spec.principal_revision {
+            drift.push(AuthorizationDrift::Principal);
+        }
+        if self.policy_revision != spec.policy_revision {
+            drift.push(AuthorizationDrift::Policy);
+        }
+        if self.session_revision != spec.session_revision {
+            drift.push(AuthorizationDrift::Session);
+        }
+        if self.workspace_revision != spec.workspace_revision {
+            drift.push(AuthorizationDrift::Workspace);
+        }
+        if self.agent_revision != spec.agent_revision {
+            drift.push(AuthorizationDrift::Agent);
+        }
+        if self.route_revision != spec.route_revision {
+            drift.push(AuthorizationDrift::Route);
+        }
+        drift
+    }
+
+    /// Fail closed unless every authorization input still matches.
+    pub fn reauthorize(&self, spec: &AcceptanceIntent) -> Result<(), OrchError> {
+        let drift = self.drift_from(spec);
+        if drift.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<&str> = drift.iter().map(|d| d.as_str()).collect();
+        Err(OrchError::with_data(
+            OrchErrorCode::ForbiddenScope,
+            format!(
+                "authorization changed after acceptance: {} no longer matches",
+                names.join(", ")
+            ),
+            serde_json::json!({ "drift": names, "specKey": spec.spec_key() }),
+        ))
+    }
+}
+
+/// A durable object that may hold a reference to one execution specification.
+///
+/// These are the only six places an execution decision can be justified from.
+/// Each stores the spec key; agreement across them is what makes the
+/// specification authoritative rather than advisory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecHolder {
+    Run,
+    Receipt,
+    Attempt,
+    Lease,
+    ProviderSend,
+    Worker,
+}
+
+impl SpecHolder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Receipt => "receipt",
+            Self::Attempt => "attempt",
+            Self::Lease => "lease",
+            Self::ProviderSend => "provider_send",
+            Self::Worker => "worker",
+        }
+    }
+}
+
+/// The spec keys each holder currently claims, checked against the sealed
+/// specification itself.
+///
+/// `None` means "this holder does not claim a specification". That is legal
+/// only before the holder exists; passing the holder in `required` makes its
+/// absence an error, so callers state exactly which bindings must already be
+/// established at each point in the lifecycle instead of hoping they are.
+#[derive(Debug, Default, Clone)]
+pub struct SpecBinding<'a> {
+    pub run: Option<&'a str>,
+    pub receipt: Option<&'a str>,
+    pub attempt: Option<&'a str>,
+    pub lease: Option<&'a str>,
+    pub provider_send: Option<&'a str>,
+    pub worker: Option<&'a str>,
+}
+
+impl<'a> SpecBinding<'a> {
+    fn claimed(&self, holder: SpecHolder) -> Option<&'a str> {
+        match holder {
+            SpecHolder::Run => self.run,
+            SpecHolder::Receipt => self.receipt,
+            SpecHolder::Attempt => self.attempt,
+            SpecHolder::Lease => self.lease,
+            SpecHolder::ProviderSend => self.provider_send,
+            SpecHolder::Worker => self.worker,
+        }
+    }
+
+    /// Fail closed unless every required holder is bound to `spec`, and every
+    /// holder that claims *anything* claims exactly `spec`.
+    pub fn verify(
+        &self,
+        spec: &AcceptanceIntent,
+        required: &[SpecHolder],
+    ) -> Result<(), OrchError> {
+        // The specification must verify on its own terms first; otherwise the
+        // key everything is compared against is itself untrustworthy.
+        spec.validate()?;
+        let key = spec.spec_key();
+        for holder in [
+            SpecHolder::Run,
+            SpecHolder::Receipt,
+            SpecHolder::Attempt,
+            SpecHolder::Lease,
+            SpecHolder::ProviderSend,
+            SpecHolder::Worker,
+        ] {
+            match self.claimed(holder) {
+                Some(claimed) if claimed == key => {}
+                Some(_) => {
+                    return Err(OrchError::with_data(
+                        OrchErrorCode::Conflict,
+                        format!(
+                            "{} is bound to a different execution specification",
+                            holder.as_str()
+                        ),
+                        serde_json::json!({ "holder": holder.as_str(), "specKey": key }),
+                    ));
+                }
+                None if required.contains(&holder) => {
+                    return Err(OrchError::with_data(
+                        OrchErrorCode::Conflict,
+                        format!(
+                            "{} is not bound to any execution specification",
+                            holder.as_str()
+                        ),
+                        serde_json::json!({ "holder": holder.as_str(), "specKey": key }),
+                    ));
+                }
+                None => {}
+            }
+        }
+        Ok(())
     }
 }
 
@@ -398,6 +618,246 @@ fn validate_hex_digest(value: &str, field: &str) -> Result<(), OrchError> {
     Ok(())
 }
 
+/// Version of the [`ProviderSendRecord`] seal.
+pub const PROVIDER_SEND_VERSION: u32 = 1;
+
+/// What is durably known about whether this attempt's work reached the
+/// provider.
+///
+/// The distinction that matters is between *not sent* and *unknown*. A request
+/// that provably never left is safe to attempt again under a fresh identity. A
+/// request whose outcome was never observed is not: the provider may have
+/// accepted it, billed it, and acted on it. Collapsing the two is how systems
+/// silently double-execute, so they are separate states and only one of them
+/// is recoverable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSendState {
+    /// Nothing was transmitted. Provably safe to attempt again.
+    KnownNotSent,
+    /// Transmission is in flight. Durable before the first byte leaves.
+    Sending,
+    /// Transmission happened, or may have; the outcome was never observed.
+    /// Never implicitly resent.
+    Uncertain,
+    /// A provider response was observed for this exact send identity.
+    Sent,
+}
+
+impl ProviderSendState {
+    /// A run may only be recorded `Completed` when its work is known to have
+    /// reached the provider and produced an observed response. Anything else
+    /// recorded as completed would be a fabricated success.
+    pub fn permits_completion(self) -> bool {
+        matches!(self, Self::Sent)
+    }
+
+    /// Only a provably-unsent request may be carried into a new attempt
+    /// without asking a human. `Uncertain` deliberately cannot.
+    pub fn permits_new_attempt(self) -> bool {
+        matches!(self, Self::KnownNotSent)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::KnownNotSent => "known_not_sent",
+            Self::Sending => "sending",
+            Self::Uncertain => "uncertain",
+            Self::Sent => "sent",
+        }
+    }
+}
+
+/// Typed reason a provider send did not reach `Sent`.
+///
+/// These are deliberately about *evidence*, not about blame: each one says
+/// what is known, so recovery can decide without guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSendFailure {
+    /// Refused locally before any byte could be transmitted.
+    PreflightRejected,
+    /// Authorization was withdrawn between admission and send.
+    AuthorizationWithdrawn,
+    /// The request was transmitted and no response was ever observed.
+    ResponseUnobserved,
+    /// The provider answered, and the answer was an error.
+    ProviderRejected,
+    /// The attempt was torn down while the send was in flight.
+    AttemptTornDown,
+    /// The durable send record itself could not be written.
+    LedgerUnavailable,
+}
+
+impl ProviderSendFailure {
+    /// The state this failure justifies. A failure that cannot rule out
+    /// transmission yields `Uncertain`, never `KnownNotSent`.
+    pub fn resulting_state(self) -> ProviderSendState {
+        match self {
+            Self::PreflightRejected | Self::AuthorizationWithdrawn => {
+                ProviderSendState::KnownNotSent
+            }
+            Self::ProviderRejected => ProviderSendState::Sent,
+            Self::ResponseUnobserved | Self::AttemptTornDown | Self::LedgerUnavailable => {
+                ProviderSendState::Uncertain
+            }
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreflightRejected => "preflight_rejected",
+            Self::AuthorizationWithdrawn => "authorization_withdrawn",
+            Self::ResponseUnobserved => "response_unobserved",
+            Self::ProviderRejected => "provider_rejected",
+            Self::AttemptTornDown => "attempt_torn_down",
+            Self::LedgerUnavailable => "ledger_unavailable",
+        }
+    }
+}
+
+/// The durable identity and observed state of one provider send.
+///
+/// The send identity is minted once per attempt and written *before* the
+/// request is transmitted, so a crash mid-send always leaves evidence that a
+/// send may have happened. Without this record, a crash between "decided to
+/// send" and "observed a response" is indistinguishable from "never started",
+/// which is exactly the case that produces duplicate model work.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderSendRecord {
+    pub send_version: u32,
+    /// Stable identity of this transmission, distinct from the attempt.
+    pub send_id: String,
+    pub run_id: String,
+    pub attempt_id: String,
+    /// The execution specification this send is authorized to transmit.
+    pub spec_key: String,
+    pub state: ProviderSendState,
+    #[serde(default)]
+    pub failure: Option<ProviderSendFailure>,
+    /// Bounded, redacted detail for operators. Never the request body.
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub digest: String,
+}
+
+impl ProviderSendRecord {
+    pub fn digest_for(&self) -> String {
+        hash_payload(&serde_json::json!({
+            "sendVersion": self.send_version,
+            "sendId": self.send_id,
+            "runId": self.run_id,
+            "attemptId": self.attempt_id,
+            "specKey": self.spec_key,
+            "state": self.state,
+            "failure": self.failure,
+            "detail": self.detail,
+            "createdAt": self.created_at.to_rfc3339(),
+            "updatedAt": self.updated_at.to_rfc3339(),
+        }))
+    }
+
+    pub fn seal(mut self) -> Self {
+        self.digest = self.digest_for();
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.send_version != PROVIDER_SEND_VERSION {
+            return Err(OrchError::new(
+                OrchErrorCode::Unsupported,
+                format!(
+                    "provider send version {} is not supported",
+                    self.send_version
+                ),
+            ));
+        }
+        validate_identity(&self.send_id, "send_id")?;
+        validate_identity(&self.run_id, "run_id")?;
+        validate_identity(&self.attempt_id, "attempt_id")?;
+        validate_hex_digest(&self.spec_key, "spec_key")?;
+        if let Some(detail) = self.detail.as_deref() {
+            validate_bounded_allow_empty(detail, "detail")?;
+        }
+        // A failure must agree with the state it justifies; a record claiming
+        // `Sent` alongside `PreflightRejected` is self-contradictory evidence.
+        if let Some(failure) = self.failure {
+            if failure.resulting_state() != self.state {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "provider send failure does not match its recorded state",
+                ));
+            }
+        }
+        validate_hex_digest(&self.digest, "digest")?;
+        if self.digest != self.digest_for() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "provider send digest does not match its sealed fields",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Legal forward transitions. The state machine never moves backwards, so
+    /// evidence can only become more definite, never less.
+    pub fn may_transition_to(&self, next: ProviderSendState) -> bool {
+        use ProviderSendState::*;
+        match (self.state, next) {
+            (KnownNotSent, Sending) => true,
+            (Sending, Sent) | (Sending, Uncertain) => true,
+            // Only a preflight-style refusal can return to "provably not sent",
+            // and only from the state where nothing was transmitted.
+            (KnownNotSent, KnownNotSent) => true,
+            _ => false,
+        }
+    }
+}
+
+/// A gate that holds every task of one attempt at its first instruction until
+/// all of that attempt's handles are registered.
+///
+/// Without it, registration races the work: a task can run, complete, and try
+/// to settle before the registry knows it exists, so teardown has nothing to
+/// abort and capacity accounting sees a run that never started. The gate makes
+/// registration and startability a single ordered step.
+#[derive(Clone)]
+pub struct StartGate {
+    open: CancellationToken,
+}
+
+impl Default for StartGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StartGate {
+    /// A gate that starts closed.
+    pub fn new() -> Self {
+        Self {
+            open: CancellationToken::new(),
+        }
+    }
+
+    /// Park until the gate opens. Returns immediately once it has.
+    pub async fn wait(&self) {
+        self.open.cancelled().await;
+    }
+
+    /// Release every waiter. Idempotent.
+    pub fn open(&self) {
+        self.open.cancel();
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open.is_cancelled()
+    }
+}
+
 /// Observable liveness of one dispatched worker future.
 ///
 /// `finished` is set from a guard held *inside* the worker future, so it flips
@@ -468,7 +928,20 @@ pub struct LiveWorker {
     worker_abort: parking_lot::Mutex<Option<AbortHandle>>,
     aggregator_abort: parking_lot::Mutex<Option<AbortHandle>>,
     supervisor: parking_lot::Mutex<Option<JoinHandle<()>>>,
-    settled: AtomicBool,
+    /// Registration is complete and the gate has been opened.
+    registered: AtomicBool,
+    /// No further work may begin; the cancel token is signalled and the nested
+    /// futures are aborted. Fencing is synchronous and proves nothing about
+    /// whether anything has stopped yet.
+    fenced: AtomicBool,
+    /// Exactly one owner installs the terminal record.
+    finalized: AtomicBool,
+    /// Exactly one owner releases host capacity, and only after quiescence
+    /// has been *proved*.
+    capacity_released: AtomicBool,
+    /// A bounded teardown could not prove quiescence. The attempt keeps its
+    /// lease and its capacity for as long as this holds.
+    escaped: AtomicBool,
 }
 
 /// What a bounded teardown actually achieved. `WorkerEscaped` is the honest
@@ -512,7 +985,11 @@ impl LiveWorker {
             worker_abort: parking_lot::Mutex::new(None),
             aggregator_abort: parking_lot::Mutex::new(None),
             supervisor: parking_lot::Mutex::new(None),
-            settled: AtomicBool::new(false),
+            registered: AtomicBool::new(false),
+            fenced: AtomicBool::new(false),
+            finalized: AtomicBool::new(false),
+            capacity_released: AtomicBool::new(false),
+            escaped: AtomicBool::new(false),
         }
     }
 
@@ -542,21 +1019,81 @@ impl LiveWorker {
         }
     }
 
-    /// Win the single settlement right for this attempt.
+    /// Mark registration complete. Only the dispatcher calls this, and only
+    /// once every handle is in the registry.
+    pub fn mark_registered(&self) {
+        self.registered.store(true, Ordering::Release);
+    }
+
+    pub fn is_registered(&self) -> bool {
+        self.registered.load(Ordering::Acquire)
+    }
+
+    /// Stop this attempt from making further progress, synchronously.
     ///
-    /// Exactly one caller ever observes `true`, no matter how many paths race
-    /// to reap the run (normal completion, deadline, explicit cancel, reaper,
-    /// panic unwind, abort, process shutdown). The winner — and only the
-    /// winner — terminalizes the run, releases its durable attempt lease,
-    /// drops its durable input, deregisters it, and releases host capacity.
-    pub fn settle_once(&self) -> bool {
-        self.settled
+    /// Fencing is what a `Drop` may do: it signals cancellation and aborts the
+    /// nested futures. It deliberately does **not** release capacity or the
+    /// lease, because an abort request is not evidence that anything stopped —
+    /// only a bounded await of the worker's own liveness is. Returns `true`
+    /// for the caller that fenced it, so fencing can be logged exactly once.
+    pub fn fence(&self) -> bool {
+        let first = self
+            .fenced
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        self.cancel.cancel();
+        self.abort_nested();
+        first
+    }
+
+    pub fn is_fenced(&self) -> bool {
+        self.fenced.load(Ordering::Acquire)
+    }
+
+    /// Win the single right to install this attempt's terminal record.
+    pub fn claim_finalization(&self) -> bool {
+        self.finalized
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
+    pub fn is_finalized(&self) -> bool {
+        self.finalized.load(Ordering::Acquire)
+    }
+
+    /// Win the single right to release this attempt's host capacity.
+    ///
+    /// Callers must have proved quiescence first — see
+    /// [`LiveWorker::terminate`]. This latch only guarantees the release
+    /// happens once, not that it is safe; the two are separate on purpose so
+    /// no synchronous path can accidentally satisfy both.
+    pub fn claim_capacity_release(&self) -> bool {
+        self.capacity_released
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn capacity_released(&self) -> bool {
+        self.capacity_released.load(Ordering::Acquire)
+    }
+
+    /// Record that a bounded teardown could not prove this attempt stopped.
+    /// Its lease and capacity are retained for as long as this holds.
+    pub fn mark_escaped(&self) {
+        self.escaped.store(true, Ordering::Release);
+    }
+
+    pub fn has_escaped(&self) -> bool {
+        self.escaped.load(Ordering::Acquire)
+    }
+
+    /// Backwards-compatible alias for the finalization latch.
+    pub fn settle_once(&self) -> bool {
+        self.claim_finalization()
+    }
+
     pub fn is_settled(&self) -> bool {
-        self.settled.load(Ordering::Acquire)
+        self.is_finalized()
     }
 
     /// Cancel, abort, and bounded-await every future this attempt owns.
@@ -567,13 +1104,9 @@ impl LiveWorker {
     /// supervisor if it overran. The worker's own liveness guard is the proof
     /// of termination; the supervisor joining is not sufficient on its own.
     pub async fn terminate(&self, budget: Duration) -> TerminationOutcome {
-        self.cancel.cancel();
-        if let Some(abort) = self.worker_abort.lock().take() {
-            abort.abort();
-        }
-        if let Some(abort) = self.aggregator_abort.lock().take() {
-            abort.abort();
-        }
+        // Fencing is synchronous and says only "stop"; everything below is the
+        // proof that it actually did.
+        self.fence();
 
         let supervisor = self.supervisor.lock().take();
         let mut supervisor_joined = true;
@@ -585,12 +1118,27 @@ impl LiveWorker {
         }
 
         if !await_worker_finished(&self.liveness, budget).await {
+            self.mark_escaped();
             return TerminationOutcome::WorkerEscaped;
         }
         if !supervisor_joined {
+            self.mark_escaped();
             return TerminationOutcome::SupervisorEscaped;
         }
         TerminationOutcome::Terminated
+    }
+
+    /// Release capacity only against proved quiescence.
+    ///
+    /// This is the single door between "we asked it to stop" and "its slot may
+    /// be given to someone else". It refuses for any outcome that did not
+    /// prove the futures are gone, so escaped work keeps its capacity and its
+    /// lease rather than being overlapped by a second attempt.
+    pub fn claim_capacity_release_after(&self, outcome: TerminationOutcome) -> bool {
+        if !outcome.may_release_capacity() {
+            return false;
+        }
+        self.claim_capacity_release()
     }
 }
 
@@ -633,6 +1181,9 @@ mod tests {
             agent_id: None,
             agent_revision: 0,
             spec_revision: "bridge/1".into(),
+            principal_revision: hash_payload(&serde_json::json!({"principal": "a"})),
+            policy_revision: hash_payload(&serde_json::json!({"policy": "a"})),
+            route_revision: hash_payload(&serde_json::json!({"route": "a"})),
             prompt: "fix the failing test".into(),
             bounds: SealedBounds {
                 max_prompt_bytes: 1000,
@@ -724,6 +1275,24 @@ mod tests {
             (
                 "spec_revision",
                 Box::new(|i: &mut AcceptanceIntent| i.spec_revision = "bridge/2".into()),
+            ),
+            (
+                "principal_revision",
+                Box::new(|i: &mut AcceptanceIntent| {
+                    i.principal_revision = hash_payload(&serde_json::json!({"principal": "b"}))
+                }),
+            ),
+            (
+                "policy_revision",
+                Box::new(|i: &mut AcceptanceIntent| {
+                    i.policy_revision = hash_payload(&serde_json::json!({"policy": "b"}))
+                }),
+            ),
+            (
+                "route_revision",
+                Box::new(|i: &mut AcceptanceIntent| {
+                    i.route_revision = hash_payload(&serde_json::json!({"route": "b"}))
+                }),
             ),
             (
                 "bounds.max_rounds",
