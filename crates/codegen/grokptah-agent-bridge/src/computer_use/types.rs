@@ -687,6 +687,29 @@ impl ComputerBackendAttestation {
             }
         }
     }
+
+    /// Existing-run dispatch may proceed only for a trusted attestation whose
+    /// backend id and capability tier match the run's stamped proof.
+    pub(crate) fn require_matching_run_proof(
+        &self,
+        proof: &ComputerCapabilityProof,
+    ) -> ComputerResult<()> {
+        match &self.trust {
+            ComputerBackendTrust::Unproven => Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "unproven backend cannot dispatch against an existing computer run",
+            )),
+            ComputerBackendTrust::Trusted { backend_id, tier } => {
+                if proof.backend_id() != backend_id || proof.tier() != *tier {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::ForbiddenAction,
+                        "backend attestation does not match the computer run proof",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Host-minted opaque surface identity plus incarnation. Native process and
