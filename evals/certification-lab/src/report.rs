@@ -2068,20 +2068,18 @@ mod tests {
         probe.elapsed_millis = 1;
         probe.provider_lanes = always_on_lanes();
         probe.provider_observation = crate::always_on::merge_provider_lanes(&probe.provider_lanes);
+        let decision_lane = crate::always_on::AlwaysOnLaneEvidence {
+            step_id: "__manager_decision__".into(),
+            work: opaque_durable_id("work-d"),
+            attempt: opaque_durable_id("attempt-d"),
+            intent: opaque_durable_id("intent-d"),
+            run: opaque_durable_id("run-d"),
+        };
         probe.always_on_shape = Some(AlwaysOnHappyShape {
             native_lanes: Vec::new(),
-            decision_lane: crate::always_on::AlwaysOnLane {
-                step_id: "__manager_decision__".into(),
-                work_id: "work-d".into(),
-                attempt_id: "attempt-d".into(),
-                intent_id: "intent-d".into(),
-                run_id: "run-d".into(),
-            },
+            decision_lane: decision_lane.clone(),
             manager_decision_binding: crate::always_on::ManagerDecisionBinding::Bound {
-                work_id: "work-d".into(),
-                attempt_id: "attempt-d".into(),
-                intent_id: "intent-d".into(),
-                run_id: "run-d".into(),
+                lane: decision_lane,
             },
         });
         probe
@@ -2142,7 +2140,7 @@ mod tests {
             .unwrap()
             .manager_decision_binding =
             crate::always_on::ManagerDecisionBinding::PurposeNotProjected {
-                work_id: "work-d".into(),
+                work: opaque_durable_id("work-d"),
             };
         assert!(validate_probe_against_definition(&unbound, definition).is_err());
     }

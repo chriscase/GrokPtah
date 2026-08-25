@@ -14,9 +14,10 @@ use uuid::Uuid;
 
 use crate::always_on::{
     assert_bootstrap_baseline, assert_exact_snapshot, assert_happy_shape,
-    assert_home_b_pre_restart_shape, assert_provider_lanes, baseline_is_settled, exact_array,
-    merge_provider_lanes, work_items, AlwaysOnFixture, AlwaysOnHappyShape, AlwaysOnHome,
-    AlwaysOnSnapshot, LoopbackProviderLane, MANAGER_DECISION_KIND, SETUP_SEMANTIC_ID,
+    assert_home_b_pre_restart_shape, assert_post_restart_shape, assert_provider_lanes,
+    baseline_is_settled, exact_array, expected_step_state, merge_provider_lanes, work_items,
+    AlwaysOnFixture, AlwaysOnHappyShape, AlwaysOnHome, AlwaysOnSnapshot, LoopbackProviderLane,
+    MANAGER_DECISION_KIND, SETUP_SEMANTIC_ID,
 };
 use crate::local_service::LocalService;
 use crate::manifest::{OracleCode, ProbeAction, ProbeDefinition};
@@ -34,6 +35,11 @@ const SAFE_TITLE: &str = "Persistent Agent certification probe";
 /// snapshot is frozen as the comparison baseline.
 const BASELINE_SETTLE_TIMEOUT: Duration = Duration::from_secs(90);
 const BASELINE_SETTLE_POLL: Duration = Duration::from_millis(50);
+/// Bounded wait for the held home to reach its post-restart steady state: the
+/// autonomous manager reacts once to the held step failing, and that reaction
+/// is asynchronous.
+const POST_RESTART_SETTLE_TIMEOUT: Duration = Duration::from_secs(90);
+const POST_RESTART_SETTLE_POLL: Duration = Duration::from_millis(50);
 
 pub struct ProbeExecution {
     pub result: ProbeResult,
@@ -1311,8 +1317,13 @@ async fn always_on_home_a(
         .await?;
 
     for step in fixture.native_steps() {
+        // The fixture's middle step is a forced failure the manager replaces,
+        // so its terminal Work state is `failed`, not `succeeded`. Demanding
+        // `succeeded` for every native step could never hold on a healthy run.
         let items = work_for_step(&work, &step);
-        if items.len() != 1 || items[0]["state"].as_str() != Some("succeeded") {
+        if items.len() != 1
+            || items[0]["state"].as_str() != Some(expected_step_state(fixture, &step)?)
+        {
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
         let work_id = items[0]["workId"]
@@ -1607,11 +1618,7 @@ async fn always_on_home_b(
     if service.provider.count_for(&fixture.step_first) != held_posts {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
-    // Every identity must survive both restarts unchanged except the held
-    // lane, which must land exactly on failed Work over an interrupted Run.
-    // Encoding the fence this way keeps Work and Run `state` inside the
-    // compared oracle instead of dropping it to make the comparison hold.
-    let expected_after_restart = expected_snapshot.with_interruption(&join.work_id, &join.run_id);
+
     let pre_plan = probe
         .call(
             &mut client,
@@ -1668,7 +1675,7 @@ async fn always_on_home_b(
         &pre_plan_hash,
     )
     .await?;
-    always_on_assert_interrupted_recovery(
+    let first_steady = always_on_assert_interrupted_recovery(
         probe,
         &mut client,
         &service,
@@ -1680,12 +1687,14 @@ async fn always_on_home_b(
         &fixture.step_first,
         held_posts,
         true,
-        &expected_after_restart,
+        &expected_snapshot,
     )
     .await?;
     tokio::time::sleep(fixture.zero_growth_window).await;
+    // True zero growth: once settled, the steady state must not move at all
+    // across the supervisor window.
     assert_exact_snapshot(
-        &expected_after_restart,
+        &first_steady,
         &always_on_snapshot(probe, &mut client, &session_id, &workspace).await?,
     )?;
     if service.provider.count_for(&fixture.step_first) != held_posts {
@@ -1720,7 +1729,7 @@ async fn always_on_home_b(
         &pre_plan_hash,
     )
     .await?;
-    always_on_assert_interrupted_recovery(
+    let second_steady = always_on_assert_interrupted_recovery(
         probe,
         &mut client,
         &service,
@@ -1732,12 +1741,15 @@ async fn always_on_home_b(
         &fixture.step_first,
         held_posts,
         false,
-        &expected_after_restart,
+        &expected_snapshot,
     )
     .await?;
+    // The second restart must reproduce the first restart's steady state
+    // exactly, down to the manager-decision Work, intent and Run identities.
+    assert_exact_snapshot(&first_steady, &second_steady)?;
     tokio::time::sleep(fixture.zero_growth_window).await;
     assert_exact_snapshot(
-        &expected_after_restart,
+        &second_steady,
         &always_on_snapshot(probe, &mut client, &session_id, &workspace).await?,
     )?;
     if service.provider.count_for(&fixture.step_first) != held_posts {
@@ -1866,8 +1878,8 @@ async fn always_on_assert_interrupted_recovery(
     expected_step_id: &str,
     expected_provider_posts: u64,
     stamp_transitions: bool,
-    expected_after_restart: &AlwaysOnSnapshot,
-) -> Result<(), DiagnosticCode> {
+    pre_restart: &AlwaysOnSnapshot,
+) -> Result<AlwaysOnSnapshot, DiagnosticCode> {
     wait_run_terminal(client, session_id, workspace, run_id).await?;
     let recovered_run = probe
         .call(
@@ -2000,10 +2012,24 @@ async fn always_on_assert_interrupted_recovery(
         work_id,
         run_id,
     )?;
-    assert_exact_snapshot(
-        expected_after_restart,
-        &always_on_snapshot(probe, client, session_id, workspace).await?,
-    )?;
+    // The manager's single reaction to the held step failing is asynchronous,
+    // so poll within a bound until the steady state holds instead of demanding
+    // it on the first read.
+    let deadline = Instant::now() + POST_RESTART_SETTLE_TIMEOUT;
+    let mut settled = None;
+    let mut last = DiagnosticCode::Timeout;
+    while Instant::now() < deadline {
+        let snapshot = always_on_snapshot(probe, client, session_id, workspace).await?;
+        match assert_post_restart_shape(pre_restart, &snapshot, work_id, run_id) {
+            Ok(_) => {
+                settled = Some(snapshot);
+                break;
+            }
+            Err(code) => last = code,
+        }
+        tokio::time::sleep(POST_RESTART_SETTLE_POLL).await;
+    }
+    let settled = settled.ok_or(last)?;
     if stamp_transitions {
         probe.transition(
             EntityKind::Work,
@@ -2016,7 +2042,7 @@ async fn always_on_assert_interrupted_recovery(
         probe.restart.implicit_execution_observed = true;
         return Err(DiagnosticCode::RestartRecoveryFailed);
     }
-    Ok(())
+    Ok(settled)
 }
 
 async fn wait_run_terminal(

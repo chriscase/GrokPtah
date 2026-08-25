@@ -19,13 +19,21 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-use crate::report::{DiagnosticCode, LoopbackProviderObservation, LoopbackProviderRecord};
+use crate::report::{
+    opaque_durable_id, DiagnosticCode, LoopbackProviderObservation, LoopbackProviderRecord,
+};
 
 /// Reserved public step id under which the manager-decision lane is projected
 /// by `ptah_list_work.sourceManagerStepId`.
 pub const MANAGER_DECISION_STEP_ID: &str = "__manager_decision__";
 /// Public `kind` discriminator for manager-decision Work.
 pub const MANAGER_DECISION_KIND: &str = "manager-decision";
+/// Public `kind` of the Work row the manager plan itself occupies. It carries
+/// no step id and no attempts, and is observed in `ptah_list_work` alongside
+/// the step lanes.
+pub const MANAGER_PLAN_KIND: &str = "manager-plan";
+/// Work rows one manager plan contributes on top of its step lanes.
+const MANAGER_PLAN_WORK_ROWS: usize = 1;
 /// Public `purpose` discriminator for the manager proposal Run.
 pub const MANAGER_PROPOSAL_PURPOSE: &str = "manager_proposal";
 /// Loopback provider semantic id for the bootstrap submit.
@@ -960,6 +968,35 @@ pub struct AlwaysOnLane {
     pub run_id: String,
 }
 
+/// One lane's identity chain, opaque for publication.
+///
+/// The report is scanned for forbidden data before it is written, and raw
+/// durable identifiers are token-shaped, so every id published here is the
+/// `opaque-<sha256>` digest the rest of the report already uses. The digests
+/// are still exact: two lanes that differ anywhere produce different evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlwaysOnLaneEvidence {
+    pub step_id: String,
+    pub work: String,
+    pub attempt: String,
+    pub intent: String,
+    pub run: String,
+}
+
+impl AlwaysOnLane {
+    /// Project this lane into the opaque form the report publishes.
+    pub fn evidence(&self) -> AlwaysOnLaneEvidence {
+        AlwaysOnLaneEvidence {
+            step_id: self.step_id.clone(),
+            work: opaque_durable_id(&self.work_id),
+            attempt: opaque_durable_id(&self.attempt_id),
+            intent: opaque_durable_id(&self.intent_id),
+            run: opaque_durable_id(&self.run_id),
+        }
+    }
+}
+
 /// Whether the manager-decision Work could be causally bound to the manager
 /// proposal Run using only public identities.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -967,19 +1004,14 @@ pub struct AlwaysOnLane {
 pub enum ManagerDecisionBinding {
     /// The decision Work's own Run is the unique Run whose public `purpose` is
     /// `manager_proposal`. The causal oracle is proven end to end.
-    Bound {
-        work_id: String,
-        attempt_id: String,
-        intent_id: String,
-        run_id: String,
-    },
+    Bound { lane: AlwaysOnLaneEvidence },
     /// No Run in the public projection carries a `purpose`, so decision Work
     /// and proposal Run cannot be joined through the public contract.
     ///
     /// This arm is a documented boundary, never a pass: the fixture declares
     /// `proposalRunsObserved`, which is unprovable without the projection, so
     /// the probe fails closed rather than claim an unearned causal oracle.
-    PurposeNotProjected { work_id: String },
+    PurposeNotProjected { work: String },
 }
 
 impl ManagerDecisionBinding {
@@ -993,9 +1025,47 @@ impl ManagerDecisionBinding {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlwaysOnHappyShape {
-    pub native_lanes: Vec<AlwaysOnLane>,
-    pub decision_lane: AlwaysOnLane,
+    pub native_lanes: Vec<AlwaysOnLaneEvidence>,
+    pub decision_lane: AlwaysOnLaneEvidence,
     pub manager_decision_binding: ManagerDecisionBinding,
+}
+
+/// The terminal public Work state the fixture's DAG requires for `step_id`.
+///
+/// The fixture's middle step is a forced failure the manager must replace, so
+/// a blanket "every native step succeeded" expectation can never hold on a
+/// healthy run. Deriving the terminal state per step from the fixture keeps
+/// the oracle exact instead of relaxing it to "any terminal state".
+pub fn expected_step_state(
+    fixture: &AlwaysOnFixture,
+    step_id: &str,
+) -> Result<&'static str, DiagnosticCode> {
+    if step_id == fixture.step_first || step_id == fixture.step_replacement {
+        Ok("succeeded")
+    } else if step_id == fixture.step_failing {
+        Ok("failed")
+    } else if step_id == MANAGER_DECISION_STEP_ID {
+        Ok("succeeded")
+    } else {
+        Err(DiagnosticCode::FixtureInvalid)
+    }
+}
+
+/// The single Work row the manager plan itself occupies.
+///
+/// `ptah_list_work` projects the plan alongside its step lanes. It carries no
+/// `sourceManagerStepId` and no attempts, so it belongs to neither the
+/// bootstrap baseline nor any lane and must be accounted for explicitly.
+pub fn require_plan_work(snapshot: &AlwaysOnSnapshot) -> Result<&WorkIdentity, DiagnosticCode> {
+    let matching: Vec<&WorkIdentity> = snapshot
+        .work
+        .iter()
+        .filter(|item| item.kind.as_deref() == Some(MANAGER_PLAN_KIND))
+        .collect();
+    match matching.as_slice() {
+        [only] if only.source_manager_step_id.is_none() && only.attempts.is_empty() => Ok(only),
+        _ => Err(DiagnosticCode::StateTransitionMismatch),
+    }
 }
 
 /// Resolve the full public identity chain for the Work projected under
@@ -1054,26 +1124,19 @@ pub fn bind_manager_decision(
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
     if snapshot.runs.iter().all(|run| run.purpose.is_none()) {
-        return Ok((
-            lane.clone(),
-            ManagerDecisionBinding::PurposeNotProjected {
-                work_id: lane.work_id,
-            },
-        ));
+        let binding = ManagerDecisionBinding::PurposeNotProjected {
+            work: opaque_durable_id(&lane.work_id),
+        };
+        return Ok((lane, binding));
     }
     let proposals = snapshot.runs_with_purpose(MANAGER_PROPOSAL_PURPOSE);
     if proposals != vec![lane.run_id.as_str()] {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
-    Ok((
-        lane.clone(),
-        ManagerDecisionBinding::Bound {
-            work_id: lane.work_id,
-            attempt_id: lane.attempt_id,
-            intent_id: lane.intent_id,
-            run_id: lane.run_id,
-        },
-    ))
+    let binding = ManagerDecisionBinding::Bound {
+        lane: lane.evidence(),
+    };
+    Ok((lane, binding))
 }
 
 /// Terminal public Work states.
@@ -1103,8 +1166,16 @@ pub fn baseline_is_settled(baseline: &AlwaysOnSnapshot) -> bool {
 
 /// Drop every identity belonging to `lanes`, leaving what the plan did not
 /// create.
-fn residual(snapshot: &AlwaysOnSnapshot, lanes: &[&AlwaysOnLane]) -> AlwaysOnSnapshot {
-    let work_ids: BTreeSet<&str> = lanes.iter().map(|lane| lane.work_id.as_str()).collect();
+fn residual(
+    snapshot: &AlwaysOnSnapshot,
+    lanes: &[&AlwaysOnLane],
+    extra_work: &[&str],
+) -> AlwaysOnSnapshot {
+    let work_ids: BTreeSet<&str> = lanes
+        .iter()
+        .map(|lane| lane.work_id.as_str())
+        .chain(extra_work.iter().copied())
+        .collect();
     let intent_ids: BTreeSet<&str> = lanes.iter().map(|lane| lane.intent_id.as_str()).collect();
     let run_ids: BTreeSet<&str> = lanes.iter().map(|lane| lane.run_id.as_str()).collect();
     let work: Vec<WorkIdentity> = snapshot
@@ -1168,7 +1239,10 @@ pub fn expected_happy_cardinality(
     let decision = widen(fixture.decision_work)?;
     let proposal = widen(fixture.proposal_runs)?;
     Ok(AlwaysOnCardinality {
-        work: sum(baseline.work, sum(native, decision)?)?,
+        work: sum(
+            baseline.work,
+            sum(sum(native, decision)?, MANAGER_PLAN_WORK_ROWS)?,
+        )?,
         runs: sum(baseline.runs, sum(native, proposal)?)?,
         intents: sum(baseline.intents, sum(native, decision)?)?,
     })
@@ -1188,7 +1262,7 @@ pub fn expected_pre_restart_cardinality(
             .ok_or(DiagnosticCode::FixtureInvalid)?,
     )?;
     Ok(AlwaysOnCardinality {
-        work: sum(baseline.work, held)?,
+        work: sum(baseline.work, sum(held, MANAGER_PLAN_WORK_ROWS)?)?,
         runs: sum(baseline.runs, held)?,
         intents: sum(baseline.intents, held)?,
     })
@@ -1208,12 +1282,26 @@ pub fn assert_happy_shape(
         if fixture.native_work_by_step.get(&step) != Some(&1) {
             return Err(DiagnosticCode::FixtureInvalid);
         }
-        native_lanes.push(resolve_lane(final_snapshot, &step)?);
+        let lane = resolve_lane(final_snapshot, &step)?;
+        if final_snapshot.work_for_step(&step)?.state.as_deref()
+            != Some(expected_step_state(fixture, &step)?)
+        {
+            return Err(DiagnosticCode::StateTransitionMismatch);
+        }
+        native_lanes.push(lane);
     }
     if fixture.decision_work != 1 || fixture.proposal_runs != 1 {
         return Err(DiagnosticCode::FixtureInvalid);
     }
     let (decision_lane, manager_decision_binding) = bind_manager_decision(final_snapshot)?;
+    if final_snapshot
+        .work_for_step(MANAGER_DECISION_STEP_ID)?
+        .state
+        .as_deref()
+        != Some(expected_step_state(fixture, MANAGER_DECISION_STEP_ID)?)
+    {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
     if !manager_decision_binding.is_bound() {
         // The fixture asserts one observed proposal Run; without the public
         // `purpose` projection that claim cannot be proven, so fail closed
@@ -1225,14 +1313,18 @@ pub fn assert_happy_shape(
     if distinct.len() != lanes.len() {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
-    assert_exact_snapshot(baseline, &residual(final_snapshot, &lanes))?;
+    let plan_work = require_plan_work(final_snapshot)?.work_id.clone();
+    assert_exact_snapshot(
+        baseline,
+        &residual(final_snapshot, &lanes, &[plan_work.as_str()]),
+    )?;
     assert_exact_cardinality(
         expected_happy_cardinality(fixture, baseline.counts)?,
         final_snapshot.counts,
     )?;
     Ok(AlwaysOnHappyShape {
-        native_lanes,
-        decision_lane,
+        native_lanes: native_lanes.iter().map(AlwaysOnLane::evidence).collect(),
+        decision_lane: decision_lane.evidence(),
         manager_decision_binding,
     })
 }
@@ -1285,11 +1377,45 @@ pub fn assert_home_b_pre_restart_shape(
     {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
-    assert_exact_snapshot(baseline, &residual(pre_restart, &[&lane]))?;
+    let plan_work = require_plan_work(pre_restart)?.work_id.clone();
+    assert_exact_snapshot(
+        baseline,
+        &residual(pre_restart, &[&lane], &[plan_work.as_str()]),
+    )?;
     assert_exact_cardinality(
         expected_pre_restart_cardinality(fixture, baseline.counts)?,
         pre_restart.counts,
     )
+}
+
+/// Assert the held home reached exactly the steady state a restart must
+/// produce.
+///
+/// Comparing the post-restart snapshot against the pre-restart one directly
+/// can never hold: when the held step fails, the autonomous manager reacts
+/// once, materialising a manager-decision lane bound to a manager proposal
+/// Run. The real invariant is that *nothing else* moves — every pre-restart
+/// identity survives, the held lane lands on failed Work over an interrupted
+/// Run, and the manager's reaction is exactly one fully joined decision lane.
+pub fn assert_post_restart_shape(
+    pre_restart: &AlwaysOnSnapshot,
+    post_restart: &AlwaysOnSnapshot,
+    work_id: &str,
+    run_id: &str,
+) -> Result<AlwaysOnLane, DiagnosticCode> {
+    let (decision_lane, binding) = bind_manager_decision(post_restart)?;
+    if !binding.is_bound() {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    let decision_work = post_restart.work_for_step(MANAGER_DECISION_STEP_ID)?;
+    if decision_work.state.as_deref() != Some("succeeded") {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
+    assert_exact_snapshot(
+        &pre_restart.with_interruption(work_id, run_id),
+        &residual(post_restart, &[&decision_lane], &[]),
+    )?;
+    Ok(decision_lane)
 }
 
 // ---------------------------------------------------------------------------
@@ -1442,6 +1568,7 @@ mod tests {
     const SETUP_WORK: &str = "work-setup";
     const SETUP_ATTEMPT: &str = "attempt-setup";
     const SETUP_RUN: &str = "run-setup";
+    const PLAN_WORK: &str = "work-plan";
 
     fn fixture() -> AlwaysOnFixture {
         AlwaysOnFixture::parse(crate::ALWAYS_ON_GROKBOT_FIXTURE).expect("canonical fixture")
@@ -1460,6 +1587,7 @@ mod tests {
         intent: &'static str,
         run: &'static str,
         purpose: Option<&'static str>,
+        state: &'static str,
     }
 
     fn happy_lanes() -> Vec<Lane> {
@@ -1472,6 +1600,7 @@ mod tests {
                 intent: "intent-a",
                 run: "run-a",
                 purpose: Some("native"),
+                state: "succeeded",
             },
             Lane {
                 step: "step-b",
@@ -1481,6 +1610,8 @@ mod tests {
                 intent: "intent-b",
                 run: "run-b",
                 purpose: Some("native"),
+                // The fixture's middle step is the forced failure.
+                state: "failed",
             },
             Lane {
                 step: "step-b-fix",
@@ -1490,6 +1621,7 @@ mod tests {
                 intent: "intent-c",
                 run: "run-c",
                 purpose: Some("native"),
+                state: "succeeded",
             },
             Lane {
                 step: MANAGER_DECISION_STEP_ID,
@@ -1499,6 +1631,7 @@ mod tests {
                 intent: "intent-d",
                 run: "run-d",
                 purpose: Some(MANAGER_PROPOSAL_PURPOSE),
+                state: "succeeded",
             },
         ]
     }
@@ -1508,6 +1641,18 @@ mod tests {
     fn projection(
         lanes: &[Lane],
         with_baseline: bool,
+    ) -> (Value, BTreeMap<String, Value>, Value, Value) {
+        projection_with(lanes, with_baseline, true)
+    }
+
+    /// Build the three list projections plus the per-Work detail documents.
+    ///
+    /// `with_plan` adds the Work row the manager plan itself occupies, which
+    /// the real `ptah_list_work` projection carries alongside the step lanes.
+    fn projection_with(
+        lanes: &[Lane],
+        with_baseline: bool,
+        with_plan: bool,
     ) -> (Value, BTreeMap<String, Value>, Value, Value) {
         let mut work = Vec::new();
         let mut details = BTreeMap::new();
@@ -1536,12 +1681,23 @@ mod tests {
                 "state": "completed"
             }));
         }
+        if with_plan {
+            work.push(json!({
+                "workId": PLAN_WORK,
+                "kind": MANAGER_PLAN_KIND,
+                "state": "blocked"
+            }));
+            details.insert(
+                PLAN_WORK.to_owned(),
+                json!({"work": {"workId": PLAN_WORK}, "attempts": []}),
+            );
+        }
         for lane in lanes {
             work.push(json!({
                 "workId": lane.work,
                 "kind": lane.kind,
                 "sourceManagerStepId": lane.step,
-                "state": "succeeded"
+                "state": lane.state
             }));
             details.insert(
                 lane.work.to_owned(),
@@ -1583,7 +1739,8 @@ mod tests {
     }
 
     fn baseline() -> AlwaysOnSnapshot {
-        snapshot(&[], true)
+        let (work, details, intents, runs) = projection_with(&[], true, false);
+        AlwaysOnSnapshot::build(&work, &details, &intents, &runs).expect("baseline snapshot")
     }
 
     fn happy() -> AlwaysOnSnapshot {
@@ -1608,7 +1765,7 @@ mod tests {
             (
                 "work id replaced",
                 mutated(|work, details, intents, _| {
-                    work["work"][1]["workId"] = json!("work-a-prime");
+                    work["work"][2]["workId"] = json!("work-a-prime");
                     let detail = details.remove("work-a").unwrap();
                     details.insert(
                         "work-a-prime".into(),
@@ -1693,13 +1850,13 @@ mod tests {
             (
                 "work kind rewritten",
                 mutated(|work, _, _, _| {
-                    work["work"][4]["kind"] = json!("native");
+                    work["work"][5]["kind"] = json!("native");
                 }),
             ),
             (
                 "work step reassigned",
                 mutated(|work, _, _, _| {
-                    work["work"][2]["sourceManagerStepId"] = json!("step-substituted");
+                    work["work"][3]["sourceManagerStepId"] = json!("step-substituted");
                 }),
             ),
         ];
@@ -1732,7 +1889,7 @@ mod tests {
             "a repeated linked run must fail"
         );
         let (mut work, details, intents, runs) = projection(&happy_lanes(), true);
-        let duplicate = work["work"][1].clone();
+        let duplicate = work["work"][2].clone();
         work["work"].as_array_mut().unwrap().push(duplicate);
         assert_eq!(
             AlwaysOnSnapshot::build(&work, &details, &intents, &runs),
@@ -1770,17 +1927,21 @@ mod tests {
         );
         // Everything else is untouched, so a second lane drifting still fails.
         assert_eq!(
-            expected.work_for_step("step-b").unwrap().state.as_deref(),
+            expected
+                .work_for_step("step-b-fix")
+                .unwrap()
+                .state
+                .as_deref(),
             Some("succeeded")
         );
         assert_eq!(
-            expected.run("run-b").unwrap().state.as_deref(),
+            expected.run("run-c").unwrap().state.as_deref(),
             Some("completed")
         );
         assert_eq!(expected.counts, canonical.counts);
         let drifted = canonical
             .with_interruption("work-a", "run-a")
-            .with_interruption("work-b", "run-b");
+            .with_interruption("work-c", "run-c");
         assert_eq!(
             assert_exact_snapshot(&expected, &drifted),
             Err(DiagnosticCode::StateTransitionMismatch)
@@ -1817,7 +1978,7 @@ mod tests {
     #[test]
     fn bootstrap_baseline_rejects_every_polluted_home() {
         let fixture = fixture();
-        let (work, details, intents, runs) = projection(&[], true);
+        let (work, details, intents, runs) = projection_with(&[], true, false);
 
         let mut extra_runs = runs.clone();
         extra_runs["runs"].as_array_mut().unwrap().push(json!({
@@ -1911,7 +2072,7 @@ mod tests {
     // -- Home-B pre-restart shape --------------------------------------------
 
     fn held_projection() -> (Value, BTreeMap<String, Value>, Value, Value) {
-        let (mut work, mut details, mut intents, mut runs) = projection(&[], true);
+        let (mut work, mut details, mut intents, mut runs) = projection_with(&[], true, true);
         work["work"].as_array_mut().unwrap().push(json!({
             "workId": "work-a",
             "kind": "native",
@@ -2093,22 +2254,32 @@ mod tests {
         let fixture = fixture();
         let shape = assert_happy_shape(&fixture, &baseline(), &happy()).expect("happy shape");
         assert_eq!(shape.native_lanes.len(), 3);
-        assert_eq!(shape.decision_lane.work_id, "work-d");
+        assert_eq!(shape.decision_lane.step_id, MANAGER_DECISION_STEP_ID);
+        assert_eq!(shape.decision_lane.work, opaque_durable_id("work-d"));
         assert_eq!(
             shape.manager_decision_binding,
             ManagerDecisionBinding::Bound {
-                work_id: "work-d".into(),
-                attempt_id: "attempt-d".into(),
-                intent_id: "intent-d".into(),
-                run_id: "run-d".into(),
+                lane: AlwaysOnLaneEvidence {
+                    step_id: MANAGER_DECISION_STEP_ID.into(),
+                    work: opaque_durable_id("work-d"),
+                    attempt: opaque_durable_id("attempt-d"),
+                    intent: opaque_durable_id("intent-d"),
+                    run: opaque_durable_id("run-d"),
+                }
             }
         );
+        // Published evidence must never carry a raw durable identifier: the
+        // report is redaction-scanned before it is written.
+        let published = serde_json::to_value(&shape).unwrap();
+        grokptah_agent_bridge::scan_value_for_forbidden_data(&published)
+            .expect("published always-on shape must survive the redaction scan");
+        assert!(!published.to_string().contains("work-d"));
         assert!(shape.manager_decision_binding.is_bound());
         // The counts the identity oracle implies, cross-checked independently.
         assert_eq!(
             expected_happy_cardinality(&fixture, baseline().counts).unwrap(),
             AlwaysOnCardinality {
-                work: 5,
+                work: 6,
                 runs: 5,
                 intents: 4
             }
@@ -2116,10 +2287,103 @@ mod tests {
         assert_eq!(
             happy().counts,
             AlwaysOnCardinality {
+                work: 6,
+                runs: 5,
+                intents: 4
+            }
+        );
+        assert_eq!(require_plan_work(&happy()).unwrap().work_id, PLAN_WORK);
+    }
+
+    /// The shapes below are what the shipped `grokptah-service` actually
+    /// projects, recorded so a contract change shows up as a test failure
+    /// rather than as a probe that silently stops proving anything.
+    #[test]
+    fn observed_service_contract_shapes_are_pinned() {
+        let fixture = fixture();
+        // A direct `ptah_submit_task` materialises one Run and no Work or
+        // intents, so the bootstrap baseline is Run-only.
+        let bare_baseline = AlwaysOnSnapshot::build(
+            &json!({"work": []}),
+            &BTreeMap::new(),
+            &json!({"intents": []}),
+            &json!({"runs": [{
+                "runId": SETUP_RUN,
+                "requestId": "req-setup",
+                "purpose": "execution",
+                "state": "completed"
+            }]}),
+        )
+        .unwrap();
+        assert_eq!(
+            bare_baseline.counts,
+            AlwaysOnCardinality {
+                work: 0,
+                runs: 1,
+                intents: 0
+            }
+        );
+        assert_eq!(
+            assert_bootstrap_baseline(&bare_baseline, &fixture, SETUP_RUN),
+            Ok(())
+        );
+        // The completed plan adds its own Work row, three native lanes and the
+        // manager-decision lane whose Run carries `manager_proposal`.
+        assert_eq!(
+            expected_happy_cardinality(&fixture, bare_baseline.counts).unwrap(),
+            AlwaysOnCardinality {
                 work: 5,
                 runs: 5,
                 intents: 4
             }
+        );
+        // While the first step is held, only the plan Work and the held lane
+        // exist.
+        assert_eq!(
+            expected_pre_restart_cardinality(&fixture, bare_baseline.counts).unwrap(),
+            AlwaysOnCardinality {
+                work: 2,
+                runs: 2,
+                intents: 1
+            }
+        );
+    }
+
+    #[test]
+    fn happy_shape_pins_each_step_to_its_fixture_terminal_state() {
+        let fixture = fixture();
+        assert_eq!(expected_step_state(&fixture, "step-a"), Ok("succeeded"));
+        assert_eq!(expected_step_state(&fixture, "step-b"), Ok("failed"));
+        assert_eq!(expected_step_state(&fixture, "step-b-fix"), Ok("succeeded"));
+        assert_eq!(
+            expected_step_state(&fixture, MANAGER_DECISION_STEP_ID),
+            Ok("succeeded")
+        );
+        assert_eq!(
+            expected_step_state(&fixture, "step-unknown"),
+            Err(DiagnosticCode::FixtureInvalid)
+        );
+        // Each step's terminal state is part of the oracle: a forced-failure
+        // step that reports success, or a step that should succeed reporting
+        // failure, must both be rejected.
+        for (index, state) in [(3usize, "succeeded"), (2, "failed"), (4, "failed")] {
+            let mut parts = projection(&happy_lanes(), true);
+            parts.0["work"][index]["state"] = json!(state);
+            let snapshot = AlwaysOnSnapshot::build(&parts.0, &parts.1, &parts.2, &parts.3).unwrap();
+            assert_eq!(
+                assert_happy_shape(&fixture, &baseline(), &snapshot),
+                Err(DiagnosticCode::StateTransitionMismatch),
+                "work row {index} reporting {state} must fail"
+            );
+        }
+        // The manager-decision lane must have succeeded.
+        let mut decision = projection(&happy_lanes(), true);
+        decision.0["work"][5]["state"] = json!("failed");
+        let decision =
+            AlwaysOnSnapshot::build(&decision.0, &decision.1, &decision.2, &decision.3).unwrap();
+        assert_eq!(
+            assert_happy_shape(&fixture, &baseline(), &decision),
+            Err(DiagnosticCode::StateTransitionMismatch)
         );
     }
 
@@ -2169,7 +2433,7 @@ mod tests {
         // A decision Work whose public kind does not agree with its reserved
         // step id is not the decision lane.
         let mut mislabelled = projection(&happy_lanes(), true);
-        mislabelled.0["work"][4]["kind"] = json!("native");
+        mislabelled.0["work"][5]["kind"] = json!("native");
         let mislabelled = AlwaysOnSnapshot::build(
             &mislabelled.0,
             &mislabelled.1,
@@ -2198,7 +2462,7 @@ mod tests {
         assert_eq!(
             binding,
             ManagerDecisionBinding::PurposeNotProjected {
-                work_id: "work-d".into()
+                work: opaque_durable_id("work-d")
             }
         );
         assert!(!binding.is_bound());
@@ -2271,6 +2535,163 @@ mod tests {
         drifted.work[0].state = Some("failed".into());
         assert_eq!(
             assert_happy_shape(&fixture, &drifted, &happy()),
+            Err(DiagnosticCode::StateTransitionMismatch)
+        );
+    }
+
+    // -- post-restart steady state -------------------------------------------
+
+    /// The held home after a restart: the held lane failed over an interrupted
+    /// Run, plus the manager's single decision lane.
+    fn post_restart() -> AlwaysOnSnapshot {
+        let (mut work, mut details, mut intents, mut runs) = held_projection();
+        work["work"][2]["state"] = json!("failed");
+        for run in runs["runs"].as_array_mut().unwrap() {
+            if run["runId"] == json!("run-a") {
+                run["state"] = json!("interrupted");
+            }
+        }
+        work["work"].as_array_mut().unwrap().push(json!({
+            "workId": "work-d",
+            "kind": MANAGER_DECISION_KIND,
+            "sourceManagerStepId": MANAGER_DECISION_STEP_ID,
+            "state": "succeeded"
+        }));
+        details.insert(
+            "work-d".into(),
+            json!({
+                "work": {"workId": "work-d"},
+                "attempts": [{"attemptId": "attempt-d", "linkedRunIds": ["run-d"]}]
+            }),
+        );
+        intents["intents"].as_array_mut().unwrap().push(json!({
+            "intentId": "intent-d",
+            "workId": "work-d",
+            "attemptId": "attempt-d",
+            "runId": "run-d",
+            "inputHash": "hash-work-d",
+            "workRevision": 1,
+            "agentSpecRevision": 1
+        }));
+        runs["runs"].as_array_mut().unwrap().push(json!({
+            "runId": "run-d",
+            "requestId": "intent-d",
+            "purpose": MANAGER_PROPOSAL_PURPOSE,
+            "state": "completed"
+        }));
+        AlwaysOnSnapshot::build(&work, &details, &intents, &runs).expect("post-restart snapshot")
+    }
+
+    #[test]
+    fn post_restart_shape_accepts_exactly_one_manager_reaction() {
+        let lane = assert_post_restart_shape(&held(), &post_restart(), "work-a", "run-a")
+            .expect("post-restart steady state");
+        assert_eq!(lane.work_id, "work-d");
+        assert_eq!(lane.run_id, "run-d");
+        // Comparing pre-restart against post-restart directly can never hold:
+        // the manager legitimately adds its decision lane.
+        assert_eq!(
+            assert_exact_snapshot(
+                &held().with_interruption("work-a", "run-a"),
+                &post_restart()
+            ),
+            Err(DiagnosticCode::StateTransitionMismatch)
+        );
+    }
+
+    #[test]
+    fn post_restart_shape_rejects_any_movement_beyond_the_decision_lane() {
+        // The held lane must land on failed Work over an interrupted Run.
+        let mut still_running = post_restart();
+        still_running
+            .runs
+            .iter_mut()
+            .find(|run| run.run_id == "run-a")
+            .unwrap()
+            .state = Some("running".into());
+        assert_eq!(
+            assert_post_restart_shape(&held(), &still_running, "work-a", "run-a"),
+            Err(DiagnosticCode::StateTransitionMismatch)
+        );
+        let mut not_failed = post_restart();
+        not_failed
+            .work
+            .iter_mut()
+            .find(|item| item.work_id == "work-a")
+            .unwrap()
+            .state = Some("succeeded".into());
+        assert_eq!(
+            assert_post_restart_shape(&held(), &not_failed, "work-a", "run-a"),
+            Err(DiagnosticCode::StateTransitionMismatch)
+        );
+        // The held lane's identities must survive the restart untouched.
+        let mut relinked = post_restart();
+        relinked
+            .work
+            .iter_mut()
+            .find(|item| item.work_id == "work-a")
+            .unwrap()
+            .attempts[0]
+            .linked_run_ids = vec!["run-readmitted".into()];
+        assert_eq!(
+            assert_post_restart_shape(&held(), &relinked, "work-a", "run-a"),
+            Err(DiagnosticCode::StateTransitionMismatch)
+        );
+        // Growth beyond the single decision lane must fail.
+        let mut grown = post_restart();
+        grown.runs.push(RunIdentity {
+            run_id: "run-extra".into(),
+            request_id: "req-extra".into(),
+            purpose: Some("execution".into()),
+            state: Some("running".into()),
+        });
+        grown.runs.sort();
+        grown.counts.runs += 1;
+        assert_eq!(
+            assert_post_restart_shape(&held(), &grown, "work-a", "run-a"),
+            Err(DiagnosticCode::StateTransitionMismatch)
+        );
+        // The plan Work row must still be there and still be attempt-free.
+        let mut plan_gone = post_restart();
+        plan_gone.work.retain(|item| item.work_id != PLAN_WORK);
+        plan_gone.counts.work -= 1;
+        assert_eq!(
+            assert_post_restart_shape(&held(), &plan_gone, "work-a", "run-a"),
+            Err(DiagnosticCode::StateTransitionMismatch)
+        );
+        assert_eq!(
+            require_plan_work(&plan_gone),
+            Err(DiagnosticCode::StateTransitionMismatch)
+        );
+        let mut plan_with_attempt = post_restart();
+        plan_with_attempt
+            .work
+            .iter_mut()
+            .find(|item| item.work_id == PLAN_WORK)
+            .unwrap()
+            .attempts
+            .push(AttemptIdentity {
+                attempt_id: "attempt-plan".into(),
+                linked_run_ids: vec!["run-plan".into()],
+            });
+        assert_eq!(
+            require_plan_work(&plan_with_attempt),
+            Err(DiagnosticCode::StateTransitionMismatch)
+        );
+        // Two decision lanes are two reactions, not one.
+        let mut doubled = post_restart();
+        let mut second = doubled
+            .work
+            .iter()
+            .find(|item| item.work_id == "work-d")
+            .unwrap()
+            .clone();
+        second.work_id = "work-d2".into();
+        doubled.work.push(second);
+        doubled.work.sort();
+        doubled.counts.work += 1;
+        assert_eq!(
+            assert_post_restart_shape(&held(), &doubled, "work-a", "run-a"),
             Err(DiagnosticCode::StateTransitionMismatch)
         );
     }
