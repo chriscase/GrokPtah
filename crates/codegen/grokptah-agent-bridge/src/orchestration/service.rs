@@ -759,17 +759,14 @@ impl OrchestrationService {
             "executionMode": intent.execution_mode,
             "queuedPosition": serde_json::Value::Null,
         });
-        let prompt = match self.store.claim_acceptance_input(
+        let prompt = self.store.claim_acceptance_input(
             &pending.run_id,
             &attempt.attempt_id,
             &attempt.owner_instance_id,
             attempt.revision,
             &run,
             response,
-        ) {
-            Ok(prompt) => prompt,
-            Err(error) => return Err(error),
-        };
+        )?;
         Ok(Some((run, prompt, attempt, intent.execution_mode)))
     }
 

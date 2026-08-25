@@ -1593,7 +1593,7 @@ impl OrchStore {
                         #[cfg(unix)]
                         {
                             use std::os::unix::fs::PermissionsExt;
-                            return metadata.permissions().mode() & 0o777 == 0o600;
+                            metadata.permissions().mode() & 0o777 == 0o600
                         }
                         #[cfg(not(unix))]
                         {
@@ -1865,10 +1865,7 @@ fn private_write_json_exclusive<T: serde::Serialize>(
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) => return Err(error),
-    };
+    let mut file = options.open(path)?;
     let result = (|| -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -3069,7 +3066,7 @@ mod tests {
         let (run, intent) = queued_run("receipt-before-lease", 1);
         store.save_run(&run).unwrap();
         store.save_acceptance_intent(&intent).unwrap();
-        store
+        assert!(store
             .complete_idempotency(
                 &intent.tool,
                 &intent.request_id,
@@ -3077,8 +3074,7 @@ mod tests {
                 Some(intent.run_id.clone()),
                 intent.response.clone(),
             )
-            .err()
-            .expect("no claim exists yet");
+            .is_err());
         store
             .claim_idempotency(&intent.tool, &intent.request_id, &intent.payload_hash)
             .unwrap();
