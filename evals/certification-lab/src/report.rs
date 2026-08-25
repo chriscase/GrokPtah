@@ -660,6 +660,33 @@ impl CampaignReport {
                 if trace.probe_id != probe.probe_id {
                     bail!("referenced trace belongs to a different probe");
                 }
+                // The always-on probe restarts the service twice and each
+                // restart publishes an explicit disconnect, restart and
+                // reconnect record. Counting them here means a candidate
+                // cannot quietly drop half the restart evidence and still
+                // present two restarts.
+                if probe.probe_id == "always-on-grokbot-lifecycle-v1"
+                    && probe.status == ProbeStatus::Passed
+                {
+                    let count = |operation: TraceOperationCode| {
+                        trace
+                            .records
+                            .iter()
+                            .filter(|record| record.operation == operation)
+                            .count()
+                    };
+                    let disconnects = count(TraceOperationCode::Disconnect);
+                    let restarts = count(TraceOperationCode::Restart);
+                    let reconnects = count(TraceOperationCode::Reconnect);
+                    if disconnects != 2 || restarts != 2 || reconnects != 2 {
+                        bail!(
+                            "always-on trace must publish two disconnect, restart and reconnect records, found {disconnects}/{restarts}/{reconnects}"
+                        );
+                    }
+                    if probe.counters.restarts != 2 {
+                        bail!("always-on probe must report exactly two restarts");
+                    }
+                }
                 if probe.counters.dropped_records != trace.dropped_records {
                     bail!("probe drop counter does not match its verified trace");
                 }
