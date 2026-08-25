@@ -150,6 +150,8 @@ pub enum DenyReason {
     ExpiredGrant,
     /// Allowed by capability, but wider than the grant's visibility cap.
     VisibilityCapped,
+    /// The presented source record is not the one the manifest holds.
+    SourceDigestMismatch,
 }
 
 /// Per-source outcome.

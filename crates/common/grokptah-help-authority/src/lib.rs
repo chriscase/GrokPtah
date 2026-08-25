@@ -24,10 +24,16 @@
 
 pub mod contract;
 pub mod grant;
+pub mod manifest;
 pub mod schema;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+pub use manifest::{
+    HELP_MANIFEST_SCHEMA, ManifestEntry, ManifestError, SourceManifest, normalize_source_bytes,
+    reject_duplicate_keys, source_digest,
+};
 
 pub use grant::{
     AuthenticatedPrincipal, GrantAcceptance, GrantMintingKey, GrantRejection, HELP_GRANT_SCHEMA,
@@ -490,6 +496,58 @@ pub fn authorize_with_grant(
     response
 }
 
+/// Authorize using a grant, with every descriptor enforced against the manifest.
+///
+/// This is what the transports call. `authorize_with_grant` trusts the
+/// descriptors it is handed; this refuses any descriptor that is not exactly
+/// the record the server-owned manifest holds, which is the check
+/// `SourceDescriptor.digest` previously lacked entirely.
+///
+/// A descriptor that fails enforcement is denied individually rather than
+/// failing the whole action, so one stale record cannot be used to deny an
+/// unrelated principal's whole request.
+#[must_use]
+pub fn authorize_against_manifest(
+    key: &GrantMintingKey,
+    presented: &HelpGrant,
+    acceptance: &GrantAcceptance,
+    manifest: &SourceManifest,
+    requested_source_ids: &[String],
+) -> DecisionResponse {
+    // Descriptors are rebuilt from the manifest, never taken from the caller.
+    let descriptors = manifest.describe(requested_source_ids);
+    let mut enforced = Vec::with_capacity(descriptors.len());
+    let mut rejected = Vec::new();
+    for descriptor in descriptors {
+        match manifest.enforce_descriptor(&descriptor) {
+            Ok(()) => enforced.push(descriptor),
+            Err(_) => rejected.push(SourceDecision {
+                source_id: receipt_safe_id(&descriptor.source_id),
+                allowed: false,
+                denied_because: Some(DenyReason::SourceDigestMismatch),
+            }),
+        }
+    }
+    // An id the manifest does not know is denied, not silently dropped.
+    for id in requested_source_ids {
+        if manifest.get(id).is_none() {
+            rejected.push(SourceDecision {
+                source_id: receipt_safe_id(id),
+                allowed: false,
+                denied_because: Some(DenyReason::SourceDigestMismatch),
+            });
+        }
+    }
+
+    let mut response = authorize_with_grant(key, presented, acceptance, &enforced);
+    if !rejected.is_empty() {
+        let mut denied = response.receipt.denied.clone();
+        denied.extend(rejected);
+        response.receipt.denied = denied;
+    }
+    response
+}
+
 /// True when `actual` is no wider than `cap`.
 fn visibility_within(actual: Visibility, cap: Visibility) -> bool {
     let rank = |visibility: Visibility| match visibility {
@@ -521,5 +579,7 @@ pub fn authorize_json(
 
 #[cfg(test)]
 mod grant_tests;
+#[cfg(test)]
+mod manifest_tests;
 #[cfg(test)]
 mod tests;
