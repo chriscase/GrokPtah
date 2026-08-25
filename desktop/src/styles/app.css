@@ -6445,7 +6445,7 @@ html[data-accent="violet"] {
   font-size: 11px;
 }
 
-+.help-center {
+.help-center {
   position: fixed;
   inset: 0;
   z-index: 86;
