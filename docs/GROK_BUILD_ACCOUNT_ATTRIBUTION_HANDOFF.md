@@ -137,24 +137,75 @@ used an isolated `CARGO_TARGET_DIR` under this session's scratchpad, serially.
 The protected soak target was never a build target here.
 
 `libdbus-1-dev` and `pkg-config` were installed into the container so the
-existing `keyring` dependency links on Linux. That is an environment fix; no
-manifest or dependency was changed.
+existing `keyring` dependency links on Linux, and `npm ci` was run in
+`desktop/`. Both are environment setup; no manifest, lockfile, or dependency was
+changed.
 
 | Gate | Result |
 | --- | --- |
-| `cargo check --lib` at `fccb7fc` before editing | pass — baseline, 3 pre-existing warnings |
-| `cargo check --lib --all-targets` after the slice | pass — same 3 pre-existing warnings, no new ones |
-| `cargo test --lib grok_account` | 18 passed, 0 failed |
-| `cargo test --test grok_account_contract` | 10 passed, 0 failed |
-| `cargo test --lib` (full crate unit suite) | see the run log referenced in the PR body |
+| `cargo fmt -- --check` | clean |
+| `cargo check --lib` at `fccb7fc`, before editing | pass — baseline, 3 pre-existing warnings |
+| `cargo check --lib --all-targets` after the slice | pass — same 3 warnings, none new |
+| `cargo test --lib grok_account` | **18 passed, 0 failed** |
+| `cargo test --test grok_account_contract` | **10 passed, 0 failed** |
+| `cargo test --test native_executor_mcp` | 19 passed, 0 failed |
+| `cargo test --test orchestration_control` | 42 passed, 0 failed |
+| `cargo test --lib` at `fccb7fc` (baseline) | 741 passed, **4 failed** |
+| `cargo test --lib` on this branch, run 1 | 759 passed, **4 failed** |
+| `cargo test --lib` on this branch, run 2 | 759 passed, **4 failed** |
+| `cargo clippy --all-targets -- -D warnings` at `fccb7fc` | **fails** — 3 dead-code errors |
+| `cargo clippy --all-targets -- -D warnings` on this branch | **fails identically** — same 3 errors |
+| `npm run typecheck` (desktop) | pass |
+| `npm run test` (desktop vitest) | 48 files, 379 tests passed |
+
+### Reading the four `cargo test --lib` failures
+
+They are **pre-existing on Linux and not caused by this slice**. The same four
+fail at the untouched `fccb7fc` baseline:
+
+```
+computer_use::isolated_visual::tests::serialized_contract_contains_no_host_paths_or_channel_secret
+computer_use::isolated_visual_channel::tests::canonical_binding_vector_matches_freestanding_guest
+computer_use::isolated_visual_runtime::tests::runtime_requires_binding_before_channels_and_stop
+computer_use::macos_observation::tests::secure_values_are_removed_and_evidence_is_exactly_scoped
+```
+
+741 → 759 passing is exactly +18, this slice's new unit tests, with the failing
+set unchanged. None of the four is in a file this slice touches.
+
+### Reading the clippy failure
+
+Also pre-existing on Linux, and identical at baseline: three `dead_code` errors
+for macOS-only items (`verified`, `native_context` ×2) in
+`computer_use/isolated_visual_artifacts.rs` and
+`computer_use/macos_observation.rs`, promoted to errors by `-D warnings`. No
+clippy finding names a file this slice touches. **This gate is red on Linux
+before and after; it is not evidence for this slice either way.** It must be run
+on macOS to be meaningful.
+
+### One observed flake, recorded rather than omitted
+
+The first full `cargo test --lib` run on this branch showed a fifth failure,
+`mcp_control::tests::computer_reads_fail_closed_when_the_ledger_is_unavailable`
+(got HTTP 200, expected 405). It did **not** reproduce in two subsequent full
+runs, and it passes in isolation on this branch. The test depends on
+process-global state (`set_grokptah_home_override` plus a `home_override_serial`
+guard) and asserts that an exclusive `ComputerStore` lock taken outside the host
+blocks the host's ensure; a `200` means the host resolved a different home than
+the outside lock did. That is an ordering/parallelism hazard in the test itself.
+This slice adds no test that touches the home override. Not fixed here, and not
+claimed as unrelated with certainty — recorded so the next operator can watch
+for it.
 
 ## Remaining unverified gates — not claimed
 
 - No live Grok Build / OIDC session was exercised. Every account projection in
   this slice was driven by synthetic facts and a fixed clock.
 - No live provider request, response, usage counter, or quota reservation.
-- The desktop UI is **not** wired to gate the Run control on `account.usable`.
-  The contract and payload exist; consuming them in `App.tsx` is the next step.
+- The desktop UI is **not** wired to gate the Run control on `account.usable`,
+  and renders no expiry warning. The contract, the payload, and the TS types
+  exist and typecheck; consuming them in `App.tsx` / `SettingsPanel.tsx` is the
+  next step and is where this slice becomes visible to a user.
 - `desktop/src/lib/protocol.ts` was hand-mirrored. No generator or cross-language
   schema test pins the Rust and TS contracts together; a drift test is a natural
   follow-up.
