@@ -39,8 +39,21 @@ function compare(left: string, right: string): number {
  * stay under `HELP_CHUNK_MAX_CHARS`. A single over-long sentence is hard-split
  * so a chunk can never exceed the bound.
  */
+/**
+ * Normalize to NFC.
+ *
+ * Citation spans are offsets into chunk text. If the corpus mixed composed and
+ * decomposed forms, the same visible character could occupy one or two code
+ * points depending on which article it came from, and a span would land in a
+ * different place than the text it quotes. Normalizing once, here, keeps every
+ * span in one coordinate system.
+ */
+function nfc(value: string): string {
+  return value.normalize("NFC");
+}
+
 function splitIntoChunkTexts(body: string): string[] {
-  const sentences = body
+  const sentences = nfc(body)
     .split(/(?<=[.!?])\s+/u)
     .map((sentence) => sentence.trim())
     .filter((sentence) => sentence.length > 0);
@@ -80,7 +93,7 @@ function buildChunks(article: HelpCanonicalArticle): UndigestedChunk[] {
       articleId: article.id,
       kind: "title",
       ordinal: 0,
-      text: article.title,
+      text: nfc(article.title),
       locale: "en",
       sourceIds,
     },
@@ -89,7 +102,7 @@ function buildChunks(article: HelpCanonicalArticle): UndigestedChunk[] {
       articleId: article.id,
       kind: "summary",
       ordinal: 0,
-      text: article.summary,
+      text: nfc(article.summary),
       locale: "en",
       sourceIds,
     },
@@ -113,7 +126,7 @@ function buildChunks(article: HelpCanonicalArticle): UndigestedChunk[] {
       articleId: article.id,
       kind: "title",
       ordinal: 0,
-      text: localization.title,
+      text: nfc(localization.title),
       locale: localization.locale,
       sourceIds,
     });
@@ -122,7 +135,7 @@ function buildChunks(article: HelpCanonicalArticle): UndigestedChunk[] {
       articleId: article.id,
       kind: "summary",
       ordinal: 0,
-      text: localization.summary,
+      text: nfc(localization.summary),
       locale: localization.locale,
       sourceIds,
     });

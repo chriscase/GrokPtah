@@ -10,7 +10,8 @@ import {
   validateHelpAnswerResponse,
   type HelpAnswerRequest,
 } from "./answer/contract";
-import { HELP_CORPUS_DIGEST } from "./canonical/corpus";
+import { HELP_CORPUS_DIGEST, getHelpChunk } from "./canonical/corpus";
+import { verifyHelpClaimSpan } from "./retrieval/spans";
 import { searchHelpCorpus } from "./retrieval/hybrid";
 
 const ROUTE = createHelpAnswerRoute("company-gateway", "tenant-42", "review-model");
@@ -21,12 +22,25 @@ function fixture(): HelpAnswerRequest {
   return buildHelpAnswerRequest("durable run recovery", results, ROUTE);
 }
 
+/** A verbatim sentence from the chunk, which every citation must now carry. */
+function quoteFrom(request: HelpAnswerRequest, index = 0): string {
+  const chunk = request.context[index]!;
+  return chunk.text.slice(0, Math.min(120, chunk.text.length));
+}
+
 function goodReply(request: HelpAnswerRequest) {
   const chunk = request.context[0]!;
   return {
     schema: HELP_ANSWER_RESPONSE_SCHEMA,
     answer: "Resume only from a durable checkpoint with the same scoped run identity.",
-    citations: [{ chunkId: chunk.chunkId, articleId: chunk.articleId, sourceId: chunk.sourceIds[0]! }],
+    citations: [
+      {
+        chunkId: chunk.chunkId,
+        articleId: chunk.articleId,
+        sourceId: chunk.sourceIds[0]!,
+        quote: quoteFrom(request),
+      },
+    ],
     uncertainty: "Live capability state must still be re-checked.",
     corpusDigest: request.corpusDigest,
     routeDigest: request.route.routeDigest,
@@ -123,6 +137,7 @@ describe("Help answer response validation", () => {
           chunkId: r.context[0]!.chunkId,
           articleId: r.context[0]!.articleId,
           sourceId: r.context[0]!.sourceIds[0]!,
+          quote: quoteFrom(r),
         })),
       }),
     ],
@@ -130,14 +145,60 @@ describe("Help answer response validation", () => {
       "citation-outside-context",
       (r: HelpAnswerRequest) => ({
         ...goodReply(r),
-        citations: [{ chunkId: "getting-started.sessions#en.title.0", articleId: "getting-started.sessions", sourceId: "product.readme.quick-start" }],
+        citations: [{ chunkId: "getting-started.sessions#en.title.0", articleId: "getting-started.sessions", sourceId: "product.readme.quick-start", quote: "Sessions" }],
       }),
     ],
     [
       "unknown-citation",
       (r: HelpAnswerRequest) => ({
         ...goodReply(r),
-        citations: [{ chunkId: r.context[0]!.chunkId, articleId: r.context[0]!.articleId, sourceId: "invented.source" }],
+        citations: [{ chunkId: r.context[0]!.chunkId, articleId: r.context[0]!.articleId, sourceId: "invented.source", quote: quoteFrom(r) }],
+      }),
+    ],
+    [
+      "unverifiable-quote",
+      (r: HelpAnswerRequest) => ({
+        ...goodReply(r),
+        citations: [
+          {
+            chunkId: r.context[0]!.chunkId,
+            articleId: r.context[0]!.articleId,
+            sourceId: r.context[0]!.sourceIds[0]!,
+            // Plausible, fluent, and not in the chunk.
+            quote: "A restart always makes it safe to resend the request.",
+          },
+        ],
+      }),
+    ],
+    [
+      "unverifiable-quote",
+      (r: HelpAnswerRequest) => ({
+        ...goodReply(r),
+        citations: [
+          {
+            chunkId: r.context[0]!.chunkId,
+            articleId: r.context[0]!.articleId,
+            sourceId: r.context[0]!.sourceIds[0]!,
+            quote: "   ",
+          },
+        ],
+      }),
+    ],
+    [
+      "insufficient-support",
+      (r: HelpAnswerRequest) => ({
+        ...goodReply(r),
+        // A long answer pinned to a very short quote is an uncited claim
+        // wearing a citation.
+        answer: "Durable recovery works like this. ".repeat(40),
+        citations: [
+          {
+            chunkId: r.context[0]!.chunkId,
+            articleId: r.context[0]!.articleId,
+            sourceId: r.context[0]!.sourceIds[0]!,
+            quote: r.context[0]!.text.slice(0, 12),
+          },
+        ],
       }),
     ],
     [
@@ -248,6 +309,51 @@ describe("Help answer execution", () => {
     if (outcome.ok) {
       expect(outcome.response.routeDigest).toBe(ROUTE.routeDigest);
       expect(outcome.response.citations[0]?.chunkId).toBeDefined();
+    }
+  });
+});
+
+describe("Help answer claim-level support", () => {
+  it("returns a verified span for every accepted citation", () => {
+    const request = fixture();
+    const validation = validateHelpAnswerResponse(goodReply(request), request);
+    expect(validation.accepted).toBe(true);
+    if (!validation.accepted) return;
+    for (const citation of validation.response.citations) {
+      // The span is re-derived from the corpus during validation, so a
+      // consumer can re-check it without trusting the provider.
+      expect(verifyHelpClaimSpan(citation.span)).toEqual({ ok: true });
+      const chunk = getHelpChunk(citation.chunkId)!;
+      expect(chunk.text.slice(citation.span.startUtf16, citation.span.endUtf16)).toBe(citation.quote);
+    }
+  });
+
+  it("accepts a quote supplied in a different normalization form", () => {
+    const results = searchHelpCorpus("cómo recuperar una ejecución duradera", { limit: 3 }).results;
+    const request = buildHelpAnswerRequest("recuperación duradera", results, ROUTE);
+    const chunk = request.context[0]!;
+    const reply = {
+      schema: HELP_ANSWER_RESPONSE_SCHEMA,
+      answer: chunk.text.slice(0, 40),
+      citations: [
+        {
+          chunkId: chunk.chunkId,
+          articleId: chunk.articleId,
+          sourceId: chunk.sourceIds[0]!,
+          quote: chunk.text.slice(0, 40).normalize("NFD"),
+        },
+      ],
+      uncertainty: "Bounded to the cited chunk.",
+      corpusDigest: request.corpusDigest,
+      routeDigest: request.route.routeDigest,
+    };
+    const validation = validateHelpAnswerResponse(reply, request);
+    expect(validation.accepted).toBe(true);
+    if (validation.accepted) {
+      // Stored back in the corpus's own form, not the caller's.
+      expect(validation.response.citations[0]!.quote.normalize("NFC")).toBe(
+        validation.response.citations[0]!.quote,
+      );
     }
   });
 });
