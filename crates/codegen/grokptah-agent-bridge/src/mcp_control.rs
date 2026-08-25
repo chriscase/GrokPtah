@@ -3026,6 +3026,60 @@ mod tests {
         set_grokptah_home_override(None);
     }
 
+    #[test]
+    fn public_error_taxonomy_keeps_transport_codes_on_reason_code() {
+        // `json_err` keeps `data.code` on the public taxonomy. Internal
+        // OrchError codes stay on bounded `reasonCode` and must not leak as
+        // the public message.
+        let cases = [
+            (
+                OrchErrorCode::Unsupported,
+                "computer use is unavailable on this host",
+                StatusCode::METHOD_NOT_ALLOWED,
+                PublicErrorCode::InvalidRequest,
+                "unsupported",
+                "The operation is unsupported.",
+            ),
+            (
+                OrchErrorCode::Timeout,
+                "request timed out",
+                StatusCode::GATEWAY_TIMEOUT,
+                PublicErrorCode::Internal,
+                "timeout",
+                "The request exceeded its bounded deadline.",
+            ),
+            (
+                OrchErrorCode::ForbiddenScope,
+                "tool run_terminal_cmd is not available",
+                StatusCode::FORBIDDEN,
+                PublicErrorCode::ForbiddenScope,
+                "forbidden_scope",
+                "The requested scope is not allowed.",
+            ),
+            (
+                OrchErrorCode::CursorExpired,
+                "computer run event cursor is below the retained window",
+                StatusCode::GONE,
+                PublicErrorCode::StaleOrRecovery,
+                "cursor_expired",
+                "The requested state is stale or requires recovery.",
+            ),
+        ];
+        for (code, internal, status, public, reason, message) in cases {
+            let error = OrchError::new(code, internal);
+            assert_eq!(status_for(&error), status, "{}", error.code.as_str());
+            assert_eq!(public_error_code(&error.code), public);
+            assert_eq!(error.code.as_str(), reason);
+            assert_eq!(public_error_message(&error.code), message);
+            assert_ne!(
+                public_error_message(&error.code),
+                error.message.as_str(),
+                "{} must not publish the internal transport message",
+                error.code.as_str()
+            );
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn computer_reads_fail_closed_when_the_ledger_is_unavailable() {
@@ -3053,16 +3107,62 @@ mod tests {
             srv,
             client: reqwest::Client::new(),
         };
-        let (status, body) = call_tool(
-            &fixture,
-            1,
-            "ptah_list_computer_runs",
-            json!({"session_id": session.id, "workspace": ws.path()}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(body["error"]["data"]["code"], "invalid_request");
-        assert_eq!(body["error"]["data"]["reasonCode"], "unsupported");
+        // Availability is global and session-independent: every Computer Run
+        // read must fail closed the same way, without leaking lock/path detail
+        // or becoming a run-existence oracle.
+        let cases = [
+            (
+                "ptah_list_computer_runs",
+                json!({"session_id": session.id, "workspace": ws.path()}),
+            ),
+            (
+                "ptah_get_computer_capacity",
+                json!({"session_id": session.id, "workspace": ws.path()}),
+            ),
+            (
+                "ptah_get_computer_run",
+                json!({
+                    "session_id": session.id,
+                    "workspace": ws.path(),
+                    "run_id": "no-such-run"
+                }),
+            ),
+            (
+                "ptah_get_computer_run_events",
+                json!({
+                    "session_id": session.id,
+                    "workspace": ws.path(),
+                    "run_id": "no-such-run"
+                }),
+            ),
+        ];
+        for (idx, (name, arguments)) in cases.into_iter().enumerate() {
+            let (status, body) = call_tool(&fixture, idx as u64 + 1, name, arguments).await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{name}");
+            assert_eq!(
+                body["error"]["data"]["code"], "invalid_request",
+                "{name} must use the public taxonomy, not the internal transport code"
+            );
+            assert_eq!(
+                body["error"]["data"]["reasonCode"], "unsupported",
+                "{name} must keep the bounded Unsupported reason"
+            );
+            assert_eq!(
+                body["error"]["data"]["message"], "The operation is unsupported.",
+                "{name}"
+            );
+            assert_eq!(
+                body["error"]["message"], "The operation is unsupported.",
+                "{name}"
+            );
+            let rendered = body.to_string();
+            assert!(
+                !rendered.contains("already open")
+                    && !rendered.contains("computer-use store")
+                    && !rendered.contains("computer use is unavailable on this host"),
+                "{name} leaked ledger/lock detail: {rendered}"
+            );
+        }
 
         fixture.srv.stop();
         set_grokptah_home_override(None);
