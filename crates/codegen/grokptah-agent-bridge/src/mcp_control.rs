@@ -30,7 +30,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use grokptah_agent_sdk::{ErrorCode as PublicErrorCode, ErrorEnvelope};
+use grokptah_agent_sdk::{ErrorCode as PublicErrorCode, ErrorEnvelope, ErrorEventRange};
 
 use crate::computer_use::ComputerClientIdentity;
 use crate::host::AgentHostHandle;
@@ -1345,11 +1345,24 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
         .as_ref()
         .and_then(Value::as_str)
         .map(|value| value.chars().take(256).collect::<String>());
+    let event_range = e
+        .data
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|extra| extra.get("eventRange"))
+        .and_then(Value::as_object)
+        .and_then(|range| {
+            Some(ErrorEventRange {
+                start_seq: range.get("startSeq")?.as_u64()?,
+                end_seq: range.get("endSeq")?.as_u64()?,
+            })
+        });
     let public = ErrorEnvelope {
         code: public_error_code(&e.code),
         message: public_error_message(&e.code).into(),
         request_id,
         reason_code: Some(e.code.as_str().into()),
+        event_range,
     };
     let mut data = serde_json::to_value(public).unwrap_or_else(|_| {
         json!({
@@ -1361,23 +1374,6 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
     // Keep `code` stable for cross-product consumers. The detailed server-side
     // reason is separately named and bounded; never forward arbitrary OrchError
     // data or overwrite the public taxonomy with an internal transport code.
-    if let Some(range) = e
-        .data
-        .as_ref()
-        .and_then(Value::as_object)
-        .and_then(|extra| extra.get("eventRange"))
-        .and_then(Value::as_object)
-    {
-        let mut safe_range = serde_json::Map::new();
-        for key in ["startSeq", "endSeq"] {
-            if let Some(value) = range.get(key).and_then(Value::as_u64) {
-                safe_range.insert(key.into(), Value::from(value));
-            }
-        }
-        if !safe_range.is_empty() {
-            data["eventRange"] = Value::Object(safe_range);
-        }
-    }
     let message = data
         .get("message")
         .and_then(Value::as_str)

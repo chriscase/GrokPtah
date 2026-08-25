@@ -24,7 +24,7 @@ pub use computer::{
     ComputerActionClass, ComputerControlRequest, ComputerControlResponse, ComputerEvent,
     ComputerEventPage, ComputerRunScope,
 };
-pub use error::{ErrorCode, ErrorEnvelope};
+pub use error::{ErrorCode, ErrorEnvelope, ErrorEventRange};
 pub use run::{
     Bounds, ChangedFile, DurableRun, DurableRunState, ExecutionMode, IdempotencyKey, ReviewReceipt,
     RunEvent, RunEventPage, RunNotification, RunScope, SubmitTaskRequest,
