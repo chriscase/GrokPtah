@@ -34,6 +34,13 @@ The initial Cursor Cloud adapter remains a qualification task; the contract is
 already reusable by ContextDesk, another Rust service, or a future TypeScript
 broker adapter.
 
+When a stream reports a cursor gap, keep the monitor fenced: a later live event
+does not prove that the missing history was replayed. Poll the broker's
+advertised relative route, validate the returned contiguous event window, and
+install it with `replaceExternalWorkerMonitor`. That is the only public
+monitor operation that clears the recovery flag; a malformed or non-contiguous
+snapshot is rejected and must not be rendered as complete.
+
 ## Browser / War Room example
 
 The browser receives only an authenticated broker session and opaque ids:
