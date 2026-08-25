@@ -430,6 +430,8 @@ impl OrchStore {
         &self,
         run_id: &str,
         attempt_id: &str,
+        owner_instance_id: &str,
+        revision: u64,
         run: &RunRecord,
         response: serde_json::Value,
     ) -> anyhow::Result<String> {
@@ -437,6 +439,23 @@ impl OrchStore {
             .acceptance_path(run_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let _g = self.inner.lock.lock();
+        let attempt_path = self
+            .attempt_path(run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let attempt: AttemptRecord = serde_json::from_str(
+            &fs::read_to_string(&attempt_path)
+                .map_err(|_| anyhow::anyhow!("attempt is missing"))?,
+        )?;
+        check_attempt_owner(
+            &attempt,
+            attempt_id,
+            owner_instance_id,
+            revision,
+            Utc::now(),
+        )?;
+        if attempt.phase != AttemptPhase::Running {
+            anyhow::bail!("attempt is not running");
+        }
         let mut intent = load_acceptance_intent_path(&path)?
             .ok_or_else(|| anyhow::anyhow!("acceptance intent is missing"))?;
         if intent.run_id != run_id
@@ -2454,6 +2473,8 @@ mod tests {
             .claim_acceptance_input(
                 &run.run_id,
                 &attempt.attempt_id,
+                &attempt.owner_instance_id,
+                attempt.revision,
                 &RunRecord {
                     state: RunState::Running,
                     ..run.clone()
@@ -2528,6 +2549,67 @@ mod tests {
             .reap_attempt("attempt-run", "attempt-1", attempt.revision, expired)
             .unwrap()
             .is_none());
+
+        let final_attempt = store
+            .claim_attempt(
+                "finalize-run",
+                "attempt-finalize",
+                "owner-finalize",
+                None,
+                now,
+                StdDuration::from_secs(10),
+            )
+            .unwrap();
+        assert!(store
+            .finalize_attempt(
+                "finalize-run",
+                "attempt-finalize",
+                "wrong-owner",
+                final_attempt.revision,
+                AttemptPhase::Completed,
+                now,
+            )
+            .is_err());
+        let heartbeat = store
+            .heartbeat_attempt(
+                "finalize-run",
+                "attempt-finalize",
+                "owner-finalize",
+                final_attempt.revision,
+                now,
+                StdDuration::from_secs(10),
+            )
+            .unwrap();
+        assert!(store
+            .finalize_attempt(
+                "finalize-run",
+                "attempt-finalize",
+                "owner-finalize",
+                final_attempt.revision,
+                AttemptPhase::Completed,
+                now,
+            )
+            .is_err());
+        let finalizing = store
+            .begin_attempt_finalization(
+                "finalize-run",
+                "attempt-finalize",
+                "owner-finalize",
+                heartbeat.revision,
+                now,
+            )
+            .unwrap();
+        let completed = store
+            .finalize_attempt(
+                "finalize-run",
+                "attempt-finalize",
+                "owner-finalize",
+                finalizing.revision,
+                AttemptPhase::Completed,
+                now,
+            )
+            .unwrap();
+        assert_eq!(completed.phase, AttemptPhase::Completed);
     }
 
     #[test]

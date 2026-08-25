@@ -714,7 +714,17 @@ impl OrchestrationService {
         });
         let run = match transitioned {
             Ok(Some(run)) => run,
-            Ok(None) => anyhow::bail!("queued run disappeared before dispatch"),
+            Ok(None) => {
+                let _ = self.store.finalize_attempt(
+                    &pending.run_id,
+                    &attempt.attempt_id,
+                    &attempt.owner_instance_id,
+                    attempt.revision,
+                    AttemptPhase::Interrupted,
+                    Utc::now(),
+                );
+                anyhow::bail!("queued run disappeared before dispatch")
+            }
             Err(error) => {
                 let _ = self.store.finalize_attempt(
                     &pending.run_id,
@@ -738,6 +748,8 @@ impl OrchestrationService {
         let prompt = match self.store.claim_acceptance_input(
             &pending.run_id,
             &attempt.attempt_id,
+            &attempt.owner_instance_id,
+            attempt.revision,
             &run,
             response,
         ) {
