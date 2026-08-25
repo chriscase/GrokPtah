@@ -797,7 +797,8 @@ impl OrchestrationService {
             else {
                 continue;
             };
-            if let Some(live) = self.live_attempts.lock().remove(&run_id) {
+            let live = { self.live_attempts.lock().remove(&run_id) };
+            if let Some(live) = live {
                 if live.attempt_id == attempt.attempt_id {
                     live.model_abort.abort();
                     let mut supervisor = live.supervisor;
