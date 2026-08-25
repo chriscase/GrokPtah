@@ -887,6 +887,29 @@ impl AlwaysOnFixture {
             .map_err(|_| DiagnosticCode::FixtureInvalid)?,
         })
     }
+
+    fn expected_restart_cardinality(&self) -> Result<AlwaysOnCardinality, DiagnosticCode> {
+        let first_work = *self
+            .native_work_by_step
+            .get(&self.step_first)
+            .ok_or(DiagnosticCode::FixtureInvalid)?;
+        Ok(AlwaysOnCardinality {
+            work: usize::try_from(
+                first_work
+                    .checked_add(self.decision_work)
+                    .and_then(|total| total.checked_add(1))
+                    .ok_or(DiagnosticCode::FixtureInvalid)?,
+            )
+            .map_err(|_| DiagnosticCode::FixtureInvalid)?,
+            runs: usize::try_from(
+                first_work
+                    .checked_add(1)
+                    .ok_or(DiagnosticCode::FixtureInvalid)?,
+            )
+            .map_err(|_| DiagnosticCode::FixtureInvalid)?,
+            intents: usize::try_from(first_work).map_err(|_| DiagnosticCode::FixtureInvalid)?,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1685,14 +1708,15 @@ async fn always_on_home_b(
     .await?;
     let work_id = join.work_id.clone();
     let run_id = join.run_id.clone();
-    let expected_cardinality =
-        always_on_snapshot(probe, &mut client, &session_id, &workspace).await?;
-    if expected_cardinality.work == 0
-        || expected_cardinality.runs == 0
-        || expected_cardinality.intents == 0
-    {
-        return Err(DiagnosticCode::StateTransitionMismatch);
-    }
+    service
+        .provider
+        .wait_accepted("manager-decision", Duration::from_secs(90))
+        .map_err(|_| DiagnosticCode::Timeout)?;
+    let expected_cardinality = fixture.expected_restart_cardinality()?;
+    assert_exact_cardinality(
+        expected_cardinality,
+        always_on_snapshot(probe, &mut client, &session_id, &workspace).await?,
+    )?;
     if service.provider.count_for(&fixture.step_first)
         != fixture.provider_posts_by_semantic[fixture.step_first.as_str()]
     {
