@@ -215,7 +215,7 @@ pub fn parse_fixture(bytes: &[u8]) -> Result<Fixture, String> {
     if !posts_by_semantic.contains_key("manager-decision") {
         return Err("happyPath.providerPostsBySemanticId missing manager-decision".into());
     }
-    let setup = take_setup(&mut root)?;
+    let setup_lane = take_setup(&mut root)?;
     let manager_plan = take_manager_plan(&mut root)?;
     let fail_closed = take_fail_closed(&mut root)?;
     let ceilings = take_ceilings(&mut root)?;
@@ -224,16 +224,16 @@ pub fn parse_fixture(bytes: &[u8]) -> Result<Fixture, String> {
     if required_assertions.len() != required_assertions.iter().collect::<BTreeSet<_>>().len() {
         return Err("requiredAssertions must be unique".into());
     }
-    if setup.runs == 0 {
+    if setup_lane.runs == 0 {
         return Err("setup.runs must be greater than zero".into());
     }
-    if setup.provider_sends == 0 {
+    if setup_lane.provider_sends == 0 {
         return Err("setup.providerSends must be greater than zero".into());
     }
-    if setup.work == 0 && setup.attempts != 0 {
+    if setup_lane.work == 0 && setup_lane.attempts != 0 {
         return Err("setup.attempts must be 0 when setup.work is 0".into());
     }
-    if setup.work == 0 && setup.intents != 0 {
+    if setup_lane.work == 0 && setup_lane.intents != 0 {
         return Err("setup.intents must be 0 when setup.work is 0".into());
     }
     if manager_plan.work != 1 {
@@ -273,7 +273,7 @@ pub fn parse_fixture(bytes: &[u8]) -> Result<Fixture, String> {
         proposal_runs,
         native_work_by_step,
         posts_by_semantic,
-        setup_lane: setup,
+        setup_lane,
         manager_plan,
         fail_closed,
         ceilings,
