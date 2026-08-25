@@ -12,7 +12,9 @@
 //!
 //! No filesystem, provider, or workspace access is reachable from here.
 
-use grokptah_help_authority::{authorize_for_served, DecisionRequest, DecisionResponse, ServedIndex};
+use grokptah_help_authority::{
+    authorize_for_served, DecisionRequest, DecisionResponse, ServedIndex,
+};
 
 /// Authorize one Help action against the corpus and index this build serves.
 ///

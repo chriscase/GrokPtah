@@ -77,6 +77,7 @@ members = [
     "crates/common/xai-computer-hub-mcp-adapter",
     "crates/common/xai-computer-hub-sdk",
     "crates/common/grokptah-agent-sdk",
+    "crates/common/grokptah-help-answer",
     "crates/common/grokptah-help-authority",
     "crates/common/xai-grok-compaction",
     "crates/common/xai-interjection-core",

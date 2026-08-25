@@ -4,6 +4,7 @@ mod commands;
 mod computer_use;
 mod event_forward;
 mod help;
+mod help_answer;
 mod pty_host;
 
 use std::sync::Mutex;
@@ -35,6 +36,18 @@ pub fn run() {
             control: Mutex::new(None),
             computer_use: std::sync::Arc::new(computer_use::DesktopComputerUse::new(&host)),
         })
+        // No answer provider is configured in this build. Registered anyway so
+        // the renderer gets an explicit `no-provider-configured` rather than a
+        // missing command, and so offline Help search stays fully useful.
+        .manage(help_answer::HelpAnswerState::unconfigured(
+            help_answer::ServedAnswerState {
+                corpus_digest: String::new(),
+                index_digest: String::new(),
+                manifest_digest: String::new(),
+                current_revision: 0,
+                policy_revision: String::new(),
+            },
+        ))
         .setup(move |app| {
             let handle = app.handle().clone();
             app.state::<AppState>().pty.set_app(handle.clone());
@@ -62,6 +75,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             help::help_authorize,
             help::help_authority_schema,
+            help_answer::help_answer_execute,
+            help_answer::help_answer_stats,
+            help_answer::help_answer_schema,
             commands::agent_start,
             commands::agent_stop,
             commands::agent_status,

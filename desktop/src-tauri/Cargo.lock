@@ -1344,6 +1344,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "grokptah-agent-bridge",
+ "grokptah-help-answer",
  "grokptah-help-authority",
  "parking_lot",
  "portable-pty",
@@ -1356,6 +1357,17 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "grokptah-help-answer"
+version = "0.1.0"
+dependencies = [
+ "grokptah-help-authority",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
