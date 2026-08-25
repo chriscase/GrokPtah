@@ -179,6 +179,109 @@ export function embedHelpTokens(tokens: readonly string[]): Float64Array | undef
   return vector;
 }
 
+const FAMILIARITY_CACHE = new Map<string, number>();
+
+/** Character-trigram posting list over the vocabulary, for the OOV path. */
+const GRAM_TO_TERMS = new Map<string, number[]>();
+raw.vocabulary.forEach((term, index) => {
+  for (const gram of new Set(charNgrams(term))) {
+    const bucket = GRAM_TO_TERMS.get(gram);
+    if (bucket) bucket.push(index);
+    else GRAM_TO_TERMS.set(gram, [index]);
+  }
+});
+
+const MAX_EDIT_DISTANCE = 3;
+
+/** Levenshtein distance, abandoned once it provably exceeds `cutoff`. */
+function boundedEditDistance(left: string, right: string, cutoff: number): number {
+  if (Math.abs(left.length - right.length) > cutoff) return cutoff + 1;
+  let previous = new Int32Array(right.length + 1);
+  let current = new Int32Array(right.length + 1);
+  for (let j = 0; j <= right.length; j += 1) previous[j] = j;
+  for (let i = 1; i <= left.length; i += 1) {
+    current[0] = i;
+    let rowMinimum = current[0]!;
+    for (let j = 1; j <= right.length; j += 1) {
+      const substitution = previous[j - 1]! + (left[i - 1] === right[j - 1] ? 0 : 1);
+      const deletion = previous[j]! + 1;
+      const insertion = current[j - 1]! + 1;
+      const best = substitution < deletion ? substitution : deletion;
+      current[j] = best < insertion ? best : insertion;
+      if (current[j]! < rowMinimum) rowMinimum = current[j]!;
+    }
+    if (rowMinimum > cutoff) return cutoff + 1;
+    const swap = previous;
+    previous = current;
+    current = swap;
+  }
+  return previous[right.length]!;
+}
+
+/**
+ * How well the model actually knows a term, in [0, 1].
+ *
+ * 1 for in-vocabulary terms. Otherwise `1 - editDistance / length` against the
+ * closest vocabulary term, with candidates narrowed by shared trigrams so the
+ * comparison stays cheap.
+ *
+ * This separates a misspelling from a word the corpus has never seen:
+ * `chekpoint`/`checkpoint` and `quata`/`quota` are one edit apart, while
+ * `sourdough` and `photosynthesis` are far from everything. Two cheaper
+ * measures were tried and rejected — cosine to the nearest embedding
+ * neighbour does not separate them at all (a subword vector is an average of
+ * many term vectors and sits close to everything), and raw trigram Dice
+ * punishes short words too hard, scoring `quata` no better than `sourdough`.
+ *
+ * Without this gate the subword backoff hands every unknown term a
+ * plausible-looking vector, and unanswerable questions score high enough to be
+ * answered instead of abstained on.
+ */
+export function helpTermFamiliarity(term: string): number {
+  const cached = FAMILIARITY_CACHE.get(term);
+  if (cached !== undefined) return cached;
+  let familiarity = 0;
+  if (TERM_INDEX.has(term)) {
+    familiarity = 1;
+  } else {
+    const candidates = new Set<number>();
+    for (const gram of new Set(charNgrams(term))) {
+      for (const index of GRAM_TO_TERMS.get(gram) ?? []) candidates.add(index);
+    }
+    for (const index of candidates) {
+      const candidate = raw.vocabulary[index]!;
+      const distance = boundedEditDistance(term, candidate, MAX_EDIT_DISTANCE);
+      if (distance > MAX_EDIT_DISTANCE) continue;
+      const longest = term.length > candidate.length ? term.length : candidate.length;
+      const similarity = 1 - distance / longest;
+      if (similarity > familiarity) familiarity = similarity;
+    }
+  }
+  FAMILIARITY_CACHE.set(term, familiarity);
+  return familiarity;
+}
+
+/**
+ * Share of the query the model can actually account for, weighted by term
+ * importance. Feeds the semantic component so an unanswerable question cannot
+ * borrow confidence from vectors built out of unknown words.
+ */
+export function helpQueryFamiliarity(tokens: readonly string[]): number {
+  if (tokens.length === 0) return 0;
+  let weighted = 0;
+  let total = 0;
+  for (const token of tokens) {
+    const weight = helpTermIdf(token);
+    const familiarity = helpTermFamiliarity(token);
+    // Below ~0.6 similarity a token is not a plausible misspelling of anything
+    // in the corpus, so it contributes no confidence at all.
+    const shaped = familiarity >= 1 ? 1 : Math.max(0, (familiarity - 0.6) / 0.3);
+    weighted += weight * (shaped > 1 ? 1 : shaped);
+    total += weight;
+  }
+  return total === 0 ? 0 : weighted / total;
+}
+
 /** Cosine similarity of two unit vectors. */
 export function cosineSimilarity(left: Float64Array, right: Float64Array): number {
   let sum = 0;
