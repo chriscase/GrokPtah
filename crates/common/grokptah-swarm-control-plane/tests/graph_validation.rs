@@ -300,6 +300,7 @@ fn unknown_fields_in_a_specification_are_refused() {
 fn a_computer_use_task_needs_a_worker_measured_for_it() {
     let mut spec = single_task_spec();
     spec.tasks[0].requires_computer_use = true;
+    spec.tasks[0].computer_use = Some(computer_use_requirement());
     let message = expect_rejected(spec, SwarmErrorCode::CapabilityNotGranted);
     assert!(message.contains("leased Computer Use"), "{message}");
 }
