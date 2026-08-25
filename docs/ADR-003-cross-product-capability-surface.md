@@ -94,6 +94,11 @@ points, not yet published packages or compatibility promises.
 The project-wide ordered status and 100% exit gate are tracked in
 [`docs/ROADMAP_TO_100.md`](./ROADMAP_TO_100.md).
 
+The consumer-facing staging guide is [`docs/EMBEDDING.md`](./EMBEDDING.md).
+It documents the trust-boundary choice and the disposable ContextDesk
+desktop/War Room integration sequence without presenting the staging barrels
+as published compatibility promises.
+
 ### 3. UI packages
 
 UI reuse is intentionally split:
