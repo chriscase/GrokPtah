@@ -19,6 +19,11 @@ use crate::always_on::{
     AlwaysOnFixture, AlwaysOnHappyShape, AlwaysOnHome, AlwaysOnSnapshot, LoopbackProviderLane,
     MANAGER_DECISION_KIND, SETUP_SEMANTIC_ID,
 };
+use crate::lane_evidence::{
+    assert_home_evidence, assert_home_send_ledger, assert_no_resume_after_cut,
+    bind_ledger_identities, observed_ledger, resolve_causal_chain, AlwaysOnCertificationSummary,
+    CausalChainEvidence, HomeEvidence, LaneEvidenceFixture, HOME_A, HOME_B,
+};
 use crate::local_service::LocalService;
 use crate::manifest::{OracleCode, ProbeAction, ProbeDefinition};
 use crate::process_service::{scan_mcp_value, ProviderDisposition};
@@ -94,6 +99,8 @@ struct ProbeBuilder<'a> {
     capture_attempt_start: Option<u32>,
     provider_lanes: Vec<LoopbackProviderLane>,
     always_on_shape: Option<AlwaysOnHappyShape>,
+    home_evidence: Vec<HomeEvidence>,
+    restart_trace_events: u64,
 }
 
 impl<'a> ProbeBuilder<'a> {
@@ -115,7 +122,24 @@ impl<'a> ProbeBuilder<'a> {
             capture_attempt_start: None,
             provider_lanes: Vec::new(),
             always_on_shape: None,
+            home_evidence: Vec::new(),
+            restart_trace_events: 0,
         }
+    }
+
+    /// Publish one restart-cycle trace event.
+    ///
+    /// PR #408 recorded an explicit disconnect, restart and reconnect record
+    /// around each of the two process restarts. Keeping all six as real trace
+    /// records means a candidate cannot quietly drop half the restart evidence
+    /// and still look like it restarted twice.
+    fn push_restart_event(&mut self, operation: TraceOperationCode) -> Result<(), DiagnosticCode> {
+        self.push_trace(operation, Vec::new(), None)?;
+        self.restart_trace_events = self
+            .restart_trace_events
+            .checked_add(1)
+            .ok_or(DiagnosticCode::BoundExceeded)?;
+        Ok(())
     }
 
     async fn call(
@@ -320,6 +344,11 @@ impl<'a> ProbeBuilder<'a> {
                 provider_observation: merge_provider_lanes(&self.provider_lanes),
                 provider_lanes: self.provider_lanes,
                 always_on_shape: self.always_on_shape,
+                always_on_summary: if self.home_evidence.is_empty() {
+                    None
+                } else {
+                    Some(AlwaysOnCertificationSummary::new(self.home_evidence))
+                },
             },
             trace: StructuralTrace {
                 schema: LAB_TRACE_SCHEMA.into(),
@@ -632,8 +661,9 @@ pub async fn execute_minimal_probe(
 
 async fn always_on_grokbot(probe: &mut ProbeBuilder<'_>) -> Result<(), DiagnosticCode> {
     let fixture = AlwaysOnFixture::load()?;
-    always_on_home_a(probe, &fixture).await?;
-    always_on_home_b(probe, &fixture).await?;
+    let lanes = LaneEvidenceFixture::load()?;
+    always_on_home_a(probe, &fixture, &lanes).await?;
+    always_on_home_b(probe, &fixture, &lanes).await?;
     // Both homes must be represented with the fixture's exact semantic counts.
     // Without this a pass could claim Home-A oracles while publishing only
     // Home-B provider records.
@@ -873,12 +903,13 @@ async fn always_on_snapshot(
 /// Run left holding pending usage.
 fn assert_happy_path_shape(
     fixture: &AlwaysOnFixture,
+    lanes: &LaneEvidenceFixture,
     service: &crate::process_service::ProcessService,
     baseline: &AlwaysOnSnapshot,
     snapshot: &AlwaysOnSnapshot,
     runs: &Value,
 ) -> Result<AlwaysOnHappyShape, DiagnosticCode> {
-    let shape = assert_happy_shape(fixture, baseline, snapshot)?;
+    let shape = assert_happy_shape(fixture, lanes, baseline, snapshot)?;
     for step in fixture.native_steps() {
         let expected = fixture
             .posts_for(&step)
@@ -1028,7 +1059,7 @@ async fn always_on_bootstrap(
     probe: &mut ProbeBuilder<'_>,
     client: &mut McpControlClient,
     workspace: &str,
-) -> Result<(String, String, String), DiagnosticCode> {
+) -> Result<AlwaysOnBootstrap, DiagnosticCode> {
     let created = probe
         .call(
             client,
@@ -1083,6 +1114,9 @@ async fn always_on_bootstrap(
         .ok_or(DiagnosticCode::McpResultMalformed)?
         .to_string();
     probe.retain_id(DurableIdKind::Agent, &agent_id);
+    // The policy carries no home-specific identity, so its digest is the same
+    // in both homes and can bind their evidence together.
+    let policy = managed_execution_policy();
     let _ = probe
         .call(
             client,
@@ -1092,18 +1126,7 @@ async fn always_on_bootstrap(
                 "session_id": session_id,
                 "workspace": workspace,
                 "agent_id": agent_id,
-                "policy": {
-                    "enabled": true,
-                    "maxConcurrentRuns": 2,
-                    "bounds": {
-                        "maxPromptBytes": 16384,
-                        "maxRounds": 4,
-                        "maxDurationMs": 45000,
-                        "maxTotalTokens": 8000
-                    },
-                    "retryEligible": false,
-                    "requiresApprovalBeforeExecution": false
-                }
+                "policy": policy
             }),
             vec![
                 ArgumentFieldCode::SessionId,
@@ -1112,7 +1135,60 @@ async fn always_on_bootstrap(
             ],
         )
         .await?;
-    Ok((session_id, agent_id, setup_run))
+    Ok(AlwaysOnBootstrap {
+        session_id,
+        agent_id,
+        setup_run,
+        policy_digest: hash_payload(&policy),
+    })
+}
+
+/// The managed-execution policy both homes install.
+fn managed_execution_policy() -> Value {
+    json!({
+        "enabled": true,
+        "maxConcurrentRuns": 2,
+        "bounds": {
+            "maxPromptBytes": 16384,
+            "maxRounds": 4,
+            "maxDurationMs": 45000,
+            "maxTotalTokens": 8000
+        },
+        "retryEligible": false,
+        "requiresApprovalBeforeExecution": false
+    })
+}
+
+/// The home-invariant manager-plan configuration digest.
+///
+/// The submitted arguments carry the session, workspace, request id and agent
+/// id, which differ per home by construction. Digesting the configuration —
+/// the objective, the autonomy knobs and the step identities — gives the two
+/// homes a value they must agree on, so a summary that pairs one home's plan
+/// with another's cannot pass.
+fn plan_config_digest(fixture: &AlwaysOnFixture) -> String {
+    hash_payload(&json!({
+        "objective": "always-on grokbot dependent DAG",
+        "autonomous": true,
+        "maxReplans": 2,
+        "maxInFlight": 2,
+        "steps": [
+            {"stepId": fixture.step_first, "kind": "native", "dependencies": []},
+            {
+                "stepId": fixture.step_failing,
+                "kind": "native",
+                "dependencies": [fixture.step_first]
+            }
+        ]
+    }))
+}
+
+/// What `always_on_bootstrap` established for one isolated home.
+struct AlwaysOnBootstrap {
+    session_id: String,
+    agent_id: String,
+    setup_run: String,
+    policy_digest: String,
 }
 
 /// Capture and validate the bootstrap baseline for a freshly spawned home.
@@ -1125,6 +1201,7 @@ async fn always_on_baseline(
     probe: &mut ProbeBuilder<'_>,
     client: &mut McpControlClient,
     fixture: &AlwaysOnFixture,
+    lanes: &LaneEvidenceFixture,
     session_id: &str,
     workspace: &str,
     setup_run: &str,
@@ -1133,7 +1210,7 @@ async fn always_on_baseline(
     let mut last = Err(DiagnosticCode::Timeout);
     while Instant::now() < deadline {
         let snapshot = always_on_snapshot(probe, client, session_id, workspace).await?;
-        last = assert_bootstrap_baseline(&snapshot, fixture, setup_run).map(|()| snapshot);
+        last = assert_bootstrap_baseline(&snapshot, fixture, lanes, setup_run).map(|()| snapshot);
         if last.as_ref().is_ok_and(baseline_is_settled) {
             return last;
         }
@@ -1158,9 +1235,71 @@ fn process_service_spawn_diagnostic(error: anyhow::Error) -> DiagnosticCode {
     }
 }
 
+/// Publish one home's send ledger, causal chains and decision evidence.
+///
+/// Each chain is built provider observation -> Work -> accepted intent ->
+/// durable Run. `linkedRunIds` is consulted only as an independent
+/// cross-check inside `resolve_causal_chain`, never to choose the Run, so a
+/// service that mislinks a Run cannot make its own link agree.
+#[allow(clippy::too_many_arguments)]
+fn publish_home_evidence(
+    probe: &mut ProbeBuilder<'_>,
+    lanes: &LaneEvidenceFixture,
+    home: &str,
+    lane: &LoopbackProviderLane,
+    snapshot: &AlwaysOnSnapshot,
+    manager_agent_id: &str,
+    policy_digest: &str,
+    plan_config: &str,
+    restart_events: u64,
+) -> Result<(), DiagnosticCode> {
+    let expectation = lanes.home(home)?;
+    let send_ledger = assert_home_send_ledger(expectation, lane, lanes.bounded_evidence)?;
+    let mut chains: Vec<CausalChainEvidence> = Vec::new();
+    for step in expectation.chains.keys() {
+        chains.push(resolve_causal_chain(snapshot, lane, step)?);
+    }
+    // The ledger, not the chain, is where durable identities live: the
+    // bootstrap send stays unbound and every other accepted send must resolve
+    // to a complete lane.
+    let send_ledger = bind_ledger_identities(send_ledger, &chains);
+    let chains: Vec<CausalChainEvidence> = chains
+        .into_iter()
+        .map(|mut chain| {
+            if let Some(entry) = send_ledger
+                .iter()
+                .find(|entry| entry.semantic_id == chain.semantic_id)
+            {
+                chain.send = entry.clone();
+            }
+            chain
+        })
+        .collect();
+    let decision = chains
+        .iter()
+        .find(|chain| chain.step_id == lanes.manager_decision.step_id)
+        .cloned()
+        .ok_or(DiagnosticCode::StateTransitionMismatch)?;
+    let evidence = HomeEvidence {
+        home: home.to_owned(),
+        manager: opaque_durable_id(manager_agent_id),
+        policy: policy_digest.to_owned(),
+        plan_config: plan_config.to_owned(),
+        restarts: expectation.restarts,
+        restart_trace_events: restart_events,
+        send_ledger,
+        chains,
+        decision,
+    };
+    assert_home_evidence(lanes, &evidence)?;
+    probe.home_evidence.push(evidence);
+    Ok(())
+}
+
 async fn always_on_home_a(
     probe: &mut ProbeBuilder<'_>,
     fixture: &AlwaysOnFixture,
+    lanes: &LaneEvidenceFixture,
 ) -> Result<(), DiagnosticCode> {
     use crate::process_service::ProcessService;
 
@@ -1170,12 +1309,18 @@ async fn always_on_home_a(
         .await
         .map_err(|_| DiagnosticCode::ServiceUnreachable)?;
     let workspace = service.workspace.display().to_string();
-    let (session_id, agent_id, setup_run) =
-        always_on_bootstrap(probe, &mut client, &workspace).await?;
+    let bootstrap = always_on_bootstrap(probe, &mut client, &workspace).await?;
+    let AlwaysOnBootstrap {
+        session_id,
+        agent_id,
+        setup_run,
+        policy_digest,
+    } = bootstrap;
     let baseline = always_on_baseline(
         probe,
         &mut client,
         fixture,
+        lanes,
         &session_id,
         &workspace,
         &setup_run,
@@ -1322,7 +1467,7 @@ async fn always_on_home_a(
         // `succeeded` for every native step could never hold on a healthy run.
         let items = work_for_step(&work, &step);
         if items.len() != 1
-            || items[0]["state"].as_str() != Some(expected_step_state(fixture, &step)?)
+            || items[0]["state"].as_str() != Some(expected_step_state(lanes, &step)?)
         {
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
@@ -1518,15 +1663,25 @@ async fn always_on_home_a(
     // identities instead, so a decision lane pointing at some other Run fails.
     probe.always_on_shape = Some(assert_happy_path_shape(
         fixture,
+        lanes,
         &service,
         &baseline,
         &after_post_success_tick,
         &runs,
     )?);
-    probe.provider_lanes.push(LoopbackProviderLane::new(
-        AlwaysOnHome::HomeA,
-        service.provider.observation(),
-    ));
+    let lane = LoopbackProviderLane::new(AlwaysOnHome::HomeA, service.provider.observation());
+    publish_home_evidence(
+        probe,
+        lanes,
+        HOME_A,
+        &lane,
+        &after_post_success_tick,
+        &agent_id,
+        &policy_digest,
+        &plan_config_digest(fixture),
+        0,
+    )?;
+    probe.provider_lanes.push(lane);
     service
         .scan_artifacts()
         .map_err(|_| DiagnosticCode::OracleMismatch)?;
@@ -1536,6 +1691,7 @@ async fn always_on_home_a(
 async fn always_on_home_b(
     probe: &mut ProbeBuilder<'_>,
     fixture: &AlwaysOnFixture,
+    lanes: &LaneEvidenceFixture,
 ) -> Result<(), DiagnosticCode> {
     use crate::process_service::ProcessService;
 
@@ -1545,12 +1701,17 @@ async fn always_on_home_b(
         .await
         .map_err(|_| DiagnosticCode::ServiceUnreachable)?;
     let workspace = service.workspace.display().to_string();
-    let (session_id, agent_id, setup_run) =
-        always_on_bootstrap(probe, &mut client, &workspace).await?;
+    let AlwaysOnBootstrap {
+        session_id,
+        agent_id,
+        setup_run,
+        policy_digest,
+    } = always_on_bootstrap(probe, &mut client, &workspace).await?;
     let baseline = always_on_baseline(
         probe,
         &mut client,
         fixture,
+        lanes,
         &session_id,
         &workspace,
         &setup_run,
@@ -1606,6 +1767,7 @@ async fn always_on_home_b(
     let expected_snapshot = always_on_snapshot(probe, &mut client, &session_id, &workspace).await?;
     assert_home_b_pre_restart_shape(
         fixture,
+        lanes,
         &baseline,
         &expected_snapshot,
         &join.work_id,
@@ -1640,9 +1802,17 @@ async fn always_on_home_b(
     let pre_plan_steps = pre_plan["plan"]["steps"].clone();
     let pre_plan_hash = plan_identity_hash(&pre_plan);
     let pid0 = service.pid();
+    // The send ledger as it stands at the cut. Anything already observed or
+    // uncertain must never gain a second attempt after the restart.
+    let ledger_before_first = observed_ledger(&LoopbackProviderLane::new(
+        AlwaysOnHome::HomeB,
+        service.provider.observation(),
+    ));
     drop(client);
+    probe.push_restart_event(TraceOperationCode::Disconnect)?;
     probe.observe_action(ProbeAction::DisconnectClient);
     probe.reconnect.attempted = true;
+    probe.push_restart_event(TraceOperationCode::Restart)?;
     probe.observe_action(ProbeAction::RestartService);
     probe.restart.attempted = true;
     probe.restart.host_owned = true;
@@ -1661,9 +1831,15 @@ async fn always_on_home_b(
         .client()
         .await
         .map_err(|_| DiagnosticCode::ServiceUnreachable)?;
+    probe.push_restart_event(TraceOperationCode::Reconnect)?;
     probe.observe_action(ProbeAction::ReconnectClient);
     probe.reconnect.reinitialized = true;
     probe.observe_oracle(OracleCode::RestartReconnectObserved);
+    assert_no_resume_after_cut(
+        lanes.home(HOME_B)?,
+        &ledger_before_first,
+        &LoopbackProviderLane::new(AlwaysOnHome::HomeB, service.provider.observation()),
+    )?;
     always_on_assert_durable_plan(
         probe,
         &mut client,
@@ -1702,7 +1878,15 @@ async fn always_on_home_b(
         return Err(DiagnosticCode::RestartRecoveryFailed);
     }
     let pid1 = service.pid();
+    let ledger_before_second = observed_ledger(&LoopbackProviderLane::new(
+        AlwaysOnHome::HomeB,
+        service.provider.observation(),
+    ));
     drop(client);
+    // PR #408 recorded a disconnect, restart and reconnect around each of the
+    // two restarts. Both cycles stay explicit trace records here.
+    probe.push_restart_event(TraceOperationCode::Disconnect)?;
+    probe.push_restart_event(TraceOperationCode::Restart)?;
     probe.counters.restarts = probe
         .counters
         .restarts
@@ -1718,6 +1902,12 @@ async fn always_on_home_b(
         .client()
         .await
         .map_err(|_| DiagnosticCode::ServiceUnreachable)?;
+    probe.push_restart_event(TraceOperationCode::Reconnect)?;
+    assert_no_resume_after_cut(
+        lanes.home(HOME_B)?,
+        &ledger_before_second,
+        &LoopbackProviderLane::new(AlwaysOnHome::HomeB, service.provider.observation()),
+    )?;
     always_on_assert_durable_plan(
         probe,
         &mut client,
@@ -1760,10 +1950,19 @@ async fn always_on_home_b(
     probe.observe_oracle(OracleCode::NoImplicitInvocationResume);
     // Home B used to assign this field outright, discarding Home A's records
     // and leaving every Home-A oracle unbacked in the published report.
-    probe.provider_lanes.push(LoopbackProviderLane::new(
-        AlwaysOnHome::HomeB,
-        service.provider.observation(),
-    ));
+    let lane = LoopbackProviderLane::new(AlwaysOnHome::HomeB, service.provider.observation());
+    publish_home_evidence(
+        probe,
+        lanes,
+        HOME_B,
+        &lane,
+        &second_steady,
+        &agent_id,
+        &policy_digest,
+        &plan_config_digest(fixture),
+        probe.restart_trace_events,
+    )?;
+    probe.provider_lanes.push(lane);
     service
         .scan_artifacts()
         .map_err(|_| DiagnosticCode::OracleMismatch)?;

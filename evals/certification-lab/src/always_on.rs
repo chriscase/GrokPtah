@@ -19,6 +19,7 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
+use crate::lane_evidence::LaneEvidenceFixture;
 use crate::report::{
     opaque_durable_id, DiagnosticCode, LoopbackProviderObservation, LoopbackProviderRecord,
 };
@@ -32,8 +33,6 @@ pub const MANAGER_DECISION_KIND: &str = "manager-decision";
 /// no step id and no attempts, and is observed in `ptah_list_work` alongside
 /// the step lanes.
 pub const MANAGER_PLAN_KIND: &str = "manager-plan";
-/// Work rows one manager plan contributes on top of its step lanes.
-const MANAGER_PLAN_WORK_ROWS: usize = 1;
 /// Public `purpose` discriminator for the manager proposal Run.
 pub const MANAGER_PROPOSAL_PURPOSE: &str = "manager_proposal";
 /// Loopback provider semantic id for the bootstrap submit.
@@ -422,14 +421,14 @@ impl AlwaysOnFixture {
     }
 }
 
-fn expect_object(value: Value, ctx: &str) -> Result<Map<String, Value>, String> {
+pub(crate) fn expect_object(value: Value, ctx: &str) -> Result<Map<String, Value>, String> {
     match value {
         Value::Object(map) => Ok(map),
         other => Err(format!("{ctx} must be an object, got {other}")),
     }
 }
 
-fn deny_unknown(map: Map<String, Value>, ctx: &str) -> Result<(), String> {
+pub(crate) fn deny_unknown(map: Map<String, Value>, ctx: &str) -> Result<(), String> {
     if map.is_empty() {
         return Ok(());
     }
@@ -437,7 +436,7 @@ fn deny_unknown(map: Map<String, Value>, ctx: &str) -> Result<(), String> {
     Err(format!("{ctx} has unknown keys {unknown:?}"))
 }
 
-fn take_string(map: &mut Map<String, Value>, key: &str) -> Result<String, String> {
+pub(crate) fn take_string(map: &mut Map<String, Value>, key: &str) -> Result<String, String> {
     match map.remove(key) {
         Some(Value::String(value)) if !value.is_empty() => Ok(value),
         Some(other) => Err(format!("{key} must be a non-empty string, got {other}")),
@@ -445,7 +444,7 @@ fn take_string(map: &mut Map<String, Value>, key: &str) -> Result<String, String
     }
 }
 
-fn take_u64(map: &mut Map<String, Value>, key: &str) -> Result<u64, String> {
+pub(crate) fn take_u64(map: &mut Map<String, Value>, key: &str) -> Result<u64, String> {
     match map.remove(key) {
         Some(Value::Number(number)) => number
             .as_u64()
@@ -455,14 +454,20 @@ fn take_u64(map: &mut Map<String, Value>, key: &str) -> Result<u64, String> {
     }
 }
 
-fn take_object(map: &mut Map<String, Value>, key: &str) -> Result<Map<String, Value>, String> {
+pub(crate) fn take_object(
+    map: &mut Map<String, Value>,
+    key: &str,
+) -> Result<Map<String, Value>, String> {
     expect_object(
         map.remove(key).ok_or_else(|| format!("missing {key}"))?,
         key,
     )
 }
 
-fn take_u64_map(map: &mut Map<String, Value>, key: &str) -> Result<BTreeMap<String, u64>, String> {
+pub(crate) fn take_u64_map(
+    map: &mut Map<String, Value>,
+    key: &str,
+) -> Result<BTreeMap<String, u64>, String> {
     let object = take_object(map, key)?;
     let mut out = BTreeMap::new();
     for (name, value) in object {
@@ -479,7 +484,10 @@ fn take_u64_map(map: &mut Map<String, Value>, key: &str) -> Result<BTreeMap<Stri
     Ok(out)
 }
 
-fn take_string_array(map: &mut Map<String, Value>, key: &str) -> Result<Vec<String>, String> {
+pub(crate) fn take_string_array(
+    map: &mut Map<String, Value>,
+    key: &str,
+) -> Result<Vec<String>, String> {
     match map.remove(key) {
         Some(Value::Array(items)) => items
             .into_iter()
@@ -899,8 +907,17 @@ fn optional_string(value: &Value) -> Option<String> {
 pub fn assert_bootstrap_baseline(
     baseline: &AlwaysOnSnapshot,
     fixture: &AlwaysOnFixture,
+    lanes: &LaneEvidenceFixture,
     setup_run_id: &str,
 ) -> Result<(), DiagnosticCode> {
+    // The setup lane's cardinality is owned by the lane fixture, not inferred
+    // from whatever the home happens to contain.
+    if baseline.counts.work != lanes.setup_lane.work
+        || baseline.counts.runs != lanes.setup_lane.runs
+        || baseline.counts.intents != lanes.setup_lane.intents
+    {
+        return Err(DiagnosticCode::StateTransitionMismatch);
+    }
     let [run] = baseline.runs.as_slice() else {
         return Err(DiagnosticCode::StateTransitionMismatch);
     };
@@ -1036,19 +1053,11 @@ pub struct AlwaysOnHappyShape {
 /// a blanket "every native step succeeded" expectation can never hold on a
 /// healthy run. Deriving the terminal state per step from the fixture keeps
 /// the oracle exact instead of relaxing it to "any terminal state".
-pub fn expected_step_state(
-    fixture: &AlwaysOnFixture,
+pub fn expected_step_state<'a>(
+    lanes: &'a LaneEvidenceFixture,
     step_id: &str,
-) -> Result<&'static str, DiagnosticCode> {
-    if step_id == fixture.step_first || step_id == fixture.step_replacement {
-        Ok("succeeded")
-    } else if step_id == fixture.step_failing {
-        Ok("failed")
-    } else if step_id == MANAGER_DECISION_STEP_ID {
-        Ok("succeeded")
-    } else {
-        Err(DiagnosticCode::FixtureInvalid)
-    }
+) -> Result<&'a str, DiagnosticCode> {
+    lanes.happy_terminal_state(step_id)
 }
 
 /// The single Work row the manager plan itself occupies.
@@ -1233,18 +1242,17 @@ fn sum(base: usize, added: usize) -> Result<usize, DiagnosticCode> {
 /// oracle: counts alone cannot detect substitution.
 pub fn expected_happy_cardinality(
     fixture: &AlwaysOnFixture,
+    lanes: &LaneEvidenceFixture,
     baseline: AlwaysOnCardinality,
 ) -> Result<AlwaysOnCardinality, DiagnosticCode> {
     let native = widen(declared_native_work(fixture)?)?;
     let decision = widen(fixture.decision_work)?;
     let proposal = widen(fixture.proposal_runs)?;
+    let plan = lanes.plan_lane.clone();
     Ok(AlwaysOnCardinality {
-        work: sum(
-            baseline.work,
-            sum(sum(native, decision)?, MANAGER_PLAN_WORK_ROWS)?,
-        )?,
-        runs: sum(baseline.runs, sum(native, proposal)?)?,
-        intents: sum(baseline.intents, sum(native, decision)?)?,
+        work: sum(baseline.work, sum(sum(native, decision)?, plan.work)?)?,
+        runs: sum(baseline.runs, sum(sum(native, proposal)?, plan.runs)?)?,
+        intents: sum(baseline.intents, sum(sum(native, decision)?, plan.intents)?)?,
     })
 }
 
@@ -1252,6 +1260,7 @@ pub fn expected_happy_cardinality(
 /// bootstrap baseline plus exactly the one held lane.
 pub fn expected_pre_restart_cardinality(
     fixture: &AlwaysOnFixture,
+    lanes: &LaneEvidenceFixture,
     baseline: AlwaysOnCardinality,
 ) -> Result<AlwaysOnCardinality, DiagnosticCode> {
     let held = widen(
@@ -1262,9 +1271,9 @@ pub fn expected_pre_restart_cardinality(
             .ok_or(DiagnosticCode::FixtureInvalid)?,
     )?;
     Ok(AlwaysOnCardinality {
-        work: sum(baseline.work, sum(held, MANAGER_PLAN_WORK_ROWS)?)?,
-        runs: sum(baseline.runs, held)?,
-        intents: sum(baseline.intents, held)?,
+        work: sum(baseline.work, sum(held, lanes.plan_lane.work)?)?,
+        runs: sum(baseline.runs, sum(held, lanes.plan_lane.runs)?)?,
+        intents: sum(baseline.intents, sum(held, lanes.plan_lane.intents)?)?,
     })
 }
 
@@ -1274,6 +1283,7 @@ pub fn expected_pre_restart_cardinality(
 /// baseline.
 pub fn assert_happy_shape(
     fixture: &AlwaysOnFixture,
+    lanes: &LaneEvidenceFixture,
     baseline: &AlwaysOnSnapshot,
     final_snapshot: &AlwaysOnSnapshot,
 ) -> Result<AlwaysOnHappyShape, DiagnosticCode> {
@@ -1284,7 +1294,7 @@ pub fn assert_happy_shape(
         }
         let lane = resolve_lane(final_snapshot, &step)?;
         if final_snapshot.work_for_step(&step)?.state.as_deref()
-            != Some(expected_step_state(fixture, &step)?)
+            != Some(expected_step_state(lanes, &step)?)
         {
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
@@ -1298,7 +1308,7 @@ pub fn assert_happy_shape(
         .work_for_step(MANAGER_DECISION_STEP_ID)?
         .state
         .as_deref()
-        != Some(expected_step_state(fixture, MANAGER_DECISION_STEP_ID)?)
+        != Some(expected_step_state(lanes, MANAGER_DECISION_STEP_ID)?)
     {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
@@ -1308,18 +1318,18 @@ pub fn assert_happy_shape(
         // instead of recording an oracle the evidence does not support.
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
-    let lanes: Vec<&AlwaysOnLane> = native_lanes.iter().chain([&decision_lane]).collect();
-    let distinct: BTreeSet<&str> = lanes.iter().map(|lane| lane.work_id.as_str()).collect();
-    if distinct.len() != lanes.len() {
+    let lane_refs: Vec<&AlwaysOnLane> = native_lanes.iter().chain([&decision_lane]).collect();
+    let distinct: BTreeSet<&str> = lane_refs.iter().map(|lane| lane.work_id.as_str()).collect();
+    if distinct.len() != lane_refs.len() {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
     let plan_work = require_plan_work(final_snapshot)?.work_id.clone();
     assert_exact_snapshot(
         baseline,
-        &residual(final_snapshot, &lanes, &[plan_work.as_str()]),
+        &residual(final_snapshot, &lane_refs, &[plan_work.as_str()]),
     )?;
     assert_exact_cardinality(
-        expected_happy_cardinality(fixture, baseline.counts)?,
+        expected_happy_cardinality(fixture, lanes, baseline.counts)?,
         final_snapshot.counts,
     )?;
     Ok(AlwaysOnHappyShape {
@@ -1341,6 +1351,7 @@ pub fn assert_happy_shape(
 /// absent.
 pub fn assert_home_b_pre_restart_shape(
     fixture: &AlwaysOnFixture,
+    lanes: &LaneEvidenceFixture,
     baseline: &AlwaysOnSnapshot,
     pre_restart: &AlwaysOnSnapshot,
     work_id: &str,
@@ -1383,7 +1394,7 @@ pub fn assert_home_b_pre_restart_shape(
         &residual(pre_restart, &[&lane], &[plan_work.as_str()]),
     )?;
     assert_exact_cardinality(
-        expected_pre_restart_cardinality(fixture, baseline.counts)?,
+        expected_pre_restart_cardinality(fixture, lanes, baseline.counts)?,
         pre_restart.counts,
     )
 }
@@ -1464,12 +1475,48 @@ impl LoopbackProviderLane {
 
     /// Accepted, correctly routed POSTs carrying `semantic_id`.
     pub fn accepted_for(&self, semantic_id: &str) -> u64 {
+        self.accepted_attempts(semantic_id).len() as u64
+    }
+
+    /// Every accepted, correctly routed send attempt carrying `semantic_id`.
+    pub fn accepted_attempts(&self, semantic_id: &str) -> Vec<&LoopbackProviderRecord> {
         self.records
             .iter()
             .filter(|record| {
                 record.auth_accepted && record.route_ok && record.semantic_id == semantic_id
             })
-            .count() as u64
+            .collect()
+    }
+
+    /// The single accepted send attempt carrying `semantic_id`.
+    ///
+    /// A causal chain may only be built on exactly one accepted attempt: zero
+    /// means nothing was sent, and two means the sender re-drove a request it
+    /// had already committed.
+    pub fn exact_accepted_attempt(
+        &self,
+        semantic_id: &str,
+    ) -> Result<&LoopbackProviderRecord, DiagnosticCode> {
+        match self.accepted_attempts(semantic_id).as_slice() {
+            [only] => Ok(only),
+            _ => Err(DiagnosticCode::StateTransitionMismatch),
+        }
+    }
+
+    /// Send attempts carrying `semantic_id`, accepted or not.
+    pub fn attempts_for(&self, semantic_id: &str) -> Vec<&LoopbackProviderRecord> {
+        self.records
+            .iter()
+            .filter(|record| record.semantic_id == semantic_id)
+            .collect()
+    }
+
+    /// Every distinct semantic id this home observed.
+    pub fn observed_semantics(&self) -> BTreeSet<&str> {
+        self.records
+            .iter()
+            .map(|record| record.semantic_id.as_str())
+            .collect()
     }
 }
 
@@ -1574,12 +1621,17 @@ fn require_lane(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::report::SendState;
     use serde_json::json;
 
     const SETUP_WORK: &str = "work-setup";
     const SETUP_ATTEMPT: &str = "attempt-setup";
     const SETUP_RUN: &str = "run-setup";
     const PLAN_WORK: &str = "work-plan";
+
+    fn lane_fixture() -> LaneEvidenceFixture {
+        LaneEvidenceFixture::load().expect("lane fixture")
+    }
 
     fn fixture() -> AlwaysOnFixture {
         AlwaysOnFixture::parse(crate::ALWAYS_ON_GROKBOT_FIXTURE).expect("canonical fixture")
@@ -1670,25 +1722,11 @@ mod tests {
         let mut intents = Vec::new();
         let mut runs = Vec::new();
         if with_baseline {
-            work.push(json!({
-                "workId": SETUP_WORK,
-                "kind": "native",
-                "state": "succeeded"
-            }));
-            details.insert(
-                SETUP_WORK.to_owned(),
-                json!({
-                    "work": {"workId": SETUP_WORK},
-                    "attempts": [{
-                        "attemptId": SETUP_ATTEMPT,
-                        "linkedRunIds": [SETUP_RUN]
-                    }]
-                }),
-            );
+            // A direct submit materialises one Run and no Work or intents.
             runs.push(json!({
                 "runId": SETUP_RUN,
                 "requestId": "req-setup",
-                "purpose": "native",
+                "purpose": "execution",
                 "state": "completed"
             }));
         }
@@ -1776,7 +1814,7 @@ mod tests {
             (
                 "work id replaced",
                 mutated(|work, details, intents, _| {
-                    work["work"][2]["workId"] = json!("work-a-prime");
+                    work["work"][1]["workId"] = json!("work-a-prime");
                     let detail = details.remove("work-a").unwrap();
                     details.insert(
                         "work-a-prime".into(),
@@ -1861,13 +1899,13 @@ mod tests {
             (
                 "work kind rewritten",
                 mutated(|work, _, _, _| {
-                    work["work"][5]["kind"] = json!("native");
+                    work["work"][4]["kind"] = json!("native");
                 }),
             ),
             (
                 "work step reassigned",
                 mutated(|work, _, _, _| {
-                    work["work"][3]["sourceManagerStepId"] = json!("step-substituted");
+                    work["work"][2]["sourceManagerStepId"] = json!("step-substituted");
                 }),
             ),
         ];
@@ -1900,7 +1938,7 @@ mod tests {
             "a repeated linked run must fail"
         );
         let (mut work, details, intents, runs) = projection(&happy_lanes(), true);
-        let duplicate = work["work"][2].clone();
+        let duplicate = work["work"][1].clone();
         work["work"].as_array_mut().unwrap().push(duplicate);
         assert_eq!(
             AlwaysOnSnapshot::build(&work, &details, &intents, &runs),
@@ -1965,7 +2003,7 @@ mod tests {
     fn bootstrap_baseline_accepts_only_the_setup_lane() {
         let fixture = fixture();
         assert_eq!(
-            assert_bootstrap_baseline(&baseline(), &fixture, SETUP_RUN),
+            assert_bootstrap_baseline(&baseline(), &fixture, &lane_fixture(), SETUP_RUN),
             Ok(())
         );
         // A home with no Work or intents at all is still a valid bootstrap
@@ -1981,7 +2019,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            assert_bootstrap_baseline(&bare, &fixture, SETUP_RUN),
+            assert_bootstrap_baseline(&bare, &fixture, &lane_fixture(), SETUP_RUN),
             Ok(())
         );
     }
@@ -1989,6 +2027,7 @@ mod tests {
     #[test]
     fn bootstrap_baseline_rejects_every_polluted_home() {
         let fixture = fixture();
+        let lanes = lane_fixture();
         let (work, details, intents, runs) = projection_with(&[], true, false);
 
         let mut extra_runs = runs.clone();
@@ -2006,30 +2045,29 @@ mod tests {
             "work-stale".into(),
             json!({
                 "work": {"workId": "work-stale"},
-                "attempts": [{"attemptId": "attempt-stale", "linkedRunIds": ["run-stale"]}]
+                "attempts": [{"attemptId": "attempt-stale", "linkedRunIds": [SETUP_RUN]}]
             }),
         );
-        let mut two_runs = runs.clone();
-        two_runs["runs"].as_array_mut().unwrap().push(json!({
-            "runId": "run-stale", "requestId": "req-stale", "state": "completed"
-        }));
         let polluted_work =
-            AlwaysOnSnapshot::build(&extra_work, &extra_details, &intents, &two_runs).unwrap();
-
-        let mut foreign_details = details.clone();
-        foreign_details.get_mut(SETUP_WORK).unwrap()["attempts"][0]["linkedRunIds"] =
-            json!(["run-elsewhere"]);
-        let foreign_link =
-            AlwaysOnSnapshot::build(&work, &foreign_details, &intents, &runs).unwrap();
+            AlwaysOnSnapshot::build(&extra_work, &extra_details, &intents, &runs).unwrap();
 
         let mut plan_work = work.clone();
-        plan_work["work"][0]["sourceManagerStepId"] = json!("step-a");
-        let leftover_plan = AlwaysOnSnapshot::build(&plan_work, &details, &intents, &runs).unwrap();
-
-        let mut decision_work = work.clone();
-        decision_work["work"][0]["kind"] = json!(MANAGER_DECISION_KIND);
-        let leftover_decision =
-            AlwaysOnSnapshot::build(&decision_work, &details, &intents, &runs).unwrap();
+        plan_work["work"].as_array_mut().unwrap().push(json!({
+            "workId": "work-leftover",
+            "kind": "native",
+            "sourceManagerStepId": "step-a",
+            "state": "succeeded"
+        }));
+        let mut plan_details = details.clone();
+        plan_details.insert(
+            "work-leftover".into(),
+            json!({
+                "work": {"workId": "work-leftover"},
+                "attempts": [{"attemptId": SETUP_ATTEMPT, "linkedRunIds": [SETUP_RUN]}]
+            }),
+        );
+        let leftover_plan =
+            AlwaysOnSnapshot::build(&plan_work, &plan_details, &intents, &runs).unwrap();
 
         let stray_intent = AlwaysOnSnapshot::build(
             &work,
@@ -2038,7 +2076,7 @@ mod tests {
                 "intentId": "intent-stale",
                 "workId": SETUP_WORK,
                 "attemptId": SETUP_ATTEMPT,
-                "runId": "run-elsewhere",
+                "runId": SETUP_RUN,
                 "inputHash": "hash-stale",
                 "workRevision": 1,
                 "agentSpecRevision": 1
@@ -2050,13 +2088,11 @@ mod tests {
         for (label, polluted) in [
             ("extra Run", polluted_run),
             ("extra Work", polluted_work),
-            ("attempt linked off-lane", foreign_link),
             ("leftover plan Work", leftover_plan),
-            ("leftover decision Work", leftover_decision),
             ("stray intent", stray_intent),
         ] {
             assert_eq!(
-                assert_bootstrap_baseline(&polluted, &fixture, SETUP_RUN),
+                assert_bootstrap_baseline(&polluted, &fixture, &lanes, SETUP_RUN),
                 Err(DiagnosticCode::StateTransitionMismatch),
                 "{label} must not become the accepted baseline"
             );
@@ -2064,7 +2100,7 @@ mod tests {
         // A baseline whose single Run is not the known setup Run is a
         // different session entirely.
         assert_eq!(
-            assert_bootstrap_baseline(&baseline(), &fixture, "run-other"),
+            assert_bootstrap_baseline(&baseline(), &fixture, &lanes, "run-other"),
             Err(DiagnosticCode::StateTransitionMismatch)
         );
     }
@@ -2075,8 +2111,11 @@ mod tests {
         let mut running = baseline();
         running.runs[0].state = Some("running".into());
         assert!(!baseline_is_settled(&running));
-        let mut leased = baseline();
-        leased.work[0].state = Some("leased".into());
+        // A home that did materialise Work must have settled it too.
+        let mut leased = held();
+        leased.runs.iter_mut().for_each(|run| {
+            run.state = Some("completed".into());
+        });
         assert!(!baseline_is_settled(&leased));
     }
 
@@ -2123,6 +2162,7 @@ mod tests {
         assert_eq!(
             assert_home_b_pre_restart_shape(
                 &fixture,
+                &lane_fixture(),
                 &baseline(),
                 &held(),
                 "work-a",
@@ -2228,6 +2268,7 @@ mod tests {
             assert_eq!(
                 assert_home_b_pre_restart_shape(
                     &fixture,
+                    &lane_fixture(),
                     &base,
                     &snapshot,
                     "work-a",
@@ -2247,6 +2288,7 @@ mod tests {
             assert_eq!(
                 assert_home_b_pre_restart_shape(
                     &fixture,
+                    &lane_fixture(),
                     &base,
                     &held(),
                     work_id,
@@ -2263,7 +2305,8 @@ mod tests {
     #[test]
     fn happy_shape_accepts_the_canonical_projection_and_binds_the_decision() {
         let fixture = fixture();
-        let shape = assert_happy_shape(&fixture, &baseline(), &happy()).expect("happy shape");
+        let shape = assert_happy_shape(&fixture, &lane_fixture(), &baseline(), &happy())
+            .expect("happy shape");
         assert_eq!(shape.native_lanes.len(), 3);
         assert_eq!(shape.decision_lane.step_id, MANAGER_DECISION_STEP_ID);
         assert_eq!(shape.decision_lane.work, opaque_durable_id("work-d"));
@@ -2288,9 +2331,9 @@ mod tests {
         assert!(shape.manager_decision_binding.is_bound());
         // The counts the identity oracle implies, cross-checked independently.
         assert_eq!(
-            expected_happy_cardinality(&fixture, baseline().counts).unwrap(),
+            expected_happy_cardinality(&fixture, &lane_fixture(), baseline().counts).unwrap(),
             AlwaysOnCardinality {
-                work: 6,
+                work: 5,
                 runs: 5,
                 intents: 4
             }
@@ -2298,7 +2341,7 @@ mod tests {
         assert_eq!(
             happy().counts,
             AlwaysOnCardinality {
-                work: 6,
+                work: 5,
                 runs: 5,
                 intents: 4
             }
@@ -2335,13 +2378,13 @@ mod tests {
             }
         );
         assert_eq!(
-            assert_bootstrap_baseline(&bare_baseline, &fixture, SETUP_RUN),
+            assert_bootstrap_baseline(&bare_baseline, &fixture, &lane_fixture(), SETUP_RUN),
             Ok(())
         );
         // The completed plan adds its own Work row, three native lanes and the
         // manager-decision lane whose Run carries `manager_proposal`.
         assert_eq!(
-            expected_happy_cardinality(&fixture, bare_baseline.counts).unwrap(),
+            expected_happy_cardinality(&fixture, &lane_fixture(), bare_baseline.counts).unwrap(),
             AlwaysOnCardinality {
                 work: 5,
                 runs: 5,
@@ -2351,7 +2394,8 @@ mod tests {
         // While the first step is held, only the plan Work and the held lane
         // exist.
         assert_eq!(
-            expected_pre_restart_cardinality(&fixture, bare_baseline.counts).unwrap(),
+            expected_pre_restart_cardinality(&fixture, &lane_fixture(), bare_baseline.counts)
+                .unwrap(),
             AlwaysOnCardinality {
                 work: 2,
                 runs: 2,
@@ -2363,37 +2407,43 @@ mod tests {
     #[test]
     fn happy_shape_pins_each_step_to_its_fixture_terminal_state() {
         let fixture = fixture();
-        assert_eq!(expected_step_state(&fixture, "step-a"), Ok("succeeded"));
-        assert_eq!(expected_step_state(&fixture, "step-b"), Ok("failed"));
-        assert_eq!(expected_step_state(&fixture, "step-b-fix"), Ok("succeeded"));
         assert_eq!(
-            expected_step_state(&fixture, MANAGER_DECISION_STEP_ID),
+            expected_step_state(&lane_fixture(), "step-a"),
+            Ok("succeeded")
+        );
+        assert_eq!(expected_step_state(&lane_fixture(), "step-b"), Ok("failed"));
+        assert_eq!(
+            expected_step_state(&lane_fixture(), "step-b-fix"),
             Ok("succeeded")
         );
         assert_eq!(
-            expected_step_state(&fixture, "step-unknown"),
+            expected_step_state(&lane_fixture(), MANAGER_DECISION_STEP_ID),
+            Ok("succeeded")
+        );
+        assert_eq!(
+            expected_step_state(&lane_fixture(), "step-unknown"),
             Err(DiagnosticCode::FixtureInvalid)
         );
         // Each step's terminal state is part of the oracle: a forced-failure
         // step that reports success, or a step that should succeed reporting
         // failure, must both be rejected.
-        for (index, state) in [(3usize, "succeeded"), (2, "failed"), (4, "failed")] {
+        for (index, state) in [(2usize, "succeeded"), (1, "failed"), (3, "failed")] {
             let mut parts = projection(&happy_lanes(), true);
             parts.0["work"][index]["state"] = json!(state);
             let snapshot = AlwaysOnSnapshot::build(&parts.0, &parts.1, &parts.2, &parts.3).unwrap();
             assert_eq!(
-                assert_happy_shape(&fixture, &baseline(), &snapshot),
+                assert_happy_shape(&fixture, &lane_fixture(), &baseline(), &snapshot),
                 Err(DiagnosticCode::StateTransitionMismatch),
                 "work row {index} reporting {state} must fail"
             );
         }
         // The manager-decision lane must have succeeded.
         let mut decision = projection(&happy_lanes(), true);
-        decision.0["work"][5]["state"] = json!("failed");
+        decision.0["work"][4]["state"] = json!("failed");
         let decision =
             AlwaysOnSnapshot::build(&decision.0, &decision.1, &decision.2, &decision.3).unwrap();
         assert_eq!(
-            assert_happy_shape(&fixture, &baseline(), &decision),
+            assert_happy_shape(&fixture, &lane_fixture(), &baseline(), &decision),
             Err(DiagnosticCode::StateTransitionMismatch)
         );
     }
@@ -2427,7 +2477,7 @@ mod tests {
             "the proposal Run count is unchanged, so counting cannot catch this"
         );
         assert_eq!(
-            assert_happy_shape(&fixture, &base, &misbound),
+            assert_happy_shape(&fixture, &lane_fixture(), &base, &misbound),
             Err(DiagnosticCode::StateTransitionMismatch)
         );
 
@@ -2437,14 +2487,14 @@ mod tests {
         let doubled =
             AlwaysOnSnapshot::build(&doubled.0, &doubled.1, &doubled.2, &doubled.3).unwrap();
         assert_eq!(
-            assert_happy_shape(&fixture, &base, &doubled),
+            assert_happy_shape(&fixture, &lane_fixture(), &base, &doubled),
             Err(DiagnosticCode::StateTransitionMismatch)
         );
 
         // A decision Work whose public kind does not agree with its reserved
         // step id is not the decision lane.
         let mut mislabelled = projection(&happy_lanes(), true);
-        mislabelled.0["work"][5]["kind"] = json!("native");
+        mislabelled.0["work"][4]["kind"] = json!("native");
         let mislabelled = AlwaysOnSnapshot::build(
             &mislabelled.0,
             &mislabelled.1,
@@ -2453,7 +2503,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            assert_happy_shape(&fixture, &base, &mislabelled),
+            assert_happy_shape(&fixture, &lane_fixture(), &base, &mislabelled),
             Err(DiagnosticCode::StateTransitionMismatch)
         );
     }
@@ -2480,7 +2530,7 @@ mod tests {
         // The probe must not pass on the boundary: the fixture declares one
         // observed proposal Run, which this projection cannot prove.
         assert_eq!(
-            assert_happy_shape(&fixture(), &baseline(), &snapshot),
+            assert_happy_shape(&fixture(), &lane_fixture(), &baseline(), &snapshot),
             Err(DiagnosticCode::StateTransitionMismatch)
         );
     }
@@ -2497,7 +2547,7 @@ mod tests {
             .filter(|lane| lane.step != "step-b-fix")
             .collect();
         assert_eq!(
-            assert_happy_shape(&fixture, &base, &snapshot(&trimmed, true)),
+            assert_happy_shape(&fixture, &lane_fixture(), &base, &snapshot(&trimmed, true)),
             Err(DiagnosticCode::StateTransitionMismatch)
         );
 
@@ -2517,7 +2567,7 @@ mod tests {
             AlwaysOnSnapshot::build(&duplicated.0, &duplicated.1, &duplicated.2, &duplicated.3)
                 .unwrap();
         assert_eq!(
-            assert_happy_shape(&fixture, &base, &duplicated),
+            assert_happy_shape(&fixture, &lane_fixture(), &base, &duplicated),
             Err(DiagnosticCode::StateTransitionMismatch)
         );
 
@@ -2537,15 +2587,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            assert_happy_shape(&fixture, &base, &residual_growth),
+            assert_happy_shape(&fixture, &lane_fixture(), &base, &residual_growth),
             Err(DiagnosticCode::StateTransitionMismatch)
         );
 
         // A baseline the final snapshot no longer contains byte for byte.
         let mut drifted = base.clone();
-        drifted.work[0].state = Some("failed".into());
+        drifted.runs[0].state = Some("failed".into());
         assert_eq!(
-            assert_happy_shape(&fixture, &drifted, &happy()),
+            assert_happy_shape(&fixture, &lane_fixture(), &drifted, &happy()),
             Err(DiagnosticCode::StateTransitionMismatch)
         );
     }
@@ -2556,7 +2606,7 @@ mod tests {
     /// Run, plus the manager's single decision lane.
     fn post_restart() -> AlwaysOnSnapshot {
         let (mut work, mut details, mut intents, mut runs) = held_projection();
-        work["work"][2]["state"] = json!("failed");
+        work["work"][1]["state"] = json!("failed");
         for run in runs["runs"].as_array_mut().unwrap() {
             if run["runId"] == json!("run-a") {
                 run["state"] = json!("interrupted");
@@ -2710,13 +2760,26 @@ mod tests {
     // -- loopback provider lanes ---------------------------------------------
 
     fn record(semantic: &str, digest: &str) -> LoopbackProviderRecord {
+        record_at(1, semantic, digest, SendState::Sent)
+    }
+
+    fn record_at(
+        ordinal: u64,
+        semantic: &str,
+        digest: &str,
+        send_state: SendState,
+    ) -> LoopbackProviderRecord {
         LoopbackProviderRecord {
+            ordinal,
             method: "POST".into(),
             path: "/v1/chat/completions".into(),
             semantic_id: semantic.into(),
             body_digest: digest.into(),
             auth_accepted: true,
             route_ok: true,
+            send_state,
+            carrier_manager: Some(opaque_durable_id("carrier-manager")),
+            carrier_home: Some(opaque_durable_id("carrier-home")),
         }
     }
 

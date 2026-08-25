@@ -8,6 +8,7 @@ pub mod artifact;
 pub mod authority_stage3;
 pub mod capture;
 pub mod cli;
+pub mod lane_evidence;
 pub mod local_service;
 pub mod manifest;
 pub mod memory_stage5;
@@ -36,6 +37,8 @@ pub const AUTHORITY_STAGE3_REPORT_SCHEMA: &str = authority_stage3::AUTHORITY_STA
 pub const MEMORY_STAGE5_REPORT_SCHEMA: &str = memory_stage5::MEMORY_STAGE5_REPORT_SCHEMA;
 pub const ALWAYS_ON_GROKBOT_FIXTURE: &[u8] = crate::process_service::FIXTURE_BYTES;
 pub const ALWAYS_ON_GROKBOT_FIXTURE_SCHEMA: &str = crate::process_service::FIXTURE_SCHEMA;
+pub const ALWAYS_ON_LANE_FIXTURE: &[u8] = include_bytes!("../always-on-lane-evidence.v1.json");
+pub const ALWAYS_ON_LANE_FIXTURE_SCHEMA: &str = "grokptah.always_on_lane_evidence_fixture.v1";
 
 #[cfg(test)]
 mod always_on_tests {

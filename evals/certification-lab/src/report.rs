@@ -19,6 +19,10 @@ use sha2::{Digest, Sha256};
 use crate::always_on::{
     assert_provider_lanes, AlwaysOnFixture, AlwaysOnHappyShape, LoopbackProviderLane,
 };
+use crate::lane_evidence::{
+    assert_certification_summary, assert_shape_matches_joins, assert_summary_binding,
+    AlwaysOnCertificationSummary, LaneEvidenceFixture,
+};
 use crate::manifest::{
     CampaignManifest, DurableEntity, DurableState, OracleCode, ProbeAction, ProbeDefinition,
     ProbeScope, MAX_MANIFEST_BYTES,
@@ -328,6 +332,10 @@ pub struct ProbeResult {
     /// The exact fixture-derived identity shape the always-on probe proved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub always_on_shape: Option<AlwaysOnHappyShape>,
+    /// Per-home send ledgers, causal chains and decision evidence, bound to
+    /// the fixture digests and to this report's contract and commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub always_on_summary: Option<AlwaysOnCertificationSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -338,15 +346,58 @@ pub struct LoopbackProviderObservation {
     pub records: Vec<LoopbackProviderRecord>,
 }
 
+/// What the sender can know about one send attempt against the loopback
+/// provider.
+///
+/// The public MCP contract does not project provider attempts (the fixture
+/// records `providerAttemptProjection: absent-on-base-main`), so this is the
+/// lab's own durable observation of the transport, not a product claim.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum SendState {
+    /// No bytes for this send attempt ever reached the provider. The sender
+    /// still holds its one-shot budget: it may send once.
+    KnownNotSent,
+    /// Bytes reached the provider and no terminal disposition was reached.
+    Sending,
+    /// The provider accepted the request but no complete response was
+    /// delivered. The sender cannot distinguish committed from not committed,
+    /// so it must never re-send.
+    Uncertain,
+    /// The provider accepted the request and a complete response was
+    /// delivered.
+    Sent,
+}
+
+impl SendState {
+    /// True only when the sender knows nothing left the process, which is the
+    /// one state in which sending once more is still permitted.
+    pub fn may_send_once(self) -> bool {
+        matches!(self, Self::KnownNotSent)
+    }
+
+    /// True when bytes were observed or may have been committed, so no restart
+    /// may resume the attempt.
+    pub fn forbids_resume(self) -> bool {
+        matches!(self, Self::Sending | Self::Uncertain | Self::Sent)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LoopbackProviderRecord {
+    pub ordinal: u64,
     pub method: String,
     pub path: String,
     pub semantic_id: String,
     pub body_digest: String,
     pub auth_accepted: bool,
     pub route_ok: bool,
+    pub send_state: SendState,
+    /// Opaque manager Agent identity observed in the request at send time.
+    pub carrier_manager: Option<String>,
+    /// Opaque isolated-home identity observed in the request at send time.
+    pub carrier_home: Option<String>,
 }
 
 impl ProbeResult {
@@ -381,6 +432,7 @@ impl ProbeResult {
             provider_observation: None,
             provider_lanes: Vec::new(),
             always_on_shape: None,
+            always_on_summary: None,
         }
     }
 
@@ -630,6 +682,22 @@ impl CampaignReport {
         let mut capture_count = 0_u32;
         for (definition, probe) in selected.into_iter().zip(&self.probes) {
             validate_probe_against_definition(probe, definition)?;
+            // Per-home evidence is only this campaign's evidence if it is
+            // stamped with this campaign's contract and commit. A summary
+            // lifted from another run carries another commit and is refused.
+            if let Some(summary) = &probe.always_on_summary {
+                assert_summary_binding(
+                    summary,
+                    &self.manifest_sha256,
+                    &self.repository_commit,
+                    self.repository_dirty,
+                )
+                .map_err(|code| {
+                    anyhow::anyhow!(
+                        "always-on summary is not bound to this campaign's contract and commit: {code:?}"
+                    )
+                })?;
+            }
             if let Some(trace_ref) = &probe.trace {
                 if !artifact_paths.insert(trace_ref.relative_path.as_str()) {
                     bail!("report references an artifact path more than once");
@@ -1271,6 +1339,26 @@ fn validate_probe_against_definition(
             Some(_) => bail!("always-on passing probe left the manager-decision binding unproven"),
             None => bail!("always-on passing probe omitted its exact identity shape"),
         }
+        // Both homes must publish their send ledger, their causal chains and a
+        // decision chain bound to the same run, attempt and request.
+        let lanes = LaneEvidenceFixture::load()
+            .map_err(|code| anyhow::anyhow!("always-on lane fixture is invalid: {code:?}"))?;
+        let Some(summary) = &probe.always_on_summary else {
+            bail!("always-on passing probe omitted its per-home certification summary");
+        };
+        assert_certification_summary(&lanes, summary).map_err(|code| {
+            anyhow::anyhow!("always-on certification summary does not match the fixture: {code:?}")
+        })?;
+        // The identity shape and the provider joins are produced from
+        // different sources; requiring them to name the same identities means
+        // neither can be edited on its own.
+        let shape = probe
+            .always_on_shape
+            .as_ref()
+            .expect("always-on shape checked above");
+        assert_shape_matches_joins(shape, summary).map_err(|code| {
+            anyhow::anyhow!("always-on identity shape does not match its provider joins: {code:?}")
+        })?;
     }
     if definition.scope == ProbeScope::ProviderStructural
         && probe.status == ProbeStatus::Passed
@@ -1986,6 +2074,7 @@ mod tests {
             provider_observation: None,
             provider_lanes: Vec::new(),
             always_on_shape: None,
+            always_on_summary: None,
         }];
         value.recompute_summary().unwrap();
         value.certified = true;
@@ -1994,6 +2083,10 @@ mod tests {
 
     fn always_on_record(semantic: &str, digest: &str) -> crate::report::LoopbackProviderRecord {
         crate::report::LoopbackProviderRecord {
+            ordinal: 1,
+            send_state: crate::report::SendState::Sent,
+            carrier_manager: Some(opaque_durable_id("carrier-manager")),
+            carrier_home: Some(opaque_durable_id("carrier-home")),
             method: "POST".into(),
             path: "/v1/chat/completions".into(),
             semantic_id: semantic.into(),
@@ -2069,20 +2162,11 @@ mod tests {
         probe.elapsed_millis = 1;
         probe.provider_lanes = always_on_lanes();
         probe.provider_observation = crate::always_on::merge_provider_lanes(&probe.provider_lanes);
-        let decision_lane = crate::always_on::AlwaysOnLaneEvidence {
-            step_id: "__manager_decision__".into(),
-            work: opaque_durable_id("work-d"),
-            attempt: opaque_durable_id("attempt-d"),
-            intent: opaque_durable_id("intent-d"),
-            run: opaque_durable_id("run-d"),
-        };
-        probe.always_on_shape = Some(AlwaysOnHappyShape {
-            native_lanes: Vec::new(),
-            decision_lane: decision_lane.clone(),
-            manager_decision_binding: crate::always_on::ManagerDecisionBinding::Bound {
-                lane: decision_lane,
-            },
-        });
+        let summary = crate::lane_evidence::sample_summary(
+            &LaneEvidenceFixture::load().expect("lane fixture"),
+        );
+        probe.always_on_shape = Some(crate::lane_evidence::sample_shape(&summary));
+        probe.always_on_summary = Some(summary);
         probe
     }
 

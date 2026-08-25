@@ -582,7 +582,16 @@ pub async fn run_campaign(options: &CampaignOptions) -> Result<CampaignCompletio
                 ));
             }
         }
-        report.probes.push(result.expect("probe result assigned"));
+        let mut result = result.expect("probe result assigned");
+        // Bind the always-on evidence to the repository and commit this
+        // campaign is reporting on, so a summary lifted from another run
+        // cannot be presented as this one's.
+        if let Some(summary) = result.always_on_summary.as_mut() {
+            summary.manifest.clone_from(&report.manifest_sha256);
+            summary.commit.clone_from(&report.repository_commit);
+            summary.dirty = report.repository_dirty;
+        }
+        report.probes.push(result);
         report.finished_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
         report.recompute_summary()?;
         report.truncation.bytes_written = artifacts.used_bytes()?;

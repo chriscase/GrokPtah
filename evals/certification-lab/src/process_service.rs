@@ -16,11 +16,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use grokptah_agent_bridge::orchestration::hash_payload;
+
+use crate::report::opaque_durable_id;
 use grokptah_agent_bridge::{scan_value_for_forbidden_data, McpControlClient};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use crate::report::{LoopbackProviderObservation, LoopbackProviderRecord};
+use crate::report::{LoopbackProviderObservation, LoopbackProviderRecord, SendState};
 
 pub const TOKEN: &str = "always-on-grokbot-cert-token-32chars";
 pub const SYNTHETIC_KEY: &str = "test-not-a-secret";
@@ -55,6 +57,7 @@ pub enum ProviderDisposition {
 
 #[derive(Clone, Debug)]
 pub struct ProviderRecord {
+    pub ordinal: u64,
     pub method: String,
     pub path: String,
     pub auth_present: bool,
@@ -63,6 +66,13 @@ pub struct ProviderRecord {
     pub body_digest: String,
     pub semantic_id: String,
     pub route_ok: bool,
+    /// Terminal transport disposition observed for this attempt. Never
+    /// `KnownNotSent`: a record only exists once bytes arrived.
+    pub send_state: SendState,
+    /// Manager Agent identity carried in the request at send time.
+    pub carrier_manager: Option<String>,
+    /// Isolated home (service workspace) carried in the request at send time.
+    pub carrier_home: Option<String>,
 }
 
 struct ProviderState {
@@ -74,6 +84,7 @@ struct ProviderState {
     release_signal: Condvar,
     posts: AtomicU64,
     rejected_auth: AtomicU64,
+    next_ordinal: AtomicU64,
     stop: AtomicBool,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -98,6 +109,7 @@ impl FakeProvider {
             release_signal: Condvar::new(),
             posts: AtomicU64::new(0),
             rejected_auth: AtomicU64::new(0),
+            next_ordinal: AtomicU64::new(1),
             stop: AtomicBool::new(false),
             workers: Mutex::new(Vec::new()),
         });
@@ -167,12 +179,16 @@ impl FakeProvider {
                 .records()
                 .into_iter()
                 .map(|record| LoopbackProviderRecord {
+                    ordinal: record.ordinal,
+                    carrier_manager: record.carrier_manager.as_deref().map(opaque_durable_id),
+                    carrier_home: record.carrier_home.as_deref().map(opaque_durable_id),
                     method: record.method,
                     path: record.path,
                     semantic_id: record.semantic_id,
                     body_digest: record.body_digest,
                     auth_accepted: record.auth_accepted,
                     route_ok: record.route_ok,
+                    send_state: record.send_state,
                 })
                 .collect(),
         }
@@ -284,7 +300,11 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
     let auth = auth_presence(&headers);
     let auth_accepted = expected_bearer_accepted(&headers);
     let semantic_id = classify_semantic(&body);
+    // Bytes have arrived, so this attempt is no longer KnownNotSent. It stays
+    // `Sending` until the connection reaches a terminal transport disposition.
+    let ordinal = state.next_ordinal.fetch_add(1, Ordering::SeqCst);
     let record = ProviderRecord {
+        ordinal,
         method: method.clone(),
         path: path.clone(),
         auth_present: auth.0,
@@ -293,6 +313,9 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
         body_digest: hash_payload(&Value::String(body.clone())),
         semantic_id: semantic_id.clone(),
         route_ok: path == "/v1/chat/completions",
+        send_state: SendState::Sending,
+        carrier_manager: carrier_manager(&body),
+        carrier_home: carrier_home(&body),
     };
     {
         let mut records = state
@@ -306,8 +329,21 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
     }
     if !auth_accepted {
         state.rejected_auth.fetch_add(1, Ordering::SeqCst);
-        let _ = stream.write_all(
-            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\nConnection: close\r\n\r\nunauthorized",
+        // A complete 401 is still a complete exchange: the sender knows what
+        // happened. It was refused, never accepted, so it binds to no intent.
+        let delivered = stream
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\nConnection: close\r\n\r\nunauthorized",
+            )
+            .is_ok();
+        settle_send(
+            state,
+            ordinal,
+            if delivered {
+                SendState::Sent
+            } else {
+                SendState::Uncertain
+            },
         );
         return;
     }
@@ -328,6 +364,11 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
         .copied()
         .unwrap_or(ProviderDisposition::Scripted);
     if disposition == ProviderDisposition::Hold {
+        // Holding means accepted-and-counted with the response withheld, which
+        // is the uncertain state from the moment the decision is taken. Waiting
+        // for the hold deadline before settling would misreport a request the
+        // service can no longer distinguish as committed.
+        settle_send(state, ordinal, SendState::Uncertain);
         let mut released = state
             .release_set
             .lock()
@@ -344,12 +385,69 @@ fn handle_provider_conn(mut stream: TcpStream, state: &ProviderState) {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             released = guard;
         }
+        // The request was accepted and counted but no response is delivered:
+        // the sender cannot tell whether the provider committed.
         let _ = stream.shutdown(Shutdown::Both);
+        settle_send(state, ordinal, SendState::Uncertain);
         return;
     }
     let response = scripted_completion(&body);
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
+    let delivered = stream.write_all(response.as_bytes()).is_ok() && stream.flush().is_ok();
+    settle_send(
+        state,
+        ordinal,
+        if delivered {
+            SendState::Sent
+        } else {
+            SendState::Uncertain
+        },
+    );
+}
+
+/// The manager Agent identity the request carries at send time.
+///
+/// The public contract puts no run, intent or attempt correlation id on the
+/// wire, but it does carry the Agent identity inside the memory-scope system
+/// message, and `ptah_list_persistent_agents` projects the same value. That
+/// makes it a nonsecret at-send carrier the loopback can observe independently
+/// and the report can cross-check against the published manager.
+fn carrier_manager(body: &str) -> Option<String> {
+    for marker in ["\"agent_id\":\"", "agent_id\\\":\\\""] {
+        if let Some(start) = body.find(marker) {
+            let rest = &body[start + marker.len()..];
+            let end = rest.find(['"', '\\']).unwrap_or(rest.len());
+            let value = &rest[..end];
+            if value.starts_with("agent-") && value.len() > 6 {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// The isolated home the request carries at send time.
+///
+/// Each home is a distinct `GROKPTAH_HOME` with its own workspace, and the
+/// service states that workspace in the request. It is the only at-send value
+/// that separates one home's traffic from the other's.
+fn carrier_home(body: &str) -> Option<String> {
+    const MARKER: &str = "Working directory: ";
+    let start = body.find(MARKER)? + MARKER.len();
+    let rest = &body[start..];
+    let end = rest.find(['\n', '\\']).unwrap_or(rest.len());
+    let value = rest[..end].trim().trim_end_matches('.');
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// Record the terminal transport disposition for one send attempt.
+fn settle_send(state: &ProviderState, ordinal: u64, send_state: SendState) {
+    let mut records = state
+        .records
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(record) = records.iter_mut().find(|record| record.ordinal == ordinal) {
+        record.send_state = send_state;
+    }
 }
 
 fn split_request_line(head: &str) -> (String, String) {
