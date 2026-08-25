@@ -8,5 +8,30 @@
  */
 export * from "./capabilities";
 export * from "./help";
+// The source-cited Help Center corpus is exported under explicit names so the
+// original bounded `searchHelp` contract remains backward compatible while
+// consumers can opt into semantic-ranking and assistant request validation.
+export {
+  HELP_ARTICLES,
+  HELP_CORPUS_VERSION,
+  buildHelpAssistantRequest,
+  buildHelpSemanticRequest,
+  parseHelpAssistantAnswer,
+  parseHelpSemanticAnswer,
+  searchHelp as searchHelpArticles,
+  validateHelpAssistantAnswer,
+  validateHelpSemanticAnswer,
+} from "./helpCenter";
+export type {
+  HelpArticle,
+  HelpAssistantAnswer,
+  HelpAssistantRequest,
+  HelpAssistantValidation,
+  HelpSemanticAnswer,
+  HelpSemanticRequest,
+  HelpSemanticValidation,
+  HelpSearchResult as HelpArticleSearchResult,
+  HelpTopic,
+} from "./helpCenter";
 export * from "./promptQueue";
 export * from "./streamApply";

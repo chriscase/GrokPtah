@@ -4,6 +4,7 @@ import {
   emptyPromptQueueState,
   promptQueueReducer,
   queueKind,
+  searchHelpArticles,
 } from "./uiCore";
 
 describe("headless UI integration barrel", () => {
@@ -28,5 +29,11 @@ describe("headless UI integration barrel", () => {
       },
     });
     expect(state.entries["session-1"]?.[0]?.text).toBe("review");
+  });
+
+  it("exposes the source-cited Help Center corpus to other products", () => {
+    const hits = searchHelpArticles("restricted company gateway");
+    expect(hits[0]?.article.id).toBe("providers.restricted-gateway-review");
+    expect(hits[0]?.retrievalMode).toBe("offline-lexical");
   });
 });

@@ -22,6 +22,8 @@ const publicApi = await import(bundlePath.href);
 const requiredExports = [
   "GrokPtahBrokerClient",
   "searchHelp",
+  "searchHelpArticles",
+  "HELP_ARTICLES",
   "promptQueueReducer",
   "applyAssistantStreamChunk",
 ];
@@ -36,6 +38,10 @@ const helpHits = publicApi.searchHelp("restricted gateway", {
 });
 if (!helpHits.some(({ entry }) => entry.id === "enterprise-gateway-review")) {
   throw new Error("public Help Center search did not return the enterprise gateway entry");
+}
+const articleHits = publicApi.searchHelpArticles("restricted company gateway");
+if (articleHits[0]?.article?.id !== "providers.restricted-gateway-review") {
+  throw new Error("public source-cited Help Center search did not rank the restricted gateway article");
 }
 const streamResult = publicApi.applyAssistantStreamChunk("", "consumer");
 if (streamResult.kind !== "replace" || streamResult.text !== "consumer") {
