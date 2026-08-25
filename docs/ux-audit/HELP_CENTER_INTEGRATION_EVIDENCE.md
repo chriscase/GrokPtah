@@ -31,7 +31,7 @@ live provider qualification, and 100% release qualification remain open.
 
 ## Verification run
 
-- `npm test`: 47 files / 263 tests passed.
+- `npm test`: 47 files / 264 tests passed.
 - `npm run typecheck`: passed.
 - `npm run build`: passed; Vite production bundle emitted.
 - `npm run verify:public`: passed; browser-safe public bundle, authority checks,
