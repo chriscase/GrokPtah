@@ -2,19 +2,19 @@ name: Swarm Control Plane
 
 on:
   push:
-    branches:
-      - main
     paths:
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/common/grokptah-swarm-control-plane/**"
       - ".github/workflows/swarm-control-plane.yml"
   pull_request:
+    types: [opened, synchronize, reopened]
     paths:
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/common/grokptah-swarm-control-plane/**"
       - ".github/workflows/swarm-control-plane.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
