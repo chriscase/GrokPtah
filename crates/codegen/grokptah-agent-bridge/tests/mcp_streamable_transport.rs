@@ -2256,15 +2256,21 @@ fn smoke_grant(run: &ComputerRun) -> ActionGrant {
     )
 }
 
-/// Live desktop-equivalent proof for the read-only Computer Run tools: the
-/// production `start_control_from_env` bootstrap (the same entry the Tauri
-/// desktop uses), seeded with real simulator runs through the host's shared
-/// store, exercised end to end by an independent Node client over real
-/// loopback HTTP — discovery, scoped reads, redaction pins, cursor paging,
-/// duplicate replay, stale-cursor recovery, cross-session/workspace
-/// rejection, capacity, auth-before-body, and reconnect replay.
-#[tokio::test]
-async fn remote_bearer_computer_reads_fail_closed() {
+struct ComputerReadsHarness {
+    env: ProcessEnvGuard,
+    _home: tempfile::TempDir,
+    ws: tempfile::TempDir,
+    ws_other: tempfile::TempDir,
+    _host: grokptah_agent_bridge::AgentHostHandle,
+    session_id: uuid::Uuid,
+    token: String,
+    run_a: ComputerRun,
+    run_b: ComputerRun,
+    run_c: ComputerRun,
+    srv: grokptah_agent_bridge::ControlServerHandle,
+}
+
+async fn start_computer_reads_harness() -> ComputerReadsHarness {
     let mut env = ProcessEnvGuard::new();
     let home = tempdir().unwrap();
     let ws = tempdir().unwrap();
@@ -2393,17 +2399,36 @@ async fn remote_bearer_computer_reads_fail_closed() {
         .await
         .expect("desktop env bootstrap must start control server");
     assert!(srv.addr.ip().is_loopback());
-    srv.orchestration_service()
-        .set_auth_credentials(vec![AuthCredential::with_computer_read_grant(
-            "primary",
-            &token,
-            session.id,
-            ws.path(),
-        )
-        .unwrap()])
+
+    ComputerReadsHarness {
+        env,
+        _home: home,
+        ws,
+        ws_other,
+        _host: host,
+        session_id: session.id,
+        token,
+        run_a,
+        run_b,
+        run_c,
+        srv,
+    }
+}
+
+/// An ungranted remote bearer (TOKEN-only `AuthCredential::new` primary)
+/// must not discover Computer Run read tools or learn run identity from the
+/// denial. This is not a ComputerRead-grant test; a scoped grant is covered
+/// by [`live_computer_reads_node_smoke`].
+#[tokio::test]
+async fn remote_bearer_computer_reads_fail_closed() {
+    let harness = start_computer_reads_harness().await;
+    harness
+        .srv
+        .orchestration_service()
+        .set_auth_credentials(vec![AuthCredential::new("primary", &harness.token).unwrap()])
         .unwrap();
 
-    let mut client = McpControlClient::new(format!("http://{}", srv.addr), &token);
+    let mut client = McpControlClient::new(format!("http://{}", harness.srv.addr), &harness.token);
     let initialized = client.initialize().await.unwrap();
     assert_eq!(
         initialized["_meta"]["grokptah/authorityCapabilities"]["hardDenials"],
@@ -2418,29 +2443,96 @@ async fn remote_bearer_computer_reads_fail_closed() {
     ] {
         assert!(
             tools.iter().all(|tool| tool.name != name),
-            "remote bearer must not discover {name}"
+            "ungranted remote bearer must not discover {name}"
         );
     }
     let denied = client
         .call_tool(
             "ptah_list_computer_runs",
             json!({
-                "session_id": session.id,
-                "workspace": ws.path().display().to_string()
+                "session_id": harness.session_id,
+                "workspace": harness.ws.path().display().to_string()
             }),
         )
         .await
         .expect_err("undiscoverable remote Computer read must fail closed");
     let encoded = denied.to_string();
     assert!(encoded.contains("unknown tool"));
-    for run_id in [&run_a.run_id, &run_b.run_id, &run_c.run_id] {
+    for run_id in [
+        &harness.run_a.run_id,
+        &harness.run_b.run_id,
+        &harness.run_c.run_id,
+    ] {
         assert!(
             !encoded.contains(run_id),
             "denial must not reveal Computer Run identity"
         );
     }
 
-    srv.stop_and_wait().await;
+    harness.srv.stop_and_wait().await;
     set_grokptah_home_override(None);
-    drop(env);
+    drop(harness.env);
+}
+
+/// Live desktop-equivalent proof for the read-only Computer Run tools: the
+/// production `start_control_from_env` bootstrap (the same entry the Tauri
+/// desktop uses), seeded with real simulator runs through the host's shared
+/// store, then given an exact host-owned ComputerRead grant and exercised
+/// end to end by an independent Node client over real loopback HTTP —
+/// discovery, scoped reads, redaction pins, cursor paging, duplicate replay,
+/// stale-cursor recovery, cross-session/workspace rejection, capacity,
+/// auth-before-body, and reconnect replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn live_computer_reads_node_smoke() {
+    let harness = start_computer_reads_harness().await;
+    harness
+        .srv
+        .orchestration_service()
+        .set_auth_credentials(vec![AuthCredential::with_computer_read_grant(
+            "primary",
+            &harness.token,
+            harness.session_id,
+            harness.ws.path(),
+        )
+        .unwrap()])
+        .unwrap();
+
+    let url = format!("http://{}/mcp", harness.srv.addr);
+    let sdk_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/mcp_sdk_interop");
+    let output = tokio::process::Command::new("node")
+        .arg(sdk_dir.join("run_computer_reads_smoke.mjs"))
+        .env("GROKPTAH_MCP_URL", &url)
+        .env("GROKPTAH_MCP_TOKEN", &harness.token)
+        .env("GROKPTAH_MCP_SESSION_ID", harness.session_id.to_string())
+        .env(
+            "GROKPTAH_MCP_WORKSPACE",
+            harness.ws.path().display().to_string(),
+        )
+        .env(
+            "GROKPTAH_MCP_OTHER_WORKSPACE",
+            harness.ws_other.path().display().to_string(),
+        )
+        .env("GROKPTAH_MCP_COMPUTER_RUN_A", &harness.run_a.run_id)
+        .env("GROKPTAH_MCP_COMPUTER_RUN_B", &harness.run_b.run_id)
+        .env("GROKPTAH_MCP_COMPUTER_RUN_C", &harness.run_c.run_id)
+        .output()
+        .await
+        .expect("spawn computer reads smoke");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "computer reads smoke failed\nstdout={stdout}\nstderr={stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(report["ok"], true, "computer reads smoke report={report}");
+    if let Some(failed) = report["failed"].as_array() {
+        assert!(failed.is_empty(), "failed checks: {failed:?}");
+    }
+    eprintln!("LIVE_COMPUTER_READS_SMOKE_REPORT {report}");
+
+    harness.srv.stop_and_wait().await;
+    set_grokptah_home_override(None);
+    drop(harness.env);
 }
