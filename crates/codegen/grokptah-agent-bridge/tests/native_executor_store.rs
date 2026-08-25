@@ -1,15 +1,60 @@
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
     assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
-    select_relevant_managed_messages, AssignmentStatus, ManagedExecutionIntent,
-    ManagedExecutionPolicy, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
-    ManagedWorkMode, MessageKind, OrchErrorCode, OrchStore, RunBounds, RunRecord, RunState,
-    WorkItem, WorkMessage, WorkPolicy, WorkProgress, WorkResult, WorkState,
-    MANAGED_EXECUTION_SCHEMA_VERSION,
+    select_relevant_managed_messages, AssignmentStatus, ManagedAdmissionCapacity,
+    ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationStage, ManagedIntentState,
+    ManagedRetryCause, ManagedWorkMode, MessageKind, OrchErrorCode, OrchStore, ProviderRoute,
+    RunBounds, RunRecord, RunState, WorkItem, WorkMessage, WorkPolicy, WorkProgress, WorkResult,
+    WorkState, MANAGED_EXECUTION_SCHEMA_VERSION, MAX_CONCURRENT_PROVIDER_RUNS,
+    PROVIDER_CEILING_EXHAUSTED,
 };
 use grokptah_agent_bridge::{AgentRecord, AgentState};
 use tempfile::tempdir;
 use uuid::Uuid;
+
+fn managed_intent(
+    intent_id: &str,
+    agent_id: &str,
+    work_id: &str,
+    session_id: Uuid,
+    provider_id: &str,
+    model_id: &str,
+) -> ManagedExecutionIntent {
+    let now = Utc::now();
+    ManagedExecutionIntent {
+        schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
+        intent_id: intent_id.into(),
+        agent_id: agent_id.into(),
+        agent_spec_revision: 1,
+        work_id: work_id.into(),
+        work_revision: 1,
+        attempt_id: None,
+        run_id: None,
+        session_id,
+        workspace: "/tmp/ws".into(),
+        source_routine_id: None,
+        source_activation_id: None,
+        model_selection_key: grokptah_agent_bridge::model_selection_key(provider_id, model_id),
+        provider_route: Some(ProviderRoute {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+        }),
+        bounds: RunBounds::default(),
+        input_hash: format!("hash-{intent_id}"),
+        state: ManagedIntentState::Claiming,
+        permission_request_id: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn capacity(live_for_agent: usize, live_for_provider: usize) -> ManagedAdmissionCapacity {
+    ManagedAdmissionCapacity {
+        live_intents_for_agent: live_for_agent,
+        live_intents_for_provider: live_for_provider,
+        max_concurrent_provider_runs: MAX_CONCURRENT_PROVIDER_RUNS,
+    }
+}
 
 fn agent(id: &str, workspace: &str, session_id: Uuid) -> AgentRecord {
     let now = Utc::now();
@@ -99,21 +144,342 @@ fn manual_only_and_foreign_agents_are_not_eligible() {
     let spec = local.current_spec().unwrap().clone();
     let work = accepted_work(session, "/tmp/ws", "local");
     let ceiling = RunBounds::default();
-    assert!(managed_execution_eligible(&work, &local, &spec, &[], 0, &ceiling).is_err());
+    assert!(
+        managed_execution_eligible(&work, &local, &spec, &[], capacity(0, 0), &ceiling).is_err()
+    );
     let mut enabled = spec.clone();
     enabled.managed_execution.enabled = true;
     enabled.managed_execution.bounds.max_total_tokens = Some(4_000);
-    assert!(managed_execution_eligible(&work, &local, &enabled, &[], 0, &ceiling).is_ok());
+    assert!(
+        managed_execution_eligible(&work, &local, &enabled, &[], capacity(0, 0), &ceiling).is_ok()
+    );
     let foreign = store.load_agent("foreign").unwrap().unwrap();
     assert_eq!(
-        managed_execution_eligible(&work, &foreign, &enabled, &[], 0, &ceiling)
+        managed_execution_eligible(&work, &foreign, &enabled, &[], capacity(0, 0), &ceiling)
             .unwrap_err()
             .code,
         OrchErrorCode::ForbiddenScope
     );
     let mut forbidden = work.clone();
     forbidden.policy.managed_execution = ManagedWorkMode::Forbid;
-    assert!(managed_execution_eligible(&forbidden, &local, &enabled, &[], 0, &ceiling).is_err());
+    assert!(managed_execution_eligible(
+        &forbidden,
+        &local,
+        &enabled,
+        &[],
+        capacity(0, 0),
+        &ceiling
+    )
+    .is_err());
+}
+
+#[test]
+fn provider_ceiling_bounds_admission_across_agents() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    store
+        .save_agent(&agent("local", "/tmp/ws", session))
+        .unwrap();
+    let local = store.load_agent("local").unwrap().unwrap();
+    let mut spec = local.current_spec().unwrap().clone();
+    spec.managed_execution.enabled = true;
+    spec.managed_execution.max_concurrent_runs = 4;
+    spec.managed_execution.bounds.max_total_tokens = Some(4_000);
+    let work = accepted_work(session, "/tmp/ws", "local");
+    let ceiling = RunBounds::default();
+
+    // One slot left under the shared provider ceiling.
+    assert!(managed_execution_eligible(
+        &work,
+        &local,
+        &spec,
+        &[],
+        capacity(0, MAX_CONCURRENT_PROVIDER_RUNS - 1),
+        &ceiling,
+    )
+    .is_ok());
+
+    // The Agent is well under its own ceiling, but other Agents already hold
+    // every live admission for this provider identity.
+    let error = managed_execution_eligible(
+        &work,
+        &local,
+        &spec,
+        &[],
+        capacity(0, MAX_CONCURRENT_PROVIDER_RUNS),
+        &ceiling,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, OrchErrorCode::CapacityExhausted);
+    assert_eq!(
+        error.message, PROVIDER_CEILING_EXHAUSTED,
+        "provider capacity must be distinguishable from the Agent ceiling"
+    );
+}
+
+#[test]
+fn agent_ceiling_still_binds_before_provider_capacity() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    store
+        .save_agent(&agent("local", "/tmp/ws", session))
+        .unwrap();
+    let local = store.load_agent("local").unwrap().unwrap();
+    let mut spec = local.current_spec().unwrap().clone();
+    spec.managed_execution.enabled = true;
+    spec.managed_execution.max_concurrent_runs = 1;
+    spec.managed_execution.bounds.max_total_tokens = Some(4_000);
+    let work = accepted_work(session, "/tmp/ws", "local");
+    let error = managed_execution_eligible(
+        &work,
+        &local,
+        &spec,
+        &[],
+        capacity(1, 0),
+        &RunBounds::default(),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, OrchErrorCode::CapacityExhausted);
+    assert_ne!(
+        error.message, PROVIDER_CEILING_EXHAUSTED,
+        "the Agent ceiling must not be reported as provider pressure"
+    );
+    assert!(
+        error
+            .message
+            .contains("managed execution concurrent run ceiling"),
+        "unexpected message: {}",
+        error.message
+    );
+}
+
+#[test]
+fn live_provider_counts_ignore_finalized_and_foreign_providers() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    store
+        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .unwrap();
+
+    let saved = |intent_id: &str, provider: &str, model: &str, state: ManagedIntentState| {
+        let item = accepted_work(session, "/tmp/ws", "worker-a");
+        store.save_work_item(&item).unwrap();
+        let now = Utc::now();
+        let intent = ManagedExecutionIntent {
+            schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
+            intent_id: intent_id.into(),
+            agent_id: "worker-a".into(),
+            agent_spec_revision: 1,
+            work_id: item.work_id.clone(),
+            work_revision: item.revision,
+            attempt_id: None,
+            run_id: None,
+            session_id: session,
+            workspace: "/tmp/ws".into(),
+            source_routine_id: None,
+            source_activation_id: None,
+            model_selection_key: grokptah_agent_bridge::model_selection_key(provider, model),
+            provider_route: Some(ProviderRoute {
+                provider_id: provider.into(),
+                model_id: model.into(),
+            }),
+            bounds: RunBounds::default(),
+            input_hash: "hash".into(),
+            state,
+            permission_request_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        store.save_managed_intent(&intent).unwrap();
+    };
+
+    saved("i-1", "corp", "code", ManagedIntentState::Claiming);
+    saved("i-2", "corp", "code", ManagedIntentState::Parked);
+    saved("i-3", "corp", "code", ManagedIntentState::Finalized);
+    saved("i-4", "other", "code", ManagedIntentState::Admitted);
+
+    assert_eq!(store.live_managed_intents_for_provider("corp").unwrap(), 2);
+    assert_eq!(store.live_managed_intents_for_provider("other").unwrap(), 1);
+    assert_eq!(
+        store.live_managed_intents_for_provider("absent").unwrap(),
+        0
+    );
+}
+
+#[test]
+fn legacy_intents_without_a_route_still_consume_provider_capacity() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    store
+        .save_agent(&agent("worker-a", "/tmp/ws", session))
+        .unwrap();
+    let item = accepted_work(session, "/tmp/ws", "worker-a");
+    store.save_work_item(&item).unwrap();
+    let now = Utc::now();
+    let mut intent = ManagedExecutionIntent {
+        schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
+        intent_id: "legacy-1".into(),
+        agent_id: "worker-a".into(),
+        agent_spec_revision: 1,
+        work_id: item.work_id.clone(),
+        work_revision: item.revision,
+        attempt_id: None,
+        run_id: None,
+        session_id: session,
+        workspace: "/tmp/ws".into(),
+        source_routine_id: None,
+        source_activation_id: None,
+        model_selection_key: grokptah_agent_bridge::model_selection_key("corp", "code"),
+        provider_route: None,
+        bounds: RunBounds::default(),
+        input_hash: "hash".into(),
+        state: ManagedIntentState::Admitted,
+        permission_request_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+    intent.validate().unwrap();
+    assert_eq!(intent.effective_provider_id().as_deref(), Some("corp"));
+
+    // A record written before provider accounting round-trips without the
+    // field and is still counted against its provider.
+    let encoded = serde_json::to_value(&intent).unwrap();
+    assert!(encoded.get("providerRoute").is_none());
+    store.save_managed_intent(&intent).unwrap();
+    assert_eq!(store.live_managed_intents_for_provider("corp").unwrap(), 1);
+
+    // A plain model id keeps its historical built-in-provider meaning.
+    intent.model_selection_key = "grok-4.5".into();
+    assert_eq!(intent.effective_provider_id().as_deref(), Some("xai"));
+}
+
+#[test]
+fn unresolvable_legacy_intent_conservatively_consumes_provider_capacity() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    let mut legacy = managed_intent(
+        "legacy-unknown",
+        "legacy-agent",
+        "legacy-work",
+        session,
+        "xai",
+        "grok",
+    );
+    legacy.provider_route = None;
+    legacy.model_selection_key = "ptah.model.v1:malformed".into();
+    legacy.validate().unwrap();
+    assert_eq!(legacy.effective_provider_id(), None);
+    store.save_managed_intent(&legacy).unwrap();
+
+    assert_eq!(store.live_managed_intents_for_provider("xai").unwrap(), 1);
+    assert_eq!(store.live_managed_intents_for_provider("corp").unwrap(), 1);
+
+    let candidate = managed_intent(
+        "candidate",
+        "candidate-agent",
+        "candidate-work",
+        session,
+        "corp",
+        "code",
+    );
+    let error = store.reserve_managed_intent(&candidate, 2, 1).unwrap_err();
+    assert_eq!(error.code, OrchErrorCode::CapacityExhausted);
+    assert_eq!(error.message, PROVIDER_CEILING_EXHAUSTED);
+}
+
+#[test]
+fn intent_validation_rejects_a_malformed_provider_route() {
+    let session = Uuid::new_v4();
+    let now = Utc::now();
+    let mut intent = ManagedExecutionIntent {
+        schema_version: MANAGED_EXECUTION_SCHEMA_VERSION,
+        intent_id: "intent-route".into(),
+        agent_id: "worker-a".into(),
+        agent_spec_revision: 1,
+        work_id: "work-1".into(),
+        work_revision: 1,
+        attempt_id: None,
+        run_id: None,
+        session_id: session,
+        workspace: "/tmp/ws".into(),
+        source_routine_id: None,
+        source_activation_id: None,
+        model_selection_key: "grok".into(),
+        provider_route: Some(ProviderRoute {
+            provider_id: String::new(),
+            model_id: "grok".into(),
+        }),
+        bounds: RunBounds::default(),
+        input_hash: "hash".into(),
+        state: ManagedIntentState::Claiming,
+        permission_request_id: None,
+        created_at: now,
+        updated_at: now,
+    };
+    assert!(intent.validate().is_err());
+    assert_eq!(intent.effective_provider_id().as_deref(), Some(""));
+
+    intent.provider_route = Some(ProviderRoute {
+        provider_id: "corp".into(),
+        model_id: "x".repeat(257),
+    });
+    assert!(intent.validate().is_err());
+
+    intent.provider_route = Some(ProviderRoute {
+        provider_id: "corp".into(),
+        model_id: "code".into(),
+    });
+    assert!(intent.validate().is_err());
+    intent.model_selection_key = grokptah_agent_bridge::model_selection_key("corp", "code");
+    intent.validate().unwrap();
+}
+
+#[test]
+fn concurrent_provider_reservations_never_exceed_the_durable_ceiling() {
+    let home = tempdir().unwrap();
+    let store = OrchStore::open(home.path()).unwrap();
+    let session = Uuid::new_v4();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(MAX_CONCURRENT_PROVIDER_RUNS + 2));
+    let mut threads = Vec::new();
+    for index in 0..MAX_CONCURRENT_PROVIDER_RUNS + 2 {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        threads.push(std::thread::spawn(move || {
+            let intent = managed_intent(
+                &format!("intent-{index}"),
+                &format!("agent-{index}"),
+                &format!("work-{index}"),
+                session,
+                "xai",
+                "grok",
+            );
+            barrier.wait();
+            store.reserve_managed_intent(
+                &intent,
+                MAX_CONCURRENT_PROVIDER_RUNS,
+                MAX_CONCURRENT_PROVIDER_RUNS,
+            )
+        }));
+    }
+    let outcomes = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 4);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter_map(|outcome| outcome.as_ref().err())
+            .filter(|error| error.message == PROVIDER_CEILING_EXHAUSTED)
+            .count(),
+        2
+    );
+    assert_eq!(store.live_managed_intents_for_provider("xai").unwrap(), 4);
 }
 
 #[test]
@@ -170,6 +536,10 @@ fn abandoned_claiming_intent_returns_work_to_queued() {
         source_routine_id: None,
         source_activation_id: None,
         model_selection_key: "grok".into(),
+        provider_route: Some(ProviderRoute {
+            provider_id: "xai".into(),
+            model_id: "grok".into(),
+        }),
         bounds: RunBounds::default(),
         input_hash: "abc".into(),
         state: ManagedIntentState::Claiming,
@@ -305,6 +675,10 @@ fn claiming_intent(
         source_routine_id: None,
         source_activation_id: None,
         model_selection_key: "grok".into(),
+        provider_route: Some(ProviderRoute {
+            provider_id: "xai".into(),
+            model_id: "grok".into(),
+        }),
         bounds: RunBounds::default(),
         input_hash: "hash".into(),
         state: ManagedIntentState::Claiming,
@@ -323,6 +697,7 @@ fn run_for_intent(intent_id: &str, session: Uuid, workspace: &str, state: RunSta
         client_id: Some("native-executor".into()),
         state,
         purpose: Default::default(),
+        provider_route: None,
         agent_id: Some("worker-a".into()),
         retry_of: None,
         parent_run_id: None,
@@ -682,8 +1057,15 @@ fn retry_eligible_false_blocks_second_native_admission() {
     store.save_work_item(&item).unwrap();
     let agent = store.load_agent("worker-a").unwrap().unwrap();
     let spec = agent.current_spec().unwrap().clone();
-    let err = managed_execution_eligible(&item, &agent, &spec, &[], 0, &RunBounds::default())
-        .unwrap_err();
+    let err = managed_execution_eligible(
+        &item,
+        &agent,
+        &spec,
+        &[],
+        capacity(0, 0),
+        &RunBounds::default(),
+    )
+    .unwrap_err();
     assert_eq!(err.code, OrchErrorCode::Conflict);
 }
 

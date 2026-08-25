@@ -52,12 +52,21 @@ admission and recovery path.
   (`retryFailed` for failed/limit, `retryExpired` for interrupted/expired) and
   `attempt_count < maxAttempts`.
 
-`ManagedExecutionPolicy.allows_auto_retry` is the single predicate for
-**native auto-admission**. `retryEligible: false` does not rewrite a Work
-item that an operator reopened with `ptah_retry_work`: that item stays
-`queued` and claimable by an external/manual worker. The native supervisor
-skips it without mutating it and without creating another Run. The original
-failed native attempt remains inspectable.
+`ManagedExecutionPolicy.allows_auto_retry` supplies the managed-policy half of
+**native auto-admission**. The durable provider-attempt ledger is a second,
+mandatory fence: native retry is permitted only when every provider attempt
+for the Run is `SameRunSafe` (`KnownNotSent`). A `KnownAccepted` or
+`UncertainAccept` send, an admitted-but-unresolved provider row, an incomplete
+attempt page, or a missing Run binding fails closed. This prevents a generic
+managed retry flag from replaying request bytes that the gateway may already
+have accepted. An operator's explicit `ptah_retry_work` remains a deliberate
+new-Run decision; it is not an automatic replay.
+
+`retryEligible: false` does not rewrite a Work item that an operator reopened
+with `ptah_retry_work`: that item stays `queued` and claimable by an
+external/manual worker. The native supervisor skips it without mutating it and
+without creating another Run. The original failed native attempt remains
+inspectable.
 
 ## Dispatcher ownership
 
@@ -136,8 +145,9 @@ live. The executor:
 
 1. Does **not** resume the interrupted model invocation
 2. Closes the old intent (`finalized`) and the Work attempt (`expired`)
-3. Applies **both** `retryEligible` and Work retry (`retryExpired`)
-4. Creates a new attempt and finite Run only when both permit
+3. Applies **both** `retryEligible` and Work retry (`retryExpired`), plus the
+   provider-attempt retry fence
+4. Creates a new attempt and finite Run only when all three permit
 5. Otherwise leaves Work `failed` with an inspectable result
 
 The same close path is used for failed/limit Runs (`retryFailed`) and for
@@ -205,8 +215,9 @@ Crash recovery:
 - terminal Run → complete/fail/cancel the Work attempt and finalize the intent
 
 Late completion after lease expiry is rejected. Retry creates a new attempt
-and a new Run only when policy allows. Native admission never loops a
-forbidden retry: queued Work with `attempt_count >= 1` and
+and a new Run only when policy and the provider-attempt fence allow it. Native
+admission never loops a forbidden retry: queued Work with
+`attempt_count >= 1` and
 `retryEligible = false` is skipped, not sealed, so a manual `ptah_retry_work`
 remains claimable by an external worker.
 
@@ -257,8 +268,13 @@ send.
   session is `session_busy` rather than a second concurrent turn.
 - Permission oneshots are process memory. They are not restart-durable.
   Resolution after restart, cancel, or a dead receiver fails closed.
-- Named control-plane credentials remain **operator-equivalent**. They share
-  one service `owner_id` and are not bound to a single Agent.
+- The candidate now enforces role-scoped control-plane credentials. A default
+  remote credential is a `RemoteCoordinator`; explicit `RemoteOperator` and
+  `Observer` credentials have narrower operation ceilings, and only the
+  trusted local adapter receives `LocalOperator` authority. Worker credentials
+  can additionally bind one durable Agent and canonical workspace roots.
+  Production-shaped issuance/rotation and independent worker evidence remain
+  separate release gates.
 - `maxConcurrentRuns` is bounded to **1–4** (default 1). Live intents in
   `claiming`, `admitted`, `parked`, and `resolving` consume that ceiling.
 
@@ -281,7 +297,41 @@ explicit enable/disable; it does not own dispatch.
 
 ## Follow-up
 
-- Manager-agent planning and decomposition
-- Message-triggered routine activation
-- Per-principal worker credentials bound to one Agent
-- Computer Use for unattended Agents (not in this slice)
+Shipped since this slice (do not treat as remaining work):
+
+- Manager-agent planning and decomposition — [`MANAGER_PLANS.md`](MANAGER_PLANS.md) (autonomous supervisor is Experimental; not a Grokbot binary; not unattended Computer Use)
+- Manual and scheduled routines — [`DURABLE_ROUTINES.md`](DURABLE_ROUTINES.md) ([#306](https://github.com/chriscase/GrokPtah/issues/306) closed)
+
+Still remaining:
+
+- Message-triggered routine activation (`RoutineTrigger::External` adapters remain `unsupported` on create/fire)
+- Per-principal worker credentials and role-scoped authority are implemented
+  in the candidate (`LocalOperator` / `RemoteOperator` /
+  `RemoteCoordinator` / `Observer`); production-shaped issuance/rotation,
+  retained evidence, and the independent 72-hour worker campaign remain open
+  and must precede any production-shaped soak.
+- Computer Use for unattended Agents (not in this slice; [#287](https://github.com/chriscase/GrokPtah/issues/287)
+  Planned; isolated visual [#288](https://github.com/chriscase/GrokPtah/issues/288)
+  is a **mandatory unmet** 100% exit, not an unsupported alternative)
+- Native Coding Readiness Center / local host quota ledger — **Pending — not shipped** on [PR #352](https://github.com/chriscase/GrokPtah/pull/352);
+  stage 1 cannot pass while that PR remains draft; merge requires independently
+  certified repair of the five confirmed P1s
+- Independent long-running workers / multi-worker ([#305](https://github.com/chriscase/GrokPtah/issues/305)) —
+  **mandatory unmet** 100% exit (durable ownership, bounded delegated
+  workloads, crash/restart recovery, no duplicate execution,
+  capability/authority isolation, retained evidence). Cannot be descoped.
+  First-slice coordinator/workload tests and closed [#307](https://github.com/chriscase/GrokPtah/issues/307)
+  do not close it.
+- Selected packaged-desktop UX ([#308](https://github.com/chriscase/GrokPtah/issues/308)) —
+  **mandatory unmet** 100% exit; Explicitly unsupported covers documented
+  non-goals only
+
+Status: [`CAPABILITY_MATRIX.md`](CAPABILITY_MATRIX.md). Road to 100%:
+[`ROADMAP_TO_100.md`](ROADMAP_TO_100.md). Grok Build session/gateway routing is
+already Supported (credential order: `XAI_API_KEY`, keychain,
+`GROKPTAH_TOKEN_COMMAND`, then `~/.grok/auth.json`); compatible gateway
+requests consume provider quota; GrokPtah does not sync a Grok Build account
+balance; a named secret-free provider-quota receipt is a mandatory unmet 100%
+exit (“not observed” fails); account-balance sync is not implemented and not
+required; the PR #352 local host quota ledger is a separate pending feature
+until merged. Live certification is a separate question.

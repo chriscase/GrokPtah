@@ -1,0 +1,194 @@
+/* LaneContextHeader — component-local layer over the shared lane-context rules
+ * in styles/app.css. Every selector is scoped under .lane-context-header
+ * (specificity 0,2,0) so it wins over the shared 0,1,0 rules regardless of
+ * bundle order, without editing the shared stylesheet. */
+
+.lane-context-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  overflow: hidden; /* the page never scrolls horizontally because of this header */
+}
+
+/* Screen-reader-only text; no shared utility exists in app.css yet. */
+.lane-context-header .lane-context-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* --- Hierarchy: Lane title anchors the header; state sits beside it --- */
+
+.lane-context-header .lane-context-heading-row {
+  flex-wrap: wrap;
+  row-gap: 0.25rem;
+}
+
+.lane-context-header .lane-context-heading {
+  flex: 1 1 14rem;
+}
+
+.lane-context-header .lane-context-heading h1 {
+  font-size: 15px;
+  letter-spacing: -0.01em;
+}
+
+/* --- Operational state pill: text + glyph, never color alone --- */
+
+.lane-context-header .lane-context-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  min-height: 22px;
+  background: color-mix(in srgb, currentColor 9%, transparent);
+  border-color: color-mix(in srgb, currentColor 35%, var(--border-soft));
+}
+
+.lane-context-header .lane-context-state-mark {
+  font-size: 10px;
+  line-height: 1;
+}
+
+.lane-context-header .lane-context-state.is-ready {
+  color: var(--state-neutral);
+}
+
+.lane-context-header .lane-context-state.is-running {
+  color: var(--ok);
+}
+
+/* Light --ok (#2f8f57) only reaches ~3.6:1 as pill text; mix toward --text
+ * for ~6:1. Dark keeps its measured 10:1 --ok. */
+[data-theme="light"] .lane-context-header .lane-context-state.is-running {
+  color: color-mix(in srgb, var(--ok) 60%, var(--text));
+}
+
+.lane-context-header .lane-context-state.is-reconnecting {
+  color: var(--state-attention);
+}
+
+.lane-context-header .lane-context-state.is-disconnected,
+.lane-context-header .lane-context-state.is-error {
+  color: var(--state-danger);
+  background: color-mix(in srgb, currentColor 14%, transparent);
+}
+
+.lane-context-header .lane-context-state.is-archived {
+  color: var(--muted);
+  border-style: dashed;
+}
+
+/* --- Facts: evidence grid that adapts from 320 up to 2560 --- */
+
+.lane-context-header .lane-context-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: 0.4rem 1rem;
+  margin: 0;
+}
+
+/* --- Run Lane: explicit but visibly subordinate to the selected Lane --- */
+
+.lane-context-header .lane-context-run-lane {
+  grid-column: 1 / -1;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--accent-dim);
+  border-radius: var(--radius);
+  background: var(--overlay-faint);
+}
+
+.lane-context-header .lane-context-run-lane dt {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.lane-context-header .lane-context-remote-flag {
+  padding: 0.05rem 0.3rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* --- Actions: compact but comfortable targets, visible focus --- */
+
+.lane-context-header .lane-context-facts button {
+  min-height: 22px;
+  padding: 0.12rem 0.45rem;
+  font-size: 10px;
+}
+
+.lane-context-header button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* --- Narrow layouts (down to 320): single column, wrapped evidence --- */
+
+@media (max-width: 480px) {
+  .lane-context-header {
+    padding: 0.45rem 0.55rem;
+  }
+
+  .lane-context-header .lane-context-facts {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.35rem;
+  }
+
+  .lane-context-header .lane-context-facts dd {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
+/* --- Very wide layouts (2560): stop stretching, stay calm --- */
+
+@media (min-width: 1600px) {
+  .lane-context-header {
+    padding: 0.65rem 1rem;
+  }
+
+  .lane-context-header .lane-context-facts {
+    grid-template-columns: repeat(4, minmax(10rem, 24rem));
+    justify-content: start;
+  }
+}
+
+/* --- Motion is opt-in only --- */
+
+@media (prefers-reduced-motion: no-preference) {
+  .lane-context-header .lane-context-state {
+    transition:
+      color 160ms ease,
+      background-color 160ms ease,
+      border-color 160ms ease;
+  }
+
+  .lane-context-header[data-state="running"] .lane-context-state-mark,
+  .lane-context-header[data-state="reconnecting"] .lane-context-state-mark {
+    animation: lane-context-state-pulse 1.8s ease-in-out infinite;
+  }
+}
+
+@keyframes lane-context-state-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.35;
+  }
+}

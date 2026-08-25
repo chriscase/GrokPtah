@@ -9,7 +9,9 @@ mod common;
 use std::time::Duration;
 
 use grokptah_agent_bridge::{
-    AuthCredential, LiveNotification, McpControlClient, McpRemoteError, RunScope,
+    save_gateway_config, scan_value_for_forbidden_data, AuthCredential, CapabilitySource,
+    GatewayConfig, LiveNotification, McpControlClient, McpRemoteError, ModelCapabilities,
+    ProviderModel, ProviderProfile, RunScope,
 };
 use grokptah_service::{start_service, ServiceConfig};
 use serde_json::json;
@@ -1018,10 +1020,107 @@ async fn hosted_service_exposes_worker_and_message_state() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn configured_worker_rotation_survives_service_restart_without_widening_authority() {
+    let env = ServiceEnv::new();
+    let workspace = env.workspace_path();
+    let old_token = "worker-old-token-with-enough-entropy";
+    let new_token = "worker-new-token-with-enough-entropy";
+
+    let worker_credential = |token: &str| {
+        AuthCredential::new("worker-build-1", token)
+            .unwrap()
+            .with_agent_binding("agent-build-1")
+            .unwrap()
+            .with_workspace_roots([workspace.clone()])
+            .unwrap()
+    };
+    let service_config = |token: &str| {
+        let mut config = ServiceConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            TOKEN,
+            vec![workspace.clone()],
+            false,
+            2,
+            Duration::from_secs(8),
+        )
+        .unwrap()
+        .with_runtime_home(env._home.path())
+        .unwrap();
+        config.client_credentials.push(worker_credential(token));
+        config
+    };
+
+    let first = start_service(service_config(old_token)).await.unwrap();
+    let mut worker = McpControlClient::new(format!("http://{}", first.addr), old_token);
+    worker.initialize().await.unwrap();
+    let before = worker
+        .call_tool("ptah_get_authority_capabilities", json!({}))
+        .await
+        .unwrap()
+        .structured;
+    assert_eq!(before["principal"]["role"], "remote_coordinator");
+    assert_eq!(before["principal"]["credentialId"], "worker-build-1");
+    assert_eq!(before["scopes"]["agentIds"], json!(["agent-build-1"]));
+    let tools = worker.list_tools().await.unwrap();
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    for required in ["ptah_claim_work", "ptah_heartbeat_worker"] {
+        assert!(names.contains(&required), "missing worker tool {required}");
+    }
+    for denied in [
+        "ptah_approve_work",
+        "ptah_approve_run",
+        "ptah_promote_run",
+        "ptah_set_managed_execution",
+        "ptah_authorize_work_execution",
+        "ptah_list_computer_runs",
+    ] {
+        assert!(!names.contains(&denied), "worker authority leaked {denied}");
+    }
+    worker.close_session().await.unwrap();
+    first.stop_and_wait().await;
+
+    let second = start_service(service_config(new_token)).await.unwrap();
+    let mut stale = McpControlClient::new(format!("http://{}", second.addr), old_token);
+    assert!(
+        stale.initialize().await.is_err(),
+        "old worker token survived rotation"
+    );
+    let mut rotated = McpControlClient::new(format!("http://{}", second.addr), new_token);
+    rotated.initialize().await.unwrap();
+    let after = rotated
+        .call_tool("ptah_get_authority_capabilities", json!({}))
+        .await
+        .unwrap()
+        .structured;
+    assert_eq!(after["principal"], before["principal"]);
+    assert_eq!(after["scopes"], before["scopes"]);
+    assert_eq!(after["operations"], before["operations"]);
+    assert_eq!(after["documentHash"], before["documentHash"]);
+    rotated.close_session().await.unwrap();
+    second.stop_and_wait().await;
+}
+
+#[tokio::test]
 async fn hosted_service_exposes_native_executor_controls() {
     let env = ServiceEnv::new();
     let workspace = env.workspace_path();
-    let handle = start_isolated(&env, vec![workspace.clone()], 2).await;
+    let mut config = ServiceConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TOKEN,
+        vec![workspace.clone()],
+        false,
+        2,
+        Duration::from_secs(8),
+    )
+    .unwrap()
+    .with_runtime_home(env._home.path())
+    .unwrap();
+    config.client_credentials = vec![AuthCredential::operator("primary", TOKEN).unwrap()];
+    let handle = start_service(config).await.unwrap();
     let mut client = mcp_client(handle.addr).await;
     let session_id = create_build_session(&mut client, &workspace, "Native executor").await;
     let agent = handle
@@ -1048,6 +1147,11 @@ async fn hosted_service_exposes_native_executor_controls() {
     assert!(capacity.structured["health"]
         .get("nativeExecutor")
         .is_some());
+    assert_eq!(
+        capacity.structured["providerQuota"]["activeReservations"],
+        0
+    );
+    assert_eq!(capacity.structured["providerQuota"]["providerCount"], 0);
     assert_eq!(
         capacity.structured["health"]["managerSupervisor"]["enabled"],
         true
@@ -1166,4 +1270,66 @@ async fn wait_run_not_queued(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn seed_declared_coding_profile() {
+    let mut model = ProviderModel::unqualified("Team/Code:Cheap");
+    model.capabilities = ModelCapabilities {
+        chat: true,
+        tools: true,
+        stream: true,
+        source: CapabilitySource::Declared,
+        ..ModelCapabilities::default()
+    };
+    let mut profile = ProviderProfile::openai_compatible(
+        "company-gateway",
+        "Company gateway",
+        "http://127.0.0.1:9/v1",
+    );
+    profile.upsert_model(model);
+    let mut config = GatewayConfig::default();
+    config.upsert_profile(profile).unwrap();
+    save_gateway_config(&config).unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn hosted_service_reports_the_same_native_coding_readiness_as_the_host() {
+    let env = ServiceEnv::new();
+    seed_declared_coding_profile();
+    let workspace = env.workspace_path();
+    let handle = start_isolated(&env, vec![workspace], 2).await;
+    let host = handle.host();
+    let from_host =
+        serde_json::to_value(host.native_coding_readiness("company-gateway", "Team/Code:Cheap"))
+            .unwrap();
+    assert_eq!(from_host["schema"], "grokptah.native-coding-readiness.v1");
+    assert_eq!(from_host["ownerId"], "primary");
+    assert_eq!(from_host["qualificationEvidence"], "declared");
+    assert_eq!(from_host["execution"]["eligibility"], "credential_missing");
+    assert_eq!(from_host["computerUse"]["enabled"], false);
+    scan_value_for_forbidden_data(&from_host).unwrap();
+    assert!(!from_host.to_string().contains("http://"));
+    assert!(!from_host.to_string().contains("127.0.0.1"));
+
+    let mut client = mcp_client(handle.addr).await;
+    let tools = client.list_tools().await.unwrap();
+    assert!(tools
+        .iter()
+        .any(|tool| tool.name == "ptah_get_native_coding_readiness"));
+    let from_mcp = client
+        .call_tool(
+            "ptah_get_native_coding_readiness",
+            json!({
+                "providerId": "company-gateway",
+                "modelId": "Team/Code:Cheap",
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(!from_mcp.is_error, "{:?}", from_mcp.raw);
+    assert_eq!(from_mcp.structured, from_host);
+
+    client.close_session().await.unwrap();
+    handle.stop_and_wait().await;
 }

@@ -1,9 +1,19 @@
 # Computer Use on macOS
 
 The first native Computer Use adapter observes one exact window and performs a deliberately small
-set of semantic Accessibility actions on macOS 14 or later. GrokPtah itself keeps its macOS 11
-minimum: ScreenCaptureKit is loaded from its fixed system-framework path only on a supported OS,
-and every native entry point checks runtime availability before use.
+set of semantic Accessibility actions on macOS 14 or later. Its established path is
+**foreground-semantic**: it operates the real foreground OS application and may activate it. A
+separate Stage 8 candidate can bind one exact, locally measured background text field after a
+reversible disposable-target calibration. That narrow path does not make the foreground adapter
+or arbitrary Accessibility actions background-safe. Neither path is an isolated visual input
+domain, and neither may be advertised as isolated from pointer, key, clipboard, or focus effects.
+Distinct window IDs are selection/target identity. Native macOS is one
+host-global-foreground conflict domain (capacity 1); two windows share one physical input domain
+and must not be treated as isolated surfaces. Packaged hardware focus, TCC, and takeover evidence remain explicitly
+unverified. Takeover is durable bookkeeping-safe; it is not physically preemptive once an action is
+already inside the native action gate. GrokPtah itself keeps its macOS 11 minimum: ScreenCaptureKit is loaded
+from its fixed system-framework path only on a supported OS, and every native entry point checks
+runtime availability before use.
 
 ## Consent and selection
 
@@ -53,9 +63,12 @@ application-specific policy can attest their sensitive regions.
 ## Semantic action boundary
 
 The cockpit can stage `activate target`, Accessibility `invoke`, visible `set value`, `select`, and
-semantic `scroll to visible`. The user sees the exact target, action summary, risk, and visible text
-payload before granting one use. Each successful or uncertain mutation consumes its observation;
-continuing requires a new local authorization and observation.
+semantic `scroll to visible`. Activate target is valid only for this foreground-semantic backend
+and is never treated as non-disruptive: `GPTActImpl` still activates with
+`NSApplicationActivateIgnoringOtherApps` when that action is explicitly authorized. Background-safe
+semantic actions cannot silently activate. The user sees the exact target, action summary, risk, and
+visible text payload before granting one use. Each successful or uncertain mutation consumes its
+observation; continuing requires a new local authorization and observation.
 
 Immediately before native dispatch, the shim revalidates the exact ScreenCaptureKit window ID,
 process ID, bundle ID, frame, frontmost application, focused AX window, semantic traversal index,
@@ -64,11 +77,46 @@ after dispatch and verifies values where Accessibility exposes a deterministic p
 Permission revocation, app restart, focus theft, window movement, stale element identity, tree
 truncation, secure controls, or failed postconditions fail closed and consume the frame.
 
-This slice has no `CGEvent` keyboard or pointer path, coordinate fallback, cursor movement,
+### Measured background text-entry boundary
+
+The candidate exposes **Measured background text** as a different execution mode, proof, backend
+ID, and start command. It supports only `set value` on the exact element calibrated moments before;
+foreground activation, invoke, select, scroll, key, pointer, clipboard, and fallback are denied.
+
+The local calibration contract is intentionally visible and destructive only to a disposable
+fixture: choose a visible, non-minimized window that is not active; provide the exact label of one
+enabled, non-secure, non-sensitive text field with a readable value; acknowledge disposability;
+and let GrokPtah write a distinct probe value and restore the original. Native code measures all
+of the following around each dispatch:
+
+- frontmost process identity;
+- active layer-zero window identity for that process;
+- physical pointer coordinates;
+- target remains background, visible, non-minimized, and frame-stable;
+- exact AX element attestation and value postcondition.
+
+If measurement is unavailable or changes, the result is uncertain and no authority is minted.
+Restoration is attempted even when the first mutation's result is ambiguous, but a receipt is
+issued only after exact re-observation proves the original value is back. The receipt expires in
+two minutes, is consumed once, and binds the picker selection, target generation, native
+process/window, and element digest. Runtime actions repeat the same boundary checks and require a
+fresh observation plus a one-use local `text_entry` grant.
+
+This candidate does not certify every application or every AX implementation. Custom controls,
+write-only values, ambiguous labels, secure fields, sensitive/truncated surfaces, hidden or
+minimized windows, and any target that cannot preserve the measured external state are denied.
+Packaged native disposable-fixture evidence and strict external qualification remain open, so
+[#287](https://github.com/chriscase/GrokPtah/issues/287) must remain open.
+
+This slice has no `CGEventPost` keyboard/pointer injection, coordinate fallback, cursor movement,
 clipboard access, AppleScript, secret substitution, automatic approval, unattended mode, model
-Computer tool, or Computer mutation over MCP. Pause, Stop, and Take over revoke authority without
+Computer tool, or Computer mutation over MCP. Capability booleans stay `pointer_fallback=false`
+and `key_chords=false`; they are a public projection of a foreground-semantic typed proof and
+cannot authorize pointer or key dispatch. Pause, Stop, and Take over revoke authority without
 depending on the model or network; an action that loses the durable completion race cannot commit
-as successful.
+as successful. The candidate's exact atomic cancellation signal preempts native preflight and
+activation waits, but an Accessibility API call already entered is not physically reversible and
+remains uncertain and non-replayable.
 
 ## Packaging and signing
 
@@ -121,6 +169,15 @@ For an opt-in bridge-level smoke against the same fixture, set `GROKPTAH_LIVE_CO
 run `cargo run --example macos_computer_use_actions` from the bridge crate. It never prompts for
 permissions and exits unless the existing Screen Recording and Accessibility grants are already
 visible to that process.
+
+For the measured-background candidate, leave the demo visible but put Terminal or another ordinary
+app in front. Then set `GROKPTAH_LIVE_BACKGROUND_COMPUTER_USE=1` and run
+`cargo run --example macos_computer_use_background_text` from the bridge crate. The smoke refuses
+an active, hidden, or minimized demo; performs and restores the calibration probe; binds the exact
+one-use receipt; performs two measured runtime text-entry actions; and finally restores the
+original disposable value. Each native dispatch independently verifies that the foreground
+process, active foreground window, and physical pointer did not change. This opt-in development
+smoke is not packaged-identity release evidence by itself.
 
 ### Isolated packaged-app inspection
 

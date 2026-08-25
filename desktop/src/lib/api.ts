@@ -2,13 +2,16 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AgentStatus,
   AuthState,
+  ComputerBackgroundSafetyReceipt,
   ComputerObservationPreview,
   ComputerAgentEligibility,
   ComputerAgentProposalResult,
   ComputerAction,
   ComputerCockpitSnapshot,
+  ComputerRunEventPage,
   ComputerPermissionStatus,
   ComputerPlatformStatus,
+  ComputerIsolatedVisualStatus,
   ComputerTargetCandidate,
   ModelInfo,
   SearchHit,
@@ -18,10 +21,12 @@ import type {
   SubagentInfo,
   DurableRun,
   DurableRunEventPage,
+  DurableRunPage,
   RunExecutionMode,
   RunReview,
   WorkspaceUiState,
   ProviderQualificationReport,
+  NativeCodingReadinessProjection,
   PersistentAgent,
   PersistentAgentResumePlan,
   LaneSummary,
@@ -74,7 +79,7 @@ export const api = {
       allowQueue,
     }),
   remoteServiceRunList: () =>
-    invoke<DurableRun[]>("remote_service_run_list"),
+    invoke<DurableRunPage>("remote_service_run_list"),
   remoteServiceWorkList: (sessionId: string, workspace: string) =>
     invoke<DurableWorkItem[]>("remote_service_work_list", {
       sessionId,
@@ -331,6 +336,10 @@ export const api = {
     }),
   computerUseStatus: () =>
     invoke<ComputerPlatformStatus>("computer_use_status"),
+  computerUseIsolatedVisualStatus: () =>
+    invoke<ComputerIsolatedVisualStatus>(
+      "computer_use_isolated_visual_status",
+    ),
   computerUseRequestPermission: (
     permission: "screen_recording" | "accessibility",
   ) =>
@@ -343,9 +352,22 @@ export const api = {
     invoke<ComputerObservationPreview>("computer_use_observe_once", {
       selectionToken,
     }),
-  computerUseCockpitSnapshot: (sessionId: string) =>
+  computerUseCockpitSnapshot: (sessionId: string, runId?: string | null) =>
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_snapshot", {
       sessionId,
+      runId: runId ?? null,
+    }),
+  computerUseCockpitEvents: (
+    sessionId: string,
+    runId: string,
+    afterSeq?: number | null,
+    limit = 100,
+  ) =>
+    invoke<ComputerRunEventPage>("computer_use_cockpit_events", {
+      sessionId,
+      runId,
+      afterSeq: afterSeq ?? null,
+      limit,
     }),
   computerUseCockpitAgentEligibility: (sessionId: string) =>
     invoke<ComputerAgentEligibility>("computer_use_cockpit_agent_eligibility", {
@@ -389,6 +411,34 @@ export const api = {
       selectionToken,
       reviewedTargetAppId,
     }),
+  computerUseMeasureBackgroundTextEntry: (
+    sessionId: string,
+    selectionToken: string,
+    reviewedTargetAppId: string,
+    elementLabel: string,
+    probeText: string,
+    disposableTargetAcknowledged: boolean,
+  ) =>
+    invoke<ComputerBackgroundSafetyReceipt>("computer_use_measure_background_text_entry", {
+      sessionId,
+      selectionToken,
+      reviewedTargetAppId,
+      elementLabel,
+      probeText,
+      disposableTargetAcknowledged,
+    }),
+  computerUseCockpitStartMeasuredBackground: (
+    sessionId: string,
+    selectionToken: string,
+    measurementToken: string,
+    reviewedTargetAppId: string,
+  ) =>
+    invoke<ComputerCockpitSnapshot>("computer_use_cockpit_start_measured_background", {
+      sessionId,
+      selectionToken,
+      measurementToken,
+      reviewedTargetAppId,
+    }),
   computerUseCockpitRefresh: (
     sessionId: string,
     runId: string,
@@ -415,38 +465,52 @@ export const api = {
     }),
   computerUseCockpitApprove: (
     sessionId: string,
+    runId: string,
     approvalId: string,
     requestId: string,
   ) =>
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_approve", {
       sessionId,
+      runId,
       approvalId,
       requestId,
     }),
-  computerUseCockpitDiscardApproval: (sessionId: string) =>
+  computerUseCockpitDiscardApproval: (sessionId: string, runId: string) =>
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_discard_approval", {
       sessionId,
+      runId,
     }),
-  computerUseCockpitPause: (
-    sessionId: string,
-    runId: string,
-    expectedVersion: number,
-  ) =>
+  computerUseCockpitPause: (sessionId: string, runId: string) =>
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_pause", {
       sessionId,
       runId,
-      expectedVersion,
     }),
-  computerUseCockpitTakeOver: (
-    sessionId: string,
-    runId: string,
-    expectedVersion: number,
-  ) =>
+  computerUseCockpitTakeOver: (sessionId: string, runId: string) =>
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_take_over", {
       sessionId,
       runId,
-      expectedVersion,
     }),
+  computerUseCockpitReconcileUncertainSurface: (
+    sessionId: string,
+    runId: string,
+    leaseId: string,
+    expectedRevision: number,
+    surfaceId: string,
+    incarnation: string,
+    note: string,
+  ) =>
+    invoke<ComputerCockpitSnapshot>(
+      "computer_use_cockpit_reconcile_uncertain_surface",
+      {
+        sessionId,
+        runId,
+        leaseId,
+        expectedRevision,
+        surfaceId,
+        incarnation,
+        note,
+      },
+    ),
   computerUseCockpitStop: (sessionId: string, runId: string) =>
     invoke<ComputerCockpitSnapshot>("computer_use_cockpit_stop", {
       sessionId,
@@ -646,8 +710,8 @@ export const api = {
     invoke<SessionCompletionRecord[]>("session_completion_history", {
       sessionId,
     }),
-  runList: (sessionId: string) =>
-    invoke<DurableRun[]>("run_list", { sessionId }),
+  runList: (sessionId: string, cursor?: string, limit?: number) =>
+    invoke<DurableRunPage>("run_list", { sessionId, cursor, limit }),
   runGet: (sessionId: string, runId: string) =>
     invoke<DurableRun | null>("run_get", { sessionId, runId }),
   runEvents: (sessionId: string, runId: string, afterSeq = 0, limit = 80) =>
@@ -772,6 +836,11 @@ export const api = {
   scheduleBackgroundTask: (title: string) =>
     invoke("schedule_background_task", { title }),
   settingsSnapshot: () => invoke<Record<string, unknown>>("settings_snapshot"),
+  nativeCodingReadiness: (providerId: string, modelId: string) =>
+    invoke<NativeCodingReadinessProjection>("native_coding_readiness", {
+      providerId,
+      modelId,
+    }),
   setSandbox: (profile: string) => invoke<void>("set_sandbox", { profile }),
   setSubagentIsolation: (mode: "worktree" | "shared") =>
     invoke<void>("set_subagent_isolation", { mode }),

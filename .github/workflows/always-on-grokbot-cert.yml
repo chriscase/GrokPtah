@@ -1,0 +1,55 @@
+name: Always-on Grokbot certification
+
+on:
+  pull_request:
+    paths:
+      - "crates/codegen/grokptah-service/**"
+      - "crates/codegen/grokptah-agent-bridge/**"
+      - "evals/certification-lab/**"
+      - "docs/ALWAYS_ON_GROKBOT_CERTIFICATION.md"
+      - ".github/workflows/always-on-grokbot-cert.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: always-on-grokbot-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  always-on-grokbot:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Linux dbus development and pkg-config
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+      - name: Service fmt
+        working-directory: crates/codegen/grokptah-service
+        run: cargo fmt --check
+      - name: Service clippy
+        working-directory: crates/codegen/grokptah-service
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Service process integration
+        working-directory: crates/codegen/grokptah-service
+        run: cargo test --locked --test always_on_grokbot -- --test-threads=1
+      - name: Certification-lab fmt
+        run: cargo fmt --check --manifest-path evals/certification-lab/Cargo.toml
+      - name: Certification-lab clippy
+        run: cargo clippy --locked --all-targets --manifest-path evals/certification-lab/Cargo.toml -- -D warnings
+      - name: Certification-lab units
+        run: cargo test --locked --manifest-path evals/certification-lab/Cargo.toml -- --test-threads=1
+      - name: Certification-lab always-on probe
+        run: |
+          cargo build --locked --manifest-path crates/codegen/grokptah-service/Cargo.toml --bin grokptah-service
+          export GROKPTAH_SERVICE_BIN="$GITHUB_WORKSPACE/crates/codegen/grokptah-service/target/debug/grokptah-service"
+          cargo run --locked --manifest-path evals/certification-lab/Cargo.toml -- \
+            run --repository "$GITHUB_WORKSPACE" --probe always-on-grokbot-lifecycle-v1

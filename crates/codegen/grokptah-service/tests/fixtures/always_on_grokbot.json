@@ -1,0 +1,152 @@
+{
+  "schema": "grokptah.always_on_grokbot_fixture.v1",
+  "schemaVersion": 2,
+  "seed": "always-on-grokbot-v1",
+  "baseSha": "67e29bd34dc64049432c715c93c2cef2185c63ea",
+  "claim": "bounded-process-smoke-and-one-accepted-request-restart-fence",
+  "nextRequiredCampaign": "pr-352-plus-provider-attempt-quota-uncertain-accept-integration",
+  "quotaLedger": "absent-at-67e29bd",
+  "proposalOnlyEnforcement": "unverified-pending-pr-352",
+  "internalPersistenceCuts": "not-proven-no-production-failpoint",
+  "attemptEvidence": "public-via-ptah_get_work.attempts-and-intent.attemptId",
+  "providerAttemptProjection": "absent-on-base-main",
+  "uncertainAcceptProjection": "absent-on-base-main",
+  "retryClassProjection": "absent-on-base-main",
+  "clock": "bounded-race-controlled-no-fake-clock-seam",
+  "supervisorPeriodMs": 2000,
+  "zeroGrowthSupervisorPeriods": 2,
+  "provedOracle": "interrupted_run_not_readmitted_within_window",
+  "soak10m": "unverified-ignored-harness-no-pinned-artifact",
+  "soak24h": "unverified-no-pinned-head-artifact",
+  "ciMode": "one-cycle-smoke",
+  "sentinels": {
+    "success": "GROKBOT_SUCCESS",
+    "fail": "GROKBOT_FORCE_FAIL",
+    "ok": "GROKBOT_OK",
+    "setup": "GROKBOT_SETUP"
+  },
+  "steps": {
+    "first": "step-a",
+    "failing": "step-b",
+    "replacement": "step-b-fix"
+  },
+  "happyPath": {
+    "decisionWork": 1,
+    "proposalRunsObserved": 1,
+    "nativeWorkByStep": {
+      "step-a": 1,
+      "step-b": 1,
+      "step-b-fix": 1
+    },
+    "providerPostsBySemanticId": {
+      "step-a": 1,
+      "step-b": 1,
+      "manager-decision": 1,
+      "step-b-fix": 1
+    }
+  },
+  "setup": {
+    "work": 0,
+    "attempts": 0,
+    "runs": 1,
+    "intents": 0,
+    "providerSends": 1
+  },
+  "managerPlan": {
+    "work": 1
+  },
+  "failClosed": {
+    "cancel": {
+      "runState": "cancelled",
+      "stopCause": "token_accounting_unavailable",
+      "errorCode": "max_total_tokens_usage_unavailable",
+      "posts": 1
+    },
+    "malformed": {
+      "runState": "limit_reached",
+      "stopCause": "token_accounting_unavailable",
+      "errorCode": "max_total_tokens_usage_unavailable",
+      "posts": 1
+    },
+    "disconnect": {
+      "runState": "limit_reached",
+      "stopCause": "token_accounting_unavailable",
+      "errorCode": "max_total_tokens_usage_unavailable",
+      "posts": 1
+    },
+    "status500": {
+      "runState": "limit_reached",
+      "stopCause": "token_accounting_unavailable",
+      "errorCode": "max_total_tokens_usage_unavailable",
+      "posts": 1
+    },
+    "slow": {
+      "runState": "limit_reached",
+      "stopCause": "token_accounting_unavailable",
+      "errorCode": "max_total_tokens_usage_unavailable",
+      "posts": 1
+    }
+  },
+  "resourceCeilings": {
+    "maxRssBytes": 4294967296,
+    "maxFdCount": 8192,
+    "maxThreads": 1024,
+    "maxDiskBytes": 134217728,
+    "maxCycleLatencyMs": 180000,
+    "maxRssGrowthBytes": 2147483648,
+    "maxFdGrowth": 512,
+    "maxThreadGrowth": 128,
+    "maxDiskGrowthBytes": 67108864
+  },
+  "artifactScan": {
+    "maxDepth": 8,
+    "maxFiles": 4096,
+    "maxFileBytes": 1048576,
+    "stderrHeadBytes": 32768,
+    "stderrTailBytes": 32768
+  },
+  "requiredAssertions": [
+    "fixture-schema-consumed",
+    "fixture-version-matches",
+    "fixture-unknown-fields-rejected",
+    "fixture-cardinalities-drive-runtime-oracle",
+    "clock-is-bounded-not-deterministic",
+    "claim-is-bounded-process-smoke",
+    "quota-and-uncertain-accept-absent",
+    "next-campaign-is-pr-352-provider-attempt-quota",
+    "lab-probe-does-not-synthesize",
+    "exact-decision-work",
+    "exact-proposal-run-observed",
+    "proposal-only-enforcement-unverified-pr-352",
+    "native-step-a-causal-join",
+    "native-step-b-causal-join",
+    "native-step-b-fix-causal-join",
+    "all-terminal-runs-pending-0",
+    "plan-succeeded",
+    "no-manual-tick-before-success",
+    "post-success-tick-idempotent",
+    "interrupted-run-not-readmitted-within-window",
+    "two-same-home-restarts",
+    "replay-same-payload",
+    "replay-changed-payload-conflict",
+    "scheduler-window-not-a-cutpoint",
+    "restart-exact-target-identities",
+    "invalid-directive-zero-replacement",
+    "cancel-two-restarts-no-resend",
+    "malformed-provider-exact-terminal",
+    "disconnect-provider-exact-terminal",
+    "status500-provider-exact-terminal",
+    "timeout-provider-exact-terminal",
+    "missing-mcp-bearer-rejected",
+    "wrong-mcp-bearer-rejected",
+    "provider-rejects-missing-bearer",
+    "provider-rejects-wrong-bearer",
+    "outside-workspace-home-unchanged",
+    "traversal-workspace-home-unchanged",
+    "wrong-session-home-unchanged",
+    "escaping-symlink-home-unchanged",
+    "symlink-swap-home-unchanged",
+    "soak-one-cycle-smoke-not-10m-or-24h",
+    "soak-report-schema"
+  ]
+}

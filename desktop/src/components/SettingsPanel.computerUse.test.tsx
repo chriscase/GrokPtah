@@ -9,6 +9,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SettingsPanel } from "./SettingsPanel";
 import type {
+  ComputerIsolatedVisualStatus,
   ComputerObservationPreview,
   ComputerPlatformStatus,
   ComputerTargetCandidate,
@@ -17,6 +18,7 @@ import type {
 const mocks = vi.hoisted(() => ({
   settingsSnapshot: vi.fn(),
   status: vi.fn(),
+  isolatedStatus: vi.fn(),
   requestPermission: vi.fn(),
   listTargets: vi.fn(),
   observeOnce: vi.fn(),
@@ -26,6 +28,7 @@ vi.mock("../lib/api", () => ({
   api: {
     settingsSnapshot: mocks.settingsSnapshot,
     computerUseStatus: mocks.status,
+    computerUseIsolatedVisualStatus: mocks.isolatedStatus,
     computerUseRequestPermission: mocks.requestPermission,
     computerUseListTargets: mocks.listTargets,
     computerUseObserveOnce: mocks.observeOnce,
@@ -44,6 +47,22 @@ const granted: ComputerPlatformStatus = {
   ...missing,
   screenRecording: "granted",
   accessibility: "granted",
+};
+
+const isolatedPending: ComputerIsolatedVisualStatus = {
+  platformId: "macos",
+  available: false,
+  hostCapable: true,
+  minimumOsVersion: "14.0",
+  operatingSystemSupported: true,
+  virtualizationFrameworkAvailable: true,
+  helperVirtualizationEntitlementVerified: false,
+  backendPackaged: false,
+  guestImageMeasured: false,
+  launchAttempted: false,
+  blocker: "backend_not_packaged",
+  detail:
+    "Host virtualization is ready; the signed helper and measured guest are not packaged yet",
 };
 
 const candidate: ComputerTargetCandidate = {
@@ -101,6 +120,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.settingsSnapshot.mockResolvedValue({});
   mocks.status.mockResolvedValue(missing);
+  mocks.isolatedStatus.mockResolvedValue(isolatedPending);
   mocks.requestPermission.mockResolvedValue("prompt_pending");
   mocks.listTargets.mockResolvedValue([candidate]);
   mocks.observeOnce.mockResolvedValue(preview);
@@ -113,10 +133,14 @@ describe("Computer Use settings", () => {
     renderSettings();
     fireEvent.click(screen.getByText("Computer Use"));
     await waitFor(() => expect(mocks.status).toHaveBeenCalled());
+    expect(mocks.isolatedStatus).toHaveBeenCalledTimes(1);
 
     expect(mocks.requestPermission).not.toHaveBeenCalled();
     expect(mocks.listTargets).not.toHaveBeenCalled();
     expect(mocks.observeOnce).not.toHaveBeenCalled();
+    expect(screen.getByText("Isolated visual workspace")).toBeTruthy();
+    expect(screen.getByText("Reserved for signed helper")).toBeTruthy();
+    expect(screen.getByText(/did not launch a virtual machine/)).toBeTruthy();
     expect(
       screen.getByText(/Codex Computer Use and Terminal grants do not grant GrokPtah access/),
     ).toBeTruthy();

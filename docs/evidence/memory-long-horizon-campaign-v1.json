@@ -1,0 +1,24 @@
+{
+  "schema": "grokptah.memory-long-horizon-evidence.v1",
+  "certification_id": "memory-logical-years-campaign-v1",
+  "candidate_sha": "47d7f7160c6a116faaeb18e987b472d4f8fc8bb9",
+  "fixture_id": "memory-long-horizon-v1",
+  "fixture_digest": "7cff6e28c81e29578c809f956c5560a33885f1c269c3d0e7c83c34c897f42668",
+  "core_source_digest": "e591c17d041cc542bd88fe5153fb0543a249ca5e5bb2fcfe4a9184b3da5f5f68",
+  "logical_years": 10,
+  "scopes": [
+    "project",
+    "agent_private",
+    "team"
+  ],
+  "critical_recall_pct": 100,
+  "stale_as_current_pct": 0,
+  "conflict_recall_pct": 100,
+  "conflict_false_positive_pct": 0,
+  "duplicate_rate_pct": 0,
+  "hot_store_within_byte_bound": true,
+  "repeated_read_reopen_deterministic": true,
+  "secret_free": true,
+  "claim_eligible": false,
+  "evidence_digest": "e0cb05ebc08d56a240a6736be7ff721a2b1032407c2fe296a02dbbf799f1de1c"
+}

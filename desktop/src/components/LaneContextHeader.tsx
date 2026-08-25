@@ -1,5 +1,6 @@
 import type { LaneSummary, RuntimeConnectionState, RuntimeTarget } from "../lib/protocol";
 import { StateCard } from "./StateCard";
+import "./LaneContextHeader.css";
 
 export type LaneContextHeaderProps = {
   lane: LaneSummary | null;
@@ -43,25 +44,39 @@ export function workspaceDisplayName(path?: string | null): string {
   return parts.slice(-3).join(" / ") || path;
 }
 
+type LaneContextStateKey =
+  | "archived"
+  | "error"
+  | "disconnected"
+  | "reconnecting"
+  | "running"
+  | "ready";
+
+/* The mark is a redundant non-color cue next to the state text, matching the
+ * StateCard glyph vocabulary. */
 function contextState(
   lane: LaneSummary | null,
   runLane: LaneSummary | null | undefined,
   runLive: boolean,
-): { label: string; state: string } {
-  if (lane?.archived) return { label: "Archived", state: "archived" };
+): { label: string; state: LaneContextStateKey; mark: string } {
+  if (lane?.archived) return { label: "Archived", state: "archived", mark: "◌" };
   const connection = runLane?.runtime_connection ?? lane?.runtime_connection;
-  if (connection === "error") return { label: "Unavailable", state: "error" };
-  if (connection === "disconnected") return { label: "Disconnected", state: "disconnected" };
-  if (connection === "reconnecting") return { label: "Reconnecting", state: "reconnecting" };
-  if (runLive) return { label: "Running", state: "running" };
-  return { label: "Ready", state: "ready" };
+  if (connection === "error") return { label: "Unavailable", state: "error", mark: "!" };
+  if (connection === "disconnected")
+    return { label: "Disconnected", state: "disconnected", mark: "⌁" };
+  if (connection === "reconnecting")
+    return { label: "Reconnecting", state: "reconnecting", mark: "↻" };
+  if (runLive) return { label: "Running", state: "running", mark: "◉" };
+  return { label: "Ready", state: "ready", mark: "○" };
 }
 
 /**
  * Product-facing ownership header for the selected Lane.
  *
  * A remote execution target remains a distinct Run Lane; it is never rendered
- * as though the selected local Lane changed Runtime ownership.
+ * as though the selected local Lane changed Runtime ownership. When present it
+ * appears as a subordinate, explicitly "Remote" row beneath the Lane's own
+ * facts, and the Lane's Runtime fact always reflects the selected Lane alone.
  */
 export function LaneContextHeader({
   lane,
@@ -79,6 +94,18 @@ export function LaneContextHeader({
   const workspace = lane?.cwd;
   const isArchived = Boolean(lane?.archived);
   const headingId = `lane-context-${lane?.id ?? "current"}`;
+  const laneRuntime = `${runtimeTargetLabel(lane?.runtime_target)} · ${runtimeConnectionLabel(lane?.runtime_connection)}`;
+
+  const remoteRunLane = runLane && runLane.id !== lane?.id ? runLane : null;
+  const runLaneName = remoteRunLane
+    ? remoteRunLane.title || workspaceDisplayName(remoteRunLane.cwd)
+    : "";
+  const runLaneRuntime = remoteRunLane
+    ? `${runtimeTargetLabel(remoteRunLane.runtime_target)} · ${runtimeConnectionLabel(remoteRunLane.runtime_connection)}`
+    : "";
+  const runLaneEvidence = remoteRunLane
+    ? [runLaneName, runLaneRuntime, remoteRunLane.cwd].filter(Boolean).join(" · ")
+    : undefined;
 
   return (
     <section
@@ -86,54 +113,93 @@ export function LaneContextHeader({
       aria-labelledby={headingId}
       data-lane-id={lane?.id ?? undefined}
       data-run-lane-id={runLane?.id ?? lane?.id ?? undefined}
+      data-state={state.state}
     >
       <div className="lane-context-heading-row">
         <div className="lane-context-heading">
-          <span className="lane-context-eyebrow">Current Lane</span>
-          <h1 id={headingId}>{title}</h1>
+          <span className="lane-context-eyebrow">Selected Lane</span>
+          <h1 id={headingId} title={title}>
+            {title}
+          </h1>
         </div>
-        <span className={`lane-context-state is-${state.state}`}>
+        <span
+          className={`lane-context-state is-${state.state}`}
+          data-state={state.state}
+          role="status"
+        >
+          <span className="lane-context-state-mark" aria-hidden>
+            {state.mark}
+          </span>
+          {/* "Work status", not "Lane status": with a remote Run Lane the pill
+              reflects the effective work connection, while the Runtime fact
+              below stays the selected Lane's own. */}
+          <span className="lane-context-sr-only">Work status: </span>
           {state.label}
         </span>
       </div>
 
       <dl className="lane-context-facts">
-        <div>
+        <div className="lane-context-fact">
           <dt>Agent</dt>
-          <dd>{agentId ? agentId : "Ad hoc"}</dd>
-        </div>
-        <div>
-          <dt>Runtime</dt>
-          <dd>
-            {runtimeTargetLabel(lane?.runtime_target)}
-            <span aria-hidden> · </span>
-            {runtimeConnectionLabel(lane?.runtime_connection)}
+          <dd title={agentId || undefined}>
+            <span>{agentId ? agentId : "Ad hoc"}</span>
           </dd>
         </div>
-        <div className="lane-context-workspace">
+        <div className="lane-context-fact">
+          <dt>Runtime</dt>
+          <dd title={laneRuntime}>
+            <span>
+              {runtimeTargetLabel(lane?.runtime_target)}
+              <span aria-hidden> · </span>
+              {runtimeConnectionLabel(lane?.runtime_connection)}
+            </span>
+          </dd>
+        </div>
+        <div className="lane-context-fact lane-context-workspace">
           <dt>Workspace</dt>
           <dd title={workspace || undefined}>
             <span>{workspaceDisplayName(workspace)}</span>
             {onChangeWorkspace && !isArchived && (
-              <button type="button" onClick={onChangeWorkspace}>
+              <button type="button" aria-label="Change workspace" onClick={onChangeWorkspace}>
                 Change
               </button>
             )}
           </dd>
         </div>
-        <div>
+        <div className="lane-context-fact">
           <dt>Run</dt>
-          <dd>{runLabel}</dd>
+          <dd title={runLabel || undefined}>
+            <span>{runLabel}</span>
+          </dd>
         </div>
-        {runLane && runLane.id !== lane?.id && (
-          <div className="lane-context-run-lane">
-            <dt>Run Lane</dt>
-            <dd title={runLane.cwd || undefined}>
-              {runLane.title || workspaceDisplayName(runLane.cwd)}
-              <span aria-hidden> · </span>
-              {runtimeTargetLabel(runLane.runtime_target)}
-              <span aria-hidden> · </span>
-              {runtimeConnectionLabel(runLane.runtime_connection)}
+        {remoteRunLane && (
+          <div
+            className="lane-context-fact lane-context-run-lane"
+            data-run-lane-target={remoteRunLane.runtime_target ?? "local_desktop"}
+            data-run-lane-connection={remoteRunLane.runtime_connection ?? "connected"}
+          >
+            <dt>
+              Run Lane
+              <span
+                className="lane-context-remote-flag"
+                title="Remote execution target — selected Lane ownership is unchanged"
+              >
+                Remote
+              </span>
+              {/* The title tooltip is mouse-only; keyboard and screen-reader
+                  users need the ownership boundary in text. */}
+              <span className="lane-context-sr-only">
+                Remote execution target; selected Lane ownership is unchanged.
+              </span>
+            </dt>
+            <dd title={runLaneEvidence}>
+              <span>
+                {runLaneName}
+                <span aria-hidden> · </span>
+                {runtimeTargetLabel(remoteRunLane.runtime_target)}
+                <span aria-hidden> · </span>
+                {runtimeConnectionLabel(remoteRunLane.runtime_connection)}
+              </span>
             </dd>
           </div>
         )}

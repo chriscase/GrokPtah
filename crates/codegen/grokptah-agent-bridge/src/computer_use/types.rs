@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const MAX_ID_BYTES: usize = 256;
@@ -54,6 +55,969 @@ impl ComputerError {
 
 pub type ComputerResult<T> = Result<T, ComputerError>;
 
+/// Durable Computer Run schema. `0` means a legacy record missing the field.
+pub const COMPUTER_RUN_SCHEMA_VERSION: u32 = 1;
+/// Durable Computer mutation receipt schema. `0` means a legacy unversioned receipt.
+pub const COMPUTER_RECEIPT_SCHEMA_VERSION: u32 = 1;
+
+/// Public Agent-principal minting is intentionally unavailable. The only
+/// issuance path resolves a durable `AgentRecord` and exact current spec
+/// revision inside `AgentHost`; callers cannot authenticate with Agent-shaped
+/// strings or deserialize a usable authority token.
+pub const AGENT_PRINCIPAL_INTEGRATION_BLOCKER: &str = "Agent ComputerPrincipal minting requires a host-resolved durable AgentRecord and exact current spec revision";
+
+/// Closed Computer Use isolation/capability tier.
+///
+/// This is the host-owned security classification. Public booleans on
+/// [`ComputerCapabilities`] are a derived projection of a
+/// [`ComputerCapabilityProof`] and never grant pointer, key, background, or
+/// isolated authority by themselves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerCapabilityTier {
+    /// May require activating the real foreground target. Current macOS native
+    /// Computer Use is this tier and must not be advertised as isolated.
+    ForegroundSemantic,
+    /// Semantic actions that have been proven not to require foreground
+    /// activation or pointer/key injection. ActivateTarget is forbidden.
+    MeasuredBackgroundSafeSemantic,
+    /// Independently isolated visual input domain. Pointer/key/visual actions
+    /// require this proof. Stage 1 only the simulator can fixture this; a
+    /// simulator fixture cannot make a native backend isolated.
+    IndependentlyIsolatedVisualInputDomain,
+    /// Missing, unknown, legacy, or unattested capability. Fail closed.
+    #[default]
+    Unproven,
+}
+
+impl ComputerCapabilityTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ForegroundSemantic => "foreground_semantic",
+            Self::MeasuredBackgroundSafeSemantic => "measured_background_safe_semantic",
+            Self::IndependentlyIsolatedVisualInputDomain => {
+                "independently_isolated_visual_input_domain"
+            }
+            Self::Unproven => "unproven",
+        }
+    }
+
+    pub fn allows_activate_target(self) -> bool {
+        matches!(self, Self::ForegroundSemantic)
+    }
+
+    pub fn allows_background_semantic(self) -> bool {
+        matches!(
+            self,
+            Self::ForegroundSemantic
+                | Self::MeasuredBackgroundSafeSemantic
+                | Self::IndependentlyIsolatedVisualInputDomain
+        )
+    }
+
+    pub fn allows_isolated_input(self) -> bool {
+        matches!(self, Self::IndependentlyIsolatedVisualInputDomain)
+    }
+}
+
+/// Origin of an isolated-input proof. Simulator fixtures are explicitly not
+/// native isolation and cannot attest a host helper that does not exist yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationProofOrigin {
+    SimulatorFixture,
+    HostNative,
+}
+
+/// Host-attested capability proof. This is the security boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ComputerCapabilityProof {
+    #[default]
+    Unproven,
+    ForegroundSemantic {
+        backend_id: String,
+        observe: bool,
+        semantic_actions: bool,
+        text_entry: bool,
+    },
+    MeasuredBackgroundSafeSemantic {
+        backend_id: String,
+        observe: bool,
+        semantic_actions: bool,
+        text_entry: bool,
+        /// Host-issued measurement identity; never a model-provided string.
+        measurement_id: String,
+    },
+    IndependentlyIsolatedVisualInputDomain {
+        backend_id: String,
+        surface_id: String,
+        incarnation: String,
+        input_domain_id: String,
+        origin: IsolationProofOrigin,
+        observe: bool,
+        semantic_actions: bool,
+        text_entry: bool,
+        key_chords: bool,
+        pointer_fallback: bool,
+    },
+}
+
+impl ComputerCapabilityProof {
+    pub fn tier(&self) -> ComputerCapabilityTier {
+        match self {
+            Self::Unproven => ComputerCapabilityTier::Unproven,
+            Self::ForegroundSemantic { .. } => ComputerCapabilityTier::ForegroundSemantic,
+            Self::MeasuredBackgroundSafeSemantic { .. } => {
+                ComputerCapabilityTier::MeasuredBackgroundSafeSemantic
+            }
+            Self::IndependentlyIsolatedVisualInputDomain { .. } => {
+                ComputerCapabilityTier::IndependentlyIsolatedVisualInputDomain
+            }
+        }
+    }
+
+    pub fn backend_id(&self) -> &str {
+        match self {
+            Self::Unproven => "",
+            Self::ForegroundSemantic { backend_id, .. }
+            | Self::MeasuredBackgroundSafeSemantic { backend_id, .. }
+            | Self::IndependentlyIsolatedVisualInputDomain { backend_id, .. } => backend_id,
+        }
+    }
+
+    pub fn observe(&self) -> bool {
+        match self {
+            Self::Unproven => false,
+            Self::ForegroundSemantic { observe, .. }
+            | Self::MeasuredBackgroundSafeSemantic { observe, .. }
+            | Self::IndependentlyIsolatedVisualInputDomain { observe, .. } => *observe,
+        }
+    }
+
+    pub fn semantic_actions(&self) -> bool {
+        match self {
+            Self::Unproven => false,
+            Self::ForegroundSemantic {
+                semantic_actions, ..
+            }
+            | Self::MeasuredBackgroundSafeSemantic {
+                semantic_actions, ..
+            }
+            | Self::IndependentlyIsolatedVisualInputDomain {
+                semantic_actions, ..
+            } => *semantic_actions,
+        }
+    }
+
+    pub fn text_entry(&self) -> bool {
+        match self {
+            Self::Unproven => false,
+            Self::ForegroundSemantic { text_entry, .. }
+            | Self::MeasuredBackgroundSafeSemantic { text_entry, .. }
+            | Self::IndependentlyIsolatedVisualInputDomain { text_entry, .. } => *text_entry,
+        }
+    }
+
+    pub fn key_chords(&self) -> bool {
+        match self {
+            Self::IndependentlyIsolatedVisualInputDomain {
+                origin: IsolationProofOrigin::SimulatorFixture,
+                key_chords,
+                ..
+            } => *key_chords,
+            _ => false,
+        }
+    }
+
+    pub fn pointer_fallback(&self) -> bool {
+        match self {
+            Self::IndependentlyIsolatedVisualInputDomain {
+                origin: IsolationProofOrigin::SimulatorFixture,
+                pointer_fallback,
+                ..
+            } => *pointer_fallback,
+            _ => false,
+        }
+    }
+
+    pub fn isolation_origin(&self) -> Option<IsolationProofOrigin> {
+        match self {
+            Self::IndependentlyIsolatedVisualInputDomain { origin, .. } => Some(*origin),
+            _ => None,
+        }
+    }
+
+    pub fn isolated_surface(&self) -> Option<ComputerSurfaceBinding> {
+        match self {
+            Self::IndependentlyIsolatedVisualInputDomain {
+                surface_id,
+                incarnation,
+                ..
+            } => Some(ComputerSurfaceBinding {
+                surface_id: surface_id.clone(),
+                incarnation: incarnation.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn input_domain_id(&self) -> Option<&str> {
+        match self {
+            Self::IndependentlyIsolatedVisualInputDomain {
+                input_domain_id, ..
+            } => Some(input_domain_id.as_str()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn bind_to_interned_surface(
+        self,
+        surface: &ComputerSurfaceBinding,
+        input_domain_id: &str,
+        measurement_id: &str,
+    ) -> ComputerResult<Self> {
+        match self {
+            Self::Unproven => Ok(Self::Unproven),
+            Self::ForegroundSemantic { .. } => Ok(self),
+            Self::MeasuredBackgroundSafeSemantic {
+                backend_id,
+                observe,
+                semantic_actions,
+                text_entry,
+                ..
+            } => Ok(Self::MeasuredBackgroundSafeSemantic {
+                backend_id,
+                observe,
+                semantic_actions,
+                text_entry,
+                measurement_id: measurement_id.to_string(),
+            }),
+            Self::IndependentlyIsolatedVisualInputDomain {
+                backend_id,
+                origin,
+                observe,
+                semantic_actions,
+                text_entry,
+                key_chords,
+                pointer_fallback,
+                ..
+            } => Ok(Self::IndependentlyIsolatedVisualInputDomain {
+                backend_id,
+                surface_id: surface.surface_id.clone(),
+                incarnation: surface.incarnation.clone(),
+                input_domain_id: input_domain_id.to_string(),
+                origin,
+                observe,
+                semantic_actions,
+                text_entry,
+                key_chords,
+                pointer_fallback,
+            }),
+        }
+    }
+
+    pub fn is_simulator_only_isolation(&self) -> bool {
+        matches!(
+            self,
+            Self::IndependentlyIsolatedVisualInputDomain {
+                origin: IsolationProofOrigin::SimulatorFixture,
+                ..
+            }
+        )
+    }
+
+    /// Host-native isolated helpers are a later stage. A HostNative isolated
+    /// proof is recorded honestly but cannot authorize dispatch in stage 1.
+    pub fn isolated_input_is_dispatchable(&self) -> bool {
+        matches!(
+            self,
+            Self::IndependentlyIsolatedVisualInputDomain {
+                origin: IsolationProofOrigin::SimulatorFixture,
+                ..
+            }
+        )
+    }
+
+    pub fn validate(&self) -> ComputerResult<()> {
+        match self {
+            Self::Unproven => Ok(()),
+            Self::ForegroundSemantic { backend_id, .. } => {
+                validate_id("backend_id", backend_id)?;
+                if backend_id == SIMULATOR_ISOLATED_BACKEND_ID
+                    || backend_id == SIMULATOR_BACKGROUND_BACKEND_ID
+                    || backend_id == MACOS_BACKGROUND_SAFE_BACKEND_ID
+                {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::InvalidRequest,
+                        "foreground-semantic proof cannot use a background or isolated backend id",
+                    ));
+                }
+                Ok(())
+            }
+            Self::MeasuredBackgroundSafeSemantic {
+                backend_id,
+                measurement_id,
+                ..
+            } => {
+                validate_id("backend_id", backend_id)?;
+                validate_id("measurement_id", measurement_id)?;
+                if is_native_macos_backend(backend_id)
+                    && backend_id != MACOS_BACKGROUND_SAFE_BACKEND_ID
+                {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::ForbiddenAction,
+                        "an unmeasured native macOS backend cannot carry background-safe proof",
+                    ));
+                }
+                Ok(())
+            }
+            Self::IndependentlyIsolatedVisualInputDomain {
+                backend_id,
+                surface_id,
+                incarnation,
+                input_domain_id,
+                origin,
+                ..
+            } => {
+                validate_id("backend_id", backend_id)?;
+                ComputerSurfaceBinding {
+                    surface_id: surface_id.clone(),
+                    incarnation: incarnation.clone(),
+                }
+                .validate()?;
+                validate_id("input_domain_id", input_domain_id)?;
+                if is_native_macos_backend(backend_id) {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::ForbiddenAction,
+                        "a native macOS backend cannot carry isolated-input proof",
+                    ));
+                }
+                if *origin == IsolationProofOrigin::SimulatorFixture
+                    && backend_id != SIMULATOR_ISOLATED_BACKEND_ID
+                {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::InvalidRequest,
+                        "simulator isolated proof must use the simulator-isolated backend id",
+                    ));
+                }
+                if *origin == IsolationProofOrigin::HostNative {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::ForbiddenAction,
+                        "host-native isolated input is unsupported in isolation-contract stage 1",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Legacy or unknown JSON cannot become background or isolated authority.
+    pub fn from_wire(value: &serde_json::Value) -> Self {
+        let Some(kind) = value.get("kind").and_then(|kind| kind.as_str()) else {
+            return Self::Unproven;
+        };
+        let parsed = match kind {
+            "unproven" | "unsupported" | "unsupported_unproven" => Ok(Self::Unproven),
+            "foreground_semantic" => parse_foreground_proof(value),
+            "measured_background_safe_semantic" => parse_background_proof(value),
+            "independently_isolated_visual_input_domain" => parse_isolated_proof(value),
+            _ => return Self::Unproven,
+        };
+        match parsed {
+            Ok(proof) if proof.validate().is_ok() => proof,
+            _ => Self::Unproven,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ComputerCapabilityProof {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(Self::from_wire(&value))
+    }
+}
+
+fn json_bool(value: &serde_json::Value, key: &str) -> bool {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn parse_foreground_proof(value: &serde_json::Value) -> ComputerResult<ComputerCapabilityProof> {
+    let backend_id = json_string(value, "backendId")
+        .or_else(|| json_string(value, "backend_id"))
+        .ok_or_else(|| {
+            ComputerError::new(ComputerErrorCode::InvalidRequest, "missing backend_id")
+        })?;
+    if json_bool(value, "keyChords")
+        || json_bool(value, "key_chords")
+        || json_bool(value, "pointerFallback")
+        || json_bool(value, "pointer_fallback")
+    {
+        return Err(ComputerError::new(
+            ComputerErrorCode::InvalidRequest,
+            "foreground-semantic proof cannot claim pointer or key authority",
+        ));
+    }
+    Ok(ComputerCapabilityProof::ForegroundSemantic {
+        backend_id,
+        observe: json_bool(value, "observe"),
+        semantic_actions: json_bool(value, "semanticActions")
+            || json_bool(value, "semantic_actions"),
+        text_entry: json_bool(value, "textEntry") || json_bool(value, "text_entry"),
+    })
+}
+
+fn parse_background_proof(value: &serde_json::Value) -> ComputerResult<ComputerCapabilityProof> {
+    if json_bool(value, "keyChords")
+        || json_bool(value, "key_chords")
+        || json_bool(value, "pointerFallback")
+        || json_bool(value, "pointer_fallback")
+    {
+        return Err(ComputerError::new(
+            ComputerErrorCode::InvalidRequest,
+            "background-safe proof cannot claim pointer or key authority",
+        ));
+    }
+    Ok(ComputerCapabilityProof::MeasuredBackgroundSafeSemantic {
+        backend_id: json_string(value, "backendId")
+            .or_else(|| json_string(value, "backend_id"))
+            .ok_or_else(|| {
+                ComputerError::new(ComputerErrorCode::InvalidRequest, "missing backend_id")
+            })?,
+        observe: json_bool(value, "observe"),
+        semantic_actions: json_bool(value, "semanticActions")
+            || json_bool(value, "semantic_actions"),
+        text_entry: json_bool(value, "textEntry") || json_bool(value, "text_entry"),
+        measurement_id: json_string(value, "measurementId")
+            .or_else(|| json_string(value, "measurement_id"))
+            .ok_or_else(|| {
+                ComputerError::new(ComputerErrorCode::InvalidRequest, "missing measurement_id")
+            })?,
+    })
+}
+
+fn parse_isolated_proof(value: &serde_json::Value) -> ComputerResult<ComputerCapabilityProof> {
+    let origin = match json_string(value, "origin").as_deref() {
+        Some("simulator_fixture") => IsolationProofOrigin::SimulatorFixture,
+        Some("host_native") => IsolationProofOrigin::HostNative,
+        _ => {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "isolated proof origin is missing or unknown",
+            ))
+        }
+    };
+    Ok(
+        ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain {
+            backend_id: json_string(value, "backendId")
+                .or_else(|| json_string(value, "backend_id"))
+                .ok_or_else(|| {
+                    ComputerError::new(ComputerErrorCode::InvalidRequest, "missing backend_id")
+                })?,
+            surface_id: json_string(value, "surfaceId")
+                .or_else(|| json_string(value, "surface_id"))
+                .unwrap_or_default(),
+            incarnation: json_string(value, "incarnation").unwrap_or_default(),
+            input_domain_id: json_string(value, "inputDomainId")
+                .or_else(|| json_string(value, "input_domain_id"))
+                .unwrap_or_default(),
+            origin,
+            observe: json_bool(value, "observe"),
+            semantic_actions: json_bool(value, "semanticActions")
+                || json_bool(value, "semantic_actions"),
+            text_entry: json_bool(value, "textEntry") || json_bool(value, "text_entry"),
+            key_chords: json_bool(value, "keyChords") || json_bool(value, "key_chords"),
+            pointer_fallback: json_bool(value, "pointerFallback")
+                || json_bool(value, "pointer_fallback"),
+        },
+    )
+}
+
+pub const MACOS_NATIVE_BACKEND_ID: &str = "macos_accessibility_semantic";
+pub const MACOS_BACKGROUND_SAFE_BACKEND_ID: &str = "macos_accessibility_measured_background_safe";
+pub const MACOS_INTERRUPTED_BACKEND_ID: &str = "macos_interrupted";
+const MACOS_NATIVE_BACKEND_IDS: &[&str] = &[
+    MACOS_NATIVE_BACKEND_ID,
+    MACOS_BACKGROUND_SAFE_BACKEND_ID,
+    MACOS_INTERRUPTED_BACKEND_ID,
+];
+
+fn is_native_macos_backend(backend_id: &str) -> bool {
+    MACOS_NATIVE_BACKEND_IDS.contains(&backend_id)
+}
+pub const SIMULATOR_FOREGROUND_BACKEND_ID: &str = "deterministic_simulator";
+pub const SIMULATOR_BACKGROUND_BACKEND_ID: &str = "deterministic_simulator_background_safe";
+pub const SIMULATOR_ISOLATED_BACKEND_ID: &str = "deterministic_simulator_isolated";
+
+/// Typed macOS native capability. Public booleans are a derived projection of
+/// this foreground-semantic proof; they never grant pointer, key, background,
+/// or isolated authority.
+pub fn macos_native_capability_proof() -> ComputerCapabilityProof {
+    ComputerCapabilityProof::ForegroundSemantic {
+        backend_id: MACOS_NATIVE_BACKEND_ID.into(),
+        observe: true,
+        semantic_actions: true,
+        text_entry: true,
+    }
+}
+
+/// Host-measured macOS Accessibility capability. This proof is used only by
+/// a backend bound to one live, reversible, disposable-target calibration.
+/// The store replaces the placeholder measurement identity with its own
+/// interned host identity before the proof can authorize a Run.
+pub fn macos_background_safe_capability_proof() -> ComputerCapabilityProof {
+    ComputerCapabilityProof::MeasuredBackgroundSafeSemantic {
+        backend_id: MACOS_BACKGROUND_SAFE_BACKEND_ID.into(),
+        observe: true,
+        semantic_actions: false,
+        text_entry: true,
+        measurement_id: "pending-host-binding".into(),
+    }
+}
+
+/// Stage-1 host-global foreground conflict-domain capacity. Native macOS and
+/// every current backend report 1. This is not isolated-surface capacity and
+/// is not ledger occupancy (`maxRunRecords`).
+pub const FOREGROUND_CONFLICT_DOMAIN_CAPACITY: u32 = 1;
+
+/// Singleton physical input domain for native macOS. Per-window, process, and
+/// bundle IDs are target identity; they are not isolation and must not intern
+/// separate conflict domains.
+pub fn macos_native_physical_input_domain() -> PhysicalInputDomain {
+    PhysicalInputDomain::attested("macos-native", "host-global-foreground")
+        .expect("host-global-foreground is a valid attested domain")
+}
+
+/// Opaque attested physical input-domain identity. Backends supply a stable
+/// fingerprint; the host hashes it and never projects native handles.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PhysicalInputDomain {
+    key: String,
+}
+
+impl PhysicalInputDomain {
+    pub fn attested(kind: &str, attested_fingerprint: &str) -> ComputerResult<Self> {
+        validate_id("physical_input_domain_kind", kind)?;
+        if attested_fingerprint.is_empty()
+            || attested_fingerprint.len() > 4096
+            || attested_fingerprint.contains('\0')
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "physical input-domain fingerprint is missing or malformed",
+            ));
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(kind.as_bytes());
+        hasher.update([0]);
+        hasher.update(attested_fingerprint.as_bytes());
+        Ok(Self {
+            key: format!("{:x}", hasher.finalize()),
+        })
+    }
+
+    pub fn as_key(&self) -> &str {
+        &self.key
+    }
+}
+
+/// Opaque host attestation for one compiled-in Computer backend.
+///
+/// The public `ComputerBackend` trait remains implementable by embedders, but
+/// the public service constructor is deliberately unproven. Trusted
+/// constructors are crate-private, so an arbitrary backend cannot turn a
+/// self-selected backend id or physical-domain fingerprint into
+/// background/isolated authority.
+#[derive(Debug, Clone)]
+pub(crate) struct ComputerBackendAttestation {
+    trust: ComputerBackendTrust,
+    physical_domain: PhysicalInputDomain,
+}
+
+#[derive(Debug, Clone)]
+enum ComputerBackendTrust {
+    Unproven,
+    Trusted {
+        backend_id: String,
+        tier: ComputerCapabilityTier,
+    },
+}
+
+impl ComputerBackendAttestation {
+    /// Fail-closed attestation used by every downstream backend unless the
+    /// GrokPtah host registry recognizes its compiled-in implementation.
+    pub(crate) fn unproven() -> Self {
+        Self {
+            trust: ComputerBackendTrust::Unproven,
+            // Unknown backends share the native foreground conflict domain.
+            // They cannot manufacture parallel capacity by varying a string.
+            physical_domain: macos_native_physical_input_domain(),
+        }
+    }
+
+    pub(crate) fn trusted(
+        backend_id: impl Into<String>,
+        tier: ComputerCapabilityTier,
+        physical_domain: PhysicalInputDomain,
+    ) -> ComputerResult<Self> {
+        let backend_id = backend_id.into();
+        validate_id("backend_id", &backend_id)?;
+        if tier == ComputerCapabilityTier::Unproven {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "trusted backend attestation requires a proven tier",
+            ));
+        }
+        Ok(Self {
+            trust: ComputerBackendTrust::Trusted { backend_id, tier },
+            physical_domain,
+        })
+    }
+
+    pub(crate) fn physical_domain(&self) -> &PhysicalInputDomain {
+        &self.physical_domain
+    }
+
+    pub(crate) fn attest_capabilities(
+        &self,
+        mut claimed: ComputerCapabilities,
+    ) -> ComputerResult<ComputerCapabilities> {
+        match &self.trust {
+            ComputerBackendTrust::Unproven => Ok(ComputerCapabilities::unproven("unproven")),
+            ComputerBackendTrust::Trusted { backend_id, tier } => {
+                claimed.hydrate_legacy();
+                claimed.validate()?;
+                if claimed.backend_id != *backend_id
+                    || claimed.proof.backend_id() != backend_id
+                    || claimed.tier != *tier
+                    || claimed.proof.tier() != *tier
+                {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::Unauthorized,
+                        "backend capability claim does not match its host attestation",
+                    ));
+                }
+                Ok(claimed)
+            }
+        }
+    }
+}
+
+/// Host-minted opaque surface identity plus incarnation. Native process and
+/// window handles must never appear here. Prefixes are not proof of issuance;
+/// only the host surface registry mints these identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ComputerSurfaceBinding {
+    #[serde(default)]
+    pub(crate) surface_id: String,
+    #[serde(default)]
+    pub(crate) incarnation: String,
+}
+
+impl ComputerSurfaceBinding {
+    pub fn surface_id(&self) -> &str {
+        &self.surface_id
+    }
+
+    pub fn incarnation(&self) -> &str {
+        &self.incarnation
+    }
+
+    pub(crate) fn issue() -> Self {
+        Self {
+            surface_id: Uuid::new_v4().to_string(),
+            incarnation: Uuid::new_v4().to_string(),
+        }
+    }
+
+    pub(crate) fn rotate_incarnation(&self) -> ComputerResult<Self> {
+        validate_id("surface_id", &self.surface_id)?;
+        Ok(Self {
+            surface_id: self.surface_id.clone(),
+            incarnation: Uuid::new_v4().to_string(),
+        })
+    }
+
+    pub fn is_issued(&self) -> bool {
+        self.validate().is_ok()
+    }
+
+    pub fn validate(&self) -> ComputerResult<()> {
+        validate_id("surface_id", &self.surface_id)?;
+        validate_id("incarnation", &self.incarnation)?;
+        Ok(())
+    }
+}
+
+/// Surface-scoped monotonic freshness. A wall-clock timestamp is never
+/// dispatch proof; `tick` is meaningful only for the live incarnation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SurfaceFreshnessFence {
+    #[serde(default)]
+    pub surface_id: String,
+    #[serde(default)]
+    pub incarnation: String,
+    #[serde(default)]
+    pub tick: u64,
+    #[serde(default)]
+    pub wall_clock: Option<DateTime<Utc>>,
+}
+
+impl SurfaceFreshnessFence {
+    pub fn validate_shape(&self) -> ComputerResult<()> {
+        ComputerSurfaceBinding {
+            surface_id: self.surface_id.clone(),
+            incarnation: self.incarnation.clone(),
+        }
+        .validate()?;
+        if self.tick == 0 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "monotonic freshness tick is missing",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Durable principal recorded on a Computer Run. Agent records exist so
+/// malicious or legacy disk records can deserialize; [`Self::validate`] fails
+/// closed for Agent identity until the out-of-allowlist host Agent registry
+/// lands. The wrapper is opaque so other crates cannot mint self-issued
+/// authority. The public issue path is
+/// [`crate::host::AgentHostHandle::computer_operator_token`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ComputerPrincipal {
+    inner: ComputerPrincipalInner,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ComputerPrincipalInner {
+    LocalOperatorSession {
+        #[serde(rename = "sessionId", alias = "session_id")]
+        session_id: Uuid,
+    },
+    Agent {
+        #[serde(rename = "agentId", alias = "agent_id")]
+        agent_id: String,
+        #[serde(rename = "specRevision", alias = "spec_revision")]
+        spec_revision: u64,
+    },
+}
+
+impl ComputerPrincipal {
+    pub(crate) fn local_operator(session_id: Uuid) -> Self {
+        Self {
+            inner: ComputerPrincipalInner::LocalOperatorSession { session_id },
+        }
+    }
+
+    /// Public Agent minting is fail-closed. See
+    /// [`AGENT_PRINCIPAL_INTEGRATION_BLOCKER`].
+    pub fn agent(_agent_id: impl Into<String>, _spec_revision: u64) -> ComputerResult<Self> {
+        Err(ComputerError::new(
+            ComputerErrorCode::Unauthorized,
+            AGENT_PRINCIPAL_INTEGRATION_BLOCKER,
+        ))
+    }
+
+    /// Crate-private issuance seam for the durable AgentHost/AgentRecord
+    /// integration. The public string constructor remains fail-closed: only
+    /// host code that has already resolved the exact durable Agent and spec
+    /// revision can call this function.
+    pub(crate) fn from_host_agent_record(
+        agent_id: impl Into<String>,
+        spec_revision: u64,
+    ) -> ComputerResult<Self> {
+        let agent_id = agent_id.into();
+        validate_id("agent_id", &agent_id)?;
+        if spec_revision == 0 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "agent principal requires a non-zero durable spec revision",
+            ));
+        }
+        Ok(Self {
+            inner: ComputerPrincipalInner::Agent {
+                agent_id,
+                spec_revision,
+            },
+        })
+    }
+
+    pub fn session_id(&self) -> Option<Uuid> {
+        match &self.inner {
+            ComputerPrincipalInner::LocalOperatorSession { session_id } => Some(*session_id),
+            ComputerPrincipalInner::Agent { .. } => None,
+        }
+    }
+
+    pub(crate) fn agent_id(&self) -> Option<&str> {
+        match &self.inner {
+            ComputerPrincipalInner::Agent { agent_id, .. } => Some(agent_id.as_str()),
+            ComputerPrincipalInner::LocalOperatorSession { .. } => None,
+        }
+    }
+
+    pub(crate) fn agent_spec_revision(&self) -> Option<u64> {
+        match &self.inner {
+            ComputerPrincipalInner::Agent { spec_revision, .. } => Some(*spec_revision),
+            ComputerPrincipalInner::LocalOperatorSession { .. } => None,
+        }
+    }
+
+    pub fn validate(&self) -> ComputerResult<()> {
+        match &self.inner {
+            ComputerPrincipalInner::LocalOperatorSession { session_id } => {
+                if session_id.is_nil() {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::Unauthorized,
+                        "local operator session identity is missing",
+                    ));
+                }
+                Ok(())
+            }
+            ComputerPrincipalInner::Agent {
+                agent_id,
+                spec_revision,
+            } => {
+                validate_id("agent_id", agent_id)?;
+                if *spec_revision == 0 {
+                    return Err(ComputerError::new(
+                        ComputerErrorCode::Unauthorized,
+                        "agent principal is missing its durable spec revision",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn public_kind(&self) -> &'static str {
+        match &self.inner {
+            ComputerPrincipalInner::LocalOperatorSession { .. } => "local_operator_session",
+            ComputerPrincipalInner::Agent { .. } => "agent",
+        }
+    }
+}
+
+/// Host-resolved caller identity. Fields are private so callers cannot mint
+/// authority; [`crate::host::AgentHostHandle::computer_operator_token`] is the
+/// public issue path. Raw `ComputerUseService` callers cannot construct a token
+/// from an arbitrary session UUID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputerAuthorityToken {
+    principal: ComputerPrincipal,
+}
+
+impl ComputerAuthorityToken {
+    pub(crate) fn from_host_principal(principal: ComputerPrincipal) -> ComputerResult<Self> {
+        principal.validate()?;
+        Ok(Self { principal })
+    }
+
+    pub(crate) fn local_operator(session_id: Uuid) -> ComputerResult<Self> {
+        Self::from_host_principal(ComputerPrincipal::local_operator(session_id))
+    }
+
+    pub(crate) fn agent_from_host_record(
+        agent_id: impl Into<String>,
+        spec_revision: u64,
+    ) -> ComputerResult<Self> {
+        Self::from_host_principal(ComputerPrincipal::from_host_agent_record(
+            agent_id,
+            spec_revision,
+        )?)
+    }
+
+    pub fn principal(&self) -> &ComputerPrincipal {
+        &self.principal
+    }
+}
+
+/// Opaque authority that can only enter the service through revoking
+/// emergency-control methods. A background Lane may receive this token so
+/// Pause, Take over, and Stop remain app-owned, but it cannot be passed to
+/// observation, authorization, approval, or action APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputerEmergencyControlToken {
+    principal: ComputerPrincipal,
+}
+
+impl ComputerEmergencyControlToken {
+    pub(crate) fn local_operator(session_id: Uuid) -> ComputerResult<Self> {
+        let principal = ComputerPrincipal::local_operator(session_id);
+        principal.validate()?;
+        Ok(Self { principal })
+    }
+
+    pub(crate) fn authority(&self) -> ComputerAuthorityToken {
+        ComputerAuthorityToken {
+            principal: self.principal.clone(),
+        }
+    }
+}
+
+/// Observation-scoped isolation binding. Missing fields deserialize empty and
+/// cannot authorize background, isolated, pointer, or key actions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservationAuthority {
+    #[serde(default)]
+    pub surface: ComputerSurfaceBinding,
+    #[serde(default)]
+    pub frame_epoch: u64,
+    #[serde(default)]
+    pub target_generation: u64,
+    #[serde(default)]
+    pub authority_epoch: u64,
+    #[serde(default)]
+    pub control_epoch: u64,
+    #[serde(default)]
+    pub freshness: SurfaceFreshnessFence,
+}
+
+impl ObservationAuthority {
+    pub fn bind(
+        run: &ComputerRun,
+        frame_epoch: u64,
+        freshness: SurfaceFreshnessFence,
+    ) -> ComputerResult<Self> {
+        run.surface.validate()?;
+        freshness.validate_shape()?;
+        if freshness.surface_id != run.surface.surface_id
+            || freshness.incarnation != run.surface.incarnation
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "freshness fence is not bound to the run surface incarnation",
+            ));
+        }
+        Ok(Self {
+            surface: run.surface.clone(),
+            frame_epoch,
+            target_generation: run.target.generation,
+            authority_epoch: run.authority_epoch,
+            control_epoch: run.control_epoch,
+            freshness,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComputerTarget {
@@ -100,6 +1064,108 @@ pub struct ObservationGeometry {
     pub width: f64,
     pub height: f64,
     pub scale_factor: f64,
+}
+
+/// What a normalized attention point refers to. The point never represents or
+/// controls the host operating-system pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerAttentionTarget {
+    Surface,
+    SemanticElement,
+}
+
+/// Redaction-safe position for the app-rendered agent attention marker.
+/// Coordinates are target-relative basis points (`0..=10_000`), so no screen
+/// origin, display arrangement, native handle, element ID, or observed text is
+/// persisted or projected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerAttentionPoint {
+    pub x_basis_points: u16,
+    pub y_basis_points: u16,
+    pub target: ComputerAttentionTarget,
+}
+
+impl ComputerAttentionPoint {
+    pub const MAX_BASIS_POINTS: u16 = 10_000;
+
+    pub fn validate(&self) -> ComputerResult<()> {
+        if self.x_basis_points > Self::MAX_BASIS_POINTS
+            || self.y_basis_points > Self::MAX_BASIS_POINTS
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "computer attention point is outside the authorized surface",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Derive a visual attention point from the same immutable observation and
+    /// semantic action that will be revalidated for approval. Missing or
+    /// out-of-surface element geometry yields no point instead of inventing a
+    /// cursor location.
+    pub fn for_action(observation: &ComputerObservation, action: &ComputerAction) -> Option<Self> {
+        match action {
+            ComputerAction::ActivateTarget => Some(Self {
+                x_basis_points: Self::MAX_BASIS_POINTS / 2,
+                y_basis_points: Self::MAX_BASIS_POINTS / 2,
+                target: ComputerAttentionTarget::Surface,
+            }),
+            ComputerAction::PointerClick { x, y, .. }
+            | ComputerAction::PointerMove { x, y }
+            | ComputerAction::PointerButton { x, y, .. } => Self::from_logical_point(
+                *x,
+                *y,
+                &observation.geometry,
+                ComputerAttentionTarget::Surface,
+            ),
+            _ => {
+                let element = observation.element(action.referenced_element()?)?;
+                let bounds = element.bounds?;
+                if bounds.x < 0.0
+                    || bounds.y < 0.0
+                    || bounds.x + bounds.width > observation.geometry.width
+                    || bounds.y + bounds.height > observation.geometry.height
+                {
+                    return None;
+                }
+                Self::from_logical_point(
+                    bounds.x + bounds.width / 2.0,
+                    bounds.y + bounds.height / 2.0,
+                    &observation.geometry,
+                    ComputerAttentionTarget::SemanticElement,
+                )
+            }
+        }
+    }
+
+    fn from_logical_point(
+        x: f64,
+        y: f64,
+        surface: &ObservationGeometry,
+        target: ComputerAttentionTarget,
+    ) -> Option<Self> {
+        if surface.validate().is_err()
+            || !x.is_finite()
+            || !y.is_finite()
+            || x < 0.0
+            || y < 0.0
+            || x > surface.width
+            || y > surface.height
+        {
+            return None;
+        }
+        let point = Self {
+            x_basis_points: ((x / surface.width) * f64::from(Self::MAX_BASIS_POINTS)).round()
+                as u16,
+            y_basis_points: ((y / surface.height) * f64::from(Self::MAX_BASIS_POINTS)).round()
+                as u16,
+            target,
+        };
+        point.validate().ok().map(|()| point)
+    }
 }
 
 impl ObservationGeometry {
@@ -219,6 +1285,10 @@ pub struct ComputerObservation {
     pub elements: Vec<SemanticElement>,
     pub elements_truncated: bool,
     pub sensitivity: Sensitivity,
+    /// Host-issued isolation binding. Missing/legacy fields are empty and
+    /// cannot authorize background, isolated, pointer, or key actions.
+    #[serde(default)]
+    pub authority: ObservationAuthority,
 }
 
 impl ComputerObservation {
@@ -226,6 +1296,18 @@ impl ComputerObservation {
         validate_id("observation_id", &self.observation_id)?;
         self.target.validate()?;
         self.geometry.validate()?;
+        if self.authority.surface.is_issued() {
+            self.authority.surface.validate()?;
+            self.authority.freshness.validate_shape()?;
+        } else if self.authority.frame_epoch != 0
+            || self.authority.authority_epoch != 0
+            || self.authority.freshness.tick != 0
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "observation authority is malformed without a host-issued surface",
+            ));
+        }
         if self.elements.len() > limits.max_semantic_elements as usize {
             return Err(ComputerError::new(
                 ComputerErrorCode::LimitReached,
@@ -290,6 +1372,16 @@ pub enum PointerButton {
     Secondary,
 }
 
+/// Explicit pointer button edge for an independently isolated visual input
+/// domain. Keeping down/up separate makes drag and hold behavior auditable and
+/// prevents a guest bridge from inventing an implicit release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerButtonState {
+    Down,
+    Up,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputerKey {
@@ -341,6 +1433,23 @@ pub enum ComputerAction {
         y: f64,
         button: PointerButton,
     },
+    PointerMove {
+        /// Guest-surface-relative logical coordinates, never host screen coordinates.
+        x: f64,
+        y: f64,
+    },
+    PointerButton {
+        /// Guest-surface-relative logical coordinates, never host screen coordinates.
+        x: f64,
+        y: f64,
+        button: PointerButton,
+        state: PointerButtonState,
+    },
+    /// Text sent to the focused control inside an independently isolated guest.
+    /// This is intentionally distinct from semantic `SetValue`.
+    TextInput {
+        text: String,
+    },
     Wait {
         millis: u64,
     },
@@ -353,11 +1462,48 @@ impl ComputerAction {
             | Self::Invoke { .. }
             | Self::Select { .. }
             | Self::Scroll { .. } => ActionClass::Semantic,
-            Self::SetValue { .. } => ActionClass::TextEntry,
+            Self::SetValue { .. } | Self::TextInput { .. } => ActionClass::TextEntry,
             Self::KeyChord { .. } => ActionClass::KeyChord,
-            Self::PointerClick { .. } => ActionClass::PointerFallback,
+            Self::PointerClick { .. } | Self::PointerMove { .. } | Self::PointerButton { .. } => {
+                ActionClass::PointerFallback
+            }
             Self::Wait { .. } => ActionClass::Semantic,
         }
+    }
+
+    /// Isolation tier required to dispatch this action. Pointer/key never
+    /// fall back to semantic or boolean capability flags.
+    pub fn required_tier(&self) -> ComputerCapabilityTier {
+        match self {
+            Self::ActivateTarget => ComputerCapabilityTier::ForegroundSemantic,
+            Self::KeyChord { .. }
+            | Self::PointerClick { .. }
+            | Self::PointerMove { .. }
+            | Self::PointerButton { .. }
+            | Self::TextInput { .. } => {
+                ComputerCapabilityTier::IndependentlyIsolatedVisualInputDomain
+            }
+            Self::Invoke { .. }
+            | Self::SetValue { .. }
+            | Self::Select { .. }
+            | Self::Scroll { .. }
+            | Self::Wait { .. } => ComputerCapabilityTier::MeasuredBackgroundSafeSemantic,
+        }
+    }
+
+    pub fn requires_isolated_input(&self) -> bool {
+        matches!(
+            self,
+            Self::KeyChord { .. }
+                | Self::PointerClick { .. }
+                | Self::PointerMove { .. }
+                | Self::PointerButton { .. }
+                | Self::TextInput { .. }
+        )
+    }
+
+    pub fn is_activate_target(&self) -> bool {
+        matches!(self, Self::ActivateTarget)
     }
 
     pub fn referenced_element(&self) -> Option<&str> {
@@ -375,16 +1521,20 @@ impl ComputerAction {
             validate_id("element_id", element_id)?;
         }
         match self {
-            Self::SetValue { text, .. } if text.len() > limits.max_text_entry_bytes as usize => {
+            Self::SetValue { text, .. } | Self::TextInput { text }
+                if text.len() > limits.max_text_entry_bytes as usize =>
+            {
                 Err(ComputerError::new(
                     ComputerErrorCode::LimitReached,
                     "text entry limit exceeded",
                 ))
             }
-            Self::SetValue { text, .. } if text.contains('\0') => Err(ComputerError::new(
-                ComputerErrorCode::InvalidRequest,
-                "text entry contains a null byte",
-            )),
+            Self::SetValue { text, .. } | Self::TextInput { text } if text.contains('\0') => {
+                Err(ComputerError::new(
+                    ComputerErrorCode::InvalidRequest,
+                    "text entry contains a null byte",
+                ))
+            }
             Self::Scroll {
                 delta_x, delta_y, ..
             } if delta_x.unsigned_abs() > 10_000 || delta_y.unsigned_abs() > 10_000 => {
@@ -396,9 +1546,16 @@ impl ComputerAction {
             Self::KeyChord { keys } if keys.is_empty() || keys.len() > 4 => Err(
                 ComputerError::new(ComputerErrorCode::InvalidRequest, "invalid key chord"),
             ),
-            Self::PointerClick { x, y, .. } if !x.is_finite() || !y.is_finite() => Err(
-                ComputerError::new(ComputerErrorCode::InvalidRequest, "invalid pointer point"),
-            ),
+            Self::PointerClick { x, y, .. }
+            | Self::PointerMove { x, y }
+            | Self::PointerButton { x, y, .. }
+                if !x.is_finite() || !y.is_finite() =>
+            {
+                Err(ComputerError::new(
+                    ComputerErrorCode::InvalidRequest,
+                    "invalid pointer point",
+                ))
+            }
             Self::Wait { millis } if *millis > limits.max_wait_millis => Err(ComputerError::new(
                 ComputerErrorCode::LimitReached,
                 "wait limit exceeded",
@@ -420,11 +1577,106 @@ pub struct ActionOutcome {
 pub struct ComputerAuditEntry {
     pub sequence: u64,
     pub at: DateTime<Utc>,
+    /// Closed, redaction-safe surface event used by replaying UI and
+    /// coordinator clients. Legacy records deserialize as `Unknown` and are
+    /// classified from their bounded operation/disposition pair at projection
+    /// time; new records persist the typed value directly.
+    #[serde(default)]
+    pub surface_event: ComputerSurfaceEvent,
+    #[serde(default)]
+    pub attention: Option<ComputerAttentionPoint>,
     pub operation: String,
     pub disposition: String,
     pub action_class: Option<ActionClass>,
     pub observation_id: Option<String>,
     pub error_code: Option<ComputerErrorCode>,
+}
+
+/// Provider-neutral event vocabulary for the agent-owned Computer surface.
+///
+/// This deliberately contains no window title, semantic label/value, entered
+/// text, evidence locator, element identifier, or backend message. The exact
+/// Run and optional run-scoped observation surrogate are carried by the event
+/// page envelope and [`ComputerAuditEntry`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputerSurfaceEvent {
+    #[default]
+    Unknown,
+    RunCreated,
+    AuthorizationGranted,
+    ObservationStarted,
+    ObservationReady,
+    ActionProposed,
+    ApprovalRequired,
+    ApprovalRejected,
+    AttentionMoved,
+    DispatchStarted,
+    PostconditionRecorded,
+    Paused,
+    Stopped,
+    Takeover,
+    Steering,
+    TargetDrift,
+    PermissionRevoked,
+    Disconnected,
+    RestartInterrupted,
+    Terminal,
+    Denied,
+}
+
+impl ComputerSurfaceEvent {
+    pub fn classify(
+        operation: &str,
+        disposition: &str,
+        error_code: Option<ComputerErrorCode>,
+    ) -> Self {
+        if error_code == Some(ComputerErrorCode::TargetChanged) {
+            return Self::TargetDrift;
+        }
+        if error_code == Some(ComputerErrorCode::PermissionRevoked) {
+            return Self::PermissionRevoked;
+        }
+        if matches!(
+            error_code,
+            Some(ComputerErrorCode::BackendUnavailable) | Some(ComputerErrorCode::TargetClosed)
+        ) {
+            return Self::Disconnected;
+        }
+        if disposition == "denied" {
+            return Self::Denied;
+        }
+        match (operation, disposition) {
+            ("create_run" | "create_agent_run", "accepted") => Self::RunCreated,
+            ("authorize", "granted") => Self::AuthorizationGranted,
+            ("observe", "started") => Self::ObservationStarted,
+            ("observe", "completed") => Self::ObservationReady,
+            ("action_proposed", _) => Self::ActionProposed,
+            ("approval", "required") => Self::ApprovalRequired,
+            ("approval", "rejected") => Self::ApprovalRejected,
+            ("attention", "moved") => Self::AttentionMoved,
+            ("act", "started") => Self::DispatchStarted,
+            ("act", "completed" | "uncertain_outcome") => Self::PostconditionRecorded,
+            ("pause", "paused") => Self::Paused,
+            ("cancel", "cancelled") => Self::Stopped,
+            ("take_over", "operator_control") => Self::Takeover,
+            ("steer", _) => Self::Steering,
+            ("recover", "interrupted") => Self::RestartInterrupted,
+            ("complete", "completed") => Self::Terminal,
+            (_, "failed" | "limit_reached" | "interrupted") => Self::Terminal,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl ComputerAuditEntry {
+    pub fn projected_surface_event(&self) -> ComputerSurfaceEvent {
+        if self.surface_event == ComputerSurfaceEvent::Unknown {
+            ComputerSurfaceEvent::classify(&self.operation, &self.disposition, self.error_code)
+        } else {
+            self.surface_event
+        }
+    }
 }
 
 impl ActionOutcome {
@@ -445,6 +1697,151 @@ pub struct ComputerCapabilities {
     pub text_entry: bool,
     pub key_chords: bool,
     pub pointer_fallback: bool,
+    /// Typed proof is the security boundary. Booleans above are a public
+    /// projection derived from this proof.
+    #[serde(default)]
+    pub proof: ComputerCapabilityProof,
+    #[serde(default)]
+    pub tier: ComputerCapabilityTier,
+}
+
+impl ComputerCapabilities {
+    pub fn from_proof(proof: ComputerCapabilityProof) -> ComputerResult<Self> {
+        proof.validate()?;
+        let backend_id = match &proof {
+            ComputerCapabilityProof::Unproven => "unproven".to_string(),
+            _ => proof.backend_id().to_string(),
+        };
+        validate_id("backend_id", &backend_id)?;
+        let caps = Self {
+            backend_id,
+            observe: proof.observe(),
+            semantic_actions: proof.semantic_actions(),
+            text_entry: proof.text_entry(),
+            key_chords: proof.key_chords(),
+            pointer_fallback: proof.pointer_fallback(),
+            tier: proof.tier(),
+            proof,
+        };
+        caps.validate()?;
+        Ok(caps)
+    }
+
+    pub fn unproven(backend_id: impl Into<String>) -> Self {
+        let backend_id = backend_id.into();
+        Self {
+            backend_id,
+            observe: false,
+            semantic_actions: false,
+            text_entry: false,
+            key_chords: false,
+            pointer_fallback: false,
+            proof: ComputerCapabilityProof::Unproven,
+            tier: ComputerCapabilityTier::Unproven,
+        }
+    }
+
+    /// Repair missing typed fields from legacy boolean-only JSON. Never
+    /// upgrades pointer/key/background/isolated authority.
+    pub fn hydrate_legacy(&mut self) {
+        let proof_missing = matches!(self.proof, ComputerCapabilityProof::Unproven);
+        let tier_missing = matches!(self.tier, ComputerCapabilityTier::Unproven);
+        if !proof_missing || !tier_missing {
+            return;
+        }
+        let claimed_pointer_or_key = self.key_chords || self.pointer_fallback;
+        self.key_chords = false;
+        self.pointer_fallback = false;
+        if claimed_pointer_or_key {
+            self.proof = ComputerCapabilityProof::Unproven;
+            self.tier = ComputerCapabilityTier::Unproven;
+            return;
+        }
+        if self.observe || self.semantic_actions || self.text_entry {
+            if self.backend_id.is_empty() {
+                return;
+            }
+            self.proof = ComputerCapabilityProof::ForegroundSemantic {
+                backend_id: self.backend_id.clone(),
+                observe: self.observe,
+                semantic_actions: self.semantic_actions,
+                text_entry: self.text_entry,
+            };
+            self.tier = ComputerCapabilityTier::ForegroundSemantic;
+        }
+    }
+
+    pub fn validate(&self) -> ComputerResult<()> {
+        if matches!(self.proof, ComputerCapabilityProof::Unproven)
+            && matches!(self.tier, ComputerCapabilityTier::Unproven)
+        {
+            if self.key_chords || self.pointer_fallback {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::InvalidRequest,
+                    "unproven capability cannot project pointer or key authority",
+                ));
+            }
+            return Ok(());
+        }
+        self.proof.validate()?;
+        let projected = Self {
+            backend_id: if self.proof.backend_id().is_empty() {
+                self.backend_id.clone()
+            } else {
+                self.proof.backend_id().to_string()
+            },
+            observe: self.proof.observe(),
+            semantic_actions: self.proof.semantic_actions(),
+            text_entry: self.proof.text_entry(),
+            key_chords: self.proof.key_chords(),
+            pointer_fallback: self.proof.pointer_fallback(),
+            proof: self.proof.clone(),
+            tier: self.proof.tier(),
+        };
+        if self.tier != projected.tier
+            || self.observe != projected.observe
+            || self.semantic_actions != projected.semantic_actions
+            || self.text_entry != projected.text_entry
+            || self.key_chords != projected.key_chords
+            || self.pointer_fallback != projected.pointer_fallback
+            || (!self.proof.backend_id().is_empty() && self.backend_id != projected.backend_id)
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "capability tier, proof, and boolean projection contradict each other",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn allows_action(&self, action: &ComputerAction) -> bool {
+        if self.validate().is_err() {
+            return false;
+        }
+        if action.requires_isolated_input() {
+            return self.proof.isolated_input_is_dispatchable()
+                && match action {
+                    ComputerAction::KeyChord { .. } => self.proof.key_chords(),
+                    ComputerAction::PointerClick { .. }
+                    | ComputerAction::PointerMove { .. }
+                    | ComputerAction::PointerButton { .. } => self.proof.pointer_fallback(),
+                    ComputerAction::TextInput { .. } => self.proof.text_entry(),
+                    _ => false,
+                };
+        }
+        if action.is_activate_target() {
+            return self.tier.allows_activate_target() && self.proof.semantic_actions();
+        }
+        match action.class() {
+            ActionClass::Semantic => {
+                self.tier.allows_background_semantic() && self.proof.semantic_actions()
+            }
+            ActionClass::TextEntry => {
+                self.tier.allows_background_semantic() && self.proof.text_entry()
+            }
+            ActionClass::KeyChord | ActionClass::PointerFallback => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -588,9 +1985,101 @@ pub struct ActionGrant {
     pub expires_at: DateTime<Utc>,
     pub uses_remaining: Option<u32>,
     pub revoked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub surface: ComputerSurfaceBinding,
+    #[serde(default)]
+    pub authority_epoch: u64,
+    #[serde(default)]
+    pub principal: Option<ComputerPrincipal>,
+    #[serde(default)]
+    pub capability_tier: ComputerCapabilityTier,
+}
+
+/// Durable WorkAttempt identity for an Agent-owned Computer Run. The host
+/// freezes this binding at Run admission; the Computer backend and model never
+/// author or widen it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComputerWorkAttemptBinding {
+    pub work_id: String,
+    pub work_attempt_id: String,
+    pub agent_id: String,
+    pub agent_spec_revision: u64,
+}
+
+impl ComputerWorkAttemptBinding {
+    pub(crate) fn validate(&self) -> ComputerResult<()> {
+        validate_id("work_id", &self.work_id)?;
+        validate_id("work_attempt_id", &self.work_attempt_id)?;
+        validate_id("agent_id", &self.agent_id)?;
+        if self.agent_spec_revision == 0 {
+            return Err(ComputerError::new(
+                ComputerErrorCode::InvalidRequest,
+                "Computer WorkAttempt binding is missing its Agent spec revision",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Request to bind one already-active durable WorkAttempt to a Computer Run.
+/// Session, workspace, Agent identity, and spec revision are deliberately
+/// absent: `AgentHost` resolves those from durable records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentComputerRunRequest {
+    pub request_id: String,
+    pub work_id: String,
+    pub work_attempt_id: String,
+    pub target: ComputerTarget,
+    pub limits: ComputerUseLimits,
+}
+
+impl AgentComputerRunRequest {
+    pub fn validate(&self) -> ComputerResult<()> {
+        validate_id("request_id", &self.request_id)?;
+        validate_id("work_id", &self.work_id)?;
+        validate_id("work_attempt_id", &self.work_attempt_id)?;
+        self.target.validate()?;
+        self.limits.validate().map(|_| ())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedAgentComputerRunAdmission {
+    pub request_id: String,
+    pub owner_session_id: Uuid,
+    pub binding: ComputerWorkAttemptBinding,
+    pub workspace: String,
+    pub target: ComputerTarget,
+    pub limits: ComputerUseLimits,
 }
 
 impl ActionGrant {
+    pub fn for_run(
+        run: &ComputerRun,
+        action_classes: BTreeSet<ActionClass>,
+        issued_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        uses_remaining: Option<u32>,
+    ) -> Self {
+        Self {
+            grant_id: Uuid::new_v4().to_string(),
+            run_id: run.run_id.clone(),
+            target: run.target.clone(),
+            action_classes,
+            issued_by: GrantIssuer::LocalUser,
+            issued_at,
+            expires_at,
+            uses_remaining,
+            revoked_at: None,
+            surface: run.surface.clone(),
+            authority_epoch: run.authority_epoch,
+            principal: run.initiating_principal.clone(),
+            capability_tier: run.capability_proof.tier(),
+        }
+    }
+
     pub fn validate(&self) -> ComputerResult<()> {
         validate_id("grant_id", &self.grant_id)?;
         validate_id("run_id", &self.run_id)?;
@@ -601,13 +2090,31 @@ impl ActionGrant {
                 "grant must have action classes and a positive lifetime",
             ));
         }
-        if self.uses_remaining == Some(0) {
+        if self.uses_remaining == Some(0) && self.revoked_at.is_none() {
             return Err(ComputerError::new(
                 ComputerErrorCode::InvalidRequest,
                 "grant has no remaining uses",
             ));
         }
+        self.surface.validate()?;
+        let Some(principal) = &self.principal else {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "grant is missing an initiating principal",
+            ));
+        };
+        principal.validate()?;
+        if matches!(self.capability_tier, ComputerCapabilityTier::Unproven) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "unproven capability cannot issue a grant",
+            ));
+        }
         Ok(())
+    }
+
+    pub fn effective_tier(&self) -> ComputerCapabilityTier {
+        self.capability_tier
     }
 }
 
@@ -645,6 +2152,30 @@ pub struct ComputerRun {
     pub last_outcome: Option<ActionOutcome>,
     pub audit: Vec<ComputerAuditEntry>,
     pub last_error: Option<ComputerError>,
+    #[serde(default)]
+    pub surface: ComputerSurfaceBinding,
+    #[serde(default)]
+    pub initiating_principal: Option<ComputerPrincipal>,
+    #[serde(default)]
+    pub authority_epoch: u64,
+    #[serde(default)]
+    pub capability_proof: ComputerCapabilityProof,
+    #[serde(default)]
+    pub freshness_tick: u64,
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_attempt: Option<ComputerWorkAttemptBinding>,
+}
+
+pub(crate) struct SurfaceAuditInput<'a> {
+    pub surface_event: ComputerSurfaceEvent,
+    pub operation: &'a str,
+    pub disposition: &'a str,
+    pub action_class: Option<ActionClass>,
+    pub observation_id: Option<String>,
+    pub error_code: Option<ComputerErrorCode>,
+    pub attention: Option<ComputerAttentionPoint>,
 }
 
 impl ComputerRun {
@@ -681,7 +2212,115 @@ impl ComputerRun {
             last_outcome: None,
             audit: Vec::new(),
             last_error: None,
+            surface: ComputerSurfaceBinding::default(),
+            initiating_principal: None,
+            authority_epoch: 0,
+            capability_proof: ComputerCapabilityProof::Unproven,
+            freshness_tick: 0,
+            schema_version: COMPUTER_RUN_SCHEMA_VERSION,
+            work_attempt: None,
         })
+    }
+
+    pub(crate) fn new_with_isolation(
+        owner_session_id: Uuid,
+        workspace: Option<String>,
+        target: ComputerTarget,
+        limits: ComputerUseLimits,
+        principal: ComputerPrincipal,
+        surface: ComputerSurfaceBinding,
+        proof: ComputerCapabilityProof,
+    ) -> ComputerResult<Self> {
+        principal.validate()?;
+        if principal
+            .session_id()
+            .is_some_and(|session_id| session_id != owner_session_id)
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "local operator principal does not match the owning session",
+            ));
+        }
+        surface.validate()?;
+        proof.validate()?;
+        let invalid_native_proof = match proof.backend_id() {
+            MACOS_NATIVE_BACKEND_ID | MACOS_INTERRUPTED_BACKEND_ID => {
+                !matches!(proof, ComputerCapabilityProof::ForegroundSemantic { .. })
+            }
+            MACOS_BACKGROUND_SAFE_BACKEND_ID => !matches!(
+                proof,
+                ComputerCapabilityProof::MeasuredBackgroundSafeSemantic { .. }
+            ),
+            _ => false,
+        };
+        if invalid_native_proof {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "native macOS Computer Use proof does not match its compiled-in execution mode",
+            ));
+        }
+        if let Some(isolated_surface) = proof.isolated_surface() {
+            if isolated_surface != surface {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::ForbiddenTarget,
+                    "isolated capability proof is not bound to this backend surface",
+                ));
+            }
+        }
+        if matches!(proof.tier(), ComputerCapabilityTier::Unproven) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::ForbiddenAction,
+                "unproven capability cannot create an attested computer run",
+            ));
+        }
+        let mut run = Self::new(owner_session_id, workspace, target, limits)?;
+        run.surface = surface;
+        run.initiating_principal = Some(principal);
+        run.capability_proof = proof;
+        run.authority_epoch = 0;
+        run.freshness_tick = 0;
+        run.schema_version = COMPUTER_RUN_SCHEMA_VERSION;
+        Ok(run)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attested_foreground_for_test(
+        owner_session_id: Uuid,
+        workspace: Option<String>,
+        target: ComputerTarget,
+        limits: ComputerUseLimits,
+    ) -> ComputerResult<Self> {
+        let surface = ComputerSurfaceBinding::issue();
+        Self::new_with_isolation(
+            owner_session_id,
+            workspace,
+            target,
+            limits,
+            ComputerPrincipal::local_operator(owner_session_id),
+            surface,
+            ComputerCapabilityProof::ForegroundSemantic {
+                backend_id: "test_foreground".into(),
+                observe: true,
+                semantic_actions: true,
+                text_entry: true,
+            },
+        )
+    }
+
+    pub fn required_principal(&self) -> ComputerResult<&ComputerPrincipal> {
+        let Some(principal) = self.initiating_principal.as_ref() else {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "computer run has no initiating principal",
+            ));
+        };
+        principal.validate()?;
+        Ok(principal)
+    }
+
+    pub fn bump_authority_epoch(&mut self) {
+        self.authority_epoch = self.authority_epoch.saturating_add(1);
+        self.updated_at = Utc::now();
     }
 
     pub fn record_audit(
@@ -692,6 +2331,18 @@ impl ComputerRun {
         observation_id: Option<String>,
         error_code: Option<ComputerErrorCode>,
     ) {
+        self.record_surface_audit(SurfaceAuditInput {
+            surface_event: ComputerSurfaceEvent::classify(operation, disposition, error_code),
+            operation,
+            disposition,
+            action_class,
+            observation_id,
+            error_code,
+            attention: None,
+        });
+    }
+
+    pub(crate) fn record_surface_audit(&mut self, input: SurfaceAuditInput<'_>) {
         const MAX_AUDIT_ENTRIES: usize = 1_024;
         if self.audit.len() == MAX_AUDIT_ENTRIES {
             self.audit.remove(0);
@@ -699,13 +2350,16 @@ impl ComputerRun {
         self.audit.push(ComputerAuditEntry {
             sequence: self.audit.last().map_or(1, |entry| entry.sequence + 1),
             at: Utc::now(),
-            operation: crate::textutil::truncate_at_char_boundary(operation, 64).to_string(),
-            disposition: crate::textutil::truncate_at_char_boundary(disposition, 64).to_string(),
-            action_class,
-            observation_id: observation_id.map(|value| {
+            surface_event: input.surface_event,
+            attention: input.attention,
+            operation: crate::textutil::truncate_at_char_boundary(input.operation, 64).to_string(),
+            disposition: crate::textutil::truncate_at_char_boundary(input.disposition, 64)
+                .to_string(),
+            action_class: input.action_class,
+            observation_id: input.observation_id.map(|value| {
                 crate::textutil::truncate_at_char_boundary(&value, MAX_ID_BYTES).to_string()
             }),
-            error_code,
+            error_code: input.error_code,
         });
     }
 
@@ -729,6 +2383,9 @@ impl ComputerRun {
             ) | (
                 ComputerRunState::AwaitingAuthorization,
                 ComputerRunState::Cancelled
+            ) | (
+                ComputerRunState::AwaitingAuthorization,
+                ComputerRunState::Paused
             ) | (ComputerRunState::Ready, ComputerRunState::Observing)
                 | (ComputerRunState::Ready, ComputerRunState::Acting)
                 | (ComputerRunState::Ready, ComputerRunState::Paused)
@@ -783,6 +2440,11 @@ impl ComputerRun {
 pub trait ComputerBackend: Send + Sync + std::fmt::Debug {
     fn capabilities(&self) -> ComputerCapabilities;
 
+    /// Legacy/advisory backend domain. The service never uses this value as
+    /// authority; only the opaque host attestation supplies the conflict
+    /// domain that is interned into a surface.
+    fn physical_input_domain(&self) -> PhysicalInputDomain;
+
     async fn observe(
         &self,
         run_id: &str,
@@ -797,6 +2459,22 @@ pub trait ComputerBackend: Send + Sync + std::fmt::Debug {
         observation: &ComputerObservation,
         action: &ComputerAction,
     ) -> ComputerResult<ActionOutcome>;
+
+    /// Backend-attested atomic action: compare the live native AX/tree/frame
+    /// generation and surface incarnation to the exact observed attestation
+    /// under the same dispatch lock immediately before input. Unsupported
+    /// backends must deny without performing input.
+    async fn act_if_current(
+        &self,
+        _run_id: &str,
+        _observation: &ComputerObservation,
+        _action: &ComputerAction,
+    ) -> ComputerResult<ActionOutcome> {
+        Err(ComputerError::new(
+            ComputerErrorCode::ForbiddenAction,
+            "backend does not attest exact-current action",
+        ))
+    }
 
     /// Returns only process-owned evidence for the exact run and opaque asset ID.
     async fn read_evidence(
@@ -866,6 +2544,117 @@ mod tests {
     }
 
     #[test]
+    fn attention_point_is_normalized_without_screen_or_element_identity() {
+        let observation = ComputerObservation {
+            observation_id: "observation-1".into(),
+            sequence: 1,
+            target: target(),
+            captured_at: Utc::now(),
+            geometry: ObservationGeometry {
+                x: 125.0,
+                y: 80.0,
+                width: 800.0,
+                height: 600.0,
+                scale_factor: 2.0,
+            },
+            screenshot: None,
+            elements: vec![SemanticElement {
+                element_id: "name-field".into(),
+                role: "text_field".into(),
+                label: Some("Name".into()),
+                value: None,
+                bounds: Some(ObservationGeometry {
+                    x: 40.0,
+                    y: 80.0,
+                    width: 400.0,
+                    height: 44.0,
+                    scale_factor: 2.0,
+                }),
+                enabled: true,
+                focused: false,
+                sensitivity: Sensitivity::None,
+                actions: BTreeSet::from([SemanticAction::SetValue]),
+            }],
+            elements_truncated: false,
+            sensitivity: Sensitivity::None,
+            authority: ObservationAuthority::default(),
+        };
+        let action = ComputerAction::SetValue {
+            element_id: "name-field".into(),
+            text: "Ada".into(),
+        };
+        let point = ComputerAttentionPoint::for_action(&observation, &action).unwrap();
+        assert_eq!(point.x_basis_points, 3_000);
+        assert_eq!(point.y_basis_points, 1_700);
+        assert_eq!(point.target, ComputerAttentionTarget::SemanticElement);
+        assert_eq!(
+            serde_json::to_value(point).unwrap(),
+            serde_json::json!({
+                "xBasisPoints": 3000,
+                "yBasisPoints": 1700,
+                "target": "semantic_element"
+            })
+        );
+
+        let guest_pointer = ComputerAttentionPoint::for_action(
+            &observation,
+            &ComputerAction::PointerMove { x: 400.0, y: 300.0 },
+        )
+        .unwrap();
+        assert_eq!(guest_pointer.x_basis_points, 5_000);
+        assert_eq!(guest_pointer.y_basis_points, 5_000);
+        assert_eq!(guest_pointer.target, ComputerAttentionTarget::Surface);
+
+        let mut outside = observation;
+        outside.elements[0].bounds.as_mut().unwrap().x = 760.0;
+        assert!(ComputerAttentionPoint::for_action(&outside, &action).is_none());
+    }
+
+    #[test]
+    fn surface_event_vocabulary_is_closed_and_legacy_rows_remain_readable() {
+        assert_eq!(
+            ComputerSurfaceEvent::classify("create_run", "accepted", None),
+            ComputerSurfaceEvent::RunCreated
+        );
+        assert_eq!(
+            ComputerSurfaceEvent::classify(
+                "observe",
+                "failed",
+                Some(ComputerErrorCode::TargetChanged),
+            ),
+            ComputerSurfaceEvent::TargetDrift
+        );
+        assert_eq!(
+            ComputerSurfaceEvent::classify(
+                "act",
+                "failed",
+                Some(ComputerErrorCode::PermissionRevoked),
+            ),
+            ComputerSurfaceEvent::PermissionRevoked
+        );
+        assert_eq!(
+            ComputerSurfaceEvent::classify("recover", "interrupted", None),
+            ComputerSurfaceEvent::RestartInterrupted
+        );
+
+        let legacy: ComputerAuditEntry = serde_json::from_value(serde_json::json!({
+            "sequence": 1,
+            "at": "2026-08-23T00:00:00Z",
+            "operation": "take_over",
+            "disposition": "operator_control",
+            "actionClass": null,
+            "observationId": null,
+            "errorCode": null
+        }))
+        .unwrap();
+        assert_eq!(legacy.surface_event, ComputerSurfaceEvent::Unknown);
+        assert_eq!(
+            legacy.projected_surface_event(),
+            ComputerSurfaceEvent::Takeover
+        );
+    }
+
+    #[test]
     fn hard_ceilings_reject_escalation() {
         let limits = ComputerUseLimits {
             max_actions: ComputerUseLimits::ceiling().max_actions + 1,
@@ -879,7 +2668,13 @@ mod tests {
 
     #[test]
     fn state_machine_never_leaves_terminal_state() {
-        let mut run = ComputerRun::new(Uuid::new_v4(), None, target(), Default::default()).unwrap();
+        let mut run = ComputerRun::attested_foreground_for_test(
+            Uuid::new_v4(),
+            None,
+            target(),
+            Default::default(),
+        )
+        .unwrap();
         run.transition(ComputerRunState::Ready).unwrap();
         run.transition(ComputerRunState::Cancelled).unwrap();
         assert!(run.transition(ComputerRunState::Ready).is_err());
@@ -927,6 +2722,415 @@ mod tests {
             .unwrap_err()
             .code,
             ComputerErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            ComputerAction::PointerMove {
+                x: f64::NAN,
+                y: 1.0,
+            }
+            .validate(&limits)
+            .unwrap_err()
+            .code,
+            ComputerErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            ComputerAction::TextInput {
+                text: "not\0valid".into(),
+            }
+            .validate(&limits)
+            .unwrap_err()
+            .code,
+            ComputerErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn isolated_input_contract_is_explicit_and_proof_gated() {
+        let surface = ComputerSurfaceBinding::issue();
+        let isolated = ComputerCapabilities::from_proof(
+            ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain {
+                backend_id: SIMULATOR_ISOLATED_BACKEND_ID.into(),
+                surface_id: surface.surface_id,
+                incarnation: surface.incarnation,
+                input_domain_id: format!("input-domain-{}", Uuid::new_v4()),
+                origin: IsolationProofOrigin::SimulatorFixture,
+                observe: true,
+                semantic_actions: true,
+                text_entry: true,
+                key_chords: true,
+                pointer_fallback: true,
+            },
+        )
+        .unwrap();
+        let actions = [
+            ComputerAction::PointerMove { x: 1.0, y: 2.0 },
+            ComputerAction::PointerButton {
+                x: 1.0,
+                y: 2.0,
+                button: PointerButton::Primary,
+                state: PointerButtonState::Down,
+            },
+            ComputerAction::TextInput { text: "Ada".into() },
+        ];
+        for action in &actions {
+            assert!(action.requires_isolated_input());
+            assert_eq!(
+                action.required_tier(),
+                ComputerCapabilityTier::IndependentlyIsolatedVisualInputDomain
+            );
+            assert!(isolated.allows_action(action));
+        }
+
+        let foreground = ComputerCapabilities::from_proof(macos_native_capability_proof()).unwrap();
+        for action in &actions {
+            assert!(!foreground.allows_action(action));
+        }
+
+        assert_eq!(
+            serde_json::to_value(&actions[1]).unwrap(),
+            serde_json::json!({
+                "type": "pointer_button",
+                "x": 1.0,
+                "y": 2.0,
+                "button": "primary",
+                "state": "down"
+            })
+        );
+    }
+
+    #[test]
+    fn legacy_boolean_capabilities_hydrate_to_foreground_or_unproven() {
+        let mut semantic: ComputerCapabilities = serde_json::from_value(serde_json::json!({
+            "backendId": "legacy_semantic",
+            "observe": true,
+            "semanticActions": true,
+            "textEntry": true,
+            "keyChords": false,
+            "pointerFallback": false
+        }))
+        .unwrap();
+        assert_eq!(semantic.proof, ComputerCapabilityProof::Unproven);
+        semantic.hydrate_legacy();
+        semantic.validate().unwrap();
+        assert_eq!(semantic.tier, ComputerCapabilityTier::ForegroundSemantic);
+        assert!(semantic.allows_action(&ComputerAction::ActivateTarget));
+        assert!(semantic.allows_action(&ComputerAction::SetValue {
+            element_id: "field".into(),
+            text: "Ada".into(),
+        }));
+        assert!(!semantic.allows_action(&ComputerAction::PointerClick {
+            x: 1.0,
+            y: 1.0,
+            button: PointerButton::Primary,
+        }));
+        assert!(!semantic.allows_action(&ComputerAction::KeyChord {
+            keys: vec![ComputerKey::Enter],
+        }));
+
+        let mut pointer: ComputerCapabilities = serde_json::from_value(serde_json::json!({
+            "backendId": "legacy_pointer",
+            "observe": true,
+            "semanticActions": true,
+            "textEntry": true,
+            "keyChords": true,
+            "pointerFallback": true
+        }))
+        .unwrap();
+        pointer.hydrate_legacy();
+        pointer.validate().unwrap();
+        assert_eq!(pointer.tier, ComputerCapabilityTier::Unproven);
+        assert!(!pointer.pointer_fallback);
+        assert!(!pointer.key_chords);
+        assert!(!pointer.allows_action(&ComputerAction::PointerClick {
+            x: 1.0,
+            y: 1.0,
+            button: PointerButton::Primary,
+        }));
+        assert!(!pointer.allows_action(&ComputerAction::ActivateTarget));
+    }
+
+    #[test]
+    fn contradictory_tier_proof_and_booleans_fail_closed() {
+        let mut caps =
+            ComputerCapabilities::from_proof(ComputerCapabilityProof::ForegroundSemantic {
+                backend_id: "fg".into(),
+                observe: true,
+                semantic_actions: true,
+                text_entry: true,
+            })
+            .unwrap();
+        caps.tier = ComputerCapabilityTier::IndependentlyIsolatedVisualInputDomain;
+        assert_eq!(
+            caps.validate().unwrap_err().code,
+            ComputerErrorCode::InvalidRequest
+        );
+        caps.tier = ComputerCapabilityTier::ForegroundSemantic;
+        caps.pointer_fallback = true;
+        assert_eq!(
+            caps.validate().unwrap_err().code,
+            ComputerErrorCode::InvalidRequest
+        );
+        caps.pointer_fallback = false;
+        caps.proof = ComputerCapabilityProof::MeasuredBackgroundSafeSemantic {
+            backend_id: SIMULATOR_BACKGROUND_BACKEND_ID.into(),
+            observe: true,
+            semantic_actions: true,
+            text_entry: true,
+            measurement_id: format!("measurement-{}", Uuid::new_v4()),
+        };
+        assert_eq!(
+            caps.validate().unwrap_err().code,
+            ComputerErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn unknown_malformed_and_host_native_isolated_proofs_deserialize_unproven() {
+        let unknown: ComputerCapabilityProof = serde_json::from_value(serde_json::json!({
+            "kind": "totally_new_tier",
+            "pointerFallback": true
+        }))
+        .unwrap();
+        assert_eq!(unknown, ComputerCapabilityProof::Unproven);
+
+        let missing: ComputerCapabilityProof = serde_json::from_value(serde_json::json!({
+            "backendId": "x"
+        }))
+        .unwrap();
+        assert_eq!(missing, ComputerCapabilityProof::Unproven);
+
+        let host_native: ComputerCapabilityProof = serde_json::from_value(serde_json::json!({
+            "kind": "independently_isolated_visual_input_domain",
+            "backendId": MACOS_NATIVE_BACKEND_ID,
+            "surfaceId": format!("surface-{}", Uuid::new_v4()),
+            "incarnation": format!("incarnation-{}", Uuid::new_v4()),
+            "inputDomainId": format!("input-domain-{}", Uuid::new_v4()),
+            "origin": "host_native",
+            "observe": true,
+            "semanticActions": true,
+            "textEntry": true,
+            "keyChords": true,
+            "pointerFallback": true
+        }))
+        .unwrap();
+        assert_eq!(host_native, ComputerCapabilityProof::Unproven);
+
+        let native_simulator_origin: ComputerCapabilityProof =
+            serde_json::from_value(serde_json::json!({
+                "kind": "independently_isolated_visual_input_domain",
+                "backendId": MACOS_NATIVE_BACKEND_ID,
+                "surfaceId": format!("surface-{}", Uuid::new_v4()),
+                "incarnation": format!("incarnation-{}", Uuid::new_v4()),
+                "inputDomainId": format!("input-domain-{}", Uuid::new_v4()),
+                "origin": "simulator_fixture",
+                "observe": true,
+                "semanticActions": true,
+                "textEntry": true,
+                "keyChords": true,
+                "pointerFallback": true
+            }))
+            .unwrap();
+        assert_eq!(native_simulator_origin, ComputerCapabilityProof::Unproven);
+    }
+
+    #[test]
+    fn native_macos_cannot_be_stamped_isolated_or_background() {
+        let surface = ComputerSurfaceBinding::issue();
+        let isolated = ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain {
+            backend_id: MACOS_NATIVE_BACKEND_ID.into(),
+            surface_id: surface.surface_id.clone(),
+            incarnation: surface.incarnation.clone(),
+            input_domain_id: format!("input-domain-{}", Uuid::new_v4()),
+            origin: IsolationProofOrigin::SimulatorFixture,
+            observe: true,
+            semantic_actions: true,
+            text_entry: true,
+            key_chords: true,
+            pointer_fallback: true,
+        };
+        assert_eq!(
+            isolated.validate().unwrap_err().code,
+            ComputerErrorCode::ForbiddenAction
+        );
+        let owner = Uuid::new_v4();
+        assert_eq!(
+            ComputerRun::new_with_isolation(
+                owner,
+                None,
+                target(),
+                Default::default(),
+                ComputerPrincipal::local_operator(owner),
+                surface.clone(),
+                isolated,
+            )
+            .unwrap_err()
+            .code,
+            ComputerErrorCode::ForbiddenAction
+        );
+
+        let background = ComputerCapabilityProof::MeasuredBackgroundSafeSemantic {
+            backend_id: MACOS_NATIVE_BACKEND_ID.into(),
+            observe: true,
+            semantic_actions: true,
+            text_entry: true,
+            measurement_id: format!("measurement-{}", Uuid::new_v4()),
+        };
+        let owner = Uuid::new_v4();
+        assert_eq!(
+            ComputerRun::new_with_isolation(
+                owner,
+                None,
+                target(),
+                Default::default(),
+                ComputerPrincipal::local_operator(owner),
+                surface,
+                background,
+            )
+            .unwrap_err()
+            .code,
+            ComputerErrorCode::ForbiddenAction
+        );
+    }
+
+    #[test]
+    fn measured_native_background_proof_is_exact_and_text_entry_only() {
+        let proof = macos_background_safe_capability_proof();
+        proof.validate().unwrap();
+        assert_eq!(
+            proof.tier(),
+            ComputerCapabilityTier::MeasuredBackgroundSafeSemantic
+        );
+        assert_eq!(proof.backend_id(), MACOS_BACKGROUND_SAFE_BACKEND_ID);
+        assert!(proof.observe());
+        assert!(!proof.semantic_actions());
+        assert!(proof.text_entry());
+        assert!(!proof.key_chords());
+        assert!(!proof.pointer_fallback());
+
+        let owner = Uuid::new_v4();
+        let run = ComputerRun::new_with_isolation(
+            owner,
+            None,
+            target(),
+            Default::default(),
+            ComputerPrincipal::local_operator(owner),
+            ComputerSurfaceBinding::issue(),
+            proof,
+        )
+        .unwrap();
+        assert_eq!(
+            run.capability_proof.tier(),
+            ComputerCapabilityTier::MeasuredBackgroundSafeSemantic
+        );
+
+        let forged_foreground = ComputerCapabilityProof::ForegroundSemantic {
+            backend_id: MACOS_BACKGROUND_SAFE_BACKEND_ID.into(),
+            observe: true,
+            semantic_actions: true,
+            text_entry: true,
+        };
+        assert_eq!(
+            forged_foreground.validate().unwrap_err().code,
+            ComputerErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn public_agent_principal_minting_is_fail_closed_without_host_agent_registry() {
+        let blocked = ComputerPrincipal::agent(format!("agent-{}", Uuid::new_v4()), 1).unwrap_err();
+        assert_eq!(blocked.code, ComputerErrorCode::Unauthorized);
+        assert_eq!(blocked.message, AGENT_PRINCIPAL_INTEGRATION_BLOCKER);
+        assert!(ComputerPrincipal::agent("user-supplied", 1).is_err());
+        let deserialized: ComputerPrincipal = serde_json::from_value(serde_json::json!({
+            "kind": "agent",
+            "agentId": format!("agent-{}", Uuid::new_v4()),
+            "specRevision": 1
+        }))
+        .unwrap();
+        assert!(deserialized.validate().is_ok());
+        // Persisted Agent principals must validate so Runs can reopen. The
+        // authority boundary is the private ComputerAuthorityToken
+        // constructor plus AgentHost's durable Agent/spec lookup.
+        let snake_legacy: ComputerPrincipal = serde_json::from_value(serde_json::json!({
+            "kind": "agent",
+            "agent_id": "agent-legacy",
+            "spec_revision": 1
+        }))
+        .unwrap();
+        assert!(snake_legacy.validate().is_ok());
+        assert!(ComputerPrincipal::local_operator(Uuid::nil())
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn isolated_proof_must_bind_the_exact_run_surface() {
+        let owner = Uuid::new_v4();
+        let surface = ComputerSurfaceBinding::issue();
+        let other = ComputerSurfaceBinding::issue();
+        let proof = ComputerCapabilityProof::IndependentlyIsolatedVisualInputDomain {
+            backend_id: SIMULATOR_ISOLATED_BACKEND_ID.into(),
+            surface_id: other.surface_id.clone(),
+            incarnation: other.incarnation.clone(),
+            input_domain_id: Uuid::new_v4().to_string(),
+            origin: IsolationProofOrigin::SimulatorFixture,
+            observe: true,
+            semantic_actions: true,
+            text_entry: true,
+            key_chords: true,
+            pointer_fallback: true,
+        };
+        assert_eq!(
+            ComputerRun::new_with_isolation(
+                owner,
+                None,
+                target(),
+                Default::default(),
+                ComputerPrincipal::local_operator(owner),
+                surface,
+                proof,
+            )
+            .unwrap_err()
+            .code,
+            ComputerErrorCode::ForbiddenTarget
+        );
+    }
+
+    #[test]
+    fn macos_native_capability_helper_is_foreground_semantic_only() {
+        let proof = macos_native_capability_proof();
+        assert_eq!(proof.tier(), ComputerCapabilityTier::ForegroundSemantic);
+        assert!(proof.observe());
+        assert!(proof.semantic_actions());
+        assert!(proof.text_entry());
+        assert!(!proof.key_chords());
+        assert!(!proof.pointer_fallback());
+        assert!(!proof.isolated_input_is_dispatchable());
+        assert_eq!(proof.backend_id(), MACOS_NATIVE_BACKEND_ID);
+        let caps = ComputerCapabilities::from_proof(proof).unwrap();
+        assert_eq!(caps.tier, ComputerCapabilityTier::ForegroundSemantic);
+        assert!(!caps.pointer_fallback);
+        assert!(!caps.key_chords);
+        assert!(!caps.allows_action(&ComputerAction::PointerClick {
+            x: 1.0,
+            y: 1.0,
+            button: PointerButton::Primary,
+        }));
+        assert!(caps.allows_action(&ComputerAction::ActivateTarget));
+        let domain = macos_native_physical_input_domain();
+        assert_eq!(domain, macos_native_physical_input_domain());
+        assert_eq!(FOREGROUND_CONFLICT_DOMAIN_CAPACITY, 1);
+    }
+
+    #[test]
+    fn public_new_is_unproven_without_self_issued_authority() {
+        let run = ComputerRun::new(Uuid::new_v4(), None, target(), Default::default()).unwrap();
+        assert_eq!(run.capability_proof, ComputerCapabilityProof::Unproven);
+        assert!(run.initiating_principal.is_none());
+        assert!(!run.surface.is_issued());
+        assert_eq!(
+            run.required_principal().unwrap_err().code,
+            ComputerErrorCode::Unauthorized
         );
     }
 }

@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::completion::{CompletionEvidence, CompletionUsage};
+use crate::gateway_config::{
+    ModelCapabilities, ProviderDeadlineClass, ProviderDialect, ProviderKind,
+};
+use crate::types::EffortLevel;
+
+use super::quota::QuotaClass;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +52,198 @@ pub enum RunPurpose {
     ManagerProposal,
 }
 
+pub const PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const MAX_PROVIDER_ROUTE_VALUE_BYTES: usize = 2_048;
+
+/// Immutable, non-secret provider route captured before a finite Run exists.
+///
+/// Dispatch must use this record rather than consulting mutable environment,
+/// catalog, or provider-profile state. The credential fingerprint binds the
+/// route to the current credential identity without persisting bearer
+/// material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRouteSnapshot {
+    pub schema_version: u32,
+    pub provider_id: String,
+    pub model_id: String,
+    pub wire_model_id: String,
+    pub selection_key: String,
+    pub kind: ProviderKind,
+    pub dialect: ProviderDialect,
+    pub base_url: String,
+    pub endpoint_fingerprint: String,
+    pub credential_ref: String,
+    pub credential_fingerprint: String,
+    pub capabilities: ModelCapabilities,
+    pub deadline_class: ProviderDeadlineClass,
+    pub effort: EffortLevel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualification_record_id: Option<String>,
+    /// Host-authored quota pool class for this finite Run. Legacy route
+    /// snapshots omit both quota fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_class: Option<QuotaClass>,
+    /// Durable reservation identity installed atomically with the Run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_reservation_id: Option<String>,
+    pub snapshot_hash: String,
+}
+
+impl ProviderRouteSnapshot {
+    fn expected_endpoint_fingerprint(&self) -> String {
+        hash_payload(&serde_json::json!({
+            "kind": self.kind,
+            "dialect": self.dialect,
+            "baseUrl": self.base_url,
+        }))
+    }
+
+    fn expected_qualification_record_id(&self) -> Option<String> {
+        (self.capabilities.source == crate::gateway_config::CapabilitySource::Measured).then(|| {
+            hash_payload(&serde_json::json!({
+                "providerId": self.provider_id,
+                "modelId": self.model_id,
+                "wireModelId": self.wire_model_id,
+                "endpointFingerprint": self.endpoint_fingerprint,
+                "credentialFingerprint": self.credential_fingerprint,
+                "qualificationSchema": self.capabilities.qualification_schema,
+            }))
+        })
+    }
+
+    fn hash_material(&self) -> serde_json::Value {
+        let mut material = serde_json::json!({
+            "schemaVersion": self.schema_version,
+            "providerId": self.provider_id,
+            "modelId": self.model_id,
+            "wireModelId": self.wire_model_id,
+            "selectionKey": self.selection_key,
+            "kind": self.kind,
+            "dialect": self.dialect,
+            "baseUrl": self.base_url,
+            "endpointFingerprint": self.endpoint_fingerprint,
+            "credentialRef": self.credential_ref,
+            "credentialFingerprint": self.credential_fingerprint,
+            "capabilities": self.capabilities,
+            "deadlineClass": self.deadline_class,
+            "effort": self.effort,
+            "qualificationRecordId": self.qualification_record_id,
+        });
+        // Preserve the hash of route snapshots written by schema v1 before
+        // quota linkage existed. New linked snapshots bind both fields.
+        if let Some(quota_class) = self.quota_class {
+            material["quotaClass"] = serde_json::json!(quota_class);
+        }
+        if let Some(reservation_id) = &self.quota_reservation_id {
+            material["quotaReservationId"] = serde_json::json!(reservation_id);
+        }
+        material
+    }
+
+    pub(crate) fn seal(mut self) -> Result<Self, OrchError> {
+        self.endpoint_fingerprint = self.expected_endpoint_fingerprint();
+        self.qualification_record_id = self.expected_qualification_record_id();
+        self.snapshot_hash = hash_payload(&self.hash_material());
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub(crate) fn bind_quota(
+        mut self,
+        quota_class: QuotaClass,
+        reservation_id: impl Into<String>,
+    ) -> Result<Self, OrchError> {
+        self.quota_class = Some(quota_class);
+        self.quota_reservation_id = Some(reservation_id.into());
+        self.seal()
+    }
+
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if self.schema_version != PROVIDER_ROUTE_SNAPSHOT_SCHEMA_VERSION {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "provider route snapshot schema is invalid",
+            ));
+        }
+        for (value, field) in [
+            (self.provider_id.as_str(), "provider_id"),
+            (self.model_id.as_str(), "model_id"),
+            (self.wire_model_id.as_str(), "wire_model_id"),
+            (self.selection_key.as_str(), "selection_key"),
+            (self.base_url.as_str(), "base_url"),
+            (self.endpoint_fingerprint.as_str(), "endpoint_fingerprint"),
+            (self.credential_ref.as_str(), "credential_ref"),
+            (
+                self.credential_fingerprint.as_str(),
+                "credential_fingerprint",
+            ),
+            (self.snapshot_hash.as_str(), "snapshot_hash"),
+        ] {
+            if value.is_empty()
+                || value.len() > MAX_PROVIDER_ROUTE_VALUE_BYTES
+                || value.contains('\0')
+            {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    format!("provider route snapshot {field} is invalid"),
+                ));
+            }
+        }
+        crate::gateway_config::validate_base_url(&self.base_url)
+            .map_err(|message| OrchError::new(OrchErrorCode::InvalidRequest, message))?;
+        let selection = crate::gateway_config::parse_model_selection(&self.selection_key)
+            .map_err(|message| OrchError::new(OrchErrorCode::InvalidRequest, message))?;
+        if selection.provider_id != self.provider_id || selection.model_id != self.model_id {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "provider route snapshot does not match its selection key",
+            ));
+        }
+        if self.endpoint_fingerprint != self.expected_endpoint_fingerprint() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "provider route endpoint fingerprint does not match its immutable endpoint",
+            ));
+        }
+        if self.capabilities.source == crate::gateway_config::CapabilitySource::Measured
+            && self.capabilities.qualification_schema.as_deref()
+                != Some(crate::gateway_config::CAPABILITY_QUALIFICATION_SCHEMA)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "measured provider route snapshot has no valid qualification schema",
+            ));
+        }
+        if self.qualification_record_id != self.expected_qualification_record_id() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "provider route qualification identity does not match its immutable fields",
+            ));
+        }
+        match (&self.quota_class, &self.quota_reservation_id) {
+            (Some(_), Some(reservation_id))
+                if !reservation_id.is_empty()
+                    && reservation_id.len() <= MAX_PROVIDER_ROUTE_VALUE_BYTES
+                    && !reservation_id.contains('\0') => {}
+            (None, None) => {}
+            _ => {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "provider route quota identity is incomplete or invalid",
+                ));
+            }
+        }
+        if self.snapshot_hash != hash_payload(&self.hash_material()) {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "provider route snapshot hash does not match its immutable fields",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Host-decided terminal cause. Unlike `terminal_result`/`final_response`,
 /// this is never inferred from model-authored prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +253,7 @@ pub enum RunStopCause {
     RoundLimit,
     DurationLimit,
     TokenCeiling,
+    ProviderQuota,
     TokenAccountingUnavailable,
     TokenAccountingOverflow,
     Stationarity,
@@ -347,6 +546,10 @@ pub struct RunAggregates {
     /// response. A non-zero value after restart makes accounting incomplete.
     #[serde(default)]
     pub usage_pending_requests: u32,
+    /// Provider attempt rows whose usage has been folded into this Run. This
+    /// is the exactly-once application fence for crash recovery.
+    #[serde(default)]
+    pub accounted_provider_attempt_ids: Vec<String>,
     #[serde(default)]
     pub verification: Option<CompletionEvidence>,
 }
@@ -362,6 +565,7 @@ impl Default for RunAggregates {
             usage: CompletionUsage::default(),
             usage_complete: true,
             usage_pending_requests: 0,
+            accounted_provider_attempt_ids: Vec::new(),
             verification: None,
         }
     }
@@ -423,6 +627,10 @@ pub struct RunRecord {
     /// Immutable host-authored capability class for this Run.
     #[serde(default)]
     pub purpose: RunPurpose,
+    /// Immutable provider route for this finite Run. `None` is accepted only
+    /// when reading legacy records created before route snapshots existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_route: Option<ProviderRouteSnapshot>,
     /// Durable agent identity owning this run. Optional for legacy runs and
     /// non-agent orchestration clients.
     #[serde(default)]
@@ -1254,6 +1462,12 @@ fn default_receipt_status() -> String {
 pub struct AuditEntry {
     pub ts: DateTime<Utc>,
     pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_document_hash: Option<String>,
     pub request_id: Option<String>,
     pub session_id: Option<Uuid>,
     pub workspace: Option<String>,
@@ -1276,8 +1490,14 @@ pub enum OrchErrorCode {
     /// Wall-clock / transport request deadline exceeded (maps to HTTP 504).
     Timeout,
     InvalidRequest,
+    /// Streamable HTTP MCP session is missing after restart or eviction.
+    /// Distinct from `InvalidRequest` so desktop can reconnect without retrying
+    /// application-level invalid tool arguments.
+    UnknownSession,
     Unsupported,
     Conflict,
+    /// Recovery may still commit a partial admission write. Not a zero-effect rejection.
+    AdmissionUncertain,
 }
 
 impl OrchErrorCode {
@@ -1293,8 +1513,10 @@ impl OrchErrorCode {
             Self::Internal => "internal",
             Self::Timeout => "timeout",
             Self::InvalidRequest => "invalid_request",
+            Self::UnknownSession => "unknown_session",
             Self::Unsupported => "unsupported",
             Self::Conflict => "conflict",
+            Self::AdmissionUncertain => "admission_uncertain",
         }
     }
 }
@@ -1438,11 +1660,13 @@ pub fn is_recognized_test_command(command: &str) -> bool {
 
 /// Tools exposed by the control plane (schema snapshot source of truth).
 pub const CONTROL_TOOLS: &[&str] = &[
+    "ptah_get_authority_capabilities",
     "ptah_list_sessions",
     "ptah_create_session",
     "ptah_list_persistent_agents",
     "ptah_get_persistent_agent",
     "ptah_get_capacity",
+    "ptah_get_native_coding_readiness",
     "ptah_list_runs",
     "ptah_get_run",
     "ptah_get_progress",
@@ -1458,6 +1682,7 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_submit_task",
     "ptah_resume_persistent_agent",
     "ptah_create_work",
+    "ptah_create_enterprise_review",
     "ptah_create_manager_plan",
     "ptah_list_manager_plans",
     "ptah_get_manager_plan",

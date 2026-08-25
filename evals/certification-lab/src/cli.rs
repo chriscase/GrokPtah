@@ -16,16 +16,32 @@ use sha2::Digest;
 use uuid::Uuid;
 
 use crate::artifact::{verify_completed_campaign, SafeOutputRoot, DEFAULT_OUTPUT_RELATIVE_PATH};
+use crate::authority_stage3::{
+    inspect as inspect_authority_stage3, run as run_authority_stage3, AuthorityStage3Options,
+    AUTHORITY_STAGE3_OUTPUT_RELATIVE_PATH, AUTHORITY_STAGE3_REPORT_SCHEMA,
+};
 use crate::manifest::CampaignManifest;
+use crate::memory_stage5::{
+    inspect as inspect_memory_stage5, run as run_memory_stage5, MemoryStage5Options,
+    MEMORY_STAGE5_OUTPUT_RELATIVE_PATH, MEMORY_STAGE5_REPORT_SCHEMA,
+};
 use crate::normalize::{normalize_capture, replay_fixture, ReplayFixture, MAX_FIXTURE_BYTES};
 use crate::report::{
     CampaignReport, DiagnosticCode, FailureClass, ProbeStatus, ReportSummary, RuntimeMode,
     MAX_REPORT_BYTES,
 };
+use crate::review_manifest::default_campaign_path;
+use crate::review_report::{
+    inspect_review_campaign, QualityClaim, ReviewMode, ReviewReport, ReviewVerdict,
+};
+use crate::review_runner::{
+    preflight_review, run_review, stderr_progress, ReviewOptions, REVIEW_OUTPUT_RELATIVE_PATH,
+};
 use crate::runner::{
     default_options, preflight, run_campaign, validate_output_location, CampaignCompletion,
     CampaignOptions, TransportConfig, ATTACH_TOKEN_ENV, DEFAULT_SMOKE_PROBES,
 };
+use crate::{LAB_REPORT_SCHEMA, REVIEW_REPORT_SCHEMA};
 
 const DEFAULT_ARTIFACT_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -57,6 +73,12 @@ pub enum Command {
     Prune(PruneArgs),
     /// Validate the checked-in manifest and authoritative catalog binding.
     ValidateManifest(RepositoryArgs),
+    /// Run the sealed code-review benchmark contract (fake) or fail closed (live).
+    Review(ReviewArgs),
+    /// Run the exact-head Stage 5 durable-memory certification campaign.
+    Memory(MemoryArgs),
+    /// Run the exact-head Stage 3 least-privilege authority campaign.
+    Authority(AuthorityArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -124,11 +146,76 @@ pub struct CampaignArgs {
     pub artifact_budget_bytes: u64,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct MemoryArgs {
+    #[command(flatten)]
+    pub repository: RepositoryArgs,
+
+    /// Absolute artifact root; defaults to the ignored Stage 5 run root.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    /// Total bytes available to the sealed Stage 5 campaign.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_ARTIFACT_BUDGET_BYTES,
+        value_parser = clap::value_parser!(u64).range(1..=2_147_483_648)
+    )]
+    pub artifact_budget_bytes: u64,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct AuthorityArgs {
+    #[command(flatten)]
+    pub repository: RepositoryArgs,
+
+    /// Absolute artifact root; defaults to the ignored Stage 3 run root.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    /// Total bytes available to the sealed Stage 3 campaign.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_ARTIFACT_BUDGET_BYTES,
+        value_parser = clap::value_parser!(u64).range(1..=2_147_483_648)
+    )]
+    pub artifact_budget_bytes: u64,
+}
+
 #[derive(Debug, Args)]
 pub struct InspectArgs {
     /// Absolute completed campaign directory containing report.json.
     #[arg(long)]
     pub campaign: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ReviewArgs {
+    #[command(flatten)]
+    pub repository: RepositoryArgs,
+
+    /// Absolute campaign path; defaults to the checked-in review overlay.
+    #[arg(long)]
+    pub campaign: Option<PathBuf>,
+
+    /// Absolute artifact root; defaults to the review ignored lab root.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    /// Explicit live mode. Fails closed without unimplemented enterprise leases.
+    #[arg(long)]
+    pub live: bool,
+
+    /// Validate the review campaign without executing arms or sealing artifacts.
+    #[arg(long)]
+    pub preflight: bool,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_ARTIFACT_BUDGET_BYTES,
+        value_parser = clap::value_parser!(u64).range(1..=134217728)
+    )]
+    pub artifact_budget_bytes: u64,
 }
 
 #[derive(Debug, Args)]
@@ -226,6 +313,18 @@ struct InspectFailure {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
+struct ReviewInspectSummary {
+    valid: bool,
+    completion_seal_verified: bool,
+    quality_claim_eligible: bool,
+    fake_cannot_prove_quality: bool,
+    verdict: ReviewVerdict,
+    campaign_id: String,
+    notice: QualityClaim,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
 struct NormalizeSummary {
     candidate_id: String,
     fixture_sha256: String,
@@ -296,7 +395,7 @@ async fn dispatch(command: Command) -> Result<(ExitClass, serde_json::Value)> {
         Command::Inspect(args) => {
             require_absolute(&args.campaign, "campaign_path_must_be_absolute")?;
             let sealed = verify_completed_campaign(&args.campaign)?;
-            if sealed.relative_path != "report.json" || sealed.bytes > MAX_REPORT_BYTES as u64 {
+            if sealed.relative_path != "report.json" {
                 bail!("campaign seal does not reference a bounded report");
             }
             let bytes = read_regular_bounded(&args.campaign.join("report.json"), MAX_REPORT_BYTES)?;
@@ -305,8 +404,54 @@ async fn dispatch(command: Command) -> Result<(ExitClass, serde_json::Value)> {
             {
                 bail!("sealed report does not match its completion record");
             }
+            let schema = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("schema")
+                        .and_then(|schema| schema.as_str().map(str::to_owned))
+                });
+            if schema.as_deref() == Some(REVIEW_REPORT_SCHEMA) {
+                let report = inspect_review_campaign(&args.campaign)?;
+                let exit = exit_for_review(&report);
+                let summary = ReviewInspectSummary {
+                    valid: true,
+                    completion_seal_verified: true,
+                    quality_claim_eligible: report.quality_claim_eligible,
+                    fake_cannot_prove_quality: report.quality_claim
+                        == QualityClaim::FakeCannotProveQuality,
+                    verdict: report.verdict,
+                    campaign_id: report.campaign_id,
+                    notice: report.quality_claim,
+                };
+                return Ok((exit, serde_json::to_value(summary)?));
+            }
+            if schema.as_deref() == Some(MEMORY_STAGE5_REPORT_SCHEMA) {
+                let summary = inspect_memory_stage5(&args.campaign)?;
+                let exit = if summary.certification_ready {
+                    ExitClass::Passed
+                } else {
+                    ExitClass::OracleFailure
+                };
+                return Ok((exit, serde_json::to_value(summary)?));
+            }
+            if schema.as_deref() == Some(AUTHORITY_STAGE3_REPORT_SCHEMA) {
+                let summary = inspect_authority_stage3(&args.campaign)?;
+                let exit = if summary.certification_ready {
+                    ExitClass::Passed
+                } else {
+                    ExitClass::OracleFailure
+                };
+                return Ok((exit, serde_json::to_value(summary)?));
+            }
+            if sealed.bytes > MAX_REPORT_BYTES as u64 {
+                bail!("campaign seal does not reference a bounded report");
+            }
             let report: CampaignReport = serde_json::from_slice(&bytes)
                 .map_err(|_| anyhow::anyhow!("report_json_invalid"))?;
+            if report.schema != LAB_REPORT_SCHEMA {
+                bail!("report_json_invalid");
+            }
             report.validate_at(&args.campaign)?;
             let exit = exit_for_report(&report);
             let failures = report
@@ -344,6 +489,110 @@ async fn dispatch(command: Command) -> Result<(ExitClass, serde_json::Value)> {
             };
             Ok((ExitClass::Passed, serde_json::to_value(summary)?))
         }
+        Command::Review(args) => review(args).await,
+        Command::Memory(args) => memory(args),
+        Command::Authority(args) => authority(args),
+    }
+}
+
+fn authority(args: AuthorityArgs) -> Result<(ExitClass, serde_json::Value)> {
+    let repository = canonical_repository(&args.repository.repository)?;
+    let output_root = match args.output {
+        Some(path) => {
+            require_absolute(&path, "output_path_must_be_absolute")?;
+            path
+        }
+        None => repository.join(AUTHORITY_STAGE3_OUTPUT_RELATIVE_PATH),
+    };
+    let completion = run_authority_stage3(&AuthorityStage3Options {
+        repository_root: repository,
+        output_root,
+        artifact_budget_bytes: args.artifact_budget_bytes,
+    })?;
+    let exit = if completion.certification_ready {
+        ExitClass::Passed
+    } else {
+        ExitClass::OracleFailure
+    };
+    Ok((exit, serde_json::to_value(completion)?))
+}
+
+fn memory(args: MemoryArgs) -> Result<(ExitClass, serde_json::Value)> {
+    let repository = canonical_repository(&args.repository.repository)?;
+    let output_root = match args.output {
+        Some(path) => {
+            require_absolute(&path, "output_path_must_be_absolute")?;
+            path
+        }
+        None => repository.join(MEMORY_STAGE5_OUTPUT_RELATIVE_PATH),
+    };
+    let completion = run_memory_stage5(&MemoryStage5Options {
+        repository_root: repository,
+        output_root,
+        artifact_budget_bytes: args.artifact_budget_bytes,
+    })?;
+    let exit = if completion.certification_ready {
+        ExitClass::Passed
+    } else {
+        ExitClass::OracleFailure
+    };
+    Ok((exit, serde_json::to_value(completion)?))
+}
+
+async fn review(args: ReviewArgs) -> Result<(ExitClass, serde_json::Value)> {
+    let repository = canonical_repository(&args.repository.repository)?;
+    let options = ReviewOptions {
+        repository_root: repository.clone(),
+        campaign_path: match args.campaign {
+            Some(path) => {
+                require_absolute(&path, "campaign_path_must_be_absolute")?;
+                path
+            }
+            None => default_campaign_path(&repository),
+        },
+        output_root: match args.output {
+            Some(path) => {
+                require_absolute(&path, "output_path_must_be_absolute")?;
+                path
+            }
+            None => repository.join(REVIEW_OUTPUT_RELATIVE_PATH),
+        },
+        artifact_budget_bytes: args.artifact_budget_bytes,
+        mode: if args.live {
+            ReviewMode::Live
+        } else {
+            ReviewMode::Fake
+        },
+        preflight_only: args.preflight,
+    };
+    if args.preflight {
+        stderr_progress(options.mode, "review_preflight");
+        let summary = preflight_review(&options)?;
+        let exit = match options.mode {
+            ReviewMode::Fake => ExitClass::Passed,
+            ReviewMode::Live => ExitClass::Indeterminate,
+        };
+        return Ok((exit, serde_json::to_value(summary)?));
+    }
+    stderr_progress(options.mode, "review_start");
+    let completion = run_review(&options).await?;
+    stderr_progress(options.mode, "review_complete");
+    Ok((
+        exit_for_review_verdict(completion.verdict),
+        serde_json::to_value(completion)?,
+    ))
+}
+
+fn exit_for_review(report: &ReviewReport) -> ExitClass {
+    exit_for_review_verdict(report.verdict)
+}
+
+fn exit_for_review_verdict(verdict: ReviewVerdict) -> ExitClass {
+    match verdict {
+        ReviewVerdict::ContractPassed => ExitClass::Passed,
+        ReviewVerdict::Failed => ExitClass::OracleFailure,
+        ReviewVerdict::Indeterminate => ExitClass::Indeterminate,
+        ReviewVerdict::SafetyFailure => ExitClass::SafetyRefusal,
     }
 }
 
@@ -618,6 +867,7 @@ fn classify_error(error: &anyhow::Error) -> (ExitClass, &'static str) {
         "tamper",
         "wrong_service_fingerprint",
         "live_ambient_route_or_credential_override_present",
+        "enterprise_gateway_live_attach_must_remain_unimplemented",
     ]
     .iter()
     .any(|needle| has(needle))
@@ -727,6 +977,16 @@ mod tests {
             "--acknowledge-disposable-target",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn review_command_defaults_to_fake_contract_mode() {
+        let parsed = Cli::try_parse_from(["grokptah-cert", "review"]).unwrap();
+        let Command::Review(args) = parsed.command else {
+            panic!("wrong command");
+        };
+        assert!(!args.live);
+        assert!(!args.preflight);
     }
 
     #[test]

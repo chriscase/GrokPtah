@@ -1,0 +1,244 @@
+/* ToolCallCard — component-local styles (Tool Activity Evidence Center).
+ *
+ * Builds on the base .tool-card rules in styles/app.css. Selectors here are
+ * written with parent-qualified specificity so they win regardless of CSS
+ * load order. Tokens only — dark/light both come from [data-theme].
+ * All motion is opt-in behind prefers-reduced-motion: no-preference.
+ */
+
+.tool-card {
+  max-width: 100%;
+  min-width: 0;
+}
+
+/* Header is a real <button> now (was <summary>) — reset chrome, keep the
+ * existing flex layout that app.css already gives .tool-card-header. */
+.tool-card .tool-card-header {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  min-width: 0;
+}
+
+.tool-card .tool-card-header:hover {
+  background: var(--overlay-faint);
+}
+
+.tool-card .tool-card-header:focus-visible,
+.tool-card .tool-card-copy:focus-visible,
+.tool-history-group .tool-history-toggle:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
+
+/* Long tool titles/paths must shrink with an ellipsis instead of pushing the
+ * row wide (app.css pins them with flex-shrink: 0). */
+.tool-card .tool-card-title {
+  flex: 0 1 auto;
+  min-width: 4ch;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Status is the primary non-color cue: always-visible text, with shape and
+ * weight distinguishing terminal problem states from routine ones. */
+.tool-card .tool-card-status {
+  flex-shrink: 0;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 0 0.45em;
+  line-height: 1.5;
+}
+
+.tool-card.status-failed .tool-card-status,
+.tool-card.status-denied .tool-card-status {
+  color: var(--danger);
+  border-color: var(--danger);
+  font-weight: 600;
+}
+
+.tool-card.status-unknown .tool-card-status {
+  border-style: dashed;
+  border-color: var(--muted);
+}
+
+/* --state-attention, not --accent: identical in dark, but the light-theme
+ * accent (#b8860b) only reaches ~2.9:1 as text while the state token holds
+ * 4.5:1+ in both themes. */
+.tool-card.status-running .tool-card-status,
+.tool-card.status-pending .tool-card-status {
+  color: var(--state-attention);
+}
+
+.tool-card.status-unknown .tool-card-glyph {
+  color: var(--muted);
+}
+
+/* Failed/denied rows carry an inset edge marker (supplementary to the badge). */
+.tool-card.status-failed,
+.tool-card.status-denied {
+  border-inline-start: 3px solid var(--danger);
+}
+
+/* Token-based live treatment (overrides app.css hard-coded teal). */
+.tool-card.is-live {
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 1px var(--accent-bg);
+}
+
+.tool-card .tool-card-caret {
+  flex-shrink: 0;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+/* Preview never contributes to page width; ellipsis inside its own box. */
+.tool-card .tool-card-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.tool-card .tool-card-body[hidden] {
+  display: none;
+}
+
+.tool-card .tool-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem 0.6rem 0;
+  border-top: 1px solid var(--border-soft);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.tool-card .tool-card-meta-status {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-card .tool-card-copy {
+  appearance: none;
+  margin-left: auto;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  padding: 0.1rem 0.45rem;
+  cursor: pointer;
+}
+
+.tool-card .tool-card-copy:hover {
+  color: var(--text);
+  background: var(--overlay-faint);
+}
+
+/* Clipboard refusal must be visible, not just announced. */
+.tool-card .tool-card-copy.is-failed {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* Meta row present → the output's own border-top would double up. */
+.tool-card .tool-card-meta + .tool-card-output {
+  border-top: 0;
+}
+
+/* Unbroken paths/hashes wrap instead of forcing horizontal page scroll;
+ * genuinely long output scrolls internally (max-height from app.css,
+ * widened on large viewports below). */
+.tool-card .tool-card-output {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  overscroll-behavior: contain;
+  /* app.css hard-codes a dark overlay that breaks light theme — use tokens. */
+  background: var(--overlay-soft);
+}
+
+.tool-history-group {
+  min-width: 0;
+}
+
+.tool-history-group .tool-history-older {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.tool-history-group .tool-history-older[hidden] {
+  display: none;
+}
+
+/* ── Responsive ─────────────────────────────────────────────────────── */
+
+/* Phone-narrow (≈320px): let the header wrap so the preview gets a full
+ * second line instead of a 3-character ellipsis. */
+@media (max-width: 479px) {
+  .tool-card .tool-card-header {
+    flex-wrap: wrap;
+    row-gap: 0.15rem;
+  }
+  /* Glyph + title + badge share the first row even for endless titles:
+   * flex-basis 0 keeps the title from forcing its own wrap line. */
+  .tool-card .tool-card-title {
+    flex: 1 1 0%;
+  }
+  .tool-card .tool-card-preview {
+    flex-basis: 100%;
+    order: 10;
+    padding-left: 1.55rem; /* align under title, past the glyph column */
+  }
+  .tool-card .tool-card-output {
+    max-height: 140px;
+  }
+}
+
+/* Desktop (≥1280px): more evidence on screen before internal scroll. */
+@media (min-width: 1280px) {
+  .tool-card .tool-card-output {
+    max-height: 240px;
+  }
+}
+
+/* Very wide (≥1920px, incl. 2560): taller output pane, slightly larger text. */
+@media (min-width: 1920px) {
+  .tool-card .tool-card-output {
+    max-height: 320px;
+    font-size: 12px;
+  }
+}
+
+/* ── Motion (opt-in only) ───────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: no-preference) {
+  .tool-card .tool-card-header,
+  .tool-card .tool-card-copy,
+  .tool-history-group .tool-history-toggle {
+    transition: background-color 120ms ease, color 120ms ease,
+      border-color 120ms ease;
+  }
+
+  .tool-card.is-live .tool-card-glyph {
+    animation: tool-card-live-pulse 1.6s ease-in-out infinite;
+  }
+
+  @keyframes tool-card-live-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+}

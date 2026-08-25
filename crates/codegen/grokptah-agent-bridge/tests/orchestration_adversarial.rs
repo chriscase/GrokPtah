@@ -210,7 +210,7 @@ async fn reads_require_run_ownership_no_global_events() {
     let err = orch.get_events(&auth, None, 0, 10).unwrap_err();
     assert_eq!(err.code.as_str(), "invalid_request");
     let err = orch.get_run(&auth, "no-such-run").unwrap_err();
-    assert_eq!(err.code.as_str(), "invalid_request");
+    assert_eq!(err.code.as_str(), "forbidden_scope");
     // list_sessions filters allowlist + busy
     let list = orch.list_sessions(&auth).unwrap();
     let ws_canon = dunce::canonicalize(ws.path()).unwrap();

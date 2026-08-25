@@ -20,6 +20,11 @@ pub const XAI_PROVIDER_ID: &str = "xai";
 pub const MODEL_SELECTION_PREFIX: &str = "ptah.model.v1:";
 pub const CAPABILITY_QUALIFICATION_SCHEMA: &str = "grokptah.provider-qualification.v1";
 pub const COMPUTER_CAPABILITY_QUALIFICATION_SCHEMA: &str = "grokptah.computer-qualification.v1";
+/// Separate qualification evidence is required before a model may receive
+/// visual fallback authority. The ordinary computer qualification only
+/// measures semantic observation/action against the in-process fixture.
+pub const ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA: &str =
+    "grokptah.isolated-visual-computer-qualification.v1";
 pub const MAX_QUALIFIED_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const MANAGED_QUALIFICATIONS_VERSION: u32 = 1;
 const ALLOWED_IMAGE_MEDIA_TYPES: &[&str] = &["image/jpeg", "image/png", "image/webp"];
@@ -192,6 +197,17 @@ impl ModelCapabilities {
             && (!self.image_input
                 || self.image_media_types.is_empty()
                 || self.max_image_bytes.is_none())
+        {
+            return ComputerUseTier::SemanticAct;
+        }
+        if self.computer_use_tier == ComputerUseTier::VisualFallbackAct
+            && self.computer_capability_source != CapabilitySource::Measured
+        {
+            return ComputerUseTier::SemanticAct;
+        }
+        if self.computer_use_tier == ComputerUseTier::VisualFallbackAct
+            && self.computer_qualification_schema.as_deref()
+                != Some(ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA)
         {
             return ComputerUseTier::SemanticAct;
         }
@@ -575,6 +591,18 @@ fn is_valid_stored_profile(profile: &ProviderProfile) -> bool {
         && profile.dialect == ProviderDialect::OpenAiChatCompletions
 }
 
+/// Managed xAI qualifications may carry the ordinary semantic probe or the
+/// separate packaged-runtime visual proof. Stored compatible-provider config
+/// deliberately accepts only the ordinary schema above; a user-editable
+/// profile must never be able to self-assert isolated visual authority.
+fn is_valid_managed_computer_qualification_schema(schema: Option<&str>) -> bool {
+    matches!(
+        schema,
+        Some(COMPUTER_CAPABILITY_QUALIFICATION_SCHEMA)
+            | Some(ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA)
+    )
+}
+
 fn validate_stored_profile(profile: &ProviderProfile) -> Result<(), String> {
     if !is_valid_stored_profile(profile) {
         return Err(
@@ -709,8 +737,9 @@ fn synthesized_xai_profile(
         capabilities = measured.capabilities.clone();
         capabilities.effort_options = effort_options;
         if capabilities.computer_capability_source == CapabilitySource::Measured
-            && capabilities.computer_qualification_schema.as_deref()
-                != Some(COMPUTER_CAPABILITY_QUALIFICATION_SCHEMA)
+            && !is_valid_managed_computer_qualification_schema(
+                capabilities.computer_qualification_schema.as_deref(),
+            )
         {
             capabilities.computer_use_tier = ComputerUseTier::None;
             capabilities.computer_capability_source = CapabilitySource::Unknown;
@@ -855,6 +884,32 @@ fn load_managed_qualifications() -> io::Result<ManagedQualificationStore> {
         ));
     }
     Ok(store)
+}
+
+/// True when the host has measured this xAI model before, regardless of the
+/// route or credential identity that produced the measurement.
+///
+/// Admission uses this only as a downgrade fence: a new autonomous Execution
+/// Run may start from declared capabilities before first qualification, but it
+/// may not silently fall back to declared tool claims after a measured route
+/// becomes stale. The operator must requalify the new exact route first.
+pub(crate) fn has_measured_xai_qualification(
+    provider_id: &str,
+    model_id: &str,
+) -> io::Result<bool> {
+    if provider_id != XAI_PROVIDER_ID {
+        return Ok(false);
+    }
+    Ok(load_managed_qualifications()?
+        .qualifications
+        .into_iter()
+        .any(|record| {
+            record.provider_id == provider_id
+                && record.model_id == model_id
+                && record.capabilities.source == CapabilitySource::Measured
+                && record.capabilities.qualification_schema.as_deref()
+                    == Some(CAPABILITY_QUALIFICATION_SCHEMA)
+        }))
 }
 
 fn save_managed_qualifications(store: &ManagedQualificationStore) -> io::Result<()> {
@@ -1395,6 +1450,9 @@ mod tests {
 
         let store = load_managed_qualifications().unwrap();
         assert_eq!(store.qualifications.len(), 3);
+        assert!(has_measured_xai_qualification(XAI_PROVIDER_ID, "grok-route").unwrap());
+        assert!(!has_measured_xai_qualification(XAI_PROVIDER_ID, "never-measured").unwrap());
+        assert!(!has_measured_xai_qualification("compatible-provider", "grok-route").unwrap());
         let failed = store
             .qualifications
             .iter()
@@ -1456,6 +1514,59 @@ mod tests {
             }
         }
 
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn managed_isolated_visual_schema_survives_host_projection() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".grokptah");
+        set_grokptah_home_override(Some(home));
+        let previous_base = std::env::var_os("XAI_API_BASE");
+
+        let (profile, mut model) = measured_managed_profile(
+            "grok-visual",
+            "https://api.x.ai/v1",
+            "managed:xai:api-key",
+            true,
+            true,
+        );
+        model.capabilities.image_input = true;
+        model.capabilities.image_media_types = vec!["image/png".into()];
+        model.capabilities.max_image_bytes = Some(1024);
+        model.capabilities.computer_use_tier = ComputerUseTier::VisualFallbackAct;
+        model.capabilities.computer_qualification_schema =
+            Some(ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA.into());
+        save_managed_profile_capabilities(&profile, &model, TEST_CREDENTIAL_FINGERPRINT).unwrap();
+
+        unsafe { std::env::set_var("XAI_API_BASE", "https://api.x.ai/v1") };
+        let projected = resolve_profile_for_selection(
+            &ModelSelection {
+                provider_id: XAI_PROVIDER_ID.into(),
+                model_id: "grok-visual".into(),
+            },
+            false,
+            Some(TEST_CREDENTIAL_FINGERPRINT),
+        )
+        .unwrap();
+        let capabilities = &projected.models[0].capabilities;
+        assert_eq!(
+            capabilities.computer_qualification_schema.as_deref(),
+            Some(ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA)
+        );
+        assert_eq!(
+            capabilities.effective_computer_use_tier(),
+            ComputerUseTier::VisualFallbackAct
+        );
+
+        unsafe {
+            if let Some(value) = previous_base {
+                std::env::set_var("XAI_API_BASE", value);
+            } else {
+                std::env::remove_var("XAI_API_BASE");
+            }
+        }
         set_grokptah_home_override(None);
     }
 
@@ -1685,6 +1796,34 @@ mod tests {
     }
 
     #[test]
+    fn user_editable_profile_cannot_self_assert_isolated_visual_authority() {
+        let mut model = ProviderModel::unqualified("forged-isolated-visual");
+        model.capabilities.tools = true;
+        model.capabilities.image_input = true;
+        model.capabilities.image_media_types = vec!["image/png".into()];
+        model.capabilities.max_image_bytes = Some(1024);
+        model.capabilities.computer_use_tier = ComputerUseTier::VisualFallbackAct;
+        model.capabilities.computer_capability_source = CapabilitySource::Measured;
+        model.capabilities.computer_qualification_schema =
+            Some(ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA.into());
+        let mut profile =
+            ProviderProfile::openai_compatible("corp", "Corp", "https://gw.example/v1");
+        profile.upsert_model(model);
+        let mut config = GatewayConfig::default();
+        config.profiles.push(profile);
+
+        config.normalize();
+
+        let capabilities = &config.profiles[0].models[0].capabilities;
+        assert_eq!(capabilities.computer_use_tier, ComputerUseTier::None);
+        assert_eq!(
+            capabilities.computer_capability_source,
+            CapabilitySource::Unknown
+        );
+        assert!(capabilities.computer_qualification_schema.is_none());
+    }
+
+    #[test]
     fn effective_tier_fails_closed_for_incoherent_profile_claims() {
         let mut capabilities = ModelCapabilities {
             computer_use_tier: ComputerUseTier::VisualFallbackAct,
@@ -1704,6 +1843,19 @@ mod tests {
         capabilities.image_input = true;
         capabilities.image_media_types = vec!["image/png".into()];
         capabilities.max_image_bytes = Some(1024);
+        assert_eq!(
+            capabilities.effective_computer_use_tier(),
+            ComputerUseTier::SemanticAct,
+            "visual fallback requires isolated-runtime qualification evidence"
+        );
+        capabilities.computer_capability_source = CapabilitySource::Measured;
+        assert_eq!(
+            capabilities.effective_computer_use_tier(),
+            ComputerUseTier::SemanticAct,
+            "measured provenance alone does not grant visual fallback"
+        );
+        capabilities.computer_qualification_schema =
+            Some(ISOLATED_VISUAL_COMPUTER_QUALIFICATION_SCHEMA.into());
         assert_eq!(
             capabilities.effective_computer_use_tier(),
             ComputerUseTier::VisualFallbackAct

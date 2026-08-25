@@ -235,6 +235,10 @@ pub fn resolve_wire_credentials() -> Option<WireCredentials> {
 }
 
 fn resolve_xai_credentials() -> Option<WireCredentials> {
+    resolve_xai_api_key_credentials().or_else(load_grok_build_session)
+}
+
+fn resolve_xai_api_key_credentials() -> Option<WireCredentials> {
     if let Ok(key) = std::env::var("XAI_API_KEY") {
         if !key.is_empty() {
             return Some(WireCredentials {
@@ -307,7 +311,7 @@ fn resolve_xai_credentials() -> Option<WireCredentials> {
             }
         }
     }
-    load_grok_build_session()
+    None
 }
 
 /// Opaque keychain reference stored in a provider profile.
@@ -488,6 +492,47 @@ pub fn resolve_wire_credentials_for_model(
     let selection = crate::gateway_config::parse_model_selection(model_selection)?;
     let profile = crate::gateway_config::resolve_profile_for_selection(&selection, false, None)?;
     resolve_profile_credentials(&profile, Some(&selection.model_id))
+}
+
+/// Resolve only the credential reference frozen onto a provider route.
+///
+/// This deliberately does not load the mutable provider catalog. A finite Run
+/// may refresh the same durable credential principal, but changing a profile's
+/// credential reference while the Run is active cannot reroute its authority.
+pub(crate) fn resolve_wire_credentials_for_route(
+    provider_id: &str,
+    kind: crate::gateway_config::ProviderKind,
+    dialect: crate::gateway_config::ProviderDialect,
+    credential_ref: &str,
+) -> Result<Option<WireCredentials>, String> {
+    use crate::gateway_config::{ProviderDialect, ProviderKind, XAI_PROVIDER_ID};
+
+    match (kind, dialect) {
+        (ProviderKind::Xai, ProviderDialect::XaiChatCompletions)
+            if provider_id == XAI_PROVIDER_ID =>
+        {
+            match credential_ref {
+                "managed:xai:api-key" => Ok(resolve_xai_api_key_credentials()),
+                "managed:xai:oidc" => {
+                    Ok(load_grok_build_session().filter(|credentials| credentials.oidc_token_auth))
+                }
+                _ => Err("xAI provider route has an unsupported credential reference".into()),
+            }
+        }
+        (ProviderKind::OpenAiCompatible, ProviderDialect::OpenAiChatCompletions)
+            if provider_id != XAI_PROVIDER_ID =>
+        {
+            let managed_by_env = matches!(provider_id, "env-grokptah" | "env-openai");
+            validate_provider_credential_ref(provider_id, managed_by_env, credential_ref)?;
+            let bearer = read_provider_credential(credential_ref)?;
+            Ok(Some(compatible_credentials(
+                provider_id,
+                credential_ref,
+                bearer,
+            )))
+        }
+        _ => Err("provider route has an unsupported credential boundary".into()),
+    }
 }
 
 fn resolve_profile_credentials(
@@ -1324,6 +1369,46 @@ mod tests {
             std::env::remove_var("OPENAI_BASE_URL");
             std::env::remove_var("OPENAI_API_KEY");
             std::env::remove_var("XAI_API_KEY");
+        }
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
+    fn frozen_route_credentials_resolve_without_the_mutable_provider_catalog() {
+        let _lock = home_override_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join(".grokptah");
+        fs::create_dir_all(&home).unwrap();
+        set_grokptah_home_override(Some(home));
+        unsafe {
+            std::env::set_var("GROKPTAH_API_KEY", "synthetic-frozen-route-key");
+            std::env::set_var("OPENAI_API_KEY", "synthetic-other-route-key");
+        }
+
+        // No gateway profile is needed: the Run already froze the trusted
+        // provider identity and credential reference at admission.
+        let resolved = resolve_wire_credentials_for_route(
+            "env-grokptah",
+            crate::gateway_config::ProviderKind::OpenAiCompatible,
+            crate::gateway_config::ProviderDialect::OpenAiChatCompletions,
+            "env:GROKPTAH_API_KEY",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.provider_id, "env-grokptah");
+        assert_eq!(resolved.bearer, "synthetic-frozen-route-key");
+
+        let error = expect_credential_error(resolve_wire_credentials_for_route(
+            "env-grokptah",
+            crate::gateway_config::ProviderKind::OpenAiCompatible,
+            crate::gateway_config::ProviderDialect::OpenAiChatCompletions,
+            "env:OPENAI_API_KEY",
+        ));
+        assert!(error.contains("does not match its profile"));
+
+        unsafe {
+            std::env::remove_var("GROKPTAH_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
         }
         set_grokptah_home_override(None);
     }
