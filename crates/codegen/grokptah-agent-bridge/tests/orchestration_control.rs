@@ -2335,7 +2335,7 @@ async fn expired_attempt_reaper_releases_capacity_and_promotes_next_once() {
         serde_json::from_str(&std::fs::read_to_string(&attempt_path).unwrap()).unwrap();
     attempt["expiresAt"] = serde_json::json!("2000-01-01T00:00:00Z");
     std::fs::write(&attempt_path, serde_json::to_vec_pretty(&attempt).unwrap()).unwrap();
-    orch.reap_expired_attempts_for_test();
+    orch.reap_expired_attempts_for_test().await;
 
     assert_eq!(
         wait_run_terminal(&orch, &auth, first_id, Duration::from_secs(10)).await,
@@ -2429,6 +2429,164 @@ async fn finalization_write_failure_releases_capacity_and_recovers_intent() {
     );
     set_grokptah_home_override(None);
     std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn failed_run_write_fails_receipt_and_never_executes_after_restart() {
+    let (home, _lock) = setup_home();
+    let ws = tempdir().unwrap();
+    let host = started_host();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 1);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let runs = orch.store().root().join("runs");
+    std::fs::remove_dir(&runs).unwrap();
+    std::fs::write(&runs, b"blocked").unwrap();
+
+    let refused = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "failed-run-write",
+            session.id,
+            ws.path(),
+            "run sh -c 'echo must-not-run >> must-not-run.txt'".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .expect_err("a failed public run write must fail the submission");
+    assert_eq!(refused.code.as_str(), "internal");
+    let receipt = orch
+        .store()
+        .load_idempotency("failed-run-write")
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.status, "failed");
+    assert!(receipt.run_id.is_some());
+    assert_eq!(
+        std::fs::read_dir(orch.store().root().join("acceptance"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name() != "sequence.json")
+            .count(),
+        0
+    );
+    std::fs::remove_file(&runs).unwrap();
+    std::fs::create_dir(&runs).unwrap();
+    let store = orch.store().clone();
+    drop(orch);
+    drop(host);
+    drop(store);
+
+    let reopened = OrchStore::open(home.path().join("orch")).unwrap();
+    assert!(reopened.list_acceptance_intents().unwrap().is_empty());
+    let host2 = started_host();
+    let orch2 = OrchestrationService::new(
+        host2.clone(),
+        host2.event_bus(),
+        reopened,
+        OrchestrationConfig {
+            bearer_token: "t".into(),
+            allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+            max_concurrent_runs: 1,
+            bounds: RunBounds::default(),
+        },
+    );
+    let auth2 = orch2.auth_header(Some("Bearer t")).unwrap();
+    let replay = orch2
+        .submit_task_with_execution_mode_and_queue(
+            &auth2,
+            "failed-run-write",
+            session.id,
+            ws.path(),
+            "run sh -c 'echo must-not-run >> must-not-run.txt'".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await;
+    assert!(replay.is_err(), "failed receipt must replay as failure");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!ws.path().join("must-not-run.txt").exists());
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn lost_recovered_slot_refuses_stale_queued_replay() {
+    let (home, _lock) = setup_home();
+    let ws = tempdir().unwrap();
+    let host = started_host();
+    host.set_project_cwd(ws.path()).unwrap();
+    let blocker = host.session_new_kind(SessionKind::Build).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(blocker.id, ws.path()).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    host.reserve_orchestration_turn("slot-blocker", blocker.id)
+        .unwrap();
+    let orch = orch_for(&host, &home, &ws, 1);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let accepted = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "lost-slot",
+            session.id,
+            ws.path(),
+            "queued input later removed".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+    let run_id = accepted["runId"].as_str().unwrap().to_string();
+    let acceptance_path = orch
+        .store()
+        .root()
+        .join("acceptance")
+        .join(format!("{}.json", safe_id_filename(&run_id).unwrap()));
+    let store = orch.store().clone();
+    drop(orch);
+    drop(host);
+    drop(store);
+    std::fs::remove_file(acceptance_path).unwrap();
+
+    let reopened = OrchStore::open(home.path().join("orch")).unwrap();
+    let lost = reopened.load_run(&run_id).unwrap().unwrap();
+    assert_eq!(lost.state, RunState::Interrupted);
+    assert_eq!(lost.error_code.as_deref(), Some("admission_lost"));
+    let host2 = started_host();
+    let orch2 = OrchestrationService::new(
+        host2.clone(),
+        host2.event_bus(),
+        reopened,
+        OrchestrationConfig {
+            bearer_token: "t".into(),
+            allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
+            max_concurrent_runs: 1,
+            bounds: RunBounds::default(),
+        },
+    );
+    let auth2 = orch2.auth_header(Some("Bearer t")).unwrap();
+    let replay = orch2
+        .submit_task_with_execution_mode_and_queue(
+            &auth2,
+            "lost-slot",
+            session.id,
+            ws.path(),
+            "queued input later removed".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .expect_err("lost queued work must not replay as accepted");
+    assert!(replay.message.contains(&run_id));
+    set_grokptah_home_override(None);
 }
 
 #[tokio::test]

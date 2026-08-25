@@ -1,5 +1,6 @@
 //! Durable run records, idempotency receipts, audit log (#196).
 
+use std::collections::HashSet;
 use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,7 @@ pub const DEFAULT_MAX_IDEMPOTENCY_RECEIPTS: usize = 1_000;
 pub const DEFAULT_TERMINAL_RUN_AGE: Duration = Duration::days(30);
 pub const DEFAULT_IDEMPOTENCY_RECEIPT_AGE: Duration = Duration::days(7);
 pub const MAX_FINALIZATION_RECOVERY_INTENTS: usize = 32;
+pub const MAX_ACCEPTANCE_PROMPT_BYTES: usize = 1_000_000;
 
 const ACTIVE_ATTEMPT_PHASES: &[&str] = &["claimed", "running", "finalizing"];
 
@@ -66,16 +68,20 @@ pub(crate) struct AcceptanceIntent {
     pub session_id: uuid::Uuid,
     pub workspace: String,
     pub execution_mode: super::types::RunExecutionMode,
+    pub allow_queue: bool,
     #[serde(default)]
     pub attempt_id: Option<String>,
     /// Full input exists only in this private acceptance ledger. It is
     /// removed before a claimed model attempt is dispatched.
     pub prompt: Option<String>,
+    pub prompt_hash: String,
+    pub bounds: super::types::RunBounds,
     pub run: RunRecord,
     pub response: serde_json::Value,
     pub phase: AcceptancePhase,
     pub created_at: chrono::DateTime<Utc>,
     pub updated_at: chrono::DateTime<Utc>,
+    pub integrity: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -107,6 +113,118 @@ impl AttemptPhase {
 
     pub(crate) fn is_active(self) -> bool {
         ACTIVE_ATTEMPT_PHASES.contains(&self.as_str())
+    }
+}
+
+impl AcceptanceIntent {
+    fn digest(&self) -> String {
+        super::types::hash_payload(&serde_json::json!({
+            "admissionId": self.admission_id,
+            "sequence": self.sequence,
+            "runId": self.run_id,
+            "requestId": self.request_id,
+            "payloadHash": self.payload_hash,
+            "tool": self.tool,
+            "sessionId": self.session_id,
+            "workspace": self.workspace,
+            "executionMode": self.execution_mode,
+            "allowQueue": self.allow_queue,
+            "attemptId": self.attempt_id,
+            "prompt": self.prompt,
+            "promptHash": self.prompt_hash,
+            "bounds": self.bounds,
+            "run": self.run,
+            "response": self.response,
+            "phase": self.phase,
+            "createdAt": self.created_at,
+        }))
+    }
+
+    fn seal(&mut self) {
+        self.integrity = self.digest();
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        safe_id_filename(&self.admission_id).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        safe_id_filename(&self.run_id).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        safe_id_filename(&self.request_id).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if self.sequence == 0
+            || self.workspace.is_empty()
+            || self.workspace.len() > 4 * 1024
+            || self.workspace.chars().any(|character| character == '\0')
+        {
+            anyhow::bail!("acceptance workspace is outside its bound");
+        }
+        self.bounds
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        self.run
+            .bounds
+            .validate()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        if self.run.run_id != self.run_id
+            || self.run.session_id != self.session_id
+            || self.run.request_id != self.request_id
+            || self.run.workspace != self.workspace
+            || self.run.bounds.max_prompt_bytes != self.bounds.max_prompt_bytes
+            || self.run.bounds.max_rounds != self.bounds.max_rounds
+            || self.run.bounds.max_duration_ms != self.bounds.max_duration_ms
+        {
+            anyhow::bail!("acceptance identity does not match its run");
+        }
+        if self
+            .prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.is_empty() || prompt.len() > self.bounds.max_prompt_bytes)
+            || self
+                .prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.len() > MAX_ACCEPTANCE_PROMPT_BYTES)
+        {
+            anyhow::bail!("acceptance prompt is outside its bound");
+        }
+        if let Some(prompt) = self.prompt.as_deref() {
+            if self.prompt_hash != super::types::hash_payload(&serde_json::json!(prompt)) {
+                anyhow::bail!("acceptance prompt hash is invalid");
+            }
+            let expected_payload = super::types::hash_payload(&serde_json::json!({
+                "sessionId": self.session_id,
+                "workspace": self.workspace,
+                "prompt": prompt,
+                "bounds": self.bounds,
+                "executionMode": self.execution_mode,
+                "allowQueue": self.allow_queue,
+                "retryOf": self.run.retry_of,
+            }));
+            if self.payload_hash != expected_payload {
+                anyhow::bail!("acceptance payload hash is invalid");
+            }
+        } else if self.prompt_hash.is_empty() {
+            anyhow::bail!("consumed acceptance has no prompt hash");
+        }
+        match self.phase {
+            AcceptancePhase::Queued => {
+                if self.prompt.is_none()
+                    || !matches!(self.run.state, RunState::Queued | RunState::Running)
+                {
+                    anyhow::bail!("queued acceptance has no recoverable input");
+                }
+            }
+            AcceptancePhase::Claimed
+            | AcceptancePhase::Cancelled
+            | AcceptancePhase::Interrupted
+                if self.prompt.is_some() =>
+            {
+                anyhow::bail!("consumed acceptance still contains prompt input");
+            }
+            _ => {}
+        }
+        if self.integrity.is_empty()
+            || !super::authz::constant_time_eq(self.integrity.as_bytes(), self.digest().as_bytes())
+        {
+            anyhow::bail!("acceptance integrity check failed");
+        }
+        Ok(())
     }
 }
 
@@ -235,8 +353,15 @@ impl OrchStore {
         // Acceptance is the admission authority. It is intentionally
         // reconstructed before receipts so a completed receipt can never
         // advertise a queued run whose private input was lost.
-        if let Err(error) = store.recover_acceptance_intents() {
-            store.mark_health_degraded(&format!("acceptance recovery failed: {error}"));
+        let recovered_acceptances = match store.recover_acceptance_intents() {
+            Ok(survivors) => survivors,
+            Err(error) => {
+                store.mark_health_degraded(&format!("acceptance recovery failed: {error}"));
+                HashSet::new()
+            }
+        };
+        if let Err(error) = store.retire_lost_queued_runs(&recovered_acceptances) {
+            store.mark_health_degraded(&format!("lost admission retirement failed: {error}"));
         }
         if let Err(error) = store.recover_finalization_intents() {
             store.mark_health_degraded(&format!("finalization recovery failed: {error}"));
@@ -379,18 +504,18 @@ impl OrchStore {
     /// Persist the full acceptance intent before a public run or receipt can
     /// claim that admission succeeded.
     pub(crate) fn save_acceptance_intent(&self, intent: &AcceptanceIntent) -> anyhow::Result<()> {
-        if intent
-            .prompt
-            .as_deref()
-            .is_some_and(|prompt| prompt.is_empty())
-        {
-            anyhow::bail!("accepted prompt must not be empty");
-        }
+        let mut sealed = intent.clone();
+        sealed.seal();
+        sealed.validate()?;
         let path = self
-            .acceptance_path(&intent.run_id)
+            .acceptance_path(&sealed.run_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let _g = self.inner.lock.lock();
-        private_atomic_write_json(&path, intent)
+        let result = private_write_json_exclusive(&path, &sealed);
+        if result.is_err_and(|error| error.kind() != std::io::ErrorKind::AlreadyExists) {
+            let _ = fs::remove_file(&path);
+        }
+        result
     }
 
     pub(crate) fn load_acceptance_intent(
@@ -473,6 +598,8 @@ impl OrchStore {
         intent.run = run.clone();
         intent.response = response;
         intent.updated_at = Utc::now();
+        intent.seal();
+        intent.validate()?;
         // The no-prompt intent is itself private and mode-checked. Keeping it
         // until receipt settlement closes the claim/receipt crash cut.
         private_atomic_write_json(&path, &intent)?;
@@ -499,6 +626,8 @@ impl OrchStore {
         intent.run = run;
         intent.response = response;
         intent.updated_at = Utc::now();
+        intent.seal();
+        intent.validate()?;
         private_atomic_write_json(&path, &intent)
     }
 
@@ -513,9 +642,44 @@ impl OrchStore {
         intent.prompt = None;
         intent.phase = AcceptancePhase::Cancelled;
         intent.updated_at = Utc::now();
+        intent.seal();
+        intent.validate()?;
         private_atomic_write_json(&path, &intent)?;
         fs::remove_file(&path)?;
         sync_parent_dir(&path)?;
+        Ok(())
+    }
+
+    /// Fail a submission that has already created a private acceptance
+    /// record. The prompt is removed before the record is unlinked; no
+    /// recovery path may see this admission as executable work.
+    pub(crate) fn fail_acceptance_intent(&self, run_id: &str) -> anyhow::Result<()> {
+        let path = self
+            .acceptance_path(run_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let _g = self.inner.lock.lock();
+        if !path.is_file() {
+            return Ok(());
+        }
+        match fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<AcceptanceIntent>(&text).ok())
+        {
+            Some(mut intent) => {
+                intent.prompt = None;
+                intent.phase = AcceptancePhase::Interrupted;
+                intent.updated_at = Utc::now();
+                intent.seal();
+                let _ = private_atomic_write_json(&path, &intent);
+            }
+            None => {
+                self.quarantine_acceptance_path(&path);
+            }
+        }
+        if path.is_file() {
+            fs::remove_file(&path)?;
+            sync_parent_dir(&path)?;
+        }
         Ok(())
     }
 
@@ -1413,105 +1577,105 @@ impl OrchStore {
         Ok(n)
     }
 
-    fn recover_acceptance_intents(&self) -> anyhow::Result<usize> {
-        let intents = self.list_acceptance_intents()?;
-        let mut recovered = 0;
-        for intent in intents {
-            let run = match self.load_run(&intent.run_id)? {
-                Some(run) => run,
-                None => {
-                    self.save_run(&intent.run)?;
-                    intent.run.clone()
-                }
+    fn recover_acceptance_intents(&self) -> anyhow::Result<HashSet<String>> {
+        let dir = self.inner.root.join("acceptance");
+        let mut survivors = HashSet::new();
+        let mut highest = 0;
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json")
+                || path.file_name().and_then(|value| value.to_str()) == Some("sequence.json")
+            {
+                continue;
+            }
+            let parsed = fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<AcceptanceIntent>(&text).ok());
+            let valid = parsed.as_ref().is_some_and(|intent| {
+                intent.validate().is_ok()
+                    && fs::metadata(&path).is_ok_and(|metadata| {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            return metadata.permissions().mode() & 0o777 == 0o600;
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = metadata;
+                            true
+                        }
+                    })
+            });
+            let Some(intent) = parsed.filter(|_| valid) else {
+                self.inner
+                    .last_run_error
+                    .lock()
+                    .replace("acceptance intent integrity or mode check failed".into());
+                self.quarantine_acceptance_path(&path);
+                continue;
             };
-            if run.run_id != intent.run_id
-                || run.session_id != intent.session_id
-                || run.request_id != intent.request_id
-                || run.workspace != intent.workspace
-            {
-                self.mark_health_degraded(&format!(
-                    "acceptance intent {} does not match its run",
-                    intent.run_id
-                ));
+            highest = highest.max(intent.sequence);
+            if intent.phase != AcceptancePhase::Queued || intent.prompt.is_none() {
+                let _ = fs::remove_file(&path);
                 continue;
             }
-
-            // The intent carries the completed response, so a crash before
-            // receipt settlement is repaired from the authoritative admission
-            // rather than failing the request and losing its input.
-            if let Err(error) = self.recover_acceptance_receipt(&intent) {
-                self.mark_health_degraded(&format!(
-                    "acceptance receipt recovery failed for {}: {error}",
-                    intent.run_id
-                ));
-                continue;
+            let run = self.load_run(&intent.run_id)?;
+            if run.as_ref().is_some_and(|run| {
+                run.state == RunState::Queued
+                    && run.run_id == intent.run_id
+                    && run.session_id == intent.session_id
+                    && run.request_id == intent.request_id
+                    && run.workspace == intent.workspace
+                    && self.receipt_acknowledged(&intent.request_id)
+            }) {
+                survivors.insert(intent.run_id);
+            } else {
+                // A missing/pending/failed receipt means the caller was not
+                // told this admission succeeded. Never execute it later.
+                let _ = fs::remove_file(&path);
             }
-
-            // A run that had reached Running before the crash is never
-            // reconstructed as queueable work. Its input is no longer needed
-            // for implicit recovery and is tombstoned below.
-            if run.state == RunState::Running || intent.phase == AcceptancePhase::Claimed {
-                let _ = self.update_run(&run.run_id, |current| {
-                    if !current.state.is_terminal() {
-                        current.state = RunState::Interrupted;
-                        current.queue_position = None;
-                        current.terminal_result = Some("interrupted".into());
-                        current.error_code = Some("interrupted".into());
-                        current.updated_at = Utc::now();
-                    }
-                    Ok(())
-                })?;
-                self.tombstone_acceptance_intent(&intent.run_id)?;
-                recovered += 1;
-                continue;
-            }
-
-            if run.state != RunState::Queued
-                || intent.phase != AcceptancePhase::Queued
-                || intent.prompt.is_none()
-            {
-                self.tombstone_acceptance_intent(&intent.run_id)?;
-                continue;
-            }
-            recovered += 1;
         }
-        Ok(recovered)
+        let next = highest.saturating_add(1);
+        let _ = private_atomic_write_json(
+            &self.admission_sequence_path(),
+            &serde_json::json!({ "next": next }),
+        );
+        Ok(survivors)
     }
 
-    fn recover_acceptance_receipt(&self, intent: &AcceptanceIntent) -> anyhow::Result<()> {
-        let receipt_path = self
-            .idemp_path(&intent.request_id)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        match fs::read_to_string(&receipt_path) {
-            Ok(text) => {
-                let receipt: IdempotencyReceipt = serde_json::from_str(&text)?;
-                if receipt.request_id != intent.request_id
-                    || receipt.payload_hash != intent.payload_hash
-                    || receipt.run_id.as_deref() != Some(intent.run_id.as_str())
-                    || receipt.tool != intent.tool
-                {
-                    anyhow::bail!("acceptance intent conflicts with idempotency receipt");
-                }
-                if receipt.status != "pending" {
-                    return Ok(());
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+    fn quarantine_acceptance_path(&self, path: &Path) {
+        let quarantine = path.with_extension(format!("json.corrupt-{}", Uuid::new_v4()));
+        if fs::rename(path, quarantine).is_err() {
+            let _ = fs::remove_file(path);
         }
-        let receipt = IdempotencyReceipt {
-            request_id: intent.request_id.clone(),
-            payload_hash: intent.payload_hash.clone(),
-            run_id: Some(intent.run_id.clone()),
-            tool: intent.tool.clone(),
-            response: intent.response.clone(),
-            error: None,
-            created_at: Utc::now(),
-            status: "complete".into(),
-        };
-        let _g = self.inner.lock.lock();
-        atomic_write_json(&receipt_path, &receipt)?;
-        Ok(())
+    }
+
+    fn retire_lost_queued_runs(&self, survivors: &HashSet<String>) -> anyhow::Result<usize> {
+        let mut retired = 0;
+        for mut run in self.list_runs()? {
+            if run.state != RunState::Queued || survivors.contains(&run.run_id) {
+                continue;
+            }
+            run.state = RunState::Interrupted;
+            run.queue_position = None;
+            run.terminal_result = Some("interrupted".into());
+            run.error_code = Some("admission_lost".into());
+            run.updated_at = Utc::now();
+            if let Some(execution) = run.execution.as_mut() {
+                execution.promotion_state = PromotionState::Conflicted;
+            }
+            self.save_run(&run)?;
+            retired += 1;
+        }
+        Ok(retired)
+    }
+
+    fn receipt_acknowledged(&self, request_id: &str) -> bool {
+        matches!(
+            self.load_idempotency(request_id),
+            Ok(Some(receipt)) if receipt.status == "complete"
+                && receipt.request_id == request_id
+        )
     }
 
     fn tombstone_acceptance_intent(&self, run_id: &str) -> anyhow::Result<()> {
@@ -1529,6 +1693,8 @@ impl OrchStore {
         intent.prompt = None;
         intent.phase = AcceptancePhase::Interrupted;
         intent.updated_at = Utc::now();
+        intent.seal();
+        intent.validate()?;
         private_atomic_write_json(&path, &intent)?;
         fs::remove_file(&path)?;
         sync_parent_dir(&path)?;
@@ -1650,7 +1816,9 @@ fn load_acceptance_intent_path(path: &Path) -> anyhow::Result<Option<AcceptanceI
             anyhow::bail!("private acceptance intent has unsafe permissions");
         }
     }
-    Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
+    let intent: AcceptanceIntent = serde_json::from_str(&fs::read_to_string(path)?)?;
+    intent.validate()?;
+    Ok(Some(intent))
 }
 
 fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
@@ -1683,6 +1851,47 @@ fn sync_parent_dir(path: &Path) -> anyhow::Result<()> {
 /// `File::create` inherits the process umask and can leave a readable temp
 /// file. This writer creates a unique 0600 file, validates the mode before
 /// writing, reapplies it after rename, and fsyncs the containing directory.
+fn private_write_json_exclusive<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_private_dir(parent).map_err(std::io::Error::other)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) => return Err(error),
+    };
+    let result = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
+                return Err(std::io::Error::other(
+                    "private acceptance file has unsafe permissions",
+                ));
+            }
+        }
+        use std::io::Write;
+        file.write_all(&serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?)?;
+        file.sync_all()?;
+        sync_parent_dir(path).map_err(std::io::Error::other)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
 fn private_atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)?;
@@ -2388,13 +2597,19 @@ mod tests {
             session_id: run.session_id,
             workspace: run.workspace.clone(),
             execution_mode: super::super::types::RunExecutionMode::Shared,
+            allow_queue: true,
             attempt_id: None,
             prompt: Some(format!("private full prompt {run_id}")),
+            prompt_hash: super::super::types::hash_payload(&serde_json::json!(format!(
+                "private full prompt {run_id}"
+            ))),
+            bounds: run.bounds.clone(),
             run: run.clone(),
             response,
             phase: AcceptancePhase::Queued,
             created_at: run.created_at,
             updated_at: run.updated_at,
+            integrity: String::new(),
         };
         (run, intent)
     }
@@ -2431,25 +2646,28 @@ mod tests {
                 assert!(reopened.load_run("crash-cut").unwrap().is_none());
                 continue;
             }
+            if cut == 1 {
+                assert!(reopened.load_run("crash-cut").unwrap().is_none());
+                assert!(reopened.list_acceptance_intents().unwrap().is_empty());
+                continue;
+            }
             assert_eq!(
                 reopened.load_run("crash-cut").unwrap().unwrap().state,
-                RunState::Queued
+                RunState::Interrupted
             );
-            let receipt = reopened
-                .load_idempotency(&intent.request_id)
-                .unwrap()
-                .unwrap();
-            assert_eq!(receipt.status, "complete");
-            assert_eq!(receipt.run_id.as_deref(), Some("crash-cut"));
-            assert_eq!(
-                reopened
-                    .list_acceptance_intents()
+            if cut == 3 {
+                let receipt = reopened
+                    .load_idempotency(&intent.request_id)
                     .unwrap()
-                    .iter()
-                    .map(|intent| intent.sequence)
-                    .collect::<Vec<_>>(),
-                vec![1]
-            );
+                    .unwrap();
+                assert_eq!(receipt.status, "failed");
+            } else {
+                assert!(reopened
+                    .load_idempotency(&intent.request_id)
+                    .unwrap()
+                    .is_none());
+            }
+            assert!(reopened.list_acceptance_intents().unwrap().is_empty());
         }
     }
 
@@ -2500,6 +2718,47 @@ mod tests {
         assert!(body.contains("\"prompt\": null"));
         store.settle_acceptance_intent(&run.run_id).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn parseable_acceptance_tamper_is_quarantined_and_never_recovered() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let (run, intent) = queued_run("tampered-acceptance", 1);
+        store.save_run(&run).unwrap();
+        store.save_acceptance_intent(&intent).unwrap();
+        store
+            .save_idempotency(&IdempotencyReceipt {
+                request_id: intent.request_id.clone(),
+                payload_hash: intent.payload_hash.clone(),
+                run_id: Some(intent.run_id.clone()),
+                tool: intent.tool.clone(),
+                response: intent.response.clone(),
+                error: None,
+                created_at: Utc::now(),
+                status: "complete".into(),
+            })
+            .unwrap();
+        let path = store.acceptance_path(&run.run_id).unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["prompt"] = serde_json::json!("tampered input");
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        drop(store);
+
+        let reopened = OrchStore::open(d.path()).unwrap();
+        let run = reopened.load_run(&run.run_id).unwrap().unwrap();
+        assert_eq!(run.state, RunState::Interrupted);
+        assert_eq!(run.error_code.as_deref(), Some("admission_lost"));
+        assert!(reopened.list_acceptance_intents().unwrap().is_empty());
+        assert!(fs::read_dir(d.path().join("acceptance"))
+            .unwrap()
+            .flatten()
+            .any(|entry| entry
+                .path()
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|extension| extension.starts_with("corrupt-"))));
     }
 
     #[test]
@@ -2633,6 +2892,18 @@ mod tests {
             let (run, intent) = queued_run(&run_id, sequence);
             store.save_run(&run).unwrap();
             store.save_acceptance_intent(&intent).unwrap();
+            store
+                .save_idempotency(&IdempotencyReceipt {
+                    request_id: intent.request_id.clone(),
+                    payload_hash: intent.payload_hash.clone(),
+                    run_id: Some(intent.run_id.clone()),
+                    tool: intent.tool.clone(),
+                    response: intent.response.clone(),
+                    error: None,
+                    created_at: Utc::now(),
+                    status: "complete".into(),
+                })
+                .unwrap();
         }
         drop(store);
         let reopened = OrchStore::open(d.path()).unwrap();
@@ -2774,7 +3045,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .status,
-            "complete"
+            "failed"
         );
         assert_eq!(
             reopened.load_attempt("claimed-cut").unwrap().unwrap().phase,

@@ -26,6 +26,7 @@ use super::types::*;
 const MAX_PENDING_ADMISSIONS: usize = 32;
 const ATTEMPT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 const ATTEMPT_LEASE: Duration = Duration::from_millis(500);
+const SUPERVISOR_TEARDOWN_DEADLINE: Duration = Duration::from_secs(5);
 const FINALIZATION_DEADLINE: Duration = Duration::from_secs(2);
 const FINALIZATION_RETRY_LIMIT: u32 = 8;
 
@@ -44,6 +45,7 @@ struct PendingRun {
 struct LiveAttempt {
     attempt_id: String,
     model_abort: tokio::task::AbortHandle,
+    supervisor: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Clone)]
@@ -75,8 +77,6 @@ pub struct OrchestrationService {
     scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     instance_id: String,
     live_attempts: Mutex<HashMap<String, LiveAttempt>>,
-    /// Join handles for in-flight runs (prevents forget + unbounded leaks).
-    join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 /// Authorized bounds for a live run event stream.
@@ -206,14 +206,6 @@ impl IdempotencyLease {
             Err(store_error) => store_error,
         }
     }
-
-    fn defer_to_recovery(&mut self) {
-        // The acceptance intent contains the response needed to settle this
-        // pending receipt on restart. Do not convert an accepted mutation into
-        // a failed receipt merely because the receipt write itself hit a
-        // transient/full-disk failure.
-        self.settled = true;
-    }
 }
 
 impl Drop for IdempotencyLease {
@@ -267,7 +259,6 @@ impl OrchestrationService {
             self_ref: self_ref.clone(),
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
             scheduler_watcher: Mutex::new(None),
-            join_handles: Mutex::new(Vec::new()),
             instance_id: Uuid::new_v4().to_string(),
             live_attempts: Mutex::new(HashMap::new()),
         });
@@ -293,7 +284,8 @@ impl OrchestrationService {
                             break;
                         };
                         service.recover_pending_admissions();
-                        service.reap_expired_attempts();
+                        service.reap_expired_attempts().await;
+                        service.reaping_handles();
                     }
                     update = events.recv() => {
                         let Some(update) = update else {
@@ -586,26 +578,6 @@ impl OrchestrationService {
         removed
     }
 
-    fn requeue_pending(&self, pending: PendingRun) -> anyhow::Result<()> {
-        self.host.reserve_orchestration_queue_slot_with_identity(
-            &pending.run_id,
-            pending.session_id,
-            &pending.admission_id,
-            pending.sequence,
-        )?;
-        let mut queue = self.pending_admissions.lock();
-        if !queue
-            .pending
-            .iter()
-            .any(|existing| existing.run_id == pending.run_id)
-        {
-            queue.pending.push_front(pending);
-        }
-        drop(queue);
-        self.sync_pending_positions();
-        Ok(())
-    }
-
     /// Promote as many queued tasks as the shared host capacity allows. The
     /// host atomically chooses the globally fair run and reserves its active
     /// turn, so two embedded control services cannot both select conflicting
@@ -659,11 +631,19 @@ impl OrchestrationService {
                 Ok(None) => self.host.release_orchestration_turn(&pending.run_id),
                 Err(error) => {
                     self.host.release_orchestration_turn(&pending.run_id);
-                    if let Err(requeue_error) = self.requeue_pending(pending) {
-                        self.store.mark_health_degraded(&format!(
-                            "queued run could not be requeued after start failure: {requeue_error}"
-                        ));
-                    }
+                    let workspace = self
+                        .store
+                        .load_run(&pending.run_id)
+                        .ok()
+                        .flatten()
+                        .map(|run| PathBuf::from(run.workspace))
+                        .unwrap_or_default();
+                    self.fail_after_receipt(
+                        &pending.run_id,
+                        pending.session_id,
+                        &workspace,
+                        OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                    );
                     eprintln!("[grokptah] queued run start deferred: {error}");
                     return;
                 }
@@ -754,48 +734,12 @@ impl OrchestrationService {
             response,
         ) {
             Ok(prompt) => prompt,
-            Err(error) => {
-                let _ = self.interrupt_run_after_start_failure(
-                    &run.run_id,
-                    &attempt,
-                    "accepted prompt could not be claimed",
-                );
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         Ok(Some((run, prompt, attempt, intent.execution_mode)))
     }
 
-    fn interrupt_run_after_start_failure(
-        &self,
-        run_id: &str,
-        attempt: &AttemptRecord,
-        reason: &str,
-    ) -> anyhow::Result<()> {
-        let _ = self.store.update_run(run_id, |run| {
-            if !run.state.is_terminal() {
-                run.state = RunState::Interrupted;
-                run.queue_position = None;
-                run.terminal_result = Some("interrupted".into());
-                run.error_code = Some("interrupted".into());
-                run.final_response = Some(reason.into());
-                run.updated_at = Utc::now();
-            }
-            Ok(())
-        })?;
-        let _ = self.store.finalize_attempt(
-            run_id,
-            &attempt.attempt_id,
-            &attempt.owner_instance_id,
-            attempt.revision,
-            AttemptPhase::Interrupted,
-            Utc::now(),
-        );
-        self.store.mark_health_degraded(reason);
-        Ok(())
-    }
-
-    fn reap_expired_attempts(&self) {
+    async fn reap_expired_attempts(&self) {
         let now = Utc::now();
         let attempts = match self.store.list_attempts() {
             Ok(attempts) => attempts,
@@ -822,6 +766,17 @@ impl OrchestrationService {
             if let Some(live) = self.live_attempts.lock().remove(&run_id) {
                 if live.attempt_id == attempt.attempt_id {
                     live.model_abort.abort();
+                    let mut supervisor = live.supervisor;
+                    let terminated =
+                        tokio::time::timeout(SUPERVISOR_TEARDOWN_DEADLINE, &mut supervisor)
+                            .await
+                            .is_ok();
+                    if !terminated {
+                        supervisor.abort();
+                        let _ = supervisor.await;
+                    }
+                } else {
+                    self.live_attempts.lock().insert(run_id.clone(), live);
                 }
             }
             if let Err(error) = self.store.update_run(&run_id, |run| {
@@ -847,8 +802,8 @@ impl OrchestrationService {
     /// Test-only entry point for deterministic expiry/reaper adversarial
     /// coverage. Production supervision remains periodic and host-owned.
     #[doc(hidden)]
-    pub fn reap_expired_attempts_for_test(&self) {
-        self.reap_expired_attempts();
+    pub async fn reap_expired_attempts_for_test(&self) {
+        self.reap_expired_attempts().await;
     }
 
     async fn begin_idempotency(
@@ -872,6 +827,16 @@ impl OrchestrationService {
                     }));
                 }
                 Ok(IdempotencyClaim::Replay(Ok(value))) => {
+                    if let Some(error) = self.stale_queued_replay(&value) {
+                        self.audit_err(
+                            tool,
+                            Some(request_id),
+                            Some(session_id),
+                            Some(&workspace.display().to_string()),
+                            &error,
+                        );
+                        return Err(error);
+                    }
                     self.audit(
                         tool,
                         Some(request_id),
@@ -926,6 +891,28 @@ impl OrchestrationService {
         }
     }
 
+    fn stale_queued_replay(&self, value: &serde_json::Value) -> Option<OrchError> {
+        if value.get("state").and_then(serde_json::Value::as_str) != Some("queued") {
+            return None;
+        }
+        let run_id = value.get("runId").and_then(serde_json::Value::as_str)?;
+        let admission_lost = self
+            .store
+            .load_run(run_id)
+            .ok()
+            .flatten()
+            .is_none_or(|run| run.error_code.as_deref() == Some("admission_lost"));
+        if !admission_lost {
+            return None;
+        }
+        Some(OrchError::new(
+            OrchErrorCode::Conflict,
+            format!(
+                "queued work did not survive admission; run {run_id} is interrupted and must be resubmitted under a new request_id"
+            ),
+        ))
+    }
+
     fn fail_claim(
         &self,
         lease: &mut IdempotencyLease,
@@ -944,9 +931,108 @@ impl OrchestrationService {
         lease.fail(run_id, error)
     }
 
+    fn fail_admission(
+        &self,
+        lease: &mut IdempotencyLease,
+        run_id: Option<&str>,
+        session_id: Uuid,
+        workspace: &Path,
+        error: OrchError,
+    ) -> OrchError {
+        self.audit_err(
+            &lease.tool,
+            Some(&lease.request_id),
+            Some(session_id),
+            Some(&workspace.display().to_string()),
+            &error,
+        );
+        if let Some(run_id) = run_id {
+            let _ = self.remove_pending(run_id);
+            self.host.release_orchestration_turn(run_id);
+            if let Err(cleanup) = self.store.fail_acceptance_intent(run_id) {
+                self.store.mark_health_degraded(&format!(
+                    "failed acceptance cleanup for {run_id}: {cleanup}"
+                ));
+            }
+            let _ = self.store.update_run(run_id, |run| {
+                if !run.state.is_terminal() {
+                    run.state = RunState::Failed;
+                    run.queue_position = None;
+                    run.terminal_result = Some("failed".into());
+                    run.error_code = Some(error.code.as_str().into());
+                    run.final_response = Some("accepted work failed before dispatch".into());
+                    run.updated_at = Utc::now();
+                }
+                Ok(())
+            });
+        }
+        lease.fail(run_id.map(str::to_string), error)
+    }
+
+    fn fail_after_receipt(
+        &self,
+        run_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        error: OrchError,
+    ) -> OrchError {
+        self.audit_err(
+            "ptah_submit_task",
+            None,
+            Some(session_id),
+            Some(&workspace.display().to_string()),
+            &error,
+        );
+        let _ = self.remove_pending(run_id);
+        self.host.release_orchestration_turn(run_id);
+        if let Err(cleanup) = self.store.fail_acceptance_intent(run_id) {
+            self.store.mark_health_degraded(&format!(
+                "failed post-receipt acceptance cleanup for {run_id}: {cleanup}"
+            ));
+        }
+        if let Some(attempt) = self.store.load_attempt(run_id).ok().flatten() {
+            if attempt.phase.is_active() {
+                let _ = self.store.finalize_attempt(
+                    run_id,
+                    &attempt.attempt_id,
+                    &attempt.owner_instance_id,
+                    attempt.revision,
+                    AttemptPhase::Interrupted,
+                    Utc::now(),
+                );
+            }
+        }
+        if let Err(update) = self.store.update_run(run_id, |run| {
+            if !run.state.is_terminal() || run.error_code.as_deref() == Some("interrupted") {
+                run.state = RunState::Interrupted;
+                run.queue_position = None;
+                run.terminal_result = Some("interrupted".into());
+                run.error_code = Some("admission_lost".into());
+                run.final_response = Some("accepted work could not be dispatched".into());
+                run.updated_at = Utc::now();
+            }
+            Ok(())
+        }) {
+            self.store.mark_health_degraded(&format!(
+                "failed post-receipt run retirement for {run_id}: {update}"
+            ));
+        }
+        error
+    }
+
     fn reaping_handles(&self) {
-        let mut h = self.join_handles.lock();
-        h.retain(|j| !j.is_finished());
+        let finished = {
+            let attempts = self.live_attempts.lock();
+            attempts
+                .iter()
+                .filter(|(_, attempt)| attempt.supervisor.is_finished())
+                .map(|(run_id, _)| run_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut attempts = self.live_attempts.lock();
+        for run_id in finished {
+            attempts.remove(&run_id);
+        }
     }
 
     /// Load run and verify workspace ownership against allowlist + session.
@@ -2910,16 +2996,6 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         let _ = auth;
         let tool = idempotency_tool;
-        let payload = json!({
-            "sessionId": session_id,
-            "workspace": workspace.display().to_string(),
-            "prompt": prompt,
-            "bounds": bounds_json,
-            "executionMode": execution_mode,
-            "allowQueue": allow_queue,
-            "retryOf": retry_of,
-        });
-        let phash = hash_payload(&payload);
 
         let finish_err = |svc: &Self, e: OrchError| -> OrchError {
             svc.audit_err(
@@ -2965,6 +3041,16 @@ impl OrchestrationService {
             Ok(c) => c,
             Err(e) => return Err(finish_err(self, e)),
         };
+        let payload = json!({
+            "sessionId": session_id,
+            "workspace": claimed.display().to_string(),
+            "prompt": prompt,
+            "bounds": bounds,
+            "executionMode": execution_mode,
+            "allowQueue": allow_queue,
+            "retryOf": retry_of,
+        });
+        let phash = hash_payload(&payload);
 
         let mut lease = match self
             .begin_idempotency(tool, request_id, &phash, session_id, &claimed)
@@ -3054,13 +3140,17 @@ impl OrchestrationService {
             session_id,
             workspace: run.workspace.clone(),
             execution_mode,
+            allow_queue,
             attempt_id: None,
             prompt: Some(prompt.clone()),
+            prompt_hash: hash_payload(&json!(prompt)),
+            bounds: bounds.clone(),
             run: run.clone(),
             response: provisional_response,
             phase: AcceptancePhase::Queued,
             created_at: run.created_at,
             updated_at: run.updated_at,
+            integrity: String::new(),
         };
         if let Err(error) = self.store.save_acceptance_intent(&intent) {
             if !queued {
@@ -3075,11 +3165,14 @@ impl OrchestrationService {
                 self.host.release_turn_reservation(session_id, &run_id);
                 self.release_capacity(&run_id);
             }
-            self.store
-                .mark_health_degraded(&format!("accepted run awaiting recovery: {e}"));
-            lease.defer_to_recovery();
-            let e = OrchError::new(OrchErrorCode::Internal, e.to_string());
-            return Err(e);
+            let error = OrchError::new(OrchErrorCode::Internal, e.to_string());
+            return Err(self.fail_admission(
+                &mut lease,
+                Some(&run_id),
+                session_id,
+                &claimed,
+                error,
+            ));
         }
 
         let queued_position = if queued {
@@ -3091,17 +3184,9 @@ impl OrchestrationService {
             }) {
                 Ok(position) => Some(position),
                 Err(error) => {
-                    let _ = self.store.update_run(&run_id, |current| {
-                        current.state = RunState::Failed;
-                        current.queue_position = None;
-                        current.terminal_result = Some("failed".into());
-                        current.error_code = Some(error.code.as_str().into());
-                        current.updated_at = Utc::now();
-                        Ok(())
-                    });
-                    return Err(self.fail_claim(
+                    return Err(self.fail_admission(
                         &mut lease,
-                        Some(run_id),
+                        Some(&run_id),
                         session_id,
                         &claimed,
                         error,
@@ -3112,107 +3197,40 @@ impl OrchestrationService {
             None
         };
 
-        let response = if queued {
-            let queued_run = self
-                .store
-                .load_run(&run_id)
-                .ok()
-                .flatten()
-                .unwrap_or(run.clone());
-            let response = json!({
-                "runId": run_id,
-                "sessionId": session_id,
-                "state": RunState::Queued,
-                "requestId": request_id,
-                "executionMode": execution_mode,
-                "queuedPosition": queued_position,
-            });
-            if let Err(error) =
-                self.store
-                    .update_acceptance_intent(&run_id, queued_run, response.clone())
-            {
-                self.store
-                    .mark_health_degraded(&format!("accepted queue response not updated: {error}"));
-                lease.defer_to_recovery();
-                return Err(OrchError::new(OrchErrorCode::Internal, error.to_string()));
-            }
-            response
-        } else {
-            let pending = PendingRun {
-                run_id: run_id.clone(),
+        let queued_run = self
+            .store
+            .load_run(&run_id)
+            .ok()
+            .flatten()
+            .unwrap_or(run.clone());
+        let response = json!({
+            "runId": run_id,
+            "sessionId": session_id,
+            "state": RunState::Queued,
+            "requestId": request_id,
+            "executionMode": execution_mode,
+            "queuedPosition": queued_position,
+        });
+        if let Err(error) =
+            self.store
+                .update_acceptance_intent(&run_id, queued_run, response.clone())
+        {
+            return Err(self.fail_admission(
+                &mut lease,
+                Some(&run_id),
                 session_id,
-                admission_id,
-                sequence,
-            };
-            let (run, prompt, attempt, execution_mode) = match self.claim_and_start_queued(&pending)
-            {
-                Ok(Some(result)) => result,
-                Ok(None) => {
-                    self.host.release_orchestration_turn(&run_id);
-                    lease.defer_to_recovery();
-                    return Err(OrchError::new(
-                        OrchErrorCode::Conflict,
-                        "accepted run was not queueable",
-                    ));
-                }
-                Err(error) => {
-                    self.release_capacity(&run_id);
-                    if self
-                        .store
-                        .load_acceptance_intent(&run_id)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|intent| intent.prompt.is_some())
-                    {
-                        let _ = self.requeue_pending(pending);
-                    } else {
-                        self.store.mark_health_degraded(&format!(
-                            "accepted run could not start: {error}"
-                        ));
-                    }
-                    lease.defer_to_recovery();
-                    return Err(OrchError::new(OrchErrorCode::Internal, error.to_string()));
-                }
-            };
-            let response = json!({
-                "runId": run_id,
-                "sessionId": session_id,
-                "state": run.state,
-                "requestId": request_id,
-                "executionMode": execution_mode,
-                "queuedPosition": serde_json::Value::Null,
-            });
-            if let Err(error) = lease.complete(Some(run_id.clone()), response.clone()) {
-                lease.defer_to_recovery();
-                self.store.mark_health_degraded(&format!(
-                    "accepted run receipt awaiting recovery: {error}"
-                ));
-                self.spawn_run(run, prompt, execution_mode, attempt);
-                return Err(error);
-            }
-            self.audit(
-                tool,
-                Some(request_id),
-                Some(session_id),
-                Some(&claimed.display().to_string()),
-                "accepted",
-                None,
-                "run started",
-            );
-            if let Err(error) = self.store.settle_acceptance_intent(&run_id) {
-                self.store.mark_health_degraded(&format!(
-                    "claimed acceptance tombstone failed for {run_id}: {error}"
-                ));
-            }
-            self.spawn_run(run, prompt, execution_mode, attempt);
-            return Ok(response);
-        };
-        if let Err(error) = lease.complete(Some(run_id.clone()), response.clone()) {
-            lease.defer_to_recovery();
-            self.store.mark_health_degraded(&format!(
-                "accepted queue receipt awaiting recovery: {error}"
+                &claimed,
+                OrchError::new(OrchErrorCode::Internal, error.to_string()),
             ));
-            return Err(error);
+        }
+        if let Err(error) = lease.complete(Some(run_id.clone()), response.clone()) {
+            return Err(self.fail_admission(
+                &mut lease,
+                Some(&run_id),
+                session_id,
+                &claimed,
+                error,
+            ));
         }
         self.audit(
             tool,
@@ -3221,11 +3239,52 @@ impl OrchestrationService {
             Some(&claimed.display().to_string()),
             "accepted",
             None,
-            if queued { "run queued" } else { "run started" },
+            if queued {
+                "run queued"
+            } else {
+                "run accepted before dispatch"
+            },
         );
-        // A capacity release can race the enqueue; this also makes an
-        // immediately available slot visible without requiring polling.
-        self.pump_pending();
+        if queued {
+            // A capacity release can race the enqueue; this also makes an
+            // immediately available slot visible without requiring polling.
+            self.pump_pending();
+        } else {
+            let pending = PendingRun {
+                run_id: run_id.clone(),
+                session_id,
+                admission_id,
+                sequence,
+            };
+            match self.claim_and_start_queued(&pending) {
+                Ok(Some((run, prompt, attempt, execution_mode))) => {
+                    self.store
+                        .settle_acceptance_intent(&run_id)
+                        .unwrap_or_else(|error| {
+                            self.store.mark_health_degraded(&format!(
+                                "claimed acceptance tombstone failed for {run_id}: {error}"
+                            ));
+                        });
+                    self.spawn_run(run, prompt, execution_mode, attempt);
+                }
+                Ok(None) => {
+                    return Err(self.fail_after_receipt(
+                        &run_id,
+                        session_id,
+                        &claimed,
+                        OrchError::new(OrchErrorCode::Conflict, "accepted run was not queueable"),
+                    ));
+                }
+                Err(error) => {
+                    return Err(self.fail_after_receipt(
+                        &run_id,
+                        session_id,
+                        &claimed,
+                        OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                    ));
+                }
+            }
+        }
 
         Ok(response)
     }
@@ -3405,13 +3464,6 @@ impl OrchestrationService {
                 .await
         });
         let model_abort = model_task.abort_handle();
-        self.live_attempts.lock().insert(
-            rid.clone(),
-            LiveAttempt {
-                attempt_id: attempt_id.clone(),
-                model_abort: model_abort.clone(),
-            },
-        );
 
         let join = tokio::spawn(async move {
             let admission_guard = AdmissionGuard {
@@ -3722,12 +3774,19 @@ impl OrchestrationService {
             // can be promoted immediately and fairly.
             admission_guard.release();
             if let Some(service) = service_ref.upgrade() {
-                service.live_attempts.lock().remove(&rid);
+                service.reaping_handles();
                 service.pump_pending();
             }
         });
         self.reaping_handles();
-        self.join_handles.lock().push(join);
+        self.live_attempts.lock().insert(
+            rid,
+            LiveAttempt {
+                attempt_id,
+                model_abort,
+                supervisor: join,
+            },
+        );
     }
 
     pub async fn queue_prompt(
