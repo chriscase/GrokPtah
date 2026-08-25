@@ -796,8 +796,8 @@ impl AlwaysOnFixture {
         };
         if fixture.native_work_by_step.len() != 3
             || fixture.provider_posts_by_semantic.len() != 4
-            || fixture.decision_work == 0
-            || fixture.proposal_runs == 0
+            || fixture.decision_work != 1
+            || fixture.proposal_runs != 1
             || fixture.native_steps().iter().any(|step| {
                 !fixture.native_work_by_step.contains_key(*step)
                     || !fixture.provider_posts_by_semantic.contains_key(*step)
