@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -44,6 +44,21 @@ try {
     workspace,
     join(packDirectory, packed),
   ], { cwd: workspace });
+  // `@grokptah/client/help-react` treats React as an optional peer, so the
+  // disposable fixture has none. Link the workspace copy rather than fetching:
+  // the fixture must stay offline, and importing through a real
+  // `node_modules` path is the point of this check.
+  const fixtureModules = join(workspace, "node_modules");
+  for (const dependency of ["react", "react-dom"]) {
+    await symlink(
+      join(fileURLToPath(new URL("../node_modules/", import.meta.url)), dependency),
+      join(fixtureModules, dependency),
+      "dir",
+    ).catch((error) => {
+      if (error.code !== "EEXIST") throw error;
+    });
+  }
+
   await writeFile(
     consumerPath,
     `import {
@@ -66,6 +81,13 @@ try {
   emptyPromptQueueState,
   promptQueueReducer,
   searchHelpArticles,
+  HELP_CORPUS_DIGEST,
+  searchHelpCorpus,
+  createHelpSearchController,
+  createHelpAnswerRoute,
+  buildHelpAnswerRequest,
+  validateHelpAnswerResponse,
+  verifyHelpModelChecksum,
 } from "@grokptah/client";
 import {
   HELP_ARTICLES as UI_CORE_HELP_ARTICLES,
@@ -172,6 +194,54 @@ const externalState = externalNotification
 if (externalState?.lastSeq !== 0 || externalState.recoveryRequired) {
   throw new Error("consumer external-worker monitor was not usable");
 }
+// ---- canonical Help core, exercised through real package resolution ----
+if (!HELP_CORPUS_DIGEST.startsWith("sha256:")) {
+  throw new Error("consumer could not read the canonical Help corpus digest");
+}
+const helpOutcome = searchHelpCorpus("why did my agent send the same request twice after a restart");
+if (helpOutcome.results[0]?.articleId !== "operations.durable-recovery") {
+  throw new Error("consumer Help retrieval did not rank the durable-recovery article");
+}
+if (helpOutcome.corpusDigest !== HELP_CORPUS_DIGEST) {
+  throw new Error("consumer Help retrieval was not bound to the shipped corpus digest");
+}
+for (const citation of helpOutcome.results[0].citations) {
+  if (!citation.path || !citation.heading || !citation.chunkId) {
+    throw new Error("consumer Help citation was missing a source anchor");
+  }
+}
+if (!searchHelpCorpus("how do I bake sourdough bread").abstained) {
+  throw new Error("consumer Help retrieval answered an unsupported question");
+}
+if (!verifyHelpModelChecksum().ok) {
+  throw new Error("consumer Help embedding model failed its checksum");
+}
+if (JSON.stringify(searchHelpCorpus("key xai-AbCdEf0123456789AbCdEf gateway")).includes("AbCdEf")) {
+  throw new Error("consumer Help retrieval echoed a credential");
+}
+const helpController = createHelpSearchController();
+helpController.search("durable run recovery");
+if (helpController.getState().results.length < 1) {
+  throw new Error("consumer Help controller returned no results");
+}
+helpController.dispose();
+
+const helpRoute = createHelpAnswerRoute("consumer-provider", "consumer-tenant", "consumer-model");
+const helpRequest = buildHelpAnswerRequest("durable run recovery", helpOutcome.results, helpRoute);
+if (helpRequest.toolsDisabled !== true || helpRequest.conversationDisabled !== true) {
+  throw new Error("consumer Help answer request did not disable tools and conversation");
+}
+if (validateHelpAnswerResponse({ schema: "grokptah.help-answer-response.v1", answer: "x", citations: [], uncertainty: "y", corpusDigest: helpRequest.corpusDigest, routeDigest: helpRoute.routeDigest }, helpRequest).accepted) {
+  throw new Error("consumer Help answer validation accepted an uncited reply");
+}
+
+const helpReact = await import("@grokptah/client/help-react");
+for (const name of ["HelpResults", "HelpSearchInput", "HelpCitationList", "HelpHighlightedText", "useHelpSearch"]) {
+  if (typeof helpReact[name] !== "function") {
+    throw new Error("consumer help-react export was not usable: " + name);
+  }
+}
+
 console.log("external consumer fixture passed");
 `,
   );

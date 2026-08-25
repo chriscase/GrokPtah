@@ -1,4 +1,9 @@
-export type HelpTopic = "getting-started" | "providers" | "computer-use" | "operations";
+import { HELP_CORPUS_DIGEST } from "./help/canonical/corpus";
+import { PROJECTED_HELP_ARTICLES } from "./help/canonical/projections";
+
+// Declared once, in the canonical corpus schema.
+export type { HelpTopic } from "./help/canonical/types";
+import type { HelpTopic } from "./help/canonical/types";
 
 export type HelpSource = {
   readonly id: string;
@@ -7,6 +12,8 @@ export type HelpSource = {
 };
 
 export const HELP_CORPUS_VERSION = "product-corpus-v1";
+/** Digest of the canonical corpus this projection was generated from. */
+export const HELP_CANONICAL_CORPUS_DIGEST = HELP_CORPUS_DIGEST;
 export type HelpRetrievalMode = "offline-lexical" | "provider-semantic";
 
 export type HelpArticle = {
@@ -21,249 +28,13 @@ export type HelpArticle = {
 };
 
 /**
- * Small, reviewable offline corpus for the first Help Center slice.
+ * Immutable source-of-truth corpus for desktop and external consumers.
  *
- * The aliases are deliberately explicit rather than pretending to be an
- * embedding model. A later semantic-index slice can replace the scorer while
- * preserving these stable article IDs and exact-match behavior.
+ * Generated from `desktop/src/lib/help/canonical/data.ts`. The article IDs,
+ * source anchors, and search behavior of this contract are unchanged; the data
+ * is no longer maintained separately from the canonical corpus.
  */
-const HELP_ARTICLE_DATA: HelpArticle[] = [
-  {
-    id: "getting-started.sessions",
-    title: "Sessions, builds, and chats",
-    topic: "getting-started",
-    summary: "Keep coding builds and ordinary chats separate while working in parallel.",
-    body:
-      "Builds are the tool-enabled workspace for repository work. Chats are separate conversations for planning or discussion. Use the Builds and Chats tabs to switch modes, and keep multiple lanes open when you need parallel work.",
-    aliases: ["coding lane", "conversation", "parallel agents", "new build", "new chat"],
-    keywords: ["session", "build", "chat", "lane", "workspace"],
-    sources: [{ id: "product.readme", path: "README.md", heading: "Quick start" }],
-  },
-  {
-    id: "getting-started.search",
-    title: "Find an earlier run",
-    topic: "getting-started",
-    summary: "Search titles, messages, tags, and folders across your saved sessions.",
-    body:
-      "Open Search from the Lanes sidebar. Hybrid search combines exact text with meaning-based ranking when the semantic index is available; Keyword mode is authoritative for commands and identifiers. Archived sessions can be included explicitly.",
-    aliases: ["search history", "find conversation", "look up a build", "semantic search", "search old work"],
-    keywords: ["search", "archive", "hybrid", "keyword", "semantic", "session"],
-    sources: [{ id: "product.readme", path: "README.md", heading: "Features (desktop)" }],
-  },
-  {
-    id: "providers.gateway",
-    title: "Provider routes and gateway policy",
-    topic: "providers",
-    summary: "Choose an explicit provider route and see what is actually qualified.",
-    body:
-      "Provider profiles describe the selected model, gateway, and capability evidence. A configured route is not the same as a live certification, and GrokPtah does not synchronize a provider account balance. Readiness and quota observability are shown separately so evidence is not mistaken for a claim.",
-    aliases: ["company gateway", "restricted model", "weaker model", "weak model", "quota", "provider settings"],
-    keywords: ["provider", "company", "gateway", "route", "model", "quota", "certification", "readiness"],
-    sources: [{ id: "provider.profiles", path: "docs/PROVIDER_PROFILES.md", heading: "Provider profiles" }],
-  },
-  {
-    id: "providers.live-gateway-evidence",
-    title: "Live gateway evidence and quota",
-    topic: "providers",
-    summary: "Know when a run used a real company gateway and what it can prove.",
-    body:
-      "A live gateway campaign must name the fixed route, tenant, model, authorization boundary, and receipt evidence. Local scripted-provider tests validate lifecycle behavior without spending external quota; they do not certify gateway routing, quota exhaustion, latency, or model quality.",
-    aliases: ["real gateway", "live provider", "grok build quota", "quota receipt", "company review lane"],
-    keywords: ["live", "gateway", "quota", "receipt", "tenant", "authorization", "latency"],
-    sources: [
-      { id: "provider.profiles", path: "docs/PROVIDER_PROFILES.md", heading: "Qualify a model" },
-      { id: "verification.guide", path: "docs/VERIFICATION.md", heading: "Verification paths" },
-    ],
-  },
-  {
-    id: "providers.grok-build-boundary",
-    title: "Grok Build, Grok Bot, and external tools",
-    topic: "providers",
-    summary: "Keep the Grok Build route separate from Grok Bot and development-tool usage.",
-    body:
-      "GrokPtah can use an explicitly configured Grok Build route, but a real quota claim requires a named live campaign and secret-free receipts. The local always-on soak uses a loopback provider and does not contact Grok Build. Grok Bot is a separate product and is not a GrokPtah runtime dependency or manager; Claude Code, Cursor, and user-submitted Grok Build prompts are external development tools, not automatic runtime providers.",
-    aliases: ["grok build vs grok bot", "grokbot", "grok bot quota", "which grok", "external coding tools", "cursor grok"],
-    keywords: ["grok", "bot", "boundary", "cursor", "claude", "external"],
-    sources: [
-      { id: "provider.boundaries", path: "docs/PROVIDER_PRODUCT_BOUNDARIES.md", heading: "Grok Build route" },
-      { id: "provider.profiles", path: "docs/PROVIDER_PROFILES.md", heading: "Provider profiles" },
-    ],
-  },
-  {
-    id: "providers.restricted-gateway-review",
-    title: "Review code through a restricted company gateway",
-    topic: "providers",
-    summary: "Use a weaker approved model and a long-running company route without pretending it is frontier-certified.",
-    body:
-      "A company gateway can still run a bounded, read-only code review when the route, tenant, model, and authority policy are fixed. GrokPtah should preserve useful partial findings on throttles or timeouts, never silently fall back, and show whether the evidence is a configured route, a live receipt, or only a local test.",
-    aliases: ["weak gateway code review", "restricted AI policy", "long running company agent", "use the model we have", "enterprise review"],
-    keywords: ["company", "restricted", "review", "read-only", "fallback", "tenant", "authority"],
-    sources: [{ id: "provider.profiles", path: "docs/PROVIDER_PROFILES.md", heading: "Provider profiles" }],
-  },
-  {
-    id: "computer-use.boundaries",
-    title: "Computer Use: consent and boundaries",
-    topic: "computer-use",
-    summary: "Understand what Computer Use can observe or do, and what it refuses.",
-    body:
-      "Computer Use is bounded by an explicit target, fresh observation, one-use approval, and a postcondition. Stop and Take over revoke authority. Secure fields, stale observations, focus changes, raw global input, clipboard injection, shell control, and unattended actions fail closed or remain unsupported.",
-    aliases: ["computer control", "clicking", "screen access", "safe automation", "mouse and keyboard"],
-    keywords: ["computer", "consent", "observation", "approval", "stop", "takeover", "secure", "unsupported"],
-    sources: [
-      { id: "computer-use.overview", path: "docs/COMPUTER_USE.md", heading: "Safety boundary" },
-      { id: "computer-use.threat-model", path: "docs/COMPUTER_USE_THREAT_MODEL.md", heading: "Trust boundaries" },
-    ],
-  },
-  {
-    id: "computer-use.isolated-guest",
-    title: "Isolated guest Computer Use",
-    topic: "computer-use",
-    summary: "Understand the isolated guest boundary without treating source proof as a usable VM.",
-    body:
-      "An isolated guest is a planned separate visual surface for bounded Computer Use, but it is not qualified for use in this release. The helper and guest image still need review and signing, one agent lease must control a guest at a time, frames must be redacted, and host clipboard, shares, raw global input, and guest networking remain denied. Source-level lease and projection tests do not prove a packaged VM, guest boot, rendered frames, or host input.",
-    aliases: ["VM computer use", "virtual machine screen", "sandboxed desktop", "isolated visual", "guest computer", "non disruptive computer use"],
-    keywords: ["guest", "VM", "isolated", "helper", "lease", "frame", "redaction", "sandbox"],
-    sources: [{ id: "computer-use.isolated-guest", path: "docs/COMPUTER_USE_THREAT_MODEL.md", heading: "Release blockers still open" }],
-  },
-  {
-    id: "computer-use.multi-agent-coordination",
-    title: "Coordinate multiple Computer Use agents",
-    topic: "computer-use",
-    summary: "Keep simultaneous agents from fighting over the same visual surface.",
-    body:
-      "Computer Use coordination is lease-based: an agent must hold the exact guest/session authority and revision before it can act. A second agent, stale observation, wrong session, Stop, or Take over must be denied without mutation. Separate guests or explicitly disjoint scopes are required for parallel work.",
-    aliases: ["two agents one screen", "multiple agents", "agent contention", "share a computer", "coordinate computer agents", "stale visual state"],
-    keywords: ["multi-agent", "coordination", "lease", "revision", "stale", "scope", "contention"],
-    sources: [{ id: "computer-use.threat-model", path: "docs/COMPUTER_USE_THREAT_MODEL.md", heading: "Evidence matrix" }],
-  },
-  {
-    id: "operations.evidence",
-    title: "Read progress and evidence correctly",
-    topic: "operations",
-    summary: "Separate deterministic tests, live-provider evidence, hardware proof, and soak reports.",
-    body:
-      "A passing unit test proves an in-tree behavior on a named revision. It does not prove a live provider campaign, a packaged macOS identity, a multi-day operational soak, or a VM guest. Always read the exact revision, evidence kind, remaining gate, and whether the result is candidate-only.",
-    aliases: ["is this certified", "what does pass mean", "qualification", "proof", "release gate"],
-    keywords: ["evidence", "test", "hardware", "live", "soak", "certified", "qualification", "release"],
-    sources: [{ id: "verification.guide", path: "docs/VERIFICATION.md", heading: "Verification paths" }],
-  },
-  {
-    id: "operations.always-on-soak",
-    title: "Always-on operational soak",
-    topic: "operations",
-    summary: "Interpret the long-running worker campaign without confusing it with live-provider certification.",
-    body:
-      "The always-on soak runs the real local service process for a measured duration against a controlled loopback provider. It checks leases, restarts, reconnects, duplicate prevention, credential rotation, resource ceilings, cleanup, and secret-free evidence. A separate live-gateway campaign is required for external provider behavior.",
-    aliases: ["72 hour test", "multi-day soak", "persistent workers", "durable agents", "endurance run"],
-    keywords: ["soak", "always-on", "worker", "restart", "reconnect", "lease", "duplicate", "cleanup"],
-    sources: [{ id: "verification.guide", path: "docs/VERIFICATION.md", heading: "Verification paths" }],
-  },
-  {
-    id: "operations.help-assistant",
-    title: "Ask the optional Help assistant safely",
-    topic: "operations",
-    summary: "Get a cited draft answer without turning Help into an unbounded agent.",
-    body:
-      "Help search is offline-first. Meaning-based ranking and the optional assistant are separate, explicit actions: the app shows the selected provider, sends only the selected article metadata or cited context, validates article IDs and citations, and labels generated text as a draft rather than product truth. Workspace paths, transcripts, credentials, clipboard data, and actions stay out of the request.",
-    aliases: ["AI help", "ask product questions", "grounded assistant", "help chatbot", "cited answer", "safe help model"],
-    keywords: ["assistant", "help", "citation", "confirmation", "privacy", "offline", "draft"],
-    sources: [{ id: "verification.guide", path: "docs/VERIFICATION.md", heading: "Verification paths" }],
-  },
-  {
-    id: "operations.durable-recovery",
-    title: "Recover a durable run safely",
-    topic: "operations",
-    summary: "Resume from an explicit checkpoint without guessing whether a send happened.",
-    body:
-      "Durable runs expose a state, cursor, and evidence trail that survive an app restart. Reconnect from the advertised cursor, treat uncertain delivery as unknown, and use an explicit retry or continuation action. Never infer that a linked session or a visible queue means a provider request was sent.",
-    aliases: ["restart a run", "recover interrupted agent", "resume after crash", "unknown send", "checkpoint recovery"],
-    keywords: ["durable", "restart", "recover", "checkpoint", "cursor", "retry", "uncertain", "resume"],
-    sources: [{ id: "durable.runs", path: "docs/DURABLE_RUNS.md", heading: "Lifecycle" }],
-  },
-  {
-    id: "operations.prompt-queue",
-    title: "Queue and steer prompts",
-    topic: "operations",
-    summary: "Keep future prompts ordered while steering only the active run you intend.",
-    body:
-      "The prompt queue is scoped to a session and carries revisions so an out-of-order snapshot cannot overwrite a newer queue. Queue a future prompt when the current turn should finish; use steering only when the run exposes that control. A stale revision or uncertain delivery must fail closed instead of silently targeting another turn.",
-    aliases: ["prompt queue", "steer agent", "send next prompt", "queue work", "deferred steering"],
-    keywords: ["queue", "prompt", "steer", "revision", "session", "ordering", "stale"],
-    sources: [{ id: "durable.queue", path: "docs/MCP_CONTROL_COORDINATOR.md", heading: "Queue" }],
-  },
-  {
-    id: "operations.review-receipts",
-    title: "Read review receipts and changes",
-    topic: "operations",
-    summary: "Verify the exact changed files and evidence before approving a run.",
-    body:
-      "A review receipt binds the changed-file list, bounded diff, fingerprint, tests, and handoff to one run identity. Check the exact workspace and revision, inspect the redacted evidence, and keep approval separate from promotion. A green provider response without a matching receipt is not approval evidence.",
-    aliases: ["review changes", "approval receipt", "changed file list", "diff fingerprint", "approve code review"],
-    keywords: ["review", "receipt", "changed", "diff", "fingerprint", "approval", "promotion", "handoff"],
-    sources: [{ id: "review.protocol", path: "docs/MCP_CONTROL_COORDINATOR.md", heading: "Evidence-backed handoff" }],
-  },
-  {
-    id: "operations.mcp-coordination",
-    title: "Coordinate MCP tools and live events",
-    topic: "operations",
-    summary: "Use negotiated MCP tools without treating transport reachability as authority.",
-    body:
-      "MCP coordination negotiates a versioned capability set, session scope, and event cursor. The transport can report a tool, but the desktop authority still applies approvals, leases, workspace fences, and redaction. Reconnect from the advertised cursor and handle recovery notifications instead of replaying an uncertain mutation.",
-    aliases: ["MCP tools", "tool coordinator", "live events", "MCP reconnect", "capability negotiation"],
-    keywords: ["MCP", "tool", "coordinator", "capability", "cursor", "reconnect", "authority", "event"],
-    sources: [{ id: "mcp.coordinator", path: "docs/MCP_CONTROL_COORDINATOR.md", heading: "Cross-product capability discovery" }],
-  },
-  {
-    id: "providers.browser-broker",
-    title: "Embed GrokPtah in a War Room",
-    topic: "providers",
-    summary: "Give a browser observe/review powers through a broker without exposing desktop authority.",
-    body:
-      "A War Room or other browser UI uses the browser-safe broker client with an authenticated session, opaque binding and run IDs, CSRF protection, and idempotency keys. The broker owns provider credentials and re-checks user, team, workspace, capability, and run scope. Browser code must never receive a bearer token, raw path, or native Computer Use authority.",
-    aliases: ["ContextDesk integration", "War Room broker", "browser client", "embed GrokPtah", "web UI integration"],
-    keywords: ["browser", "broker", "War Room", "embed", "ContextDesk", "opaque", "CSRF", "credential"],
-    sources: [{ id: "embedding.guide", path: "docs/EMBEDDING.md", heading: "Browser / War Room example" }],
-  },
-  {
-    id: "providers.external-cloud-workers",
-    title: "Launch and monitor a cloud coding worker",
-    topic: "providers",
-    summary: "Spin up an isolated external coding agent and review its bounded evidence through the broker.",
-    body:
-      "External workers use the provider-neutral GrokPtah contract: pin the exact repository and starting ref, require isolated execution, monitor redacted status and cursor recovery, and collect only bounded relative artifacts. Cursor Cloud and future Claude Code adapters keep credentials server-side. Creating a draft PR never approves or merges changes; review receipts and the existing human promotion gate remain separate.",
-    aliases: ["cloud agent", "Cursor Cloud worker", "external coding agent", "spawn remote agent", "agent harness worker"],
-    keywords: ["cloud", "worker", "Cursor", "Claude", "external", "isolated", "artifact", "review", "promotion"],
-    sources: [
-      { id: "cursor.cloud.integration", path: "docs/CURSOR_CLOUD_INTEGRATION.md", heading: "GrokPtah architecture" },
-      { id: "embedding.external-workers", path: "docs/EMBEDDING.md", heading: "External cloud workers" },
-    ],
-  },
-  {
-    id: "computer-use.consent",
-    title: "Approve a Computer Use action",
-    topic: "computer-use",
-    summary: "Understand the one-use consent, postcondition, and takeover controls around visual actions.",
-    body:
-      "Observation and control are separate capabilities. Before a semantic action, verify the fresh target, scope, lease, and postcondition; approve only the action class you intend. Stop, Take over, focus changes, outdated visual state, secure fields, and cleanup uncertainty revoke authority or fail closed. A focused app window is not proof that an isolated target is safe.",
-    aliases: ["computer approval", "take over agent", "visual action consent", "postcondition", "semantic click safety"],
-    keywords: ["approve", "Computer", "consent", "lease", "postcondition", "takeover", "cleanup"],
-    sources: [{ id: "computer-use.overview", path: "docs/COMPUTER_USE.md", heading: "Safety boundary" }],
-  },
-];
-
-function freezeHelpArticle(article: HelpArticle): HelpArticle {
-  return Object.freeze({
-    ...article,
-    aliases: Object.freeze([...article.aliases]),
-    keywords: Object.freeze([...article.keywords]),
-    sources: Object.freeze(article.sources.map((source) => Object.freeze({ ...source }))),
-  });
-}
-
-/** Immutable source-of-truth corpus for desktop and external consumers. */
-export const HELP_ARTICLES: readonly HelpArticle[] = Object.freeze(
-  HELP_ARTICLE_DATA.map(freezeHelpArticle),
-);
+export const HELP_ARTICLES: readonly HelpArticle[] = PROJECTED_HELP_ARTICLES;
 
 export type HelpSearchResult = {
   article: HelpArticle;

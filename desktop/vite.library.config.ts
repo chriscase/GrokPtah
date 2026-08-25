@@ -8,6 +8,7 @@ export default defineConfig({
       entry: {
         "grokptah-public": resolve(process.cwd(), "src/lib/public.ts"),
         "ui-core": resolve(process.cwd(), "src/lib/uiCore.ts"),
+        "help-react": resolve(process.cwd(), "src/lib/helpPublic.ts"),
       },
       formats: ["es"],
       fileName: (_format, entryName) => `${entryName}.js`,
@@ -15,9 +16,10 @@ export default defineConfig({
     outDir: "dist/public",
     emptyOutDir: false,
     rollupOptions: {
-      // The public entry is intentionally self-contained and has no Tauri or
-      // React runtime dependency. Keep browser consumers dependency-free.
-      external: [],
+      // `grokptah-public` and `ui-core` import no React and stay
+      // self-contained; listing React here only affects the `help-react`
+      // entry, which must not bundle a second copy of the host's React.
+      external: ["react", "react-dom", "react/jsx-runtime"],
     },
   },
 });

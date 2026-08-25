@@ -10,7 +10,9 @@ describe("HelpPanel", () => {
     render(<HelpPanel open onClose={onClose} audience="operator" includeRestricted />);
     const input = screen.getByRole("textbox", { name: "Search Help Center" });
     fireEvent.change(input, { target: { value: "stale frame" } });
-    fireEvent.click(screen.getByRole("button", { name: /Use Computer Use without losing control/i }));
+    // Title comes from the consolidated article; the two former corpora
+    // titled this entry differently and the merge keeps one title.
+    fireEvent.click(screen.getByRole("button", { name: /Computer Use: consent and boundaries/i }));
     expect(screen.getByText(/Help explains behavior only/i)).toBeTruthy();
     expect(screen.getByText("Gated guidance")).toBeTruthy();
   });

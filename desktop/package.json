@@ -4,17 +4,22 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
     "build": "tsc -b && vite build",
     "build:public": "tsc -p tsconfig.lib.json && vite build --config vite.library.config.ts && node scripts/stage-public-package.mjs",
-    "verify:public": "npm run build:public && node scripts/verify-public.mjs && node scripts/run-public-consumer-smoke.mjs",
-    "typecheck": "tsc --noEmit",
+    "dev": "vite",
+    "help:build-model": "node --import ./scripts/register-ts-hook.mjs scripts/build-help-model.mjs",
+    "help:eval": "node --import ./scripts/register-ts-hook.mjs scripts/run-help-eval.mjs",
+    "help:verify": "npm run help:verify-corpus && npm run help:verify-model && npm run help:eval",
+    "help:verify-corpus": "node --import ./scripts/register-ts-hook.mjs scripts/verify-help-corpus.mjs",
+    "help:verify-model": "node --import ./scripts/register-ts-hook.mjs scripts/verify-help-model.mjs",
     "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:build": "tauri build",
+    "tauri:dev": "tauri dev",
     "test": "vitest run",
     "test:watch": "vitest",
-    "tauri": "tauri",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "typecheck": "tsc --noEmit",
+    "verify:public": "npm run build:public && node scripts/verify-public.mjs && node scripts/run-public-consumer-smoke.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",
