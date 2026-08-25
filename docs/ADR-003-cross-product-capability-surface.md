@@ -200,6 +200,10 @@ changing the authority boundary:
   broker session, accepts only opaque binding/run ids, validates binding/run
   response envelopes before exposing them to consumers, and enforces
   cursor-aware redacted SSE recovery.
+- `desktop/src/lib/uiCore.ts` is a headless, Tauri-free staging barrel for
+  capability/help search, prompt-queue reducers, and stream application
+  helpers. It contains no React components or native authority and is the
+  extraction point for the future `@grokptah/ui-core` package.
 - `docs/schemas/grokptah-run.v1.schema.json` pins the shared run, event,
   recovery, and review-receipt JSON shapes used by non-Rust consumers.
 - `docs/WEB_BROKER_PROTOCOL.md` is the concrete server-side contract for

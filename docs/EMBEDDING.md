@@ -76,6 +76,26 @@ explicit session/workspace/run identity. A desktop adapter should:
 4. Present promotion and Computer Use as separate human-visible gates.
 5. Fail closed on stale revisions, expired leases, locked hosts, and cleanup uncertainty.
 
+## Headless UI primitives
+
+Products that want their own visual language can use the Tauri-free
+`desktop/src/lib/uiCore.ts` staging barrel. It exposes capability negotiation,
+Help Center search, prompt-queue reducers, and stream application helpers, but
+no React components, native APIs, credentials, or desktop state:
+
+```ts
+import {
+  applyAssistantStreamChunk,
+  promptQueueReducer,
+  searchHelp,
+} from "./desktop/src/lib/uiCore";
+```
+
+The reducer inputs and stream cursors remain host-neutral. A consumer owns its
+rendering, focus management, transport adapter, and approval presentation.
+The barrel is intentionally a staging source for `@grokptah/ui-core`; it is
+not yet a published package or SemVer promise.
+
 ## ContextDesk integration checklist
 
 The minimum disposable integration should prove, against one exact candidate:
