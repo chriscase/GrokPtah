@@ -1233,6 +1233,13 @@ fn validate_probe_against_definition(
     {
         bail!("passing restart probe lacks recovered state or observed implicit execution");
     }
+    if definition.id == "always-on-grokbot-lifecycle-v1" && probe.status == ProbeStatus::Passed {
+        match &probe.provider_observation {
+            Some(observation)
+                if !observation.records.is_empty() && observation.accepted_posts > 0 => {}
+            _ => bail!("always-on passing probe omitted observed loopback provider records"),
+        }
+    }
     if definition.scope == ProbeScope::ProviderStructural
         && probe.status == ProbeStatus::Passed
         && probe.capture_refs.is_empty()
