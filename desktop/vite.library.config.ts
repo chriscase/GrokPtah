@@ -5,9 +5,12 @@ import { resolve } from "node:path";
 export default defineConfig({
   build: {
     lib: {
-      entry: resolve(process.cwd(), "src/lib/public.ts"),
+      entry: {
+        "grokptah-public": resolve(process.cwd(), "src/lib/public.ts"),
+        "ui-core": resolve(process.cwd(), "src/lib/uiCore.ts"),
+      },
       formats: ["es"],
-      fileName: () => "grokptah-public.js",
+      fileName: (_format, entryName) => `${entryName}.js`,
     },
     outDir: "dist/public",
     emptyOutDir: false,

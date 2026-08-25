@@ -27,10 +27,20 @@ try {
   promptQueueReducer,
   searchHelpArticles,
 } from "@grokptah/client";
+import {
+  HELP_ARTICLES as UI_CORE_HELP_ARTICLES,
+  searchHelpArticles as uiCoreSearchHelpArticles,
+} from "@grokptah/client/ui-core";
 
 if (HELP_ARTICLES.length < 1) throw new Error("consumer could not read the Help Center corpus");
+if (UI_CORE_HELP_ARTICLES.length !== HELP_ARTICLES.length) {
+  throw new Error("ui-core subpath exposed a different Help Center corpus");
+}
 if (searchHelpArticles("restricted company gateway")[0]?.article?.id !== "providers.restricted-gateway-review") {
   throw new Error("consumer Help Center ranking did not match the published contract");
+}
+if (uiCoreSearchHelpArticles("restricted company gateway")[0]?.article?.id !== "providers.restricted-gateway-review") {
+  throw new Error("ui-core consumer Help Center ranking did not match the published contract");
 }
 if (applyAssistantStreamChunk("", "consumer").text !== "consumer") {
   throw new Error("consumer stream helper did not apply a bounded update");

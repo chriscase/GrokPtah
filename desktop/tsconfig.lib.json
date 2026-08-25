@@ -8,5 +8,5 @@
     "outDir": "dist/public/types",
     "rootDir": "src/lib"
   },
-  "include": ["src/lib/public.ts"]
+  "include": ["src/lib/public.ts", "src/lib/uiCore.ts"]
 }

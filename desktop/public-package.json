@@ -8,10 +8,15 @@
     ".": {
       "types": "./types/public.d.ts",
       "import": "./grokptah-public.js"
+    },
+    "./ui-core": {
+      "types": "./types/uiCore.d.ts",
+      "import": "./ui-core.js"
     }
   },
   "files": [
     "grokptah-public.js",
+    "ui-core.js",
     "types"
   ]
 }

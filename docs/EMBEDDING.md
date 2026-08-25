@@ -95,23 +95,26 @@ import {
 
 The reducer inputs and stream cursors remain host-neutral. A consumer owns its
 rendering, focus management, transport adapter, and approval presentation.
-The barrel is intentionally a staging source for `@grokptah/ui-core`; it is
-not yet a published package or SemVer promise.
+The generated package now exposes the same headless surface as the
+`@grokptah/client/ui-core` subpath. It is still a staging artifact rather than
+a published SemVer promise, but consumers can exercise the real import path
+before publication.
 
 To produce a reviewable, Tauri-free consumer artifact from an exact checkout,
 run `npm run verify:public` in `desktop/`. This builds and verifies a bundled
-`desktop/dist/public/grokptah-public.js` plus declaration files under
-`desktop/dist/public/types/` and a package manifest for `@grokptah/client`.
+`desktop/dist/public/grokptah-public.js`, `desktop/dist/public/ui-core.js`,
+declaration files under `desktop/dist/public/types/`, and a package manifest
+for `@grokptah/client` with its `./ui-core` subpath.
 The generated artifact contains the browser-safe broker client and headless
 primitives only; it does not contain `trusted.ts`, Tauri APIs, bearer tokens,
 provider API-key markers, absolute host paths, `GROKPTAH_HOME`, or native
 Computer Use authority. The same command then installs that generated manifest
 into a disposable external-consumer fixture and imports it through normal
 `node_modules/@grokptah/client` package resolution. That fixture exercises the
-Help Center corpus, queue reducer, stream helper, and broker constructor, so a
-direct bundle import cannot masquerade as a consumer integration. The fixture
-is deleted after the check. Publication still requires the compatibility and
-release gates in the roadmap.
+Help Center corpus, queue reducer, stream helper, broker constructor, and the
+separate `@grokptah/client/ui-core` import, so a direct bundle import cannot
+masquerade as a consumer integration. The fixture is deleted after the check.
+Publication still requires the compatibility and release gates in the roadmap.
 
 ## ContextDesk integration checklist
 

@@ -208,8 +208,8 @@ changing the authority boundary:
   cursor-aware redacted SSE recovery.
 - `desktop/src/lib/uiCore.ts` is a headless, Tauri-free surface for
   capability/help search, prompt-queue reducers, and stream application
-  helpers. It contains no React components or native authority and is included
-  in the current `@grokptah/client` staging artifact; a separately versioned
+  helpers. It contains no React components or native authority and is staged
+  as the real `@grokptah/client/ui-core` subpath; a separately versioned
   `@grokptah/ui-core` package remains a release decision.
 - `docs/schemas/grokptah-run.v1.schema.json` pins the shared run, event,
   recovery, and review-receipt JSON shapes used by non-Rust consumers.
