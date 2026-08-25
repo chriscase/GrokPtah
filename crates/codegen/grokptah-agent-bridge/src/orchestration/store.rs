@@ -1792,15 +1792,22 @@ fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Res
     }
     let tmp = path.with_extension("json.tmp");
     use std::io::Write;
-    let mut file = fs::File::create(&tmp)?;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
-    file.sync_all()?;
-    fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        fs::File::open(parent)?.sync_all()?;
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(value)?)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    Ok(())
+    result
 }
 
 fn write_json_exclusive<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
@@ -2713,5 +2720,76 @@ mod tests {
             health["finalizationRecoveryPending"],
             MAX_FINALIZATION_RECOVERY_INTENTS
         );
+    }
+
+    #[test]
+    fn claim_receipt_restart_cut_never_resumes_running_work() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let (mut run, mut intent) = queued_run("claimed-cut", 1);
+        run.state = RunState::Running;
+        run.start_seq = Some(1);
+        intent.run = run.clone();
+        intent.phase = AcceptancePhase::Claimed;
+        intent.attempt_id = Some("attempt-claimed-cut".into());
+        intent.prompt = None;
+        store.save_run(&run).unwrap();
+        store.save_acceptance_intent(&intent).unwrap();
+        store
+            .save_idempotency(&IdempotencyReceipt {
+                request_id: intent.request_id.clone(),
+                payload_hash: intent.payload_hash.clone(),
+                run_id: Some(intent.run_id.clone()),
+                tool: intent.tool.clone(),
+                response: intent.response.clone(),
+                error: None,
+                created_at: Utc::now(),
+                status: "pending".into(),
+            })
+            .unwrap();
+        store
+            .claim_attempt(
+                &run.run_id,
+                "attempt-claimed-cut",
+                "owner-claimed-cut",
+                None,
+                Utc::now(),
+                StdDuration::from_secs(30),
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = OrchStore::open(d.path()).unwrap();
+        assert_eq!(
+            reopened.load_run("claimed-cut").unwrap().unwrap().state,
+            RunState::Interrupted
+        );
+        assert_eq!(
+            reopened
+                .load_idempotency(&intent.request_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "complete"
+        );
+        assert_eq!(
+            reopened.load_attempt("claimed-cut").unwrap().unwrap().phase,
+            AttemptPhase::Interrupted
+        );
+        assert!(reopened.list_acceptance_intents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn injected_finalization_failure_keeps_recovery_queue_bounded() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let candidate = terminal_run("finalization-write-failure");
+        let target = store.finalization_path(&candidate.run_id).unwrap();
+        fs::create_dir(&target).unwrap();
+        assert!(store.persist_finalization(&candidate).is_err());
+        assert_eq!(store.finalization_recovery_count(), 0);
+        assert!(!store.durability_health()["degraded"].as_bool().unwrap());
+        assert!(!target.with_extension("json.tmp").exists());
+        fs::remove_dir(&target).unwrap();
     }
 }
