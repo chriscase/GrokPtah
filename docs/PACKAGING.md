@@ -16,6 +16,24 @@ Outputs, from the exact commit checked out:
 Unsigned local builds are expected and fine; signing/notarization is a separate,
 credentialed concern and is deliberately not wired into the default build.
 
+## Browser-safe public package
+
+The Tauri-free consumer surface can be staged independently of the native app:
+
+```sh
+cd desktop
+npm ci
+npm run verify:public
+npm pack --dry-run ./dist/public
+```
+
+This emits an installable `@grokptah/client` candidate containing the browser
+broker client, headless UI primitives, and TypeScript declarations. The verifier
+also checks the consumer entry points and rejects Tauri APIs, trusted adapters,
+bearer-token code, or native Computer Use authority. Publication remains gated
+on cross-repository conformance, security, Always-On, gateway, and packaged
+Computer Use qualification.
+
 ## Verifying a produced package
 
 ```sh
