@@ -134,6 +134,37 @@ pub fn advertised_capabilities() -> CapabilitySet {
             description: "Use lease- and revision-fenced semantic Computer Use controls.".into(),
         });
     }
+    if has("ptah_list_external_workers")
+        && has("ptah_get_external_worker")
+        && has("ptah_get_external_worker_run")
+        && has("ptah_get_external_worker_events")
+        && has("ptah_list_external_worker_artifacts")
+    {
+        capabilities.push(CapabilityDescriptor {
+            id: "external.observe".into(),
+            tier: CapabilityTier::Observe,
+            mutating: false,
+            human_gate: false,
+            availability: CapabilityAvailability::Available,
+            description:
+                "Read redacted external-worker identity, status, events, and artifact listings."
+                    .into(),
+        });
+    }
+    if has("ptah_launch_external_worker")
+        && has("ptah_follow_up_external_worker")
+        && has("ptah_cancel_external_worker")
+    {
+        capabilities.push(CapabilityDescriptor {
+            id: "external.execute".into(),
+            tier: CapabilityTier::Execute,
+            mutating: true,
+            human_gate: false,
+            availability: CapabilityAvailability::Available,
+            description:
+                "Launch, follow up, and cancel isolated exact-ref external coding workers.".into(),
+        });
+    }
 
     CapabilitySet {
         contract: CAPABILITY_CONTRACT_VERSION.into(),
@@ -159,6 +190,18 @@ mod tests {
             set.get("computer.control")
                 .map(|capability| capability.human_gate),
             Some(true)
+        );
+        assert!(set.get("external.observe").is_some());
+        assert!(set.get("external.execute").is_some());
+        assert_ne!(
+            set.get("external.execute")
+                .map(|capability| capability.tier),
+            Some(CapabilityTier::ComputerControl)
+        );
+        assert_ne!(
+            set.get("external.execute")
+                .map(|capability| capability.tier),
+            Some(CapabilityTier::Promote)
         );
     }
 

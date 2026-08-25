@@ -76,6 +76,7 @@ fn seed_run(
             progress: None,
             execution: None,
             approval: None,
+            external: None,
         })
         .unwrap();
 }

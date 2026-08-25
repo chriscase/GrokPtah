@@ -8,9 +8,9 @@
 
 use async_trait::async_trait;
 use grokptah_agent_sdk::{
-    ExternalWorkerArtifact, ExternalWorkerExecutionMode, ExternalWorkerFollowUpRequest,
-    ExternalWorkerLaunchRequest, ExternalWorkerLaunchResult, ExternalWorkerProvider,
-    ExternalWorkerRecord, ExternalWorkerRunRecord, ExternalWorkerState,
+    ExternalWorkerArtifact, ExternalWorkerEvent, ExternalWorkerExecutionMode,
+    ExternalWorkerFollowUpRequest, ExternalWorkerLaunchRequest, ExternalWorkerLaunchResult,
+    ExternalWorkerProvider, ExternalWorkerRecord, ExternalWorkerRunRecord, ExternalWorkerState,
 };
 use parking_lot::RwLock;
 use reqwest::{Client, Method, StatusCode, Url};
@@ -92,6 +92,18 @@ pub trait ExternalWorkerAdapter: Send + Sync {
         external_agent_id: &str,
         external_run_id: &str,
     ) -> Result<ExternalWorkerRunRecord, ExternalWorkerAdapterError>;
+
+    /// Try to read a live event stream. `Ok(None)` means the stream is
+    /// unavailable or expired and the manager must fall back to status polling.
+    /// A missing stream is never evidence of completion.
+    async fn try_stream_events(
+        &self,
+        _external_agent_id: &str,
+        _external_run_id: &str,
+        _after_seq: u64,
+    ) -> Result<Option<Vec<ExternalWorkerEvent>>, ExternalWorkerAdapterError> {
+        Ok(None)
+    }
 }
 
 /// Process-local registry for qualified external-worker providers.
@@ -220,6 +232,7 @@ impl CursorCloudAdapter {
                 .timeout(Duration::from_secs(10))
                 .connect_timeout(Duration::from_secs(2))
                 .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
                 .build()
                 .expect("test client is valid"),
             base_url: Url::parse(base_url).expect("test server URL is valid"),
@@ -539,7 +552,7 @@ struct CursorAgent {
     status: String,
     #[serde(default)]
     repos: Vec<CursorRepo>,
-    #[serde(default)]
+    #[serde(default, rename = "autoCreatePR")]
     auto_create_pr: Option<bool>,
     #[serde(default)]
     work_on_current_branch: Option<bool>,
@@ -606,11 +619,11 @@ struct CursorArtifact {
 }
 
 fn github_repository_url(repository: &str) -> Result<String, ExternalWorkerAdapterError> {
-    if repository.starts_with("https://github.com/") {
+    if let Some(rest) = repository.strip_prefix("https://github.com/") {
         if repository.contains('?')
             || repository.contains('#')
             || repository.ends_with('/')
-            || repository[19..].split('/').count() != 2
+            || rest.split('/').count() != 2
         {
             return Err(ExternalWorkerAdapterError::InvalidRequest(
                 "repository must identify exactly one GitHub repository",
@@ -739,13 +752,17 @@ fn run_record(
     Ok(run)
 }
 
+pub(crate) fn redact_external_detail(value: &str) -> Option<String> {
+    safe_terminal_result(value)
+}
+
 fn safe_terminal_result(value: &str) -> Option<String> {
     if value.contains('\0') {
         return None;
     }
     // Preserve readable multi-line final replies without allowing control
     // characters to cross the browser projection.
-    let value = value.replace('\r', " ").replace('\n', " ");
+    let value = value.replace(['\r', '\n'], " ");
     let lower = value.to_ascii_lowercase();
     if value.trim().is_empty()
         || value.len() > 4_096
@@ -923,14 +940,18 @@ mod tests {
     #[test]
     fn live_adapter_requires_safe_base_and_explicit_allowlist() {
         assert!(CursorCloudAdapter::with_base_url("https://127.0.0.1", "key").is_err());
-        assert!(CursorCloudAdapter::with_base_url("https://api.cursor.com", "key")
-            .unwrap()
-            .with_repository_allowlist(["chriscase/GrokPtah"])
-            .is_ok());
-        assert!(CursorCloudAdapter::with_base_url("https://api.cursor.com", "key")
-            .unwrap()
-            .with_repository_allowlist(std::iter::empty::<&str>())
-            .is_err());
+        assert!(
+            CursorCloudAdapter::with_base_url("https://api.cursor.com", "key")
+                .unwrap()
+                .with_repository_allowlist(["chriscase/GrokPtah"])
+                .is_ok()
+        );
+        assert!(
+            CursorCloudAdapter::with_base_url("https://api.cursor.com", "key")
+                .unwrap()
+                .with_repository_allowlist(std::iter::empty::<&str>())
+                .is_err()
+        );
     }
 
     #[test]
@@ -987,10 +1008,25 @@ mod tests {
         assert_eq!(safe_terminal_result("wrote /Users/alice/project"), None);
         assert_eq!(safe_terminal_result("Authorization: Bearer token"), None);
         assert_eq!(safe_terminal_result("password=secret"), None);
-        assert_eq!(safe_terminal_result("wrote C:\\Users\\alice\\project"), None);
+        assert_eq!(
+            safe_terminal_result("wrote C:\\Users\\alice\\project"),
+            None
+        );
+    }
+
+    #[test]
+    fn fake_agent_projection_proves_isolated_write_safety() {
+        let agent: CursorAgent = serde_json::from_value(fake_agent()).unwrap();
+        assert_eq!(agent.auto_create_pr, Some(false));
+        assert_eq!(agent.work_on_current_branch, Some(false));
+        assert_eq!(
+            agent.env.as_ref().map(|env| env.kind.as_str()),
+            Some("cloud")
+        );
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn fake_cursor_api_covers_launch_poll_artifacts_and_terminal_cancel() {
         let state = FakeCursorState::default();
         let app = Router::new()

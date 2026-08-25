@@ -1,6 +1,10 @@
 //! Shared orchestration types for #196.
 
 use chrono::{DateTime, Utc};
+use grokptah_agent_sdk::{
+    ExternalWorkerArtifact, ExternalWorkerEvent, ExternalWorkerProvider, ExternalWorkerRecord,
+    ExternalWorkerRunRecord,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -373,6 +377,61 @@ pub struct RunRecord {
     /// Optional persisted approval for an exact isolated-run review.
     #[serde(default)]
     pub approval: Option<RunApproval>,
+    /// Optional linkage to a provider-managed external worker run.
+    #[serde(default)]
+    pub external: Option<ExternalRunAttachment>,
+}
+
+/// Durable attachment from a local orchestration run to an external worker.
+///
+/// This is a share-safe identity fence: provider credentials and raw tool
+/// output are intentionally absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalRunAttachment {
+    pub provider: ExternalWorkerProvider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    pub external_agent_id: String,
+    pub external_run_id: String,
+    pub request_id: String,
+    pub repository: String,
+    pub starting_ref: String,
+}
+
+/// Host-owned durable worker identity attached to a session/workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DurableExternalWorker {
+    pub worker: ExternalWorkerRecord,
+    pub session_id: Uuid,
+    pub workspace: String,
+    pub local_run_id: String,
+    pub launch_request_id: String,
+    pub version: u64,
+}
+
+/// Host-owned durable run identity, redacted events, and artifact listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DurableExternalRun {
+    pub run: ExternalWorkerRunRecord,
+    pub session_id: Uuid,
+    pub workspace: String,
+    pub local_run_id: String,
+    pub request_id: String,
+    pub provider: ExternalWorkerProvider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    pub repository: String,
+    pub starting_ref: String,
+    pub version: u64,
+    #[serde(default)]
+    pub stream_expired: bool,
+    #[serde(default)]
+    pub events: Vec<ExternalWorkerEvent>,
+    #[serde(default)]
+    pub artifacts: Vec<ExternalWorkerArtifact>,
 }
 
 pub const MAX_AGENT_CONTEXT_BYTES: usize = 16 * 1024;
@@ -789,6 +848,14 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_pause_computer_run",
     "ptah_take_over_computer_run",
     "ptah_cancel_computer_run",
+    "ptah_launch_external_worker",
+    "ptah_list_external_workers",
+    "ptah_get_external_worker",
+    "ptah_get_external_worker_run",
+    "ptah_get_external_worker_events",
+    "ptah_follow_up_external_worker",
+    "ptah_list_external_worker_artifacts",
+    "ptah_cancel_external_worker",
     "ptah_submit_task",
     "ptah_resume_persistent_agent",
     "ptah_retry_run",

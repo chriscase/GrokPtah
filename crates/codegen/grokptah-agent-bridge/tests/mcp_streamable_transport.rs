@@ -1228,6 +1228,7 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
             progress: None,
             execution: None,
             approval: None,
+            external: None,
         })
         .unwrap();
 

@@ -18,6 +18,11 @@ use crate::session::{SessionKind, WorkspaceStatus};
 use super::authz::{canonical_workspace, require_workspace_match, AuthContext, WorkspaceAllowlist};
 use super::store::{IdempotencyClaim, OrchStore};
 use super::types::*;
+use crate::external_worker::ExternalWorkerRegistry;
+
+#[path = "external.rs"]
+mod external;
+pub use external::external_worker_registry_from_env;
 
 /// Admission is deliberately bounded so an untrusted coordinator cannot turn
 /// queued submissions into an unbounded in-memory prompt store.
@@ -64,6 +69,8 @@ pub struct OrchestrationService {
     scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Explicitly installed provider adapters. Empty until host setup.
+    external_workers: Mutex<Arc<ExternalWorkerRegistry>>,
 }
 
 /// Authorized bounds for a live run event stream.
@@ -203,6 +210,7 @@ impl OrchestrationService {
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
             scheduler_watcher: Mutex::new(None),
             join_handles: Mutex::new(Vec::new()),
+            external_workers: Mutex::new(Arc::new(ExternalWorkerRegistry::new())),
         });
         service.start_scheduler_watcher();
         service
@@ -717,6 +725,7 @@ impl OrchestrationService {
     /// Resume one verified persistent agent through the service adapter. The
     /// host owns the idempotency receipt and checkpoint validation; this layer
     /// adds workspace/session authorization and transport bounds.
+    #[allow(clippy::too_many_arguments)]
     pub async fn resume_persistent_agent(
         &self,
         _auth: &AuthContext,
@@ -2261,6 +2270,15 @@ impl OrchestrationService {
             Ok(run) => run,
             Err(error) => return Err(fail(self, error)),
         };
+        if run.external.is_some() {
+            return Err(fail(
+                self,
+                OrchError::new(
+                    OrchErrorCode::ForbiddenScope,
+                    "external worker review and promotion require the isolated-run approval gate",
+                ),
+            ));
+        }
         let mut lease = match self
             .begin_idempotency(
                 tool,
@@ -2390,6 +2408,12 @@ impl OrchestrationService {
         });
         let phash = hash_payload(&payload);
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        if run.external.is_some() {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "external worker review and promotion require the isolated-run approval gate",
+            ));
+        }
         let mut lease = match self
             .begin_idempotency(
                 tool,
@@ -2683,6 +2707,7 @@ impl OrchestrationService {
             progress: None,
             execution: None,
             approval: None,
+            external: None,
         };
         if let Err(e) = self.store.save_run(&run) {
             if !queued {

@@ -93,6 +93,13 @@ export type ExternalWorkerLaunchResult = {
   run: ExternalWorkerRunRecord;
 };
 
+export type ExternalWorkerEventPage = {
+  events: ExternalWorkerEvent[];
+  lastSeq: number;
+  pollRoute: string;
+  nextCursor?: number;
+};
+
 export type ExternalWorkerNotification =
   | { type: "event"; event: ExternalWorkerEvent }
   | { type: "recovery"; afterSeq: number; reason: string; pollRoute: string };
@@ -290,6 +297,27 @@ export function parseExternalWorkerLaunchResult(value: unknown): ExternalWorkerL
   const run = parseExternalWorkerRunRecord(value.run);
   if (!worker || !run || worker.externalAgentId !== run.externalAgentId) return null;
   return { worker, run };
+}
+
+/** Parse a bounded redacted event page used for status reconnect. */
+export function parseExternalWorkerEventPage(value: unknown): ExternalWorkerEventPage | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(["events", "lastSeq", "pollRoute", "nextCursor"]))) {
+    return null;
+  }
+  if (!Array.isArray(value.events) || value.events.length > MAX_EVENTS) return null;
+  const events = value.events.map(parseExternalWorkerEvent);
+  if (events.some((event) => event === null)) return null;
+  if (!Number.isInteger(value.lastSeq) || (value.lastSeq as number) < 0) return null;
+  if (!sameOriginRoute(value.pollRoute)) return null;
+  if (value.nextCursor !== undefined && (!Number.isInteger(value.nextCursor) || (value.nextCursor as number) < 0)) {
+    return null;
+  }
+  return {
+    events: events as ExternalWorkerEvent[],
+    lastSeq: value.lastSeq as number,
+    pollRoute: value.pollRoute,
+    ...(value.nextCursor === undefined ? {} : { nextCursor: value.nextCursor as number }),
+  };
 }
 
 /** Parse a redacted event without exposing provider tool output. */

@@ -684,6 +684,14 @@ fn capability_for_tool(tool: &str) -> Option<&'static str> {
         | "ptah_pause_computer_run"
         | "ptah_take_over_computer_run"
         | "ptah_cancel_computer_run" => "computer.control",
+        "ptah_list_external_workers"
+        | "ptah_get_external_worker"
+        | "ptah_get_external_worker_run"
+        | "ptah_get_external_worker_events"
+        | "ptah_list_external_worker_artifacts" => "external.observe",
+        "ptah_launch_external_worker"
+        | "ptah_follow_up_external_worker"
+        | "ptah_cancel_external_worker" => "external.execute",
         _ => return None,
     })
 }

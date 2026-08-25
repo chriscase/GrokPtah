@@ -90,6 +90,26 @@ describe("GrokPtahBrokerClient", () => {
     expect(fetcher.mock.calls[0][1]?.headers).not.toHaveProperty("Authorization");
   });
 
+  it("reads redacted external-worker events without a bearer token", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
+      events: [{ seq: 1, ts: "2026-08-24T00:00:00Z", kind: "run.launched", detail: "external worker launched" }],
+      lastSeq: 1,
+      pollRoute: "/external-workers/agent-1/runs/run-1",
+      nextCursor: 1,
+    }));
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    const page = await client.getExternalWorkerEvents("binding-1", "agent-1", "run-1");
+    expect(page.lastSeq).toBe(1);
+    expect(String(fetcher.mock.calls[0][0])).toBe(
+      "https://contextdesk.example/api/grokptah/v1/bindings/binding-1/external-workers/agent-1/runs/run-1/events",
+    );
+    expect(fetcher.mock.calls[0][1]?.headers).not.toHaveProperty("Authorization");
+  });
+
   it("fails closed when a typed binding or run envelope is malformed", async () => {
     expect(parseBrokerBinding({
       bindingId: "binding-1",

@@ -8,12 +8,14 @@
 
 import {
   parseExternalWorkerArtifact,
+  parseExternalWorkerEventPage,
   parseExternalWorkerFollowUpRequest,
   parseExternalWorkerLaunchRequest,
   parseExternalWorkerLaunchResult,
   parseExternalWorkerRecord,
   parseExternalWorkerRunRecord,
   type ExternalWorkerArtifact,
+  type ExternalWorkerEventPage,
   type ExternalWorkerFollowUpRequest,
   type ExternalWorkerLaunchRequest,
   type ExternalWorkerLaunchResult,
@@ -663,6 +665,21 @@ export class GrokPtahBrokerClient {
       throw new GrokPtahBrokerError(0, "invalid_response", "External worker artifacts response is invalid");
     }
     return artifacts as ExternalWorkerArtifact[];
+  }
+
+  /** Read redacted external-worker events with cursor recovery. */
+  async getExternalWorkerEvents(
+    bindingId: string,
+    externalAgentId: string,
+    externalRunId: string,
+    afterSeq = 0,
+  ): Promise<ExternalWorkerEventPage> {
+    const suffix = afterSeq > 0 ? `?afterSeq=${afterSeq}` : "";
+    return this.requestValidated(
+      `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/runs/${segment(externalRunId)}/events${suffix}`,
+      parseExternalWorkerEventPage,
+      {},
+    );
   }
 
   /** Cancel an external worker run; cancellation remains terminal. */
