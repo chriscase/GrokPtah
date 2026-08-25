@@ -80,7 +80,8 @@ pub use isolated_visual_helper::{
 };
 pub use isolated_visual_helper_control::IsolatedVisualHelperControl;
 pub use isolated_visual_helper_control::{
-    read_isolated_visual_challenge, ISOLATED_VISUAL_CHALLENGE_BYTES,
+    read_isolated_visual_challenge, read_isolated_visual_challenge_with_timeout,
+    ISOLATED_VISUAL_CHALLENGE_BYTES,
 };
 pub use isolated_visual_input::{
     IsolatedVisualInputGate, IsolatedVisualInputKeyState, IsolatedVisualInputMessage,
@@ -103,7 +104,7 @@ pub use isolated_visual_stream::{
     ISOLATED_VISUAL_STREAM_MAX_FRAME_PACKET_BYTES,
 };
 #[cfg(target_os = "macos")]
-pub(crate) use macos_isolated_runtime::IsolatedVisualPackagedRuntime;
+pub use macos_isolated_runtime::IsolatedVisualPackagedRuntime;
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
     computer_isolated_visual_status, ComputerBackgroundSafetyReceipt,
@@ -133,7 +134,7 @@ pub fn canonical_workspace_string(path: &std::path::Path) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 mod macos_native;
-pub use service::ComputerUseService;
+pub use service::{ComputerAgentActionProposal, ComputerUseService};
 pub use simulator::SimulatorBackend;
 pub use store::ComputerStore;
 pub(crate) use types::ResolvedAgentComputerRunAdmission;

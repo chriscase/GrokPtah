@@ -125,7 +125,9 @@ impl ServiceConfig {
                 .map_err(|error| anyhow::anyhow!(error.message))?]
         };
         if let Ok(value) = env::var("GROKPTAH_SERVICE_CLIENTS") {
-            client_credentials.extend(parse_client_credentials(&value)?);
+            for credential in parse_client_credentials(&value)? {
+                install_client_credential(&mut client_credentials, credential);
+            }
         }
         let agent_owner_id = env::var("GROKPTAH_SERVICE_AGENT_OWNER")
             .unwrap_or_else(|_| "primary".into())
@@ -266,11 +268,12 @@ where
                     config.client_credentials.push(primary);
                 }
             }
-            "--client" => config
-                .client_credentials
-                .push(parse_client_credential(&next_value(
-                    &mut iter, "--client",
-                )?)?),
+            "--client" => {
+                install_client_credential(
+                    &mut config.client_credentials,
+                    parse_client_credential(&next_value(&mut iter, "--client")?)?,
+                );
+            }
             "--workspace" => {
                 if !explicit_workspaces {
                     config.workspaces.clear();
@@ -378,8 +381,25 @@ fn parse_client_credentials(value: &str) -> Result<Vec<AuthCredential>> {
         .collect()
 }
 
+/// `GROKPTAH_SERVICE_TOKEN` always synthesizes coordinator `primary`. Named
+/// `operator:primary=` / `observer:primary=` entries replace that credential
+/// instead of duplicating it, so process tests and owned labs can install
+/// Always-On `ManagedConfigure` without changing the product default.
+fn install_client_credential(credentials: &mut Vec<AuthCredential>, credential: AuthCredential) {
+    if credential.id == "primary" {
+        if let Some(existing) = credentials
+            .iter_mut()
+            .find(|existing| existing.id == "primary")
+        {
+            *existing = credential;
+            return;
+        }
+    }
+    credentials.push(credential);
+}
+
 pub fn help_text() -> &'static str {
-    "GrokPtah headless service\n\nUsage: grokptah-service [options]\n\nOptions:\n  --listen ADDR                         Bind address (default 127.0.0.1:39200)\n  --token TOKEN                         Coordinator bearer (or GROKPTAH_SERVICE_TOKEN)\n  --workspace PATH                      Allowlisted workspace; repeatable\n  --client [ROLE:]ID[/AGENT]=TOKEN      Named coordinator/operator/observer/worker credential\n  --allow-remote                        Permit non-loopback bind; health requires auth\n  --max-concurrent N                    Concurrent request/run ceiling (default 4)\n  --request-timeout-ms N                Request deadline (default 120000)\n  -h, --help                            Show this help\n      --version                         Show the service version\n\nGROKPTAH_SERVICE_CLIENTS accepts comma-separated [ROLE:]ID[/AGENT]=TOKEN entries.\nThe default role is coordinator. Worker credentials require worker:ID/AGENT=TOKEN and are scoped to the configured workspaces.\nLocal-operator authority is never bearer-selectable.\nGROKPTAH_SERVICE_AGENT_OWNER names the durable Agent owner account.\nSet GROKPTAH_HOME to choose the durable service data directory."
+    "GrokPtah headless service\n\nUsage: grokptah-service [options]\n\nOptions:\n  --listen ADDR                         Bind address (default 127.0.0.1:39200)\n  --token TOKEN                         Coordinator bearer (or GROKPTAH_SERVICE_TOKEN)\n  --workspace PATH                      Allowlisted workspace; repeatable\n  --client [ROLE:]ID[/AGENT]=TOKEN      Named coordinator/operator/observer/worker credential\n  --allow-remote                        Permit non-loopback bind; health requires auth\n  --max-concurrent N                    Concurrent request/run ceiling (default 4)\n  --request-timeout-ms N                Request deadline (default 120000)\n  -h, --help                            Show this help\n      --version                         Show the service version\n\nGROKPTAH_SERVICE_CLIENTS accepts comma-separated [ROLE:]ID[/AGENT]=TOKEN entries.\nThe default role is coordinator. Worker credentials require worker:ID/AGENT=TOKEN and are scoped to the configured workspaces.\noperator:primary=TOKEN matching GROKPTAH_SERVICE_TOKEN replaces the synthesized coordinator primary; it does not duplicate it.\nLocal-operator authority is never bearer-selectable.\nGROKPTAH_SERVICE_AGENT_OWNER names the durable Agent owner account.\nSet GROKPTAH_HOME to choose the durable service data directory."
 }
 
 pub struct ServiceHandle {
@@ -557,6 +577,12 @@ mod tests {
             .iter()
             .any(|credential| credential.id == "dashboard"
                 && credential.role() == AuthorityRole::Observer));
+        let primary = config
+            .client_credentials
+            .iter()
+            .find(|credential| credential.id == "primary")
+            .expect("primary credential");
+        assert_eq!(primary.role(), AuthorityRole::RemoteCoordinator);
 
         let mut duplicate = config;
         duplicate
@@ -596,6 +622,70 @@ mod tests {
         assert!(parse_client_credential("worker:missing-agent=token").is_err());
         assert!(parse_client_credential("worker:id/agent/extra=token").is_err());
         assert!(parse_client_credential("coordinator:id/agent=token").is_err());
+    }
+
+    #[test]
+    fn named_operator_primary_replaces_synthesized_coordinator_without_duplicating() {
+        let action = parse_args([
+            "--listen",
+            "127.0.0.1:0",
+            "--token",
+            "primary-token",
+            "--workspace",
+            "/tmp/project",
+            "--client",
+            "operator:primary=primary-token",
+        ])
+        .unwrap();
+        let StartupAction::Run(config) = action else {
+            panic!("expected run action");
+        };
+        let primaries = config
+            .client_credentials
+            .iter()
+            .filter(|credential| credential.id == "primary")
+            .collect::<Vec<_>>();
+        assert_eq!(primaries.len(), 1);
+        assert_eq!(primaries[0].role(), AuthorityRole::RemoteOperator);
+        assert_eq!(primaries[0].token(), "primary-token");
+        assert_eq!(config.token, "primary-token");
+    }
+
+    #[test]
+    fn token_only_primary_stays_remote_coordinator() {
+        let action = parse_args([
+            "--listen",
+            "127.0.0.1:0",
+            "--token",
+            "primary-token",
+            "--workspace",
+            "/tmp/project",
+        ])
+        .unwrap();
+        let StartupAction::Run(config) = action else {
+            panic!("expected run action");
+        };
+        let primary = config
+            .client_credentials
+            .iter()
+            .find(|credential| credential.id == "primary")
+            .expect("primary credential");
+        assert_eq!(primary.role(), AuthorityRole::RemoteCoordinator);
+    }
+
+    #[test]
+    fn operator_primary_with_mismatched_token_fails_closed() {
+        assert!(parse_args([
+            "--listen",
+            "127.0.0.1:0",
+            "--token",
+            "primary-token",
+            "--workspace",
+            "/tmp/project",
+            "--client",
+            "operator:primary=other-token",
+        ])
+        .is_err());
     }
 
     #[test]

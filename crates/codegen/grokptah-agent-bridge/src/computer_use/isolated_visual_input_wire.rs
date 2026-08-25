@@ -240,7 +240,17 @@ impl IsolatedVisualInputWire {
             )
         })?;
         let text = encoded[cursor..payload_end].to_vec();
-        let message = WireFields::to_message(kind, state, code, x, y, delta_x, delta_y, text)?;
+        let message = WireFields {
+            kind,
+            state,
+            code,
+            x,
+            y,
+            delta_x,
+            delta_y,
+            text,
+        }
+        .to_message()?;
         Ok(DecodedInput {
             frame_sequence,
             input_sequence,
@@ -360,16 +370,17 @@ impl WireFields {
         Ok(fields)
     }
 
-    fn to_message(
-        kind: u8,
-        state: u8,
-        code: u16,
-        x: u32,
-        y: u32,
-        delta_x: i32,
-        delta_y: i32,
-        text: Vec<u8>,
-    ) -> ComputerResult<IsolatedVisualInputMessage> {
+    fn to_message(self) -> ComputerResult<IsolatedVisualInputMessage> {
+        let Self {
+            kind,
+            state,
+            code,
+            x,
+            y,
+            delta_x,
+            delta_y,
+            text,
+        } = self;
         let message = match kind {
             1 if state == 0 && code == 0 && delta_x == 0 && delta_y == 0 && text.is_empty() => {
                 IsolatedVisualInputMessage::PointerMove { x, y }

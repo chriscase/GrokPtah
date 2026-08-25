@@ -2168,6 +2168,16 @@ pub struct ComputerRun {
     pub work_attempt: Option<ComputerWorkAttemptBinding>,
 }
 
+pub(crate) struct SurfaceAuditInput<'a> {
+    pub surface_event: ComputerSurfaceEvent,
+    pub operation: &'a str,
+    pub disposition: &'a str,
+    pub action_class: Option<ActionClass>,
+    pub observation_id: Option<String>,
+    pub error_code: Option<ComputerErrorCode>,
+    pub attention: Option<ComputerAttentionPoint>,
+}
+
 impl ComputerRun {
     pub fn new(
         owner_session_id: Uuid,
@@ -2321,27 +2331,18 @@ impl ComputerRun {
         observation_id: Option<String>,
         error_code: Option<ComputerErrorCode>,
     ) {
-        self.record_surface_audit(
-            ComputerSurfaceEvent::classify(operation, disposition, error_code),
+        self.record_surface_audit(SurfaceAuditInput {
+            surface_event: ComputerSurfaceEvent::classify(operation, disposition, error_code),
             operation,
             disposition,
             action_class,
             observation_id,
             error_code,
-            None,
-        );
+            attention: None,
+        });
     }
 
-    pub(crate) fn record_surface_audit(
-        &mut self,
-        surface_event: ComputerSurfaceEvent,
-        operation: &str,
-        disposition: &str,
-        action_class: Option<ActionClass>,
-        observation_id: Option<String>,
-        error_code: Option<ComputerErrorCode>,
-        attention: Option<ComputerAttentionPoint>,
-    ) {
+    pub(crate) fn record_surface_audit(&mut self, input: SurfaceAuditInput<'_>) {
         const MAX_AUDIT_ENTRIES: usize = 1_024;
         if self.audit.len() == MAX_AUDIT_ENTRIES {
             self.audit.remove(0);
@@ -2349,15 +2350,16 @@ impl ComputerRun {
         self.audit.push(ComputerAuditEntry {
             sequence: self.audit.last().map_or(1, |entry| entry.sequence + 1),
             at: Utc::now(),
-            surface_event,
-            attention,
-            operation: crate::textutil::truncate_at_char_boundary(operation, 64).to_string(),
-            disposition: crate::textutil::truncate_at_char_boundary(disposition, 64).to_string(),
-            action_class,
-            observation_id: observation_id.map(|value| {
+            surface_event: input.surface_event,
+            attention: input.attention,
+            operation: crate::textutil::truncate_at_char_boundary(input.operation, 64).to_string(),
+            disposition: crate::textutil::truncate_at_char_boundary(input.disposition, 64)
+                .to_string(),
+            action_class: input.action_class,
+            observation_id: input.observation_id.map(|value| {
                 crate::textutil::truncate_at_char_boundary(&value, MAX_ID_BYTES).to_string()
             }),
-            error_code,
+            error_code: input.error_code,
         });
     }
 

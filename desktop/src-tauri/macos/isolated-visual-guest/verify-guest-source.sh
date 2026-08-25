@@ -90,6 +90,7 @@ if [ "$(uname -s)" = Linux ]; then
 fi
 
 for required in \
+  'CONFIG_BLK_DEV_INITRD=y' \
   'CONFIG_INITRAMFS_SOURCE="grokptah-initramfs.cpio"' \
   'CONFIG_VSOCKETS=y' \
   'CONFIG_VIRTIO_VSOCKETS=y' \

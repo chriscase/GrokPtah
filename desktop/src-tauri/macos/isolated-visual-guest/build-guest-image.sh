@@ -138,6 +138,7 @@ require_config() {
     exit 65
   }
 }
+require_config CONFIG_BLK_DEV_INITRD=y
 require_config 'CONFIG_INITRAMFS_SOURCE="grokptah-initramfs.cpio"'
 require_config CONFIG_VSOCKETS=y
 require_config CONFIG_VIRTIO_VSOCKETS=y

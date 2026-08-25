@@ -2122,12 +2122,13 @@ mod tests {
             BTreeSet::from([crate::computer_use::ActionClass::TextEntry])
         );
         assert_eq!(source.text_value.lock().as_str(), "public-demo-value");
-        let requests = source.action_requests.lock();
-        assert_eq!(requests.len(), 2);
-        assert!(requests.iter().all(|request| {
-            request.execution_mode == MacSemanticExecutionMode::MeasuredBackground
-        }));
-        drop(requests);
+        {
+            let requests = source.action_requests.lock();
+            assert_eq!(requests.len(), 2);
+            assert!(requests.iter().all(|request| {
+                request.execution_mode == MacSemanticExecutionMode::MeasuredBackground
+            }));
+        }
 
         let directory = tempfile::tempdir().unwrap();
         let service = platform

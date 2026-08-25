@@ -42,6 +42,7 @@ const AMBIENT_CREDENTIAL_ENV: &[&str] = &[
     "XAI_API_BASE",
     "GROKPTAH_TOKEN_COMMAND",
     "GROKPTAH_AGENT_OFFLINE",
+    "GROKPTAH_SERVICE_CLIENTS",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
 ];
@@ -869,6 +870,10 @@ fn spawn_service(
     let mut child = command
         .env("GROKPTAH_HOME", home)
         .env("GROKPTAH_SERVICE_TOKEN", TOKEN)
+        .env(
+            "GROKPTAH_SERVICE_CLIENTS",
+            format!("operator:primary={TOKEN}"),
+        )
         .env("GROKPTAH_SERVICE_LISTEN", "127.0.0.1:0")
         .env("GROKPTAH_SERVICE_WORKSPACES", workspace)
         .env("GROKPTAH_SERVICE_MAX_CONCURRENT", "4")

@@ -1398,11 +1398,13 @@ fn spawn_service(
     for key in AMBIENT_CREDENTIAL_ENV {
         command.env_remove(key);
     }
-    if client_specs.is_empty() {
-        command.env_remove("GROKPTAH_SERVICE_CLIENTS");
-    } else {
-        command.env("GROKPTAH_SERVICE_CLIENTS", client_specs.join(","));
-    }
+    // TOKEN-only synthesis is coordinator and cannot list
+    // `ptah_set_managed_execution`. Named `operator:primary=` replaces that
+    // credential; extra specs stay workers and must not include primary.
+    command.env(
+        "GROKPTAH_SERVICE_CLIENTS",
+        always_on_operator_client_specs(client_specs).join(","),
+    );
     let mut child = command
         .env("GROKPTAH_HOME", home)
         .env("GROKPTAH_SERVICE_TOKEN", TOKEN)
@@ -1433,6 +1435,27 @@ fn spawn_service(
         });
     }
     child
+}
+
+fn always_on_operator_client_specs(client_specs: &[String]) -> Vec<String> {
+    let mut specs = Vec::with_capacity(client_specs.len() + 1);
+    specs.push(format!("operator:primary={TOKEN}"));
+    for spec in client_specs {
+        assert!(
+            !spec.contains(":primary="),
+            "Always-On extra client specs must not replace operator primary: {spec}"
+        );
+        specs.push(spec.clone());
+    }
+    specs
+}
+
+#[test]
+fn always_on_operator_client_specs_keep_workers_off_primary() {
+    let specs = always_on_operator_client_specs(&["worker:w1/agent-1=worker-token-1".to_string()]);
+    assert_eq!(specs[0], format!("operator:primary={TOKEN}"));
+    assert_eq!(specs[1], "worker:w1/agent-1=worker-token-1");
+    assert_eq!(specs.len(), 2);
 }
 
 fn endpoint_dead(addr: &str) -> bool {

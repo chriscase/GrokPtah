@@ -166,18 +166,21 @@ pub use completion::{
     CompletionUsage,
 };
 pub use computer_agent::{ComputerAgentEligibility, ComputerAgentProposal};
+#[cfg(target_os = "macos")]
+pub use computer_use::IsolatedVisualPackagedRuntime;
 pub use computer_use::{
     canonical_workspace_string, computer_isolated_visual_status,
     macos_background_safe_capability_proof, macos_native_capability_proof,
     macos_native_physical_input_domain, measure_open_isolated_visual_artifact,
     measure_open_isolated_visual_artifacts, measure_packaged_isolated_visual_artifacts,
-    project_run_at, read_isolated_visual_challenge, ActionClass, ActionGrant, ActionGrantSummary,
-    ActionOutcome, ActionOutcomeSummary, AgentComputerRunRequest, ComputerAction,
-    ComputerAttentionPoint, ComputerAttentionTarget, ComputerAuditEntry, ComputerAuthorityToken,
-    ComputerBackend, ComputerBackendPublicView, ComputerBackgroundSafetyReceipt,
-    ComputerCapabilities, ComputerCapabilityProof, ComputerCapabilityTier,
-    ComputerControlDisposition, ComputerEmergencyControlToken, ComputerError, ComputerErrorCode,
-    ComputerErrorSummary, ComputerIsolatedVisualBlocker, ComputerIsolatedVisualStatus, ComputerKey,
+    project_run_at, read_isolated_visual_challenge, read_isolated_visual_challenge_with_timeout,
+    ActionClass, ActionGrant, ActionGrantSummary, ActionOutcome, ActionOutcomeSummary,
+    AgentComputerRunRequest, ComputerAction, ComputerAgentActionProposal, ComputerAttentionPoint,
+    ComputerAttentionTarget, ComputerAuditEntry, ComputerAuthorityToken, ComputerBackend,
+    ComputerBackendPublicView, ComputerBackgroundSafetyReceipt, ComputerCapabilities,
+    ComputerCapabilityProof, ComputerCapabilityTier, ComputerControlDisposition,
+    ComputerEmergencyControlToken, ComputerError, ComputerErrorCode, ComputerErrorSummary,
+    ComputerIsolatedVisualBlocker, ComputerIsolatedVisualStatus, ComputerKey,
     ComputerLocalApproval, ComputerLocalAuditEntry, ComputerLocalElement, ComputerLocalError,
     ComputerLocalGrant, ComputerLocalLimits, ComputerLocalObservation, ComputerLocalTarget,
     ComputerObservation, ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,

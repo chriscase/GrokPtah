@@ -226,8 +226,28 @@ impl IsolatedVisualRuntimeSession {
         self.lifecycle.complete_cleanup(evidence)
     }
 
+    /// Completes cleanup from host-observed process/handle/overlay/cache facts.
+    /// Evidence construction stays crate-private so a coordinator cannot
+    /// manufacture terminal authority from serialized booleans.
+    pub fn complete_observed_cleanup(
+        &mut self,
+        helper_process_absent: bool,
+        no_open_handles: bool,
+        overlay_removed: bool,
+        frame_cache_removed: bool,
+    ) -> ComputerResult<()> {
+        let evidence = IsolatedVisualCleanupEvidence::verified(
+            self.lifecycle.contract().surface.clone(),
+            helper_process_absent,
+            no_open_handles,
+            overlay_removed,
+            frame_cache_removed,
+        )?;
+        self.complete_cleanup(&evidence)
+    }
+
     /// Records helper/runtime failure without skipping cleanup evidence.
-    pub(crate) fn fail(&mut self) -> ComputerResult<()> {
+    pub fn fail(&mut self) -> ComputerResult<()> {
         self.input_gate.poison();
         self.lifecycle.fail()
     }
