@@ -478,3 +478,66 @@ fn every_contract_object_is_closed_in_the_schema() {
         }
     }
 }
+
+// ------------------------------------------------- served-index adapter
+
+#[test]
+fn authorize_for_served_matches_the_direct_call() {
+    // The transports (Tauri command, browser broker) are pure delegations to
+    // this function. If it diverged from `authorize`, the desktop and the
+    // browser could differ even though both authority implementations agree.
+    let served = ServedIndex {
+        corpus_digest: SERVED_CORPUS.into(),
+        index_digest: SERVED_INDEX.into(),
+    };
+    for action in [Action::Search, Action::Answer, Action::ReadSource] {
+        for capabilities in [
+            vec![],
+            vec![Capability::HelpSearch],
+            vec![Capability::HelpSearch, Capability::HelpAnswer],
+            vec![Capability::HelpSearch, Capability::HelpSearchPrivate],
+        ] {
+            let request = request(
+                action,
+                principal(&capabilities),
+                vec![source("pub-1", Visibility::Public)],
+            );
+            assert_eq!(
+                serde_json::to_value(authorize(&request, SERVED_CORPUS, SERVED_INDEX)).unwrap(),
+                serde_json::to_value(authorize_for_served(&request, &served)).unwrap(),
+                "adapter diverged for {action:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_stale_served_index_denies() {
+    let served = ServedIndex {
+        corpus_digest: "sha256:9999999999999999999999999999999999999999999999999999999999999999"
+            .into(),
+        index_digest: SERVED_INDEX.into(),
+    };
+    let request = request(
+        Action::Search,
+        principal(&[Capability::HelpSearch]),
+        vec![source("pub-1", Visibility::Public)],
+    );
+    let response = authorize_for_served(&request, &served);
+    assert!(!response.allowed);
+    assert_eq!(response.denied_because, Some(DenyReason::StaleIndex));
+}
+
+#[test]
+fn served_index_rejects_unknown_fields() {
+    // A caller must not be able to smuggle an extra field past the adapter.
+    assert!(
+        serde_json::from_str::<ServedIndex>(
+            r#"{"corpusDigest":"c","indexDigest":"i","trustMe":true}"#
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_str::<ServedIndex>(r#"{"corpusDigest":"c","indexDigest":"i"}"#).is_ok()
+    );
+}

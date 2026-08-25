@@ -244,6 +244,30 @@ pub fn authorize(
     }
 }
 
+/// What a process is actually serving.
+///
+/// Held separately from the request, which carries what the caller *believes*.
+/// Comparing the two is what makes a stale index detectable instead of
+/// silently answering from a different corpus.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ServedIndex {
+    pub corpus_digest: String,
+    pub index_digest: String,
+}
+
+/// Authorize against a served index.
+///
+/// This is the whole body of the desktop Tauri command and of the browser
+/// broker's server side. Keeping it here rather than in either adapter is what
+/// makes the two transports identical by construction: an adapter that added
+/// logic of its own could diverge even though both authority implementations
+/// agree on the shared fixtures.
+#[must_use]
+pub fn authorize_for_served(request: &DecisionRequest, served: &ServedIndex) -> DecisionResponse {
+    authorize(request, &served.corpus_digest, &served.index_digest)
+}
+
 /// Authorize from a JSON payload.
 ///
 /// Parsing is strict: an unknown field is a rejection, not a warning. This is

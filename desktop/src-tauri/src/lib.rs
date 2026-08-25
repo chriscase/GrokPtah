@@ -3,6 +3,7 @@
 mod commands;
 mod computer_use;
 mod event_forward;
+mod help;
 mod pty_host;
 
 use std::sync::Mutex;
@@ -59,6 +60,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            help::help_authorize,
+            help::help_authority_schema,
             commands::agent_start,
             commands::agent_stop,
             commands::agent_status,

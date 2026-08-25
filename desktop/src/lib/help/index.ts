@@ -111,3 +111,62 @@ export {
   type HelpSearchController,
   type HelpSearchState,
 } from "./consumer";
+
+// ---- authority ------------------------------------------------------------
+export {
+  HELP_DECISION_REQUEST_SCHEMA,
+  HELP_DECISION_RESPONSE_SCHEMA,
+  HELP_MAX_ID_BYTES,
+  HELP_MAX_SOURCES_PER_DECISION,
+  HelpAuthorityMalformedError,
+  authorizeHelpDecision,
+  authorizeHelpDecisionJson,
+  parseHelpDecisionRequest,
+  type HelpAction,
+  type HelpCapability,
+  type HelpDecisionReceipt,
+  type HelpDecisionRequest,
+  type HelpDecisionResponse,
+  type HelpDenyReason,
+  type HelpPrincipal,
+  type HelpSourceDescriptor,
+  type HelpVisibility,
+} from "./authority/decision";
+export {
+  createHelpExecutor,
+  type HelpExecutor,
+  type HelpExecutorOutcome,
+} from "./authority/executor";
+
+// ---- claim spans ----------------------------------------------------------
+export {
+  HELP_MAX_QUOTE_CODE_POINTS,
+  buildHelpClaimSpan,
+  mapSanitizedRangeToSource,
+  sanitizeWithOffsetMap,
+  verifyHelpClaimSpan,
+  type HelpClaimSpan,
+  type HelpSpanFailure,
+  type HelpSpanVerification,
+} from "./retrieval/spans";
+
+// ---- index provenance -----------------------------------------------------
+export {
+  HELP_INDEX_PROVENANCE,
+  HelpIndexDigestMismatchError,
+} from "./retrieval/hybrid";
+export { HELP_INDEX_SCHEMA, type HelpIndexProvenance } from "./retrieval/provenance";
+
+// ---- task runtime ---------------------------------------------------------
+export {
+  HELP_SCHEDULER_DEFAULTS,
+  HelpTaskError,
+  createHelpTaskScheduler,
+  type HelpSchedulerOptions,
+  type HelpTaskContext,
+  type HelpTaskFailure,
+  type HelpTaskKind,
+  type HelpTaskRecord,
+  type HelpTaskScheduler,
+  type HelpTaskState,
+} from "./runtime/tasks";

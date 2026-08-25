@@ -89,6 +89,14 @@ const requiredExports = [
   "redactHelpText",
   "sanitizeHelpText",
   "verifyHelpModelChecksum",
+  // Authority, spans, provenance, and the task runtime.
+  "authorizeHelpDecision",
+  "parseHelpDecisionRequest",
+  "createHelpExecutor",
+  "buildHelpClaimSpan",
+  "verifyHelpClaimSpan",
+  "HELP_INDEX_PROVENANCE",
+  "createHelpTaskScheduler",
 ];
 const missing = requiredExports.filter((name) => !(name in publicApi));
 if (missing.length > 0) {
@@ -167,6 +175,45 @@ if (Object.isFrozen(publicApi.HELP_CORPUS) !== true) {
 const helpReactApi = await import(helpReactBundlePath.href);
 for (const name of ["HelpResults", "HelpSearchInput", "HelpCitationList", "HelpHighlightedText", "useHelpSearch", "searchHelpCorpus"]) {
   if (!(name in helpReactApi)) throw new Error(`help-react bundle is missing required export: ${name}`);
+}
+
+// A consumer must be able to authorize, and must be denied by default.
+const denied = publicApi.authorizeHelpDecision(
+  {
+    schema: "grokptah.help-authority-request.v1",
+    action: "search",
+    principal: { principal_id: "p", tenant_id: "t", capabilities: [] },
+    corpus_digest: publicApi.HELP_CORPUS_DIGEST,
+    index_digest: publicApi.HELP_INDEX_PROVENANCE.indexDigest,
+    sources: [],
+  },
+  publicApi.HELP_CORPUS_DIGEST,
+  publicApi.HELP_INDEX_PROVENANCE.indexDigest,
+);
+if (denied.allowed || denied.denied_because !== "missing_capability") {
+  throw new Error("published authority did not deny a principal with no capability");
+}
+let rejected = false;
+try {
+  publicApi.parseHelpDecisionRequest({ schema: "x", action: "search", bypass: true });
+} catch {
+  rejected = true;
+}
+if (!rejected) throw new Error("published authority accepted an unknown field");
+
+// Claim spans must be re-verifiable by a consumer that did not produce them.
+const spanChunk = publicApi.HELP_CORPUS.chunks[0];
+const span = publicApi.buildHelpClaimSpan(spanChunk.id, spanChunk.text.slice(0, 16));
+if (!span || publicApi.verifyHelpClaimSpan(span).ok !== true) {
+  throw new Error("published claim spans did not verify against the published corpus");
+}
+if (publicApi.verifyHelpClaimSpan({ ...span, startUtf16: span.startUtf16 + 1 }).ok !== false) {
+  throw new Error("published claim spans accepted a drifted offset");
+}
+
+// The index digest must bind the corpus actually shipped.
+if (publicApi.HELP_INDEX_PROVENANCE.corpusDigest !== publicApi.HELP_CORPUS_DIGEST) {
+  throw new Error("published index provenance is not bound to the published corpus");
 }
 
 console.log(`public bundle verified: ${requiredExports.join(", ")}`);
