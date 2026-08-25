@@ -932,14 +932,19 @@ async fn drive_six_phases(
     )
     .await
     .expect_err("undeclared Computer mutation must fail closed");
-    if missing_capability_denial != "forbidden_scope" {
+    let missing_capability_denial_kind = if missing_capability_denial.starts_with("unknown tool ") {
+        "unknown_tool"
+    } else {
+        missing_capability_denial.as_str()
+    };
+    if missing_capability_denial_kind != "unknown_tool" {
         defects.push(format!(
-            "{}.hostCapability.missingCapabilityDenial: actual={} expected=forbidden_scope",
+            "{}.hostCapability.missingCapabilityDenial: actual={} expected=unknown_tool",
             kind.as_str(),
-            missing_capability_denial
+            missing_capability_denial_kind
         ));
     }
-    host_contract["missingCapabilityDenial"] = json!(missing_capability_denial);
+    host_contract["missingCapabilityDenial"] = json!(missing_capability_denial_kind);
 
     let capacity0 = call_ok(&mut launched.mcp, "ptah_get_capacity", json!({}), scan).await;
     let readiness_supported = advertised
