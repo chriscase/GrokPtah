@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   buildHelpAssistantRequest,
@@ -13,6 +16,12 @@ import {
 } from "./helpCenter";
 import { HELP_RETRIEVAL_FIXTURES } from "./helpCenter.fixtures";
 
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../../");
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 describe("offline Help Center corpus", () => {
   it("keeps a stable, non-empty article inventory", () => {
     expect(HELP_ARTICLES).toHaveLength(18);
@@ -27,6 +36,17 @@ describe("offline Help Center corpus", () => {
     expect(new Set(HELP_INDEX.map((entry) => entry.article.id)).size).toBe(
       HELP_INDEX.length,
     );
+  });
+
+  it("keeps every source citation resolvable to a real heading", () => {
+    for (const source of HELP_ARTICLES.flatMap((article) => article.sources)) {
+      const contents = readFileSync(resolve(repoRoot, source.path), "utf8");
+      const heading = new RegExp(
+        `(?:^|\\n)#{1,6}\\s+${escapeRegExp(source.heading)}(?:\\s|$)`,
+        "m",
+      );
+      expect(contents, `${source.path}#${source.heading}`).toMatch(heading);
+    }
   });
 
   it("ranks exact topic identifiers above body-only matches", () => {

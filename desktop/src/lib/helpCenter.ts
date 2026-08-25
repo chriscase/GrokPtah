@@ -233,7 +233,7 @@ export const HELP_ARTICLES: HelpArticle[] = [
       "Observation and control are separate capabilities. Before a semantic action, verify the fresh target, scope, lease, and postcondition; approve only the action class you intend. Stop, Take over, focus changes, outdated visual state, secure fields, and cleanup uncertainty revoke authority or fail closed. A focused app window is not proof that an isolated target is safe.",
     aliases: ["computer approval", "take over agent", "visual action consent", "postcondition", "semantic click safety"],
     keywords: ["approve", "Computer", "consent", "lease", "postcondition", "takeover", "cleanup"],
-    sources: [{ id: "computer-use.overview", path: "docs/COMPUTER_USE.md", heading: "Approval and postconditions" }],
+    sources: [{ id: "computer-use.overview", path: "docs/COMPUTER_USE.md", heading: "Safety boundary" }],
   },
 ];
 
