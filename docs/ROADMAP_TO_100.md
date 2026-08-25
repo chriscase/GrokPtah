@@ -58,17 +58,19 @@ the same candidate release:
   pass 48 test files / 282 tests, typecheck, the production Vite build, and
   `npm run verify:public`.
   The public check includes generated export/authority-boundary checks,
-  external-worker launch/status/monitor exports, and an installed `npm pack` archive plus
+  external-worker launch/follow-up/cancel/artifact parsers, and an installed `npm pack` archive plus
   normal `node_modules/@grokptah/client`
   consumer smoke fixture. The package
   remains a release candidate until publication and a real cross-repository
   consumer integration are green.
-- The native `CursorCloudAdapter` now owns server-side API-key use, exact
-  repository/ref verification, isolated launch, status polling, cancellation,
-  and fail-closed artifact/result projections; its fake API fixture covers the
-  core lifecycle without credentials. It remains source-level until the
-  adapter compiles, the fixture passes, and one disposable live Cursor Cloud
-  campaign is green.
+- The native `CursorCloudAdapter` plus `ExternalWorkerHost` now own server-side
+  API-key use, host/adapter repository allowlists, exact repository/ref
+  verification, isolated launch (`repos`, no `env`), durable idempotency with
+  explicit Pending/Uncertain, 409 GET reconciliation, observed terminal
+  cancellation, and fail-closed run-attributed artifacts. Streaming is
+  explicitly unsupported. The fake API fixture covers those checks without
+  credentials. This remains source-level until a disposable live Cursor Cloud
+  campaign is green; it is not a 100% claim.
 - Put the current integration changes on an exact reviewable candidate, then
   run the independent strongest-model review protocol with Fast off.
 - Integrate ContextDesk's server broker and desktop adapter against the SDK and

@@ -64,7 +64,8 @@ describe("GrokPtahBrokerClient", () => {
         externalAgentId: "agent-1",
         externalRunId: "run-1",
         state: "running",
-        lastSeq: 0,
+        lastSeq: null,
+        stream: "unsupported",
         createdAt: "2026-08-24T00:00:00Z",
         updatedAt: "2026-08-24T00:00:00Z",
       },
@@ -754,6 +755,192 @@ describe("GrokPtahBrokerClient", () => {
       }
     };
     await expect(read()).rejects.toThrow("malformed");
+  });
+
+  it("binds follow-up, cancel, and artifacts to the requested worker/run ids", async () => {
+    const worker = {
+      provider: "cursor_cloud",
+      externalAgentId: "agent-1",
+      repository: "org/repo",
+      startingRef: "main",
+      state: "ready",
+      createdAt: "2026-08-24T00:00:00Z",
+      updatedAt: "2026-08-24T00:00:00Z",
+    };
+    const run = {
+      externalAgentId: "agent-1",
+      externalRunId: "run-1",
+      state: "cancelled",
+      stream: "unsupported",
+      lastSeq: null,
+      createdAt: "2026-08-24T00:00:00Z",
+      updatedAt: "2026-08-24T00:00:00Z",
+    };
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(worker))
+      .mockResolvedValueOnce(jsonResponse({ ...run, state: "running" }))
+      .mockResolvedValueOnce(jsonResponse(run))
+      .mockResolvedValueOnce(jsonResponse([
+        { path: "artifacts/report.md", digest: "sha256:abc", runId: "run-1", sizeBytes: 12 },
+      ]));
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    const followUp = await client.followUpExternalWorker("binding-1", "agent-1", {
+      requestId: "follow-1",
+      prompt: "Re-check the focused change",
+    }, "follow-1");
+    expect(followUp.externalRunId).toBe("run-1");
+    const cancelled = await client.cancelExternalWorker("binding-1", "agent-1", "run-1", "cancel-1");
+    expect(cancelled.state).toBe("cancelled");
+    const artifacts = await client.getExternalWorkerArtifacts("binding-1", "agent-1", "run-1");
+    expect(artifacts[0]?.runId).toBe("run-1");
+    expect(String(fetcher.mock.calls[1][0])).toContain("/external-workers/agent-1/runs");
+    expect(String(fetcher.mock.calls[2][0])).toContain("/runs/run-1/cancel");
+    expect(String(fetcher.mock.calls[3][0])).toContain("/runs/run-1/artifacts");
+    expect(fetcher.mock.calls[1][1]?.headers).not.toHaveProperty("Authorization");
+  });
+
+  it("rejects follow-up, cancel, and artifact responses that drift off the requested ids", async () => {
+    const clientFor = (body: unknown) => new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher: vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(body)),
+      csrfToken: "csrf-1",
+    });
+    await expect(clientFor({
+      provider: "cursor_cloud",
+      externalAgentId: "other-agent",
+      repository: "org/repo",
+      startingRef: "main",
+      state: "ready",
+      createdAt: "now",
+      updatedAt: "now",
+    }).getExternalWorker("binding-1", "agent-1")).rejects.toMatchObject({ code: "invalid_response" });
+
+    const followFetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({
+        provider: "cursor_cloud",
+        externalAgentId: "agent-1",
+        repository: "org/repo",
+        startingRef: "main",
+        state: "ready",
+        createdAt: "now",
+        updatedAt: "now",
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        externalAgentId: "other-agent",
+        externalRunId: "run-1",
+        state: "running",
+        stream: "unsupported",
+        lastSeq: null,
+        createdAt: "now",
+        updatedAt: "now",
+      }));
+    const followClient = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher: followFetcher,
+      csrfToken: "csrf-1",
+    });
+    await expect(followClient.followUpExternalWorker("binding-1", "agent-1", {
+      requestId: "follow-1",
+      prompt: "Re-check",
+    }, "follow-1")).rejects.toMatchObject({ code: "invalid_response" });
+
+    await expect(clientFor({
+      externalAgentId: "agent-1",
+      externalRunId: "run-1",
+      state: "running",
+      stream: "unsupported",
+      lastSeq: null,
+      createdAt: "now",
+      updatedAt: "now",
+    }).cancelExternalWorker("binding-1", "agent-1", "run-1", "cancel-1"))
+      .rejects.toMatchObject({ code: "invalid_response" });
+
+    await expect(clientFor([
+      { path: "artifacts/report.md", digest: "sha256:abc", runId: "other-run" },
+    ]).getExternalWorkerArtifacts("binding-1", "agent-1", "run-1"))
+      .rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  it("rejects a launch envelope bound to a different repository or fake lastSeq", async () => {
+    const workerRun = (overrides: Record<string, unknown> = {}) => ({
+      worker: {
+        provider: "cursor_cloud",
+        externalAgentId: "agent-1",
+        repository: "other/repo",
+        startingRef: "main",
+        state: "running",
+        createdAt: "now",
+        updatedAt: "now",
+      },
+      run: {
+        externalAgentId: "agent-1",
+        externalRunId: "run-1",
+        state: "running",
+        stream: "unsupported",
+        lastSeq: null,
+        createdAt: "now",
+        updatedAt: "now",
+        ...overrides,
+      },
+    });
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher: vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(workerRun())),
+      csrfToken: "csrf-1",
+    });
+    await expect(client.launchExternalWorker("binding-1", {
+      requestId: "request-1",
+      provider: "cursor_cloud",
+      repository: "org/repo",
+      startingRef: "main",
+      prompt: "Review the exact candidate",
+      executionMode: "isolated",
+      autoCreatePr: false,
+    }, "request-1")).rejects.toMatchObject({ code: "invalid_response" });
+
+    const fakeSeq = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher: vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(workerRun({ lastSeq: 0 }))),
+      csrfToken: "csrf-1",
+    });
+    await expect(fakeSeq.launchExternalWorker("binding-1", {
+      requestId: "request-1",
+      provider: "cursor_cloud",
+      repository: "other/repo",
+      startingRef: "main",
+      prompt: "Review the exact candidate",
+      executionMode: "isolated",
+      autoCreatePr: false,
+    }, "request-1")).rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  it("rejects follow-up on unknown, failed, cancelled, or archived workers before posting", async () => {
+    for (const state of ["unknown", "failed", "cancelled", "archived"] as const) {
+      const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
+        provider: "cursor_cloud",
+        externalAgentId: "agent-1",
+        repository: "org/repo",
+        startingRef: "main",
+        state,
+        createdAt: "now",
+        updatedAt: "now",
+      }));
+      const client = new GrokPtahBrokerClient({
+        baseUrl: "https://contextdesk.example",
+        fetcher,
+        csrfToken: "csrf-1",
+      });
+      await expect(client.followUpExternalWorker("binding-1", "agent-1", {
+        requestId: "follow-1",
+        prompt: "Re-check",
+      }, "follow-1")).rejects.toMatchObject({ code: "invalid_request" });
+      expect(fetcher).toHaveBeenCalledTimes(1);
+      expect(String(fetcher.mock.calls[0][0])).not.toContain("/runs");
+    }
   });
 
   it("wraps non-JSON broker responses as safe invalid-response errors", async () => {

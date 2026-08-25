@@ -47,6 +47,7 @@ const requiredExports = [
   "parseExternalWorkerLaunchRequest",
   "parseExternalWorkerFollowUpRequest",
   "parseExternalWorkerLaunchResult",
+  "parseExternalWorkerArtifact",
   "parseExternalWorkerNotification",
   "applyExternalWorkerNotification",
   "searchHelp",
@@ -66,6 +67,7 @@ for (const name of [
   "applyAssistantStreamChunk",
   "EXTERNAL_WORKER_CONTRACT",
   "parseExternalWorkerFollowUpRequest",
+  "parseExternalWorkerArtifact",
   "parseExternalWorkerNotification",
   "applyExternalWorkerNotification",
 ]) {

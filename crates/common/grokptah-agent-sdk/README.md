@@ -17,7 +17,10 @@ The crate covers:
 - lease- and revision-fenced Computer Use control requests.
 - provider-neutral external-worker launch, lifecycle, event, and artifact
   projections for cloud coding agents, including explicitly idempotent
-  follow-up requests.
+  follow-up requests. v1 streaming is unsupported (`last_seq` must be `None`);
+  artifacts require a digest and serialize `runId`. These DTOs are reusable
+  by other products and do not include credentials, network clients, or
+  execution policy.
 
 The boundary DTOs that accept caller-controlled data expose a `validate()`
 method. Consumers should call those validators before crossing a process or
@@ -25,7 +28,9 @@ product boundary; the authority still applies its negotiated workspace,
 capability, and host ceilings after validation. Read-only page/projection
 wrappers remain data-only and inherit the validation of the records they carry.
 Invalid bounds, empty identity fences, absolute review paths, oversized
-event/detail payloads, and zero-duration Computer Use leases fail closed.
+event/detail payloads, newline/control characters in repository/ref
+identities, fake stream cursors, and zero-duration Computer Use leases fail
+closed.
 
 Adapters remain responsible for mapping these contracts to MCP, applying host
 policy, authenticating users, redacting data, and retaining credentials. The

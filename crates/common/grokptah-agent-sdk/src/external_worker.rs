@@ -22,6 +22,13 @@ pub const MAX_EXTERNAL_WORKER_REF_BYTES: usize = 512;
 /// Maximum UTF-8 bytes accepted for a redacted worker detail string.
 pub const MAX_EXTERNAL_WORKER_DETAIL_BYTES: usize = 4_096;
 
+/// v1 does not claim a sequenced provider event stream.
+///
+/// Adapters must set [`ExternalWorkerRunRecord::stream`] to
+/// [`ExternalWorkerStreamState::Unsupported`] and `last_seq` to `None`.
+/// Synthesizing `last_seq = 0` as continuity is a contract violation.
+pub const EXTERNAL_WORKER_STREAMING_SUPPORTED: bool = false;
+
 /// Known external worker families supported by the contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +71,15 @@ pub enum ExternalWorkerState {
     Archived,
     /// The provider returned a state this adapter does not recognize.
     Unknown,
+}
+
+/// Whether a run projection claims a sequenced provider event stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalWorkerStreamState {
+    /// Streaming is not implemented or not qualified. Poll GET state instead.
+    /// `last_seq` must be `None`.
+    Unsupported,
 }
 
 /// Bounded request for creating an external worker and its initial run.
@@ -221,8 +237,11 @@ pub struct ExternalWorkerRunRecord {
     pub external_run_id: String,
     /// Current projected lifecycle state.
     pub state: ExternalWorkerState,
-    /// Last provider event sequence retained by the adapter.
-    pub last_seq: u64,
+    /// Explicit stream contract for this run. v1 Cursor is unsupported.
+    pub stream: ExternalWorkerStreamState,
+    /// Last provider event sequence when streaming is supported.
+    /// Must be `None` when [`Self::stream`] is [`ExternalWorkerStreamState::Unsupported`].
+    pub last_seq: Option<u64>,
     /// Bounded terminal label, if terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_result: Option<String>,
@@ -237,6 +256,9 @@ impl ExternalWorkerRunRecord {
     pub fn validate(&self) -> Result<(), &'static str> {
         validate_identity(&self.external_agent_id, "external_agent_id")?;
         validate_identity(&self.external_run_id, "external_run_id")?;
+        if self.stream == ExternalWorkerStreamState::Unsupported && self.last_seq.is_some() {
+            return Err("unsupported streams must not synthesize a last_seq cursor");
+        }
         if let Some(result) = &self.terminal_result {
             validate_detail(result, "terminal_result")?;
         }
@@ -302,8 +324,12 @@ impl ExternalWorkerEvent {
 pub struct ExternalWorkerArtifact {
     /// Repository-relative or provider-relative artifact path.
     pub path: String,
-    /// Content digest supplied by the provider or adapter.
+    /// Content digest supplied by the provider or a trusted download-and-hash.
     pub digest: String,
+    /// Opaque provider run identity this artifact is attributed to.
+    /// Serialized as `runId` to match the public JSON Schema and TypeScript parser.
+    #[serde(rename = "runId")]
+    pub external_run_id: String,
     /// Bounded artifact size, if reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
@@ -320,7 +346,8 @@ impl ExternalWorkerArtifact {
         {
             return Err("artifact path must be bounded and relative");
         }
-        validate_identity(&self.digest, "digest")
+        validate_identity(&self.digest, "digest")?;
+        validate_identity(&self.external_run_id, "external_run_id")
     }
 }
 
@@ -358,11 +385,15 @@ fn validate_ref(value: &str, field: &str) -> Result<(), &'static str> {
             _ => "worker ref must not be empty",
         });
     }
+    if value
+        .chars()
+        .any(|character| matches!(character, '\n' | '\r' | '\0'))
+    {
+        return Err("worker ref contains a control character");
+    }
     if value.len() > MAX_EXTERNAL_WORKER_REF_BYTES
         || value.starts_with('/')
-        || value
-            .chars()
-            .any(|character| matches!(character, '\\' | '\n' | '\r' | '\0'))
+        || value.contains('\\')
         || value.split('/').any(|segment| segment == "..")
     {
         return Err("worker ref must be bounded and non-absolute");
@@ -437,23 +468,54 @@ mod tests {
         request.starting_ref = "refs/heads/review\n".into();
         assert_eq!(
             request.validate(),
-            Err("worker identity contains a control character")
+            Err("worker ref contains a control character")
         );
     }
 
     #[test]
-    fn artifacts_are_relative_and_events_are_bounded() {
+    fn newline_in_repository_or_ref_fails_closed() {
+        let mut request = launch();
+        request.repository = "chriscase/GrokPtah\n".into();
+        assert_eq!(
+            request.validate(),
+            Err("worker ref contains a control character")
+        );
+        request.repository = "chriscase/GrokPtah".into();
+        request.starting_ref = "main\r".into();
+        assert_eq!(
+            request.validate(),
+            Err("worker ref contains a control character")
+        );
+    }
+
+    #[test]
+    fn artifacts_are_relative_run_attributed_and_events_are_bounded() {
         let artifact = ExternalWorkerArtifact {
             path: "reports/review.json".into(),
             digest: "sha256:abc".into(),
+            external_run_id: "run-1".into(),
             size_bytes: Some(42),
         };
         assert!(artifact.validate().is_ok());
-        let bad = ExternalWorkerArtifact {
+        let value = serde_json::to_value(&artifact).expect("artifact serializes");
+        assert_eq!(value["runId"], "run-1");
+        assert!(value.get("externalRunId").is_none());
+        let round_trip: ExternalWorkerArtifact =
+            serde_json::from_value(value).expect("artifact deserializes runId");
+        assert_eq!(round_trip.external_run_id, "run-1");
+        let bad_path = ExternalWorkerArtifact {
             path: "../secret".into(),
+            ..artifact.clone()
+        };
+        assert!(bad_path.validate().is_err());
+        let missing_run = ExternalWorkerArtifact {
+            external_run_id: String::new(),
             ..artifact
         };
-        assert!(bad.validate().is_err());
+        assert_eq!(
+            missing_run.validate(),
+            Err("external_run_id must not be empty")
+        );
         let event = ExternalWorkerEvent {
             seq: 1,
             ts: "2026-08-24T00:00:00Z".into(),
@@ -461,5 +523,29 @@ mod tests {
             detail: "checking tests".into(),
         };
         assert!(event.validate().is_ok());
+    }
+
+    #[test]
+    fn unsupported_streams_must_not_synthesize_a_zero_cursor() {
+        assert!(!EXTERNAL_WORKER_STREAMING_SUPPORTED);
+        let mut run = ExternalWorkerRunRecord {
+            external_agent_id: "agent-1".into(),
+            external_run_id: "run-1".into(),
+            state: ExternalWorkerState::Running,
+            stream: ExternalWorkerStreamState::Unsupported,
+            last_seq: None,
+            terminal_result: None,
+            created_at: "2026-08-24T00:00:00Z".into(),
+            updated_at: "2026-08-24T00:00:01Z".into(),
+        };
+        assert!(run.validate().is_ok());
+        let value = serde_json::to_value(&run).expect("run serializes");
+        assert_eq!(value["stream"], "unsupported");
+        assert_eq!(value["lastSeq"], serde_json::Value::Null);
+        run.last_seq = Some(0);
+        assert_eq!(
+            run.validate(),
+            Err("unsupported streams must not synthesize a last_seq cursor")
+        );
     }
 }

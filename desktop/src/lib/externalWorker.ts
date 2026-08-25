@@ -8,6 +8,8 @@
  */
 
 export const EXTERNAL_WORKER_CONTRACT = "grokptah.external-workers.v1" as const;
+/** v1 does not claim a sequenced provider event stream. lastSeq must be null. */
+export const EXTERNAL_WORKER_STREAMING_SUPPORTED = false;
 
 export type ExternalWorkerProvider =
   | "cursor_cloud"
@@ -69,7 +71,8 @@ export type ExternalWorkerRunRecord = {
   externalAgentId: string;
   externalRunId: string;
   state: ExternalWorkerState;
-  lastSeq: number;
+  stream: "unsupported";
+  lastSeq: number | null;
   terminalResult?: string;
   createdAt: string;
   updatedAt: string;
@@ -85,6 +88,7 @@ export type ExternalWorkerEvent = {
 export type ExternalWorkerArtifact = {
   path: string;
   digest: string;
+  runId: string;
   sizeBytes?: number;
 };
 
@@ -267,15 +271,15 @@ export function parseExternalWorkerRecord(value: unknown): ExternalWorkerRecord 
 /** Parse a redacted provider run projection. */
 export function parseExternalWorkerRunRecord(value: unknown): ExternalWorkerRunRecord | null {
   if (!isRecord(value) || !hasOnlyKeys(value, new Set([
-    "externalAgentId", "externalRunId", "state", "lastSeq", "terminalResult", "createdAt", "updatedAt",
+    "externalAgentId", "externalRunId", "state", "stream", "lastSeq", "terminalResult", "createdAt", "updatedAt",
   ]))) return null;
   if (
     !identity(value.externalAgentId) ||
     !identity(value.externalRunId) ||
     typeof value.state !== "string" ||
     !STATES.has(value.state as ExternalWorkerState) ||
-    !Number.isInteger(value.lastSeq) ||
-    (value.lastSeq as number) < 0 ||
+    value.stream !== "unsupported" ||
+    value.lastSeq !== null ||
     (value.terminalResult !== undefined && !boundedString(value.terminalResult, MAX_DETAIL_BYTES, true)) ||
     !boundedString(value.createdAt, 128) ||
     !boundedString(value.updatedAt, 128)
@@ -324,12 +328,13 @@ export function parseExternalWorkerNotification(value: unknown): ExternalWorkerN
   return { type: "recovery", afterSeq: value.afterSeq as number, reason: value.reason, pollRoute: value.pollRoute };
 }
 
-/** Parse a bounded, relative artifact reference. */
+/** Parse a bounded, relative, run-attributed artifact reference. */
 export function parseExternalWorkerArtifact(value: unknown): ExternalWorkerArtifact | null {
-  if (!isRecord(value) || !hasOnlyKeys(value, new Set(["path", "digest", "sizeBytes"]))) return null;
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(["path", "digest", "runId", "sizeBytes"]))) return null;
   if (
     !relativeRef(value.path) ||
     !identity(value.digest) ||
+    !identity(value.runId) ||
     (value.sizeBytes !== undefined && (!Number.isInteger(value.sizeBytes) || (value.sizeBytes as number) < 0))
   ) return null;
   return value as ExternalWorkerArtifact;

@@ -593,7 +593,9 @@ export class GrokPtahBrokerClient {
     if (
       result.worker.externalAgentId !== result.run.externalAgentId ||
       result.worker.repository !== request.repository ||
-      result.worker.startingRef !== request.startingRef
+      result.worker.startingRef !== request.startingRef ||
+      result.run.stream !== "unsupported" ||
+      result.run.lastSeq !== null
     ) {
       throw new GrokPtahBrokerError(0, "invalid_response", "External worker launch does not match the request");
     }
@@ -617,20 +619,28 @@ export class GrokPtahBrokerClient {
     if (["unknown", "failed", "cancelled", "archived"].includes(worker.state)) {
       throw new GrokPtahBrokerError(0, "invalid_request", "External worker is not eligible for follow-up");
     }
-    return this.requestValidated(
+    const run = await this.requestValidated(
       `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/runs`,
       parseExternalWorkerRunRecord,
       { method: "POST", idempotencyKey, body: request },
     );
+    if (run.externalAgentId !== externalAgentId || run.stream !== "unsupported" || run.lastSeq !== null) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker follow-up does not match the request");
+    }
+    return run;
   }
 
   /** Read a redacted external-worker identity from the broker. */
   async getExternalWorker(bindingId: string, externalAgentId: string): Promise<ExternalWorkerRecord> {
-    return this.requestValidated(
+    const worker = await this.requestValidated(
       `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}`,
       parseExternalWorkerRecord,
       {},
     );
+    if (worker.externalAgentId !== externalAgentId) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker identity does not match the request");
+    }
+    return worker;
   }
 
   /** Read the redacted current run projection for an external worker. */
@@ -639,11 +649,20 @@ export class GrokPtahBrokerClient {
     externalAgentId: string,
     externalRunId: string,
   ): Promise<ExternalWorkerRunRecord> {
-    return this.requestValidated(
+    const run = await this.requestValidated(
       `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/runs/${segment(externalRunId)}`,
       parseExternalWorkerRunRecord,
       {},
     );
+    if (
+      run.externalAgentId !== externalAgentId ||
+      run.externalRunId !== externalRunId ||
+      run.stream !== "unsupported" ||
+      run.lastSeq !== null
+    ) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker run identity does not match the request");
+    }
+    return run;
   }
 
   /** Read bounded relative artifacts returned by an external worker. */
@@ -662,7 +681,11 @@ export class GrokPtahBrokerClient {
     if (artifacts.some((artifact) => artifact === null)) {
       throw new GrokPtahBrokerError(0, "invalid_response", "External worker artifacts response is invalid");
     }
-    return artifacts as ExternalWorkerArtifact[];
+    const parsed = artifacts as ExternalWorkerArtifact[];
+    if (parsed.some((artifact) => artifact.runId !== externalRunId)) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker artifact is not attributed to the requested run");
+    }
+    return parsed;
   }
 
   /** Cancel an external worker run; cancellation remains terminal. */
@@ -677,7 +700,13 @@ export class GrokPtahBrokerClient {
       parseExternalWorkerRunRecord,
       { method: "POST", idempotencyKey },
     );
-    if (result.state !== "cancelled") {
+    if (
+      result.state !== "cancelled" ||
+      result.externalAgentId !== externalAgentId ||
+      result.externalRunId !== externalRunId ||
+      result.stream !== "unsupported" ||
+      result.lastSeq !== null
+    ) {
       throw new GrokPtahBrokerError(0, "invalid_response", "External worker cancellation was not terminal");
     }
     return result;

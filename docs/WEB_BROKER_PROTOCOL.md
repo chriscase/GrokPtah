@@ -82,9 +82,9 @@ binding and run ids to the exact GrokPtah `session_id`, `workspace`, and
 | `POST /bindings/{bindingId}/external-workers` | external worker adapter | execute | Launches an isolated exact-ref cloud worker; requires idempotency and CSRF. |
 | `GET /bindings/{bindingId}/external-workers/{agentId}` | external worker adapter | read-only | Redacted provider worker identity and lifecycle. |
 | `POST /bindings/{bindingId}/external-workers/{agentId}/runs` | external worker adapter | execute | Queues one bounded follow-up run; only one active provider run is allowed; requires idempotency and CSRF. |
-| `GET /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}` | external worker adapter | read-only | Redacted provider run status and cursor. |
-| `GET /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/artifacts` | external worker adapter | read-only | Bounded relative artifact references only. |
-| `POST /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/cancel` | external worker adapter | execute | Explicit terminal cancellation; requires idempotency and CSRF. |
+| `GET /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}` | external worker adapter | read-only | Redacted provider run status. v1 streaming is unsupported; `lastSeq` must be null. |
+| `GET /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/artifacts` | external worker adapter | read-only | Bounded relative artifact references with digest and matching `runId` only. Never raw URLs. |
+| `POST /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/cancel` | external worker adapter | execute | Explicit terminal cancellation; success requires observed `cancelled`; requires idempotency and CSRF. |
 | `POST /bindings/{bindingId}/runs/{runId}/approve` | broker approval | execute | Binds exact review fingerprints to a short-lived approval. |
 | `POST /bindings/{bindingId}/runs/{runId}/promote` | promotion authority | promote | Requires the short-lived approval and desktop human gate. |
 | `POST /bindings/{bindingId}/runs/{runId}/cancel` | `ptah_cancel` | execute | Explicit user action; idempotent request id. |
@@ -107,6 +107,26 @@ The broker supplies a fresh, unique `request_id`, records the user and
 investigation audit context, and forwards only an allowlisted execution mode
 and bounds. It must reject empty prompts, out-of-policy workspaces, and bounds
 above the team maximum before calling GrokPtah.
+
+### External workers
+
+Browser clients bind every launch/follow-up/cancel/artifact call to the
+requested repository/ref, worker id, run id, and `Idempotency-Key` /
+`requestId`. Same-origin broker routes only; no provider host is contacted
+from the browser. v1 run projections must send `stream: "unsupported"` and
+`lastSeq: null`. Artifacts must include a non-empty digest and a `runId`
+matching the requested run; raw download URLs, credentials, and unknown
+fields fail closed.
+
+The trusted host keeps a durable idempotency ledger for launch, follow-up,
+and cancel. Identical retries replay the original result. Payload drift is
+rejected. Pending and Uncertain outcomes stay fail-closed until reconciled.
+A host-level repository allowlist is required; registering an adapter does
+not grant launch rights to every repository the API key can access.
+
+These routes are not Computer Use and are not the core agent harness. Server
+broker wiring and live Cursor qualification remain open; typed parsers and a
+native adapter fixture are staged.
 
 ### Typed redacted projections
 

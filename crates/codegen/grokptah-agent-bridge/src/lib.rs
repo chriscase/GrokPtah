@@ -115,8 +115,11 @@ pub use discover::{
 pub use event_bus::{EventBus, EventReceiver, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use external_worker::{
-    CursorCloudAdapter, ExternalWorkerAdapter, ExternalWorkerAdapterError, ExternalWorkerRegistry,
-    CURSOR_CLOUD_API_BASE,
+    canonical_cancel_payload_hash, canonical_follow_up_payload_hash, canonical_launch_payload_hash,
+    CursorCloudAdapter, ExternalWorkerAdapter, ExternalWorkerAdapterError, ExternalWorkerHost,
+    ExternalWorkerLedger, ExternalWorkerLedgerClaim, ExternalWorkerLedgerStatus,
+    ExternalWorkerOperation, ExternalWorkerRegistry, ProviderConflictCode, CURSOR_CLOUD_API_BASE,
+    MAX_EXTERNAL_WORKER_ARTIFACT_BYTES,
 };
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use mcp_control::{

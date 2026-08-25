@@ -24,15 +24,17 @@ Products that want GrokPtah to launch and monitor an external coding agent
 should import the `external_worker` contracts from `grokptah-agent-sdk` rather
 than inventing provider-specific DTOs. The contract covers an exact-ref,
 isolated launch request, opaque worker/run identities, redacted event updates,
-and bounded relative artifact references. The provider adapter keeps its API
-key and network client in the trusted service; the desktop and War Room UI
-receive only the redacted projections and existing review/approval receipts.
+and bounded relative artifacts with a required `runId`. v1 does not claim a
+sequenced provider event stream: `stream` is `unsupported` and `lastSeq` is
+`null`. The provider adapter keeps its API key, presigned download URLs, and
+network client in the trusted service; the desktop and War Room UI receive only
+the redacted projections and existing review/approval receipts.
 
 The JSON representation is versioned at
 [`grokptah-external-worker.v1.schema.json`](./schemas/grokptah-external-worker.v1.schema.json).
-The initial Cursor Cloud adapter remains a qualification task; the contract is
-already reusable by ContextDesk, another Rust service, or a future TypeScript
-broker adapter.
+The Cursor Cloud adapter and host ledger are staged behind a fake-API fixture;
+they are not a live qualification or a 100% claim. The DTOs remain reusable by
+ContextDesk, another Rust service, or a TypeScript broker adapter.
 
 ## Browser / War Room example
 
@@ -145,7 +147,8 @@ Computer Use authority. The same command then installs that generated manifest
 into a disposable external-consumer fixture, installs the generated `npm pack`
 archive, and imports it through normal `node_modules/@grokptah/client` package
 resolution. That fixture exercises the
-Help Center corpus, queue reducer, stream helper, broker constructor, and the
+Help Center corpus, queue reducer, stream helper, broker constructor, typed
+external-worker launch/follow-up/cancel/artifact parsers, and the
 separate `@grokptah/client/ui-core` import, so a direct bundle import cannot
 masquerade as a consumer integration. The fixture is deleted after the check.
 Publication still requires the compatibility and release gates in the roadmap.

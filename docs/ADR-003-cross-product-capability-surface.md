@@ -63,7 +63,11 @@ the same redacted run projections, review receipts, and approval gates used for
 local runs. This is a planned adapter, not a claim that Cursor Cloud is
 currently integrated or qualified. The reusable launch/status/event/artifact
 DTOs now live in `grokptah-agent-sdk::external_worker` and have a matching
-versioned JSON Schema; the provider adapter and live qualification remain open.
+versioned JSON Schema. A trusted native Cursor Cloud v1 adapter, host
+allowlist, and durable launch/follow-up/cancel ledger are staged behind a
+fake-API fixture; streaming is explicitly unsupported (`lastSeq` must stay
+null), live artifact listings without run attribution fail closed, and live
+qualification remains open. This is not a 100% claim.
 See [`CURSOR_CLOUD_INTEGRATION.md`](./CURSOR_CLOUD_INTEGRATION.md).
 
 ## Public contract layers
