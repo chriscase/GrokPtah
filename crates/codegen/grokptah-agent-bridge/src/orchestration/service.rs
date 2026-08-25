@@ -62,6 +62,25 @@ use super::workload::{
 /// queued submissions into an unbounded in-memory prompt store.
 const MAX_PENDING_ADMISSIONS: usize = 32;
 
+fn work_result_idempotency_details(
+    attempt_id: &str,
+    lease_token: &str,
+    result: &WorkResult,
+) -> serde_json::Value {
+    // `completed_at` is stamped at the mutation boundary and must not be part
+    // of the idempotency hash, or an identical retry would look like a new
+    // payload and conflict against the already-terminal attempt.
+    json!({
+        "attemptId": attempt_id,
+        "leaseToken": lease_token,
+        "summary": result.summary,
+        "evidence": result.evidence,
+        "artifacts": result.artifacts,
+        "failure": result.failure,
+        "cancellationReason": result.cancellation_reason,
+    })
+}
+
 fn validate_provider_route_for_purpose(
     route: &super::types::ProviderRouteSnapshot,
     purpose: RunPurpose,
@@ -1324,8 +1343,13 @@ impl OrchestrationService {
             cancellation_reason: None,
             completed_at: Utc::now(),
         };
+        // The coding loop converts provider/transport errors into a completed
+        // turn whose summary starts with "Agent failed:". Managed native Work
+        // must still fail-closed so Always-On replacement (GROKBOT_FORCE_FAIL)
+        // can run. Direct operator submit_task terminals are unchanged.
+        let agent_loop_failed = result.summary.starts_with("Agent failed:");
         let outcome = match run.state {
-            RunState::Completed => {
+            RunState::Completed if !agent_loop_failed => {
                 let outcome = if self
                     .store
                     .load_work_item(&intent.work_id)
@@ -1364,7 +1388,11 @@ impl OrchestrationService {
                         &intent.intent_id,
                         retry_eligible,
                         ManagedRetryCause::Failed,
-                        result.failure.as_deref().unwrap_or("managed run failed"),
+                        result.failure.as_deref().unwrap_or(if agent_loop_failed {
+                            "managed run completed with an agent-loop failure"
+                        } else {
+                            "managed run failed"
+                        }),
                         Utc::now(),
                     )
                     .map(|_| ())
@@ -3749,7 +3777,7 @@ impl OrchestrationService {
             session_id,
             workspace,
             work_id,
-            json!({"attemptId": attempt_id, "leaseToken": lease_token, "result": result}),
+            work_result_idempotency_details(attempt_id, lease_token, &result),
             |store| store.complete_work(work_id, attempt_id, lease_token, result),
         )
         .await
@@ -3774,7 +3802,7 @@ impl OrchestrationService {
             session_id,
             workspace,
             work_id,
-            json!({"attemptId": attempt_id, "leaseToken": lease_token, "result": result}),
+            work_result_idempotency_details(attempt_id, lease_token, &result),
             |store| store.fail_work(work_id, attempt_id, lease_token, result),
         )
         .await

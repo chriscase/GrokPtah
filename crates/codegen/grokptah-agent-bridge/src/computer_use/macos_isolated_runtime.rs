@@ -101,11 +101,9 @@ fn waitpid_without_interrupt(pid: libc::pid_t) -> Option<libc::pid_t> {
         // SAFETY: the PID was returned by the native launch shim and this
         // supervisor is the only code allowed to reap it.
         let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
-        if result < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                std::thread::yield_now();
-                continue;
-            }
+        if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            std::thread::yield_now();
+            continue;
         }
         return Some(result);
     }
@@ -181,6 +179,8 @@ fn terminate_process(pid: libc::pid_t) -> bool {
 /// private channels. It is deliberately not wired into capability admission:
 /// callers must still provide a reviewed package manifest and independently
 /// prove boot, rendering, input, and cleanup before exposing this backend.
+/// The helper source gate requires this type to remain `pub(crate)` until
+/// qualification; a crate-root re-export is forbidden.
 pub(crate) struct IsolatedVisualPackagedRuntime {
     pid: libc::pid_t,
     exited: bool,
@@ -188,7 +188,7 @@ pub(crate) struct IsolatedVisualPackagedRuntime {
 }
 
 impl IsolatedVisualPackagedRuntime {
-    pub(crate) fn launch(contract: IsolatedVisualLaunchContract) -> ComputerResult<Self> {
+    pub fn launch(contract: IsolatedVisualLaunchContract) -> ComputerResult<Self> {
         contract.validate()?;
         // Hold the exact read-only package handles through the native launch
         // call. This binds the caller's manifest to measured artifact bytes
@@ -282,7 +282,7 @@ impl IsolatedVisualPackagedRuntime {
     }
 
     /// Drives the fixed Prepared → start → Running → bind → Bound sequence.
-    pub(crate) fn start(&mut self) -> ComputerResult<()> {
+    pub fn start(&mut self) -> ComputerResult<()> {
         if let Err(error) = self
             .driver
             .receive_helper_event_with_timeout(PREPARED_EVENT_TIMEOUT)
@@ -310,14 +310,14 @@ impl IsolatedVisualPackagedRuntime {
         Ok(())
     }
 
-    pub(crate) fn read_frame(&mut self) -> ComputerResult<Option<IsolatedVisualFrame>> {
+    pub fn read_frame(&mut self) -> ComputerResult<Option<IsolatedVisualFrame>> {
         match self.driver.read_frame_with_timeout(FRAME_READ_TIMEOUT) {
             Ok(frame) => Ok(frame),
             Err(error) => self.abort_with_error(error),
         }
     }
 
-    pub(crate) fn write_input(
+    pub fn write_input(
         &mut self,
         input_sequence: u64,
         request_nonce: &str,
@@ -334,10 +334,7 @@ impl IsolatedVisualPackagedRuntime {
         }
     }
 
-    pub(crate) fn stop(
-        &mut self,
-        disposition: IsolatedVisualTerminalDisposition,
-    ) -> ComputerResult<()> {
+    pub fn stop(&mut self, disposition: IsolatedVisualTerminalDisposition) -> ComputerResult<()> {
         if let Err(error) = self
             .driver
             .stop_with_timeout(disposition, CONTROL_WRITE_TIMEOUT)
@@ -361,11 +358,28 @@ impl IsolatedVisualPackagedRuntime {
     /// Completes the terminal transition only after the caller has verified
     /// exact helper/process absence, open-handle closure, overlay removal, and
     /// frame-cache removal for this surface incarnation.
-    pub(crate) fn complete_cleanup(
+    pub fn complete_cleanup(
         &mut self,
         evidence: &IsolatedVisualCleanupEvidence,
     ) -> ComputerResult<()> {
         self.driver.complete_cleanup(evidence)
+    }
+
+    /// Completes cleanup from host-observed facts. Does not claim a signed
+    /// helper, guest boot, or Virtualization.framework launch succeeded.
+    pub fn complete_observed_cleanup(
+        &mut self,
+        helper_process_absent: bool,
+        no_open_handles: bool,
+        overlay_removed: bool,
+        frame_cache_removed: bool,
+    ) -> ComputerResult<()> {
+        self.driver.complete_observed_cleanup(
+            helper_process_absent,
+            no_open_handles,
+            overlay_removed,
+            frame_cache_removed,
+        )
     }
 
     fn abort_with_error<T>(&mut self, error: ComputerError) -> ComputerResult<T> {
@@ -376,7 +390,7 @@ impl IsolatedVisualPackagedRuntime {
         Err(error)
     }
 
-    pub(crate) fn runtime(&self) -> &IsolatedVisualRuntimeSession {
+    pub fn runtime(&self) -> &IsolatedVisualRuntimeSession {
         self.driver.runtime()
     }
 
@@ -428,14 +442,48 @@ impl Drop for IsolatedVisualPackagedRuntime {
     }
 }
 
+/// Keep crate-private packaged-runtime entrypoints linked in the lib artifact.
+/// `#[cfg(test)]` holds are invisible to `cargo clippy --all-targets -D warnings`
+/// on the lib target. This is not capability admission, launch, boot, or
+/// qualification. The helper source gate still requires `pub(crate)`.
+fn keep_packaged_runtime_linked_in_lib() {
+    let _launch = IsolatedVisualPackagedRuntime::launch;
+    let _start = IsolatedVisualPackagedRuntime::start;
+    let _read_frame = IsolatedVisualPackagedRuntime::read_frame;
+    let _write_input = IsolatedVisualPackagedRuntime::write_input;
+    let _stop = IsolatedVisualPackagedRuntime::stop;
+    let _complete_cleanup = IsolatedVisualPackagedRuntime::complete_cleanup;
+    let _complete_observed_cleanup = IsolatedVisualPackagedRuntime::complete_observed_cleanup;
+    let _runtime = IsolatedVisualPackagedRuntime::runtime;
+}
+
+#[used]
+static PACKAGED_RUNTIME_LIB_LINKAGE: fn() = keep_packaged_runtime_linked_in_lib;
+
 #[cfg(test)]
 mod tests {
     use super::descriptors_are_distinct;
+    use super::IsolatedVisualPackagedRuntime;
 
     #[test]
     fn native_launch_descriptor_set_must_be_complete_and_unique() {
         assert!(descriptors_are_distinct(&[3, 4, 5, 6, 7]));
         assert!(!descriptors_are_distinct(&[3, 4, 4, 6, 7]));
         assert!(!descriptors_are_distinct(&[3, -1, 5, 6, 7]));
+    }
+
+    #[test]
+    fn packaged_runtime_crate_private_entrypoint_stays_linked() {
+        // Keep the supervisor reachable inside the crate so macOS `-D warnings`
+        // does not treat it as dead code, without crate-root re-export or
+        // capability admission. This is not launch, boot, or qualification proof.
+        let _launch = IsolatedVisualPackagedRuntime::launch;
+        let _start = IsolatedVisualPackagedRuntime::start;
+        let _read_frame = IsolatedVisualPackagedRuntime::read_frame;
+        let _write_input = IsolatedVisualPackagedRuntime::write_input;
+        let _stop = IsolatedVisualPackagedRuntime::stop;
+        let _complete_cleanup = IsolatedVisualPackagedRuntime::complete_cleanup;
+        let _complete_observed_cleanup = IsolatedVisualPackagedRuntime::complete_observed_cleanup;
+        let _runtime = IsolatedVisualPackagedRuntime::runtime;
     }
 }

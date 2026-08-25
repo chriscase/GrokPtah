@@ -128,16 +128,37 @@ touch -d '@0' "$work/initramfs/init"
 (cd "$work/initramfs" && printf './init\n' | cpio --quiet --create --format=newc --owner=0:0 --reproducible > "$initramfs")
 
 make -C "$kernel" ARCH=arm64 LLVM=1 KCONFIG_NOTIMESTAMP=1 defconfig
-"$kernel/scripts/kconfig/merge_config.sh" -m -r "$kernel/.config" \
+# merge_config.sh writes KCONFIG_CONFIG relative to CWD unless -O is set.
+# Hosted CI CWD is the repository root, so a CWD merge left the kernel
+# tree's .config as stock defconfig and olddefconfig reported no change
+# while CONFIG_INITRAMFS_SOURCE never reached require_config.
+"$kernel/scripts/kconfig/merge_config.sh" -m -r -O "$kernel" "$kernel/.config" \
   "$script_dir/kernel.config.fragment"
 make -C "$kernel" ARCH=arm64 LLVM=1 KCONFIG_NOTIMESTAMP=1 olddefconfig
 
 require_config() {
-  grep -Fx "$1" "$kernel/.config" >/dev/null || {
-    echo "kernel configuration lost required setting: $1" >&2
-    exit 65
-  }
+  wanted=$1
+  if grep -Fx "$wanted" "$kernel/.config" >/dev/null; then
+    return 0
+  fi
+  # After olddefconfig, kconfig writes disabled bools as
+  # `# CONFIG_FOO is not set` rather than `CONFIG_FOO=n`. The fragment still
+  # uses `=n` so merge_config.sh can override defconfig's `=y`.
+  case "$wanted" in
+    CONFIG_*=n)
+      name=${wanted%=n}
+      if grep -Fx "# ${name} is not set" "$kernel/.config" >/dev/null; then
+        return 0
+      fi
+      ;;
+  esac
+  echo "kernel configuration lost required setting: $wanted" >&2
+  echo "observed INITRAMFS/INITRD/MODULES lines:" >&2
+  grep -E '^(CONFIG_(BLK_DEV_INITRD|INITRAMFS_|MODULES)=|# CONFIG_MODULES is not set)' \
+    "$kernel/.config" >&2 || true
+  exit 65
 }
+require_config CONFIG_BLK_DEV_INITRD=y
 require_config 'CONFIG_INITRAMFS_SOURCE="grokptah-initramfs.cpio"'
 require_config CONFIG_VSOCKETS=y
 require_config CONFIG_VIRTIO_VSOCKETS=y

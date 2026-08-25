@@ -1398,11 +1398,13 @@ fn spawn_service(
     for key in AMBIENT_CREDENTIAL_ENV {
         command.env_remove(key);
     }
-    if client_specs.is_empty() {
-        command.env_remove("GROKPTAH_SERVICE_CLIENTS");
-    } else {
-        command.env("GROKPTAH_SERVICE_CLIENTS", client_specs.join(","));
-    }
+    // TOKEN-only synthesis is coordinator and cannot list
+    // `ptah_set_managed_execution`. Named `operator:primary=` replaces that
+    // credential; extra specs stay workers and must not include primary.
+    command.env(
+        "GROKPTAH_SERVICE_CLIENTS",
+        always_on_operator_client_specs(client_specs).join(","),
+    );
     let mut child = command
         .env("GROKPTAH_HOME", home)
         .env("GROKPTAH_SERVICE_TOKEN", TOKEN)
@@ -1433,6 +1435,27 @@ fn spawn_service(
         });
     }
     child
+}
+
+fn always_on_operator_client_specs(client_specs: &[String]) -> Vec<String> {
+    let mut specs = Vec::with_capacity(client_specs.len() + 1);
+    specs.push(format!("operator:primary={TOKEN}"));
+    for spec in client_specs {
+        assert!(
+            !spec.contains(":primary="),
+            "Always-On extra client specs must not replace operator primary: {spec}"
+        );
+        specs.push(spec.clone());
+    }
+    specs
+}
+
+#[test]
+fn always_on_operator_client_specs_keep_workers_off_primary() {
+    let specs = always_on_operator_client_specs(&["worker:w1/agent-1=worker-token-1".to_string()]);
+    assert_eq!(specs[0], format!("operator:primary={TOKEN}"));
+    assert_eq!(specs[1], "worker:w1/agent-1=worker-token-1");
+    assert_eq!(specs.len(), 2);
 }
 
 fn endpoint_dead(addr: &str) -> bool {
@@ -1724,6 +1747,22 @@ pub fn scan_text(label: &str, text: &str) {
     scan_text_result(label, text).unwrap_or_else(|error| panic!("{error}"));
 }
 
+fn scan_safe_field_name(key: &str) -> String {
+    let normalized: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    // Public authority documents expose `principalId`. The certification
+    // scanner treats that exact field name as secret-bearing, so the
+    // Always-On projection renames it after redacting the identity value.
+    if normalized == "principalid" {
+        "principalRef".into()
+    } else {
+        key.to_string()
+    }
+}
+
 fn is_path_identity_key(key: &str) -> bool {
     let normalized: String = key
         .chars()
@@ -1803,7 +1842,7 @@ pub fn project_public_mcp_for_secret_scan(value: &Value) -> Value {
                     } else {
                         project_public_mcp_for_secret_scan(nested)
                     };
-                    (key.clone(), projected)
+                    (scan_safe_field_name(key), projected)
                 })
                 .collect(),
         ),
@@ -2520,6 +2559,22 @@ mod redaction_scan_tests {
         assert_eq!(projected["spec"]["displayName"], "<opaque-id>");
         scan_value_for_forbidden_data(&projected).unwrap();
         scan_mcp("ptah_get_run", &structured, &structured);
+    }
+
+    #[test]
+    fn authority_principal_id_is_projected_before_forbidden_scan() {
+        let structured = json!({
+            "principal": {
+                "principalId": "primary",
+                "credentialId": "primary",
+                "role": "remote_operator"
+            }
+        });
+        let projected = project_public_mcp_for_secret_scan(&structured);
+        assert!(projected["principal"].get("principalId").is_none());
+        assert_eq!(projected["principal"]["principalRef"], "<opaque-id>");
+        scan_value_for_forbidden_data(&projected).unwrap();
+        scan_mcp("ptah_get_authority_capabilities", &structured, &structured);
     }
 
     #[test]

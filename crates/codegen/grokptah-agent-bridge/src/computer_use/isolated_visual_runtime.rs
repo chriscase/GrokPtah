@@ -226,8 +226,28 @@ impl IsolatedVisualRuntimeSession {
         self.lifecycle.complete_cleanup(evidence)
     }
 
+    /// Completes cleanup from host-observed process/handle/overlay/cache facts.
+    /// Evidence construction stays crate-private so a coordinator cannot
+    /// manufacture terminal authority from serialized booleans.
+    pub fn complete_observed_cleanup(
+        &mut self,
+        helper_process_absent: bool,
+        no_open_handles: bool,
+        overlay_removed: bool,
+        frame_cache_removed: bool,
+    ) -> ComputerResult<()> {
+        let evidence = IsolatedVisualCleanupEvidence::verified(
+            self.lifecycle.contract().surface.clone(),
+            helper_process_absent,
+            no_open_handles,
+            overlay_removed,
+            frame_cache_removed,
+        )?;
+        self.complete_cleanup(&evidence)
+    }
+
     /// Records helper/runtime failure without skipping cleanup evidence.
-    pub(crate) fn fail(&mut self) -> ComputerResult<()> {
+    pub fn fail(&mut self) -> ComputerResult<()> {
         self.input_gate.poison();
         self.lifecycle.fail()
     }
@@ -267,6 +287,8 @@ mod tests {
         }
     }
 
+    const REQUEST_NONCE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
     #[test]
     fn runtime_requires_binding_before_channels_and_stop() {
         let contract = contract();
@@ -289,7 +311,7 @@ mod tests {
         let mut guest =
             IsolatedVisualFrameCarrier::new_guest_with_challenge(&contract, &[7; 32]).unwrap();
         let chunks = guest
-            .seal_frame(1, "00112233445566778899aabbccddeeff", 2, 2, &[1, 2, 3, 4])
+            .seal_frame(1, REQUEST_NONCE, 2, 2, &[1, 2, 3, 4])
             .unwrap();
         assert_eq!(
             runtime.open_frame_chunk(&chunks[0]).unwrap().unwrap().bytes,
@@ -298,7 +320,7 @@ mod tests {
         let packet = runtime
             .seal_input(
                 1,
-                "00112233445566778899aabbccddeeff",
+                REQUEST_NONCE,
                 IsolatedVisualInputMessage::PointerMove { x: 1, y: 1 },
             )
             .unwrap();
@@ -330,7 +352,7 @@ mod tests {
         assert!(runtime
             .seal_input(
                 1,
-                "00112233445566778899aabbccddeeff",
+                REQUEST_NONCE,
                 IsolatedVisualInputMessage::Text { text: "x".into() }
             )
             .is_err());

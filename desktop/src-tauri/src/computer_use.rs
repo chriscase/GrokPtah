@@ -7,10 +7,10 @@ use chrono::{Duration, Utc};
 use grokptah_agent_bridge::MacOsObservationPlatform;
 use grokptah_agent_bridge::{
     canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
-    ComputerAgentProposal, ComputerAttentionPoint, ComputerAuthorityToken,
-    ComputerBackendPublicView, ComputerBackgroundSafetyReceipt, ComputerCapabilities,
-    ComputerEmergencyControlToken, ComputerError, ComputerLocalApproval, ComputerObservation,
-    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerAgentActionProposal, ComputerAgentProposal, ComputerAttentionPoint,
+    ComputerAuthorityToken, ComputerBackendPublicView, ComputerBackgroundSafetyReceipt,
+    ComputerCapabilities, ComputerEmergencyControlToken, ComputerError, ComputerLocalApproval,
+    ComputerObservation, ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerRun, ComputerRunEventPage, ComputerRunProjection,
     ComputerRunState, ComputerSurfaceCoordination, ComputerTargetCandidate,
     ComputerUncertainSurfaceLease, ComputerUseLimits, ComputerUseService, SemanticAction,
@@ -737,16 +737,18 @@ impl DesktopComputerUse {
             return Err("Resolve or discard the current Computer Use approval first".into());
         }
         if proposal_origin == ComputerProposalOrigin::Agent {
+            let request_id = Uuid::new_v4().to_string();
+            let caller = self.operator_token(owner_session_id)?;
             service
-                .record_agent_action_proposal(
-                    &Uuid::new_v4().to_string(),
-                    &self.operator_token(owner_session_id)?,
+                .record_agent_action_proposal(ComputerAgentActionProposal {
+                    request_id: &request_id,
+                    caller: &caller,
                     run_id,
                     expected_version,
                     observation_id,
                     action_class,
                     attention,
-                )
+                })
                 .map_err(|error| error.to_string())?;
         }
         pending.insert(

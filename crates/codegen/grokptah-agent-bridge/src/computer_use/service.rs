@@ -21,7 +21,22 @@ use super::types::{
     ComputerControlDisposition, ComputerEmergencyControlToken, ComputerError, ComputerErrorCode,
     ComputerObservation, ComputerResult, ComputerRun, ComputerRunState, ComputerSurfaceEvent,
     ComputerTarget, ComputerUseLimits, ObservationAuthority, ResolvedAgentComputerRunAdmission,
+    SurfaceAuditInput,
 };
+
+/// Exact inputs for one redaction-safe agent action proposal record.
+/// Bundled so the desktop/control contract stays explicit without an 8-argument
+/// function at this mutation boundary.
+#[derive(Debug, Clone, Copy)]
+pub struct ComputerAgentActionProposal<'a> {
+    pub request_id: &'a str,
+    pub caller: &'a ComputerAuthorityToken,
+    pub run_id: &'a str,
+    pub expected_version: u64,
+    pub observation_id: &'a str,
+    pub action_class: ActionClass,
+    pub attention: Option<ComputerAttentionPoint>,
+}
 
 pub struct ComputerUseService {
     backend: Arc<dyn ComputerBackend>,
@@ -648,14 +663,17 @@ impl ComputerUseService {
     /// semantic action against the local observation.
     pub fn record_agent_action_proposal(
         &self,
-        request_id: &str,
-        caller: &ComputerAuthorityToken,
-        run_id: &str,
-        expected_version: u64,
-        observation_id: &str,
-        action_class: ActionClass,
-        attention: Option<ComputerAttentionPoint>,
+        proposal: ComputerAgentActionProposal<'_>,
     ) -> ComputerResult<ComputerRun> {
+        let ComputerAgentActionProposal {
+            request_id,
+            caller,
+            run_id,
+            expected_version,
+            observation_id,
+            action_class,
+            attention,
+        } = proposal;
         validate_id("run_id", run_id)?;
         validate_id("observation_id", observation_id)?;
         if !matches!(action_class, ActionClass::Semantic | ActionClass::TextEntry) {
@@ -702,35 +720,35 @@ impl ComputerUseService {
                     ));
                 }
                 run.updated_at = Utc::now();
-                run.record_surface_audit(
-                    ComputerSurfaceEvent::ActionProposed,
-                    "action_proposed",
-                    "staged",
-                    Some(action_class),
-                    Some(observation_id.into()),
-                    None,
-                    None,
-                );
+                run.record_surface_audit(SurfaceAuditInput {
+                    surface_event: ComputerSurfaceEvent::ActionProposed,
+                    operation: "action_proposed",
+                    disposition: "staged",
+                    action_class: Some(action_class),
+                    observation_id: Some(observation_id.into()),
+                    error_code: None,
+                    attention: None,
+                });
                 if let Some(point) = attention {
-                    run.record_surface_audit(
-                        ComputerSurfaceEvent::AttentionMoved,
-                        "attention",
-                        "moved",
-                        Some(action_class),
-                        Some(observation_id.into()),
-                        None,
-                        Some(point),
-                    );
+                    run.record_surface_audit(SurfaceAuditInput {
+                        surface_event: ComputerSurfaceEvent::AttentionMoved,
+                        operation: "attention",
+                        disposition: "moved",
+                        action_class: Some(action_class),
+                        observation_id: Some(observation_id.into()),
+                        error_code: None,
+                        attention: Some(point),
+                    });
                 }
-                run.record_surface_audit(
-                    ComputerSurfaceEvent::ApprovalRequired,
-                    "approval",
-                    "required",
-                    Some(action_class),
-                    Some(observation_id.into()),
-                    None,
-                    None,
-                );
+                run.record_surface_audit(SurfaceAuditInput {
+                    surface_event: ComputerSurfaceEvent::ApprovalRequired,
+                    operation: "approval",
+                    disposition: "required",
+                    action_class: Some(action_class),
+                    observation_id: Some(observation_id.into()),
+                    error_code: None,
+                    attention: None,
+                });
                 Ok(())
             })
             .and_then(|run| run.ok_or_else(unknown_run));
@@ -794,15 +812,15 @@ impl ComputerUseService {
                     ));
                 }
                 run.updated_at = Utc::now();
-                run.record_surface_audit(
-                    ComputerSurfaceEvent::ApprovalRejected,
-                    "approval",
-                    "rejected",
-                    Some(action_class),
-                    Some(observation_id.into()),
-                    None,
-                    None,
-                );
+                run.record_surface_audit(SurfaceAuditInput {
+                    surface_event: ComputerSurfaceEvent::ApprovalRejected,
+                    operation: "approval",
+                    disposition: "rejected",
+                    action_class: Some(action_class),
+                    observation_id: Some(observation_id.into()),
+                    error_code: None,
+                    attention: None,
+                });
                 Ok(())
             })
             .and_then(|run| run.ok_or_else(unknown_run));
@@ -2447,15 +2465,15 @@ mod tests {
         };
         let attention = ComputerAttentionPoint::for_action(&observation, &action);
         let staged = service
-            .record_agent_action_proposal(
-                "stage-agent-attention",
-                &token,
-                &run.run_id,
-                current.version,
-                &observation.observation_id,
-                action.class(),
+            .record_agent_action_proposal(ComputerAgentActionProposal {
+                request_id: "stage-agent-attention",
+                caller: &token,
+                run_id: &run.run_id,
+                expected_version: current.version,
+                observation_id: &observation.observation_id,
+                action_class: action.class(),
                 attention,
-            )
+            })
             .unwrap();
 
         assert_eq!(staged.version, current.version);
@@ -2480,15 +2498,15 @@ mod tests {
             .contains("not persisted in attention evidence"));
 
         let replayed = service
-            .record_agent_action_proposal(
-                "stage-agent-attention",
-                &token,
-                &run.run_id,
-                current.version,
-                &observation.observation_id,
-                action.class(),
+            .record_agent_action_proposal(ComputerAgentActionProposal {
+                request_id: "stage-agent-attention",
+                caller: &token,
+                run_id: &run.run_id,
+                expected_version: current.version,
+                observation_id: &observation.observation_id,
+                action_class: action.class(),
                 attention,
-            )
+            })
             .unwrap();
         assert_eq!(replayed.audit.len(), staged.audit.len());
 

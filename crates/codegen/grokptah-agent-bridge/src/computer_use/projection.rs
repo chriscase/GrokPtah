@@ -648,7 +648,7 @@ mod tests {
     use super::*;
     use crate::computer_use::types::{
         ActionGrant, ActionOutcome, ComputerObservation, ComputerTarget, EvidenceRef,
-        ObservationGeometry, SemanticElement,
+        ObservationGeometry, SemanticElement, SurfaceAuditInput,
     };
 
     fn target() -> ComputerTarget {
@@ -893,19 +893,19 @@ mod tests {
     fn event_entries_serialize_only_the_pinned_audit_keys() {
         let mut run = run();
         run.current_observation = Some(observation_with_secrets(&run.target.clone()));
-        run.record_surface_audit(
-            ComputerSurfaceEvent::AttentionMoved,
-            "attention",
-            "moved",
-            Some(ActionClass::Semantic),
-            Some("observation-01234567-89ab-cdef-0123-456789abcdef".into()),
-            None,
-            Some(ComputerAttentionPoint {
+        run.record_surface_audit(SurfaceAuditInput {
+            surface_event: ComputerSurfaceEvent::AttentionMoved,
+            operation: "attention",
+            disposition: "moved",
+            action_class: Some(ActionClass::Semantic),
+            observation_id: Some("observation-01234567-89ab-cdef-0123-456789abcdef".into()),
+            error_code: None,
+            attention: Some(ComputerAttentionPoint {
                 x_basis_points: 3_000,
                 y_basis_points: 1_700,
                 target: super::super::types::ComputerAttentionTarget::SemanticElement,
             }),
-        );
+        });
         let page = project_events(&run, None, 10);
         let wire = serde_json::to_string(&page).unwrap();
         assert!(!wire.contains("observation-01234567-89ab-cdef-0123-456789abcdef"));

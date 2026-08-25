@@ -165,14 +165,29 @@ impl<ER, CW, FR, IW> IsolatedVisualRuntimeDriver<ER, CW, FR, IW> {
             .send_stop_with_timeout(&mut self.runtime, disposition, timeout)
     }
 
-    pub(crate) fn complete_cleanup(
+    pub fn complete_cleanup(
         &mut self,
         evidence: &IsolatedVisualCleanupEvidence,
     ) -> ComputerResult<()> {
         self.runtime.complete_cleanup(evidence)
     }
 
-    pub(crate) fn fail(&mut self) -> ComputerResult<()> {
+    pub fn complete_observed_cleanup(
+        &mut self,
+        helper_process_absent: bool,
+        no_open_handles: bool,
+        overlay_removed: bool,
+        frame_cache_removed: bool,
+    ) -> ComputerResult<()> {
+        self.runtime.complete_observed_cleanup(
+            helper_process_absent,
+            no_open_handles,
+            overlay_removed,
+            frame_cache_removed,
+        )
+    }
+
+    pub fn fail(&mut self) -> ComputerResult<()> {
         self.runtime.fail()
     }
 
