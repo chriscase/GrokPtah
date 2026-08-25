@@ -520,6 +520,28 @@ impl TaskKind {
     }
 }
 
+fn worker_mode_allows_task(
+    worker_mode: SubagentCapabilityMode,
+    task_mode: SubagentCapabilityMode,
+) -> bool {
+    match worker_mode {
+        SubagentCapabilityMode::ReadOnly => task_mode == SubagentCapabilityMode::ReadOnly,
+        SubagentCapabilityMode::ReadWrite => {
+            matches!(
+                task_mode,
+                SubagentCapabilityMode::ReadOnly | SubagentCapabilityMode::ReadWrite
+            )
+        }
+        SubagentCapabilityMode::Execute => {
+            matches!(
+                task_mode,
+                SubagentCapabilityMode::ReadOnly | SubagentCapabilityMode::Execute
+            )
+        }
+        SubagentCapabilityMode::All => false,
+    }
+}
+
 /// One node in the task graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -588,6 +610,42 @@ impl TaskSpec {
                 self.task_id
             )));
         }
+        match self.capability_mode {
+            SubagentCapabilityMode::ReadWrite
+                if !self
+                    .capabilities
+                    .contains(&WorkerCapability::WriteWorkspace)
+                    && !self
+                        .capabilities
+                        .contains(&WorkerCapability::ExecuteInWorktree) =>
+            {
+                return Err(SwarmError::capability(format!(
+                    "read-write task '{}' declares no mutating capability",
+                    self.task_id
+                )));
+            }
+            SubagentCapabilityMode::Execute
+                if !self
+                    .capabilities
+                    .contains(&WorkerCapability::ExecuteInWorktree) =>
+            {
+                return Err(SwarmError::capability(format!(
+                    "execute task '{}' must declare ExecuteInWorktree",
+                    self.task_id
+                )));
+            }
+            SubagentCapabilityMode::Execute
+                if self
+                    .capabilities
+                    .contains(&WorkerCapability::WriteWorkspace) =>
+            {
+                return Err(SwarmError::invalid(format!(
+                    "execute task '{}' cannot declare WriteWorkspace",
+                    self.task_id
+                )));
+            }
+            _ => {}
+        }
         if self.dependencies.len() > MAX_DEPENDENCIES {
             return Err(SwarmError::bound(format!(
                 "task '{}' declares more than {MAX_DEPENDENCIES} dependencies",
@@ -653,6 +711,14 @@ impl TaskSpec {
                 self.task_id
             )));
         }
+        if !worker_mode_allows_task(worker.capability_mode, self.capability_mode) {
+            return Err(SwarmError::capability(format!(
+                "task '{}' requests capability mode '{}' beyond the worker's '{}'",
+                self.task_id,
+                self.capability_mode.as_str(),
+                worker.capability_mode.as_str()
+            )));
+        }
         let required_capability = match self.kind {
             TaskKind::Work => WorkerCapability::ReadWorkspace,
             TaskKind::Review => WorkerCapability::Review,
@@ -677,6 +743,22 @@ impl TaskSpec {
         {
             return Err(SwarmError::capability(format!(
                 "task '{}' requests a capability its worker does not hold",
+                self.task_id
+            )));
+        }
+        let task_mutates = self.capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                WorkerCapability::WriteWorkspace
+                    | WorkerCapability::ExecuteInWorktree
+                    | WorkerCapability::ComputerUseLeased
+            )
+        });
+        if (self.capability_mode != SubagentCapabilityMode::ReadOnly || task_mutates)
+            && worker.isolation != IsolationRequirement::Worktree
+        {
+            return Err(SwarmError::invalid(format!(
+                "task '{}' requires worktree isolation for its effective capability mode",
                 self.task_id
             )));
         }

@@ -50,9 +50,11 @@ existing rule that a model name is never proof of capability.
 run commands must require a dedicated worktree; so must any worker that is not
 read-only. This mirrors `SUBAGENT_ISOLATION.md` rather than restating it, and
 `IsolationRequirement::as_subagent_isolation` projects straight onto the
-existing `SubagentIsolationMode` wire enum. As in that document, worktree
-separation prevents routine edit collisions; it is not an operating-system
-sandbox, and nothing here claims otherwise.
+existing `SubagentIsolationMode` wire enum. Each task also declares its exact
+capability set and mode; the mode must be no broader than its worker's mode,
+and the effective task authority determines the worktree requirement. As in
+that document, worktree separation prevents routine edit collisions; it is not
+an operating-system sandbox, and nothing here claims otherwise.
 
 **No browser or raw-host authority is expressible.** `WorkerCapability` is a
 closed set with no browser variant and no raw-host variant, so no specification

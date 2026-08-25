@@ -412,6 +412,31 @@ fn dispatch_intent_uses_the_task_capability_set() {
 }
 
 #[test]
+fn a_read_only_worker_cannot_run_an_execute_task() {
+    let mut spec = single_task_spec();
+    spec.workers[0].capability_mode = SubagentCapabilityMode::ReadOnly;
+    spec.workers[0].capabilities = [WorkerCapability::ReadWorkspace].into_iter().collect();
+    spec.workers[0].isolation = IsolationRequirement::SharedReadOnly;
+    spec.tasks[0].capability_mode = SubagentCapabilityMode::Execute;
+    spec.tasks[0].capabilities = [WorkerCapability::ReadWorkspace].into_iter().collect();
+    expect_rejected(spec, SwarmErrorCode::CapabilityNotGranted);
+
+    let mut spec = single_task_spec();
+    spec.workers[0].capability_mode = SubagentCapabilityMode::ReadOnly;
+    spec.workers[0].capabilities = [WorkerCapability::ReadWorkspace].into_iter().collect();
+    spec.workers[0].isolation = IsolationRequirement::Worktree;
+    spec.tasks[0].capability_mode = SubagentCapabilityMode::Execute;
+    spec.tasks[0].capabilities = [
+        WorkerCapability::ReadWorkspace,
+        WorkerCapability::ExecuteInWorktree,
+    ]
+    .into_iter()
+    .collect();
+    let message = expect_rejected(spec, SwarmErrorCode::CapabilityNotGranted);
+    assert!(message.contains("beyond the worker"), "{message}");
+}
+
+#[test]
 fn a_synthesis_task_must_declare_a_review_quorum() {
     let mut spec = diamond_spec(QuorumRule::Unanimous);
     spec.tasks[5].review_gate = None;
