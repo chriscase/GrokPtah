@@ -43,8 +43,22 @@ fn utf8_worker(state: ExternalWorkerState) -> ExternalWorkerRecord {
 #[test]
 fn context_desk_consumer_imports_only_crate_root_surfaces() {
     let source = include_str!("context_desk_consumer.rs");
+    let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
     let module_path = ["grokptah_agent_sdk", "external_worker"].join("::");
     let error_module = ["grokptah_agent_sdk", "error", ""].join("::");
+    let native_crate = ["grokptah", "agent", "bridge"].join("-");
+    let native_module = ["grokptah", "agent", "bridge"].join("_");
+    let tauri_package = ["@", "tauri", "-apps"].join("");
+    let trusted_export = ["client", "trusted"].join("/");
+    let bearer_header = ["Authorization", "Bearer"].join(": ");
+    let desktop_src = ["src", "tauri"].join("-");
+    assert!(
+        source
+            .lines()
+            .filter(|line| line.trim_start().starts_with("use "))
+            .all(|line| line.trim_start().starts_with("use grokptah_agent_sdk::{")),
+        "ContextDesk consumer must import only crate-root SDK surfaces"
+    );
     assert!(
         !source.contains(&module_path),
         "ContextDesk consumer must not reach through the external_worker module path"
@@ -53,11 +67,25 @@ fn context_desk_consumer_imports_only_crate_root_surfaces() {
         !source.contains(&error_module),
         "ContextDesk consumer must not reach through the error module path"
     );
-    let native_crate = ["grokptah", "agent", "bridge"].join("-");
-    let native_module = ["grokptah", "agent", "bridge"].join("_");
     assert!(
-        !source.contains(&native_crate) && !source.contains(&native_module),
+        !source.contains(&native_crate)
+            && !source.contains(&native_module)
+            && !source.contains(&desktop_src),
         "ContextDesk consumer must not depend on the native desktop bridge"
+    );
+    assert!(
+        !source.contains(&tauri_package) && !source.contains(&trusted_export),
+        "ContextDesk consumer must stay Tauri-free and must not import trusted modules"
+    );
+    assert!(
+        !source.contains(&bearer_header),
+        "ContextDesk consumer must not carry bearer credentials"
+    );
+    assert!(
+        !manifest.contains(&native_crate)
+            && !manifest.contains(&tauri_package)
+            && !manifest.contains("tauri"),
+        "public SDK package must stay host-neutral and Tauri-free"
     );
 }
 
@@ -75,9 +103,10 @@ fn context_desk_consumer_round_trips_list_archive_unarchive_with_utf8_names() {
         .expect("UTF-8 identity cursor is valid at the crate root");
     let query_json = serde_json::to_value(&query).expect("list query serializes");
     assert_eq!(query_json["cursor"], "page-审查-1");
+    assert_eq!(query_json["includeArchived"], false);
     assert!(
-        query_json.get("includeArchived").is_none(),
-        "includeArchived false must be omitted rather than inheriting a provider default"
+        query_json["includeArchived"].is_boolean(),
+        "includeArchived false must serialize as a boolean, not JSON null"
     );
     let query_round: ExternalWorkerListQuery =
         serde_json::from_value(query_json).expect("list query deserializes");
@@ -143,8 +172,10 @@ fn context_desk_consumer_round_trips_list_archive_unarchive_with_utf8_names() {
     archived.validate().expect("archived UTF-8 worker is valid");
     let archived_json = serde_json::to_value(&archived).expect("archived worker serializes");
     assert_eq!(archived_json["state"], "archived");
+    assert_eq!(archived_json["externalAgentId"], "agent-审查-1");
     assert!(archived_json.get("name").is_none());
     assert!(archived_json.get("apiKey").is_none());
+    assert!(archived_json.get("authorization").is_none());
     let archived_round: ExternalWorkerRecord =
         serde_json::from_value(archived_json).expect("archived worker deserializes");
     archived_round
@@ -157,6 +188,8 @@ fn context_desk_consumer_round_trips_list_archive_unarchive_with_utf8_names() {
     restored.validate().expect("unarchived worker is valid");
     let restored_json = serde_json::to_value(&restored).expect("unarchived worker serializes");
     assert_eq!(restored_json["state"], "ready");
+    assert_eq!(restored_json["externalAgentId"], "agent-审查-1");
+    assert_ne!(restored_json["state"], "archived");
     let restored_round: ExternalWorkerRecord =
         serde_json::from_value(restored_json).expect("unarchived worker deserializes");
     restored_round
