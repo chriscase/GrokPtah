@@ -15,7 +15,7 @@ import { HELP_RETRIEVAL_FIXTURES } from "./helpCenter.fixtures";
 
 describe("offline Help Center corpus", () => {
   it("keeps a stable, non-empty article inventory", () => {
-    expect(HELP_ARTICLES).toHaveLength(12);
+    expect(HELP_ARTICLES).toHaveLength(18);
     expect(new Set(HELP_ARTICLES.map((article) => article.id)).size).toBe(
       HELP_ARTICLES.length,
     );

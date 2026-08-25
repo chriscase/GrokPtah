@@ -169,6 +169,72 @@ export const HELP_ARTICLES: HelpArticle[] = [
     keywords: ["assistant", "help", "citation", "confirmation", "privacy", "offline", "draft"],
     sources: [{ id: "verification.guide", path: "docs/VERIFICATION.md", heading: "Verification paths" }],
   },
+  {
+    id: "operations.durable-recovery",
+    title: "Recover a durable run safely",
+    topic: "operations",
+    summary: "Resume from an explicit checkpoint without guessing whether a send happened.",
+    body:
+      "Durable runs expose a state, cursor, and evidence trail that survive an app restart. Reconnect from the advertised cursor, treat uncertain delivery as unknown, and use an explicit retry or continuation action. Never infer that a linked session or a visible queue means a provider request was sent.",
+    aliases: ["restart a run", "recover interrupted agent", "resume after crash", "unknown send", "checkpoint recovery"],
+    keywords: ["durable", "restart", "recover", "checkpoint", "cursor", "retry", "uncertain", "resume"],
+    sources: [{ id: "durable.runs", path: "docs/DURABLE_RUNS.md", heading: "Recovery contract" }],
+  },
+  {
+    id: "operations.prompt-queue",
+    title: "Queue and steer prompts",
+    topic: "operations",
+    summary: "Keep future prompts ordered while steering only the active run you intend.",
+    body:
+      "The prompt queue is scoped to a session and carries revisions so an out-of-order snapshot cannot overwrite a newer queue. Queue a future prompt when the current turn should finish; use steering only when the run exposes that control. A stale revision or uncertain delivery must fail closed instead of silently targeting another turn.",
+    aliases: ["prompt queue", "steer agent", "send next prompt", "queue work", "deferred steering"],
+    keywords: ["queue", "prompt", "steer", "revision", "session", "ordering", "stale"],
+    sources: [{ id: "durable.queue", path: "docs/PERSISTENT_AGENT_PROTOCOL.md", heading: "Queue and steering" }],
+  },
+  {
+    id: "operations.review-receipts",
+    title: "Read review receipts and changes",
+    topic: "operations",
+    summary: "Verify the exact changed files and evidence before approving a run.",
+    body:
+      "A review receipt binds the changed-file list, bounded diff, fingerprint, tests, and handoff to one run identity. Check the exact workspace and revision, inspect the redacted evidence, and keep approval separate from promotion. A green provider response without a matching receipt is not approval evidence.",
+    aliases: ["review changes", "approval receipt", "changed file list", "diff fingerprint", "approve code review"],
+    keywords: ["review", "receipt", "changed", "diff", "fingerprint", "approval", "promotion", "handoff"],
+    sources: [{ id: "review.protocol", path: "docs/INDEPENDENT_REVIEW_PROTOCOL.md", heading: "Review receipt" }],
+  },
+  {
+    id: "operations.mcp-coordination",
+    title: "Coordinate MCP tools and live events",
+    topic: "operations",
+    summary: "Use negotiated MCP tools without treating transport reachability as authority.",
+    body:
+      "MCP coordination negotiates a versioned capability set, session scope, and event cursor. The transport can report a tool, but the desktop authority still applies approvals, leases, workspace fences, and redaction. Reconnect from the advertised cursor and handle recovery notifications instead of replaying an uncertain mutation.",
+    aliases: ["MCP tools", "tool coordinator", "live events", "MCP reconnect", "capability negotiation"],
+    keywords: ["MCP", "tool", "coordinator", "capability", "cursor", "reconnect", "authority", "event"],
+    sources: [{ id: "mcp.coordinator", path: "docs/MCP_CONTROL_COORDINATOR.md", heading: "Coordinator contract" }],
+  },
+  {
+    id: "providers.browser-broker",
+    title: "Embed GrokPtah in a War Room",
+    topic: "providers",
+    summary: "Give a browser observe/review powers through a broker without exposing desktop authority.",
+    body:
+      "A War Room or other browser UI uses the browser-safe broker client with an authenticated session, opaque binding and run IDs, CSRF protection, and idempotency keys. The broker owns provider credentials and re-checks user, team, workspace, capability, and run scope. Browser code must never receive a bearer token, raw path, or native Computer Use authority.",
+    aliases: ["ContextDesk integration", "War Room broker", "browser client", "embed GrokPtah", "web UI integration"],
+    keywords: ["browser", "broker", "War Room", "embed", "ContextDesk", "opaque", "CSRF", "credential"],
+    sources: [{ id: "embedding.guide", path: "docs/EMBEDDING.md", heading: "Browser / War Room example" }],
+  },
+  {
+    id: "computer-use.consent",
+    title: "Approve a Computer Use action",
+    topic: "computer-use",
+    summary: "Understand the one-use consent, postcondition, and takeover controls around visual actions.",
+    body:
+      "Observation and control are separate capabilities. Before a semantic action, verify the fresh target, scope, lease, and postcondition; approve only the action class you intend. Stop, Take over, focus changes, outdated visual state, secure fields, and cleanup uncertainty revoke authority or fail closed. A focused app window is not proof that an isolated target is safe.",
+    aliases: ["computer approval", "take over agent", "visual action consent", "postcondition", "semantic click safety"],
+    keywords: ["approve", "Computer", "consent", "lease", "postcondition", "takeover", "cleanup"],
+    sources: [{ id: "computer-use.overview", path: "docs/COMPUTER_USE.md", heading: "Approval and postconditions" }],
+  },
 ];
 
 export type HelpSearchResult = {

@@ -15,9 +15,10 @@ live provider qualification, and 100% release qualification remain open.
 
 ## Delivered behavior
 
-- Twelve stable article IDs cover sessions, search, providers, restricted
-  gateways, Grok Build boundaries, Computer Use, coordination, evidence,
-  Always-On operation, and help-assistant limits.
+- Eighteen stable article IDs cover sessions, search, providers, restricted
+  gateways, Grok Build boundaries, Computer Use, coordination, durable
+  recovery, prompt queues, MCP, broker embedding, review receipts, Always-On
+  operation, and help-assistant limits.
 - Offline lexical search is deterministic and labelled as offline; aliases and
   weighted fields support power-user paraphrases.
 - Meaning search and assistant requests require explicit confirmation, send
