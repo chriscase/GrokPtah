@@ -16,11 +16,18 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 45
     env:
-      # Keep every restored cache private to this job's disposable runner.
-      CARGO_HOME: ${{ runner.temp }}/grokptah-cargo-home
-      CARGO_TARGET_DIR: ${{ runner.temp }}/grokptah-target
       CARGO_INCREMENTAL: "0"
     steps:
+      # `runner` is not an available context in a job-level `env:` block, so
+      # setting these there silently yielded `/grokptah-cargo-home` and
+      # `/grokptah-target` at the filesystem root rather than the private
+      # per-runner locations this job intends. $RUNNER_TEMP is a real
+      # environment variable on the runner, so export from a step instead.
+      - name: Pin Cargo home and target to this runner's private temp
+        run: |
+          echo "CARGO_HOME=${RUNNER_TEMP}/grokptah-cargo-home" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/grokptah-target" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           clean: true
