@@ -148,6 +148,20 @@ or a team role is not a Computer Use grant. Computer control requests must
 carry the expected run revision and action class; stale revisions are rejected
 without mutation.
 
+The approval payload uses the same changed-file object shape as the
+`ReviewReceipt` projection; a path-only list is not sufficient evidence:
+
+```json
+{
+  "sourceFingerprint": "src-01J...",
+  "finalFingerprint": "final-01J...",
+  "changedFiles": [
+    { "path": "desktop/src/lib/grokptahBrokerClient.ts", "summary": "Typed broker approval contract" }
+  ],
+  "ttlMs": 300000
+}
+```
+
 The browser-facing client may carry these two routes as typed calls, but the
 client is not the authority: the broker must recompute or verify the review
 receipt, bind the approval to the same opaque run and fingerprints, enforce a

@@ -101,7 +101,7 @@ describe("GrokPtahBrokerClient", () => {
       {
         sourceFingerprint: "source-1",
         finalFingerprint: "final-1",
-        changedFiles: ["src/lib.ts"],
+        changedFiles: [{ path: "src/lib.ts", summary: "Updated broker client contract" }],
         ttlMs: 30_000,
       },
       "approve-intent-1",
@@ -114,7 +114,7 @@ describe("GrokPtahBrokerClient", () => {
     expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body))).toEqual({
       sourceFingerprint: "source-1",
       finalFingerprint: "final-1",
-      changedFiles: ["src/lib.ts"],
+      changedFiles: [{ path: "src/lib.ts", summary: "Updated broker client contract" }],
       ttlMs: 30_000,
     });
     expect(String(fetcher.mock.calls[1][0])).toBe(

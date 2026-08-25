@@ -35,10 +35,17 @@ export type GrokPtahBrokerRunRequest = {
 };
 
 /** The exact review evidence a broker must bind before issuing approval. */
+export type GrokPtahBrokerChangedFile = {
+  /** Repository-relative path from the authoritative review receipt. */
+  path: string;
+  /** Bounded human-readable summary from the authoritative review receipt. */
+  summary: string;
+};
+
 export type GrokPtahBrokerApprovalRequest = {
   sourceFingerprint: string;
   finalFingerprint: string;
-  changedFiles: string[];
+  changedFiles: GrokPtahBrokerChangedFile[];
   ttlMs?: number;
 };
 
@@ -49,7 +56,7 @@ export type GrokPtahBrokerApproval = {
   brokerRunId: string;
   sourceFingerprint: string;
   finalFingerprint: string;
-  changedFiles: string[];
+  changedFiles: GrokPtahBrokerChangedFile[];
   expiresAt: string;
 };
 
