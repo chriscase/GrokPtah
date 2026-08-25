@@ -106,6 +106,11 @@ export const HELP_RETRIEVAL_FIXTURES: HelpRetrievalFixture[] = [
     rationale: "paraphrase",
   },
   {
+    query: "spin up an isolated cloud coding agent",
+    expectedId: "providers.external-cloud-workers",
+    rationale: "paraphrase",
+  },
+  {
     query: "approve semantic action postcondition",
     expectedId: "computer-use.consent",
     rationale: "paraphrase",

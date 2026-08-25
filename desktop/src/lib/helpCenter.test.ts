@@ -25,7 +25,7 @@ function escapeRegExp(value: string): string {
 
 describe("offline Help Center corpus", () => {
   it("keeps a stable, non-empty article inventory", () => {
-    expect(HELP_ARTICLES).toHaveLength(18);
+    expect(HELP_ARTICLES).toHaveLength(19);
     expect(new Set(HELP_ARTICLES.map((article) => article.id)).size).toBe(
       HELP_ARTICLES.length,
     );
@@ -81,6 +81,9 @@ describe("offline Help Center corpus", () => {
     );
     expect(searchHelp("grok bot quota vs grok build")[0]?.article.id).toBe(
       "providers.grok-build-boundary",
+    );
+    expect(searchHelp("spin up an isolated cloud coding agent")[0]?.article.id).toBe(
+      "providers.external-cloud-workers",
     );
     expect(searchHelp("72 hour persistent workers")[0]?.article.id).toBe(
       "operations.always-on-soak",

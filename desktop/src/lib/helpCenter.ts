@@ -225,6 +225,20 @@ const HELP_ARTICLE_DATA: HelpArticle[] = [
     sources: [{ id: "embedding.guide", path: "docs/EMBEDDING.md", heading: "Browser / War Room example" }],
   },
   {
+    id: "providers.external-cloud-workers",
+    title: "Launch and monitor a cloud coding worker",
+    topic: "providers",
+    summary: "Spin up an isolated external coding agent and review its bounded evidence through the broker.",
+    body:
+      "External workers use the provider-neutral GrokPtah contract: pin the exact repository and starting ref, require isolated execution, monitor redacted status and cursor recovery, and collect only bounded relative artifacts. Cursor Cloud and future Claude Code adapters keep credentials server-side. Creating a draft PR never approves or merges changes; review receipts and the existing human promotion gate remain separate.",
+    aliases: ["cloud agent", "Cursor Cloud worker", "external coding agent", "spawn remote agent", "agent harness worker"],
+    keywords: ["cloud", "worker", "Cursor", "Claude", "external", "isolated", "artifact", "review", "promotion"],
+    sources: [
+      { id: "cursor.cloud.integration", path: "docs/CURSOR_CLOUD_INTEGRATION.md", heading: "GrokPtah architecture" },
+      { id: "embedding.external-workers", path: "docs/EMBEDDING.md", heading: "External cloud workers" },
+    ],
+  },
+  {
     id: "computer-use.consent",
     title: "Approve a Computer Use action",
     topic: "computer-use",
