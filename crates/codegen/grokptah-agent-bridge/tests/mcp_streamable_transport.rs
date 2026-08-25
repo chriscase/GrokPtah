@@ -887,8 +887,7 @@ async fn unknown_and_forbidden_tools_fail_closed_over_http() {
         // json_err redacts the internal "not available" phrasing onto the
         // stable public forbidden_scope envelope.
         assert_eq!(
-            body["error"]["message"],
-            "The requested scope is not allowed.",
+            body["error"]["message"], "The requested scope is not allowed.",
             "{name}: {body}"
         );
         assert_eq!(body["error"]["data"]["code"], "forbidden_scope");
