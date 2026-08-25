@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "build:public": "tsc -p tsconfig.lib.json && vite build --config vite.library.config.ts",
+    "build:public": "tsc -p tsconfig.lib.json && vite build --config vite.library.config.ts && node scripts/stage-public-package.mjs",
     "verify:public": "npm run build:public && node scripts/verify-public.mjs",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",

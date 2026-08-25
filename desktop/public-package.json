@@ -1,0 +1,17 @@
+{
+  "name": "@grokptah/client",
+  "version": "0.1.0",
+  "description": "Browser-safe GrokPtah broker client and headless UI primitives",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./types/public.d.ts",
+      "import": "./grokptah-public.js"
+    }
+  },
+  "files": [
+    "grokptah-public.js",
+    "types"
+  ]
+}
