@@ -1874,7 +1874,7 @@ mod tests {
             "authorization",
         ] {
             assert!(
-                PUBLIC_SECRET_NEEDLES.iter().any(|item| *item == needle),
+                PUBLIC_SECRET_NEEDLES.contains(&needle),
                 "canonical policy missing `{needle}`"
             );
             assert!(public_text_leaks_secret(needle), "{needle}");
