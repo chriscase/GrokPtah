@@ -277,9 +277,10 @@ pub struct ExternalWorkerListQuery {
     /// Opaque pagination cursor from a previous page's `next_cursor`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
-    /// When false, archived workers must not be included. Adapters send this
-    /// flag explicitly rather than inheriting a provider default.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// When false, archived workers must not be included. Serializers emit this
+    /// flag as an explicit boolean so consumers never see JSON null or inherit a
+    /// provider default. Omitted inbound values still deserialize as false.
+    #[serde(default)]
     pub include_archived: bool,
 }
 
@@ -781,6 +782,20 @@ mod tests {
             .expect("omitted includeArchived is false");
         assert!(!omitted.include_archived);
         assert_eq!(omitted.limit, None);
+        let serialized_default =
+            serde_json::to_value(&omitted).expect("default list query serializes");
+        assert_eq!(serialized_default["includeArchived"], false);
+        assert!(
+            serialized_default["includeArchived"].is_boolean(),
+            "includeArchived must serialize as a boolean, not JSON null"
+        );
+        assert!(
+            serde_json::from_value::<ExternalWorkerListQuery>(serde_json::json!({
+                "includeArchived": null
+            }))
+            .is_err(),
+            "includeArchived must fail closed on JSON null"
+        );
     }
 
     #[test]

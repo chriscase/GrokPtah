@@ -148,6 +148,12 @@ const utf8Query = parseExternalWorkerListQuery({
   includeArchived: false,
 });
 if (utf8Query?.cursor !== "page-审查-1") fail("consumer list query parser dropped a UTF-8 cursor");
+if (utf8Query?.includeArchived !== false) {
+  fail("consumer list query parser dropped explicit includeArchived false");
+}
+if (parseExternalWorkerListQuery({ includeArchived: null }) !== null) {
+  fail("consumer list query parser accepted JSON null includeArchived");
+}
 
 if (parseExternalWorkerSummary({
   provider: "cursor_cloud",
