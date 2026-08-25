@@ -17,8 +17,10 @@ import {
   embedHelpTokens,
   helpChunkVector,
   helpQueryFamiliarity,
+  resolveHelpQueryTerms,
 } from "../model/artifact";
 import { buildHelpExcerpt, sanitizeHelpText, type HelpExcerpt } from "./highlight";
+import { redactHelpText, type HelpRedaction } from "./redact";
 import { scoreLexical, type LexicalDocument } from "./lexical";
 import { HELP_QUERY_MAX_TERMS, boundQuery, normalizeText, tokenize } from "./text";
 
@@ -33,10 +35,22 @@ export const HELP_RETRIEVAL_MAX_LIMIT = 25;
  * across queries, which is what makes a single abstention threshold meaningful.
  */
 export const HELP_FUSION_WEIGHTS = Object.freeze({
-  lexical: 0.5,
-  semantic: 0.34,
-  exactPhrase: 0.16,
+  lexical: 0.67,
+  semantic: 0.25,
+  exactPhrase: 0.08,
 });
+
+/**
+ * Coordination damping exponent.
+ *
+ * Applied as `coordination ** HELP_COORDINATION_EXPONENT`. Chosen by the same
+ * sweep as the weights: a strong exponent suppresses single-rare-term false
+ * matches but also punishes long natural-language paraphrases, most of whose
+ * words no article contains. With query correction and a vocabulary trained on
+ * the cited sources, mild damping plus the abstention threshold does better
+ * than harsh coordination on both counts.
+ */
+export const HELP_COORDINATION_EXPONENT = 0.15;
 
 /**
  * BM25 saturation constant.
@@ -50,11 +64,18 @@ const BM25_SATURATION = 6;
 /**
  * Minimum fused score to answer rather than abstain.
  *
- * Calibrated against the gold set: chosen as the midpoint of the widest gap
- * between the supported-query and unsupported-query score distributions. See
- * `src/lib/help/eval/` and `helpRetrieval.eval.test.ts`.
+ * Calibrated by an offline grid sweep over fusion weights, coordination
+ * damping, and threshold against the 146-query gold set, selecting the point
+ * that maximizes Recall@1 subject to a false-answer rate at or below 5%.
+ * Reproduce with `scripts/run-help-eval.mjs`; the operating point and the
+ * neighbouring frontier are recorded in `docs/HELP_SEMANTIC_CORE.md`.
+ *
+ * The frontier is real: driving false answers to zero costs roughly five more
+ * points of answerable coverage. This point declines to answer about one
+ * answerable query in twelve rather than inventing support for one that has
+ * none.
  */
-export const HELP_ABSTENTION_THRESHOLD = 0.18;
+export const HELP_ABSTENTION_THRESHOLD = 0.38;
 
 export type HelpRetrievalMode = "hybrid" | "lexical" | "semantic";
 
@@ -77,6 +98,8 @@ export type HelpRetrievalOptions = {
 export type HelpScoreComponents = {
   readonly lexicalBm25: number;
   readonly lexicalNormalized: number;
+  /** Share of distinct query terms this article matched, in [0, 1]. */
+  readonly coordination: number;
   readonly exactPhrase: number;
   readonly semanticCosine: number;
   /** Semantic cosine after the query-familiarity discount. */
@@ -138,6 +161,13 @@ export type HelpRetrievalOutcome = {
    * Low values mean the question is outside what the corpus covers.
    */
   readonly queryFamiliarity: number;
+  /** Misspelled terms mapped onto the vocabulary, for "showing results for". */
+  readonly corrections: readonly { readonly from: string; readonly to: string }[];
+  /**
+   * Credential-shaped or private-path spans removed before scoring. Reports
+   * the kind and count only — never the matched text.
+   */
+  readonly redactions: readonly HelpRedaction[];
 };
 
 /** Raised when a caller pins a corpus digest that no longer matches. */
@@ -181,6 +211,8 @@ function emptyOutcome(
   queryTruncated: boolean,
   confidence = 0,
   queryFamiliarity = 0,
+  corrections: readonly { readonly from: string; readonly to: string }[] = [],
+  redactions: readonly HelpRedaction[] = [],
 ): HelpRetrievalOutcome {
   return Object.freeze({
     schema: HELP_RETRIEVAL_SCHEMA,
@@ -196,6 +228,8 @@ function emptyOutcome(
     margin: 0,
     queryTruncated,
     queryFamiliarity,
+    corrections: Object.freeze(corrections),
+    redactions: Object.freeze(redactions),
   });
 }
 
@@ -226,7 +260,9 @@ function describe(components: HelpScoreComponents, matchedTerms: readonly string
   if (components.lexicalNormalized > 0) {
     parts.push(
       matchedTerms.length > 0
-        ? `keyword match on ${matchedTerms.slice(0, 6).join(", ")} (BM25 ${components.lexicalBm25.toFixed(2)})`
+        ? `keyword match on ${matchedTerms.slice(0, 6).join(", ")} ` +
+            `(BM25 ${components.lexicalBm25.toFixed(2)}, ` +
+            `${Math.round(components.coordination * 100)}% of query terms)`
         : `keyword score ${components.lexicalBm25.toFixed(2)}`,
     );
   }
@@ -270,26 +306,41 @@ export function searchHelpCorpus(
   options: HelpRetrievalOptions = {},
 ): HelpRetrievalOutcome {
   const mode = options.mode ?? "hybrid";
-  const bounded = boundQuery(typeof rawQuery === "string" ? rawQuery : "");
-  const queryTruncated = typeof rawQuery === "string" && rawQuery.trim().length > bounded.length;
+  // Redact first: a pasted credential must never be tokenized, scored,
+  // echoed in an excerpt, or forwarded by the answer contract — and removing
+  // it also stops a high-entropy string from consuming the query budget.
+  const redaction = redactHelpText(typeof rawQuery === "string" ? rawQuery : "");
+  const bounded = boundQuery(redaction.text);
+  const queryTruncated = redaction.text.trim().length > bounded.length;
 
   if (options.expectCorpusDigest && options.expectCorpusDigest !== HELP_CORPUS_DIGEST) {
     throw new HelpCorpusDigestMismatchError(options.expectCorpusDigest, HELP_CORPUS_DIGEST);
   }
-  if (options.signal?.aborted) return emptyOutcome(bounded, mode, "cancelled", queryTruncated);
-  if (bounded.length === 0) return emptyOutcome(bounded, mode, "empty-query", queryTruncated);
+  if (options.signal?.aborted) return emptyOutcome(bounded, mode, "cancelled", queryTruncated, 0, 0, [], redaction.redactions);
+  if (bounded.length === 0) return emptyOutcome(bounded, mode, "empty-query", queryTruncated, 0, 0, [], redaction.redactions);
 
   const limit = Math.max(1, Math.min(options.limit ?? HELP_RETRIEVAL_DEFAULT_LIMIT, HELP_RETRIEVAL_MAX_LIMIT));
   const queryTokens = tokenize(bounded, HELP_QUERY_MAX_TERMS);
+  // Map tokens onto the vocabulary first, correcting likely misspellings, so
+  // BM25, coordination, and the embedding fold-in all see real terms. A token
+  // the corpus has no word for stays unresolved and counts against coverage.
+  const resolvedTerms = resolveHelpQueryTerms(queryTokens);
+  const effectiveTokens = resolvedTerms
+    .map((entry) => entry.term)
+    .filter((term): term is string => term !== null);
+  const corrections = resolvedTerms
+    .filter((entry) => entry.corrected)
+    .map((entry) => Object.freeze({ from: entry.original, to: entry.term as string }));
+  const distinctQueryTerms = new Set(resolvedTerms.map((entry) => entry.term ?? entry.original)).size;
   const normalizedQuery = normalizeText(bounded).replace(/\s+/g, " ").trim();
-  if (queryTokens.length === 0) return emptyOutcome(bounded, mode, "no-match", queryTruncated);
+  if (queryTokens.length === 0) return emptyOutcome(bounded, mode, "no-match", queryTruncated, 0, 0, [], redaction.redactions);
 
   const useLexical = mode !== "semantic";
   const useSemantic = mode !== "lexical";
   // How much of this query the model has any basis to judge. Scales the
   // semantic component so a question about something the corpus never covers
   // cannot borrow confidence from vectors assembled out of unknown words.
-  const queryFamiliarity = helpQueryFamiliarity(queryTokens);
+  const queryFamiliarity = helpQueryFamiliarity(resolvedTerms);
 
   const candidates = new Map<string, Candidate>();
   const ensure = (articleId: string, locale: string): Candidate => {
@@ -315,8 +366,8 @@ export function searchHelpCorpus(
 
   // ---- lexical ------------------------------------------------------------
   if (useLexical) {
-    if (options.signal?.aborted) return emptyOutcome(bounded, mode, "cancelled", queryTruncated, 0, queryFamiliarity);
-    for (const hit of scoreLexical(queryTokens, normalizedQuery)) {
+    if (options.signal?.aborted) return emptyOutcome(bounded, mode, "cancelled", queryTruncated, 0, queryFamiliarity, corrections, redaction.redactions);
+    for (const hit of scoreLexical(effectiveTokens, normalizedQuery)) {
       const document: LexicalDocument = hit.document;
       const candidate = ensure(document.articleId, document.locale);
       const normalized = hit.bm25 / (hit.bm25 + BM25_SATURATION);
@@ -346,8 +397,8 @@ export function searchHelpCorpus(
 
   // ---- semantic -----------------------------------------------------------
   if (useSemantic) {
-    if (options.signal?.aborted) return emptyOutcome(bounded, mode, "cancelled", queryTruncated, 0, queryFamiliarity);
-    const queryVector = embedHelpTokens(queryTokens);
+    if (options.signal?.aborted) return emptyOutcome(bounded, mode, "cancelled", queryTruncated, 0, queryFamiliarity, corrections, redaction.redactions);
+    const queryVector = embedHelpTokens(effectiveTokens);
     if (queryVector) {
       for (const chunk of HELP_CORPUS.chunks) {
         const chunkVector = helpChunkVector(chunk.id);
@@ -375,8 +426,8 @@ export function searchHelpCorpus(
     }
   }
 
-  if (options.signal?.aborted) return emptyOutcome(bounded, mode, "cancelled", queryTruncated, 0, queryFamiliarity);
-  if (candidates.size === 0) return emptyOutcome(bounded, mode, "no-match", queryTruncated, 0, queryFamiliarity);
+  if (options.signal?.aborted) return emptyOutcome(bounded, mode, "cancelled", queryTruncated, 0, queryFamiliarity, corrections, redaction.redactions);
+  if (candidates.size === 0) return emptyOutcome(bounded, mode, "no-match", queryTruncated, 0, queryFamiliarity, corrections, redaction.redactions);
 
   // ---- fuse, filter, rank -------------------------------------------------
   const weights = HELP_FUSION_WEIGHTS;
@@ -393,10 +444,19 @@ export function searchHelpCorpus(
     if (options.topic && options.topic !== "all" && article.topic !== options.topic) continue;
     if (options.audience && !article.audience.includes(options.audience)) continue;
     if (allowedAccess && !allowedAccess.has(article.access)) continue;
+    // Coordination: how much of the query this article actually accounts for.
+    // Without it a single rare term carries an otherwise unrelated query —
+    // "convert 40 celsius to fahrenheit" matched an article containing
+    // "converts" and scored high enough to answer.
+    const coordination =
+      distinctQueryTerms === 0 ? 0 : Math.min(1, candidate.matchedTerms.size / distinctQueryTerms);
+    const dampedCoordination = Math.pow(coordination, HELP_COORDINATION_EXPONENT);
     const semanticEffective = candidate.semanticCosine * queryFamiliarity;
     const raw =
-      (useLexical ? weights.lexical * candidate.lexicalNormalized + weights.exactPhrase * candidate.exactPhrase : 0) +
-      (useSemantic ? weights.semantic * semanticEffective : 0);
+      (useLexical
+        ? weights.lexical * candidate.lexicalNormalized * dampedCoordination +
+          weights.exactPhrase * candidate.exactPhrase
+        : 0) + (useSemantic ? weights.semantic * semanticEffective : 0);
     candidate.fused = activeWeight > 0 ? raw / activeWeight : 0;
     if (candidate.fused <= 0) continue;
     if (!candidate.bestChunkId) {
@@ -406,7 +466,7 @@ export function searchHelpCorpus(
     scored.push(candidate);
   }
 
-  if (scored.length === 0) return emptyOutcome(bounded, mode, "no-match", queryTruncated, 0, queryFamiliarity);
+  if (scored.length === 0) return emptyOutcome(bounded, mode, "no-match", queryTruncated, 0, queryFamiliarity, corrections, redaction.redactions);
 
   scored.sort(
     (left, right) =>
@@ -419,7 +479,7 @@ export function searchHelpCorpus(
   const margin = scored.length > 1 ? confidence - scored[1]!.fused : confidence;
   const threshold = options.minConfidence ?? HELP_ABSTENTION_THRESHOLD;
   if (confidence < threshold) {
-    return emptyOutcome(bounded, mode, "below-confidence", queryTruncated, confidence, queryFamiliarity);
+    return emptyOutcome(bounded, mode, "below-confidence", queryTruncated, confidence, queryFamiliarity, corrections, redaction.redactions);
   }
 
   const results: HelpRetrievalResult[] = [];
@@ -430,6 +490,8 @@ export function searchHelpCorpus(
     const components: HelpScoreComponents = Object.freeze({
       lexicalBm25: candidate.lexicalBm25,
       lexicalNormalized: candidate.lexicalNormalized,
+      coordination:
+        distinctQueryTerms === 0 ? 0 : Math.min(1, candidate.matchedTerms.size / distinctQueryTerms),
       exactPhrase: candidate.exactPhrase,
       semanticCosine: candidate.semanticCosine,
       semanticEffective: candidate.semanticCosine * queryFamiliarity,
@@ -469,5 +531,7 @@ export function searchHelpCorpus(
     margin,
     queryTruncated,
     queryFamiliarity,
+    corrections: Object.freeze(corrections),
+    redactions: Object.freeze(redaction.redactions),
   });
 }

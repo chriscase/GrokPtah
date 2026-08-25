@@ -20,7 +20,7 @@
  *
  *   node --import ./scripts/register-ts-hook.mjs scripts/build-help-model.mjs
  */
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -35,8 +35,19 @@ const JACOBI_MAX_SWEEPS = 60;
 const JACOBI_EPSILON = 1e-12;
 
 // ---------------------------------------------------------------- documents
-// Chunk documents give local context; one metadata document per article adds
-// the alias/keyword phrasings, which is where paraphrase signal comes from.
+// Three kinds of training document:
+//   1. corpus chunks           - local context for the text that gets cited;
+//   2. article metadata        - alias/keyword phrasings, the paraphrase signal;
+//   3. cited source sections   - the actual documentation behind each citation.
+//
+// (3) matters. Trained on the Help corpus alone the space is far too coarse to
+// separate an on-topic paraphrase from an off-topic question: unrelated queries
+// reached a median best-cosine of 0.72, and no abstention threshold can fix a
+// ranking where true positives score below false positives. The cited sections
+// are already part of this repository and are what the corpus summarizes, so
+// learning co-occurrence from them sharpens the space without introducing any
+// external data or a second source of truth. Only canonical chunks are ever
+// retrievable or citable; these documents only shape the vector space.
 const documents = [];
 for (const chunk of HELP_CORPUS.chunks) {
   documents.push({ id: chunk.id, tokens: tokenize(chunk.text, 4096) });
@@ -50,6 +61,46 @@ for (const article of HELP_CORPUS.articles) {
     ...article.localizations.flatMap((l) => [l.title, l.summary, ...l.keywords]),
   ].join(" \n ");
   documents.push({ id: `${article.id}#meta`, tokens: tokenize(text, 4096) });
+}
+
+const repoRoot = join(here, "..", "..");
+const fileCache = new Map();
+async function sectionText(path, heading) {
+  if (!fileCache.has(path)) fileCache.set(path, await readFile(join(repoRoot, path), "utf8"));
+  const lines = fileCache.get(path).split("\n");
+  const startIndex = lines.findIndex(
+    (line) => /^#{1,6} /.test(line) && line.replace(/^#{1,6} /, "").trim() === heading,
+  );
+  if (startIndex < 0) throw new Error(`build-help-model: heading "${heading}" not found in ${path}`);
+  const level = (lines[startIndex].match(/^#+/) ?? ["#"])[0].length;
+  const body = [];
+  for (let index = startIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    const match = line.match(/^(#{1,6}) /);
+    if (match && match[1].length <= level) break;
+    body.push(line);
+  }
+  return body.join("\n");
+}
+
+/** Paragraphs, with fenced code blocks dropped: commands are not prose. */
+function paragraphsOf(text) {
+  return text
+    .replace(/```[\s\S]*?```/g, " ")
+    .split(/\n\s*\n/)
+    .map((paragraph) => paragraph.replace(/\s+/g, " ").trim())
+    .filter((paragraph) => paragraph.length >= 40);
+}
+
+let sourceParagraphs = 0;
+for (const source of HELP_CORPUS.sources) {
+  const paragraphs = paragraphsOf(await sectionText(source.path, source.heading));
+  paragraphs.forEach((paragraph, index) => {
+    const tokens = tokenize(paragraph, 4096);
+    if (tokens.length < 4) return;
+    documents.push({ id: `source:${source.id}#${index}`, tokens });
+    sourceParagraphs += 1;
+  });
 }
 
 // ------------------------------------------------------------- vocabulary
@@ -320,7 +371,9 @@ const provenance = {
   documentCount: D,
   trainedFromCorpusDigest: HELP_CORPUS.digest,
   trainedFromContentVersion: HELP_CORPUS.contentVersion,
-  trainingInputs: "desktop/src/lib/help/canonical/data.ts (this repository only)",
+  trainingInputs:
+    "desktop/src/lib/help/canonical/data.ts plus the cited README.md and docs/*.md sections (this repository only)",
+  sourceParagraphs,
   externalData: "none",
   network: "none — training and inference are fully offline",
   runtime: "pure TypeScript; no native modules, no WASM, no model server",
@@ -394,6 +447,6 @@ const markdown = [
 await writeFile(join(modelDir, "MODEL_PROVENANCE.md"), markdown);
 
 console.log(`built ${artifact.modelId}: dims=${dims} vocab=${V} subwords=${subwords.length} chunks=${chunkIds.length}`);
-console.log(`  documents:  ${D}`);
+console.log(`  documents:  ${D} (${HELP_CORPUS.chunks.length} chunks, ${HELP_CORPUS.articles.length} metadata, ${sourceParagraphs} cited source paragraphs)`);
 console.log(`  checksum:   ${checksum}`);
 console.log(`  corpus:     ${HELP_CORPUS.digest}`);

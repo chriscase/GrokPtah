@@ -179,7 +179,7 @@ export function embedHelpTokens(tokens: readonly string[]): Float64Array | undef
   return vector;
 }
 
-const FAMILIARITY_CACHE = new Map<string, number>();
+const CORRECTION_CACHE = new Map<string, string | null>();
 
 /** Character-trigram posting list over the vocabulary, for the OOV path. */
 const GRAM_TO_TERMS = new Map<string, number[]>();
@@ -191,95 +191,150 @@ raw.vocabulary.forEach((term, index) => {
   }
 });
 
-const MAX_EDIT_DISTANCE = 3;
-
-/** Levenshtein distance, abandoned once it provably exceeds `cutoff`. */
+/**
+ * Damerau-Levenshtein distance, abandoned once it provably exceeds `cutoff`.
+ *
+ * Adjacent transposition counts as one edit, not two. That single difference
+ * is what lets `reveiw`, `reciept`, `durabel`, `promotoin`, and `discrad` be
+ * recognized as one-edit typos of real corpus words.
+ */
 function boundedEditDistance(left: string, right: string, cutoff: number): number {
   if (Math.abs(left.length - right.length) > cutoff) return cutoff + 1;
-  let previous = new Int32Array(right.length + 1);
-  let current = new Int32Array(right.length + 1);
-  for (let j = 0; j <= right.length; j += 1) previous[j] = j;
+  const width = right.length + 1;
+  let twoBack = new Int32Array(width);
+  let previous = new Int32Array(width);
+  let current = new Int32Array(width);
+  for (let j = 0; j < width; j += 1) previous[j] = j;
   for (let i = 1; i <= left.length; i += 1) {
     current[0] = i;
     let rowMinimum = current[0]!;
-    for (let j = 1; j <= right.length; j += 1) {
-      const substitution = previous[j - 1]! + (left[i - 1] === right[j - 1] ? 0 : 1);
+    for (let j = 1; j < width; j += 1) {
+      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+      const substitution = previous[j - 1]! + cost;
       const deletion = previous[j]! + 1;
       const insertion = current[j - 1]! + 1;
-      const best = substitution < deletion ? substitution : deletion;
-      current[j] = best < insertion ? best : insertion;
-      if (current[j]! < rowMinimum) rowMinimum = current[j]!;
+      let best = substitution < deletion ? substitution : deletion;
+      if (insertion < best) best = insertion;
+      if (i > 1 && j > 1 && left[i - 1] === right[j - 2] && left[i - 2] === right[j - 1]) {
+        const transposition = twoBack[j - 2]! + 1;
+        if (transposition < best) best = transposition;
+      }
+      current[j] = best;
+      if (best < rowMinimum) rowMinimum = best;
     }
     if (rowMinimum > cutoff) return cutoff + 1;
-    const swap = previous;
+    const recycled = twoBack;
+    twoBack = previous;
     previous = current;
-    current = swap;
+    current = recycled;
   }
   return previous[right.length]!;
 }
 
 /**
- * How well the model actually knows a term, in [0, 1].
+ * Edit budget by term length.
  *
- * 1 for in-vocabulary terms. Otherwise `1 - editDistance / length` against the
- * closest vocabulary term, with candidates narrowed by shared trigrams so the
- * comparison stays cheap.
- *
- * This separates a misspelling from a word the corpus has never seen:
- * `chekpoint`/`checkpoint` and `quata`/`quota` are one edit apart, while
- * `sourdough` and `photosynthesis` are far from everything. Two cheaper
- * measures were tried and rejected — cosine to the nearest embedding
- * neighbour does not separate them at all (a subword vector is an average of
- * many term vectors and sits close to everything), and raw trigram Dice
- * punishes short words too hard, scoring `quata` no better than `sourdough`.
- *
- * Without this gate the subword backoff hands every unknown term a
- * plausible-looking vector, and unanswerable questions score high enough to be
- * answered instead of abstained on.
+ * Short words are not corrected at all: within one edit a four-letter word
+ * resembles far too much of any vocabulary to guess at. This is what keeps
+ * `bake` and `bread` from being "corrected" into corpus terms and making an
+ * unanswerable question look answerable.
  */
-export function helpTermFamiliarity(term: string): number {
-  const cached = FAMILIARITY_CACHE.get(term);
-  if (cached !== undefined) return cached;
-  let familiarity = 0;
-  if (TERM_INDEX.has(term)) {
-    familiarity = 1;
-  } else {
-    const candidates = new Set<number>();
-    for (const gram of new Set(charNgrams(term))) {
-      for (const index of GRAM_TO_TERMS.get(gram) ?? []) candidates.add(index);
-    }
-    for (const index of candidates) {
-      const candidate = raw.vocabulary[index]!;
-      const distance = boundedEditDistance(term, candidate, MAX_EDIT_DISTANCE);
-      if (distance > MAX_EDIT_DISTANCE) continue;
-      const longest = term.length > candidate.length ? term.length : candidate.length;
-      const similarity = 1 - distance / longest;
-      if (similarity > familiarity) familiarity = similarity;
-    }
-  }
-  FAMILIARITY_CACHE.set(term, familiarity);
-  return familiarity;
+function editBudget(length: number): number {
+  if (length >= 9) return 2;
+  if (length >= 5) return 1;
+  return 0;
 }
 
 /**
- * Share of the query the model can actually account for, weighted by term
- * importance. Feeds the semantic component so an unanswerable question cannot
- * borrow confidence from vectors built out of unknown words.
+ * Length of the common prefix of two terms.
+ *
+ * A correction must agree with the original near the start. Typos rarely
+ * change a word's opening, and without this guard the vocabulary swallows
+ * ordinary English: `please` becomes `lease` and `contents` becomes
+ * `consent`, handing off-topic queries lexical evidence they should not have.
  */
-export function helpQueryFamiliarity(tokens: readonly string[]): number {
-  if (tokens.length === 0) return 0;
-  let weighted = 0;
-  let total = 0;
-  for (const token of tokens) {
-    const weight = helpTermIdf(token);
-    const familiarity = helpTermFamiliarity(token);
-    // Below ~0.6 similarity a token is not a plausible misspelling of anything
-    // in the corpus, so it contributes no confidence at all.
-    const shaped = familiarity >= 1 ? 1 : Math.max(0, (familiarity - 0.6) / 0.3);
-    weighted += weight * (shaped > 1 ? 1 : shaped);
-    total += weight;
+function commonPrefixLength(left: string, right: string): number {
+  const limit = left.length < right.length ? left.length : right.length;
+  let index = 0;
+  while (index < limit && left[index] === right[index]) index += 1;
+  return index;
+}
+
+const MIN_CORRECTION_PREFIX = 2;
+
+/**
+ * Map a query term onto the vocabulary, correcting a likely misspelling.
+ *
+ * Returns the term itself when it is already known, the corrected term when
+ * one is unambiguously close, and null when the corpus has no such word.
+ *
+ * Correcting the query is what makes misspellings work: BM25, coordination,
+ * and the embedding fold-in then all operate on real vocabulary instead of
+ * each separately trying to cope with a typo. Ties at the same edit distance
+ * resolve to the lexicographically smallest candidate so the correction is
+ * reproducible.
+ */
+export function helpCorrectTerm(term: string): string | null {
+  const cached = CORRECTION_CACHE.get(term);
+  if (cached !== undefined) return cached;
+  let corrected: string | null = null;
+  if (TERM_INDEX.has(term)) {
+    corrected = term;
+  } else {
+    const budget = editBudget(term.length);
+    if (budget > 0) {
+      const candidates = new Set<number>();
+      for (const gram of new Set(charNgrams(term))) {
+        for (const index of GRAM_TO_TERMS.get(gram) ?? []) candidates.add(index);
+      }
+      let bestDistance = budget + 1;
+      for (const index of candidates) {
+        const candidate = raw.vocabulary[index]!;
+        if (commonPrefixLength(term, candidate) < MIN_CORRECTION_PREFIX) continue;
+        const distance = boundedEditDistance(term, candidate, budget);
+        if (distance > budget) continue;
+        if (distance < bestDistance || (distance === bestDistance && corrected !== null && candidate < corrected)) {
+          bestDistance = distance;
+          corrected = candidate;
+        }
+      }
+    }
   }
-  return total === 0 ? 0 : weighted / total;
+  CORRECTION_CACHE.set(term, corrected);
+  return corrected;
+}
+
+export type HelpQueryTerm = {
+  readonly original: string;
+  /** Vocabulary term used for retrieval, or null when the corpus has none. */
+  readonly term: string | null;
+  readonly corrected: boolean;
+};
+
+/** Resolve every query token against the vocabulary, correcting misspellings. */
+export function resolveHelpQueryTerms(tokens: readonly string[]): HelpQueryTerm[] {
+  return tokens.map((original) => {
+    const term = helpCorrectTerm(original);
+    return { original, term, corrected: term !== null && term !== original };
+  });
+}
+
+/**
+ * Share of the query the corpus can account for, weighted by term importance.
+ *
+ * Scales the semantic component so a question about something the corpus never
+ * covers cannot borrow confidence from vectors assembled out of unknown words.
+ */
+export function helpQueryFamiliarity(resolved: readonly HelpQueryTerm[]): number {
+  if (resolved.length === 0) return 0;
+  let known = 0;
+  let total = 0;
+  for (const entry of resolved) {
+    const weight = helpTermIdf(entry.term ?? entry.original);
+    total += weight;
+    if (entry.term !== null) known += weight;
+  }
+  return total === 0 ? 0 : known / total;
 }
 
 /** Cosine similarity of two unit vectors. */
