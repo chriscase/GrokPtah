@@ -84,9 +84,29 @@ struct MemoryStoreState {
 /// This is intentionally not a production durability implementation. It
 /// provides the same revision and cross-swarm lease rules that a file or
 /// hosted store must provide, making those rules testable without providers.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct InMemorySwarmStore {
     inner: Arc<Mutex<MemoryStoreState>>,
+    allow_structural_leases: bool,
+}
+
+impl Default for InMemorySwarmStore {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(MemoryStoreState::default())),
+            allow_structural_leases: false,
+        }
+    }
+}
+
+impl InMemorySwarmStore {
+    /// Opt into structural-only lease checks for provider-free tests.
+    pub fn for_tests() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(MemoryStoreState::default())),
+            allow_structural_leases: true,
+        }
+    }
 }
 
 impl InMemorySwarmStore {
@@ -155,6 +175,11 @@ impl DurableSwarmStore for InMemorySwarmStore {
         lease: &ComputerUseLeaseRef,
         now: chrono::DateTime<chrono::Utc>,
     ) -> SwarmResult<()> {
+        if !self.allow_structural_leases {
+            return Err(SwarmError::capability(
+                "Computer Use requires an authoritative external lease verifier",
+            ));
+        }
         if !lease.is_usable_at(now) {
             return Err(SwarmError::capability(
                 "Computer Use lease is not live at the durable admission instant",

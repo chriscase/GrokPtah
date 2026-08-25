@@ -839,7 +839,8 @@ fn computer_use_swarm() -> SwarmController {
     spec.tasks[0].worker_id = worker_id("cu-cursor");
     spec.tasks[0].requires_computer_use = true;
     spec.tasks[0].computer_use = Some(computer_use_requirement());
-    SwarmController::new(spec, at(0)).expect("valid")
+    SwarmController::new_with_store(spec, at(0), Arc::new(InMemorySwarmStore::for_tests()))
+        .expect("valid")
 }
 
 #[test]
@@ -903,7 +904,7 @@ fn a_lease_binding_must_match_the_exact_dispatch() {
 
 #[test]
 fn one_lease_cannot_be_consumed_by_two_swarms() {
-    let store = Arc::new(InMemorySwarmStore::default());
+    let store = Arc::new(InMemorySwarmStore::for_tests());
     let first = computer_use_swarm();
     let mut first = SwarmController::new_with_store(first.spec().clone(), at(0), store.clone())
         .expect("first swarm");
@@ -937,7 +938,7 @@ fn one_lease_cannot_be_consumed_by_two_swarms() {
 
 #[test]
 fn concurrent_plans_racing_one_lease_converge_on_one_dispatch() {
-    let store = Arc::new(InMemorySwarmStore::default());
+    let store = Arc::new(InMemorySwarmStore::for_tests());
     let seed = computer_use_swarm();
     let mut first =
         SwarmController::new_with_store(seed.spec().clone(), at(0), store.clone()).expect("swarm");

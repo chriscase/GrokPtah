@@ -183,7 +183,12 @@ fn a_row_shows_the_isolation_and_lease_a_dispatch_ran_under() {
     spec.tasks[0].worker_id = worker_id("cu-cursor");
     spec.tasks[0].requires_computer_use = true;
     spec.tasks[0].computer_use = Some(computer_use_requirement());
-    let mut swarm = SwarmController::new(spec, at(0)).expect("valid");
+    let mut swarm = SwarmController::new_with_store(
+        spec,
+        at(0),
+        std::sync::Arc::new(grokptah_swarm_control_plane::InMemorySwarmStore::for_tests()),
+    )
+    .expect("valid");
 
     let intent = swarm.plan_dispatches(at(1)).remove(0);
     swarm
