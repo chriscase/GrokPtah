@@ -2127,7 +2127,7 @@ async fn accepted_queued_prompt_restarts_from_private_intent_exactly_once() {
         )
         .await
         .unwrap();
-    assert_eq!(replay["runId"], run_id);
+    assert_eq!(replay["runId"], run_id.as_str());
     assert_eq!(
         std::fs::read_dir(replacement.store().root().join("acceptance"))
             .unwrap()
