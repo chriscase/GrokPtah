@@ -319,18 +319,19 @@ impl CursorCloudAdapter {
         if run.state == ExternalWorkerState::Cancelled {
             return Ok(run);
         }
-        if code == Some(ProviderConflictCode::RunNotCancellable)
-            || matches!(
-                run.state,
-                ExternalWorkerState::Completed
-                    | ExternalWorkerState::Failed
-                    | ExternalWorkerState::Archived
-            )
-        {
+        if matches!(
+            run.state,
+            ExternalWorkerState::Completed
+                | ExternalWorkerState::Failed
+                | ExternalWorkerState::Archived
+        ) {
             return Err(ExternalWorkerAdapterError::InvalidRequest(
                 "Cursor run is not cancellable",
             ));
         }
+        // 409 means GET is authoritative. A still-running run after a refused
+        // cancel is Uncertain; do not treat the conflict code as success.
+        let _ = code;
         Err(ExternalWorkerAdapterError::Uncertain)
     }
 
@@ -753,7 +754,7 @@ struct CursorAgent {
     status: String,
     #[serde(default)]
     repos: Vec<CursorRepo>,
-    #[serde(default)]
+    #[serde(default, rename = "autoCreatePR", alias = "autoCreatePr")]
     auto_create_pr: Option<bool>,
     #[serde(default)]
     work_on_current_branch: Option<bool>,
@@ -992,9 +993,7 @@ fn run_state(status: &str) -> ExternalWorkerState {
 }
 
 #[cfg(test)]
-pub(crate) use tests::{
-    spawn_fake_cursor, FakeCursorConfig, FakeCursorState, FAKE_AGENT, FAKE_RUN,
-};
+pub(crate) use tests::{spawn_fake_cursor, FakeCursorState, FAKE_AGENT, FAKE_RUN};
 
 #[cfg(test)]
 mod tests {
@@ -1042,6 +1041,8 @@ mod tests {
         pub download_host_override: Option<String>,
         pub omit_download_expiry: bool,
         pub create_delay_ms: u64,
+        pub reconcile_cancelled: bool,
+        pub defer_listed_runs_until_follow_up: bool,
     }
 
     impl Default for FakeCursorConfig {
@@ -1073,6 +1074,8 @@ mod tests {
                 download_host_override: None,
                 omit_download_expiry: false,
                 create_delay_ms: 0,
+                reconcile_cancelled: false,
+                defer_listed_runs_until_follow_up: false,
             }
         }
     }
@@ -1154,8 +1157,9 @@ mod tests {
 
     async fn fake_run_read(State(state): State<FakeCursorState>) -> Json<Value> {
         let cancelled = *state.cancelled.lock().unwrap();
+        let cancel_calls = *state.cancel_calls.lock().unwrap();
         let config = state.config.lock().unwrap().clone();
-        let status = if cancelled {
+        let status = if cancelled || (config.reconcile_cancelled && cancel_calls > 0) {
             "CANCELLED"
         } else {
             config.run_status.as_str()
@@ -1184,8 +1188,14 @@ mod tests {
     }
 
     async fn fake_runs(State(state): State<FakeCursorState>) -> Json<Value> {
+        let posted = !state.follow_up_requests.lock().unwrap().is_empty();
         let config = state.config.lock().unwrap().clone();
-        Json(json!({ "items": config.listed_runs }))
+        let items = if config.defer_listed_runs_until_follow_up && !posted {
+            Vec::new()
+        } else {
+            config.listed_runs
+        };
+        Json(json!({ "items": items }))
     }
 
     async fn fake_cancel(State(state): State<FakeCursorState>) -> impl IntoResponse {
@@ -1366,6 +1376,22 @@ mod tests {
             safe_terminal_result("wrote C:\\Users\\alice\\project"),
             None
         );
+    }
+
+    #[test]
+    fn cursor_safety_flags_accept_official_auto_create_pr_casing() {
+        let agent: CursorAgent = serde_json::from_value(json!({
+            "id": FAKE_AGENT,
+            "status": "ACTIVE",
+            "repos": [{"url": "https://github.com/chriscase/GrokPtah", "startingRef": "main"}],
+            "autoCreatePR": false,
+            "workOnCurrentBranch": false,
+            "createdAt": "2026-08-24T00:00:00Z",
+            "updatedAt": "2026-08-24T00:00:01Z"
+        }))
+        .unwrap();
+        assert_eq!(agent.auto_create_pr, Some(false));
+        assert_eq!(agent.work_on_current_branch, Some(false));
     }
 
     #[test]
@@ -1558,6 +1584,7 @@ mod tests {
             config.follow_up_status = 409;
             config.follow_up_code = Some("agent_busy".into());
             config.listed_runs = vec![fake_run(FAKE_RUN, "RUNNING")];
+            config.defer_listed_runs_until_follow_up = true;
         }
         let base = spawn_fake_cursor(state.clone()).await;
         let adapter = CursorCloudAdapter::for_test(&base);
@@ -1606,8 +1633,9 @@ mod tests {
             let mut config = state.config.lock().unwrap();
             config.cancel_status = 409;
             config.cancel_code = Some("run_not_cancellable".into());
+            config.reconcile_cancelled = true;
+            config.run_status = "RUNNING".into();
         }
-        *state.cancelled.lock().unwrap() = true;
         let base = spawn_fake_cursor(state.clone()).await;
         let adapter = CursorCloudAdapter::for_test(&base);
         let run = adapter.cancel(FAKE_AGENT, FAKE_RUN).await.unwrap();
