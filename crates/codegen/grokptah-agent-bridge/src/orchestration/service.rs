@@ -614,9 +614,9 @@ impl OrchestrationService {
         let Some(intent) = self.store.load_acceptance_intent(&pending.run_id)? else {
             anyhow::bail!("queued run has no private acceptance intent");
         };
-        let Some(prompt) = intent.prompt.as_ref() else {
+        if intent.prompt.is_none() {
             anyhow::bail!("queued run has no private prompt input");
-        };
+        }
         let expected_revision = self
             .store
             .load_attempt(&pending.run_id)?
