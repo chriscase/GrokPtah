@@ -2357,6 +2357,61 @@ async fn expired_attempt_reaper_releases_capacity_and_promotes_next_once() {
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+async fn aborted_outer_supervisor_guard_terminalizes_before_capacity_reuse() {
+    std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let first = host.session_new_kind(SessionKind::Build).unwrap();
+    let second = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(first.id, ws.path()).unwrap();
+    host.session_set_cwd(second.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 1);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+    let first_response = orch
+        .submit_task(
+            &auth,
+            "outer-abort-first",
+            first.id,
+            ws.path(),
+            "run sleep 8".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let second_response = orch
+        .submit_task_with_execution_mode_and_queue(
+            &auth,
+            "outer-abort-second",
+            second.id,
+            ws.path(),
+            "list files".into(),
+            None,
+            RunExecutionMode::Shared,
+            true,
+        )
+        .await
+        .unwrap();
+    let first_id = first_response["runId"].as_str().unwrap();
+    let second_id = second_response["runId"].as_str().unwrap();
+    assert!(orch.abort_attempt_supervisor_for_test(first_id).await);
+    assert_eq!(
+        wait_run_terminal(&orch, &auth, first_id, Duration::from_secs(5)).await,
+        RunState::Interrupted
+    );
+    assert_eq!(
+        wait_run_terminal(&orch, &auth, second_id, Duration::from_secs(10)).await,
+        RunState::Completed
+    );
+    assert_eq!(orch.get_capacity(&auth).unwrap()["activeRuns"], 0);
+    set_grokptah_home_override(None);
+    std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn finalization_write_failure_releases_capacity_and_recovers_intent() {
     std::env::set_var("GROKPTAH_AGENT_OFFLINE", "1");
     let (home, _lock) = setup_home();

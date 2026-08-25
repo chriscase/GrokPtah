@@ -848,6 +848,20 @@ impl OrchestrationService {
         self.reap_expired_attempts().await;
     }
 
+    /// Test-only crash-cut hook for the outer supervisor guard. Production
+    /// aborts arrive through runtime shutdown or exact reaping.
+    #[doc(hidden)]
+    pub async fn abort_attempt_supervisor_for_test(&self, run_id: &str) -> bool {
+        let Some(live) = self.take_live_attempt(run_id) else {
+            return false;
+        };
+        live.model_abort.abort();
+        let mut supervisor = live.supervisor;
+        supervisor.abort();
+        let _ = supervisor.await;
+        true
+    }
+
     fn take_live_attempt(&self, run_id: &str) -> Option<LiveAttempt> {
         self.live_attempts.lock().remove(run_id)
     }
