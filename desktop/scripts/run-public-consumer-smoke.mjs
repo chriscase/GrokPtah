@@ -52,6 +52,11 @@ try {
   parseBrokerEventUpdate,
   parseBrokerRunProjection,
   parseBrokerReviewProjection,
+  EXTERNAL_WORKER_CONTRACT,
+  parseExternalWorkerLaunchRequest,
+  parseExternalWorkerNotification,
+  applyExternalWorkerNotification,
+  createExternalWorkerMonitor,
   HELP_ARTICLES,
   HELP_ENTRIES,
   applyAssistantStreamChunk,
@@ -128,6 +133,31 @@ if (parseBrokerReviewProjection({
   fingerprint: "final-1",
 })?.fingerprint !== "final-1") {
   throw new Error("consumer broker review projection parser was not usable");
+}
+if (EXTERNAL_WORKER_CONTRACT !== "grokptah.external-workers.v1") {
+  throw new Error("consumer external-worker contract version was not usable");
+}
+const launch = parseExternalWorkerLaunchRequest({
+  requestId: "consumer-request",
+  provider: "cursor_cloud",
+  repository: "org/repo",
+  startingRef: "main",
+  prompt: "Review the exact candidate",
+  executionMode: "isolated",
+  autoCreatePr: false,
+});
+if (launch?.executionMode !== "isolated") {
+  throw new Error("consumer external-worker launch parser was not usable");
+}
+const externalNotification = parseExternalWorkerNotification({
+  type: "event",
+  event: { seq: 0, ts: "2026-08-24T00:00:00Z", kind: "run.started", detail: "started" },
+});
+const externalState = externalNotification
+  ? applyExternalWorkerNotification(createExternalWorkerMonitor(), externalNotification)
+  : null;
+if (externalState?.lastSeq !== 0 || externalState.recoveryRequired) {
+  throw new Error("consumer external-worker monitor was not usable");
 }
 console.log("external consumer fixture passed");
 `,

@@ -128,7 +128,10 @@ rendering, focus management, transport adapter, and approval presentation.
 The generated package now exposes the same headless surface as the
 `@grokptah/client/ui-core` subpath. It is still a staging artifact rather than
 a published SemVer promise, but consumers can exercise the real import path
-before publication.
+before publication. The same subpath now exposes the external-worker parsers
+and cursor-aware monitor reducer, so a War Room can render cloud-worker status
+without importing React, Tauri, credentials, or provider-specific response
+shapes.
 
 To produce a reviewable, Tauri-free consumer artifact from an exact checkout,
 run `npm run verify:public` in `desktop/`. This builds and verifies a bundled

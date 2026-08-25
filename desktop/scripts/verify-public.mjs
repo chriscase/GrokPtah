@@ -43,6 +43,10 @@ const requiredExports = [
   "parseBrokerEventUpdate",
   "parseBrokerRunProjection",
   "parseBrokerReviewProjection",
+  "EXTERNAL_WORKER_CONTRACT",
+  "parseExternalWorkerLaunchRequest",
+  "parseExternalWorkerNotification",
+  "applyExternalWorkerNotification",
   "searchHelp",
   "searchHelpArticles",
   "HELP_ARTICLES",
@@ -53,7 +57,15 @@ const missing = requiredExports.filter((name) => !(name in publicApi));
 if (missing.length > 0) {
   throw new Error(`public bundle is missing required exports: ${missing.join(", ")}`);
 }
-for (const name of ["HELP_ARTICLES", "searchHelpArticles", "promptQueueReducer", "applyAssistantStreamChunk"]) {
+for (const name of [
+  "HELP_ARTICLES",
+  "searchHelpArticles",
+  "promptQueueReducer",
+  "applyAssistantStreamChunk",
+  "EXTERNAL_WORKER_CONTRACT",
+  "parseExternalWorkerNotification",
+  "applyExternalWorkerNotification",
+]) {
   if (!(name in uiCoreApi)) throw new Error(`ui-core bundle is missing required export: ${name}`);
 }
 if ("GrokPtahBrokerClient" in uiCoreApi) {

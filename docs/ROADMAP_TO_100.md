@@ -54,10 +54,11 @@ the same candidate release:
   candidate: the Help Center integration (`45441d1f`) and follow-up
   hardening/corpus/public-consumer/broker-boundary/typed-projection/event-redaction
   commits through `cc151fcc`
-  pass 47 test files / 276 tests, typecheck, the production Vite build, and
+  pass 48 test files / 279 tests, typecheck, the production Vite build, and
   `npm run verify:public`.
-  The public check includes generated export/authority-boundary checks and a
-  installed `npm pack` archive plus normal `node_modules/@grokptah/client`
+  The public check includes generated export/authority-boundary checks,
+  external-worker monitor exports, and an installed `npm pack` archive plus
+  normal `node_modules/@grokptah/client`
   consumer smoke fixture. The package
   remains a release candidate until publication and a real cross-repository
   consumer integration are green.
