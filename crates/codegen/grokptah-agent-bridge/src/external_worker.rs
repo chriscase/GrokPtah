@@ -904,6 +904,8 @@ fn worker_record(
             "Cursor worker status is missing",
         ));
     }
+    // Name-scoped replacement-character gate: a U+FFFD in this provider
+    // display name fails only this worker's projection.
     reject_lossy_utf8(agent.name.as_deref())?;
     if agent.auto_create_pr != Some(false) || agent.work_on_current_branch != Some(false) {
         return Err(ExternalWorkerAdapterError::InvalidResponse(
@@ -969,6 +971,8 @@ fn worker_summary(
             "Cursor worker status is missing",
         ));
     }
+    // Name-scoped: list mapping fails this item only; callers must not treat
+    // that as cancel/archive of a different worker.
     reject_lossy_utf8(agent.name.as_deref())?;
     if let Some(env) = &agent.env {
         if env.kind != "cloud" {
@@ -1023,6 +1027,13 @@ fn run_record(
     Ok(run)
 }
 
+/// Reject a provider-visible display `name` that contains U+FFFD.
+///
+/// Invalid UTF-8 already fails closed at `from_slice`. This gate is
+/// explicitly name-scoped: it inspects only the decoded `name` of the worker
+/// being projected. It must not cancel, archive, or mutate another stable
+/// worker, and it does not change run-detail omission in
+/// [`safe_terminal_result`].
 fn reject_lossy_utf8(value: Option<&str>) -> Result<(), ExternalWorkerAdapterError> {
     if value.is_some_and(|text| text.contains('\u{FFFD}')) {
         return Err(ExternalWorkerAdapterError::InvalidResponse(
@@ -1669,6 +1680,18 @@ mod tests {
         assert_eq!(archived.repository, "chriscase/GrokPtah");
         assert_eq!(archived.starting_ref, "main");
         assert_eq!(state.archive_posts.lock().unwrap().as_slice(), [AGENT_1]);
+        let sibling = adapter.get_worker(AGENT_2).await.unwrap();
+        assert_eq!(sibling.external_agent_id, AGENT_2);
+        assert_eq!(sibling.state, ExternalWorkerState::Ready);
+        assert_ne!(sibling.state, ExternalWorkerState::Archived);
+        assert_ne!(sibling.state, ExternalWorkerState::Cancelled);
+        assert!(!state.archived.lock().unwrap().contains(AGENT_2));
+        assert!(!state
+            .archive_posts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|id| id == AGENT_2));
 
         let archived_again = adapter.archive(AGENT_1).await.unwrap();
         assert_eq!(archived_again.state, ExternalWorkerState::Archived);
@@ -1957,6 +1980,120 @@ mod tests {
         }))
     }
 
+    const FFFD_NAME: &str = "caf\u{FFFD}";
+
+    #[derive(Clone, Default)]
+    struct FffdNameCursorState {
+        archived: Arc<Mutex<BTreeSet<String>>>,
+        cancelled: Arc<Mutex<BTreeSet<String>>>,
+        archive_posts: Arc<Mutex<Vec<String>>>,
+        cancel_posts: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn fffd_name_agent(id: &str, archived: bool) -> Value {
+        let mut agent = fake_agent_record(id, archived);
+        agent["name"] = json!(if id == AGENT_1 {
+            FFFD_NAME
+        } else {
+            "stable sibling"
+        });
+        agent
+    }
+
+    fn fffd_name_router(state: FffdNameCursorState) -> Router {
+        Router::new()
+            .route("/v1/agents", post(fffd_name_create).get(fffd_name_list))
+            .route("/v1/agents/{id}", get(fffd_name_agent_read))
+            .route("/v1/agents/{id}/archive", post(fffd_name_archive))
+            .route(
+                "/v1/agents/{id}/runs/{run_id}/cancel",
+                post(fffd_name_cancel),
+            )
+            .with_state(state)
+    }
+
+    async fn fffd_name_create() -> Json<Value> {
+        Json(json!({
+            "agent": fffd_name_agent(AGENT_1, false),
+            "run": {
+                "id": RUN_1,
+                "agentId": AGENT_1,
+                "status": "CREATING",
+                "createdAt": "2026-08-24T00:00:00Z",
+                "updatedAt": "2026-08-24T00:00:01Z"
+            }
+        }))
+    }
+
+    async fn fffd_name_list(State(state): State<FffdNameCursorState>) -> Json<Value> {
+        let archived = state.archived.lock().unwrap().clone();
+        Json(json!({
+            "items": [
+                {
+                    "id": AGENT_1,
+                    "name": FFFD_NAME,
+                    "status": if archived.contains(AGENT_1) { "ARCHIVED" } else { "ACTIVE" },
+                    "env": {"type": "cloud"},
+                    "url": format!("https://cursor.com/agents/{AGENT_1}"),
+                    "createdAt": "2026-08-24T00:00:00Z",
+                    "updatedAt": "2026-08-24T00:00:01Z",
+                    "latestRunId": RUN_1
+                },
+                {
+                    "id": AGENT_2,
+                    "name": "stable sibling",
+                    "status": if archived.contains(AGENT_2) { "ARCHIVED" } else { "ACTIVE" },
+                    "env": {"type": "cloud"},
+                    "url": format!("https://cursor.com/agents/{AGENT_2}"),
+                    "createdAt": "2026-08-24T00:00:00Z",
+                    "updatedAt": "2026-08-24T00:00:05Z",
+                    "latestRunId": RUN_1
+                }
+            ]
+        }))
+    }
+
+    async fn fffd_name_agent_read(
+        State(state): State<FffdNameCursorState>,
+        Path(id): Path<String>,
+    ) -> Result<Json<Value>, StatusCode> {
+        if !known_agent(&id) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let archived = state.archived.lock().unwrap().contains(&id);
+        Ok(Json(fffd_name_agent(&id, archived)))
+    }
+
+    async fn fffd_name_archive(
+        State(state): State<FffdNameCursorState>,
+        Path(id): Path<String>,
+    ) -> Result<Json<Value>, StatusCode> {
+        if !known_agent(&id) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        state.archive_posts.lock().unwrap().push(id.clone());
+        state.archived.lock().unwrap().insert(id.clone());
+        Ok(Json(json!({ "id": id })))
+    }
+
+    async fn fffd_name_cancel(
+        State(state): State<FffdNameCursorState>,
+        Path((id, _run_id)): Path<(String, String)>,
+    ) -> Result<Json<Value>, StatusCode> {
+        if !known_agent(&id) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        state.cancel_posts.lock().unwrap().push(id.clone());
+        state.cancelled.lock().unwrap().insert(id);
+        Ok(Json(json!({
+            "id": RUN_1,
+            "agentId": AGENT_1,
+            "status": "CANCELLED",
+            "createdAt": "2026-08-24T00:00:00Z",
+            "updatedAt": "2026-08-24T00:00:02Z"
+        })))
+    }
+
     #[test]
     fn cursor_list_item_decodes_non_ascii_utf8_names_without_projecting_them() {
         let mut value = fake_list_item(AGENT_1, false, "2026-08-24T00:00:01Z");
@@ -1992,6 +2129,45 @@ mod tests {
             serde_json::from_value(fake_list_item(AGENT_1, false, "2026-08-24T00:00:01Z")).unwrap();
         item.name = Some("caf\u{FFFD}".into());
         assert!(worker_summary(&item).is_err());
+    }
+
+    #[test]
+    fn replacement_character_policy_is_name_scoped_and_does_not_mutate_a_sibling() {
+        let mut tainted: CursorAgent =
+            serde_json::from_value(fake_agent_record(AGENT_1, false)).unwrap();
+        tainted.name = Some(FFFD_NAME.into());
+        assert!(matches!(
+            worker_record(&tainted, None, None),
+            Err(ExternalWorkerAdapterError::InvalidResponse(_))
+        ));
+
+        let sibling: CursorAgent =
+            serde_json::from_value(fake_agent_record(AGENT_2, false)).unwrap();
+        let projected = worker_record(&sibling, None, None).expect("stable sibling stays valid");
+        projected.validate().expect("sibling public DTO validates");
+        assert_eq!(projected.external_agent_id, AGENT_2);
+        assert_eq!(projected.state, ExternalWorkerState::Ready);
+        assert_ne!(projected.state, ExternalWorkerState::Cancelled);
+        assert_ne!(projected.state, ExternalWorkerState::Archived);
+        let json = serde_json::to_value(&projected).unwrap();
+        assert!(json.get("name").is_none());
+        assert!(!json.to_string().contains('\u{FFFD}'));
+        let round_trip: ExternalWorkerRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip, projected);
+
+        let mut bad_item: CursorAgentListItem =
+            serde_json::from_value(fake_list_item(AGENT_1, false, "2026-08-24T00:00:01Z")).unwrap();
+        bad_item.name = Some(FFFD_NAME.into());
+        assert!(worker_summary(&bad_item).is_err());
+        let good_item: CursorAgentListItem =
+            serde_json::from_value(fake_list_item(AGENT_2, false, "2026-08-24T00:00:05Z")).unwrap();
+        let summary = worker_summary(&good_item).unwrap();
+        assert_eq!(summary.external_agent_id, AGENT_2);
+        assert_eq!(summary.state, ExternalWorkerState::Ready);
+        assert!(serde_json::to_value(&summary)
+            .unwrap()
+            .get("name")
+            .is_none());
     }
 
     #[tokio::test]
@@ -2097,5 +2273,84 @@ mod tests {
         assert!(!rendered.contains('\u{FFFD}'));
         assert!(!rendered.contains("synthetic-cursor-key"));
         assert!(!rendered.contains("Bearer"));
+    }
+
+    #[tokio::test]
+    async fn launch_and_get_reject_fffd_name_without_mutating_a_stable_sibling() {
+        let state = FffdNameCursorState::default();
+        let address = spawn_app(fffd_name_router(state.clone())).await;
+        let adapter = CursorCloudAdapter::for_test(&address);
+
+        let mut request = launch_request();
+        request.prompt = format!("审查候选用例 {FFFD_NAME}");
+        request
+            .validate()
+            .expect("public launch DTO treats U+FFFD as valid Unicode");
+        let encoded = serde_json::to_value(&request).expect("launch request serializes");
+        let decoded: ExternalWorkerLaunchRequest =
+            serde_json::from_value(encoded).expect("launch request deserializes");
+        assert_eq!(decoded.prompt, request.prompt);
+        assert!(decoded.prompt.contains('\u{FFFD}'));
+        assert!(decoded.prompt.contains("审查候选用例"));
+
+        assert!(matches!(
+            adapter.launch(&launch_request()).await.unwrap_err(),
+            ExternalWorkerAdapterError::InvalidResponse(_)
+        ));
+        assert!(matches!(
+            adapter.get_worker(AGENT_1).await.unwrap_err(),
+            ExternalWorkerAdapterError::InvalidResponse(_)
+        ));
+        assert!(matches!(
+            adapter.archive(AGENT_1).await.unwrap_err(),
+            ExternalWorkerAdapterError::InvalidResponse(_)
+        ));
+        assert!(
+            state.archive_posts.lock().unwrap().is_empty(),
+            "name-scoped FFFD rejection must not archive the tainted worker"
+        );
+        assert!(state.archived.lock().unwrap().is_empty());
+        assert!(state.cancelled.lock().unwrap().is_empty());
+        assert!(state.cancel_posts.lock().unwrap().is_empty());
+
+        let sibling = adapter
+            .get_worker(AGENT_2)
+            .await
+            .expect("stable sibling remains readable");
+        sibling
+            .validate()
+            .expect("sibling public DTO stays in bounds");
+        assert_eq!(sibling.external_agent_id, AGENT_2);
+        assert_eq!(sibling.state, ExternalWorkerState::Ready);
+        assert_ne!(sibling.state, ExternalWorkerState::Cancelled);
+        assert_ne!(sibling.state, ExternalWorkerState::Archived);
+        let sibling_json = serde_json::to_value(&sibling).unwrap();
+        assert!(sibling_json.get("name").is_none());
+        assert!(sibling_json.get("repository").is_some());
+        let sibling_rendered = sibling_json.to_string();
+        assert!(!sibling_rendered.contains('\u{FFFD}'));
+        assert!(!sibling_rendered.contains("synthetic-cursor-key"));
+        assert!(!sibling_rendered.contains("Bearer"));
+        let round_trip: ExternalWorkerRecord = serde_json::from_value(sibling_json).unwrap();
+        round_trip
+            .validate()
+            .expect("round-tripped sibling validates");
+        assert_eq!(round_trip, sibling);
+
+        let page_error = adapter
+            .list_workers(&ExternalWorkerListQuery::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            page_error,
+            ExternalWorkerAdapterError::InvalidResponse(_)
+        ));
+        let still_sibling = adapter.get_worker(AGENT_2).await.unwrap();
+        assert_eq!(still_sibling.external_agent_id, AGENT_2);
+        assert_eq!(still_sibling.state, ExternalWorkerState::Ready);
+        assert!(state.archived.lock().unwrap().is_empty());
+        assert!(state.cancelled.lock().unwrap().is_empty());
+        assert!(!state.archived.lock().unwrap().contains(AGENT_2));
+        assert!(!state.cancelled.lock().unwrap().contains(AGENT_2));
     }
 }

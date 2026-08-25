@@ -113,8 +113,12 @@ path is qualified.
    explicit `includeArchived` flag, reversible archive/unarchive with identity
    and state verification, malformed/unknown list responses failing closed,
    non-ASCII UTF-8 name/detail/prompt round-trip without lossy conversion,
-   fail-closed invalid or non-UTF-8 JSON, and run-attributed digest-bearing
-   artifacts without network credentials. Stream
+   fail-closed invalid or non-UTF-8 JSON, a name-scoped U+FFFD `name` gate
+   that cannot cancel/archive/mutate a sibling worker, direct launch/get
+   coverage for a U+FFFD display name plus crate-root public DTO
+   validation/round-trip, hosted Desktop `cargo test -p grokptah-agent-sdk`
+   on SDK-path changes, and run-attributed digest-bearing artifacts without
+   network credentials. Stream
    reconnect/expiry, durable idempotent retry, and a real artifact download/hash
    path remain to be added. Live Cursor qualification is still an open gate.
 2. **Read-only live probe:** list models/repositories and read an existing
