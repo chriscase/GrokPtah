@@ -515,7 +515,7 @@ impl OrchStore {
         if result.is_err_and(|error| error.kind() != std::io::ErrorKind::AlreadyExists) {
             let _ = fs::remove_file(&path);
         }
-        result
+        result.map_err(anyhow::Error::from)
     }
 
     pub(crate) fn load_acceptance_intent(
