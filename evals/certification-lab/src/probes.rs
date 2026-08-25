@@ -4748,6 +4748,14 @@ mod tests {
     }
 
     #[test]
+    fn always_on_grokbot_lifecycle_probe_has_no_implementation_tools_entry() {
+        let manifest = CampaignManifest::bundled().unwrap();
+        assert!(manifest.probe("always-on-grokbot-lifecycle-v1").is_some());
+        assert!(implementation_tools("always-on-grokbot-lifecycle-v1").is_none());
+        assert!(!has_implementation("always-on-grokbot-lifecycle-v1"));
+    }
+
+    #[test]
     fn implemented_probe_tool_allowlists_exactly_match_the_manifest() {
         let manifest = CampaignManifest::bundled().unwrap();
         for definition in manifest

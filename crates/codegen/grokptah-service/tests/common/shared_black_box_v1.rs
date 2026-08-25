@@ -73,6 +73,10 @@ const AUDITED_GOLDENS: &[(&str, &str)] = &[
         "67e29bd34dc64049432c715c93c2cef2185c63ea",
         "expected-main-67e29bd3.json",
     ),
+    (
+        "748ab129b0b06c2fb475990f8f572c93ac87d392",
+        "expected-748ab129b0b06c.json",
+    ),
 ];
 
 const FIXTURE_ALLOWLIST: &[&str] = &[
@@ -84,6 +88,7 @@ const FIXTURE_ALLOWLIST: &[&str] = &[
     "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/scenario.json",
     "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-main-67e29bd3.json",
     "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-pr352-4bd2081b.json",
+    "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-748ab129b0b06c.json",
 ];
 
 const GOLDEN_UPDATE_ENV_VARS: &[&str] = &[
@@ -2885,12 +2890,16 @@ fn repo_root() -> PathBuf {
         .expect("canonicalize repo root")
 }
 
-fn git_stdout(args: &[&str]) -> Result<String, String> {
-    let root = repo_root();
+fn git_stdout(root: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(&root)
+        .arg(root)
         .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .output()
         .map_err(|error| format!("git {}: {error}", args.join(" ")))?;
     if !output.status.success() {
@@ -2903,6 +2912,52 @@ fn git_stdout(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout)
         .trim_end()
         .to_string())
+}
+
+fn git_stdout_in(root: &Path, args: &[&str]) -> Result<String, String> {
+    git_stdout(root, args)
+}
+
+fn git_tree_in(root: &Path, rev: &str) -> Result<String, String> {
+    git_stdout(root, &["rev-parse", &format!("{rev}^{{tree}}")])
+}
+
+fn commit_parents_in(root: &Path, sha: &str) -> Result<Vec<String>, String> {
+    let line = git_stdout(root, &["rev-list", "--parents", "-n", "1", sha])?;
+    let mut parts = line.split_whitespace();
+    let Some(self_sha) = parts.next() else {
+        return Err(format!("git rev-list --parents returned empty for {sha}"));
+    };
+    if self_sha != sha {
+        return Err(format!(
+            "git rev-list --parents started with {self_sha}, expected {sha}"
+        ));
+    }
+    Ok(parts.map(str::to_string).collect())
+}
+
+/// GitHub `pull_request` jobs check out a two-parent merge of the PR into the
+/// base. When that merge's tree equals the second parent, it is not a unique
+/// host revision: start the allowlist walk at the PR head. Unique-tree merges
+/// stay fail-closed as the merge SHA itself. Never walk until a known golden.
+fn audit_walk_start_in(root: &Path, head: &str) -> String {
+    let Ok(parents) = commit_parents_in(root, head) else {
+        return head.to_string();
+    };
+    if parents.len() != 2 {
+        return head.to_string();
+    }
+    let Ok(head_tree) = git_tree_in(root, head) else {
+        return head.to_string();
+    };
+    let Ok(second_tree) = git_tree_in(root, &parents[1]) else {
+        return head.to_string();
+    };
+    if head_tree == second_tree {
+        parents[1].clone()
+    } else {
+        head.to_string()
+    }
 }
 
 fn porcelain_paths(status: &str) -> Vec<String> {
@@ -2930,19 +2985,22 @@ fn allowlisted(path: &str) -> bool {
     })
 }
 
-fn commit_changed_files(sha: &str) -> Result<Vec<String>, String> {
-    let parent = git_stdout(&["rev-parse", &format!("{sha}^")]);
+fn commit_changed_files_in(root: &Path, sha: &str) -> Result<Vec<String>, String> {
+    let parent = git_stdout_in(root, &["rev-parse", &format!("{sha}^")]);
     let diff = if parent.is_ok() {
-        git_stdout(&["diff", "--name-only", &format!("{sha}^"), sha])?
+        git_stdout_in(root, &["diff", "--name-only", &format!("{sha}^"), sha])?
     } else {
-        git_stdout(&[
-            "diff-tree",
-            "--no-commit-id",
-            "--name-only",
-            "--root",
-            "-r",
-            sha,
-        ])?
+        git_stdout_in(
+            root,
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "--root",
+                "-r",
+                sha,
+            ],
+        )?
     };
     Ok(diff
         .lines()
@@ -2952,19 +3010,36 @@ fn commit_changed_files(sha: &str) -> Result<Vec<String>, String> {
 }
 
 fn detect_audited_source_revision() -> String {
-    let status = git_stdout(&["status", "--porcelain"]).expect("git status");
+    detect_audited_source_revision_in(&repo_root())
+}
+
+fn detect_audited_source_revision_in(root: &Path) -> String {
+    let status = git_stdout_in(root, &["status", "--porcelain"]).expect("git status");
     for path in porcelain_paths(&status) {
         if !allowlisted(&path) {
             panic!("unexpected dirty path outside fixture allowlist: {path}");
         }
     }
-    let mut sha = git_stdout(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    let head = git_stdout_in(root, &["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    let parents = commit_parents_in(root, &head).unwrap_or_default();
+    if parents.len() > 2 {
+        return head;
+    }
+    if parents.len() == 2 {
+        let head_tree = git_tree_in(root, &head).ok();
+        let second_tree = git_tree_in(root, &parents[1]).ok();
+        match (head_tree, second_tree) {
+            (Some(head_tree), Some(second_tree)) if head_tree == second_tree => {}
+            _ => return head,
+        }
+    }
+    let mut sha = audit_walk_start_in(root, &head);
     loop {
-        let files = commit_changed_files(&sha).expect("commit files");
+        let files = commit_changed_files_in(root, &sha).expect("commit files");
         if files.iter().any(|path| !allowlisted(path)) {
             return sha;
         }
-        match git_stdout(&["rev-parse", &format!("{sha}^")]) {
+        match git_stdout_in(root, &["rev-parse", &format!("{sha}^")]) {
             Ok(parent) => sha = parent,
             Err(_) => panic!("could not identify audited host revision (fail closed)"),
         }
@@ -3182,6 +3257,42 @@ fn malformed_golden_fails_before_launch() {
     assert!(text.contains("malformed golden"), "{text}");
 }
 
+const FIXTURE_GIT_PRODUCT: &str = "crates/codegen/grokptah-agent-bridge/src/lib.rs";
+const FIXTURE_GIT_ALLOWLIST: &str =
+    "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/scenario.json";
+const FIXTURE_GIT_UNIQUE: &str = "desktop/src-tauri/src/lib.rs";
+
+fn git_in(root: &Path, args: &[&str]) {
+    git_stdout_in(root, args).unwrap_or_else(|error| panic!("{error}"));
+}
+
+fn init_fixture_git_repo() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dunce::canonicalize(dir.path()).expect("canonicalize fixture git root");
+    git_in(&root, &["init", "-b", "main"]);
+    git_in(&root, &["config", "user.email", "sbb-v1@example.test"]);
+    git_in(&root, &["config", "user.name", "sbb-v1"]);
+    git_in(&root, &["config", "commit.gpgsign", "false"]);
+    (dir, root)
+}
+
+fn write_git_commit(root: &Path, path: &str, contents: &str, message: &str) -> String {
+    let full = root.join(path);
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&full, contents).unwrap();
+    git_in(root, &["add", "--", path]);
+    git_in(root, &["commit", "-m", message]);
+    git_stdout_in(root, &["rev-parse", "HEAD"]).unwrap()
+}
+
+fn merge_no_ff(root: &Path, first_parent: &str, second_parent: &str, message: &str) -> String {
+    git_in(root, &["checkout", "-q", first_parent]);
+    git_in(root, &["merge", "--no-ff", "-m", message, second_parent]);
+    git_stdout_in(root, &["rev-parse", "HEAD"]).unwrap()
+}
+
 #[test]
 fn unknown_source_revision_fails_closed() {
     let scenario = Scenario::load();
@@ -3191,6 +3302,105 @@ fn unknown_source_revision_fails_closed() {
     .expect_err("unknown revision must fail closed");
     let text = panic_text(message);
     assert!(text.contains("unexpected source revision"), "{text}");
+}
+
+#[test]
+fn unknown_detected_revision_still_fails_closed() {
+    let scenario = Scenario::load();
+    let (_dir, root) = init_fixture_git_repo();
+    let unknown = write_git_commit(&root, FIXTURE_GIT_PRODUCT, "unknown-host\n", "unknown host");
+    let detected = detect_audited_source_revision_in(&root);
+    assert_eq!(detected, unknown);
+    let message = catch_unwind(AssertUnwindSafe(|| {
+        select_golden_file(&detected, &scenario)
+    }))
+    .expect_err("unknown detected revision must fail closed");
+    let text = panic_text(message);
+    assert!(text.contains("unexpected source revision"), "{text}");
+    assert!(text.contains(&unknown), "{text}");
+}
+
+#[test]
+fn matching_tree_github_merge_uses_second_parent() {
+    let (_dir, root) = init_fixture_git_repo();
+    let base = write_git_commit(&root, FIXTURE_GIT_PRODUCT, "base\n", "base");
+    let product = write_git_commit(&root, FIXTURE_GIT_PRODUCT, "product\n", "product");
+    let fixture = write_git_commit(&root, FIXTURE_GIT_ALLOWLIST, "{}\n", "allowlist fixture");
+    let merge = merge_no_ff(&root, &base, &fixture, "github pull_request merge");
+    let parents = commit_parents_in(&root, &merge).unwrap();
+    assert_eq!(parents, vec![base.clone(), fixture.clone()]);
+    assert_eq!(
+        git_tree_in(&root, &merge).unwrap(),
+        git_tree_in(&root, &fixture).unwrap()
+    );
+    assert_eq!(audit_walk_start_in(&root, &merge), fixture);
+    assert_eq!(detect_audited_source_revision_in(&root), product);
+}
+
+#[test]
+fn unique_tree_merge_is_not_inferred_as_a_parent_golden() {
+    let scenario = Scenario::load();
+    let (_dir, root) = init_fixture_git_repo();
+    let base = write_git_commit(&root, FIXTURE_GIT_PRODUCT, "base\n", "base");
+    let first = write_git_commit(&root, FIXTURE_GIT_PRODUCT, "first-parent\n", "first parent");
+    git_in(&root, &["branch", "pr-head", &base]);
+    git_in(&root, &["checkout", "-q", "pr-head"]);
+    let second = write_git_commit(
+        &root,
+        FIXTURE_GIT_UNIQUE,
+        "second-parent\n",
+        "second parent",
+    );
+    let merge = merge_no_ff(&root, &first, &second, "unique-tree merge");
+    let parents = commit_parents_in(&root, &merge).unwrap();
+    assert_eq!(parents, vec![first.clone(), second.clone()]);
+    assert_ne!(
+        git_tree_in(&root, &merge).unwrap(),
+        git_tree_in(&root, &second).unwrap()
+    );
+    assert_eq!(audit_walk_start_in(&root, &merge), merge);
+    let detected = detect_audited_source_revision_in(&root);
+    assert_eq!(detected, merge);
+    assert_ne!(detected, second);
+    assert_ne!(detected, first);
+    let message = catch_unwind(AssertUnwindSafe(|| {
+        select_golden_file(&detected, &scenario)
+    }))
+    .expect_err("unique-tree merge must not inherit a parent golden");
+    let text = panic_text(message);
+    assert!(text.contains("unexpected source revision"), "{text}");
+    assert!(text.contains(&merge), "{text}");
+}
+
+#[test]
+fn octopus_merge_is_not_rewritten() {
+    let scenario = Scenario::load();
+    let (_dir, root) = init_fixture_git_repo();
+    let base = write_git_commit(&root, FIXTURE_GIT_PRODUCT, "base\n", "base");
+    git_in(&root, &["branch", "side-a", &base]);
+    git_in(&root, &["branch", "side-b", &base]);
+    git_in(&root, &["checkout", "-q", "side-a"]);
+    let _a = write_git_commit(&root, "side-a.txt", "A\n", "side a");
+    git_in(&root, &["checkout", "-q", "side-b"]);
+    let _b = write_git_commit(&root, "side-b.txt", "B\n", "side b");
+    git_in(&root, &["checkout", "-q", &base]);
+    git_in(&root, &["merge", "-m", "octopus", "side-a", "side-b"]);
+    let merge = git_stdout_in(&root, &["rev-parse", "HEAD"]).unwrap();
+    let parents = commit_parents_in(&root, &merge).unwrap();
+    assert!(
+        parents.len() >= 3,
+        "expected octopus parents, got {parents:?}"
+    );
+    assert_eq!(audit_walk_start_in(&root, &merge), merge);
+    let detected = detect_audited_source_revision_in(&root);
+    assert_eq!(detected, merge);
+    let message = catch_unwind(AssertUnwindSafe(|| {
+        select_golden_file(&detected, &scenario)
+    }))
+    .expect_err("octopus merge must fail closed");
+    let text = panic_text(message);
+    assert!(text.contains("unexpected source revision"), "{text}");
+    assert!(text.contains(&merge), "{text}");
 }
 
 #[test]
@@ -3368,5 +3578,23 @@ fn expected_main_golden_is_immutable_for_audited_revision() {
     assert_eq!(
         loaded["overlay"]["mcpError"]["code"],
         json!("invalid_request")
+    );
+}
+
+#[test]
+fn expected_748ab129_golden_is_immutable_for_audited_revision() {
+    let path = PathBuf::from(GOLDEN_DIR).join("expected-748ab129b0b06c.json");
+    let loaded = load_immutable_golden(&path, "748ab129b0b06c2fb475990f8f572c93ac87d392");
+    assert_eq!(
+        loaded["features"]["hostCapabilityContract"]["missingCapabilityDenial"],
+        json!("forbidden_scope")
+    );
+    assert_eq!(
+        loaded["features"]["nativeCodingReadiness"]["support"],
+        json!("present")
+    );
+    assert_eq!(
+        loaded["sourceRevision"],
+        json!("748ab129b0b06c2fb475990f8f572c93ac87d392")
     );
 }

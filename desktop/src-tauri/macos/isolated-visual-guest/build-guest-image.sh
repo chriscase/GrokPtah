@@ -143,7 +143,9 @@ require_config() {
   fi
   # After olddefconfig, kconfig writes disabled bools as
   # `# CONFIG_FOO is not set` rather than `CONFIG_FOO=n`. The fragment still
-  # uses `=n` so merge_config.sh can override defconfig's `=y`.
+  # uses `=n` so merge_config.sh can override defconfig's `=y`. Enabled `=y`
+  # and INITRAMFS provenance stay exact; an absent key is not treated as
+  # disabled.
   case "$wanted" in
     CONFIG_*=n)
       name=${wanted%=n}

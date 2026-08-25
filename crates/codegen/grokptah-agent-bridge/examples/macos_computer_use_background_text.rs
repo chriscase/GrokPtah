@@ -4,11 +4,13 @@ use std::collections::BTreeSet;
 #[cfg(target_os = "macos")]
 use chrono::{Duration, Utc};
 #[cfg(target_os = "macos")]
+use grokptah_agent_bridge::computer_use::SemanticElement;
+#[cfg(target_os = "macos")]
 use grokptah_agent_bridge::{
     set_grokptah_home_override, ActionClass, ActionGrant, AgentHost, ComputerAction,
     ComputerAuthorityToken, ComputerCapabilityTier, ComputerObservation,
     ComputerObservationPlatform, ComputerRun, ComputerStore, ComputerUseLimits, ComputerUseService,
-    HostConfig, MacOsObservationPlatform, SemanticAction, SemanticElement,
+    HostConfig, MacOsObservationPlatform, SemanticAction,
 };
 #[cfg(target_os = "macos")]
 use uuid::Uuid;

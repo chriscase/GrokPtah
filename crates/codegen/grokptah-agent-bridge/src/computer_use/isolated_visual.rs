@@ -208,7 +208,28 @@ impl IsolatedVisualLaunchContract {
                 "isolated input domain is not independent from its surface identity",
             ));
         }
-        self.manifest.validate()
+        self.manifest.validate()?;
+        #[cfg(target_os = "macos")]
+        {
+            // The crate-private packaged supervisor is the only macOS launch
+            // entrypoint for this contract. Binding it here keeps `-D warnings`
+            // from treating the supervisor as dead code without constructing a
+            // helper, minting authority, or crate-root re-export.
+            let _packaged = Self::packaged_runtime;
+            super::macos_isolated_runtime::bind_packaged_supervisor_entrypoints();
+            let _ = _packaged;
+        }
+        Ok(())
+    }
+
+    /// Crate-private macOS packaged supervisor for this exact contract.
+    /// Callers must still independently measure a reviewed package; this does
+    /// not spawn a helper, launch a VM, or mint Computer Use authority.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn packaged_runtime(
+        self,
+    ) -> ComputerResult<super::macos_isolated_runtime::IsolatedVisualPackagedRuntime> {
+        super::macos_isolated_runtime::IsolatedVisualPackagedRuntime::launch(self)
     }
 }
 
