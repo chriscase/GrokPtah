@@ -976,7 +976,6 @@ fn assert_exact_cardinality(
     expected: AlwaysOnCardinality,
     actual: AlwaysOnCardinality,
 ) -> Result<(), DiagnosticCode> {
-    eprintln!("always_on_cardinality_debug expected={expected:?} actual={actual:?}");
     if expected == actual {
         Ok(())
     } else {
