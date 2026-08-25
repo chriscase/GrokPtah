@@ -94,6 +94,29 @@ describe("GrokPtahBrokerClient", () => {
     expect(binding.capabilities[0]?.id).toBe("run.review");
   });
 
+  it("rejects path-like binding aliases and malformed capability requests before transmission", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    for (const [investigationId, workspace, capabilities] of [
+      ["", "approved", ["run.review"]],
+      ["war-room", "/Users/secret", ["run.review"]],
+      ["war-room", "approved", ["run.review", "run.review"]],
+      ["war-room", "approved", ["Run.Review"]],
+    ] as const) {
+      await expect(client.createBinding(investigationId, workspace, capabilities, "bind-1"))
+        .rejects.toMatchObject({ code: "invalid_request" });
+    }
+    await expect(client.createBinding(" ", "approved", ["run.review"], "bind-1"))
+      .rejects.toMatchObject({ code: "invalid_request" });
+    await expect(client.createBinding("war-room", " ", ["run.review"], "bind-1"))
+      .rejects.toMatchObject({ code: "invalid_request" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("fails closed before a mutating request without a broker CSRF token", async () => {
     const fetcher = vi.fn<typeof fetch>();
     const client = new GrokPtahBrokerClient({ baseUrl: "https://contextdesk.example", fetcher });
@@ -191,6 +214,7 @@ describe("GrokPtahBrokerClient", () => {
       [{ path: "../secret", summary: "bounded" }],
       [{ path: "/absolute", summary: "bounded" }],
       [{ path: "src/file.ts", summary: "é".repeat(257) }],
+      [{ path: "src/file.ts", summary: "bounded", extra: true }],
     ]) {
       await expect(
         client.approveRun("binding-1", "run-1", { ...base, changedFiles }, "approve-intent-1"),

@@ -39,6 +39,14 @@ const MAX_BROKER_ROUNDS = 24;
 const MAX_BROKER_PROMPT_BOUND_BYTES = 4 * 1_048_576;
 const MAX_BROKER_SSE_REASON_BYTES = 256;
 const MAX_BROKER_SSE_ROUTE_BYTES = 2_048;
+const MAX_BROKER_ID_BYTES = 256;
+const MAX_BROKER_IDEMPOTENCY_BYTES = 256;
+const MAX_BROKER_CAPABILITIES = 64;
+const MAX_BROKER_CAPABILITY_ID_BYTES = 128;
+const MAX_BROKER_CHANGED_FILES = 256;
+const MAX_BROKER_FINGERPRINT_BYTES = 256;
+const MAX_BROKER_PATH_BYTES = 512;
+const BROKER_CAPABILITY_ID = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9_]*)+$/;
 
 const BROKER_AVAILABILITIES: ReadonlySet<GrokPtahBrokerCapability["availability"]> = new Set([
   "available",
@@ -91,7 +99,11 @@ export type GrokPtahBrokerRecovery = {
 export type GrokPtahBrokerNotification = GrokPtahBrokerEvent | GrokPtahBrokerRecovery;
 
 function boundedString(value: unknown, maxBytes: number): value is string {
-  return typeof value === "string" && value.length > 0 && new TextEncoder().encode(value).byteLength <= maxBytes;
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    new TextEncoder().encode(value).byteLength <= maxBytes
+  );
 }
 
 function hasOnlyKeys(value: Record<string, unknown>, keys: ReadonlySet<string>): boolean {
@@ -199,10 +211,11 @@ export class GrokPtahBrokerClient {
     requestedCapabilities: string[],
     idempotencyKey: string,
   ): Promise<GrokPtahBrokerBinding> {
+    validateBindingRequest(investigationId, workspace, requestedCapabilities);
     return this.requestValidated("/bindings", parseBrokerBinding, {
       method: "POST",
       idempotencyKey,
-      body: { investigationId, workspace, requestedCapabilities },
+      body: { investigationId, workspace, requestedCapabilities: [...requestedCapabilities] },
     });
   }
 
@@ -431,6 +444,13 @@ export class GrokPtahBrokerClient {
           "A non-empty idempotency key is required for mutating requests",
         );
       }
+      if (new TextEncoder().encode(options.idempotencyKey).byteLength > MAX_BROKER_IDEMPOTENCY_BYTES) {
+        throw new GrokPtahBrokerError(
+          0,
+          "invalid_request",
+          "Idempotency key exceeds the broker byte ceiling",
+        );
+      }
     }
     if (options.body !== undefined) headers["Content-Type"] = "application/json";
     if (options.idempotencyKey) headers["Idempotency-Key"] = options.idempotencyKey.trim();
@@ -474,8 +494,48 @@ export class GrokPtahBrokerClient {
 }
 
 function segment(value: string): string {
-  if (!value.trim()) throw new Error("Broker identifier must not be empty");
+  if (!boundedString(value, MAX_BROKER_ID_BYTES)) {
+    throw new GrokPtahBrokerError(
+      0,
+      "invalid_request",
+      "Broker identifier must be a bounded non-empty string",
+    );
+  }
   return encodeURIComponent(value);
+}
+
+function validateBindingRequest(
+  investigationId: unknown,
+  workspace: unknown,
+  requestedCapabilities: unknown,
+): asserts investigationId is string {
+  validateOpaqueText(investigationId, "Investigation id", MAX_BROKER_ID_BYTES);
+  if (!boundedString(workspace, MAX_BROKER_ID_BYTES)) {
+    throw new GrokPtahBrokerError(0, "invalid_request", "Workspace alias must be bounded and non-empty");
+  }
+  if (workspace.includes("/") || workspace.includes("\\") || workspace.includes("..")) {
+    throw new GrokPtahBrokerError(0, "invalid_request", "Workspace must be an opaque alias, not a path");
+  }
+  if (!Array.isArray(requestedCapabilities) || requestedCapabilities.length > MAX_BROKER_CAPABILITIES) {
+    throw new GrokPtahBrokerError(0, "invalid_request", "Requested capabilities are invalid or too numerous");
+  }
+  const ids = new Set<string>();
+  for (const capability of requestedCapabilities) {
+    if (
+      !boundedString(capability, MAX_BROKER_CAPABILITY_ID_BYTES) ||
+      !BROKER_CAPABILITY_ID.test(capability) ||
+      ids.has(capability)
+    ) {
+      throw new GrokPtahBrokerError(0, "invalid_request", "Requested capabilities must be unique stable ids");
+    }
+    ids.add(capability);
+  }
+}
+
+function validateOpaqueText(value: unknown, label: string, maxBytes: number): asserts value is string {
+  if (!boundedString(value, maxBytes)) {
+    throw new GrokPtahBrokerError(0, "invalid_request", `${label} must be bounded and non-empty`);
+  }
 }
 
 function validateApprovalRequest(request: GrokPtahBrokerApprovalRequest): void {
@@ -483,7 +543,9 @@ function validateApprovalRequest(request: GrokPtahBrokerApprovalRequest): void {
     typeof request.sourceFingerprint !== "string" ||
     typeof request.finalFingerprint !== "string" ||
     !request.sourceFingerprint.trim() ||
-    !request.finalFingerprint.trim()
+    !request.finalFingerprint.trim() ||
+    !boundedString(request.sourceFingerprint, MAX_BROKER_FINGERPRINT_BYTES) ||
+    !boundedString(request.finalFingerprint, MAX_BROKER_FINGERPRINT_BYTES)
   ) {
     throw new GrokPtahBrokerError(
       0,
@@ -491,7 +553,7 @@ function validateApprovalRequest(request: GrokPtahBrokerApprovalRequest): void {
       "Approval fingerprints must not be empty",
     );
   }
-  if (!Array.isArray(request.changedFiles)) {
+  if (!Array.isArray(request.changedFiles) || request.changedFiles.length > MAX_BROKER_CHANGED_FILES) {
     throw new GrokPtahBrokerError(
       0,
       "invalid_request",
@@ -512,11 +574,13 @@ function validateApprovalRequest(request: GrokPtahBrokerApprovalRequest): void {
     if (
       file === null ||
       typeof file !== "object" ||
+      !hasOnlyKeys(file as Record<string, unknown>, new Set(["path", "summary"])) ||
       typeof file.path !== "string" ||
       typeof file.summary !== "string" ||
       !file.path.trim() ||
       file.path.startsWith("/") ||
       file.path.includes("..") ||
+      new TextEncoder().encode(file.path).byteLength > MAX_BROKER_PATH_BYTES ||
       new TextEncoder().encode(file.summary).byteLength > 512
     ) {
       throw new GrokPtahBrokerError(
