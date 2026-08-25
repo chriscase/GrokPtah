@@ -915,17 +915,35 @@ impl AlwaysOnSnapshot {
     }
 
     /// The snapshot the interrupted-run fence must observe after a restart:
-    /// every identity preserved bit for bit, with exactly the target Work
-    /// `failed` and the target Run `interrupted`.
+    /// every identity preserved bit for bit, with the held Work `failed` (and
+    /// its public revision advanced once), the held attempt `expired`, the held
+    /// intent `finalized` when the projection exposes a state, and the target
+    /// Run `interrupted`.
     ///
-    /// Expressing the fence this way keeps the Run and Work `state` fields
-    /// inside the compared oracle. Dropping state to make the comparison hold
-    /// would have re-opened the substitution hole this module closes.
+    /// Those extra field moves are the public contract of SIGKILL against an
+    /// in-flight lease (`ManagedRetryCause::Interrupted` expires the attempt).
+    /// Treating only Work/Run `state` as the interruption delta left the
+    /// identity snapshot unable to reconstruct a real held home.
     pub fn with_interruption(&self, work_id: &str, run_id: &str) -> Self {
         let mut next = self.clone();
         for item in &mut next.work {
-            if item.work_id == work_id && item.state.is_some() {
-                item.state = Some("failed".to_owned());
+            if item.work_id == work_id {
+                if item.state.is_some() && item.state.as_deref() != Some("failed") {
+                    item.state = Some("failed".to_owned());
+                    item.revision = item.revision.saturating_add(1);
+                }
+                for attempt in &mut item.attempts {
+                    if attempt.state.is_some()
+                        && attempt.linked_run_ids.iter().any(|linked| linked == run_id)
+                    {
+                        attempt.state = Some("expired".to_owned());
+                    }
+                }
+            }
+        }
+        for intent in &mut next.intents {
+            if intent.run_id == run_id && intent.state.is_some() {
+                intent.state = Some("finalized".to_owned());
             }
         }
         for run in &mut next.runs {
@@ -1569,9 +1587,11 @@ pub fn assert_home_b_pre_restart_shape(
 /// Comparing the post-restart snapshot against the pre-restart one directly
 /// can never hold: when the held step fails, the autonomous manager reacts
 /// once, materialising a manager-decision lane bound to a manager proposal
-/// Run. The real invariant is that *nothing else* moves — every pre-restart
-/// identity survives, the held lane lands on failed Work over an interrupted
-/// Run, and the manager's reaction is exactly one fully joined decision lane.
+/// Run, and the held lane's public Work revision / attempt state / intent
+/// state move with the interruption. The real invariant is that *nothing
+/// else* moves — every pre-restart identity survives, the held lane lands on
+/// failed Work over an expired attempt and an interrupted Run, and the
+/// manager's reaction is exactly one fully joined decision lane.
 pub fn assert_post_restart_shape(
     pre_restart: &AlwaysOnSnapshot,
     post_restart: &AlwaysOnSnapshot,
@@ -2425,6 +2445,23 @@ mod tests {
             expected.work_for_step("step-a").unwrap().state.as_deref(),
             Some("failed")
         );
+        assert_eq!(expected.work_for_step("step-a").unwrap().revision, 2);
+        assert_eq!(
+            expected.work_for_step("step-a").unwrap().attempts[0]
+                .state
+                .as_deref(),
+            Some("expired")
+        );
+        assert_eq!(
+            expected
+                .intents
+                .iter()
+                .find(|intent| intent.run_id == "run-a")
+                .unwrap()
+                .state
+                .as_deref(),
+            Some("finalized")
+        );
         assert_eq!(
             expected.run("run-a").unwrap().state.as_deref(),
             Some("interrupted")
@@ -2652,7 +2689,8 @@ mod tests {
             "inputHash": "hash-work-a",
             "workRevision": 1,
             "agentSpecRevision": 1,
-            "agentId": "agent-1"
+            "agentId": "agent-1",
+            "state": "admitted"
         }));
         runs["runs"].as_array_mut().unwrap().push(json!({
             "runId": "run-a",
@@ -3127,6 +3165,13 @@ mod tests {
         for item in work["work"].as_array_mut().unwrap() {
             if item["workId"] == json!("work-a") {
                 item["state"] = json!("failed");
+                item["revision"] = json!(2);
+            }
+        }
+        details.get_mut("work-a").unwrap()["attempts"][0]["state"] = json!("expired");
+        for intent in intents["intents"].as_array_mut().unwrap() {
+            if intent["runId"] == json!("run-a") {
+                intent["state"] = json!("finalized");
             }
         }
         for run in runs["runs"].as_array_mut().unwrap() {
@@ -3220,6 +3265,40 @@ mod tests {
             .state = Some("succeeded".into());
         assert_eq!(
             assert_post_restart_shape(&held(), &not_failed, "work-a", "run-a"),
+            Err(DiagnosticCode::StateTransitionMismatch)
+        );
+        let mut lease_still_live = post_restart();
+        lease_still_live
+            .work
+            .iter_mut()
+            .find(|item| item.work_id == "work-a")
+            .unwrap()
+            .attempts[0]
+            .state = Some("leased".into());
+        assert_eq!(
+            assert_post_restart_shape(&held(), &lease_still_live, "work-a", "run-a"),
+            Err(DiagnosticCode::StateTransitionMismatch)
+        );
+        let mut intent_not_finalized = post_restart();
+        intent_not_finalized
+            .intents
+            .iter_mut()
+            .find(|intent| intent.run_id == "run-a")
+            .unwrap()
+            .state = Some("admitted".into());
+        assert_eq!(
+            assert_post_restart_shape(&held(), &intent_not_finalized, "work-a", "run-a"),
+            Err(DiagnosticCode::StateTransitionMismatch)
+        );
+        let mut revision_frozen = post_restart();
+        revision_frozen
+            .work
+            .iter_mut()
+            .find(|item| item.work_id == "work-a")
+            .unwrap()
+            .revision = 1;
+        assert_eq!(
+            assert_post_restart_shape(&held(), &revision_frozen, "work-a", "run-a"),
             Err(DiagnosticCode::StateTransitionMismatch)
         );
         // The held lane's identities must survive the restart untouched.
