@@ -420,7 +420,8 @@ export type HelpLaneHost = {
  * chat as the user's active Lane or on the open-tab strip.
  *
  * `session_new_kind("chat")` and `session_prompt` both mutate host
- * `active_session`; restore the snapshot after create and again after delete.
+ * `active_session`. Restore the snapshot after every provider operation:
+ * create, session_prompt success or failure, and helper cleanup.
  */
 export async function runHelpProviderTurn<T>(
   host: HelpLaneHost,
@@ -428,14 +429,24 @@ export async function runHelpProviderTurn<T>(
   parse: (reply: string) => T,
 ): Promise<T> {
   const chrome = host.snapshot();
-  const session = await host.createEphemeralChat();
+  const restore = () => host.restore(chrome);
+  let sessionId: string | undefined;
   try {
-    await host.restore(chrome);
-    const reply = await host.prompt(session.id, prompt);
+    const session = await host.createEphemeralChat();
+    sessionId = session.id;
+    await restore();
+    let reply: string;
+    try {
+      reply = await host.prompt(session.id, prompt);
+    } finally {
+      await restore();
+    }
     return parse(reply);
   } finally {
-    await host.deleteSession(session.id).catch(() => undefined);
-    await host.restore(chrome);
+    if (sessionId) {
+      await host.deleteSession(sessionId).catch(() => undefined);
+    }
+    await restore();
   }
 }
 

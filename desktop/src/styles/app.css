@@ -2118,6 +2118,8 @@ button:disabled {
   grid-template-rows: 1fr;
   background: var(--bg);
   color: var(--text);
+  /* Honor html[data-type-scale] on body/#root; chrome sizes below use this em. */
+  font-size: 1em;
 }
 
 .help-surface {
@@ -2147,7 +2149,7 @@ button:disabled {
   padding: 0.9rem 1rem 1rem;
   background: var(--bg-panel);
   color: var(--text);
-  font-size: 12px;
+  font-size: calc(12 / 13.5 * 1em);
   box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
 }
 
@@ -2169,7 +2171,7 @@ button:disabled {
 }
 
 .help-header h2 {
-  font-size: 1.2rem;
+  font-size: 1.2em;
 }
 
 .help-eyebrow,
@@ -2183,7 +2185,7 @@ button:disabled {
 .help-eyebrow {
   margin-bottom: 0.2rem;
   color: var(--accent-label);
-  font-size: 10px;
+  font-size: calc(10 / 13.5 * 1em);
   font-weight: 700;
   letter-spacing: 0.09em;
   text-transform: uppercase;
@@ -2191,7 +2193,7 @@ button:disabled {
 
 .help-subtitle {
   margin-top: 0.3rem;
-  font-size: 12px;
+  font-size: calc(12 / 13.5 * 1em);
 }
 
 .help-header > button {
@@ -2221,7 +2223,7 @@ button:disabled {
 .help-search label,
 .help-topic-label {
   color: var(--muted);
-  font-size: 11px;
+  font-size: calc(11 / 13.5 * 1em);
   font-weight: 600;
 }
 
@@ -2234,14 +2236,20 @@ button:disabled {
   background: var(--bg-input);
   color: var(--text);
   font: inherit;
-  font-size: 12px;
+  font-size: calc(12 / 13.5 * 1em);
   padding: 0.55rem 0.65rem;
 }
 
 .help-search input:focus-visible,
 .help-topic:focus-visible,
-.help-list-item:focus-visible {
-  outline: 2px solid var(--accent);
+.help-list-item:focus-visible,
+.help-semantic-search:focus-visible,
+.help-semantic-confirm button:focus-visible,
+.help-assistant-card button:focus-visible,
+.help-assistant-confirm button:focus-visible,
+.help-header > button:focus-visible,
+.help-confirm-details summary:focus-visible {
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 
@@ -2254,13 +2262,13 @@ button:disabled {
 .help-result-count {
   margin: 0.9rem 0 0.45rem;
   color: var(--muted);
-  font-size: 11px;
+  font-size: calc(11 / 13.5 * 1em);
 }
 
 .help-retrieval-mode {
   margin: 0 0 0.6rem;
   color: var(--muted);
-  font-size: 10px;
+  font-size: calc(10 / 13.5 * 1em);
   letter-spacing: 0.02em;
 }
 
@@ -2274,7 +2282,7 @@ button:disabled {
   background: var(--overlay-faint);
   color: var(--text);
   font: inherit;
-  font-size: 11px;
+  font-size: calc(11 / 13.5 * 1em);
   cursor: pointer;
 }
 
@@ -2288,12 +2296,6 @@ button:disabled {
   opacity: 0.55;
 }
 
-.help-semantic-search:focus-visible,
-.help-semantic-confirm button:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
 .help-semantic-confirm,
 .help-retrieval-status {
   display: grid;
@@ -2302,7 +2304,7 @@ button:disabled {
   border-top: 1px solid var(--border-soft);
   padding: 0.65rem 0;
   color: var(--muted);
-  font-size: 11px;
+  font-size: calc(11 / 13.5 * 1em);
   line-height: 1.45;
 }
 
@@ -2313,6 +2315,11 @@ button:disabled {
 .help-semantic-confirm button {
   justify-self: start;
   min-height: 44px;
+}
+
+.help-semantic-confirm button.primary,
+.help-assistant-confirm button.primary {
+  color: var(--accent-label);
 }
 
 .help-confidence-note {
@@ -2348,20 +2355,20 @@ button:disabled {
 }
 
 .help-list-item strong {
-  font-size: 12px;
+  font-size: calc(12 / 13.5 * 1em);
 }
 
 .help-list-item > span:not(.help-list-topic),
 .help-list-item small {
   color: var(--muted);
-  font-size: 11px;
+  font-size: calc(11 / 13.5 * 1em);
   line-height: 1.35;
 }
 
 .help-list-topic,
 .help-article-topic {
   color: var(--accent-label);
-  font-size: 10px;
+  font-size: calc(10 / 13.5 * 1em);
   font-weight: 700;
   letter-spacing: 0.07em;
   text-transform: uppercase;
@@ -2376,20 +2383,20 @@ button:disabled {
 .help-article h3 {
   max-width: 740px;
   margin-top: 0.45rem;
-  font-size: clamp(1.2rem, 2.2vw, 1.7rem);
+  font-size: clamp(1.2em, 2.2vw, 1.7em);
 }
 
 .help-article-summary {
   max-width: 680px;
   margin-top: 0.55rem;
-  font-size: 14px;
+  font-size: calc(14 / 13.5 * 1em);
   line-height: 1.5;
 }
 
 .help-article-body {
   max-width: 720px;
   margin: 1.45rem 0 0;
-  font-size: 14px;
+  font-size: calc(14 / 13.5 * 1em);
   line-height: 1.75;
 }
 
@@ -2403,7 +2410,7 @@ button:disabled {
   border-radius: 7px;
   padding: 0.7rem 0.85rem;
   background: var(--overlay-faint);
-  font-size: 11px;
+  font-size: calc(11 / 13.5 * 1em);
 }
 
 .help-source-card span,
@@ -2429,7 +2436,7 @@ button:disabled {
 .help-index-note {
   max-width: 720px;
   margin-top: 1rem;
-  font-size: 11px;
+  font-size: calc(11 / 13.5 * 1em);
   line-height: 1.5;
 }
 
@@ -2437,7 +2444,7 @@ button:disabled {
   max-width: 720px;
   margin-top: 0.55rem;
   color: var(--muted);
-  font-size: 11px;
+  font-size: calc(11 / 13.5 * 1em);
   line-height: 1.5;
 }
 
@@ -2450,7 +2457,7 @@ button:disabled {
   border-radius: 7px;
   padding: 0.8rem 0.9rem;
   background: var(--overlay-faint);
-  font-size: 11px;
+  font-size: calc(11 / 13.5 * 1em);
 }
 
 .help-assistant-card p,
@@ -2476,11 +2483,12 @@ button:disabled {
 .help-confirm-details {
   border: 1px solid var(--border-soft);
   border-radius: 6px;
-  max-height: 11rem;
+  max-height: 11em;
   overflow: auto;
   padding: 0.45rem 0.6rem;
   color: var(--muted);
-  font-size: 11px;
+  /* Parent confirm dialog is 12/13.5 em; keep 11px-equivalent without compounding. */
+  font-size: calc(11 / 12 * 1em);
 }
 
 .help-confirm-details summary {
@@ -2525,7 +2533,7 @@ button:disabled {
 
 .help-empty p {
   color: var(--muted);
-  font-size: 13px;
+  font-size: calc(13 / 13.5 * 1em);
 }
 
 @media (max-width: 720px) {
@@ -2558,11 +2566,19 @@ button:disabled {
   .help-nav,
   .help-surface,
   .help-confirm-layer,
+  .help-confirm-details,
   .help-source-card,
   .help-assistant-card,
   .help-semantic-confirm,
   .help-assistant-confirm {
     border-color: CanvasText;
+    background: Canvas;
+    color: CanvasText;
+  }
+
+  .help-confirm-details summary,
+  .help-confirm-details code {
+    color: CanvasText;
   }
 
   .help-list-item.is-selected,
@@ -2570,6 +2586,8 @@ button:disabled {
     border-color: Highlight;
     background: Canvas;
     color: CanvasText;
+    outline: 2px solid Highlight;
+    outline-offset: 0;
   }
 
   .help-search input:focus-visible,
@@ -2579,8 +2597,19 @@ button:disabled {
   .help-semantic-confirm button:focus-visible,
   .help-assistant-card button:focus-visible,
   .help-assistant-confirm button:focus-visible,
-  .help-header > button:focus-visible {
-    outline-color: Highlight;
+  .help-header > button:focus-visible,
+  .help-confirm-details summary:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
+
+  .help-semantic-search:disabled,
+  .help-center button:disabled,
+  .help-center input:disabled,
+  .help-center select:disabled {
+    color: GrayText;
+    border-color: GrayText;
+    opacity: 1;
   }
 }
 
