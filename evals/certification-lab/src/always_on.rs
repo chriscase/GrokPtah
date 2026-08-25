@@ -1506,9 +1506,10 @@ pub fn merge_provider_lanes(lanes: &[LoopbackProviderLane]) -> Option<LoopbackPr
 /// Home A must show one accepted POST for every declared semantic id — the
 /// three native steps and the manager decision — plus the single bootstrap
 /// `setup` POST. Home B holds the first step open and is restarted twice, so
-/// it must show its own `setup` POST and exactly one POST for the held step,
-/// and must never have reached the dependent step, the replacement step or the
-/// manager decision.
+/// it must show its own `setup` POST, exactly one POST for the held step, and
+/// exactly one manager-decision POST for the single reaction to that step
+/// failing. It must never have reached the dependent step or its replacement,
+/// and the held step must never be re-sent across either restart.
 pub fn assert_provider_lanes(
     fixture: &AlwaysOnFixture,
     lanes: &[LoopbackProviderLane],
@@ -1528,21 +1529,31 @@ pub fn assert_provider_lanes(
     let held = fixture
         .posts_for(&fixture.step_first)
         .ok_or(DiagnosticCode::FixtureInvalid)?;
+    let decision = fixture
+        .posts_for(MANAGER_DECISION_KIND)
+        .ok_or(DiagnosticCode::FixtureInvalid)?;
     if home_b.accepted_for(SETUP_SEMANTIC_ID) != 1
         || home_b.accepted_for(&fixture.step_first) != held
+        || home_b.accepted_for(MANAGER_DECISION_KIND) != decision
     {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
+    // Home B never reaches the dependent step or its replacement: the held
+    // lane fails, the manager reacts exactly once, and the plan stops there.
     for never in [
         fixture.step_failing.as_str(),
         fixture.step_replacement.as_str(),
-        MANAGER_DECISION_KIND,
     ] {
         if home_b.accepted_for(never) != 0 {
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
     }
-    if home_b.accepted_posts != held.checked_add(1).ok_or(DiagnosticCode::FixtureInvalid)? {
+    if home_b.accepted_posts
+        != held
+            .checked_add(decision)
+            .and_then(|total| total.checked_add(1))
+            .ok_or(DiagnosticCode::FixtureInvalid)?
+    {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
     Ok(())
@@ -2727,11 +2738,13 @@ mod tests {
     fn home_b_lane() -> LoopbackProviderLane {
         LoopbackProviderLane {
             home: AlwaysOnHome::HomeB,
-            accepted_posts: 2,
+            accepted_posts: 3,
             rejected_auth: 0,
             records: vec![
                 record(SETUP_SEMANTIC_ID, "d-setup-b"),
                 record("step-a", "d-step-a-held"),
+                // The manager's single reaction to the held step failing.
+                record(MANAGER_DECISION_KIND, "d-decision-b"),
             ],
         }
     }
@@ -2742,9 +2755,9 @@ mod tests {
         let lanes = vec![home_a_lane(), home_b_lane()];
         assert_eq!(assert_provider_lanes(&fixture, &lanes), Ok(()));
         let merged = merge_provider_lanes(&lanes).expect("merged observation");
-        assert_eq!(merged.accepted_posts, 7);
+        assert_eq!(merged.accepted_posts, 8);
         assert_eq!(merged.rejected_auth, 0);
-        assert_eq!(merged.records.len(), 7);
+        assert_eq!(merged.records.len(), 8);
         // Home A's records come first and stay reconstructable.
         assert_eq!(merged.records[0].body_digest, "d-setup-a");
         assert_eq!(merged.records[5].body_digest, "d-setup-b");
@@ -2835,9 +2848,20 @@ mod tests {
             assert_eq!(
                 assert_provider_lanes(&fixture, &[home_a_lane(), lane]),
                 Err(DiagnosticCode::StateTransitionMismatch),
-                "Home B reaching {semantic} must fail"
+                "Home B reaching {semantic} again must fail"
             );
         }
+        // Home B must show exactly one manager-decision POST: the manager
+        // reacts once, and neither restart may re-drive it.
+        let mut no_decision = home_b_lane();
+        no_decision
+            .records
+            .retain(|item| item.semantic_id != MANAGER_DECISION_KIND);
+        no_decision.accepted_posts -= 1;
+        assert_eq!(
+            assert_provider_lanes(&fixture, &[home_a_lane(), no_decision]),
+            Err(DiagnosticCode::StateTransitionMismatch)
+        );
         // Home B missing or duplicating its held step.
         let mut missing_held = home_b_lane();
         missing_held

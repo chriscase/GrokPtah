@@ -2019,11 +2019,12 @@ mod tests {
             },
             LoopbackProviderLane {
                 home: crate::always_on::AlwaysOnHome::HomeB,
-                accepted_posts: 2,
+                accepted_posts: 3,
                 rejected_auth: 0,
                 records: vec![
                     always_on_record("setup", "d-setup-b"),
                     always_on_record("step-a", "d-step-a-held"),
+                    always_on_record("manager-decision", "d-decision-b"),
                 ],
             },
         ]
