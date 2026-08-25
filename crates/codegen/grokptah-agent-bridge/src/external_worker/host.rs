@@ -21,6 +21,35 @@ use reqwest::StatusCode;
 use std::path::Path;
 use std::sync::Arc;
 
+/// What a reconcile actually observed, without guessing at anything.
+///
+/// `provider_owned` is deliberately a fact rather than a decision: an operator
+/// resolving an uncertain request needs to see that the provider disagrees, not
+/// have this host quietly adopt or discard a worker on their behalf.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconcileReport {
+    /// Opaque provider worker identity this grant covers.
+    pub external_agent_id: String,
+    /// GrokPtah run the worker was launched for.
+    pub run_id: String,
+    /// Attempt within that run.
+    pub attempt: u32,
+    /// Idempotency key of the launch that created the grant.
+    pub request_id: String,
+    /// Digest of the frozen launch intent.
+    pub launch_intent_digest: String,
+    /// Local grant lifecycle.
+    pub grant_state: super::authority::AuthorityState,
+    /// Lifecycle the provider currently reports.
+    pub provider_state: grokptah_agent_sdk::ExternalWorkerState,
+    /// Whether the provider still reports this worker on the approved
+    /// repository and starting ref.
+    pub provider_owned: bool,
+    /// Provider runs this grant covers.
+    pub known_runs: Vec<String>,
+}
+
 /// Trusted host that wraps qualified adapters with a durable ledger and the
 /// durable authority every action is re-checked against.
 ///
@@ -106,6 +135,14 @@ impl ExternalWorkerHost {
             .registry
             .get(request.provider)
             .ok_or(ExternalWorkerAdapterError::UnsupportedProvider)?;
+        // Admission happens before the ledger claim, so a request asking for a
+        // ceiling nobody enforces never becomes a durable claim, and a
+        // host-enforced ceiling is applied before anything is transmitted.
+        // Bounds were previously validated for shape and then discarded:
+        // accepted, stored, never sent, never enforced.
+        let bounds = adapter
+            .bounds_support()
+            .admit(request.bounds.as_ref(), &request.prompt)?;
         let hash = canonical_launch_payload_hash(request)?;
         match self
             .ledger
@@ -143,6 +180,7 @@ impl ExternalWorkerHost {
                             attempt,
                             request_id: request.request_id.clone(),
                             launch_intent: LaunchIntent::from_request(request),
+                            bounds: Some(bounds),
                             now: result.worker.created_at.clone(),
                         })?;
                         if self.authority.insert(&grant).is_err() {
@@ -377,6 +415,90 @@ impl ExternalWorkerHost {
         grokptah_agent_sdk::validate_artifact_listing(&artifacts, external_run_id)
             .map_err(ExternalWorkerAdapterError::InvalidResponse)?;
         Ok(artifacts)
+    }
+
+    /// List the workers this exact scope holds a grant for.
+    ///
+    /// Read from the durable grants, not from the provider: a provider listing
+    /// would show every worker the *credential* can see, which is exactly the
+    /// cross-tenant disclosure the grant exists to prevent.
+    pub fn list_workers(
+        &self,
+        principal: &ExternalWorkerPrincipal,
+    ) -> Result<Vec<ExternalWorkerAuthority>, ExternalWorkerAdapterError> {
+        Ok(self.authority.list_for(principal)?)
+    }
+
+    /// Archive a worker, under re-authorization.
+    pub fn archive(
+        &self,
+        principal: &ExternalWorkerPrincipal,
+        provider: grokptah_agent_sdk::ExternalWorkerProvider,
+        external_agent_id: &str,
+        now: &str,
+    ) -> Result<ExternalWorkerAuthority, ExternalWorkerAdapterError> {
+        Ok(self
+            .authority
+            .set_archived(principal, provider, external_agent_id, true, now)?)
+    }
+
+    /// Return an archived worker to the active list, under re-authorization.
+    pub fn unarchive(
+        &self,
+        principal: &ExternalWorkerPrincipal,
+        provider: grokptah_agent_sdk::ExternalWorkerProvider,
+        external_agent_id: &str,
+        now: &str,
+    ) -> Result<ExternalWorkerAuthority, ExternalWorkerAdapterError> {
+        Ok(self
+            .authority
+            .set_archived(principal, provider, external_agent_id, false, now)?)
+    }
+
+    /// Reconcile one worker's local grant against the provider's current state.
+    ///
+    /// This is the operator answer to an `Uncertain` outcome. It re-reads the
+    /// provider under the grant's own identity and reports what is actually
+    /// there; it deliberately does not mutate the provider, because the whole
+    /// reason a request is uncertain is that nobody knows what it already did.
+    ///
+    /// Ownership is re-checked at read time: a provider that now reports this
+    /// worker under a different repository or starting ref is not the worker
+    /// this grant was issued for, and the reconcile fails closed rather than
+    /// adopting it.
+    pub async fn reconcile(
+        &self,
+        principal: &ExternalWorkerPrincipal,
+        provider: grokptah_agent_sdk::ExternalWorkerProvider,
+        external_agent_id: &str,
+    ) -> Result<ReconcileReport, ExternalWorkerAdapterError> {
+        let grant = self.reauthorize(
+            ExternalWorkerAction::Reconcile,
+            principal,
+            provider,
+            external_agent_id,
+            None,
+        )?;
+        let observed = self
+            .adapter(provider)?
+            .get_worker(external_agent_id)
+            .await?;
+        // Current provider ownership, not just a matching ID. An opaque ID that
+        // now points at a different repository is a different worker.
+        let intent = &grant.launch_intent;
+        let owned = observed.repository == intent.repository
+            && super::refs_equal(&observed.starting_ref, &intent.starting_ref);
+        Ok(ReconcileReport {
+            external_agent_id: grant.external_agent_id.clone(),
+            run_id: grant.run_id.clone(),
+            attempt: grant.attempt,
+            request_id: grant.request_id.clone(),
+            launch_intent_digest: grant.launch_intent_digest.clone(),
+            grant_state: grant.state,
+            provider_state: observed.state,
+            provider_owned: owned,
+            known_runs: grant.external_run_ids.iter().cloned().collect(),
+        })
     }
 
     /// Resolve the adapter for the provider the grant is bound to.
@@ -824,6 +946,7 @@ mod tests {
             attempt: 1,
             request_id: "req-rogue".into(),
             launch_intent: LaunchIntent::from_request(&launch_request("req-rogue", "do the work")),
+            bounds: None,
             now: "2026-08-25T00:00:00Z".into(),
         })
         .unwrap();
@@ -983,6 +1106,184 @@ mod tests {
                 )
             ),
             "an over-long listing must be refused at the host boundary, got {error:?}",
+        );
+    }
+
+    /// Bounds were validated for shape and then dropped on the floor:
+    /// `launch_payload` never read `request.bounds`, so a caller who asked for
+    /// a round or duration ceiling was told yes and got nothing.
+    #[tokio::test]
+    async fn a_ceiling_nobody_enforces_is_refused_rather_than_accepted_and_dropped() {
+        let (host, state, _dir) = host_with_fake(FakeCursorState::default()).await;
+
+        for (label, bounds) in [
+            (
+                "max_rounds",
+                grokptah_agent_sdk::Bounds {
+                    max_rounds: Some(8),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_duration_ms",
+                grokptah_agent_sdk::Bounds {
+                    max_duration_ms: Some(60_000),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut request = launch_request(&format!("req-{label}"), "do the work");
+            request.bounds = Some(bounds);
+            let error = host
+                .launch(&principal(), "gp-run-1", 1, &request)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ExternalWorkerAdapterError::InvalidRequest(message)
+                    if message.contains(label)),
+                "{label} must be refused, got {error:?}",
+            );
+        }
+        // Refused at admission, before anything became a durable claim or
+        // reached the provider.
+        assert!(state.launch_requests.lock().unwrap().is_empty());
+    }
+
+    /// A host-enforced ceiling is applied before transmission, and recorded in
+    /// the durable grant so the record proves which ceilings were real.
+    #[tokio::test]
+    async fn a_host_enforced_ceiling_is_applied_at_admission_and_recorded() {
+        let (host, state, _dir) = host_with_fake(FakeCursorState::default()).await;
+
+        let mut oversized = launch_request("req-too-long", "this prompt is far too long");
+        oversized.bounds = Some(grokptah_agent_sdk::Bounds {
+            max_prompt_bytes: Some(4),
+            ..Default::default()
+        });
+        let error = host
+            .launch(&principal(), "gp-run-1", 1, &oversized)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ExternalWorkerAdapterError::InvalidRequest(
+                    "prompt exceeds the requested max_prompt_bytes"
+                )
+            ),
+            "the host ceiling must be enforced, got {error:?}",
+        );
+        assert!(state.launch_requests.lock().unwrap().is_empty());
+
+        let mut within = launch_request("req-ok", "short");
+        within.bounds = Some(grokptah_agent_sdk::Bounds {
+            max_prompt_bytes: Some(4096),
+            ..Default::default()
+        });
+        let launched = host
+            .launch(&principal(), "gp-run-1", 1, &within)
+            .await
+            .unwrap();
+
+        let grant = host
+            .authority
+            .load(CURSOR, &launched.worker.external_agent_id)
+            .unwrap()
+            .expect("a grant was issued");
+        assert_eq!(
+            grant.bounds.and_then(|bounds| bounds.max_prompt_bytes),
+            Some(crate::external_worker::BoundEnforcement::Host),
+            "the durable grant must record who enforced the ceiling",
+        );
+    }
+
+    /// Lifecycle: a worker can be listed, archived, unarchived and reconciled,
+    /// and every one of those is re-authorized rather than trusting the ID.
+    #[tokio::test]
+    async fn lifecycle_operations_are_scoped_and_reauthorized() {
+        let (host, _state, _dir) = host_with_fake(FakeCursorState::default()).await;
+        let launched = host
+            .launch(
+                &principal(),
+                "gp-run-1",
+                1,
+                &launch_request("req-1", "do the work"),
+            )
+            .await
+            .unwrap();
+        let agent = launched.worker.external_agent_id.clone();
+
+        // Listing shows this scope's worker, and nobody else's.
+        let mine = host.list_workers(&principal()).unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].external_agent_id, agent);
+        let mut foreign = principal();
+        foreign.tenant = "tenant-b".into();
+        assert!(
+            host.list_workers(&foreign).unwrap().is_empty(),
+            "a listing must not reveal another scope's workers",
+        );
+
+        // Archive is authorized, and an archived worker stops accepting steering.
+        host.archive(&principal(), CURSOR, &agent, "2026-08-25T01:00:00Z")
+            .unwrap();
+        let error = host
+            .follow_up(
+                &principal(),
+                CURSOR,
+                &agent,
+                &ExternalWorkerFollowUpRequest {
+                    request_id: "req-follow".into(),
+                    prompt: "keep going".into(),
+                    bounds: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ExternalWorkerAdapterError::Unauthorized(_)));
+
+        // A foreign scope can neither archive nor unarchive it.
+        assert!(host
+            .unarchive(&foreign, CURSOR, &agent, "2026-08-25T01:01:00Z")
+            .is_err());
+        host.unarchive(&principal(), CURSOR, &agent, "2026-08-25T01:02:00Z")
+            .unwrap();
+
+        // Reconcile reports what the provider says without mutating it.
+        let report = host.reconcile(&principal(), CURSOR, &agent).await.unwrap();
+        assert_eq!(report.external_agent_id, agent);
+        assert_eq!(report.run_id, "gp-run-1");
+        assert_eq!(report.attempt, 1);
+        assert!(
+            report.provider_owned,
+            "the fake still reports the same repo"
+        );
+        assert!(host.reconcile(&foreign, CURSOR, &agent).await.is_err());
+    }
+
+    /// Current provider ownership is checked at read time. An opaque ID that
+    /// now points at a different repository is a different worker, and adopting
+    /// it would let a provider hand this host somebody else's work.
+    #[tokio::test]
+    async fn reconcile_reports_a_provider_that_no_longer_owns_the_worker() {
+        let (host, state, _dir) = host_with_fake(FakeCursorState::default()).await;
+        let launched = host
+            .launch(
+                &principal(),
+                "gp-run-1",
+                1,
+                &launch_request("req-1", "do the work"),
+            )
+            .await
+            .unwrap();
+        state.config.lock().unwrap().repo_url = "https://github.com/attacker/other".into();
+        let report = host
+            .reconcile(&principal(), CURSOR, &launched.worker.external_agent_id)
+            .await
+            .unwrap();
+        assert!(
+            !report.provider_owned,
+            "a repository change must be reported, not silently adopted",
         );
     }
 

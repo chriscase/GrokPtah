@@ -247,6 +247,12 @@ pub struct ExternalWorkerAuthority {
     pub launch_intent_digest: String,
     /// The frozen launch intent itself.
     pub launch_intent: LaunchIntent,
+    /// Which requested ceilings were enforced, and by whom.
+    ///
+    /// A ceiling the caller asked for is either recorded here with its enforcer
+    /// or was refused at admission. It is never silently dropped.
+    #[serde(default)]
+    pub bounds: Option<super::BoundsDisposition>,
     /// Grant lifecycle.
     pub state: AuthorityState,
     /// RFC3339 creation timestamp.
@@ -303,6 +309,8 @@ pub struct NewGrant {
     pub request_id: String,
     /// The frozen launch intent.
     pub launch_intent: LaunchIntent,
+    /// What was actually done about each requested ceiling.
+    pub bounds: Option<super::BoundsDisposition>,
     /// RFC3339 issue timestamp.
     pub now: String,
 }
@@ -323,6 +331,7 @@ impl ExternalWorkerAuthority {
             request_id: grant.request_id,
             launch_intent_digest: grant.launch_intent.digest(),
             launch_intent: grant.launch_intent,
+            bounds: grant.bounds,
             state: AuthorityState::Active,
             created_at: grant.now.clone(),
             updated_at: grant.now,
@@ -519,6 +528,89 @@ impl AuthorityStore {
     }
 }
 
+/// Maximum grants one listing will return.
+///
+/// A listing walks the store, so it is bounded for the same reason an artifact
+/// listing is: an unbounded local directory should not become an unbounded
+/// response.
+pub const MAX_AUTHORITY_LISTING: usize = 512;
+
+impl AuthorityStore {
+    /// List the grants this exact scope holds.
+    ///
+    /// Filtering happens after loading, on the same field-by-field comparison
+    /// `authorize` uses, so a listing cannot become a way to learn that another
+    /// tenant's worker exists. Revoked grants are omitted; archived ones are
+    /// included and marked, because hiding them would make "where did my worker
+    /// go" unanswerable.
+    pub fn list_for(
+        &self,
+        claimed: &ExternalWorkerPrincipal,
+    ) -> Result<Vec<ExternalWorkerAuthority>, AuthorityError> {
+        claimed.validate()?;
+        let entries = std::fs::read_dir(&self.root).map_err(|_| AuthorityError::Unavailable)?;
+        let mut found = Vec::new();
+        for entry in entries {
+            let path = entry.map_err(|_| AuthorityError::Unavailable)?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(Some(bytes)) = super::durable::read_private_json(&path) else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_slice::<ExternalWorkerAuthority>(&bytes) else {
+                continue;
+            };
+            if record.state == AuthorityState::Revoked {
+                continue;
+            }
+            // The same comparison `authorize` makes. A grant this caller could
+            // not act on is a grant they must not be told exists.
+            if record.principal != *claimed {
+                continue;
+            }
+            found.push(record);
+            if found.len() >= MAX_AUTHORITY_LISTING {
+                break;
+            }
+        }
+        found.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.external_agent_id.cmp(&right.external_agent_id))
+        });
+        Ok(found)
+    }
+
+    /// Move a grant between active and archived, under re-authorization.
+    ///
+    /// Archiving is itself an authorized action, so a caller outside the grant
+    /// cannot park or resurrect someone else's worker.
+    pub fn set_archived(
+        &self,
+        claimed: &ExternalWorkerPrincipal,
+        provider: ExternalWorkerProvider,
+        external_agent_id: &str,
+        archived: bool,
+        now: &str,
+    ) -> Result<ExternalWorkerAuthority, AuthorityError> {
+        let action = if archived {
+            ExternalWorkerAction::Archive
+        } else {
+            ExternalWorkerAction::Unarchive
+        };
+        let mut record = self.authorize(action, claimed, provider, external_agent_id, None)?;
+        record.state = if archived {
+            AuthorityState::Archived
+        } else {
+            AuthorityState::Active
+        };
+        record.updated_at = now.to_string();
+        self.update(&record)?;
+        Ok(record)
+    }
+}
+
 fn provider_key(provider: ExternalWorkerProvider) -> &'static str {
     match provider {
         ExternalWorkerProvider::CursorCloud => "cursor_cloud",
@@ -567,6 +659,7 @@ mod tests {
             attempt: 1,
             request_id: "req-1".into(),
             launch_intent: intent(),
+            bounds: None,
             now: "2026-08-25T00:00:00Z".into(),
         })
         .expect("grant issues")

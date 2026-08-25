@@ -14,13 +14,14 @@ mod ledger;
 
 pub use authority::{
     AuthorityError, AuthorityState, AuthorityStore, ExternalWorkerAction, ExternalWorkerAuthority,
-    ExternalWorkerPrincipal, LaunchIntent, NewGrant, MAX_AUTHORITY_FIELD_BYTES, MAX_AUTHORITY_RUNS,
+    ExternalWorkerPrincipal, LaunchIntent, NewGrant, MAX_AUTHORITY_FIELD_BYTES,
+    MAX_AUTHORITY_LISTING, MAX_AUTHORITY_RUNS,
 };
 pub use cursor::{
     CursorCloudAdapter, CURSOR_CLOUD_API_BASE, MAX_EXTERNAL_WORKER_ARTIFACT_BYTES,
     MAX_EXTERNAL_WORKER_LISTING_BYTES, PRODUCTION_ARTIFACT_HOST_PREFIX,
 };
-pub use host::ExternalWorkerHost;
+pub use host::{ExternalWorkerHost, ReconcileReport};
 pub use ledger::{
     canonical_cancel_payload_hash, canonical_follow_up_payload_hash, canonical_launch_payload_hash,
     ExternalWorkerLedger, ExternalWorkerLedgerClaim, ExternalWorkerLedgerStatus,
@@ -113,11 +114,134 @@ pub enum ExternalWorkerAdapterError {
     Unauthorized(#[from] AuthorityError),
 }
 
+/// Who, if anyone, can actually make one requested ceiling true.
+///
+/// A bound that is accepted and then honored by nobody is worse than a refused
+/// one: the caller believes a limit is in force. Every ceiling therefore has to
+/// name its enforcer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundEnforcement {
+    /// This host enforces it, before or around the provider call.
+    Host,
+    /// The provider accepts the value and enforces it; it is transmitted.
+    Provider,
+    /// Nothing here can honor it. Requesting it fails closed.
+    Unsupported,
+}
+
+/// Which ceilings one adapter can actually make true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoundsSupport {
+    /// Enforcement for [`Bounds::max_prompt_bytes`].
+    pub max_prompt_bytes: BoundEnforcement,
+    /// Enforcement for [`Bounds::max_rounds`].
+    pub max_rounds: BoundEnforcement,
+    /// Enforcement for [`Bounds::max_duration_ms`].
+    pub max_duration_ms: BoundEnforcement,
+}
+
+impl BoundsSupport {
+    /// Nothing is supported. The safe default for a new adapter: a ceiling is
+    /// only honored once someone has said, explicitly, that they honor it.
+    pub const NONE: Self = Self {
+        max_prompt_bytes: BoundEnforcement::Unsupported,
+        max_rounds: BoundEnforcement::Unsupported,
+        max_duration_ms: BoundEnforcement::Unsupported,
+    };
+
+    /// Refuse a request that asks for a ceiling nobody will enforce, and apply
+    /// every host-enforced ceiling now.
+    ///
+    /// Returns the disposition to record durably, so the grant proves which
+    /// ceilings were real rather than merely requested.
+    pub fn admit(
+        &self,
+        bounds: Option<&grokptah_agent_sdk::Bounds>,
+        prompt: &str,
+    ) -> Result<BoundsDisposition, ExternalWorkerAdapterError> {
+        let Some(bounds) = bounds else {
+            return Ok(BoundsDisposition::default());
+        };
+        let mut disposition = BoundsDisposition::default();
+        if let Some(limit) = bounds.max_prompt_bytes {
+            match self.max_prompt_bytes {
+                BoundEnforcement::Unsupported => {
+                    return Err(ExternalWorkerAdapterError::InvalidRequest(
+                        "provider cannot honor max_prompt_bytes",
+                    ))
+                }
+                BoundEnforcement::Host => {
+                    // Enforced here, at admission, before anything is sent.
+                    if prompt.len() as u64 > u64::from(limit) {
+                        return Err(ExternalWorkerAdapterError::InvalidRequest(
+                            "prompt exceeds the requested max_prompt_bytes",
+                        ));
+                    }
+                    disposition.max_prompt_bytes = Some(BoundEnforcement::Host);
+                }
+                BoundEnforcement::Provider => {
+                    disposition.max_prompt_bytes = Some(BoundEnforcement::Provider);
+                }
+            }
+        }
+        if bounds.max_rounds.is_some() {
+            match self.max_rounds {
+                BoundEnforcement::Unsupported => {
+                    return Err(ExternalWorkerAdapterError::InvalidRequest(
+                        "provider cannot honor max_rounds",
+                    ))
+                }
+                enforcement => disposition.max_rounds = Some(enforcement),
+            }
+        }
+        if bounds.max_duration_ms.is_some() {
+            match self.max_duration_ms {
+                BoundEnforcement::Unsupported => {
+                    return Err(ExternalWorkerAdapterError::InvalidRequest(
+                        "provider cannot honor max_duration_ms",
+                    ))
+                }
+                enforcement => disposition.max_duration_ms = Some(enforcement),
+            }
+        }
+        Ok(disposition)
+    }
+}
+
+/// What was actually done about each requested ceiling.
+///
+/// `None` means the caller did not ask for that ceiling. A ceiling that was
+/// asked for is always either recorded here with its enforcer or refused at
+/// admission; it is never silently dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoundsDisposition {
+    /// Enforcer for a requested prompt-byte ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_prompt_bytes: Option<BoundEnforcement>,
+    /// Enforcer for a requested round ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<BoundEnforcement>,
+    /// Enforcer for a requested duration ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_ms: Option<BoundEnforcement>,
+}
+
 /// Provider-neutral lifecycle operations required by the manager.
 #[async_trait]
 pub trait ExternalWorkerAdapter: Send + Sync {
     /// Provider family implemented by this adapter.
     fn provider(&self) -> ExternalWorkerProvider;
+
+    /// Which requested ceilings this adapter can actually make true.
+    ///
+    /// Defaults to none, so an adapter that has not thought about bounds
+    /// refuses every ceiling rather than accepting and ignoring it.
+    fn bounds_support(&self) -> BoundsSupport {
+        BoundsSupport::NONE
+    }
 
     /// Create an isolated worker and its initial run.
     async fn launch(

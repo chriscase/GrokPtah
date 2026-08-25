@@ -2,7 +2,8 @@
 
 use super::{
     checked_id, extract_provider_conflict_code, github_repository_url, refs_equal,
-    repository_identity, ExternalWorkerAdapter, ExternalWorkerAdapterError, ProviderConflictCode,
+    repository_identity, BoundEnforcement, BoundsSupport, ExternalWorkerAdapter,
+    ExternalWorkerAdapterError, ProviderConflictCode,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -578,6 +579,23 @@ fn hex_sha256(bytes: &[u8]) -> String {
 impl ExternalWorkerAdapter for CursorCloudAdapter {
     fn provider(&self) -> ExternalWorkerProvider {
         ExternalWorkerProvider::CursorCloud
+    }
+
+    /// What Cursor Cloud Agents v1 can actually be held to.
+    ///
+    /// A prompt ceiling is real because this host measures the prompt before
+    /// transmitting it. Rounds and wall-clock duration are not: the v1 API
+    /// exposes no field for either, and this host runs no supervisor that
+    /// cancels a run on expiry, so claiming to enforce them would tell a caller
+    /// a limit is in force when nothing would apply it. Both are refused at
+    /// admission instead of accepted and dropped, which is what happened before
+    /// — `launch_payload` never read `request.bounds` at all.
+    fn bounds_support(&self) -> BoundsSupport {
+        BoundsSupport {
+            max_prompt_bytes: BoundEnforcement::Host,
+            max_rounds: BoundEnforcement::Unsupported,
+            max_duration_ms: BoundEnforcement::Unsupported,
+        }
     }
 
     async fn launch(
