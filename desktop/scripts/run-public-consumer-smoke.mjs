@@ -54,6 +54,7 @@ try {
   parseBrokerReviewProjection,
   EXTERNAL_WORKER_CONTRACT,
   parseExternalWorkerLaunchRequest,
+  parseExternalWorkerLaunchResult,
   parseExternalWorkerNotification,
   applyExternalWorkerNotification,
   createExternalWorkerMonitor,
@@ -148,6 +149,9 @@ const launch = parseExternalWorkerLaunchRequest({
 });
 if (launch?.executionMode !== "isolated") {
   throw new Error("consumer external-worker launch parser was not usable");
+}
+if (parseExternalWorkerLaunchResult({ worker: {}, run: {} }) !== null) {
+  throw new Error("consumer external-worker launch result parser failed closed");
 }
 const externalNotification = parseExternalWorkerNotification({
   type: "event",

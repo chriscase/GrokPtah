@@ -78,6 +78,11 @@ export type ExternalWorkerArtifact = {
   sizeBytes?: number;
 };
 
+export type ExternalWorkerLaunchResult = {
+  worker: ExternalWorkerRecord;
+  run: ExternalWorkerRunRecord;
+};
+
 export type ExternalWorkerNotification =
   | { type: "event"; event: ExternalWorkerEvent }
   | { type: "recovery"; afterSeq: number; reason: string; pollRoute: string };
@@ -218,6 +223,14 @@ export function parseExternalWorkerRunRecord(value: unknown): ExternalWorkerRunR
     !boundedString(value.updatedAt, 128)
   ) return null;
   return value as ExternalWorkerRunRecord;
+}
+
+/** Parse the initial worker/run envelope returned by a launch request. */
+export function parseExternalWorkerLaunchResult(value: unknown): ExternalWorkerLaunchResult | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(["worker", "run"]))) return null;
+  const worker = parseExternalWorkerRecord(value.worker);
+  const run = parseExternalWorkerRunRecord(value.run);
+  return worker && run ? { worker, run } : null;
 }
 
 /** Parse a redacted event without exposing provider tool output. */

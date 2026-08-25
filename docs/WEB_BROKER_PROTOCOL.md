@@ -79,6 +79,11 @@ binding and run ids to the exact GrokPtah `session_id`, `workspace`, and
 | `GET /bindings/{bindingId}/runs/{runId}/tests` | `ptah_get_test_results` | read-only | No arbitrary command output. |
 | `GET /bindings/{bindingId}/runs/{runId}/handoff` | `ptah_get_handoff` | read-only | Bounded final handoff. |
 | `GET /bindings/{bindingId}/runs/{runId}/review` | `ptah_review_run` | read-only | Isolated-run diff/fingerprint. |
+| `POST /bindings/{bindingId}/external-workers` | external worker adapter | execute | Launches an isolated exact-ref cloud worker; requires idempotency and CSRF. |
+| `GET /bindings/{bindingId}/external-workers/{agentId}` | external worker adapter | read-only | Redacted provider worker identity and lifecycle. |
+| `GET /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}` | external worker adapter | read-only | Redacted provider run status and cursor. |
+| `GET /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/artifacts` | external worker adapter | read-only | Bounded relative artifact references only. |
+| `POST /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/cancel` | external worker adapter | execute | Explicit terminal cancellation; requires idempotency and CSRF. |
 | `POST /bindings/{bindingId}/runs/{runId}/approve` | broker approval | execute | Binds exact review fingerprints to a short-lived approval. |
 | `POST /bindings/{bindingId}/runs/{runId}/promote` | promotion authority | promote | Requires the short-lived approval and desktop human gate. |
 | `POST /bindings/{bindingId}/runs/{runId}/cancel` | `ptah_cancel` | execute | Explicit user action; idempotent request id. |

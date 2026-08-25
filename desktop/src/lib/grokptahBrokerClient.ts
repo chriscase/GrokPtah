@@ -6,6 +6,19 @@
  * binding/run ids defined by docs/WEB_BROKER_PROTOCOL.md.
  */
 
+import {
+  parseExternalWorkerArtifact,
+  parseExternalWorkerLaunchRequest,
+  parseExternalWorkerLaunchResult,
+  parseExternalWorkerRecord,
+  parseExternalWorkerRunRecord,
+  type ExternalWorkerArtifact,
+  type ExternalWorkerLaunchRequest,
+  type ExternalWorkerLaunchResult,
+  type ExternalWorkerRecord,
+  type ExternalWorkerRunRecord,
+} from "./externalWorker";
+
 export type GrokPtahBrokerCapability = {
   id: string;
   availability: "available" | "gated" | "unavailable";
@@ -556,6 +569,77 @@ export class GrokPtahBrokerClient {
       throw new GrokPtahBrokerError(0, "invalid_response", "Broker run binding does not match the request");
     }
     return run;
+  }
+
+  /** Launch an isolated external coding worker through the trusted broker. */
+  async launchExternalWorker(
+    bindingId: string,
+    request: ExternalWorkerLaunchRequest,
+    idempotencyKey: string,
+  ): Promise<ExternalWorkerLaunchResult> {
+    if (parseExternalWorkerLaunchRequest(request) === null) {
+      throw new GrokPtahBrokerError(0, "invalid_request", "External worker launch request is invalid");
+    }
+    return this.requestValidated(
+      `/bindings/${segment(bindingId)}/external-workers`,
+      parseExternalWorkerLaunchResult,
+      { method: "POST", idempotencyKey, body: request },
+    );
+  }
+
+  /** Read a redacted external-worker identity from the broker. */
+  async getExternalWorker(bindingId: string, externalAgentId: string): Promise<ExternalWorkerRecord> {
+    return this.requestValidated(
+      `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}`,
+      parseExternalWorkerRecord,
+      {},
+    );
+  }
+
+  /** Read the redacted current run projection for an external worker. */
+  async getExternalWorkerRun(
+    bindingId: string,
+    externalAgentId: string,
+    externalRunId: string,
+  ): Promise<ExternalWorkerRunRecord> {
+    return this.requestValidated(
+      `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/runs/${segment(externalRunId)}`,
+      parseExternalWorkerRunRecord,
+      {},
+    );
+  }
+
+  /** Read bounded relative artifacts returned by an external worker. */
+  async getExternalWorkerArtifacts(
+    bindingId: string,
+    externalAgentId: string,
+    externalRunId: string,
+  ): Promise<ExternalWorkerArtifact[]> {
+    const value = await this.request<unknown>(
+      `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/runs/${segment(externalRunId)}/artifacts`,
+    );
+    if (!Array.isArray(value)) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker artifacts response is invalid");
+    }
+    const artifacts = value.map(parseExternalWorkerArtifact);
+    if (artifacts.some((artifact) => artifact === null)) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker artifacts response is invalid");
+    }
+    return artifacts as ExternalWorkerArtifact[];
+  }
+
+  /** Cancel an external worker run; cancellation remains terminal. */
+  async cancelExternalWorker(
+    bindingId: string,
+    externalAgentId: string,
+    externalRunId: string,
+    idempotencyKey: string,
+  ): Promise<ExternalWorkerRunRecord> {
+    return this.requestValidated(
+      `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/runs/${segment(externalRunId)}/cancel`,
+      parseExternalWorkerRunRecord,
+      { method: "POST", idempotencyKey },
+    );
   }
 
   async getRun<T = unknown>(bindingId: string, brokerRunId: string): Promise<T> {

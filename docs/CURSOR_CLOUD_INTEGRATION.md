@@ -86,7 +86,9 @@ or browser-safe broker without importing GrokPtah's authority implementation.
    it and verify no source checkout was changed.
 4. **Manager integration:** expose Cursor as a provider-neutral lane in the
    desktop and browser-safe broker, with explicit user-visible provider and
-   cost/usage labels.
+   cost/usage labels. The staged browser client now has typed launch, status,
+   artifact, and cancellation calls; the trusted server routes remain to be
+   implemented and qualified.
 5. **Release gate:** independently review the adapter, run a retry/restart
    soak, and prove that approval, promotion, and Computer Use remain separate.
 

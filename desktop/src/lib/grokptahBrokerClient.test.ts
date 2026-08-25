@@ -49,6 +49,47 @@ describe("GrokPtahBrokerClient", () => {
     expect(fetcher.mock.calls[0][1]?.headers).not.toHaveProperty("Authorization");
   });
 
+  it("launches an isolated external worker through the broker without credentials", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
+      worker: {
+        provider: "cursor_cloud",
+        externalAgentId: "agent-1",
+        repository: "org/repo",
+        startingRef: "main",
+        state: "running",
+        createdAt: "2026-08-24T00:00:00Z",
+        updatedAt: "2026-08-24T00:00:00Z",
+      },
+      run: {
+        externalAgentId: "agent-1",
+        externalRunId: "run-1",
+        state: "running",
+        lastSeq: 0,
+        createdAt: "2026-08-24T00:00:00Z",
+        updatedAt: "2026-08-24T00:00:00Z",
+      },
+    }));
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    const result = await client.launchExternalWorker("binding-1", {
+      requestId: "request-1",
+      provider: "cursor_cloud",
+      repository: "org/repo",
+      startingRef: "main",
+      prompt: "Review the exact candidate",
+      executionMode: "isolated",
+      autoCreatePr: false,
+    }, "intent-1");
+    expect(result.run.externalRunId).toBe("run-1");
+    expect(String(fetcher.mock.calls[0][0])).toBe(
+      "https://contextdesk.example/api/grokptah/v1/bindings/binding-1/external-workers",
+    );
+    expect(fetcher.mock.calls[0][1]?.headers).not.toHaveProperty("Authorization");
+  });
+
   it("fails closed when a typed binding or run envelope is malformed", async () => {
     expect(parseBrokerBinding({
       bindingId: "binding-1",

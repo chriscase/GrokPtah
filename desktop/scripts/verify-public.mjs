@@ -45,6 +45,7 @@ const requiredExports = [
   "parseBrokerReviewProjection",
   "EXTERNAL_WORKER_CONTRACT",
   "parseExternalWorkerLaunchRequest",
+  "parseExternalWorkerLaunchResult",
   "parseExternalWorkerNotification",
   "applyExternalWorkerNotification",
   "searchHelp",

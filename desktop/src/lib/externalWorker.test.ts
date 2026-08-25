@@ -5,6 +5,7 @@ import {
   parseExternalWorkerArtifact,
   parseExternalWorkerEvent,
   parseExternalWorkerLaunchRequest,
+  parseExternalWorkerLaunchResult,
   parseExternalWorkerNotification,
   parseExternalWorkerRecord,
 } from "./externalWorker";
@@ -65,6 +66,30 @@ describe("external worker UI contract", () => {
     })).toBeNull();
     expect(parseExternalWorkerArtifact({ path: "reports/review.json", digest: "sha256:abc" })).not.toBeNull();
     expect(parseExternalWorkerArtifact({ path: "../secret", digest: "sha256:abc" })).toBeNull();
+  });
+
+  it("parses a launch envelope only when both worker and run projections are valid", () => {
+    const result = parseExternalWorkerLaunchResult({
+      worker: {
+        provider: "cursor_cloud",
+        externalAgentId: "agent-1",
+        repository: "org/repo",
+        startingRef: "main",
+        state: "running",
+        createdAt: "now",
+        updatedAt: "now",
+      },
+      run: {
+        externalAgentId: "agent-1",
+        externalRunId: "run-1",
+        state: "running",
+        lastSeq: 0,
+        createdAt: "now",
+        updatedAt: "now",
+      },
+    });
+    expect(result?.run.externalRunId).toBe("run-1");
+    expect(parseExternalWorkerLaunchResult({ worker: result?.worker, run: { state: "running" } })).toBeNull();
   });
 
   it("requires cursor recovery instead of inferring completion", () => {
