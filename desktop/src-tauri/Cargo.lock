@@ -1355,6 +1355,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "xai-source-view",
 ]
 
 [[package]]
@@ -5324,6 +5325,14 @@ dependencies = [
  "libc",
  "once_cell",
  "pkg-config",
+]
+
+[[package]]
+name = "xai-source-view"
+version = "0.1.0"
+dependencies = [
+ "dunce",
+ "serde",
 ]
 
 [[package]]

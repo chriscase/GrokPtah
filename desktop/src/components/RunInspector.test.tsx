@@ -58,7 +58,14 @@ function run(overrides: Partial<DurableRun> = {}): DurableRun {
 
 const review: RunReview = {
   changedFiles: [{ path: "src/lib.rs", summary: "changed in isolated run" }],
-  diff: "diff --git a/src/lib.rs b/src/lib.rs\n+changed",
+  diff: [
+    "diff --git a/src/lib.rs b/src/lib.rs",
+    "--- a/src/lib.rs",
+    "+++ b/src/lib.rs",
+    "@@ -4,2 +4,3 @@",
+    " fn existing() {}",
+    "+fn added() {}",
+  ].join("\n"),
   diffTruncated: false,
   fingerprint: "abc123",
 };
@@ -282,7 +289,42 @@ describe("RunInspector", () => {
     fireEvent.click(screen.getByText("Review diff"));
     expect(await screen.findByText(/1 changed files/)).toBeTruthy();
     expect(screen.getByText("Promote reviewed changes")).toBeTruthy();
-    expect(screen.getByText(/diff --git/)).toBeTruthy();
+    // The review is now per file, so a reviewer steps through the change
+    // rather than scanning one wall of diff text before promoting.
+    expect(screen.getByTestId("run-diff-position")).toHaveTextContent(
+      "File 1 of 1 · src/lib.rs · modified · +1 −0",
+    );
+    expect(screen.getByTestId("run-diff-hunks")).toHaveTextContent("fn added() {}");
+    expect(screen.queryByTestId("run-diff-open")).toBeNull();
+  });
+
+  it("opens a reviewed file in that run's own isolated worktree", async () => {
+    const onOpenSource = vi.fn();
+    const isolated = run({
+      execution: {
+        mode: "isolated_worktree",
+        sourceWorkspace: "/tmp/demo",
+        executionWorkspace: "/tmp/demo/.grokptah/worktrees/runs/run-1",
+        baseRevision: "base",
+        sourceFingerprint: "source",
+        finalFingerprint: "abc123",
+        promotionState: "ready",
+        promotedAt: null,
+      },
+    });
+    render(
+      <RunInspector
+        runs={[isolated]}
+        onRefresh={vi.fn()}
+        onOpenSource={onOpenSource}
+        {...actions}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("Review diff"));
+    fireEvent.click(await screen.findByTestId("run-diff-open"));
+
+    expect(onOpenSource).toHaveBeenCalledWith(isolated.runId, "src/lib.rs", 5);
   });
 
   it("shows durable MCP approval state before allowing promotion", async () => {

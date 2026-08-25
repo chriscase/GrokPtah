@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { RunDiffNavigator } from "./RunDiffNavigator";
 import type {
   DurableRun,
   DurableRunEventPage,
@@ -21,6 +22,12 @@ type RunInspectorProps = {
   onSteer: (runId: string, text: string) => Promise<void>;
   onCancel: (runId: string) => Promise<void>;
   onEvents: (runId: string, afterSeq?: number, limit?: number) => Promise<DurableRunEventPage>;
+  /**
+   * Open one changed file read-only in the run's own isolated worktree, at
+   * its first change. Omitted when source inspection is unavailable; the
+   * navigator then reviews in place without an open affordance.
+   */
+  onOpenSource?: (runId: string, path: string, line: number | null) => void;
 };
 
 const stateLabels: Record<DurableRun["state"], string> = {
@@ -133,6 +140,7 @@ export function RunInspector({
   onSteer,
   onCancel,
   onEvents,
+  onOpenSource,
 }: RunInspectorProps) {
   const [originFilter, setOriginFilter] = useState<"all" | "desktop" | "mcp" | "other">("all");
   const [localWatching, setLocalWatching] = useState(true);
@@ -630,7 +638,16 @@ export function RunInspector({
                             {reviews[run.runId].changedFiles.length} changed files
                             {reviews[run.runId].diffTruncated ? " · diff truncated" : ""}
                           </summary>
-                          <pre>{reviews[run.runId].diff || "No changes"}</pre>
+                          <RunDiffNavigator
+                            runId={run.runId}
+                            diff={reviews[run.runId].diff}
+                            truncated={reviews[run.runId].diffTruncated}
+                            onOpenFile={
+                              onOpenSource
+                                ? (path, line) => onOpenSource(run.runId, path, line)
+                                : undefined
+                            }
+                          />
                         </details>
                       )}
                     </div>

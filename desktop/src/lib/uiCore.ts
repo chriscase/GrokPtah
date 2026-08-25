@@ -36,4 +36,12 @@ export type {
   HelpTopic,
 } from "./helpCenter";
 export * from "./promptQueue";
+// Read-only source inspection: contracts, locator/diff parsing, highlighting,
+// and in-file search. All pure and Tauri-free — the desktop's privileged
+// filesystem boundary stays behind the native command layer.
+export * from "./sourceDiff";
+export * from "./sourceHighlight";
+export * from "./sourceLocator";
+export * from "./sourceSearch";
+export * from "./sourceView";
 export * from "./streamApply";

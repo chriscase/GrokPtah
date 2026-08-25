@@ -79,6 +79,7 @@ members = [
     "crates/common/grokptah-agent-sdk",
     "crates/common/xai-grok-compaction",
     "crates/common/xai-interjection-core",
+    "crates/common/xai-source-view",
     "crates/common/xai-test-utils",
     "crates/common/xai-tool-protocol",
     "crates/common/xai-tool-runtime",
@@ -316,6 +317,7 @@ xai-prompt-queue = { path = "crates/codegen/xai-prompt-queue" }
 xai-proto-build = { path = "crates/build/xai-proto-build" }
 xai-ratatui-inline = { path = "crates/codegen/xai-ratatui-inline" }
 xai-ratatui-textarea = { path = "crates/codegen/xai-ratatui-textarea" }
+xai-source-view = { path = "crates/common/xai-source-view" }
 xai-sqlite-journal = { path = "crates/codegen/xai-sqlite-journal" }
 xai-system-power = { path = "crates/codegen/xai-system-power" }
 xai-test-utils = { path = "crates/common/xai-test-utils" }

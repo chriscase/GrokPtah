@@ -4,6 +4,7 @@ mod commands;
 mod computer_use;
 mod event_forward;
 mod pty_host;
+mod source_view;
 
 use std::sync::Mutex;
 
@@ -148,6 +149,8 @@ pub fn run() {
             commands::auth_open_login,
             commands::file_tree,
             commands::fuzzy_open,
+            source_view::source_view_roots,
+            source_view::source_view_open,
             commands::git_status,
             commands::git_diff,
             commands::git_stage_all,

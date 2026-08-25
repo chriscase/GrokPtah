@@ -14267,6 +14267,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "xai-source-view"
+version = "0.1.0"
+dependencies = [
+ "dunce",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "xai-sqlite-journal"
 version = "0.1.0"
 dependencies = [

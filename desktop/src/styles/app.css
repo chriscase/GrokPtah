@@ -7080,3 +7080,420 @@ html[data-accent="violet"] {
     outline: 2px solid Highlight;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Read-only source viewer (#411-adjacent: inspection, not execution).
+
+   Sizing is expressed in rem and ch so the whole surface scales with the
+   user's text size: at 200% the dialog simply gets taller, and at 400% (a
+   ~320px CSS viewport) it goes full-bleed instead of clipping. Nothing here
+   depends on a fixed pixel height.
+--------------------------------------------------------------------------- */
+
+.modal-backdrop[data-modal-layer="source-viewer"] {
+  z-index: 110;
+  align-items: stretch;
+  justify-content: stretch;
+  padding: 1rem;
+}
+
+.source-viewer {
+  width: min(64rem, 100%);
+  max-height: 100%;
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 0.85rem;
+  overflow: hidden;
+}
+
+.source-viewer-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.source-viewer-heading {
+  min-width: 0;
+  flex: 1 1 18ch;
+}
+
+.source-viewer-title {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
+  line-height: 1.4;
+  /* Break on separators so a deep path wraps instead of forcing a scrollbar. */
+  overflow-wrap: anywhere;
+}
+
+.source-viewer-identity {
+  margin: 0.15rem 0 0;
+  font-size: 0.75rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.source-viewer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.source-viewer-search {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.source-viewer-search-field {
+  flex: 1 1 14ch;
+  min-width: 10ch;
+}
+
+.source-viewer-search-field input {
+  width: 100%;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.35rem 0.5rem;
+  font-size: 0.85rem;
+}
+
+.source-viewer-match-count {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--muted);
+  min-width: 5ch;
+  text-align: center;
+}
+
+.source-viewer-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.source-viewer-notice,
+.source-viewer-loading,
+.source-viewer-binary {
+  font-size: 0.78rem;
+  color: var(--muted);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 0.4rem 0.55rem;
+}
+
+.source-viewer-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.source-viewer-code {
+  flex: 1 1 auto;
+  min-height: 6rem;
+  overflow: auto;
+  background: var(--bg-input);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+}
+
+.source-viewer-lines {
+  margin: 0;
+  padding: 0.35rem 0;
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.source-viewer-line {
+  display: flex;
+  gap: 0.75rem;
+  padding: 0 0.55rem;
+}
+
+.source-viewer-line.is-active-match {
+  background: var(--accent-bg);
+}
+
+.source-viewer-line-number {
+  flex: 0 0 auto;
+  min-width: 4ch;
+  text-align: right;
+  color: var(--muted);
+  /* Decorative: never part of a copied selection. */
+  user-select: none;
+}
+
+.source-viewer-line-text {
+  flex: 1 1 auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: inherit;
+}
+
+.source-viewer-line-cut {
+  color: var(--muted);
+}
+
+.source-viewer-match {
+  background: var(--accent-bg);
+  color: var(--text);
+  border-radius: 2px;
+}
+
+.source-viewer-line.is-active-match .source-viewer-match {
+  outline: 1px solid var(--accent);
+}
+
+.source-viewer-more {
+  align-self: flex-start;
+}
+
+.tok-comment {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.tok-string {
+  color: var(--ok);
+}
+
+.tok-number {
+  color: var(--tool);
+}
+
+.tok-keyword {
+  color: var(--accent-label);
+}
+
+/* File references inside tool output open directly, so they read as links
+   but stay inside a <pre> without breaking its layout. */
+.locator-link {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: var(--accent-label);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.locator-link:hover {
+  color: var(--text);
+}
+
+/* --- Per-file diff review before promotion --- */
+
+.run-diff-navigator {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.run-diff-summary,
+.run-diff-position {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.run-diff-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.run-diff-picker {
+  flex: 1 1 16ch;
+  min-width: 10ch;
+}
+
+.run-diff-picker select {
+  width: 100%;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.3rem 0.4rem;
+  font-size: 0.8rem;
+}
+
+.run-diff-hunks {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-height: 28rem;
+  overflow: auto;
+}
+
+.run-diff-hunk-heading {
+  font-size: 0.72rem;
+  color: var(--muted);
+  padding: 0.2rem 0.4rem;
+  overflow-wrap: anywhere;
+}
+
+.run-diff-lines {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+.run-diff-line {
+  display: flex;
+  gap: 0.6rem;
+  padding: 0 0.4rem;
+}
+
+.run-diff-line-number {
+  flex: 0 0 auto;
+  min-width: 4ch;
+  text-align: right;
+  color: var(--muted);
+  user-select: none;
+}
+
+.run-diff-line-text {
+  flex: 1 1 auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: inherit;
+}
+
+/* Change kind is carried by a prefix glyph as well as colour, so the diff
+   stays readable in forced-colors and for colour-blind readers. */
+.run-diff-line.kind-add .run-diff-line-text::before {
+  content: "+ ";
+  color: var(--ok);
+}
+
+.run-diff-line.kind-remove .run-diff-line-text::before {
+  content: "− ";
+  color: var(--danger);
+}
+
+.run-diff-line.kind-context .run-diff-line-text::before {
+  content: "\00a0\00a0";
+}
+
+.run-diff-line.kind-add {
+  background: rgba(127, 217, 154, 0.08);
+}
+
+.run-diff-line.kind-remove {
+  background: rgba(240, 113, 120, 0.08);
+}
+
+@media (max-width: 720px) {
+  .modal-backdrop[data-modal-layer="source-viewer"] {
+    padding: 0;
+  }
+
+  .source-viewer {
+    width: 100%;
+    border-radius: 0;
+    border-left: none;
+    border-right: none;
+  }
+
+  .source-viewer-search-field,
+  .run-diff-picker {
+    flex-basis: 100%;
+  }
+
+  .source-viewer-toggle {
+    font-size: 0.72rem;
+  }
+}
+
+/* At very large text sizes the viewport shrinks to a narrow column; drop the
+   fixed gutter so line text keeps most of the width. */
+@media (max-width: 26rem) {
+  .source-viewer-line,
+  .run-diff-line {
+    gap: 0.4rem;
+  }
+
+  .source-viewer-line-number,
+  .run-diff-line-number {
+    min-width: 3ch;
+  }
+
+  .run-diff-hunks {
+    max-height: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .source-viewer,
+  .source-viewer *,
+  .run-diff-navigator,
+  .run-diff-navigator * {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (forced-colors: active) {
+  .source-viewer,
+  .source-viewer-code,
+  .source-viewer-notice,
+  .source-viewer-loading,
+  .source-viewer-binary,
+  .run-diff-picker select {
+    border-color: CanvasText;
+  }
+
+  /* System colours override the palette; keep every token legible rather
+     than inheriting a hue the platform has replaced. */
+  .tok-comment,
+  .tok-string,
+  .tok-number,
+  .tok-keyword,
+  .source-viewer-line-number,
+  .run-diff-line-number {
+    color: CanvasText;
+    forced-color-adjust: none;
+    -webkit-text-fill-color: CanvasText;
+  }
+
+  .source-viewer-match,
+  .source-viewer-line.is-active-match {
+    background: Highlight;
+    color: HighlightText;
+    forced-color-adjust: none;
+  }
+
+  .locator-link {
+    color: LinkText;
+    forced-color-adjust: none;
+  }
+
+  .run-diff-line.kind-add,
+  .run-diff-line.kind-remove,
+  .run-diff-line.kind-context {
+    background: Canvas;
+    color: CanvasText;
+  }
+}

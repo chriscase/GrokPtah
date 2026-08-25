@@ -15,6 +15,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 grokptah-agent-bridge = { path = "../../crates/codegen/grokptah-agent-bridge" }
+xai-source-view = { path = "../../crates/common/xai-source-view" }
 tauri = { version = "2", features = ["devtools"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2"

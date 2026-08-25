@@ -1,5 +1,6 @@
 import { memo, useEffect, useState } from "react";
 import type { TranscriptItem } from "../lib/protocol";
+import { LocatorText } from "./LocatorText";
 
 type ToolItem = Extract<TranscriptItem, { kind: "tool" }>;
 
@@ -42,7 +43,14 @@ function shortOutput(output?: string, max = 88): string {
  * collapses again unless the user has manually toggled this card.
  */
 /** Memoized so settled tool cards skip re-render when other panes stream (#122). */
-export const ToolCallCard = memo(function ToolCallCard({ item }: { item: ToolItem }) {
+export const ToolCallCard = memo(function ToolCallCard({
+  item,
+  onOpenSource,
+}: {
+  item: ToolItem;
+  /** Open a file named in the tool title or output, read-only. */
+  onOpenSource?: (path: string, line: number | null) => void;
+}) {
   const status = statusLabel(item.status);
   const live = status === "running" || status === "pending";
   /** null = follow automatic open rules; boolean = user override */
@@ -70,7 +78,9 @@ export const ToolCallCard = memo(function ToolCallCard({ item }: { item: ToolIte
         <span className="tool-card-glyph" aria-hidden>
           {statusGlyph(status)}
         </span>
-        <span className="tool-card-title">{title}</span>
+        <span className="tool-card-title">
+          <LocatorText text={title} onOpenSource={onOpenSource} limit={4} />
+        </span>
         <span className="tool-card-status">{status}</span>
         {!open && preview ? (
           <span className="tool-card-preview" title={item.output}>
@@ -82,7 +92,9 @@ export const ToolCallCard = memo(function ToolCallCard({ item }: { item: ToolIte
         ) : null}
       </summary>
       {item.output ? (
-        <pre className="tool-card-output">{item.output}</pre>
+        <pre className="tool-card-output">
+          <LocatorText text={item.output} onOpenSource={onOpenSource} />
+        </pre>
       ) : live ? (
         <div className="tool-card-waiting">Running…</div>
       ) : (
@@ -99,9 +111,11 @@ export const ToolCallCard = memo(function ToolCallCard({ item }: { item: ToolIte
 export function ToolHistoryGroup({
   tools,
   keepRecent = 8,
+  onOpenSource,
 }: {
   tools: { item: ToolItem; index: number }[];
   keepRecent?: number;
+  onOpenSource?: (path: string, line: number | null) => void;
 }) {
   const [showOlder, setShowOlder] = useState(false);
   if (tools.length === 0) return null;
@@ -128,10 +142,18 @@ export function ToolHistoryGroup({
       )}
       {showOlder &&
         older.map(({ item, index }) => (
-          <ToolCallCard key={`tool-old-${item.callId || index}`} item={item} />
+          <ToolCallCard
+            key={`tool-old-${item.callId || index}`}
+            item={item}
+            onOpenSource={onOpenSource}
+          />
         ))}
       {recent.map(({ item, index }) => (
-        <ToolCallCard key={`tool-r-${item.callId || index}`} item={item} />
+        <ToolCallCard
+          key={`tool-r-${item.callId || index}`}
+          item={item}
+          onOpenSource={onOpenSource}
+        />
       ))}
     </div>
   );

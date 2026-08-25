@@ -94,6 +94,11 @@ export type SessionPaneProps = {
   cwd?: string | null;
   /** Peer sessions for collision detection in multi-dock chrome. */
   titlePeers?: { id: string; title: string; cwd?: string | null }[];
+  /**
+   * Open a file named in tool output read-only. Must be **stable**
+   * (useCallback) so passing it does not defeat this pane's memoisation.
+   */
+  onOpenSource?: (path: string, line: number | null) => void;
 };
 
 /**
@@ -118,6 +123,7 @@ export const SessionPane = memo(function SessionPane({
   showClose,
   cwd,
   titlePeers = [],
+  onOpenSource,
 }: SessionPaneProps) {
   const displayTitle = displaySessionTitle(
     { id: tab.id, title: tab.title, cwd },
@@ -275,7 +281,11 @@ export const SessionPane = memo(function SessionPane({
                 <div className="tool-batch-label">
                   Tools · {row.tools.length}
                 </div>
-                <ToolHistoryGroup tools={row.tools} keepRecent={8} />
+                <ToolHistoryGroup
+                  tools={row.tools}
+                  keepRecent={8}
+                  onOpenSource={onOpenSource}
+                />
               </div>
             );
           }
@@ -288,7 +298,9 @@ export const SessionPane = memo(function SessionPane({
                     {item.kind === "user" ? "You" : "Grok"}
                   </div>
                 )}
-                {item.kind === "tool" && <ToolCallCard item={item} />}
+                {item.kind === "tool" && (
+                  <ToolCallCard item={item} onOpenSource={onOpenSource} />
+                )}
                 {item.kind === "plan" && (
                   <>
                     <strong>Plan ({item.status})</strong>

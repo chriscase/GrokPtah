@@ -39,6 +39,8 @@ import { TerminalPane, type ToolShellAttach } from "./components/TerminalPane";
 import { PermissionModal } from "./components/PermissionModal";
 import { PromptQueuePanel } from "./components/PromptQueuePanel";
 import { RunInspector } from "./components/RunInspector";
+import { SourceViewer } from "./components/SourceViewer";
+import { useSourceViewer } from "./lib/useSourceViewer";
 import { PersistentAgentPanel } from "./components/PersistentAgentPanel";
 import { SubagentCard } from "./components/SubagentCard";
 import {
@@ -276,6 +278,11 @@ export default function App() {
   /** Open concurrent workspaces (tabs). Multiple can be busy at once. */
   const [tabs, setTabs] = useState<SessionTab[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  /**
+   * Read-only source inspection. Clicking a file, a tool path, or a diff row
+   * opens the bytes directly instead of asking the model to read them.
+   */
+  const sourceViewer = useSourceViewer(activeSessionId);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const {
     composer,
@@ -2744,6 +2751,7 @@ export default function App() {
                     onClosePane={undockSession}
                     onFocusSession={focusSession}
                     onSetWorkingDirectory={setWorkingDirectory}
+                    onOpenSource={sourceViewer.openSource}
                     cwd={dockTab.cwd ?? sessions.find((s) => s.id === dockTab.id)?.cwd}
                     titlePeers={[
                       ...sessions,
@@ -3279,7 +3287,8 @@ export default function App() {
                 key={f}
                 type="button"
                 className="file-item"
-                onClick={() => void sendPrompt(`read ${f}`)}
+                title={`Open ${f} in the read-only source viewer`}
+                onClick={() => sourceViewer.openSource(f)}
               >
                 {f}
               </button>
@@ -3561,6 +3570,9 @@ export default function App() {
               watching={runsWatching}
               onWatchingChange={setRunsWatching}
               onRefresh={() => void refreshRuns()}
+              onOpenSource={(runId, path, line) =>
+                sourceViewer.openSource(path, line, { runId })
+              }
               onReview={(runId) => {
                 if (!activeSessionId) return Promise.reject(new Error("No active session"));
                 return api.runReview(activeSessionId, runId);
@@ -3902,6 +3914,16 @@ export default function App() {
         onAskAssistant={askHelpAssistant}
         onSearchSemantic={searchHelpSemantically}
         assistantProviderLabel={assistantProviderLabel}
+      />
+
+      <SourceViewer
+        open={sourceViewer.open}
+        document={sourceViewer.document}
+        error={sourceViewer.error}
+        loading={sourceViewer.loading}
+        initialLine={sourceViewer.request?.line ?? null}
+        onClose={sourceViewer.close}
+        onRetry={sourceViewer.retry}
       />
 
       {aboutOpen && (

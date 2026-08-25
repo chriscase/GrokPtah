@@ -33,6 +33,11 @@ import type {
   SteeringReceipt,
 } from "./promptQueue";
 import type { CapabilitySet } from "./capabilities";
+import {
+  parseSourceDocument,
+  parseSourceRoots,
+  type SourceDocument,
+} from "./sourceView";
 
 export const api = {
   agentStart: () => invoke<void>("agent_start"),
@@ -425,6 +430,31 @@ export const api = {
     invoke<AuthState>("auth_set_api_key", { apiKey, displayName }),
   authOpenLogin: () => invoke<string>("auth_open_login"),
   fileTree: () => invoke<string[]>("file_tree"),
+  /** Boundaries this session may inspect: its workspace and run worktrees. */
+  sourceViewRoots: (sessionId?: string | null) =>
+    invoke<unknown>("source_view_roots", { sessionId: sessionId ?? null }).then(parseSourceRoots),
+  /**
+   * Read one file inside one approved boundary. The backend refuses anything
+   * outside it, so the frontend never needs to police the path itself.
+   */
+  sourceViewOpen: (
+    rootId: string,
+    path: string,
+    options: {
+      sessionId?: string | null;
+      maxBytes?: number;
+      maxLines?: number;
+      maxLineChars?: number;
+    } = {},
+  ): Promise<SourceDocument> =>
+    invoke<unknown>("source_view_open", {
+      rootId,
+      path,
+      sessionId: options.sessionId ?? null,
+      maxBytes: options.maxBytes ?? null,
+      maxLines: options.maxLines ?? null,
+      maxLineChars: options.maxLineChars ?? null,
+    }).then(parseSourceDocument),
   fuzzyOpen: (query: string) => invoke<string[]>("fuzzy_open", { query }),
   gitStatus: () => invoke<string>("git_status"),
   gitDiff: () => invoke<string>("git_diff"),
