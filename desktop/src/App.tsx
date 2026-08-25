@@ -25,7 +25,13 @@ import {
 import { ComputerCockpit } from "./components/ComputerCockpit";
 import { FleetStrip } from "./components/FleetStrip";
 import { SearchPanel } from "./components/SearchPanel";
-import { HelpPanel } from "./components/HelpPanel";
+import { HelpCenter } from "./components/HelpCenter";
+import {
+  parseHelpAssistantAnswer,
+  parseHelpSemanticAnswer,
+  type HelpAssistantRequest,
+  type HelpSemanticRequest,
+} from "./lib/helpCenter";
 import { SessionBrowser } from "./components/SessionBrowser";
 import { SessionPane } from "./components/SessionPane";
 import { SettingsPanel } from "./components/SettingsPanel";
@@ -565,6 +571,59 @@ export default function App() {
   );
   const currentEffort = effortForModel(models, status?.model, status?.effort);
   const currentModelInfo = models.find((model) => model.id === status?.model);
+  const assistantProviderLabel = [
+    currentModelInfo?.provider_label ?? currentModelInfo?.provider_id,
+    currentModelInfo?.display_name ?? currentModelInfo?.id ?? status?.model,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .join(" · ") || "selected provider";
+  const askHelpAssistant = useCallback(
+    async (request: HelpAssistantRequest) => {
+      const session = await api.sessionNewKind("chat");
+      const prompt = [
+        "You are the optional GrokPtah product-help assistant.",
+        request.instruction,
+        `Selected provider/model: ${assistantProviderLabel}`,
+        `Retrieval mode: ${request.retrievalMode}`,
+        `Corpus version: ${request.corpusVersion}`,
+        "Do not switch provider, tenant, model, or retrieval scope.",
+        "Return JSON only with exactly these keys: text (string), citations (array of exact source IDs), uncertainty (string).",
+        `Question: ${request.query}`,
+        `Cited context:\n${request.citedContext}`,
+      ].join("\n\n");
+      try {
+        const reply = await api.sessionPrompt(session.id, prompt);
+        return parseHelpAssistantAnswer(reply);
+      } finally {
+        await api.sessionDelete(session.id).catch(() => undefined);
+      }
+    },
+    [assistantProviderLabel],
+  );
+  const searchHelpSemantically = useCallback(
+    async (request: HelpSemanticRequest) => {
+      const session = await api.sessionNewKind("chat");
+      const prompt = [
+        "You are the optional GrokPtah Help Center semantic retriever.",
+        request.instruction,
+        `Selected provider/model: ${assistantProviderLabel}`,
+        `Retrieval mode: ${request.retrievalMode}`,
+        `Corpus version: ${request.corpusVersion}`,
+        "Do not switch provider, tenant, model, or retrieval scope.",
+        "Return JSON only with exactly these keys: results (array of objects with articleId, score, rationale), uncertainty (string).",
+        `Query: ${request.query}`,
+        `Candidate article metadata:\n${JSON.stringify(request.candidates)}`,
+      ].join("\n\n");
+      try {
+        const reply = await api.sessionPrompt(session.id, prompt);
+        return parseHelpSemanticAnswer(reply);
+      } finally {
+        await api.sessionDelete(session.id).catch(() => undefined);
+      }
+    },
+    [assistantProviderLabel],
+  );
   const activeTabKind = kindForTab(activeTab, sessions, workspaceMode);
   const activeIsBuild = activeTabKind === "build";
   const activeCwd = activeSummary?.cwd || activeTab?.cwd;
@@ -1618,6 +1677,10 @@ export default function App() {
     const fromComposer = text === undefined;
     if (fromComposer) {
       clearComposerFor(activeSessionId);
+    }
+    if (prompt === "/help") {
+      setHelpOpen(true);
+      return;
     }
     let id: string;
     try {
@@ -3804,7 +3867,13 @@ export default function App() {
         }}
       />
 
-      <HelpPanel open={helpOpen} onClose={() => setHelpOpen(false)} />
+      <HelpCenter
+        open={helpOpen}
+        onClose={() => setHelpOpen(false)}
+        onAskAssistant={askHelpAssistant}
+        onSearchSemantic={searchHelpSemantically}
+        assistantProviderLabel={assistantProviderLabel}
+      />
 
       {aboutOpen && (
         <div className="modal-backdrop" onClick={() => setAboutOpen(false)}>
