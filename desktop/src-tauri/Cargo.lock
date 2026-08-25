@@ -1308,6 +1308,7 @@ dependencies = [
  "dunce",
  "fs2",
  "futures",
+ "grokptah-agent-sdk",
  "http-body-util",
  "keyring",
  "libc",
@@ -1324,6 +1325,14 @@ dependencies = [
  "tower",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "grokptah-agent-sdk"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
