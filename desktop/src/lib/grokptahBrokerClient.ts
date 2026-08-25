@@ -512,17 +512,102 @@ export function parseBrokerEventUpdate(value: unknown): GrokPtahBrokerEventUpdat
   };
 }
 
+/** Share-safe public error envelope returned by a ContextDesk broker. */
+export type GrokPtahBrokerErrorEnvelope = {
+  code: string;
+  message: string;
+  requestId?: string;
+  reasonCode?: string;
+  eventRange?: { startSeq: number; endSeq: number };
+};
+
+const BROKER_ERROR_CODE = /^[a-z][a-z0-9_]{0,127}$/;
+
+function parseBrokerEventRange(value: unknown): GrokPtahBrokerErrorEnvelope["eventRange"] | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (!hasOnlyKeys(record, new Set(["startSeq", "endSeq"]))) return null;
+  if (
+    typeof record.startSeq !== "number" ||
+    !Number.isSafeInteger(record.startSeq) ||
+    record.startSeq < 0 ||
+    typeof record.endSeq !== "number" ||
+    !Number.isSafeInteger(record.endSeq) ||
+    record.endSeq < record.startSeq
+  ) {
+    return null;
+  }
+  return { startSeq: record.startSeq, endSeq: record.endSeq };
+}
+
+/**
+ * Parse a typed public error envelope without copying privileged extra fields.
+ *
+ * Unknown keys such as `authorization` or `privilegedPath` are ignored so a
+ * leaky broker body cannot become consumer-visible state. Malformed recovery
+ * ranges fail closed.
+ */
+export function parseBrokerErrorEnvelope(value: unknown): GrokPtahBrokerErrorEnvelope | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (
+    !boundedString(record.code, 128) ||
+    !BROKER_ERROR_CODE.test(record.code) ||
+    !boundedString(record.message, 512) ||
+    PRIVILEGED_TEXT_NEEDLE.test(record.message)
+  ) {
+    return null;
+  }
+  if (record.requestId !== undefined && !boundedString(record.requestId, MAX_BROKER_ID_BYTES)) {
+    return null;
+  }
+  if (
+    record.reasonCode !== undefined &&
+    (!boundedString(record.reasonCode, 128) ||
+      !BROKER_ERROR_CODE.test(record.reasonCode) ||
+      PRIVILEGED_TEXT_NEEDLE.test(record.reasonCode))
+  ) {
+    return null;
+  }
+  let eventRange: GrokPtahBrokerErrorEnvelope["eventRange"];
+  if (record.eventRange !== undefined) {
+    const parsedRange = parseBrokerEventRange(record.eventRange);
+    if (parsedRange === null) return null;
+    eventRange = parsedRange;
+  }
+  return {
+    code: record.code,
+    message: record.message,
+    ...(record.requestId === undefined ? {} : { requestId: record.requestId }),
+    ...(record.reasonCode === undefined ? {} : { reasonCode: record.reasonCode }),
+    ...(eventRange === undefined ? {} : { eventRange }),
+  };
+}
+
 export class GrokPtahBrokerError extends Error {
   readonly status: number;
   readonly code: string;
   readonly requestId?: string;
+  readonly reasonCode?: string;
+  readonly eventRange?: { startSeq: number; endSeq: number };
 
-  constructor(status: number, code: string, message: string, requestId?: string) {
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    requestId?: string,
+    extras?: {
+      reasonCode?: string;
+      eventRange?: { startSeq: number; endSeq: number };
+    },
+  ) {
     super(message);
     this.name = "GrokPtahBrokerError";
     this.status = status;
     this.code = code;
     this.requestId = requestId;
+    this.reasonCode = extras?.reasonCode;
+    this.eventRange = extras?.eventRange;
   }
 }
 
@@ -1264,13 +1349,15 @@ async function throwBrokerError(response: Response): Promise<never> {
   } catch {
     // Preserve the stable HTTP status even when a proxy emits no JSON body.
   }
+  const parsed = parseBrokerErrorEnvelope(body);
   throw new GrokPtahBrokerError(
     response.status,
-    typeof body.code === "string" ? body.code.slice(0, 128) : "http_error",
-    typeof body.message === "string"
-      ? body.message.slice(0, 512)
-      : `Broker request failed with HTTP ${response.status}`,
-    typeof body.requestId === "string" ? body.requestId.slice(0, 256) : undefined,
+    parsed?.code ?? "http_error",
+    parsed?.message ?? `Broker request failed with HTTP ${response.status}`,
+    parsed?.requestId,
+    parsed
+      ? { reasonCode: parsed.reasonCode, eventRange: parsed.eventRange }
+      : undefined,
   );
 }
 

@@ -5,6 +5,7 @@ import {
   GrokPtahBrokerError,
   parseBrokerApproval,
   parseBrokerBinding,
+  parseBrokerErrorEnvelope,
   parseBrokerEventUpdate,
   parseBrokerRun,
   parseBrokerReviewProjection,
@@ -867,6 +868,72 @@ describe("GrokPtahBrokerClient", () => {
         status: 403,
         code: "forbidden_scope",
         requestId: "req-1",
+      }),
+    );
+  });
+
+  it("parses typed public error envelopes including unknown and expired cursors", async () => {
+    expect(parseBrokerErrorEnvelope({
+      code: "stale_or_recovery",
+      message: "resume from the retained window",
+      reasonCode: "cursor_expired",
+      requestId: "req-9",
+      eventRange: { startSeq: 12, endSeq: 18 },
+    })).toEqual({
+      code: "stale_or_recovery",
+      message: "resume from the retained window",
+      reasonCode: "cursor_expired",
+      requestId: "req-9",
+      eventRange: { startSeq: 12, endSeq: 18 },
+    });
+    expect(parseBrokerErrorEnvelope({
+      code: "stale_or_recovery",
+      message: "list cursor is unknown",
+      reasonCode: "unknown_cursor",
+    })).toEqual({
+      code: "stale_or_recovery",
+      message: "list cursor is unknown",
+      reasonCode: "unknown_cursor",
+    });
+    const leaked = parseBrokerErrorEnvelope({
+      code: "unauthenticated",
+      message: "broker session expired",
+      authorization: "Bearer secret",
+    });
+    expect(leaked).toMatchObject({ code: "unauthenticated" });
+    expect(leaked).not.toHaveProperty("authorization");
+    expect(parseBrokerErrorEnvelope({
+      code: "stale_or_recovery",
+      message: "Authorization: Bearer secret",
+      reasonCode: "cursor_expired",
+    })).toBeNull();
+    expect(parseBrokerErrorEnvelope({
+      code: "stale_or_recovery",
+      message: "resume from the retained window",
+      eventRange: { startSeq: 18, endSeq: 12 },
+    })).toBeNull();
+
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse(
+        {
+          code: "stale_or_recovery",
+          message: "resume from the retained window",
+          reasonCode: "cursor_expired",
+          requestId: "req-9",
+          eventRange: { startSeq: 12, endSeq: 18 },
+          privilegedPath: "/Users/secret",
+        },
+        410,
+      ),
+    );
+    const client = new GrokPtahBrokerClient({ baseUrl: "https://contextdesk.example", fetcher });
+    await expect(client.listExternalWorkers("binding-1", { cursor: "expired-page" })).rejects.toEqual(
+      expect.objectContaining<GrokPtahBrokerError>({
+        status: 410,
+        code: "stale_or_recovery",
+        requestId: "req-9",
+        reasonCode: "cursor_expired",
+        eventRange: { startSeq: 12, endSeq: 18 },
       }),
     );
   });

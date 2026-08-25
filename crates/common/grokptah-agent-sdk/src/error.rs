@@ -26,7 +26,7 @@ pub enum ErrorCode {
 
 /// Bounded retained-event range returned with cursor recovery errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ErrorEventRange {
     /// First retained sequence, inclusive.
     pub start_seq: u64,
@@ -36,13 +36,14 @@ pub struct ErrorEventRange {
 
 /// Public error envelope suitable for a broker or non-Rust client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ErrorEnvelope {
     /// Stable category.
     pub code: ErrorCode,
     /// Share-safe message.
     pub message: String,
     /// Request identity for audit/support correlation.
+    #[serde(default)]
     pub request_id: Option<String>,
     /// Optional bounded transport reason; `code` remains the stable category.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,5 +85,14 @@ mod tests {
         let decoded: ErrorEnvelope =
             serde_json::from_value(recovered_value).expect("recovery round-trips");
         assert_eq!(decoded.event_range, recovered.event_range);
+        assert!(
+            serde_json::from_value::<ErrorEnvelope>(serde_json::json!({
+                "code": "forbidden_scope",
+                "message": "workspace is not bound",
+                "authorization": "Bearer secret"
+            }))
+            .is_err(),
+            "public error envelopes must not accept credential fields"
+        );
     }
 }
