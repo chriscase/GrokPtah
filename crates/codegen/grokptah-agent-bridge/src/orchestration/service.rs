@@ -1627,14 +1627,14 @@ impl OrchestrationService {
         after_seq: u64,
         limit: usize,
     ) -> Result<JournalPage, OrchError> {
-        // Read the bounded run range before applying the caller's page limit.
-        // Applying `limit` to the global journal first can return a page made
-        // entirely of other sessions and advance the cursor past this run's
-        // events. `read_range_all` is bounded by the journal retention policy
-        // and preserves cursor-expiry failures instead of silently skipping.
+        // Filter the journal to this run before applying `limit`. Applying
+        // `limit` to the global journal first can return a page made entirely
+        // of other sessions and advance the cursor past this run's events.
+        // Return a recoverable prefix before a later durable gap; a 410 is
+        // reserved for an empty page.
         let mut entries = self
             .bus
-            .read_range_all(after_seq, run.end_seq, Some(run.session_id))
+            .read_range_page(after_seq, run.end_seq, Some(run.session_id), limit)
             .map_err(|_| {
                 OrchError::new(
                     OrchErrorCode::CursorExpired,
@@ -1645,7 +1645,6 @@ impl OrchestrationService {
             run.start_seq.map(|s| e.seq >= s).unwrap_or(true)
                 && run.end_seq.map(|s| e.seq <= s).unwrap_or(true)
         });
-        entries.truncate(limit.clamp(1, 500));
         let next_cursor = entries.last().map(|e| e.seq);
         Ok(JournalPage {
             entries,

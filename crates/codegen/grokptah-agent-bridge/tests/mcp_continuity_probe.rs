@@ -190,6 +190,10 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
     // server to emit the explicit recovery notification when the client
     // resumes reading.
     wait_for_file(&ready_file).await;
+    // Drain persistence work from the earlier probe steps before the flood.
+    // Keep bursts below the writer queue capacity so the bounded page reader
+    // can reconcile a prefix before the intentionally lagging live stream.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
     for index in 0..6_000 {
         host.event_bus().publish(SessionUpdate::AgentMessageChunk {
             session_id: gap_session.id,
@@ -198,7 +202,7 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
         if index % 100 == 99 {
             // Keep the persistence writer ahead of its small queue while the
             // unread HTTP body still forces the broadcast receiver to lag.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
