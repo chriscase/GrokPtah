@@ -139,6 +139,7 @@ function boundedString(value: unknown, maxBytes: number, rejectPrivileged = fals
     typeof value === "string" &&
     value.trim().length > 0 &&
     new TextEncoder().encode(value).byteLength <= maxBytes &&
+    !/[\u0000-\u001f\u007f]/.test(value) &&
     (!rejectPrivileged || !PRIVILEGED_TEXT.test(value))
   );
 }
@@ -361,5 +362,33 @@ export function applyExternalWorkerNotification(
     return { ...state, recoveryRequired: true };
   }
   const events = [...state.events, event].slice(-MAX_EVENTS);
-  return { lastSeq: event.seq, events, recoveryRequired: false };
+  // Once a gap or recovery frame has been observed, a later live event is not
+  // proof that the missing history was replayed. Keep the fence raised until
+  // the caller installs an authoritative polled snapshot via
+  // `replaceExternalWorkerMonitor`.
+  return { lastSeq: event.seq, events, recoveryRequired: state.recoveryRequired };
+}
+
+/**
+ * Replace a monitor from a contiguous, authoritative poll response.
+ *
+ * A stream cannot clear `recoveryRequired`; only a validated snapshot from the
+ * broker can do that. The input is treated as untrusted because this function
+ * is part of the Tauri-free public package boundary.
+ */
+export function replaceExternalWorkerMonitor(
+  values: readonly unknown[],
+): ExternalWorkerMonitorState | null {
+  if (values.length > MAX_EVENTS) return null;
+  const events = values.map(parseExternalWorkerEvent);
+  if (events.some((event) => event === null)) return null;
+  const parsed = events as ExternalWorkerEvent[];
+  for (let index = 1; index < parsed.length; index += 1) {
+    if (parsed[index]!.seq !== parsed[index - 1]!.seq + 1) return null;
+  }
+  return {
+    lastSeq: parsed.at(-1)?.seq ?? -1,
+    events: parsed.slice(-MAX_EVENTS),
+    recoveryRequired: false,
+  };
 }

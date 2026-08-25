@@ -90,6 +90,73 @@ describe("GrokPtahBrokerClient", () => {
     expect(fetcher.mock.calls[0][1]?.headers).not.toHaveProperty("Authorization");
   });
 
+  it("rejects external worker responses whose identities do not match the route", async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({
+        provider: "cursor_cloud",
+        externalAgentId: "other-agent",
+        repository: "org/repo",
+        startingRef: "main",
+        state: "running",
+        createdAt: "now",
+        updatedAt: "now",
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        externalAgentId: "agent-1",
+        externalRunId: "other-run",
+        state: "running",
+        lastSeq: 0,
+        createdAt: "now",
+        updatedAt: "now",
+      }));
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+    });
+
+    await expect(client.getExternalWorker("binding-1", "agent-1"))
+      .rejects.toMatchObject({ code: "invalid_response" });
+    await expect(client.getExternalWorkerRun("binding-1", "agent-1", "run-1"))
+      .rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  it("rejects a launch response from a different provider profile", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
+      worker: {
+        provider: "custom",
+        providerId: "other-gateway",
+        externalAgentId: "agent-1",
+        repository: "org/repo",
+        startingRef: "main",
+        state: "running",
+        createdAt: "now",
+        updatedAt: "now",
+      },
+      run: {
+        externalAgentId: "agent-1",
+        externalRunId: "run-1",
+        state: "running",
+        lastSeq: 0,
+        createdAt: "now",
+        updatedAt: "now",
+      },
+    }));
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    await expect(client.launchExternalWorker("binding-1", {
+      requestId: "request-1",
+      provider: "cursor_cloud",
+      repository: "org/repo",
+      startingRef: "main",
+      prompt: "Review the exact candidate",
+      executionMode: "isolated",
+      autoCreatePr: false,
+    }, "request-1")).rejects.toMatchObject({ code: "invalid_response" });
+  });
+
   it("fails closed when a typed binding or run envelope is malformed", async () => {
     expect(parseBrokerBinding({
       bindingId: "binding-1",

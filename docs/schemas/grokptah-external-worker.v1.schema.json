@@ -24,13 +24,13 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 256,
-      "pattern": "^[^\\u0000-\\u001f\\r\\n]+$"
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
     },
     "ref": {
       "type": "string",
       "minLength": 1,
       "maxLength": 512,
-      "pattern": "^[^/\\\\][^\\u0000-\\u001f\\r\\n]*$"
+      "pattern": "^[^/\\\\][^\\u0000-\\u001f\\u007f]*$"
     },
     "bounds": {
       "type": "object",
@@ -54,7 +54,7 @@
         "prompt": { "type": "string", "minLength": 1, "maxLength": 1048576 },
         "model": { "$ref": "#/$defs/identity" },
         "executionMode": { "const": "isolated" },
-        "autoCreatePr": { "type": "boolean" },
+        "autoCreatePr": { "const": false },
         "bounds": { "$ref": "#/$defs/bounds" }
       }
     },
@@ -70,7 +70,11 @@
         "startingRef": { "$ref": "#/$defs/ref" },
         "state": { "$ref": "#/$defs/state" },
         "branch": { "$ref": "#/$defs/ref" },
-        "workerUrl": { "type": "string", "maxLength": 512, "pattern": "^https://" },
+        "workerUrl": {
+          "type": "string",
+          "maxLength": 512,
+          "pattern": "^https://[^/?#@]+(?:/[^?#]*)?$"
+        },
         "createdAt": { "type": "string", "minLength": 1 },
         "updatedAt": { "type": "string", "minLength": 1 }
       }
@@ -97,7 +101,11 @@
         "seq": { "type": "integer", "minimum": 0 },
         "ts": { "type": "string", "minLength": 1 },
         "kind": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "detail": { "type": "string", "maxLength": 4096 }
+        "detail": {
+          "type": "string",
+          "maxLength": 4096,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]*$"
+        }
       }
     },
     "artifact": {

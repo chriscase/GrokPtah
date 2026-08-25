@@ -4,6 +4,7 @@ import {
   HELP_CONTRACT,
   EXTERNAL_WORKER_CONTRACT,
   createExternalWorkerMonitor,
+  replaceExternalWorkerMonitor,
   parseCapabilitySet,
   promptQueueReducer,
 } from "./public";
@@ -16,5 +17,6 @@ describe("public integration barrel", () => {
     expect(typeof promptQueueReducer).toBe("function");
     expect(EXTERNAL_WORKER_CONTRACT).toBe("grokptah.external-workers.v1");
     expect(createExternalWorkerMonitor().lastSeq).toBe(-1);
+    expect(typeof replaceExternalWorkerMonitor).toBe("function");
   });
 });
