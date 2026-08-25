@@ -74,6 +74,10 @@ const rebuilt = {
   chunkCount: HELP_CORPUS.chunks.length,
   sourceCount: HELP_CORPUS.sources.length,
   serializationSha256: sha256Hex(serializeHelpCorpus()),
+  // Per-record digests, so a single edited article or source is visible in the
+  // lock diff rather than only shifting one aggregate value.
+  articleDigests: Object.fromEntries(HELP_CORPUS.articles.map((a) => [a.id, a.digest])),
+  sourceDigests: Object.fromEntries(HELP_CORPUS.sources.map((s) => [s.id, s.digest])),
 };
 if (process.argv.includes("--write")) {
   const { writeFile } = await import("node:fs/promises");
@@ -84,8 +88,19 @@ if (process.argv.includes("--write")) {
 } else {
   const locked = JSON.parse(await readFile(lockPath, "utf8"));
   for (const key of Object.keys(rebuilt)) {
-    if (locked[key] !== rebuilt[key]) {
-      fail(`corpus lock drift on ${key}: locked ${locked[key]} != rebuilt ${rebuilt[key]}`);
+    const lockedValue = locked[key];
+    const rebuiltValue = rebuilt[key];
+    if (typeof rebuiltValue === "object" && rebuiltValue !== null) {
+      for (const [id, digest] of Object.entries(rebuiltValue)) {
+        if (lockedValue?.[id] !== digest) {
+          fail(`corpus lock drift on ${key}.${id}: locked ${lockedValue?.[id]} != rebuilt ${digest}`);
+        }
+      }
+      for (const id of Object.keys(lockedValue ?? {})) {
+        if (!(id in rebuiltValue)) fail(`corpus lock drift: ${key}.${id} disappeared`);
+      }
+    } else if (lockedValue !== rebuiltValue) {
+      fail(`corpus lock drift on ${key}: locked ${lockedValue} != rebuilt ${rebuiltValue}`);
     }
   }
 }
@@ -114,6 +129,20 @@ for (const chunk of HELP_CORPUS.chunks) {
   if (!HELP_CORPUS.articles.some((article) => article.id === chunk.articleId)) {
     fail(`chunk ${chunk.id} references unknown article ${chunk.articleId}`);
   }
+}
+
+// 3b. Every record carries its own domain-separated digest.
+const seenDigests = new Map();
+for (const record of [...HELP_CORPUS.articles, ...HELP_CORPUS.chunks, ...HELP_CORPUS.sources]) {
+  if (!/^sha256:[0-9a-f]{64}$/.test(record.digest ?? "")) {
+    fail(`record ${record.id} has no well-formed digest`);
+    continue;
+  }
+  const previous = seenDigests.get(record.digest);
+  if (previous && previous !== record.id) {
+    fail(`digest collision between ${previous} and ${record.id}`);
+  }
+  seenDigests.set(record.digest, record.id);
 }
 
 // 4. The legacy contracts must be projections of this corpus, not a second one.

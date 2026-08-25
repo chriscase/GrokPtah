@@ -20,14 +20,31 @@ export type HelpTopic = "getting-started" | "providers" | "computer-use" | "oper
 export type HelpAudience = "everyone" | "power_user" | "operator";
 export type HelpAccess = "public" | "gated" | "operator";
 
-/** A citation target: an exact repository path plus an exact heading. */
-export type HelpSourceAnchor = {
+/** The authored form of a citation target, before its digest is computed. */
+export type HelpSourceSeed = {
   /** Stable citation id used in answers, e.g. `provider.profiles`. */
   readonly id: string;
   /** Repository-relative path. Must exist in the tree. */
   readonly path: string;
   /** Exact Markdown heading text within `path`. */
   readonly heading: string;
+  /** Who may see content from this source. Absent means `public`. */
+  readonly visibility?: HelpSourceVisibility;
+};
+
+/**
+ * Who a source may be surfaced to.
+ *
+ * `project` and `private` are default-deny: they require an explicit,
+ * action-time grant naming the same tenant and project.
+ */
+export type HelpSourceVisibility = "public" | "project" | "private";
+
+/** A citation target plus its own domain-separated digest. */
+export type HelpSourceAnchor = HelpSourceSeed & {
+  readonly visibility: HelpSourceVisibility;
+  /** `domainDigest(source, [id, path, heading, visibility])`. */
+  readonly digest: string;
 };
 
 /** Locale-tagged surface text so supported articles are retrievable in-language. */
@@ -53,6 +70,8 @@ export type HelpChunk = {
   readonly locale: string;
   /** Source anchor ids that back this chunk. Never empty. */
   readonly sourceIds: readonly string[];
+  /** `domainDigest(chunk, [id, articleId, kind, ordinal, locale, text, ...sources])`. */
+  readonly digest: string;
 };
 
 export type HelpCanonicalArticle = {
@@ -76,6 +95,8 @@ export type HelpCanonicalArticle = {
    * consolidated article replaces a former standalone entry.
    */
   readonly legacyEntryId?: string;
+  /** Digest over this article's own content and its source digests. */
+  readonly digest: string;
 };
 
 /** The frozen, digest-bound corpus handed to every retriever. */
@@ -92,7 +113,13 @@ export type HelpCanonicalCorpus = {
    * this value and fail closed when it drifts.
    */
   readonly digest: string;
-  /** Digest over only the cited `path#heading` set, for anchor drift checks. */
+  /**
+   * Digest over the set of per-source digests, for anchor drift checks.
+   *
+   * Computed from length-prefixed per-source digests rather than joined
+   * `id|path#heading` strings; the joined form collided whenever a separator
+   * character appeared inside a field.
+   */
   readonly sourceDigest: string;
 };
 
@@ -100,6 +127,6 @@ export type HelpCanonicalCorpus = {
  * Authoring shape. Articles reference sources by id so a citation id always
  * resolves to exactly one `path#heading`; `corpus.ts` resolves them.
  */
-export type HelpArticleSeed = Omit<HelpCanonicalArticle, "sources"> & {
+export type HelpArticleSeed = Omit<HelpCanonicalArticle, "sources" | "digest"> & {
   readonly sourceIds: readonly string[];
 };

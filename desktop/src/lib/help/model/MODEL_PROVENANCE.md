@@ -4,13 +4,13 @@ GENERATED FILE - rebuild with `node --import ./scripts/register-ts-hook.mjs scri
 
 - **Model id**: `grokptah-help-lsa-v1` v1.0.0
 - **Artifact**: `desktop/src/lib/help/model/helpEmbeddingModel.v1.ts`
-- **SHA-256** (canonical serialization): `sha256:363557ccd5f81d095b66619e1aea6b671f730fdbe7f15a5b3492b3f866ca34b6`
+- **SHA-256** (canonical serialization): `sha256:7a7edf68152634cf7266905d86d96f37d2b0ff950859f34d1eeb5bd95bbac869`
 - **Method**: ppmi+truncated-svd(lsa)+char-trigram-subword
 - **Dimensions**: 64
 - **Vocabulary**: 1527 terms; 1407 character trigrams
 - **Embedded chunks**: 105 (from 231 training documents)
 - **Trained from**: desktop/src/lib/help/canonical/data.ts plus the cited README.md and docs/*.md sections (this repository only)
-- **Corpus digest**: `sha256:fcdb78f7019a7a11349205626058f230273831ea6eabb76c9e16c7d9dd6efc79`
+- **Corpus digest**: `sha256:9547bad7a455554cb6b5b7419bea4b4e3739c0d66b082144f84bc14854e1b0d9`
 - **External data**: none
 - **Network**: none — training and inference are fully offline
 - **Runtime**: pure TypeScript; no native modules, no WASM, no model server

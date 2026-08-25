@@ -20,6 +20,7 @@ import {
   resolveHelpQueryTerms,
 } from "../model/artifact";
 import { buildHelpExcerpt, sanitizeHelpText, type HelpExcerpt } from "./highlight";
+import { buildHelpIndexProvenance, type HelpIndexProvenance } from "./provenance";
 import { redactHelpText, type HelpRedaction } from "./redact";
 import { scoreLexical, type LexicalDocument } from "./lexical";
 import { HELP_QUERY_MAX_TERMS, boundQuery, normalizeText, tokenize } from "./text";
@@ -77,6 +78,22 @@ const BM25_SATURATION = 6;
  */
 export const HELP_ABSTENTION_THRESHOLD = 0.38;
 
+/**
+ * Provenance of the in-memory index this build serves.
+ *
+ * Hashes the corpus, the model, the tokenizer, and every scoring constant
+ * together. A caller can pin it to detect an index that drifted while each
+ * individual digest still looked correct.
+ */
+export const HELP_INDEX_PROVENANCE: HelpIndexProvenance = buildHelpIndexProvenance({
+  lexicalWeight: HELP_FUSION_WEIGHTS.lexical,
+  semanticWeight: HELP_FUSION_WEIGHTS.semantic,
+  exactPhraseWeight: HELP_FUSION_WEIGHTS.exactPhrase,
+  coordinationExponent: HELP_COORDINATION_EXPONENT,
+  bm25Saturation: BM25_SATURATION,
+  abstentionThreshold: HELP_ABSTENTION_THRESHOLD,
+});
+
 export type HelpRetrievalMode = "hybrid" | "lexical" | "semantic";
 
 export type HelpRetrievalOptions = {
@@ -88,6 +105,8 @@ export type HelpRetrievalOptions = {
   readonly mode?: HelpRetrievalMode;
   /** Fail closed unless the corpus digest matches this value exactly. */
   readonly expectCorpusDigest?: string;
+  /** Fail closed unless the index digest matches this value exactly. */
+  readonly expectIndexDigest?: string;
   /** Override the calibrated abstention threshold. */
   readonly minConfidence?: number;
   /** Cooperative cancellation. */
@@ -145,6 +164,8 @@ export type HelpRetrievalOutcome = {
   readonly corpusDigest: string;
   readonly corpusContentVersion: string;
   readonly modelId: string;
+  /** Digest of the corpus+model+tokenizer+scoring combination that ran. */
+  readonly indexDigest: string;
   readonly mode: HelpRetrievalMode;
   readonly query: string;
   readonly results: readonly HelpRetrievalResult[];
@@ -177,6 +198,18 @@ export class HelpCorpusDigestMismatchError extends Error {
   constructor(expected: string, actual: string) {
     super(`help retrieval: expected corpus ${expected} but this build ships ${actual}`);
     this.name = "HelpCorpusDigestMismatchError";
+    this.expected = expected;
+    this.actual = actual;
+  }
+}
+
+/** Raised when a caller pins an index digest that no longer matches. */
+export class HelpIndexDigestMismatchError extends Error {
+  readonly expected: string;
+  readonly actual: string;
+  constructor(expected: string, actual: string) {
+    super(`help retrieval: expected index ${expected} but this build serves ${actual}`);
+    this.name = "HelpIndexDigestMismatchError";
     this.expected = expected;
     this.actual = actual;
   }
@@ -219,6 +252,7 @@ function emptyOutcome(
     corpusDigest: HELP_CORPUS_DIGEST,
     corpusContentVersion: HELP_CORPUS.contentVersion,
     modelId: HELP_MODEL_ID,
+    indexDigest: HELP_INDEX_PROVENANCE.indexDigest,
     mode,
     query,
     results: Object.freeze([]),
@@ -315,6 +349,9 @@ export function searchHelpCorpus(
 
   if (options.expectCorpusDigest && options.expectCorpusDigest !== HELP_CORPUS_DIGEST) {
     throw new HelpCorpusDigestMismatchError(options.expectCorpusDigest, HELP_CORPUS_DIGEST);
+  }
+  if (options.expectIndexDigest && options.expectIndexDigest !== HELP_INDEX_PROVENANCE.indexDigest) {
+    throw new HelpIndexDigestMismatchError(options.expectIndexDigest, HELP_INDEX_PROVENANCE.indexDigest);
   }
   if (options.signal?.aborted) return emptyOutcome(bounded, mode, "cancelled", queryTruncated, 0, 0, [], redaction.redactions);
   if (bounded.length === 0) return emptyOutcome(bounded, mode, "empty-query", queryTruncated, 0, 0, [], redaction.redactions);
@@ -522,6 +559,7 @@ export function searchHelpCorpus(
     corpusDigest: HELP_CORPUS_DIGEST,
     corpusContentVersion: HELP_CORPUS.contentVersion,
     modelId: HELP_MODEL_ID,
+    indexDigest: HELP_INDEX_PROVENANCE.indexDigest,
     mode,
     query: bounded,
     results: Object.freeze(results),
