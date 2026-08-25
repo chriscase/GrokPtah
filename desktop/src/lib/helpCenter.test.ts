@@ -250,4 +250,76 @@ describe("offline Help Center corpus", () => {
     expect(chrome).toEqual(original);
     expect(chrome.tabIds).not.toContain("helper");
   });
+
+  it("restores Help chrome after session_prompt success, failure, and cleanup", async () => {
+    const original: HelpLaneChrome = { tabIds: ["lane-a", "lane-b"], activeId: "lane-a" };
+    const accepted = JSON.stringify({
+      text: "Use the cited article.",
+      citations: ["product.readme"],
+      uncertainty: "Not certification.",
+    });
+
+    const run = async (mode: "success" | "prompt-failure" | "create-failure") => {
+      const events: string[] = [];
+      let chrome: HelpLaneChrome = {
+        tabIds: [...original.tabIds],
+        activeId: original.activeId,
+      };
+      let chromeAtDelete: HelpLaneChrome | null = null;
+      const host = {
+        snapshot: () => ({ tabIds: [...chrome.tabIds], activeId: chrome.activeId }),
+        restore: async (next: HelpLaneChrome) => {
+          events.push("restore");
+          chrome = { tabIds: [...next.tabIds], activeId: next.activeId };
+        },
+        createEphemeralChat: async () => {
+          events.push("create");
+          chrome = { tabIds: [...chrome.tabIds, "helper"], activeId: "helper" };
+          if (mode === "create-failure") throw new Error("session_new_kind failed");
+          return { id: "helper" };
+        },
+        prompt: async (sessionId: string, text: string) => {
+          events.push("prompt");
+          chrome = { ...chrome, activeId: sessionId };
+          if (mode === "prompt-failure") throw new Error("session_prompt failed");
+          expect(text).toBe("bounded help prompt");
+          return accepted;
+        },
+        deleteSession: async (sessionId: string) => {
+          events.push("delete");
+          chromeAtDelete = { tabIds: [...chrome.tabIds], activeId: chrome.activeId };
+          chrome = {
+            tabIds: chrome.tabIds.filter((id) => id !== sessionId),
+            activeId: chrome.activeId === sessionId ? null : chrome.activeId,
+          };
+        },
+      };
+
+      if (mode === "success") {
+        const answer = await runHelpProviderTurn(host, "bounded help prompt", parseHelpAssistantAnswer);
+        expect(answer.citations).toEqual(["product.readme"]);
+        expect(events).toEqual(["create", "restore", "prompt", "restore", "delete", "restore"]);
+        expect(chromeAtDelete).toEqual(original);
+      } else if (mode === "prompt-failure") {
+        await expect(runHelpProviderTurn(host, "bounded help prompt", parseHelpAssistantAnswer)).rejects.toThrow(
+          "session_prompt failed",
+        );
+        expect(events).toEqual(["create", "restore", "prompt", "restore", "delete", "restore"]);
+        expect(chromeAtDelete).toEqual(original);
+      } else {
+        await expect(runHelpProviderTurn(host, "bounded help prompt", parseHelpAssistantAnswer)).rejects.toThrow(
+          "session_new_kind failed",
+        );
+        expect(events).toEqual(["create", "restore"]);
+        expect(chromeAtDelete).toBeNull();
+      }
+
+      expect(chrome).toEqual(original);
+      expect(chrome.tabIds).not.toContain("helper");
+    };
+
+    await run("success");
+    await run("prompt-failure");
+    await run("create-failure");
+  });
 });
