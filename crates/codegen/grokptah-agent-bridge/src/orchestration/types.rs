@@ -349,7 +349,7 @@ pub struct RunRecord {
     #[serde(default)]
     pub parent_run_id: Option<String>,
     /// One-based position in the bounded host-global admission queue.
-    /// Cleared when the run starts, is cancelled, or is interrupted on restart.
+    /// Cleared when the run starts, is cancelled, or its admission is lost.
     #[serde(default)]
     pub queue_position: Option<usize>,
     pub bounds: RunBounds,
