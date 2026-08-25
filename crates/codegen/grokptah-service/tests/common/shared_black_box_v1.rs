@@ -74,6 +74,10 @@ const AUDITED_GOLDENS: &[(&str, &str)] = &[
         "67e29bd34dc64049432c715c93c2cef2185c63ea",
         "expected-main-67e29bd3.json",
     ),
+    (
+        "3e6bde2c13bd26aae9494843ac52c92744072fec",
+        "expected-pr399-3e6bde2.json",
+    ),
 ];
 
 const FIXTURE_ALLOWLIST: &[&str] = &[
@@ -85,6 +89,7 @@ const FIXTURE_ALLOWLIST: &[&str] = &[
     "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/scenario.json",
     "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-main-67e29bd3.json",
     "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-pr352-4bd2081b.json",
+    "crates/codegen/grokptah-service/tests/fixtures/shared-black-box/v1/expected-pr399-3e6bde2.json",
 ];
 
 const GOLDEN_UPDATE_ENV_VARS: &[&str] = &[
