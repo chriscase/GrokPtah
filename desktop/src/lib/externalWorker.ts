@@ -112,6 +112,13 @@ const MAX_REF_BYTES = 512;
 const MAX_PROMPT_BYTES = 1_048_576;
 const MAX_DETAIL_BYTES = 4_096;
 const MAX_EVENTS = 256;
+/** Maximum bytes a single external worker artifact may report. */
+export const MAX_EXTERNAL_WORKER_ARTIFACT_BYTES = 8 * 1024 * 1024;
+/** Maximum artifacts accepted in one run listing. */
+export const MAX_EXTERNAL_WORKER_ARTIFACTS = 256;
+/** The only content-digest algorithm this contract accepts. */
+const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/;
+const WINDOWS_DRIVE = /^[A-Za-z]:/;
 const PROVIDERS = new Set<ExternalWorkerProvider>([
   "cursor_cloud",
   "claude_code_cloud",
@@ -177,6 +184,23 @@ function relativeRef(value: unknown): value is string {
     !value.includes("\\") &&
     !value.split("/").some((segment) => segment === "..") &&
     !/[\u0000-\u001f\u007f]/.test(value)
+  );
+}
+
+/**
+ * Artifact paths are stricter than refs: they name a file a consumer may
+ * materialize under a containment root, so every form that can leave that root
+ * or make two strings name one file is refused. `relativeRef` alone accepts a
+ * Windows drive path, which carries neither a leading slash nor a backslash.
+ */
+function artifactPath(value: unknown): value is string {
+  return (
+    relativeRef(value) &&
+    !value.startsWith("~") &&
+    !WINDOWS_DRIVE.test(value) &&
+    !value.includes("?") &&
+    !value.includes("#") &&
+    !value.split("/").some((segment) => segment === "" || segment === ".")
   );
 }
 
@@ -332,12 +356,37 @@ export function parseExternalWorkerNotification(value: unknown): ExternalWorkerN
 export function parseExternalWorkerArtifact(value: unknown): ExternalWorkerArtifact | null {
   if (!isRecord(value) || !hasOnlyKeys(value, new Set(["path", "digest", "runId", "sizeBytes"]))) return null;
   if (
-    !relativeRef(value.path) ||
-    !identity(value.digest) ||
+    !artifactPath(value.path) ||
+    typeof value.digest !== "string" ||
+    !SHA256_DIGEST.test(value.digest) ||
     !identity(value.runId) ||
-    (value.sizeBytes !== undefined && (!Number.isInteger(value.sizeBytes) || (value.sizeBytes as number) < 0))
+    (value.sizeBytes !== undefined &&
+      (!Number.isInteger(value.sizeBytes) ||
+        (value.sizeBytes as number) < 0 ||
+        (value.sizeBytes as number) > MAX_EXTERNAL_WORKER_ARTIFACT_BYTES))
   ) return null;
   return value as ExternalWorkerArtifact;
+}
+
+/**
+ * Parse a whole artifact listing against the run it was requested for.
+ *
+ * Attribution and the item ceiling are properties of the listing, not of one
+ * artifact, so a caller that maps `parseExternalWorkerArtifact` over an array
+ * cannot enforce them. `null` means the listing is refused as a whole.
+ */
+export function parseExternalWorkerArtifactListing(
+  value: unknown,
+  externalRunId: string,
+): ExternalWorkerArtifact[] | null {
+  if (!Array.isArray(value) || value.length > MAX_EXTERNAL_WORKER_ARTIFACTS) return null;
+  const artifacts: ExternalWorkerArtifact[] = [];
+  for (const item of value) {
+    const artifact = parseExternalWorkerArtifact(item);
+    if (!artifact || artifact.runId !== externalRunId) return null;
+    artifacts.push(artifact);
+  }
+  return artifacts;
 }
 
 /** Create an empty monitor state for one external run. */

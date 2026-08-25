@@ -7,7 +7,7 @@
  */
 
 import {
-  parseExternalWorkerArtifact,
+  parseExternalWorkerArtifactListing,
   parseExternalWorkerFollowUpRequest,
   parseExternalWorkerLaunchRequest,
   parseExternalWorkerLaunchResult,
@@ -674,16 +674,11 @@ export class GrokPtahBrokerClient {
     const value = await this.request<unknown>(
       `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/runs/${segment(externalRunId)}/artifacts`,
     );
-    if (!Array.isArray(value)) {
+    // The listing parser owns attribution and the item ceiling as well, so a
+    // broker cannot hand back another run's artifacts or an unbounded array.
+    const parsed = parseExternalWorkerArtifactListing(value, externalRunId);
+    if (!parsed) {
       throw new GrokPtahBrokerError(0, "invalid_response", "External worker artifacts response is invalid");
-    }
-    const artifacts = value.map(parseExternalWorkerArtifact);
-    if (artifacts.some((artifact) => artifact === null)) {
-      throw new GrokPtahBrokerError(0, "invalid_response", "External worker artifacts response is invalid");
-    }
-    const parsed = artifacts as ExternalWorkerArtifact[];
-    if (parsed.some((artifact) => artifact.runId !== externalRunId)) {
-      throw new GrokPtahBrokerError(0, "invalid_response", "External worker artifact is not attributed to the requested run");
     }
     return parsed;
   }

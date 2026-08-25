@@ -215,6 +215,11 @@ impl ExternalWorkerHost {
     }
 
     /// List run-attributed artifacts. Raw download URLs never cross this boundary.
+    ///
+    /// The listing is re-validated here rather than trusted from the adapter.
+    /// Path containment, the digest rule, the size ceiling, run attribution,
+    /// and the item ceiling are properties of the boundary, so an adapter that
+    /// forgets one cannot publish through it.
     pub async fn list_artifacts(
         &self,
         provider: grokptah_agent_sdk::ExternalWorkerProvider,
@@ -225,9 +230,12 @@ impl ExternalWorkerHost {
             .registry
             .get(provider)
             .ok_or(ExternalWorkerAdapterError::UnsupportedProvider)?;
-        adapter
+        let artifacts = adapter
             .list_artifacts(external_agent_id, external_run_id)
-            .await
+            .await?;
+        grokptah_agent_sdk::validate_artifact_listing(&artifacts, external_run_id)
+            .map_err(ExternalWorkerAdapterError::InvalidResponse)?;
+        Ok(artifacts)
     }
 
     fn cursor_adapter(&self) -> Result<Arc<dyn ExternalWorkerAdapter>, ExternalWorkerAdapterError> {
@@ -453,6 +461,162 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, ExternalWorkerAdapterError::PayloadDrift));
         assert_eq!(*state.cancel_calls.lock().unwrap(), 1);
+    }
+
+    /// An adapter that forgets a rule must not be able to publish through the
+    /// host. Containment, the digest rule, the size ceiling, attribution, and
+    /// the item ceiling are boundary properties, so the host re-checks them
+    /// instead of trusting whatever the adapter returned.
+    struct RogueArtifactAdapter {
+        artifacts: Vec<ExternalWorkerArtifact>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExternalWorkerAdapter for RogueArtifactAdapter {
+        fn provider(&self) -> ExternalWorkerProvider {
+            ExternalWorkerProvider::LocalWorker
+        }
+
+        async fn launch(
+            &self,
+            _request: &ExternalWorkerLaunchRequest,
+        ) -> Result<ExternalWorkerLaunchResult, ExternalWorkerAdapterError> {
+            unreachable!("this adapter exists only to return artifacts")
+        }
+
+        async fn get_worker(
+            &self,
+            _external_agent_id: &str,
+        ) -> Result<grokptah_agent_sdk::ExternalWorkerRecord, ExternalWorkerAdapterError> {
+            unreachable!("this adapter exists only to return artifacts")
+        }
+
+        async fn get_run(
+            &self,
+            _external_agent_id: &str,
+            _external_run_id: &str,
+        ) -> Result<ExternalWorkerRunRecord, ExternalWorkerAdapterError> {
+            unreachable!("this adapter exists only to return artifacts")
+        }
+
+        async fn follow_up(
+            &self,
+            _external_agent_id: &str,
+            _request: &ExternalWorkerFollowUpRequest,
+        ) -> Result<ExternalWorkerRunRecord, ExternalWorkerAdapterError> {
+            unreachable!("this adapter exists only to return artifacts")
+        }
+
+        async fn list_artifacts(
+            &self,
+            _external_agent_id: &str,
+            _external_run_id: &str,
+        ) -> Result<Vec<ExternalWorkerArtifact>, ExternalWorkerAdapterError> {
+            Ok(self.artifacts.clone())
+        }
+
+        async fn cancel(
+            &self,
+            _external_agent_id: &str,
+            _external_run_id: &str,
+        ) -> Result<ExternalWorkerRunRecord, ExternalWorkerAdapterError> {
+            unreachable!("this adapter exists only to return artifacts")
+        }
+    }
+
+    fn sound_artifact() -> ExternalWorkerArtifact {
+        ExternalWorkerArtifact {
+            path: "artifacts/report.md".into(),
+            digest: "sha256:be426b4d0bc6e0536d2bb2e8917792b442ac93cfa0ea7ff26a95e00b62a5af37"
+                .into(),
+            external_run_id: FAKE_RUN.into(),
+            size_bytes: Some(12),
+        }
+    }
+
+    async fn host_with_rogue_adapter(
+        artifacts: Vec<ExternalWorkerArtifact>,
+    ) -> (ExternalWorkerHost, tempfile::TempDir) {
+        let registry = Arc::new(ExternalWorkerRegistry::new());
+        registry.register(Arc::new(RogueArtifactAdapter { artifacts }));
+        let dir = tempfile::tempdir().unwrap();
+        let host = ExternalWorkerHost::open(registry, dir.path()).unwrap();
+        (host, dir)
+    }
+
+    #[tokio::test]
+    async fn host_revalidates_every_artifact_listing_an_adapter_returns() {
+        let (host, _dir) = host_with_rogue_adapter(vec![sound_artifact()]).await;
+        let listed = host
+            .list_artifacts(ExternalWorkerProvider::LocalWorker, FAKE_AGENT, FAKE_RUN)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+
+        for (label, rogue) in [
+            (
+                "another run's artifact",
+                ExternalWorkerArtifact {
+                    external_run_id: "run-somebody-else".into(),
+                    ..sound_artifact()
+                },
+            ),
+            (
+                "a traversal path",
+                ExternalWorkerArtifact {
+                    path: "artifacts/../../etc/passwd".into(),
+                    ..sound_artifact()
+                },
+            ),
+            (
+                "a drive-absolute path",
+                ExternalWorkerArtifact {
+                    path: "C:/Users/secret/.ssh/id_ed25519".into(),
+                    ..sound_artifact()
+                },
+            ),
+            (
+                "an unverifiable digest",
+                ExternalWorkerArtifact {
+                    digest: "sha256:abc".into(),
+                    ..sound_artifact()
+                },
+            ),
+            (
+                "an unbounded size",
+                ExternalWorkerArtifact {
+                    size_bytes: Some(u64::MAX),
+                    ..sound_artifact()
+                },
+            ),
+        ] {
+            let (host, _dir) = host_with_rogue_adapter(vec![rogue]).await;
+            let error = host
+                .list_artifacts(ExternalWorkerProvider::LocalWorker, FAKE_AGENT, FAKE_RUN)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ExternalWorkerAdapterError::InvalidResponse(_)),
+                "{label} must be refused at the host boundary, got {error:?}",
+            );
+        }
+
+        let over_ceiling =
+            vec![sound_artifact(); grokptah_agent_sdk::MAX_EXTERNAL_WORKER_ARTIFACTS + 1];
+        let (host, _dir) = host_with_rogue_adapter(over_ceiling).await;
+        let error = host
+            .list_artifacts(ExternalWorkerProvider::LocalWorker, FAKE_AGENT, FAKE_RUN)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ExternalWorkerAdapterError::InvalidResponse(
+                    "artifact listing exceeds its item ceiling"
+                )
+            ),
+            "an over-long listing must be refused at the host boundary, got {error:?}",
+        );
     }
 
     #[tokio::test]

@@ -21,6 +21,18 @@ pub const MAX_EXTERNAL_WORKER_ID_BYTES: usize = 256;
 pub const MAX_EXTERNAL_WORKER_REF_BYTES: usize = 512;
 /// Maximum UTF-8 bytes accepted for a redacted worker detail string.
 pub const MAX_EXTERNAL_WORKER_DETAIL_BYTES: usize = 4_096;
+/// Maximum bytes a single external worker artifact may report.
+///
+/// The trusted adapter also refuses to download more than this when it hashes
+/// an artifact itself. Stating the ceiling here bounds the metadata on the
+/// path where a provider supplies its own digest and nothing is downloaded.
+pub const MAX_EXTERNAL_WORKER_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+/// Maximum artifacts accepted in one run listing.
+pub const MAX_EXTERNAL_WORKER_ARTIFACTS: usize = 256;
+/// The only content-digest algorithm this contract accepts.
+pub const EXTERNAL_WORKER_DIGEST_PREFIX: &str = "sha256:";
+/// Hex characters in a SHA-256 digest.
+const EXTERNAL_WORKER_DIGEST_HEX_LEN: usize = 64;
 
 /// v1 does not claim a sequenced provider event stream.
 ///
@@ -344,17 +356,45 @@ pub struct ExternalWorkerArtifact {
 impl ExternalWorkerArtifact {
     /// Validate an artifact reference without allowing host paths.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.path.trim().is_empty()
-            || self.path.len() > MAX_EXTERNAL_WORKER_REF_BYTES
-            || self.path.starts_with('/')
-            || self.path.contains('\\')
-            || self.path.split('/').any(|segment| segment == "..")
+        validate_artifact_path(&self.path)?;
+        validate_digest(&self.digest)?;
+        validate_identity(&self.external_run_id, "external_run_id")?;
+        if self
+            .size_bytes
+            .is_some_and(|size| size > MAX_EXTERNAL_WORKER_ARTIFACT_BYTES)
         {
-            return Err("artifact path must be bounded and relative");
+            return Err("artifact size exceeds its byte ceiling");
         }
-        validate_identity(&self.digest, "digest")?;
-        validate_identity(&self.external_run_id, "external_run_id")
+        Ok(())
     }
+
+    /// Validate this artifact against the run a listing was requested for.
+    pub fn validate_for_run(&self, external_run_id: &str) -> Result<(), &'static str> {
+        self.validate()?;
+        if self.external_run_id != external_run_id {
+            return Err("artifact is not attributed to the requested run");
+        }
+        Ok(())
+    }
+}
+
+/// Validate a whole artifact listing against the run it was requested for.
+///
+/// Attribution is a property of the listing, not of one artifact, so it cannot
+/// live in [`ExternalWorkerArtifact::validate`]. Keeping the rule here means a
+/// second adapter cannot publish another provider's artifacts under this run,
+/// and no caller has to size a collection from a provider-controlled count.
+pub fn validate_artifact_listing(
+    artifacts: &[ExternalWorkerArtifact],
+    external_run_id: &str,
+) -> Result<(), &'static str> {
+    if artifacts.len() > MAX_EXTERNAL_WORKER_ARTIFACTS {
+        return Err("artifact listing exceeds its item ceiling");
+    }
+    for artifact in artifacts {
+        artifact.validate_for_run(external_run_id)?;
+    }
+    Ok(())
 }
 
 fn validate_identity(value: &str, field: &str) -> Result<(), &'static str> {
@@ -366,7 +406,6 @@ fn validate_identity(value: &str, field: &str) -> Result<(), &'static str> {
             "model" => "model must not be empty",
             "external_agent_id" => "external_agent_id must not be empty",
             "external_run_id" => "external_run_id must not be empty",
-            "digest" => "digest must not be empty",
             _ => "worker identity must not be empty",
         });
     }
@@ -403,6 +442,65 @@ fn validate_ref(value: &str, field: &str) -> Result<(), &'static str> {
         || value.split('/').any(|segment| segment == "..")
     {
         return Err("worker ref must be bounded and non-absolute");
+    }
+    Ok(())
+}
+
+/// Artifact paths are stricter than refs: they name a file a consumer may
+/// materialize under a containment root, so every form that can leave that
+/// root or make two strings name one file is refused.
+fn validate_artifact_path(value: &str) -> Result<(), &'static str> {
+    const ERROR: &str = "artifact path must be bounded and relative";
+    if value.trim().is_empty() || value.len() > MAX_EXTERNAL_WORKER_REF_BYTES {
+        return Err(ERROR);
+    }
+    // NUL truncates the path for any C-API consumer and CR/LF forge a line in
+    // anything that logs the listing.
+    if value.chars().any(char::is_control) {
+        return Err(ERROR);
+    }
+    // Absolute in every form a consumer might honour: POSIX and UNC roots, a
+    // Windows drive (`C:/x` carries neither a leading slash nor a backslash),
+    // and a tilde any shell-expanding consumer resolves to a home directory.
+    let bytes = value.as_bytes();
+    if value.starts_with('/')
+        || value.starts_with('~')
+        || value.contains('\\')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+    {
+        return Err(ERROR);
+    }
+    // A query or fragment is not part of a path; accepting one lets a provider
+    // smuggle a credential into a value that is presented as a file name.
+    if value.contains('?') || value.contains('#') {
+        return Err(ERROR);
+    }
+    // Empty and `.` segments make two spellings name one file, so a consumer
+    // that normalizes and one that does not disagree about what was digested.
+    // `..` is the traversal itself.
+    if value
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(ERROR);
+    }
+    Ok(())
+}
+
+/// A digest is only a safety property if it names an algorithm and a full
+/// value. The trusted adapter's own download-and-hash path emits exactly this
+/// shape, so a provider-supplied digest is held to the same standard.
+fn validate_digest(value: &str) -> Result<(), &'static str> {
+    const ERROR: &str = "digest must be sha256:<64 lowercase hex>";
+    let Some(hex) = value.strip_prefix(EXTERNAL_WORKER_DIGEST_PREFIX) else {
+        return Err(ERROR);
+    };
+    if hex.len() != EXTERNAL_WORKER_DIGEST_HEX_LEN
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ERROR);
     }
     Ok(())
 }
@@ -496,12 +594,7 @@ mod tests {
 
     #[test]
     fn artifacts_are_relative_run_attributed_and_events_are_bounded() {
-        let artifact = ExternalWorkerArtifact {
-            path: "reports/review.json".into(),
-            digest: "sha256:abc".into(),
-            external_run_id: "run-1".into(),
-            size_bytes: Some(42),
-        };
+        let artifact = artifact();
         assert!(artifact.validate().is_ok());
         let value = serde_json::to_value(&artifact).expect("artifact serializes");
         assert_eq!(value["runId"], "run-1");
@@ -573,6 +666,216 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&asking).expect("serializes"))
                 .expect("round-trips");
         assert!(decoded.validate().is_err());
+    }
+
+    const REAL_DIGEST: &str =
+        "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+    fn artifact() -> ExternalWorkerArtifact {
+        ExternalWorkerArtifact {
+            path: "artifacts/review.json".into(),
+            digest: REAL_DIGEST.into(),
+            external_run_id: "run-1".into(),
+            size_bytes: Some(42),
+        }
+    }
+
+    /// The adapter's own download-and-hash path always produces
+    /// `sha256:<64 lowercase hex>`. A provider-supplied digest was held to a
+    /// strictly weaker standard: any bounded non-control string passed, so an
+    /// unverifiable label reached the durable ledger and the browser.
+    #[test]
+    fn digest_must_be_a_real_sha256_not_an_arbitrary_label() {
+        assert!(artifact().validate().is_ok());
+        for bogus in [
+            "sha256:abc",
+            "trust-me",
+            "md5:9f86d081884c7d659a2feaa0c55ad015",
+            "sha256:9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08",
+            "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a0",
+            "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a088",
+            "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00zzz",
+            "sha512:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        ] {
+            let candidate = ExternalWorkerArtifact {
+                digest: bogus.into(),
+                ..artifact()
+            };
+            assert_eq!(
+                candidate.validate(),
+                Err("digest must be sha256:<64 lowercase hex>"),
+                "digest {bogus:?} must not be accepted as a content digest",
+            );
+        }
+    }
+
+    /// `starts_with('/')` and `contains('\\')` do not describe every absolute
+    /// path. A Windows drive-absolute path uses forward slashes and no `..`,
+    /// so it passed a check whose whole purpose was refusing host paths.
+    #[test]
+    fn artifact_path_refuses_every_absolute_form() {
+        for absolute in [
+            "C:/Windows/System32/config",
+            "c:/Users/secret/.ssh/id_ed25519",
+            "Z:/",
+            "/etc/passwd",
+            "~/.ssh/id_ed25519",
+            "~",
+        ] {
+            let candidate = ExternalWorkerArtifact {
+                path: absolute.into(),
+                ..artifact()
+            };
+            assert_eq!(
+                candidate.validate(),
+                Err("artifact path must be bounded and relative"),
+                "absolute path {absolute:?} must not be accepted",
+            );
+        }
+    }
+
+    /// `validate_ref` refuses control characters; the artifact path check was
+    /// written inline and forgot them. A NUL truncates the path for any C-API
+    /// consumer, and CR/LF forge a line in anything that logs the listing.
+    #[test]
+    fn artifact_path_refuses_control_characters() {
+        for hostile in [
+            "artifacts/report\u{0}",
+            "artifacts/report\nlog-forged-line",
+            "artifacts/report\r\n",
+            "artifacts/report\u{7f}",
+        ] {
+            let candidate = ExternalWorkerArtifact {
+                path: hostile.into(),
+                ..artifact()
+            };
+            assert_eq!(
+                candidate.validate(),
+                Err("artifact path must be bounded and relative"),
+                "path {hostile:?} must not be accepted",
+            );
+        }
+    }
+
+    /// Empty and `.` segments make two different strings name one file, so a
+    /// consumer that normalizes and a consumer that does not disagree about
+    /// what was digested. The Cursor adapter already refused these; the
+    /// contract every other adapter shares did not.
+    #[test]
+    fn artifact_path_refuses_ambiguous_and_cloaked_segments() {
+        for ambiguous in [
+            "artifacts//review.json",
+            "artifacts/./review.json",
+            "artifacts/review.json?sig=secret",
+            "artifacts/review.json#fragment",
+            "artifacts/",
+        ] {
+            let candidate = ExternalWorkerArtifact {
+                path: ambiguous.into(),
+                ..artifact()
+            };
+            assert_eq!(
+                candidate.validate(),
+                Err("artifact path must be bounded and relative"),
+                "path {ambiguous:?} must not be accepted",
+            );
+        }
+    }
+
+    /// The bridge has an 8 MiB download ceiling, but it is only reached when
+    /// the adapter downloads to hash. A provider that supplies its own digest
+    /// skips that path entirely, so an unbounded `sizeBytes` was published
+    /// with no ceiling anywhere.
+    #[test]
+    fn artifact_size_is_bounded_by_the_contract_not_only_by_a_download() {
+        let at_ceiling = ExternalWorkerArtifact {
+            size_bytes: Some(MAX_EXTERNAL_WORKER_ARTIFACT_BYTES),
+            ..artifact()
+        };
+        assert!(at_ceiling.validate().is_ok());
+        for oversized in [MAX_EXTERNAL_WORKER_ARTIFACT_BYTES + 1, u64::MAX] {
+            let candidate = ExternalWorkerArtifact {
+                size_bytes: Some(oversized),
+                ..artifact()
+            };
+            assert_eq!(
+                candidate.validate(),
+                Err("artifact size exceeds its byte ceiling"),
+                "size {oversized} must not be accepted",
+            );
+        }
+    }
+
+    /// The published schema is what a non-Rust consumer implements against.
+    /// Nothing checked that it still described this contract, so the two could
+    /// drift silently. Pin the artifact bounds both sides must agree on.
+    #[test]
+    fn published_schema_states_the_same_artifact_bounds_as_this_contract() {
+        const SCHEMA: &str =
+            include_str!("../../../../docs/schemas/grokptah-external-worker.v1.schema.json");
+        let schema: serde_json::Value =
+            serde_json::from_str(SCHEMA).expect("published schema is valid JSON");
+        let defs = &schema["$defs"];
+        assert_eq!(
+            defs["digest"]["pattern"],
+            serde_json::json!("^sha256:[0-9a-f]{64}$"),
+            "schema digest rule must match validate_digest",
+        );
+        assert_eq!(
+            defs["artifact"]["properties"]["sizeBytes"]["maximum"],
+            serde_json::json!(MAX_EXTERNAL_WORKER_ARTIFACT_BYTES),
+        );
+        assert_eq!(
+            schema["properties"]["artifacts"]["maxItems"],
+            serde_json::json!(MAX_EXTERNAL_WORKER_ARTIFACTS),
+        );
+        assert_eq!(
+            defs["artifactPath"]["maxLength"],
+            serde_json::json!(MAX_EXTERNAL_WORKER_REF_BYTES),
+        );
+        // The artifact must not fall back to the looser `ref` and `identity`
+        // rules the rest of the contract uses.
+        assert_eq!(
+            defs["artifact"]["properties"]["path"]["$ref"],
+            serde_json::json!("#/$defs/artifactPath"),
+        );
+        assert_eq!(
+            defs["artifact"]["properties"]["digest"]["$ref"],
+            serde_json::json!("#/$defs/digest"),
+        );
+        assert_eq!(
+            schema["properties"]["contract"]["const"],
+            serde_json::json!(EXTERNAL_WORKER_CONTRACT_VERSION),
+        );
+    }
+
+    /// Per-artifact validation cannot see the run a listing was requested
+    /// for, so attribution was enforced in one adapter and nowhere else.
+    #[test]
+    fn listings_are_run_attributed_and_bounded_in_count() {
+        let listing = vec![artifact()];
+        assert!(validate_artifact_listing(&listing, "run-1").is_ok());
+        assert_eq!(
+            validate_artifact_listing(&listing, "run-2"),
+            Err("artifact is not attributed to the requested run"),
+        );
+        let oversized = vec![artifact(); MAX_EXTERNAL_WORKER_ARTIFACTS + 1];
+        assert_eq!(
+            validate_artifact_listing(&oversized, "run-1"),
+            Err("artifact listing exceeds its item ceiling"),
+        );
+        let at_ceiling = vec![artifact(); MAX_EXTERNAL_WORKER_ARTIFACTS];
+        assert!(validate_artifact_listing(&at_ceiling, "run-1").is_ok());
+        // A single bad member fails the whole listing closed.
+        let mut mixed = vec![artifact()];
+        mixed.push(ExternalWorkerArtifact {
+            digest: "sha256:abc".into(),
+            ..artifact()
+        });
+        assert_eq!(
+            validate_artifact_listing(&mixed, "run-1"),
+            Err("digest must be sha256:<64 lowercase hex>"),
+        );
     }
 
     #[test]

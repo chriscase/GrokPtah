@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
+import schema from "../../../docs/schemas/grokptah-external-worker.v1.schema.json";
 import {
   applyExternalWorkerNotification,
   createExternalWorkerMonitor,
+  EXTERNAL_WORKER_CONTRACT,
   EXTERNAL_WORKER_STREAMING_SUPPORTED,
+  MAX_EXTERNAL_WORKER_ARTIFACTS,
+  MAX_EXTERNAL_WORKER_ARTIFACT_BYTES,
   parseExternalWorkerArtifact,
+  parseExternalWorkerArtifactListing,
   parseExternalWorkerEvent,
   parseExternalWorkerFollowUpRequest,
   parseExternalWorkerLaunchRequest,
@@ -11,6 +16,9 @@ import {
   parseExternalWorkerNotification,
   parseExternalWorkerRecord,
 } from "./externalWorker";
+
+const SHA256_DIGEST_PATTERN = "^sha256:[0-9a-f]{64}$";
+const DIGEST = "sha256:be426b4d0bc6e0536d2bb2e8917792b442ac93cfa0ea7ff26a95e00b62a5af37";
 
 describe("external worker UI contract", () => {
   it("does not claim a sequenced provider stream", () => {
@@ -113,15 +121,115 @@ describe("external worker UI contract", () => {
       createdAt: "now",
       updatedAt: "now",
     })).toBeNull();
-    expect(parseExternalWorkerArtifact({ path: "reports/review.json", digest: "sha256:abc", runId: "run-1" })).not.toBeNull();
-    expect(parseExternalWorkerArtifact({ path: "../secret", digest: "sha256:abc", runId: "run-1" })).toBeNull();
-    expect(parseExternalWorkerArtifact({ path: "reports/review.json", digest: "sha256:abc" })).toBeNull();
+    expect(parseExternalWorkerArtifact({ path: "reports/review.json", digest: DIGEST, runId: "run-1" })).not.toBeNull();
+    expect(parseExternalWorkerArtifact({ path: "../secret", digest: DIGEST, runId: "run-1" })).toBeNull();
+    expect(parseExternalWorkerArtifact({ path: "reports/review.json", digest: DIGEST })).toBeNull();
     expect(parseExternalWorkerArtifact({
       path: "reports/review.json",
-      digest: "sha256:abc",
+      digest: DIGEST,
       runId: "run-1",
       url: "https://secret.example/file",
     })).toBeNull();
+  });
+
+  it("refuses artifact digests that are not a full SHA-256", () => {
+    expect(parseExternalWorkerArtifact({ path: "artifacts/review.json", digest: DIGEST, runId: "run-1" })).not.toBeNull();
+    for (const digest of [
+      "sha256:abc",
+      "trust-me",
+      "md5:9f86d081884c7d659a2feaa0c55ad015",
+      DIGEST.toUpperCase(),
+      `${DIGEST}0`,
+      DIGEST.slice(0, -1),
+      DIGEST.replace("sha256", "sha512"),
+    ]) {
+      expect(
+        parseExternalWorkerArtifact({ path: "artifacts/review.json", digest, runId: "run-1" }),
+        `digest ${digest} must be refused`,
+      ).toBeNull();
+    }
+  });
+
+  it("refuses every absolute, traversing, or ambiguous artifact path", () => {
+    for (const path of [
+      "C:/Windows/System32/config",
+      "c:/Users/secret/.ssh/id_ed25519",
+      "/etc/passwd",
+      "~/.ssh/id_ed25519",
+      "artifacts/../../etc/passwd",
+      "artifacts//review.json",
+      "artifacts/./review.json",
+      "artifacts/",
+      "artifacts/review.json?sig=secret",
+      "artifacts/review.json#fragment",
+      "artifacts\\review.json",
+    ]) {
+      expect(
+        parseExternalWorkerArtifact({ path, digest: DIGEST, runId: "run-1" }),
+        `path ${path} must be refused`,
+      ).toBeNull();
+    }
+  });
+
+  it("bounds artifact size and listing length, and enforces attribution", () => {
+    const artifact = { path: "artifacts/review.json", digest: DIGEST, runId: "run-1" };
+    expect(parseExternalWorkerArtifact({ ...artifact, sizeBytes: MAX_EXTERNAL_WORKER_ARTIFACT_BYTES })).not.toBeNull();
+    expect(parseExternalWorkerArtifact({ ...artifact, sizeBytes: MAX_EXTERNAL_WORKER_ARTIFACT_BYTES + 1 })).toBeNull();
+    expect(parseExternalWorkerArtifact({ ...artifact, sizeBytes: Number.MAX_SAFE_INTEGER })).toBeNull();
+
+    expect(parseExternalWorkerArtifactListing([artifact], "run-1")).toHaveLength(1);
+    // Attribution belongs to the listing, not to one artifact.
+    expect(parseExternalWorkerArtifactListing([artifact], "run-2")).toBeNull();
+    expect(parseExternalWorkerArtifactListing(
+      Array.from({ length: MAX_EXTERNAL_WORKER_ARTIFACTS }, () => artifact),
+      "run-1",
+    )).toHaveLength(MAX_EXTERNAL_WORKER_ARTIFACTS);
+    expect(parseExternalWorkerArtifactListing(
+      Array.from({ length: MAX_EXTERNAL_WORKER_ARTIFACTS + 1 }, () => artifact),
+      "run-1",
+    )).toBeNull();
+    // One bad member fails the whole listing closed.
+    expect(parseExternalWorkerArtifactListing([artifact, { ...artifact, digest: "sha256:abc" }], "run-1")).toBeNull();
+    expect(parseExternalWorkerArtifactListing("not-an-array", "run-1")).toBeNull();
+  });
+
+  it("agrees with the published v1 schema on artifact bounds", () => {
+    const artifact = schema.$defs.artifact.properties;
+    expect(schema.$defs.digest.pattern).toBe(SHA256_DIGEST_PATTERN);
+    expect(artifact.sizeBytes.maximum).toBe(MAX_EXTERNAL_WORKER_ARTIFACT_BYTES);
+    expect(schema.properties.artifacts.maxItems).toBe(MAX_EXTERNAL_WORKER_ARTIFACTS);
+    // The artifact must not fall back to the looser `ref` and `identity` rules.
+    expect(artifact.path.$ref).toBe("#/$defs/artifactPath");
+    expect(artifact.digest.$ref).toBe("#/$defs/digest");
+    expect(schema.properties.contract.const).toBe(EXTERNAL_WORKER_CONTRACT);
+
+    // The schema's own path rule must accept and refuse exactly what the
+    // parser does, so a non-TypeScript consumer implementing the schema lands
+    // on the same containment rule.
+    const schemaPath = new RegExp(schema.$defs.artifactPath.pattern, "u");
+    for (const path of [
+      "artifacts/report.md",
+      "artifacts/a/b/c.json",
+      "artifacts/..hidden",
+    ]) {
+      expect(schemaPath.test(path), `schema must accept ${path}`).toBe(true);
+      expect(parseExternalWorkerArtifact({ path, digest: DIGEST, runId: "run-1" })).not.toBeNull();
+    }
+    for (const path of [
+      "C:/Windows/System32/config",
+      "/etc/passwd",
+      "~/.ssh/id_ed25519",
+      "artifacts/../../etc/passwd",
+      "artifacts//review.json",
+      "artifacts/./review.json",
+      "artifacts/",
+      "artifacts/review.json?sig=secret",
+      "artifacts/review.json#fragment",
+      "artifacts\\review.json",
+    ]) {
+      expect(schemaPath.test(path), `schema must refuse ${path}`).toBe(false);
+      expect(parseExternalWorkerArtifact({ path, digest: DIGEST, runId: "run-1" })).toBeNull();
+    }
   });
 
   it("accepts bounded follow-ups but rejects empty prompts and unknown fields", () => {

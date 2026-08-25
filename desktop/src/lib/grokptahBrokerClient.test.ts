@@ -781,7 +781,7 @@ describe("GrokPtahBrokerClient", () => {
       .mockResolvedValueOnce(jsonResponse({ ...run, state: "running" }))
       .mockResolvedValueOnce(jsonResponse(run))
       .mockResolvedValueOnce(jsonResponse([
-        { path: "artifacts/report.md", digest: "sha256:abc", runId: "run-1", sizeBytes: 12 },
+        { path: "artifacts/report.md", digest: "sha256:be426b4d0bc6e0536d2bb2e8917792b442ac93cfa0ea7ff26a95e00b62a5af37", runId: "run-1", sizeBytes: 12 },
       ]));
     const client = new GrokPtahBrokerClient({
       baseUrl: "https://contextdesk.example",
@@ -860,7 +860,7 @@ describe("GrokPtahBrokerClient", () => {
       .rejects.toMatchObject({ code: "invalid_response" });
 
     await expect(clientFor([
-      { path: "artifacts/report.md", digest: "sha256:abc", runId: "other-run" },
+      { path: "artifacts/report.md", digest: "sha256:be426b4d0bc6e0536d2bb2e8917792b442ac93cfa0ea7ff26a95e00b62a5af37", runId: "other-run" },
     ]).getExternalWorkerArtifacts("binding-1", "agent-1", "run-1"))
       .rejects.toMatchObject({ code: "invalid_response" });
   });

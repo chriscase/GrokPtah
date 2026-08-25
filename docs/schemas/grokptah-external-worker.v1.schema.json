@@ -11,7 +11,7 @@
     "worker": { "$ref": "#/$defs/worker" },
     "run": { "$ref": "#/$defs/run" },
     "events": { "type": "array", "items": { "$ref": "#/$defs/event" } },
-    "artifacts": { "type": "array", "items": { "$ref": "#/$defs/artifact" } }
+    "artifacts": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/artifact" } }
   },
   "$defs": {
     "provider": {
@@ -31,6 +31,18 @@
       "minLength": 1,
       "maxLength": 512,
       "pattern": "^[^/\\\\][^\\u0000-\\u001f\\r\\n]*$"
+    },
+    "artifactPath": {
+      "$comment": "Stricter than ref: refuses the absolute forms a ref allows (a Windows drive, a tilde), query/fragment cloaking, and empty, '.', or '..' segments, so joining it onto a containment root cannot leave that root.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!~)(?![A-Za-z]:)(?!\\.{1,2}(?:/|$))[^/\\\\?#\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\?#\\u0000-\\u001f\\u007f]+)*$"
+    },
+    "digest": {
+      "$comment": "A digest is only a safety property if it names an algorithm and carries a full value.",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
     },
     "bounds": {
       "type": "object",
@@ -106,10 +118,10 @@
       "additionalProperties": false,
       "required": ["path", "digest", "runId"],
       "properties": {
-        "path": { "$ref": "#/$defs/ref" },
-        "digest": { "$ref": "#/$defs/identity" },
+        "path": { "$ref": "#/$defs/artifactPath" },
+        "digest": { "$ref": "#/$defs/digest" },
         "runId": { "$ref": "#/$defs/identity" },
-        "sizeBytes": { "type": "integer", "minimum": 0 }
+        "sizeBytes": { "type": "integer", "minimum": 0, "maximum": 8388608 }
       }
     }
   }

@@ -10,6 +10,7 @@ use grokptah_agent_sdk::{
     ExternalWorkerArtifact, ExternalWorkerExecutionMode, ExternalWorkerFollowUpRequest,
     ExternalWorkerLaunchRequest, ExternalWorkerLaunchResult, ExternalWorkerProvider,
     ExternalWorkerRecord, ExternalWorkerRunRecord, ExternalWorkerState, ExternalWorkerStreamState,
+    MAX_EXTERNAL_WORKER_ARTIFACTS,
 };
 use reqwest::{Client, Method, StatusCode, Url};
 use serde::{de::DeserializeOwned, Deserialize};
@@ -23,7 +24,10 @@ use std::time::Duration;
 pub const CURSOR_CLOUD_API_BASE: &str = "https://api.cursor.com";
 
 /// Maximum bytes downloaded when hashing a provider artifact.
-pub const MAX_EXTERNAL_WORKER_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+///
+/// Re-exported from the contract so the download guard and the bound the
+/// contract enforces on reported metadata cannot drift apart.
+pub use grokptah_agent_sdk::MAX_EXTERNAL_WORKER_ARTIFACT_BYTES;
 
 /// Maximum bytes read from a successful provider control-plane response.
 ///
@@ -701,6 +705,11 @@ impl ExternalWorkerAdapter for CursorCloudAdapter {
         let response: CursorArtifacts = self
             .request(Method::GET, &format!("/v1/agents/{id}/artifacts"), None)
             .await?;
+        if response.items.len() > MAX_EXTERNAL_WORKER_ARTIFACTS {
+            return Err(ExternalWorkerAdapterError::InvalidResponse(
+                "Cursor artifact listing exceeds its item ceiling",
+            ));
+        }
         let mut artifacts = Vec::with_capacity(response.items.len());
         for item in response.items {
             if !Self::artifact_path_is_safe(&item.path) {
@@ -1067,6 +1076,10 @@ mod tests {
 
     pub const FAKE_AGENT: &str = "bc-00000000-0000-0000-0000-000000000001";
     pub const FAKE_RUN: &str = "run-00000000-0000-0000-0000-000000000001";
+    /// SHA-256 of the fake provider's artifact bytes, so the fixture satisfies
+    /// the contract's digest rule instead of sidestepping it with a label.
+    pub const FAKE_ARTIFACT_DIGEST: &str =
+        "sha256:be426b4d0bc6e0536d2bb2e8917792b442ac93cfa0ea7ff26a95e00b62a5af37";
 
     #[derive(Clone)]
     pub struct FakeCursorState {
@@ -1129,7 +1142,7 @@ mod tests {
                     "items": [{
                         "path": "artifacts/report.md",
                         "runId": FAKE_RUN,
-                        "digest": "sha256:abc",
+                        "digest": FAKE_ARTIFACT_DIGEST,
                         "sizeBytes": 12
                     }]
                 }),
@@ -1903,6 +1916,110 @@ mod tests {
                 .digest
                 .starts_with("sha256:")
         );
+    }
+
+    /// The adapter hashes an artifact itself only when the provider omits a
+    /// digest. On the supplied-digest path nothing is downloaded, so the label
+    /// was published unverified. It must at least be a SHA-256.
+    #[tokio::test]
+    async fn provider_supplied_digest_must_be_a_real_sha256() {
+        for digest in [
+            "sha256:abc",
+            "trust-me",
+            "md5:9f86d081884c7d659a2feaa0c55ad015",
+        ] {
+            let state = FakeCursorState::default();
+            state.config.lock().unwrap().artifacts = json!({
+                "items": [{
+                    "path": "artifacts/report.md",
+                    "runId": FAKE_RUN,
+                    "digest": digest,
+                    "sizeBytes": 12
+                }]
+            });
+            let base = spawn_fake_cursor(state.clone()).await;
+            let adapter = CursorCloudAdapter::for_test(&base);
+            let error = adapter
+                .list_artifacts(FAKE_AGENT, FAKE_RUN)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ExternalWorkerAdapterError::InvalidResponse(
+                        "digest must be sha256:<64 lowercase hex>"
+                    )
+                ),
+                "digest {digest:?} must be refused, got {error:?}",
+            );
+            assert_eq!(*state.download_calls.lock().unwrap(), 0);
+        }
+    }
+
+    /// `max_artifact_bytes` only guards the download. A provider that supplies
+    /// its own digest never reaches that guard, so an unbounded `sizeBytes`
+    /// reached the ledger and the browser with no ceiling anywhere.
+    #[tokio::test]
+    async fn reported_size_is_bounded_on_the_path_that_never_downloads() {
+        let state = FakeCursorState::default();
+        state.config.lock().unwrap().artifacts = json!({
+            "items": [{
+                "path": "artifacts/report.md",
+                "runId": FAKE_RUN,
+                "digest": FAKE_ARTIFACT_DIGEST,
+                "sizeBytes": MAX_EXTERNAL_WORKER_ARTIFACT_BYTES + 1
+            }]
+        });
+        let base = spawn_fake_cursor(state.clone()).await;
+        let adapter = CursorCloudAdapter::for_test(&base);
+        let error = adapter
+            .list_artifacts(FAKE_AGENT, FAKE_RUN)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ExternalWorkerAdapterError::InvalidResponse(
+                    "artifact size exceeds its byte ceiling"
+                )
+            ),
+            "oversized reported size must be refused, got {error:?}",
+        );
+        assert_eq!(*state.download_calls.lock().unwrap(), 0);
+    }
+
+    /// The listing sized a collection from a provider-controlled count before
+    /// anything about that count had been checked.
+    #[tokio::test]
+    async fn artifact_listing_is_bounded_before_a_collection_is_sized() {
+        let items = (0..=MAX_EXTERNAL_WORKER_ARTIFACTS)
+            .map(|index| {
+                json!({
+                    "path": format!("artifacts/report-{index}.md"),
+                    "runId": FAKE_RUN,
+                    "digest": FAKE_ARTIFACT_DIGEST,
+                    "sizeBytes": 12
+                })
+            })
+            .collect::<Vec<_>>();
+        let state = FakeCursorState::default();
+        state.config.lock().unwrap().artifacts = json!({ "items": items });
+        let base = spawn_fake_cursor(state.clone()).await;
+        let adapter = CursorCloudAdapter::for_test(&base);
+        let error = adapter
+            .list_artifacts(FAKE_AGENT, FAKE_RUN)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ExternalWorkerAdapterError::InvalidResponse(
+                    "Cursor artifact listing exceeds its item ceiling"
+                )
+            ),
+            "an over-long listing must be refused, got {error:?}",
+        );
+        assert_eq!(*state.download_calls.lock().unwrap(), 0);
     }
 
     #[tokio::test]
