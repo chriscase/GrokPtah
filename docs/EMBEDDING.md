@@ -98,7 +98,7 @@ The barrel is intentionally a staging source for `@grokptah/ui-core`; it is
 not yet a published package or SemVer promise.
 
 To produce a reviewable, Tauri-free consumer artifact from an exact checkout,
-run `npm run build:public` in `desktop/`. This emits a bundled
+run `npm run verify:public` in `desktop/`. This builds and verifies a bundled
 `desktop/dist/public/grokptah-public.js` plus declaration files under
 `desktop/dist/public/types/`. The generated artifact contains the browser-safe
 broker client and headless primitives only; it does not contain `trusted.ts`,
