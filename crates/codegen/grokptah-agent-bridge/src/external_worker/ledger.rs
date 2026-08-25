@@ -16,7 +16,6 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -594,6 +593,10 @@ fn durable_error_label(error: &ExternalWorkerAdapterError) -> String {
             None => format!("provider {}", status.as_u16()),
         },
         ExternalWorkerAdapterError::Transport(_) => "transport failed".into(),
+        // The durable label records only that authority refused the action.
+        // Recording which binding failed would persist, in a file an operator
+        // may share, exactly the hint a caller needs to forge the next attempt.
+        ExternalWorkerAdapterError::Unauthorized(_) => "unauthorized".into(),
     }
 }
 
@@ -603,6 +606,9 @@ fn replayed_error(label: Option<&str>) -> ExternalWorkerAdapterError {
         Some("pending") => ExternalWorkerAdapterError::Pending,
         Some("uncertain") => ExternalWorkerAdapterError::Uncertain,
         Some("payload drift") => ExternalWorkerAdapterError::PayloadDrift,
+        Some("unauthorized") => {
+            ExternalWorkerAdapterError::Unauthorized(super::authority::AuthorityError::Forbidden)
+        }
         Some("invalid API base") => ExternalWorkerAdapterError::InvalidBaseUrl,
         Some(message) => {
             if let Some(rest) = message.strip_prefix("provider ") {

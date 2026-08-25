@@ -51,10 +51,8 @@ pub(crate) fn create_private_dir_all(path: &Path) -> io::Result<()> {
             current.push(component);
             if let Ok(metadata) = fs::metadata(&current) {
                 if metadata.is_dir() && metadata.permissions().mode() & 0o077 != 0 {
-                    let _ = fs::set_permissions(
-                        &current,
-                        fs::Permissions::from_mode(PRIVATE_DIR_MODE),
-                    );
+                    let _ =
+                        fs::set_permissions(&current, fs::Permissions::from_mode(PRIVATE_DIR_MODE));
                 }
             }
         }
@@ -114,7 +112,7 @@ mod windows_flags {
 /// component, or a file above the record ceiling, is an error rather than a
 /// value: both mean this is not a record this process wrote.
 pub(crate) fn read_private_json(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    let mut file = match open_no_follow(path) {
+    let file = match open_no_follow(path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         // O_NOFOLLOW reports ELOOP when the final component is a symlink.
@@ -134,7 +132,8 @@ pub(crate) fn read_private_json(path: &Path) -> io::Result<Option<Vec<u8>>> {
         ));
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(MAX_DURABLE_RECORD_BYTES + 1).read_to_end(&mut bytes)?;
+    file.take(MAX_DURABLE_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_DURABLE_RECORD_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -195,9 +194,9 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 /// destination path. A local attacker cannot pre-create the path being staged,
 /// and two concurrent writers cannot collide on it.
 fn stage(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "durable path has no parent")
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "durable path has no parent"))?;
     let temp = parent.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
     let mut file = create_new_private(&temp)?;
     let write = file

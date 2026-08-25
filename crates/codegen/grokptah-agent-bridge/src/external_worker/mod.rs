@@ -6,11 +6,16 @@
 //! not control a foreground Cursor desktop window and it never grants native
 //! Computer Use authority.
 
+mod authority;
 mod cursor;
 mod durable;
 mod host;
 mod ledger;
 
+pub use authority::{
+    AuthorityError, AuthorityState, AuthorityStore, ExternalWorkerAction, ExternalWorkerAuthority,
+    ExternalWorkerPrincipal, LaunchIntent, NewGrant, MAX_AUTHORITY_FIELD_BYTES, MAX_AUTHORITY_RUNS,
+};
 pub use cursor::{
     CursorCloudAdapter, CURSOR_CLOUD_API_BASE, MAX_EXTERNAL_WORKER_ARTIFACT_BYTES,
     PRODUCTION_ARTIFACT_HOST_PREFIX,
@@ -99,6 +104,13 @@ pub enum ExternalWorkerAdapterError {
     /// The same request_id was reused with a different canonical payload.
     #[error("external worker request_id reused with a different payload")]
     PayloadDrift,
+    /// The caller holds no authority for this worker or this action.
+    ///
+    /// Carries the authority verdict rather than a bare boolean so the durable
+    /// audit trail records *that* it was refused without recording which
+    /// binding failed, which would tell a caller what to forge next.
+    #[error("external worker action is not authorized")]
+    Unauthorized(#[from] AuthorityError),
 }
 
 /// Provider-neutral lifecycle operations required by the manager.
