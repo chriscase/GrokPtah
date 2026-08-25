@@ -12,18 +12,28 @@ use grokptah_agent_bridge::{McpControlClient, McpRemoteError};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::always_on::{
+    assert_bootstrap_baseline, assert_exact_snapshot, assert_happy_shape,
+    assert_home_b_pre_restart_shape, assert_provider_lanes, baseline_is_settled, exact_array,
+    merge_provider_lanes, work_items, AlwaysOnFixture, AlwaysOnHappyShape, AlwaysOnHome,
+    AlwaysOnSnapshot, LoopbackProviderLane, MANAGER_DECISION_KIND, SETUP_SEMANTIC_ID,
+};
 use crate::local_service::LocalService;
 use crate::manifest::{OracleCode, ProbeAction, ProbeDefinition};
 use crate::process_service::{scan_mcp_value, ProviderDisposition};
 use crate::report::{
     diagnostic_failure_class, opaque_durable_id, ArgumentFieldCode, DiagnosticCode, DurableIdKind,
-    DurableStateCode, EntityKind, EvidenceCounters, LoopbackProviderObservation, OpaqueDurableId,
-    PhaseCode, PhaseResult, ProbeResult, ProbeStatus, ReconnectEvidence, RestartEvidence,
-    StructuralTrace, TraceOperationCode, TraceRecord, TransitionEvidence,
+    DurableStateCode, EntityKind, EvidenceCounters, OpaqueDurableId, PhaseCode, PhaseResult,
+    ProbeResult, ProbeStatus, ReconnectEvidence, RestartEvidence, StructuralTrace,
+    TraceOperationCode, TraceRecord, TransitionEvidence,
 };
 use crate::LAB_TRACE_SCHEMA;
 
 const SAFE_TITLE: &str = "Persistent Agent certification probe";
+/// Bounded wait for a freshly bootstrapped home to settle before its identity
+/// snapshot is frozen as the comparison baseline.
+const BASELINE_SETTLE_TIMEOUT: Duration = Duration::from_secs(90);
+const BASELINE_SETTLE_POLL: Duration = Duration::from_millis(50);
 
 pub struct ProbeExecution {
     pub result: ProbeResult,
@@ -76,7 +86,8 @@ struct ProbeBuilder<'a> {
     capture_provider_run: Option<ProviderRunEvidence>,
     provider_attempt_start: Option<u32>,
     capture_attempt_start: Option<u32>,
-    provider_observation: Option<LoopbackProviderObservation>,
+    provider_lanes: Vec<LoopbackProviderLane>,
+    always_on_shape: Option<AlwaysOnHappyShape>,
 }
 
 impl<'a> ProbeBuilder<'a> {
@@ -96,7 +107,8 @@ impl<'a> ProbeBuilder<'a> {
             capture_provider_run: None,
             provider_attempt_start: None,
             capture_attempt_start: None,
-            provider_observation: None,
+            provider_lanes: Vec::new(),
+            always_on_shape: None,
         }
     }
 
@@ -299,7 +311,9 @@ impl<'a> ProbeBuilder<'a> {
                 trace: None,
                 capture_refs: Vec::new(),
                 elapsed_millis,
-                provider_observation: self.provider_observation,
+                provider_observation: merge_provider_lanes(&self.provider_lanes),
+                provider_lanes: self.provider_lanes,
+                always_on_shape: self.always_on_shape,
             },
             trace: StructuralTrace {
                 schema: LAB_TRACE_SCHEMA.into(),
@@ -614,6 +628,10 @@ async fn always_on_grokbot(probe: &mut ProbeBuilder<'_>) -> Result<(), Diagnosti
     let fixture = AlwaysOnFixture::load()?;
     always_on_home_a(probe, &fixture).await?;
     always_on_home_b(probe, &fixture).await?;
+    // Both homes must be represented with the fixture's exact semantic counts.
+    // Without this a pass could claim Home-A oracles while publishing only
+    // Home-B provider records.
+    assert_provider_lanes(&fixture, &probe.provider_lanes)?;
     assert_observed_contract(probe)
 }
 
@@ -670,14 +688,6 @@ fn always_on_scan(value: &Value) -> Result<(), DiagnosticCode> {
     scan_mcp_value("mcp", value).map_err(|_| DiagnosticCode::RedactionRejected)
 }
 
-fn work_items(work: &Value) -> &[Value] {
-    work.get("work")
-        .or_else(|| work.get("items"))
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-}
-
 fn work_for_step<'a>(work: &'a Value, step_id: &str) -> Vec<&'a Value> {
     work_items(work)
         .iter()
@@ -717,176 +727,38 @@ fn pending_usage(run: &Value) -> u64 {
         .unwrap_or(0)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AlwaysOnFixture {
-    step_first: String,
-    step_failing: String,
-    step_replacement: String,
-    decision_work: u64,
-    proposal_runs: u64,
-    native_work_by_step: BTreeMap<String, u64>,
-    provider_posts_by_semantic: BTreeMap<String, u64>,
-    zero_growth_window: Duration,
-}
-
-impl AlwaysOnFixture {
-    fn load() -> Result<Self, DiagnosticCode> {
-        let value: Value = serde_json::from_slice(crate::ALWAYS_ON_GROKBOT_FIXTURE)
-            .map_err(|_| DiagnosticCode::FixtureInvalid)?;
-        Self::from_value(&value)
-    }
-
-    fn from_value(value: &Value) -> Result<Self, DiagnosticCode> {
-        if value["schema"].as_str() != Some(crate::ALWAYS_ON_GROKBOT_FIXTURE_SCHEMA)
-            || value["schemaVersion"].as_u64() != Some(2)
-        {
-            return Err(DiagnosticCode::FixtureInvalid);
-        }
-        let string = |value: &Value| {
-            value
-                .as_str()
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .ok_or(DiagnosticCode::FixtureInvalid)
-        };
-        let step_first = string(&value["steps"]["first"])?;
-        let step_failing = string(&value["steps"]["failing"])?;
-        let step_replacement = string(&value["steps"]["replacement"])?;
-        let decision_work = value["happyPath"]["decisionWork"]
-            .as_u64()
-            .ok_or(DiagnosticCode::FixtureInvalid)?;
-        let proposal_runs = value["happyPath"]["proposalRunsObserved"]
-            .as_u64()
-            .ok_or(DiagnosticCode::FixtureInvalid)?;
-        let count_map = |name: &str| -> Result<BTreeMap<String, u64>, DiagnosticCode> {
-            value["happyPath"][name]
-                .as_object()
-                .ok_or(DiagnosticCode::FixtureInvalid)?
-                .iter()
-                .map(|(key, value)| {
-                    Ok((
-                        key.clone(),
-                        value.as_u64().ok_or(DiagnosticCode::FixtureInvalid)?,
-                    ))
-                })
-                .collect()
-        };
-        let native_work_by_step = count_map("nativeWorkByStep")?;
-        let provider_posts_by_semantic = count_map("providerPostsBySemanticId")?;
-        let period = value["supervisorPeriodMs"]
-            .as_u64()
-            .ok_or(DiagnosticCode::FixtureInvalid)?;
-        let periods = value["zeroGrowthSupervisorPeriods"]
-            .as_u64()
-            .ok_or(DiagnosticCode::FixtureInvalid)?;
-        let zero_growth_window = Duration::from_millis(
-            period
-                .checked_mul(periods)
-                .ok_or(DiagnosticCode::FixtureInvalid)?,
-        );
-        let fixture = Self {
-            step_first,
-            step_failing,
-            step_replacement,
-            decision_work,
-            proposal_runs,
-            native_work_by_step,
-            provider_posts_by_semantic,
-            zero_growth_window,
-        };
-        if fixture.native_work_by_step.len() != 3
-            || fixture.provider_posts_by_semantic.len() != 4
-            || fixture.decision_work != 1
-            || fixture.proposal_runs != 1
-            || fixture.native_steps().iter().any(|step| {
-                !fixture.native_work_by_step.contains_key(*step)
-                    || !fixture.provider_posts_by_semantic.contains_key(*step)
-            })
-        {
-            return Err(DiagnosticCode::FixtureInvalid);
-        }
-        for step in [
-            &fixture.step_first,
-            &fixture.step_failing,
-            &fixture.step_replacement,
-        ] {
-            if fixture.native_work_by_step.get(step) != Some(&1)
-                || fixture.provider_posts_by_semantic.get(step) != Some(&1)
-            {
-                return Err(DiagnosticCode::FixtureInvalid);
-            }
-        }
-        if fixture.provider_posts_by_semantic.get("manager-decision") != Some(&1) {
-            return Err(DiagnosticCode::FixtureInvalid);
-        }
-        Ok(fixture)
-    }
-
-    fn plan_arguments(
-        &self,
-        request_id: &str,
-        session_id: &str,
-        workspace: &str,
-        agent_id: &str,
-    ) -> Value {
-        json!({
-            "request_id": request_id,
-            "session_id": session_id,
-            "workspace": workspace,
-            "manager_agent_id": agent_id,
-            "objective": "always-on grokbot dependent DAG",
-            "autonomous": true,
-            "max_replans": 2,
-            "max_in_flight": 2,
-            "steps": [
-                native_step(&self.step_first, "GROKBOT_SUCCESS first native unit", &[], agent_id),
-                native_step(
-                    &self.step_failing,
-                    "GROKBOT_FORCE_FAIL child that must be replaced",
-                    &[self.step_first.as_str()],
-                    agent_id
-                )
-            ]
-        })
-    }
-
-    fn native_steps(&self) -> [&str; 3] {
-        [
-            self.step_first.as_str(),
-            self.step_failing.as_str(),
-            self.step_replacement.as_str(),
+/// Build the `ptah_create_manager_plan` arguments for the fixture's DAG.
+fn plan_arguments(
+    fixture: &AlwaysOnFixture,
+    request_id: &str,
+    session_id: &str,
+    workspace: &str,
+    agent_id: &str,
+) -> Value {
+    json!({
+        "request_id": request_id,
+        "session_id": session_id,
+        "workspace": workspace,
+        "manager_agent_id": agent_id,
+        "objective": "always-on grokbot dependent DAG",
+        "autonomous": true,
+        "max_replans": 2,
+        "max_in_flight": 2,
+        "steps": [
+            native_step(
+                &fixture.step_first,
+                "GROKBOT_SUCCESS first native unit",
+                &[],
+                agent_id
+            ),
+            native_step(
+                &fixture.step_failing,
+                "GROKBOT_FORCE_FAIL child that must be replaced",
+                &[fixture.step_first.as_str()],
+                agent_id
+            )
         ]
-    }
-
-    fn expected_happy_cardinality(&self) -> Result<AlwaysOnCardinality, DiagnosticCode> {
-        let native_work = self
-            .native_work_by_step
-            .values()
-            .try_fold(0_u64, |total, count| total.checked_add(*count))
-            .ok_or(DiagnosticCode::FixtureInvalid)?;
-        Ok(AlwaysOnCardinality {
-            work: usize::try_from(
-                native_work
-                    .checked_add(self.decision_work)
-                    .ok_or(DiagnosticCode::FixtureInvalid)?,
-            )
-            .map_err(|_| DiagnosticCode::FixtureInvalid)?,
-            runs: usize::try_from(
-                native_work
-                    .checked_add(self.proposal_runs)
-                    .ok_or(DiagnosticCode::FixtureInvalid)?,
-            )
-            .map_err(|_| DiagnosticCode::FixtureInvalid)?,
-            intents: usize::try_from(native_work).map_err(|_| DiagnosticCode::FixtureInvalid)?,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct AlwaysOnCardinality {
-    work: usize,
-    runs: usize,
-    intents: usize,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -894,13 +766,6 @@ struct AlwaysOnHeldJoin {
     work_id: String,
     attempt_id: String,
     run_id: String,
-}
-
-fn exact_array<'a>(value: &'a Value, key: &str) -> Result<&'a [Value], DiagnosticCode> {
-    value[key]
-        .as_array()
-        .map(Vec::as_slice)
-        .ok_or(DiagnosticCode::McpResultMalformed)
 }
 
 fn exact_single_linked_run(
@@ -923,12 +788,18 @@ fn exact_single_linked_run(
     Ok(run_id.to_owned())
 }
 
+/// Capture the exact public identity snapshot for one session.
+///
+/// Every Work row is expanded through `ptah_get_work` so its attempt ids and
+/// the complete `linkedRunIds` set take part in the comparison. Bare counts
+/// are cardinality-neutral: they cannot tell a preserved Work from one that
+/// was torn down and rebuilt under a fresh id during the same window.
 async fn always_on_snapshot(
     probe: &mut ProbeBuilder<'_>,
     client: &mut McpControlClient,
     session_id: &str,
     workspace: &str,
-) -> Result<AlwaysOnCardinality, DiagnosticCode> {
+) -> Result<AlwaysOnSnapshot, DiagnosticCode> {
     let scope = json!({ "session_id": session_id, "workspace": workspace });
     let fields = vec![ArgumentFieldCode::SessionId, ArgumentFieldCode::Workspace];
     let work = probe
@@ -940,6 +811,7 @@ async fn always_on_snapshot(
             fields.clone(),
         )
         .await?;
+    always_on_scan(&work)?;
     let runs = probe
         .call(
             client,
@@ -949,6 +821,7 @@ async fn always_on_snapshot(
             fields.clone(),
         )
         .await?;
+    always_on_scan(&runs)?;
     let intents = probe
         .call(
             client,
@@ -958,82 +831,62 @@ async fn always_on_snapshot(
             fields,
         )
         .await?;
-    Ok(AlwaysOnCardinality {
-        work: work_items(&work).len(),
-        runs: exact_array(&runs, "runs")?.len(),
-        intents: exact_array(&intents, "intents")?.len(),
-    })
-}
-
-fn assert_exact_cardinality(
-    expected: AlwaysOnCardinality,
-    actual: AlwaysOnCardinality,
-) -> Result<(), DiagnosticCode> {
-    if expected == actual {
-        Ok(())
-    } else {
-        Err(DiagnosticCode::StateTransitionMismatch)
+    always_on_scan(&intents)?;
+    let mut details = BTreeMap::new();
+    let work_ids = work_items(&work)
+        .iter()
+        .map(|item| required_string(item, &["workId"]))
+        .collect::<Result<Vec<String>, DiagnosticCode>>()?;
+    for work_id in work_ids {
+        let detailed = probe
+            .call(
+                client,
+                TraceOperationCode::GetWork,
+                "ptah_get_work",
+                json!({
+                    "session_id": session_id,
+                    "workspace": workspace,
+                    "work_id": work_id
+                }),
+                vec![
+                    ArgumentFieldCode::SessionId,
+                    ArgumentFieldCode::Workspace,
+                    ArgumentFieldCode::WorkId,
+                ],
+            )
+            .await?;
+        always_on_scan(&detailed)?;
+        if details.insert(work_id, detailed).is_some() {
+            return Err(DiagnosticCode::StateTransitionMismatch);
+        }
     }
+    AlwaysOnSnapshot::build(&work, &details, &intents, &runs)
 }
-
-fn assert_happy_path_counts(
+/// Assert the completed Home-A happy path against the fixture: the exact
+/// fixture-derived identity shape, the provider POST budget, and no terminal
+/// Run left holding pending usage.
+fn assert_happy_path_shape(
     fixture: &AlwaysOnFixture,
     service: &crate::process_service::ProcessService,
-    work: &Value,
+    baseline: &AlwaysOnSnapshot,
+    snapshot: &AlwaysOnSnapshot,
     runs: &Value,
-    intents: &Value,
-) -> Result<(), DiagnosticCode> {
-    let expected = fixture.expected_happy_cardinality()?;
-    let actual = AlwaysOnCardinality {
-        work: work_items(work).len(),
-        runs: exact_array(runs, "runs")?.len(),
-        intents: exact_array(intents, "intents")?.len(),
-    };
-    assert_exact_cardinality(expected, actual)?;
-    if work_items(work)
-        .iter()
-        .filter(|item| item["kind"].as_str() == Some("manager-decision"))
-        .count() as u64
-        != fixture.decision_work
-    {
-        return Err(DiagnosticCode::StateTransitionMismatch);
-    }
-    if exact_array(runs, "runs")?
-        .iter()
-        .filter(|run| run["purpose"].as_str() == Some("manager_proposal"))
-        .count() as u64
-        != fixture.proposal_runs
-    {
-        return Err(DiagnosticCode::StateTransitionMismatch);
-    }
+) -> Result<AlwaysOnHappyShape, DiagnosticCode> {
+    let shape = assert_happy_shape(fixture, baseline, snapshot)?;
     for step in fixture.native_steps() {
-        if work_for_step(work, step).len() as u64 != fixture.native_work_by_step[step] {
-            return Err(DiagnosticCode::StateTransitionMismatch);
-        }
-        if service.provider.count_for(step) != fixture.provider_posts_by_semantic[step] {
+        let expected = fixture
+            .posts_for(&step)
+            .ok_or(DiagnosticCode::FixtureInvalid)?;
+        if service.provider.count_for(&step) != expected {
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
     }
-    if service.provider.count_for("manager-decision")
-        != fixture.provider_posts_by_semantic["manager-decision"]
-        || service.provider.count_for("setup") != 1
-    {
-        return Err(DiagnosticCode::StateTransitionMismatch);
-    }
-    let expected_posts = fixture
-        .provider_posts_by_semantic
-        .values()
-        .try_fold(1_u64, |total, count| total.checked_add(*count))
+    let decision_posts = fixture
+        .posts_for(MANAGER_DECISION_KIND)
         .ok_or(DiagnosticCode::FixtureInvalid)?;
-    if service.send_count() != expected_posts {
-        return Err(DiagnosticCode::StateTransitionMismatch);
-    }
-    if exact_array(intents, "intents")?.len() as u64
-        != fixture
-            .native_work_by_step
-            .values()
-            .try_fold(0_u64, |total, count| total.checked_add(*count))
-            .ok_or(DiagnosticCode::FixtureInvalid)?
+    if service.provider.count_for(MANAGER_DECISION_KIND) != decision_posts
+        || service.provider.count_for(SETUP_SEMANTIC_ID) != 1
+        || service.send_count() != fixture.expected_total_posts()?
     {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
@@ -1045,7 +898,7 @@ fn assert_happy_path_counts(
     }) {
         return Err(DiagnosticCode::RestartRecoveryFailed);
     }
-    Ok(())
+    Ok(shape)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1169,7 +1022,7 @@ async fn always_on_bootstrap(
     probe: &mut ProbeBuilder<'_>,
     client: &mut McpControlClient,
     workspace: &str,
-) -> Result<(String, String), DiagnosticCode> {
+) -> Result<(String, String, String), DiagnosticCode> {
     let created = probe
         .call(
             client,
@@ -1253,7 +1106,37 @@ async fn always_on_bootstrap(
             ],
         )
         .await?;
-    Ok((session_id, agent_id))
+    Ok((session_id, agent_id, setup_run))
+}
+
+/// Capture and validate the bootstrap baseline for a freshly spawned home.
+///
+/// The baseline is polled until every identity it contains has settled, so the
+/// later exact comparisons cannot race the supervisor, and it is validated
+/// against the known setup Run id so a polluted home fails instead of becoming
+/// the accepted starting state.
+async fn always_on_baseline(
+    probe: &mut ProbeBuilder<'_>,
+    client: &mut McpControlClient,
+    fixture: &AlwaysOnFixture,
+    session_id: &str,
+    workspace: &str,
+    setup_run: &str,
+) -> Result<AlwaysOnSnapshot, DiagnosticCode> {
+    let deadline = Instant::now() + BASELINE_SETTLE_TIMEOUT;
+    let mut last = Err(DiagnosticCode::Timeout);
+    while Instant::now() < deadline {
+        let snapshot = always_on_snapshot(probe, client, session_id, workspace).await?;
+        last = assert_bootstrap_baseline(&snapshot, fixture, setup_run).map(|()| snapshot);
+        if last.as_ref().is_ok_and(baseline_is_settled) {
+            return last;
+        }
+        tokio::time::sleep(BASELINE_SETTLE_POLL).await;
+    }
+    match last {
+        Ok(_) => Err(DiagnosticCode::Timeout),
+        Err(code) => Err(code),
+    }
 }
 
 fn process_service_spawn_diagnostic(error: anyhow::Error) -> DiagnosticCode {
@@ -1281,9 +1164,19 @@ async fn always_on_home_a(
         .await
         .map_err(|_| DiagnosticCode::ServiceUnreachable)?;
     let workspace = service.workspace.display().to_string();
-    let (session_id, agent_id) = always_on_bootstrap(probe, &mut client, &workspace).await?;
+    let (session_id, agent_id, setup_run) =
+        always_on_bootstrap(probe, &mut client, &workspace).await?;
+    let baseline = always_on_baseline(
+        probe,
+        &mut client,
+        fixture,
+        &session_id,
+        &workspace,
+        &setup_run,
+    )
+    .await?;
     let plan_request = request_id("plan");
-    let args = fixture.plan_arguments(&plan_request, &session_id, &workspace, &agent_id);
+    let args = plan_arguments(fixture, &plan_request, &session_id, &workspace, &agent_id);
     let created_plan = probe
         .call(
             &mut client,
@@ -1418,7 +1311,7 @@ async fn always_on_home_a(
         .await?;
 
     for step in fixture.native_steps() {
-        let items = work_for_step(&work, step);
+        let items = work_for_step(&work, &step);
         if items.len() != 1 || items[0]["state"].as_str() != Some("succeeded") {
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
@@ -1469,7 +1362,11 @@ async fn always_on_home_a(
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
         always_on_require_unique_join(&work, &detailed, &intents, &runs, work_id, &run_id)?;
-        if service.provider.count_for(step) != fixture.provider_posts_by_semantic[step] {
+        if service.provider.count_for(&step)
+            != fixture
+                .posts_for(&step)
+                .ok_or(DiagnosticCode::FixtureInvalid)?
+        {
             return Err(DiagnosticCode::StateTransitionMismatch);
         }
         let campaign_runs: Vec<_> = runs["runs"]
@@ -1507,23 +1404,11 @@ async fn always_on_home_a(
         probe.retain_id(DurableIdKind::Run, &run_id);
     }
     probe.observe_action(ProbeAction::InspectWorkAttempts);
-    if work_items(&work)
-        .iter()
-        .filter(|item| item["kind"].as_str() == Some("manager-decision"))
-        .count() as u64
-        != fixture.decision_work
-        || service.provider.count_for("manager-decision")
-            != fixture.provider_posts_by_semantic["manager-decision"]
+    if service.provider.count_for(MANAGER_DECISION_KIND)
+        != fixture
+            .posts_for(MANAGER_DECISION_KIND)
+            .ok_or(DiagnosticCode::FixtureInvalid)?
     {
-        return Err(DiagnosticCode::StateTransitionMismatch);
-    }
-    let proposal = runs["runs"]
-        .as_array()
-        .ok_or(DiagnosticCode::McpResultMalformed)?
-        .iter()
-        .filter(|run| run["purpose"].as_str() == Some("manager_proposal"))
-        .count() as u64;
-    if proposal != fixture.proposal_runs {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
     for run in runs["runs"]
@@ -1556,7 +1441,7 @@ async fn always_on_home_a(
         return Err(DiagnosticCode::IdempotencyReplayMismatch);
     }
     let after_replay = always_on_snapshot(probe, &mut client, &session_id, &workspace).await?;
-    assert_exact_cardinality(before_post_success_tick, after_replay)?;
+    assert_exact_snapshot(&before_post_success_tick, &after_replay)?;
     probe.observe_action(ProbeAction::ReplayRequest);
     probe.observe_oracle(OracleCode::RequestReplaySameResource);
 
@@ -1591,7 +1476,7 @@ async fn always_on_home_a(
         _ => return Err(DiagnosticCode::IdempotencyConflictUnproven),
     }
     let after_conflict = always_on_snapshot(probe, &mut client, &session_id, &workspace).await?;
-    assert_exact_cardinality(after_replay, after_conflict)?;
+    assert_exact_snapshot(&after_replay, &after_conflict)?;
     probe.observe_action(ProbeAction::ReplayChangedPayload);
     probe.observe_oracle(OracleCode::ChangedPayloadConflict);
 
@@ -1616,8 +1501,21 @@ async fn always_on_home_a(
     probe.observe_action(ProbeAction::TickManagerPlan);
     let after_post_success_tick =
         always_on_snapshot(probe, &mut client, &session_id, &workspace).await?;
-    assert_exact_cardinality(before_post_success_tick, after_post_success_tick)?;
-    assert_happy_path_counts(fixture, &service, &work, &runs, &intents)?;
+    assert_exact_snapshot(&before_post_success_tick, &after_post_success_tick)?;
+    // The manager-decision Work and the manager proposal Run used to be two
+    // independent counts. `assert_happy_path_shape` joins them through public
+    // identities instead, so a decision lane pointing at some other Run fails.
+    probe.always_on_shape = Some(assert_happy_path_shape(
+        fixture,
+        &service,
+        &baseline,
+        &after_post_success_tick,
+        &runs,
+    )?);
+    probe.provider_lanes.push(LoopbackProviderLane::new(
+        AlwaysOnHome::HomeA,
+        service.provider.observation(),
+    ));
     service
         .scan_artifacts()
         .map_err(|_| DiagnosticCode::OracleMismatch)?;
@@ -1636,12 +1534,27 @@ async fn always_on_home_b(
         .await
         .map_err(|_| DiagnosticCode::ServiceUnreachable)?;
     let workspace = service.workspace.display().to_string();
-    let (session_id, agent_id) = always_on_bootstrap(probe, &mut client, &workspace).await?;
+    let (session_id, agent_id, setup_run) =
+        always_on_bootstrap(probe, &mut client, &workspace).await?;
+    let baseline = always_on_baseline(
+        probe,
+        &mut client,
+        fixture,
+        &session_id,
+        &workspace,
+        &setup_run,
+    )
+    .await?;
     service
         .provider
         .arm(&fixture.step_first, ProviderDisposition::Hold);
-    let plan_args =
-        fixture.plan_arguments(&request_id("plan-b"), &session_id, &workspace, &agent_id);
+    let plan_args = plan_arguments(
+        fixture,
+        &request_id("plan-b"),
+        &session_id,
+        &workspace,
+        &agent_id,
+    );
     let expected_plan_steps = plan_args["steps"].clone();
     let created_plan = probe
         .call(
@@ -1674,19 +1587,31 @@ async fn always_on_home_b(
     .await?;
     let work_id = join.work_id.clone();
     let run_id = join.run_id.clone();
-    let expected_cardinality =
-        always_on_snapshot(probe, &mut client, &session_id, &workspace).await?;
-    if expected_cardinality.work == 0
-        || expected_cardinality.runs == 0
-        || expected_cardinality.intents == 0
-    {
+    // A non-zero count check here would accept any polluted home as the
+    // baseline for every later zero-growth comparison. Require the exact
+    // fixture-derived pre-restart shape instead: the bootstrap baseline plus
+    // the single held lane, with the dependent step, the replacement step and
+    // the manager-decision lane all still absent.
+    let expected_snapshot = always_on_snapshot(probe, &mut client, &session_id, &workspace).await?;
+    assert_home_b_pre_restart_shape(
+        fixture,
+        &baseline,
+        &expected_snapshot,
+        &join.work_id,
+        &join.attempt_id,
+        &join.run_id,
+    )?;
+    let held_posts = fixture
+        .posts_for(&fixture.step_first)
+        .ok_or(DiagnosticCode::FixtureInvalid)?;
+    if service.provider.count_for(&fixture.step_first) != held_posts {
         return Err(DiagnosticCode::StateTransitionMismatch);
     }
-    if service.provider.count_for(&fixture.step_first)
-        != fixture.provider_posts_by_semantic[fixture.step_first.as_str()]
-    {
-        return Err(DiagnosticCode::StateTransitionMismatch);
-    }
+    // Every identity must survive both restarts unchanged except the held
+    // lane, which must land exactly on failed Work over an interrupted Run.
+    // Encoding the fence this way keeps Work and Run `state` inside the
+    // compared oracle instead of dropping it to make the comparison hold.
+    let expected_after_restart = expected_snapshot.with_interruption(&join.work_id, &join.run_id);
     let pre_plan = probe
         .call(
             &mut client,
@@ -1753,19 +1678,17 @@ async fn always_on_home_b(
         &join.attempt_id,
         &run_id,
         &fixture.step_first,
-        fixture.provider_posts_by_semantic[fixture.step_first.as_str()],
+        held_posts,
         true,
-        expected_cardinality,
+        &expected_after_restart,
     )
     .await?;
     tokio::time::sleep(fixture.zero_growth_window).await;
-    assert_exact_cardinality(
-        expected_cardinality,
-        always_on_snapshot(probe, &mut client, &session_id, &workspace).await?,
+    assert_exact_snapshot(
+        &expected_after_restart,
+        &always_on_snapshot(probe, &mut client, &session_id, &workspace).await?,
     )?;
-    if service.provider.count_for(&fixture.step_first)
-        != fixture.provider_posts_by_semantic[fixture.step_first.as_str()]
-    {
+    if service.provider.count_for(&fixture.step_first) != held_posts {
         probe.restart.implicit_execution_observed = true;
         return Err(DiagnosticCode::RestartRecoveryFailed);
     }
@@ -1807,25 +1730,28 @@ async fn always_on_home_b(
         &join.attempt_id,
         &run_id,
         &fixture.step_first,
-        fixture.provider_posts_by_semantic[fixture.step_first.as_str()],
+        held_posts,
         false,
-        expected_cardinality,
+        &expected_after_restart,
     )
     .await?;
     tokio::time::sleep(fixture.zero_growth_window).await;
-    assert_exact_cardinality(
-        expected_cardinality,
-        always_on_snapshot(probe, &mut client, &session_id, &workspace).await?,
+    assert_exact_snapshot(
+        &expected_after_restart,
+        &always_on_snapshot(probe, &mut client, &session_id, &workspace).await?,
     )?;
-    if service.provider.count_for(&fixture.step_first)
-        != fixture.provider_posts_by_semantic[fixture.step_first.as_str()]
-    {
+    if service.provider.count_for(&fixture.step_first) != held_posts {
         probe.restart.implicit_execution_observed = true;
         return Err(DiagnosticCode::RestartRecoveryFailed);
     }
     probe.observe_oracle(OracleCode::InterruptedRunNotReadmittedWithinWindow);
     probe.observe_oracle(OracleCode::NoImplicitInvocationResume);
-    probe.provider_observation = Some(service.provider.observation());
+    // Home B used to assign this field outright, discarding Home A's records
+    // and leaving every Home-A oracle unbacked in the published report.
+    probe.provider_lanes.push(LoopbackProviderLane::new(
+        AlwaysOnHome::HomeB,
+        service.provider.observation(),
+    ));
     service
         .scan_artifacts()
         .map_err(|_| DiagnosticCode::OracleMismatch)?;
@@ -1940,7 +1866,7 @@ async fn always_on_assert_interrupted_recovery(
     expected_step_id: &str,
     expected_provider_posts: u64,
     stamp_transitions: bool,
-    expected_cardinality: AlwaysOnCardinality,
+    expected_after_restart: &AlwaysOnSnapshot,
 ) -> Result<(), DiagnosticCode> {
     wait_run_terminal(client, session_id, workspace, run_id).await?;
     let recovered_run = probe
@@ -2074,9 +2000,9 @@ async fn always_on_assert_interrupted_recovery(
         work_id,
         run_id,
     )?;
-    assert_exact_cardinality(
-        expected_cardinality,
-        always_on_snapshot(probe, client, session_id, workspace).await?,
+    assert_exact_snapshot(
+        expected_after_restart,
+        &always_on_snapshot(probe, client, session_id, workspace).await?,
     )?;
     if stamp_transitions {
         probe.transition(
@@ -6489,7 +6415,7 @@ mod tests {
         mutants.push(missing_provider);
         for mutant in mutants {
             assert_eq!(
-                AlwaysOnFixture::from_value(&mutant),
+                AlwaysOnFixture::from_json(&mutant),
                 Err(DiagnosticCode::FixtureInvalid)
             );
         }
@@ -6543,34 +6469,6 @@ mod tests {
                 assert_observed_contract(&candidate),
                 Err(DiagnosticCode::OracleMismatch),
                 "missing oracle {missing:?} must fail"
-            );
-        }
-    }
-
-    #[test]
-    fn always_on_cardinality_comparison_rejects_each_growth_dimension() {
-        let expected = AlwaysOnCardinality {
-            work: 4,
-            runs: 4,
-            intents: 3,
-        };
-        for mutant in [
-            AlwaysOnCardinality {
-                work: 5,
-                ..expected
-            },
-            AlwaysOnCardinality {
-                runs: 5,
-                ..expected
-            },
-            AlwaysOnCardinality {
-                intents: 4,
-                ..expected
-            },
-        ] {
-            assert_eq!(
-                assert_exact_cardinality(expected, mutant),
-                Err(DiagnosticCode::StateTransitionMismatch)
             );
         }
     }

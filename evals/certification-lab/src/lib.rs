@@ -3,6 +3,7 @@
 //! The lab may bootstrap an isolated loopback host, but every probe observes
 //! and mutates product state through [`grokptah_agent_bridge::McpControlClient`].
 
+pub mod always_on;
 pub mod artifact;
 pub mod authority_stage3;
 pub mod capture;
