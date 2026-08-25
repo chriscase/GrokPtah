@@ -3026,6 +3026,31 @@ mod tests {
         set_grokptah_home_override(None);
     }
 
+    #[test]
+    fn unsupported_transport_code_projects_to_public_invalid_request() {
+        // `json_err` keeps `data.code` on the public taxonomy. Unsupported is
+        // HTTP 405 with `invalid_request` plus bounded `reasonCode=unsupported`.
+        let error = OrchError::new(
+            OrchErrorCode::Unsupported,
+            "computer use is unavailable on this host",
+        );
+        assert_eq!(status_for(&error), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            public_error_code(&error.code),
+            PublicErrorCode::InvalidRequest
+        );
+        assert_eq!(error.code.as_str(), "unsupported");
+        assert_eq!(
+            public_error_message(&error.code),
+            "The operation is unsupported."
+        );
+        assert_ne!(
+            public_error_message(&error.code),
+            error.message.as_str(),
+            "lock/store detail must not become the public message"
+        );
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn computer_reads_fail_closed_when_the_ledger_is_unavailable() {
@@ -3053,16 +3078,62 @@ mod tests {
             srv,
             client: reqwest::Client::new(),
         };
-        let (status, body) = call_tool(
-            &fixture,
-            1,
-            "ptah_list_computer_runs",
-            json!({"session_id": session.id, "workspace": ws.path()}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(body["error"]["data"]["code"], "invalid_request");
-        assert_eq!(body["error"]["data"]["reasonCode"], "unsupported");
+        // Availability is global and session-independent: every Computer Run
+        // read must fail closed the same way, without leaking lock/path detail
+        // or becoming a run-existence oracle.
+        let cases = [
+            (
+                "ptah_list_computer_runs",
+                json!({"session_id": session.id, "workspace": ws.path()}),
+            ),
+            (
+                "ptah_get_computer_capacity",
+                json!({"session_id": session.id, "workspace": ws.path()}),
+            ),
+            (
+                "ptah_get_computer_run",
+                json!({
+                    "session_id": session.id,
+                    "workspace": ws.path(),
+                    "run_id": "no-such-run"
+                }),
+            ),
+            (
+                "ptah_get_computer_run_events",
+                json!({
+                    "session_id": session.id,
+                    "workspace": ws.path(),
+                    "run_id": "no-such-run"
+                }),
+            ),
+        ];
+        for (idx, (name, arguments)) in cases.into_iter().enumerate() {
+            let (status, body) = call_tool(&fixture, idx as u64 + 1, name, arguments).await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{name}");
+            assert_eq!(
+                body["error"]["data"]["code"], "invalid_request",
+                "{name} must use the public taxonomy, not the internal transport code"
+            );
+            assert_eq!(
+                body["error"]["data"]["reasonCode"], "unsupported",
+                "{name} must keep the bounded Unsupported reason"
+            );
+            assert_eq!(
+                body["error"]["data"]["message"], "The operation is unsupported.",
+                "{name}"
+            );
+            assert_eq!(
+                body["error"]["message"], "The operation is unsupported.",
+                "{name}"
+            );
+            let rendered = body.to_string();
+            assert!(
+                !rendered.contains("already open")
+                    && !rendered.contains("computer-use store")
+                    && !rendered.contains("computer use is unavailable on this host"),
+                "{name} leaked ledger/lock detail: {rendered}"
+            );
+        }
 
         fixture.srv.stop();
         set_grokptah_home_override(None);
