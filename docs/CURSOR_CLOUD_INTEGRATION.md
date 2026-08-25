@@ -55,13 +55,21 @@ or browser-safe broker without importing GrokPtah's authority implementation.
 
 The native bridge now exposes `CursorCloudAdapter` behind the
 `ExternalWorkerAdapter` trait. It targets Cursor Cloud Agents API v1, keeps the
-API key in the trusted process, sends only an isolated exact-repository/ref
-request, verifies the returned agent/run identity, polls status, enforces
-terminal cancellation, and refuses to publish provider artifact listings that
-do not carry a content digest. Its in-tree fake API fixture covers launch,
-polling, artifact projection, and terminal cancellation without credentials.
+API key in the trusted process, requires an explicit repository allowlist, sends
+only an isolated exact-repository/ref request, verifies the returned agent/run
+identity and write/PR safety flags, polls status, rejects unknown or busy
+follow-up targets, enforces terminal cancellation, and refuses to publish
+provider artifact listings without both a content digest and run attribution.
+Its in-tree fake API fixture covers the bounded checks without credentials.
 This is an implementation seam and contract fixture, not evidence that a live
 Cursor account has been exercised.
+
+For the v1 request shape, an explicit `repos` entry selects the hosted cloud
+environment; a named `env` is not sent alongside `repos` because Cursor treats
+those fields as mutually exclusive. The live API's artifact listing currently
+returns agent-scoped paths and sizes rather than a digest or run attribution,
+so the adapter deliberately fails closed until a trusted download-and-hash
+path is qualified.
 
 ## Safety contract
 
@@ -88,10 +96,12 @@ Cursor account has been exercised.
 ## Qualification stages
 
 1. **Contract fixture:** the native fake Cursor API fixture now proves
-   isolated create, exact source projection, status polling, digest-bearing
-   artifacts, redacted terminal text, and terminal cancellation without
-   network credentials. List/follow-up/archive, stream reconnect/expiry, and
-   durable idempotent retry fixtures remain to be added.
+   isolated create, explicit allowlist and response-safety checks, exact source
+   projection, status polling, busy/unknown follow-up rejection, redacted
+   terminal text, terminal cancellation, and run-attributed digest-bearing
+   artifacts without network credentials. Provider list/archive, stream
+   reconnect/expiry, durable idempotent retry, and a real artifact download/hash
+   path remain to be added.
 2. **Read-only live probe:** list models/repositories and read an existing
    disposable agent; record API version, limits, retention, and redaction.
 3. **Disposable create:** create one agent from an exact public test ref with

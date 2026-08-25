@@ -82,7 +82,7 @@ describe("GrokPtahBrokerClient", () => {
       prompt: "Review the exact candidate",
       executionMode: "isolated",
       autoCreatePr: false,
-    }, "intent-1");
+    }, "request-1");
     expect(result.run.externalRunId).toBe("run-1");
     expect(String(fetcher.mock.calls[0][0])).toBe(
       "https://contextdesk.example/api/grokptah/v1/bindings/binding-1/external-workers",

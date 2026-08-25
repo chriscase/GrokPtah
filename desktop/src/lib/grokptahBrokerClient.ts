@@ -582,11 +582,22 @@ export class GrokPtahBrokerClient {
     if (parseExternalWorkerLaunchRequest(request) === null) {
       throw new GrokPtahBrokerError(0, "invalid_request", "External worker launch request is invalid");
     }
-    return this.requestValidated(
+    if (request.requestId !== idempotencyKey) {
+      throw new GrokPtahBrokerError(0, "invalid_request", "External worker requestId must match Idempotency-Key");
+    }
+    const result = await this.requestValidated(
       `/bindings/${segment(bindingId)}/external-workers`,
       parseExternalWorkerLaunchResult,
       { method: "POST", idempotencyKey, body: request },
     );
+    if (
+      result.worker.externalAgentId !== result.run.externalAgentId ||
+      result.worker.repository !== request.repository ||
+      result.worker.startingRef !== request.startingRef
+    ) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker launch does not match the request");
+    }
+    return result;
   }
 
   /** Queue a bounded follow-up run on an existing external worker. */
@@ -598,6 +609,13 @@ export class GrokPtahBrokerClient {
   ): Promise<ExternalWorkerRunRecord> {
     if (parseExternalWorkerFollowUpRequest(request) === null) {
       throw new GrokPtahBrokerError(0, "invalid_request", "External worker follow-up request is invalid");
+    }
+    if (request.requestId !== idempotencyKey) {
+      throw new GrokPtahBrokerError(0, "invalid_request", "External worker requestId must match Idempotency-Key");
+    }
+    const worker = await this.getExternalWorker(bindingId, externalAgentId);
+    if (["unknown", "failed", "cancelled", "archived"].includes(worker.state)) {
+      throw new GrokPtahBrokerError(0, "invalid_request", "External worker is not eligible for follow-up");
     }
     return this.requestValidated(
       `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/runs`,
@@ -654,11 +672,15 @@ export class GrokPtahBrokerClient {
     externalRunId: string,
     idempotencyKey: string,
   ): Promise<ExternalWorkerRunRecord> {
-    return this.requestValidated(
+    const result = await this.requestValidated(
       `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/runs/${segment(externalRunId)}/cancel`,
       parseExternalWorkerRunRecord,
       { method: "POST", idempotencyKey },
     );
+    if (result.state !== "cancelled") {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker cancellation was not terminal");
+    }
+    return result;
   }
 
   async getRun<T = unknown>(bindingId: string, brokerRunId: string): Promise<T> {

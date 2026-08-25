@@ -42,6 +42,15 @@ describe("external worker UI contract", () => {
       executionMode: "isolated",
       autoCreatePr: false,
     })?.providerId).toBe("company-gateway");
+    expect(parseExternalWorkerLaunchRequest({
+      requestId: "req-1",
+      provider: "cursor_cloud",
+      repository: "org/repo",
+      startingRef: "main",
+      prompt: "Review",
+      executionMode: "isolated",
+      autoCreatePr: true,
+    })).toBeNull();
   });
 
   it("parses redacted records and relative artifacts only", () => {
@@ -62,6 +71,16 @@ describe("external worker UI contract", () => {
       startingRef: "main",
       state: "running",
       workerUrl: "file:///private/secret",
+      createdAt: "now",
+      updatedAt: "now",
+    })).toBeNull();
+    expect(parseExternalWorkerRecord({
+      provider: "cursor_cloud",
+      externalAgentId: "agent-1",
+      repository: "org/repo",
+      startingRef: "main",
+      state: "running",
+      workerUrl: "https://cursor.com/agents/agent-1?token=secret",
       createdAt: "now",
       updatedAt: "now",
     })).toBeNull();
@@ -108,6 +127,10 @@ describe("external worker UI contract", () => {
     });
     expect(result?.run.externalRunId).toBe("run-1");
     expect(parseExternalWorkerLaunchResult({ worker: result?.worker, run: { state: "running" } })).toBeNull();
+    expect(parseExternalWorkerLaunchResult({
+      worker: result?.worker,
+      run: { ...result?.run, externalAgentId: "other-agent" },
+    })).toBeNull();
   });
 
   it("requires cursor recovery instead of inferring completion", () => {
@@ -127,10 +150,16 @@ describe("external worker UI contract", () => {
       type: "recovery",
       afterSeq: 0,
       reason: "cursor_expired",
-      pollRoute: "api/runs/run-1",
+      pollRoute: "/api/runs/run-1",
     });
     expect(recovery).not.toBeNull();
     expect(applyExternalWorkerNotification(afterFirst!, recovery!)).toMatchObject({ recoveryRequired: true });
+    expect(parseExternalWorkerNotification({
+      type: "recovery",
+      afterSeq: 0,
+      reason: "cursor_expired",
+      pollRoute: "//evil.example/runs/run-1",
+    })).toBeNull();
     expect(parseExternalWorkerNotification({
       type: "event",
       event: { seq: 1, ts: "now", kind: "run.progress", detail: "Authorization: secret" },

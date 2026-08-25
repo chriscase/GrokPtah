@@ -124,7 +124,7 @@ const STATES = new Set<ExternalWorkerState>([
   "archived",
   "unknown",
 ]);
-const PRIVILEGED_TEXT = /(?:\/(?:users|private|var|tmp|home|volumes)\/|https?:\/\/|(?:^|[\s=:])(authorization|bearer|api[_ -]?key|xai_api_key|grokptah_home|clipboard|private[_ -]?key|secret(?:[_ -]?key)?)(?:[\s=:]|$))/i;
+const PRIVILEGED_TEXT = /(?:\/(?:users|private|var|tmp|home|volumes)\/|(?:[a-z]:\\users\\|\\\\)|https?:\/\/|(?:^|[\s=:])(authorization|bearer|api[_ -]?key|xai_api_key|grokptah_home|clipboard|private[_ -]?key|password|cookie|session[_ -]?token|secret(?:[_ -]?key)?)(?:[\s=:]|$))/i;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -143,11 +143,48 @@ function boundedString(value: unknown, maxBytes: number, rejectPrivileged = fals
   );
 }
 
+function safeWorkerUrl(value: unknown, provider?: ExternalWorkerProvider): value is string {
+  if (!boundedString(value, MAX_REF_BYTES) || !value.startsWith("https://")) return false;
+  try {
+    const parsed = new URL(value);
+    if (
+      parsed.protocol !== "https:" ||
+      !parsed.hostname ||
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      parsed.hash ||
+      /[\u0000-\u001f\u007f]/.test(value)
+    ) return false;
+    if (provider === "cursor_cloud") {
+      const host = parsed.hostname.toLowerCase();
+      if (host !== "cursor.com" && !host.endsWith(".cursor.com")) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function relativeRef(value: unknown): value is string {
   return (
     boundedString(value, MAX_REF_BYTES) &&
     !value.startsWith("/") &&
     !value.includes("\\") &&
+    !value.split("/").some((segment) => segment === "..") &&
+    !/[\u0000-\u001f\u007f]/.test(value)
+  );
+}
+
+function sameOriginRoute(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.startsWith("/") &&
+    !value.startsWith("//") &&
+    value.length <= MAX_REF_BYTES &&
+    !value.includes("\\") &&
+    !value.includes("?") &&
+    !value.includes("#") &&
     !value.split("/").some((segment) => segment === "..") &&
     !/[\u0000-\u001f\u007f]/.test(value)
   );
@@ -185,7 +222,7 @@ export function parseExternalWorkerLaunchRequest(value: unknown): ExternalWorker
     !boundedString(value.prompt, MAX_PROMPT_BYTES) ||
     (value.model !== undefined && !identity(value.model)) ||
     value.executionMode !== "isolated" ||
-    typeof value.autoCreatePr !== "boolean" ||
+    value.autoCreatePr !== false ||
     (value.bounds !== undefined && !validBounds(value.bounds)) ||
     (value.provider === "custom" && value.providerId === undefined)
   ) return null;
@@ -219,7 +256,7 @@ export function parseExternalWorkerRecord(value: unknown): ExternalWorkerRecord 
     typeof value.state !== "string" ||
     !STATES.has(value.state as ExternalWorkerState) ||
     (value.branch !== undefined && !relativeRef(value.branch)) ||
-    (value.workerUrl !== undefined && (!boundedString(value.workerUrl, MAX_REF_BYTES) || !value.workerUrl.startsWith("https://"))) ||
+    (value.workerUrl !== undefined && !safeWorkerUrl(value.workerUrl, value.provider as ExternalWorkerProvider)) ||
     !boundedString(value.createdAt, 128) ||
     !boundedString(value.updatedAt, 128) ||
     (value.provider === "custom" && value.providerId === undefined)
@@ -251,7 +288,8 @@ export function parseExternalWorkerLaunchResult(value: unknown): ExternalWorkerL
   if (!isRecord(value) || !hasOnlyKeys(value, new Set(["worker", "run"]))) return null;
   const worker = parseExternalWorkerRecord(value.worker);
   const run = parseExternalWorkerRunRecord(value.run);
-  return worker && run ? { worker, run } : null;
+  if (!worker || !run || worker.externalAgentId !== run.externalAgentId) return null;
+  return { worker, run };
 }
 
 /** Parse a redacted event without exposing provider tool output. */
@@ -281,7 +319,7 @@ export function parseExternalWorkerNotification(value: unknown): ExternalWorkerN
     !Number.isInteger(value.afterSeq) ||
     (value.afterSeq as number) < 0 ||
     !boundedString(value.reason, 256, true) ||
-    !relativeRef(value.pollRoute)
+    !sameOriginRoute(value.pollRoute)
   ) return null;
   return { type: "recovery", afterSeq: value.afterSeq as number, reason: value.reason, pollRoute: value.pollRoute };
 }

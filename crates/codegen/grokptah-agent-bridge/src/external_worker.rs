@@ -18,6 +18,7 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 
 /// Public API base for Cursor Cloud Agents v1.
@@ -82,6 +83,7 @@ pub trait ExternalWorkerAdapter: Send + Sync {
     async fn list_artifacts(
         &self,
         external_agent_id: &str,
+        external_run_id: &str,
     ) -> Result<Vec<ExternalWorkerArtifact>, ExternalWorkerAdapterError>;
 
     /// Cancel an active run and verify its terminal projection.
@@ -131,6 +133,7 @@ pub struct CursorCloudAdapter {
     http: Client,
     base_url: Url,
     api_key: String,
+    allowed_repositories: Option<Arc<std::collections::BTreeSet<String>>>,
 }
 
 impl CursorCloudAdapter {
@@ -162,25 +165,68 @@ impl CursorCloudAdapter {
         {
             return Err(ExternalWorkerAdapterError::InvalidBaseUrl);
         }
+        if !crate::ssrf::check_url(base_url.as_str()).allow {
+            return Err(ExternalWorkerAdapterError::InvalidBaseUrl);
+        }
         let api_key = api_key.into();
         if api_key.trim().is_empty() || api_key.chars().any(|c| matches!(c, '\r' | '\n' | '\0')) {
             return Err(ExternalWorkerAdapterError::InvalidRequest(
                 "provider API key must be non-empty and free of control characters",
             ));
         }
+        let http = Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| ExternalWorkerAdapterError::InvalidBaseUrl)?;
         Ok(Self {
-            http: Client::new(),
+            http,
             base_url,
             api_key,
+            allowed_repositories: None,
         })
+    }
+
+    /// Install the explicit repository allowlist required for live launches.
+    /// The adapter refuses to create a worker until this is configured.
+    pub fn with_repository_allowlist<I, S>(
+        mut self,
+        repositories: I,
+    ) -> Result<Self, ExternalWorkerAdapterError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut allowlist = std::collections::BTreeSet::new();
+        for repository in repositories {
+            allowlist.insert(repository_identity(&github_repository_url(
+                repository.as_ref(),
+            )?)?);
+        }
+        if allowlist.is_empty() {
+            return Err(ExternalWorkerAdapterError::InvalidRequest(
+                "Cursor repository allowlist must not be empty",
+            ));
+        }
+        self.allowed_repositories = Some(Arc::new(allowlist));
+        Ok(self)
     }
 
     #[cfg(test)]
     fn for_test(base_url: &str) -> Self {
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(2))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("test client is valid"),
             base_url: Url::parse(base_url).expect("test server URL is valid"),
             api_key: "synthetic-cursor-key".into(),
+            allowed_repositories: Some(Arc::new(
+                ["chriscase/GrokPtah".to_string()].into_iter().collect(),
+            )),
         }
     }
 
@@ -226,6 +272,17 @@ impl CursorCloudAdapter {
         }
         Ok(value)
     }
+
+    async fn list_provider_runs(
+        &self,
+        external_agent_id: &str,
+    ) -> Result<Vec<CursorRun>, ExternalWorkerAdapterError> {
+        let id = Self::checked_id(external_agent_id)?;
+        let response: CursorRuns = self
+            .request(Method::GET, &format!("/v1/agents/{id}/runs"), None)
+            .await?;
+        Ok(response.items)
+    }
 }
 
 #[async_trait]
@@ -255,13 +312,26 @@ impl ExternalWorkerAdapter for CursorCloudAdapter {
             ));
         }
         let repository_url = github_repository_url(&request.repository)?;
+        let repository_identity = repository_identity(&repository_url)?;
+        let Some(allowlist) = &self.allowed_repositories else {
+            return Err(ExternalWorkerAdapterError::InvalidRequest(
+                "Cursor repository allowlist is not configured",
+            ));
+        };
+        if !allowlist.contains(&repository_identity) {
+            return Err(ExternalWorkerAdapterError::InvalidRequest(
+                "repository is not in the Cursor allowlist",
+            ));
+        }
         let mut payload = json!({
             "prompt": { "text": request.prompt },
             "repos": [{
                 "url": repository_url,
                 "startingRef": request.starting_ref,
             }],
-            "env": { "type": "cloud" },
+            // Cursor's v1 API uses the presence of `repos` to select its
+            // hosted cloud environment; an explicit named `env` is mutually
+            // exclusive with `repos` and would make this request invalid.
             "workOnCurrentBranch": false,
             "autoCreatePR": false,
         });
@@ -326,7 +396,35 @@ impl ExternalWorkerAdapter for CursorCloudAdapter {
         request
             .validate()
             .map_err(ExternalWorkerAdapterError::InvalidRequest)?;
+        if request.bounds.is_some() {
+            return Err(ExternalWorkerAdapterError::InvalidRequest(
+                "Cursor follow-up bounds are not supported by the provider API",
+            ));
+        }
         let agent_id = Self::checked_id(external_agent_id)?;
+        let worker = self.get_worker(agent_id).await?;
+        if matches!(
+            worker.state,
+            ExternalWorkerState::Unknown
+                | ExternalWorkerState::Failed
+                | ExternalWorkerState::Cancelled
+                | ExternalWorkerState::Archived
+        ) {
+            return Err(ExternalWorkerAdapterError::InvalidRequest(
+                "Cursor worker is not eligible for a follow-up",
+            ));
+        }
+        let active_runs = self.list_provider_runs(agent_id).await?;
+        if active_runs.iter().any(|run| {
+            matches!(
+                run_state(&run.status),
+                ExternalWorkerState::Provisioning | ExternalWorkerState::Running
+            )
+        }) {
+            return Err(ExternalWorkerAdapterError::InvalidRequest(
+                "Cursor worker already has an active run",
+            ));
+        }
         let response: CursorFollowUpResponse = self
             .request(
                 Method::POST,
@@ -340,8 +438,10 @@ impl ExternalWorkerAdapter for CursorCloudAdapter {
     async fn list_artifacts(
         &self,
         external_agent_id: &str,
+        external_run_id: &str,
     ) -> Result<Vec<ExternalWorkerArtifact>, ExternalWorkerAdapterError> {
         let id = Self::checked_id(external_agent_id)?;
+        let run_id = Self::checked_id(external_run_id)?;
         let response: CursorArtifacts = self
             .request(Method::GET, &format!("/v1/agents/{id}/artifacts"), None)
             .await?;
@@ -349,6 +449,16 @@ impl ExternalWorkerAdapter for CursorCloudAdapter {
             .items
             .into_iter()
             .map(|item| {
+                if !item.path.starts_with("artifacts/") {
+                    return Err(ExternalWorkerAdapterError::InvalidResponse(
+                        "Cursor artifact path is not provider-relative",
+                    ));
+                }
+                if item.run_id.as_deref() != Some(run_id) {
+                    return Err(ExternalWorkerAdapterError::InvalidResponse(
+                        "Cursor artifact is not attributed to the requested run",
+                    ));
+                }
                 let digest = item
                     .digest
                     .ok_or(ExternalWorkerAdapterError::InvalidResponse(
@@ -374,13 +484,31 @@ impl ExternalWorkerAdapter for CursorCloudAdapter {
     ) -> Result<ExternalWorkerRunRecord, ExternalWorkerAdapterError> {
         let agent_id = Self::checked_id(external_agent_id)?;
         let run_id = Self::checked_id(external_run_id)?;
-        let _: CursorIdResponse = self
-            .request(
+        let before = self.get_run(agent_id, run_id).await?;
+        if before.state == ExternalWorkerState::Cancelled {
+            return Ok(before);
+        }
+        if !matches!(
+            before.state,
+            ExternalWorkerState::Provisioning | ExternalWorkerState::Running
+        ) {
+            return Err(ExternalWorkerAdapterError::InvalidRequest(
+                "Cursor run is not cancellable",
+            ));
+        }
+        match self
+            .request::<CursorIdResponse>(
                 Method::POST,
                 &format!("/v1/agents/{agent_id}/runs/{run_id}/cancel"),
                 None,
             )
-            .await?;
+            .await
+        {
+            Ok(_) => {}
+            Err(ExternalWorkerAdapterError::Provider { status })
+                if status == StatusCode::CONFLICT => {}
+            Err(error) => return Err(error),
+        }
         let run = self.get_run(agent_id, run_id).await?;
         if run.state != ExternalWorkerState::Cancelled {
             return Err(ExternalWorkerAdapterError::InvalidResponse(
@@ -411,8 +539,20 @@ struct CursorAgent {
     status: String,
     #[serde(default)]
     repos: Vec<CursorRepo>,
+    #[serde(default)]
+    auto_create_pr: Option<bool>,
+    #[serde(default)]
+    work_on_current_branch: Option<bool>,
+    #[serde(default)]
+    env: Option<CursorEnvironment>,
     created_at: String,
     updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CursorEnvironment {
+    #[serde(rename = "type")]
+    kind: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -448,9 +588,17 @@ struct CursorArtifacts {
 }
 
 #[derive(Debug, Deserialize)]
+struct CursorRuns {
+    #[serde(default)]
+    items: Vec<CursorRun>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CursorArtifact {
     path: String,
+    #[serde(default)]
+    run_id: Option<String>,
     #[serde(default)]
     digest: Option<String>,
     #[serde(default)]
@@ -509,6 +657,18 @@ fn worker_record(
     expected_repository: Option<&str>,
     expected_ref: Option<&str>,
 ) -> Result<ExternalWorkerRecord, ExternalWorkerAdapterError> {
+    if agent.auto_create_pr != Some(false) || agent.work_on_current_branch != Some(false) {
+        return Err(ExternalWorkerAdapterError::InvalidResponse(
+            "Cursor response did not prove PR creation and current-branch writes are disabled",
+        ));
+    }
+    if let Some(env) = &agent.env {
+        if env.kind != "cloud" {
+            return Err(ExternalWorkerAdapterError::InvalidResponse(
+                "Cursor response environment is not hosted cloud",
+            ));
+        }
+    }
     if agent.repos.len() != 1 {
         return Err(ExternalWorkerAdapterError::InvalidResponse(
             "Cursor worker must have exactly one repository",
@@ -592,12 +752,20 @@ fn safe_terminal_result(value: &str) -> Option<String> {
         || value.contains("http://")
         || value.contains("https://")
         || lower.contains("authorization")
+        || lower.contains("bearer")
         || lower.contains("api_key")
+        || lower.contains("password")
+        || lower.contains("cookie")
+        || lower.contains("private key")
         || lower.contains("secret")
         || lower.contains("clipboard")
         || value.contains("/Users/")
         || value.contains("/private/")
         || value.contains("/tmp/")
+        || value
+            .get(1..3)
+            .is_some_and(|drive| drive.eq_ignore_ascii_case(":\\"))
+        || value.contains("\\Users\\")
     {
         return None;
     }
@@ -666,6 +834,9 @@ mod tests {
             "url": "https://cursor.com/agents/bc-00000000-0000-0000-0000-000000000001",
             "status": "ACTIVE",
             "repos": [{"url": "https://github.com/chriscase/GrokPtah", "startingRef": "main"}],
+            "autoCreatePR": false,
+            "workOnCurrentBranch": false,
+            "env": {"type": "cloud"},
             "createdAt": "2026-08-24T00:00:00Z",
             "updatedAt": "2026-08-24T00:00:01Z"
         })
@@ -719,6 +890,10 @@ mod tests {
         }))
     }
 
+    async fn fake_runs(State(_state): State<FakeCursorState>) -> Json<Value> {
+        Json(json!({ "items": [] }))
+    }
+
     async fn fake_cancel(State(state): State<FakeCursorState>) -> Json<Value> {
         *state.cancelled.lock().unwrap() = true;
         Json(json!({"id": "run-00000000-0000-0000-0000-000000000001"}))
@@ -726,7 +901,12 @@ mod tests {
 
     async fn fake_artifacts(State(_state): State<FakeCursorState>) -> Json<Value> {
         Json(json!({
-            "items": [{"path": "artifacts/report.md", "digest": "sha256:abc", "sizeBytes": 12}]
+            "items": [{
+                "path": "artifacts/report.md",
+                "runId": "run-00000000-0000-0000-0000-000000000001",
+                "digest": "sha256:abc",
+                "sizeBytes": 12
+            }]
         }))
     }
 
@@ -738,6 +918,19 @@ mod tests {
         );
         assert!(github_repository_url("https://github.com/a/b/c").is_err());
         assert!(github_repository_url("https://github.com/a/b?token=1").is_err());
+    }
+
+    #[test]
+    fn live_adapter_requires_safe_base_and_explicit_allowlist() {
+        assert!(CursorCloudAdapter::with_base_url("https://127.0.0.1", "key").is_err());
+        assert!(CursorCloudAdapter::with_base_url("https://api.cursor.com", "key")
+            .unwrap()
+            .with_repository_allowlist(["chriscase/GrokPtah"])
+            .is_ok());
+        assert!(CursorCloudAdapter::with_base_url("https://api.cursor.com", "key")
+            .unwrap()
+            .with_repository_allowlist(std::iter::empty::<&str>())
+            .is_err());
     }
 
     #[test]
@@ -793,6 +986,8 @@ mod tests {
         );
         assert_eq!(safe_terminal_result("wrote /Users/alice/project"), None);
         assert_eq!(safe_terminal_result("Authorization: Bearer token"), None);
+        assert_eq!(safe_terminal_result("password=secret"), None);
+        assert_eq!(safe_terminal_result("wrote C:\\Users\\alice\\project"), None);
     }
 
     #[tokio::test]
@@ -807,7 +1002,7 @@ mod tests {
             )
             .route(
                 "/v1/agents/bc-00000000-0000-0000-0000-000000000001/runs",
-                post(fake_follow_up),
+                post(fake_follow_up).get(fake_runs),
             )
             .route(
                 "/v1/agents/bc-00000000-0000-0000-0000-000000000001/runs/run-00000000-0000-0000-0000-000000000001/cancel",
@@ -847,7 +1042,7 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0]["repos"][0]["startingRef"], "main");
         assert_eq!(sent[0]["autoCreatePR"], false);
-        assert_eq!(sent[0]["env"]["type"], "cloud");
+        assert!(sent[0].get("env").is_none());
         drop(sent);
 
         let worker = adapter
@@ -884,7 +1079,10 @@ mod tests {
         );
         assert_eq!(follow_up.state, ExternalWorkerState::Provisioning);
         let artifacts = adapter
-            .list_artifacts(&launch.worker.external_agent_id)
+            .list_artifacts(
+                &launch.worker.external_agent_id,
+                &launch.run.external_run_id,
+            )
             .await
             .unwrap();
         assert_eq!(artifacts[0].path, "artifacts/report.md");
