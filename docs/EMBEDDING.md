@@ -105,7 +105,12 @@ run `npm run verify:public` in `desktop/`. This builds and verifies a bundled
 The generated artifact contains the browser-safe broker client and headless
 primitives only; it does not contain `trusted.ts`, Tauri APIs, bearer tokens,
 provider API-key markers, absolute host paths, `GROKPTAH_HOME`, or native
-Computer Use authority. Publication still requires the compatibility and
+Computer Use authority. The same command then installs that generated manifest
+into a disposable external-consumer fixture and imports it through normal
+`node_modules/@grokptah/client` package resolution. That fixture exercises the
+Help Center corpus, queue reducer, stream helper, and broker constructor, so a
+direct bundle import cannot masquerade as a consumer integration. The fixture
+is deleted after the check. Publication still requires the compatibility and
 release gates in the roadmap.
 
 ## ContextDesk integration checklist
