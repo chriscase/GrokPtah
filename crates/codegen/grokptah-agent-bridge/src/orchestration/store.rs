@@ -525,10 +525,7 @@ impl OrchStore {
             Err(_) => return Ok(None),
         };
         let _g = self.inner.lock.lock();
-        if !path.is_file() {
-            return Ok(None);
-        }
-        Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
+        self.read_attempt_path(&path)
     }
 
     /// CAS-create the one attempt allowed for a durable run. `None` is the
@@ -760,6 +757,13 @@ impl OrchStore {
     fn read_attempt_path(&self, path: &Path) -> anyhow::Result<Option<AttemptRecord>> {
         if !path.is_file() {
             return Ok(None);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if fs::metadata(path)?.permissions().mode() & 0o777 != 0o600 {
+                anyhow::bail!("private attempt record has unsafe permissions");
+            }
         }
         Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
     }
