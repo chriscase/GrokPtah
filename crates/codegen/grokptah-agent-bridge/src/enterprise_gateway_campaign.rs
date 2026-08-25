@@ -785,11 +785,7 @@ fn cursor_account_receipt_check(bundle: &CampaignBundle) -> CampaignCheck {
                     "offline Cursor fixtures cannot use the live Cursor API base",
                 );
             }
-            if cursor
-                .api_base
-                .as_deref()
-                .is_some_and(|base| url_can_be_live(base))
-            {
+            if cursor.api_base.as_deref().is_some_and(url_can_be_live) {
                 return CampaignCheck::fail(
                     "cursor_account_receipt",
                     "offline Cursor fixtures cannot carry a non-loopback API base",
