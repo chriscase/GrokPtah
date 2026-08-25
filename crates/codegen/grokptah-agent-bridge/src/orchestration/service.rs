@@ -39,7 +39,6 @@ struct PendingRun {
     session_id: Uuid,
     admission_id: String,
     sequence: u64,
-    execution_mode: RunExecutionMode,
 }
 
 struct LiveAttempt {
@@ -347,7 +346,6 @@ impl OrchestrationService {
                 session_id: intent.session_id,
                 admission_id: intent.admission_id,
                 sequence: intent.sequence,
-                execution_mode: intent.execution_mode,
             });
         }
         drop(queue);
@@ -3029,7 +3027,6 @@ impl OrchestrationService {
                 session_id,
                 admission_id: admission_id.clone(),
                 sequence,
-                execution_mode,
             }) {
                 Ok(position) => Some(position),
                 Err(error) => {
@@ -3085,7 +3082,6 @@ impl OrchestrationService {
                 session_id,
                 admission_id,
                 sequence,
-                execution_mode,
             };
             let (run, prompt, attempt, execution_mode) = match self.claim_and_start_queued(&pending)
             {
