@@ -739,10 +739,12 @@ mod tests {
         query.validate().expect("list query is valid");
         assert_eq!(query.limit, Some(20));
         assert!(query.include_archived);
-        assert!(serde_json::from_str::<ExternalWorkerListQuery>(
-            r#"{"prUrl":"https://github.com/org/repo/pull/1"}"#
-        )
-        .is_err());
+        assert!(
+            serde_json::from_str::<ExternalWorkerListQuery>(
+                r#"{"prUrl":"https://github.com/org/repo/pull/1"}"#
+            )
+            .is_err()
+        );
         let invalid_limit = ExternalWorkerListQuery {
             limit: Some(0),
             ..ExternalWorkerListQuery::default()

@@ -838,11 +838,11 @@ struct CursorArtifact {
 }
 
 fn github_repository_url(repository: &str) -> Result<String, ExternalWorkerAdapterError> {
-    if repository.starts_with("https://github.com/") {
+    if let Some(path) = repository.strip_prefix("https://github.com/") {
         if repository.contains('?')
             || repository.contains('#')
             || repository.ends_with('/')
-            || repository[19..].split('/').count() != 2
+            || path.split('/').count() != 2
         {
             return Err(ExternalWorkerAdapterError::InvalidRequest(
                 "repository must identify exactly one GitHub repository",
@@ -1017,7 +1017,7 @@ fn safe_terminal_result(value: &str) -> Option<String> {
     }
     // Preserve readable multi-line final replies without allowing control
     // characters to cross the browser projection.
-    let value = value.replace('\r', " ").replace('\n', " ");
+    let value = value.replace(['\r', '\n'], " ");
     let lower = value.to_ascii_lowercase();
     if value.trim().is_empty()
         || value.len() > 4_096
@@ -1485,12 +1485,13 @@ mod tests {
         let launch = adapter.launch(&launch_request()).await.unwrap();
         assert_eq!(launch.worker.external_agent_id, AGENT_1);
         assert_eq!(launch.run.state, ExternalWorkerState::Provisioning);
-        let sent = state.launch_requests.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0]["repos"][0]["startingRef"], "main");
-        assert_eq!(sent[0]["autoCreatePR"], false);
-        assert!(sent[0].get("env").is_none());
-        drop(sent);
+        {
+            let sent = state.launch_requests.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0]["repos"][0]["startingRef"], "main");
+            assert_eq!(sent[0]["autoCreatePR"], false);
+            assert!(sent[0].get("env").is_none());
+        }
 
         let worker = adapter
             .get_worker(&launch.worker.external_agent_id)
@@ -1611,13 +1612,14 @@ mod tests {
         assert_eq!(second.items[0].external_agent_id, AGENT_1);
         assert!(second.next_cursor.is_none());
 
-        let queries = state.list_queries.lock().unwrap();
-        assert_eq!(queries[0]["includeArchived"], false);
-        assert_eq!(queries[0]["limit"], 20);
-        assert_eq!(queries[1]["includeArchived"], true);
-        assert_eq!(queries[1]["limit"], 1);
-        assert_eq!(queries[2]["cursor"], AGENT_1);
-        drop(queries);
+        {
+            let queries = state.list_queries.lock().unwrap();
+            assert_eq!(queries[0]["includeArchived"], false);
+            assert_eq!(queries[0]["limit"], 20);
+            assert_eq!(queries[1]["includeArchived"], true);
+            assert_eq!(queries[1]["limit"], 1);
+            assert_eq!(queries[2]["cursor"], AGENT_1);
+        }
         assert!(state
             .request_urls
             .lock()
