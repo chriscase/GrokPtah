@@ -28,8 +28,9 @@ use std::time::Duration;
 
 use grokptah_agent_bridge::{
     home_override_serial, set_grokptah_home_override, start_control_server, AgentHost,
-    AgentHostHandle, ControlServerHandle, HostConfig, McpControlClient, McpRemoteError,
-    OrchestrationConfig, OrchestrationService, RuntimeHome, RuntimeHostKind, WorkspaceAllowlist,
+    AgentHostHandle, AuthCredential, ControlServerHandle, HostConfig, McpControlClient,
+    McpRemoteError, OrchestrationConfig, OrchestrationService, RuntimeHome, RuntimeHostKind,
+    WorkspaceAllowlist,
 };
 use grokptah_service::{start_service, ServiceConfig, ServiceHandle};
 use grokptah_test_gateway::{MockGateway, RecordedRequest, Response, Step};
@@ -663,6 +664,9 @@ async fn start_endpoint(
                 },
                 RuntimeHostKind::DesktopLocal,
             );
+            orch.set_auth_credentials(vec![AuthCredential::operator("primary", token)
+                .expect("shared parity operator credential")])
+                .expect("install shared parity operator credential");
             let server = start_control_server(orch, 0)
                 .await
                 .expect("desktop control server");
@@ -676,7 +680,7 @@ async fn start_endpoint(
             }
         }
         EndpointKind::Hosted => {
-            let config = ServiceConfig::new(
+            let mut config = ServiceConfig::new(
                 "127.0.0.1:0".parse().unwrap(),
                 token,
                 vec![workspace.to_path_buf()],
@@ -687,6 +691,8 @@ async fn start_endpoint(
             .expect("hosted service config")
             .with_runtime_home(home)
             .expect("hosted runtime home");
+            config.client_credentials = vec![AuthCredential::operator("primary", token)
+                .expect("shared parity operator credential")];
             let handle = start_service(config).await.expect("start hosted service");
             let addr = format!("http://{}", handle.addr);
             let mcp = McpControlClient::new(&addr, token);
@@ -773,11 +779,7 @@ fn host_capability_contract(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let expected_hard_denials = vec![
-        "approval".to_string(),
-        "promotion".to_string(),
-        "computer_use".to_string(),
-    ];
+    let expected_hard_denials = vec!["computer_use".to_string()];
     let actual_hard_denials = document["hardDenials"]
         .as_array()
         .map(|values| {
@@ -804,7 +806,7 @@ fn host_capability_contract(
         (
             "principal.role",
             document["principal"]["role"].clone(),
-            json!("remote_coordinator"),
+            json!("remote_operator"),
         ),
         (
             "hostCapabilities",
@@ -930,14 +932,19 @@ async fn drive_six_phases(
     )
     .await
     .expect_err("undeclared Computer mutation must fail closed");
-    if missing_capability_denial != "forbidden_scope" {
+    let missing_capability_denial_kind = if missing_capability_denial.starts_with("unknown tool ") {
+        "unknown_tool"
+    } else {
+        missing_capability_denial.as_str()
+    };
+    if missing_capability_denial_kind != "unknown_tool" {
         defects.push(format!(
-            "{}.hostCapability.missingCapabilityDenial: actual={} expected=forbidden_scope",
+            "{}.hostCapability.missingCapabilityDenial: actual={} expected=unknown_tool",
             kind.as_str(),
-            missing_capability_denial
+            missing_capability_denial_kind
         ));
     }
-    host_contract["missingCapabilityDenial"] = json!(missing_capability_denial);
+    host_contract["missingCapabilityDenial"] = json!(missing_capability_denial_kind);
 
     let capacity0 = call_ok(&mut launched.mcp, "ptah_get_capacity", json!({}), scan).await;
     let readiness_supported = advertised
@@ -2885,11 +2892,10 @@ fn repo_root() -> PathBuf {
         .expect("canonicalize repo root")
 }
 
-fn git_stdout(args: &[&str]) -> Result<String, String> {
-    let root = repo_root();
+fn git_stdout_at(root: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
-        .arg(&root)
+        .arg(root)
         .args(args)
         .output()
         .map_err(|error| format!("git {}: {error}", args.join(" ")))?;
@@ -2930,19 +2936,22 @@ fn allowlisted(path: &str) -> bool {
     })
 }
 
-fn commit_changed_files(sha: &str) -> Result<Vec<String>, String> {
-    let parent = git_stdout(&["rev-parse", &format!("{sha}^")]);
+fn commit_changed_files_at(root: &Path, sha: &str) -> Result<Vec<String>, String> {
+    let parent = git_stdout_at(root, &["rev-parse", &format!("{sha}^")]);
     let diff = if parent.is_ok() {
-        git_stdout(&["diff", "--name-only", &format!("{sha}^"), sha])?
+        git_stdout_at(root, &["diff", "--name-only", &format!("{sha}^"), sha])?
     } else {
-        git_stdout(&[
-            "diff-tree",
-            "--no-commit-id",
-            "--name-only",
-            "--root",
-            "-r",
-            sha,
-        ])?
+        git_stdout_at(
+            root,
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "--root",
+                "-r",
+                sha,
+            ],
+        )?
     };
     Ok(diff
         .lines()
@@ -2952,21 +2961,64 @@ fn commit_changed_files(sha: &str) -> Result<Vec<String>, String> {
 }
 
 fn detect_audited_source_revision() -> String {
-    let status = git_stdout(&["status", "--porcelain"]).expect("git status");
+    detect_audited_source_revision_at(&repo_root())
+}
+
+enum AuditedWalkStart {
+    Direct,
+    SecondParent(String),
+    RetainHead,
+}
+
+fn audited_walk_start(root: &Path, head: &str) -> AuditedWalkStart {
+    let Ok(parent_line) = git_stdout_at(root, &["rev-list", "--parents", "-n", "1", head]) else {
+        return AuditedWalkStart::RetainHead;
+    };
+    let parents: Vec<_> = parent_line.split_whitespace().collect();
+    if parents.first().copied() != Some(head) {
+        return AuditedWalkStart::RetainHead;
+    }
+    match parents.len() {
+        1 | 2 => AuditedWalkStart::Direct,
+        3 => {
+            let merge_tree = git_stdout_at(root, &["rev-parse", &format!("{head}^{{tree}}")]);
+            let second_parent_tree =
+                git_stdout_at(root, &["rev-parse", &format!("{}^{{tree}}", parents[2])]);
+            match (merge_tree, second_parent_tree) {
+                (Ok(merge_tree), Ok(second_parent_tree)) if merge_tree == second_parent_tree => {
+                    AuditedWalkStart::SecondParent(parents[2].to_string())
+                }
+                _ => AuditedWalkStart::RetainHead,
+            }
+        }
+        _ => AuditedWalkStart::RetainHead,
+    }
+}
+
+fn detect_audited_source_revision_at(root: &Path) -> String {
+    let status = git_stdout_at(root, &["status", "--porcelain"]).expect("git status");
     for path in porcelain_paths(&status) {
         if !allowlisted(&path) {
             panic!("unexpected dirty path outside fixture allowlist: {path}");
         }
     }
-    let mut sha = git_stdout(&["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    let head = git_stdout_at(root, &["rev-parse", "HEAD"]).expect("git rev-parse HEAD");
+    let mut sha = match audited_walk_start(root, &head) {
+        AuditedWalkStart::Direct => head.clone(),
+        AuditedWalkStart::SecondParent(parent) => parent,
+        AuditedWalkStart::RetainHead => return head,
+    };
     loop {
-        let files = commit_changed_files(&sha).expect("commit files");
+        let files = match commit_changed_files_at(root, &sha) {
+            Ok(files) => files,
+            Err(_) => return head,
+        };
         if files.iter().any(|path| !allowlisted(path)) {
             return sha;
         }
-        match git_stdout(&["rev-parse", &format!("{sha}^")]) {
+        match git_stdout_at(root, &["rev-parse", &format!("{sha}^")]) {
             Ok(parent) => sha = parent,
-            Err(_) => panic!("could not identify audited host revision (fail closed)"),
+            Err(_) => return head,
         }
     }
 }
@@ -3342,9 +3394,9 @@ fn host_capability_oracle_rejects_kind_and_capability_drift() {
             "hostKind": "desktop_local",
             "hostVersion": "0.1.0"
         },
-        "principal": { "role": "remote_coordinator" },
+        "principal": { "role": "remote_operator" },
         "hostCapabilities": desktop_capabilities,
-        "hardDenials": ["approval", "promotion", "computer_use"]
+        "hardDenials": ["computer_use"]
     });
     let mut defects = Vec::new();
     host_capability_contract(EndpointKind::Desktop, &document, &mut defects);
@@ -3369,4 +3421,163 @@ fn expected_main_golden_is_immutable_for_audited_revision() {
         loaded["overlay"]["mcpError"]["code"],
         json!("invalid_request")
     );
+}
+
+fn detector_test_git(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("run detector test git command");
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string()
+}
+
+fn detector_test_repo() -> TempDir {
+    let repo = tempfile::tempdir().expect("detector test repo");
+    detector_test_git(repo.path(), &["init", "--quiet", "-b", "main"]);
+    detector_test_git(
+        repo.path(),
+        &["config", "user.email", "detector-tests@example.invalid"],
+    );
+    detector_test_git(repo.path(), &["config", "user.name", "detector tests"]);
+    detector_test_write(
+        repo.path(),
+        "crates/codegen/grokptah-service/tests/shared_black_box_v1.rs",
+        "fixture-only base\n",
+    );
+    detector_test_commit(repo.path(), "base").expect("detector test base commit");
+    repo
+}
+
+fn detector_test_write(repo: &Path, path: &str, contents: &str) {
+    let path = repo.join(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("detector test parent");
+    }
+    std::fs::write(path, contents).expect("detector test file");
+}
+
+fn detector_test_commit(repo: &Path, message: &str) -> Result<String, String> {
+    let add = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["add", "--all"])
+        .output()
+        .map_err(|error| format!("git add: {error}"))?;
+    if !add.status.success() {
+        return Err(String::from_utf8_lossy(&add.stderr).to_string());
+    }
+    let commit = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["commit", "--quiet", "-m", message])
+        .output()
+        .map_err(|error| format!("git commit: {error}"))?;
+    if !commit.status.success() {
+        return Err(String::from_utf8_lossy(&commit.stderr).to_string());
+    }
+    Ok(detector_test_git(repo, &["rev-parse", "HEAD"]))
+}
+
+fn matching_tree_detector_test_repo() -> (TempDir, String, String) {
+    let repo = detector_test_repo();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "-b", "candidate"]);
+    detector_test_write(repo.path(), "candidate-only.txt", "candidate\n");
+    let candidate =
+        detector_test_commit(repo.path(), "candidate outside fixture allowlist").unwrap();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_test_git(
+        repo.path(),
+        &["merge", "--quiet", "--no-ff", "--no-edit", "candidate"],
+    );
+    let merge = detector_test_git(repo.path(), &["rev-parse", "HEAD"]);
+    (repo, candidate, merge)
+}
+
+#[test]
+fn matching_tree_merge_starts_audited_walk_at_second_parent() {
+    let (repo, candidate, merge) = matching_tree_detector_test_repo();
+    assert_ne!(candidate, merge);
+    assert_eq!(detect_audited_source_revision_at(repo.path()), candidate);
+}
+
+#[test]
+fn unique_tree_merge_retains_merge_sha() {
+    let repo = detector_test_repo();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "-b", "candidate"]);
+    detector_test_write(repo.path(), "candidate-only.txt", "candidate\n");
+    detector_test_commit(repo.path(), "candidate change").unwrap();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_test_write(repo.path(), "base-only.txt", "base branch\n");
+    detector_test_commit(repo.path(), "base branch change").unwrap();
+    detector_test_git(
+        repo.path(),
+        &["merge", "--quiet", "--no-ff", "--no-edit", "candidate"],
+    );
+    let merge = detector_test_git(repo.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(detect_audited_source_revision_at(repo.path()), merge);
+}
+
+#[test]
+fn octopus_merge_retains_merge_sha() {
+    let repo = detector_test_repo();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "-b", "one"]);
+    detector_test_write(repo.path(), "one-only.txt", "one\n");
+    detector_test_commit(repo.path(), "one").unwrap();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_test_git(repo.path(), &["checkout", "--quiet", "-b", "two"]);
+    detector_test_write(repo.path(), "two-only.txt", "two\n");
+    detector_test_commit(repo.path(), "two").unwrap();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_test_git(repo.path(), &["checkout", "--quiet", "-b", "three"]);
+    detector_test_write(repo.path(), "three-only.txt", "three\n");
+    detector_test_commit(repo.path(), "three").unwrap();
+    detector_test_git(repo.path(), &["checkout", "--quiet", "main"]);
+    detector_test_git(
+        repo.path(),
+        &[
+            "merge",
+            "--quiet",
+            "--no-ff",
+            "--no-edit",
+            "one",
+            "two",
+            "three",
+        ],
+    );
+    let merge = detector_test_git(repo.path(), &["rev-parse", "HEAD"]);
+    let parents = detector_test_git(repo.path(), &["rev-list", "--parents", "-n", "1", "HEAD"]);
+    assert_eq!(parents.split_whitespace().count(), 5);
+    assert_eq!(detect_audited_source_revision_at(repo.path()), merge);
+}
+
+#[test]
+fn shallow_matching_tree_merge_retains_merge_sha() {
+    let (repo, _candidate, merge) = matching_tree_detector_test_repo();
+    let clone_parent = tempfile::tempdir().expect("shallow clone parent");
+    let clone = clone_parent.path().join("clone");
+    let source = format!("file://{}", repo.path().display());
+    let output = Command::new("git")
+        .args(["clone", "--quiet", "--depth", "1", "--branch", "main"])
+        .arg(source)
+        .arg(&clone)
+        .output()
+        .expect("clone shallow detector test repo");
+    assert!(
+        output.status.success(),
+        "git clone failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let shallow_head = detector_test_git(&clone, &["rev-parse", "HEAD"]);
+    assert_eq!(shallow_head, merge);
+    assert_eq!(detect_audited_source_revision_at(&clone), merge);
 }
