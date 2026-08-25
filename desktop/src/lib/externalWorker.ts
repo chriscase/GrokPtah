@@ -118,7 +118,20 @@ export const MAX_EXTERNAL_WORKER_ARTIFACT_BYTES = 8 * 1024 * 1024;
 export const MAX_EXTERNAL_WORKER_ARTIFACTS = 256;
 /** The only content-digest algorithm this contract accepts. */
 const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/;
-const WINDOWS_DRIVE = /^[A-Za-z]:/;
+/**
+ * One conservative portable grammar for artifact paths, identical to the Rust
+ * contract and the published `grokptah-external-worker.v1` schema: ASCII
+ * alphanumerics, dot, underscore and hyphen per segment, never ending in a
+ * dot, never a Windows reserved device name. That single shape also refuses
+ * every absolute form, traversal, empty and dot segments, separators,
+ * query/fragment cloaking, and all non-ASCII — so a path that resolves here
+ * resolves the same way on every filesystem.
+ *
+ * Held as a string, not a literal, so a test can assert it is byte-identical
+ * to the schema's own `artifactPath` pattern.
+ */
+export const ARTIFACT_PATH_PATTERN = "^(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|/|$))[A-Za-z0-9._-]*[A-Za-z0-9_-](?:/(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|/|$))[A-Za-z0-9._-]*[A-Za-z0-9_-])*$";
+const ARTIFACT_PATH = new RegExp(ARTIFACT_PATH_PATTERN);
 const PROVIDERS = new Set<ExternalWorkerProvider>([
   "cursor_cloud",
   "claude_code_cloud",
@@ -195,12 +208,9 @@ function relativeRef(value: unknown): value is string {
  */
 function artifactPath(value: unknown): value is string {
   return (
-    relativeRef(value) &&
-    !value.startsWith("~") &&
-    !WINDOWS_DRIVE.test(value) &&
-    !value.includes("?") &&
-    !value.includes("#") &&
-    !value.split("/").some((segment) => segment === "" || segment === ".")
+    typeof value === "string" &&
+    new TextEncoder().encode(value).byteLength <= MAX_REF_BYTES &&
+    ARTIFACT_PATH.test(value)
   );
 }
 

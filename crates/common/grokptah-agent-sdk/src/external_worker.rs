@@ -484,7 +484,45 @@ fn validate_artifact_path(value: &str) -> Result<(), &'static str> {
     {
         return Err(ERROR);
     }
+    // One conservative portable grammar, applied everywhere.
+    //
+    // Refusing anything outside it is deliberate: a permissive path is a
+    // portability bug that only shows up on someone else's filesystem. Unicode
+    // normalization makes two different byte strings name one file on macOS,
+    // case-insensitivity does the same on Windows and macOS, and a name that
+    // is merely awkward on POSIX can be unopenable on Windows. A digest over
+    // bytes cannot save a consumer that resolved the wrong file.
+    for segment in value.split('/') {
+        if !segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(ERROR);
+        }
+        // Windows silently strips a trailing dot or space, so `report.md.` and
+        // `report.md` are the same file there and different ones on POSIX.
+        if segment.ends_with('.') || segment.ends_with(' ') || segment.starts_with(' ') {
+            return Err(ERROR);
+        }
+        if is_windows_reserved_name(segment) {
+            return Err(ERROR);
+        }
+    }
     Ok(())
+}
+
+/// Windows reserved device names, which cannot be created as files even inside
+/// a directory, and which match case-insensitively and ignoring an extension.
+fn is_windows_reserved_name(segment: &str) -> bool {
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    // `NUL.txt` is as reserved as `NUL`, so compare the stem.
+    let stem = segment.split('.').next().unwrap_or(segment);
+    RESERVED
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
 }
 
 /// A digest is only a safety property if it names an algorithm and a full
@@ -804,6 +842,191 @@ mod tests {
                 "size {oversized} must not be accepted",
             );
         }
+    }
+
+    /// One conservative grammar, so a path that resolves here resolves the
+    /// same way on every consumer's filesystem.
+    #[test]
+    fn artifact_paths_follow_one_portable_ascii_grammar() {
+        for portable in [
+            "artifacts/report.md",
+            "artifacts/a/b/c-1_2.json",
+            "a",
+            "artifacts/..hidden",
+            "artifacts/UPPER.TXT",
+        ] {
+            let candidate = ExternalWorkerArtifact {
+                path: portable.into(),
+                ..artifact()
+            };
+            assert!(
+                candidate.validate().is_ok(),
+                "portable path {portable:?} must be accepted",
+            );
+        }
+        for hostile in [
+            // Unicode normalization makes these two name one file on macOS.
+            "artifacts/café.md",
+            "artifacts/cafe\u{301}.md",
+            // A right-to-left override reorders how the name is displayed.
+            "artifacts/report\u{202e}gnp.md",
+            // A zero-width space is invisible next to a legitimate name.
+            "artifacts/report\u{200b}.md",
+            // Shell and Windows metacharacters.
+            "artifacts/report;rm -rf.md",
+            "artifacts/report*.md",
+            "artifacts/report:stream",
+            "artifacts/report|pipe",
+            "artifacts/a b.md",
+            // Windows strips these, collapsing two names into one.
+            "artifacts/report.md.",
+            "artifacts/report.md ",
+            "artifacts/ report.md",
+            // Reserved device names, with and without an extension.
+            "artifacts/NUL",
+            "artifacts/nul.txt",
+            "artifacts/COM1",
+            "artifacts/lpt9.log",
+            "CON/report.md",
+        ] {
+            let candidate = ExternalWorkerArtifact {
+                path: hostile.into(),
+                ..artifact()
+            };
+            assert_eq!(
+                candidate.validate(),
+                Err("artifact path must be bounded and relative"),
+                "path {hostile:?} must not be accepted",
+            );
+        }
+    }
+
+    /// The same corpus the TypeScript parser and the published schema are
+    /// tested against, under a real JSON Schema validator, in
+    /// `desktop/src/lib/externalWorkerConformance.test.ts`.
+    ///
+    /// Three hand-written implementations of one rule drift. Reading the cases
+    /// from one file means a rule that changes here and nowhere else fails in
+    /// two suites rather than surfacing in a consumer.
+    #[test]
+    fn the_shared_conformance_corpus_agrees_with_this_validator() {
+        const CORPUS: &str = include_str!(
+            "../../../../docs/schemas/grokptah-external-worker.v1.conformance.json"
+        );
+        let corpus: serde_json::Value =
+            serde_json::from_str(CORPUS).expect("conformance corpus is valid JSON");
+        assert_eq!(corpus["contract"], EXTERNAL_WORKER_CONTRACT_VERSION);
+        let valid_digest = corpus["validDigest"]
+            .as_str()
+            .expect("corpus names a valid digest");
+
+        let strings = |group: &str, verdict: &str| -> Vec<String> {
+            corpus[group][verdict]
+                .as_array()
+                .unwrap_or_else(|| panic!("corpus has {group}.{verdict}"))
+                .iter()
+                .map(|item| item.as_str().expect("corpus entry is a string").to_string())
+                .collect()
+        };
+
+        let mut checked = 0usize;
+        for path in strings("artifactPath", "accept") {
+            let candidate = ExternalWorkerArtifact {
+                path: path.clone(),
+                digest: valid_digest.into(),
+                external_run_id: "run-1".into(),
+                size_bytes: None,
+            };
+            assert!(
+                candidate.validate().is_ok(),
+                "corpus says accept, validator refused: {path:?}",
+            );
+            checked += 1;
+        }
+        for path in strings("artifactPath", "refuse") {
+            let candidate = ExternalWorkerArtifact {
+                path: path.clone(),
+                digest: valid_digest.into(),
+                external_run_id: "run-1".into(),
+                size_bytes: None,
+            };
+            assert_eq!(
+                candidate.validate(),
+                Err("artifact path must be bounded and relative"),
+                "corpus says refuse, validator accepted: {path:?}",
+            );
+            checked += 1;
+        }
+        for digest in strings("digest", "accept") {
+            let candidate = ExternalWorkerArtifact {
+                digest: digest.clone(),
+                ..ExternalWorkerArtifact {
+                    path: "artifacts/report.md".into(),
+                    digest: valid_digest.into(),
+                    external_run_id: "run-1".into(),
+                    size_bytes: None,
+                }
+            };
+            assert!(
+                candidate.validate().is_ok(),
+                "corpus says accept, validator refused digest {digest:?}",
+            );
+            checked += 1;
+        }
+        for digest in strings("digest", "refuse") {
+            let candidate = ExternalWorkerArtifact {
+                path: "artifacts/report.md".into(),
+                digest: digest.clone(),
+                external_run_id: "run-1".into(),
+                size_bytes: None,
+            };
+            assert_eq!(
+                candidate.validate(),
+                Err("digest must be sha256:<64 lowercase hex>"),
+                "corpus says refuse, validator accepted digest {digest:?}",
+            );
+            checked += 1;
+        }
+        for size in corpus["sizeBytes"]["accept"]
+            .as_array()
+            .expect("corpus has sizeBytes.accept")
+        {
+            let size = size.as_u64().expect("an accepted size is unsigned");
+            let candidate = ExternalWorkerArtifact {
+                path: "artifacts/report.md".into(),
+                digest: valid_digest.into(),
+                external_run_id: "run-1".into(),
+                size_bytes: Some(size),
+            };
+            assert!(
+                candidate.validate().is_ok(),
+                "corpus says accept, validator refused size {size}",
+            );
+            checked += 1;
+        }
+        // A negative size cannot be spelled in `u64`; the contract makes that
+        // case unrepresentable rather than merely invalid, so only the
+        // over-ceiling case is exercised here.
+        for size in corpus["sizeBytes"]["refuse"]
+            .as_array()
+            .expect("corpus has sizeBytes.refuse")
+            .iter()
+            .filter_map(serde_json::Value::as_u64)
+        {
+            let candidate = ExternalWorkerArtifact {
+                path: "artifacts/report.md".into(),
+                digest: valid_digest.into(),
+                external_run_id: "run-1".into(),
+                size_bytes: Some(size),
+            };
+            assert_eq!(
+                candidate.validate(),
+                Err("artifact size exceeds its byte ceiling"),
+                "corpus says refuse, validator accepted size {size}",
+            );
+            checked += 1;
+        }
+        assert!(checked > 40, "the corpus must not silently shrink");
     }
 
     /// The published schema is what a non-Rust consumer implements against.

@@ -1,0 +1,76 @@
+{
+  "$comment": "Shared conformance corpus for grokptah-external-workers.v1. Every implementation of the contract - the Rust SDK validator, the browser-safe TypeScript parser, and the published JSON Schema under a real validator - must agree on every case here. It exists because three hand-written implementations of one rule drift, and a case-by-case parity assertion only proves agreement on the cases someone thought to write twice.",
+  "contract": "grokptah.external-workers.v1",
+  "validDigest": "sha256:be426b4d0bc6e0536d2bb2e8917792b442ac93cfa0ea7ff26a95e00b62a5af37",
+  "artifactPath": {
+    "accept": [
+      "artifacts/report.md",
+      "artifacts/a/b/c-1_2.json",
+      "a",
+      "artifacts/..hidden",
+      "artifacts/UPPER.TXT",
+      "artifacts/report_v2-final.md"
+    ],
+    "refuse": [
+      "C:/Windows/System32/config",
+      "c:/Users/secret/.ssh/id_ed25519",
+      "Z:/",
+      "/etc/passwd",
+      "~/.ssh/id_ed25519",
+      "~",
+      "artifacts/../../etc/passwd",
+      "artifacts//review.json",
+      "artifacts/./review.json",
+      "artifacts/",
+      "artifacts/review.json?sig=secret",
+      "artifacts/review.json#fragment",
+      "artifacts\\review.json",
+      "artifacts/review\u0000.json",
+      "..",
+      ".",
+      "artifacts/café.md",
+      "artifacts/café.md",
+      "artifacts/report‮gnp.md",
+      "artifacts/report​.md",
+      "artifacts/report;rm -rf.md",
+      "artifacts/report*.md",
+      "artifacts/report:stream",
+      "artifacts/report|pipe",
+      "artifacts/a b.md",
+      "artifacts/review.json.",
+      "artifacts/review.json ",
+      "artifacts/ review.json",
+      "artifacts/NUL",
+      "artifacts/nul.txt",
+      "artifacts/COM1",
+      "artifacts/lpt9.log",
+      "CON/review.json"
+    ]
+  },
+  "digest": {
+    "accept": [
+      "sha256:be426b4d0bc6e0536d2bb2e8917792b442ac93cfa0ea7ff26a95e00b62a5af37"
+    ],
+    "refuse": [
+      "sha256:abc",
+      "trust-me",
+      "md5:9f86d081884c7d659a2feaa0c55ad015",
+      "SHA256:BE426B4D0BC6E0536D2BB2E8917792B442AC93CFA0EA7FF26A95E00B62A5AF37",
+      "sha256:be426b4d0bc6e0536d2bb2e8917792b442ac93cfa0ea7ff26a95e00b62a5af370",
+      "sha256:be426b4d0bc6e0536d2bb2e8917792b442ac93cfa0ea7ff26a95e00b62a5af3",
+      "sha512:be426b4d0bc6e0536d2bb2e8917792b442ac93cfa0ea7ff26a95e00b62a5af37",
+      ""
+    ]
+  },
+  "sizeBytes": {
+    "accept": [
+      0,
+      1,
+      8388608
+    ],
+    "refuse": [
+      -1,
+      8388609
+    ]
+  }
+}

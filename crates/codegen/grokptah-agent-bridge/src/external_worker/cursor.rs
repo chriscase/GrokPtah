@@ -41,6 +41,12 @@ pub const MAX_PROVIDER_RESPONSE_BYTES: u64 = 1024 * 1024;
 /// so this ceiling is deliberately tighter than the success ceiling.
 pub const MAX_PROVIDER_ERROR_BODY_BYTES: u64 = 64 * 1024;
 
+/// Maximum bytes this host will materialize across one whole run listing.
+///
+/// The per-artifact ceiling alone permits `MAX_EXTERNAL_WORKER_ARTIFACTS`
+/// artifacts each just under it, so the aggregate is bounded separately.
+pub const MAX_EXTERNAL_WORKER_LISTING_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Documented virtual-hosted Cursor artifact prefix.
 pub const PRODUCTION_ARTIFACT_HOST_PREFIX: &str = "cloud-agent-artifacts.s3.";
 
@@ -52,6 +58,7 @@ pub struct CursorCloudAdapter {
     allowed_repositories: Option<Arc<BTreeSet<String>>>,
     allowed_artifact_hosts: Arc<BTreeSet<String>>,
     max_artifact_bytes: u64,
+    max_listing_bytes: u64,
     allow_http_artifact_hosts: bool,
 }
 
@@ -106,6 +113,7 @@ impl CursorCloudAdapter {
             allowed_repositories: None,
             allowed_artifact_hosts: Arc::new(BTreeSet::new()),
             max_artifact_bytes: MAX_EXTERNAL_WORKER_ARTIFACT_BYTES,
+            max_listing_bytes: MAX_EXTERNAL_WORKER_LISTING_BYTES,
             allow_http_artifact_hosts: false,
         })
     }
@@ -156,11 +164,17 @@ impl CursorCloudAdapter {
             )),
             allowed_artifact_hosts: Arc::new(hosts),
             max_artifact_bytes: MAX_EXTERNAL_WORKER_ARTIFACT_BYTES,
+            max_listing_bytes: MAX_EXTERNAL_WORKER_LISTING_BYTES,
             allow_http_artifact_hosts: true,
         }
     }
 
     #[cfg(test)]
+    pub(crate) fn with_max_listing_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_listing_bytes = max_bytes;
+        self
+    }
+
     pub(crate) fn with_max_artifact_bytes(mut self, max_bytes: u64) -> Self {
         self.max_artifact_bytes = max_bytes;
         self
@@ -711,6 +725,7 @@ impl ExternalWorkerAdapter for CursorCloudAdapter {
             ));
         }
         let mut artifacts = Vec::with_capacity(response.items.len());
+        let mut total_bytes: u64 = 0;
         for item in response.items {
             if !Self::artifact_path_is_safe(&item.path) {
                 return Err(ExternalWorkerAdapterError::InvalidResponse(
@@ -727,27 +742,46 @@ impl ExternalWorkerAdapter for CursorCloudAdapter {
                     "Cursor artifact is not attributed to the requested run",
                 ));
             }
-            let digest = match item.digest.filter(|value| !value.trim().is_empty()) {
-                Some(digest) => digest,
-                None => {
-                    let (digest, hashed_bytes) = self
-                        .download_and_hash(id, &item.path, item.size_bytes)
-                        .await?;
-                    if let Some(reported) = item.size_bytes {
-                        if reported != hashed_bytes {
-                            return Err(ExternalWorkerAdapterError::InvalidResponse(
-                                "Cursor artifact size did not match the downloaded bytes",
-                            ));
-                        }
-                    }
-                    digest
+            // Always stream and rehash. A provider-supplied digest is a claim
+            // about bytes this host has never seen: trusting it means the
+            // digest published to a reviewer certifies nothing, and the byte
+            // ceiling is never applied on that path. The digest that leaves
+            // here is always one this host computed over bytes it read.
+            let (digest, hashed_bytes) = self
+                .download_and_hash(id, &item.path, item.size_bytes)
+                .await?;
+            if let Some(claimed) = item.digest.filter(|value| !value.trim().is_empty()) {
+                // A supplied digest is still checked, so a provider that
+                // reports one cannot disagree with its own bytes unnoticed.
+                if claimed != digest {
+                    return Err(ExternalWorkerAdapterError::InvalidResponse(
+                        "Cursor artifact digest did not match the downloaded bytes",
+                    ));
                 }
-            };
+            }
+            if let Some(reported) = item.size_bytes {
+                if reported != hashed_bytes {
+                    return Err(ExternalWorkerAdapterError::InvalidResponse(
+                        "Cursor artifact size did not match the downloaded bytes",
+                    ));
+                }
+            }
+            // The aggregate ceiling bounds the whole listing, not just each
+            // member: 256 artifacts each just under the per-item ceiling is
+            // two gigabytes that every per-item check would allow.
+            total_bytes = total_bytes.saturating_add(hashed_bytes);
+            if total_bytes > self.max_listing_bytes {
+                return Err(ExternalWorkerAdapterError::InvalidResponse(
+                    "Cursor artifact listing exceeds its aggregate byte ceiling",
+                ));
+            }
             let artifact = ExternalWorkerArtifact {
                 path: item.path,
                 digest,
                 external_run_id: run_id.to_string(),
-                size_bytes: item.size_bytes,
+                // The size published is the count of bytes this host actually
+                // materialized, never the provider's claim about them.
+                size_bytes: Some(hashed_bytes),
             };
             artifact
                 .validate()
@@ -1918,22 +1952,24 @@ mod tests {
         );
     }
 
-    /// The adapter hashes an artifact itself only when the provider omits a
-    /// digest. On the supplied-digest path nothing is downloaded, so the label
-    /// was published unverified. It must at least be a SHA-256.
+    /// A provider-supplied digest is a claim about bytes this host has never
+    /// seen. It is no longer taken as the answer: the artifact is always
+    /// streamed and rehashed, and a claim that disagrees with the materialized
+    /// bytes fails the listing closed.
     #[tokio::test]
-    async fn provider_supplied_digest_must_be_a_real_sha256() {
-        for digest in [
+    async fn a_supplied_digest_is_checked_against_the_bytes_not_trusted() {
+        for claimed in [
             "sha256:abc",
             "trust-me",
-            "md5:9f86d081884c7d659a2feaa0c55ad015",
+            // Well-formed, correct algorithm, simply not these bytes.
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         ] {
             let state = FakeCursorState::default();
             state.config.lock().unwrap().artifacts = json!({
                 "items": [{
                     "path": "artifacts/report.md",
                     "runId": FAKE_RUN,
-                    "digest": digest,
+                    "digest": claimed,
                     "sizeBytes": 12
                 }]
             });
@@ -1947,20 +1983,53 @@ mod tests {
                 matches!(
                     error,
                     ExternalWorkerAdapterError::InvalidResponse(
-                        "digest must be sha256:<64 lowercase hex>"
+                        "Cursor artifact digest did not match the downloaded bytes"
                     )
                 ),
-                "digest {digest:?} must be refused, got {error:?}",
+                "digest {claimed:?} must be refused against the bytes, got {error:?}",
             );
-            assert_eq!(*state.download_calls.lock().unwrap(), 0);
+            assert_eq!(
+                *state.download_calls.lock().unwrap(),
+                1,
+                "the artifact must have been streamed before the claim was judged",
+            );
         }
     }
 
-    /// `max_artifact_bytes` only guards the download. A provider that supplies
-    /// its own digest never reaches that guard, so an unbounded `sizeBytes`
-    /// reached the ledger and the browser with no ceiling anywhere.
+    /// The digest and size that leave the adapter are always the ones this host
+    /// computed, never the provider's claims about them.
     #[tokio::test]
-    async fn reported_size_is_bounded_on_the_path_that_never_downloads() {
+    async fn the_published_digest_and_size_are_always_the_materialized_ones() {
+        let state = FakeCursorState::default();
+        state.config.lock().unwrap().artifacts = json!({
+            "items": [{
+                "path": "artifacts/report.md",
+                "runId": FAKE_RUN,
+                "digest": FAKE_ARTIFACT_DIGEST,
+                "sizeBytes": 12
+            }]
+        });
+        let base = spawn_fake_cursor(state.clone()).await;
+        let adapter = CursorCloudAdapter::for_test(&base);
+        let artifacts = adapter.list_artifacts(FAKE_AGENT, FAKE_RUN).await.unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            artifacts[0].digest,
+            format!("sha256:{}", hex_sha256(&Sha256::digest(b"hashed-bytes"))),
+        );
+        assert_eq!(artifacts[0].size_bytes, Some(12));
+        assert_eq!(artifacts[0].external_run_id, FAKE_RUN);
+        assert_eq!(
+            *state.download_calls.lock().unwrap(),
+            1,
+            "a matching claim is still verified, not skipped",
+        );
+    }
+
+    /// An oversized reported size is refused before a byte is fetched, so a
+    /// provider cannot make this host pull an unbounded object.
+    #[tokio::test]
+    async fn an_oversized_reported_size_is_refused_before_any_download() {
         let state = FakeCursorState::default();
         state.config.lock().unwrap().artifacts = json!({
             "items": [{
@@ -1980,12 +2049,65 @@ mod tests {
             matches!(
                 error,
                 ExternalWorkerAdapterError::InvalidResponse(
-                    "artifact size exceeds its byte ceiling"
+                    "Cursor artifact exceeds the download byte ceiling"
                 )
             ),
-            "oversized reported size must be refused, got {error:?}",
+            "an oversized reported size must be refused, got {error:?}",
         );
         assert_eq!(*state.download_calls.lock().unwrap(), 0);
+    }
+
+    /// Per-artifact ceilings alone permit a listing of many near-ceiling
+    /// artifacts, so the aggregate is bounded separately.
+    #[tokio::test]
+    async fn the_listing_is_bounded_in_aggregate_bytes_not_only_per_artifact() {
+        // A listing ceiling small enough to reach under the item ceiling: three
+        // 4 KiB artifacts against a 10 KiB aggregate.
+        let per_artifact = 4096u64;
+        let listing_ceiling = 10 * 1024u64;
+        let items = (0..3)
+            .map(|index| {
+                json!({
+                    "path": format!("artifacts/report-{index}.md"),
+                    "runId": FAKE_RUN,
+                    "sizeBytes": per_artifact
+                })
+            })
+            .collect::<Vec<_>>();
+        let state = FakeCursorState::default();
+        {
+            let mut config = state.config.lock().unwrap();
+            config.artifacts = json!({ "items": items });
+            config.artifact_bytes = vec![b'x'; per_artifact as usize];
+        }
+        let base = spawn_fake_cursor(state.clone()).await;
+        let adapter = CursorCloudAdapter::for_test(&base).with_max_listing_bytes(listing_ceiling);
+        let error = adapter
+            .list_artifacts(FAKE_AGENT, FAKE_RUN)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ExternalWorkerAdapterError::InvalidResponse(
+                    "Cursor artifact listing exceeds its aggregate byte ceiling"
+                )
+            ),
+            "an oversized listing must be refused in aggregate, got {error:?}",
+        );
+        // It stopped at the ceiling rather than draining the whole listing.
+        assert_eq!(*state.download_calls.lock().unwrap(), 3);
+
+        // Under the ceiling the same listing resolves.
+        let adapter = CursorCloudAdapter::for_test(&base).with_max_listing_bytes(64 * 1024);
+        assert_eq!(
+            adapter
+                .list_artifacts(FAKE_AGENT, FAKE_RUN)
+                .await
+                .unwrap()
+                .len(),
+            3,
+        );
     }
 
     /// The listing sized a collection from a provider-controlled count before

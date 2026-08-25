@@ -12,19 +12,23 @@ on:
     paths:
       - "crates/common/grokptah-agent-sdk/**"
       - "docs/schemas/grokptah-external-worker.v1.schema.json"
+      - "docs/schemas/grokptah-external-worker.v1.conformance.json"
       - "desktop/src/lib/externalWorker.ts"
       - "desktop/src/lib/externalWorker.test.ts"
       - "desktop/src/lib/grokptahBrokerClient.ts"
       - "desktop/src/lib/grokptahBrokerClient.test.ts"
+      - "desktop/src/lib/externalWorkerConformance.test.ts"
       - ".github/workflows/external-worker-contract.yml"
   pull_request:
     paths:
       - "crates/common/grokptah-agent-sdk/**"
       - "docs/schemas/grokptah-external-worker.v1.schema.json"
+      - "docs/schemas/grokptah-external-worker.v1.conformance.json"
       - "desktop/src/lib/externalWorker.ts"
       - "desktop/src/lib/externalWorker.test.ts"
       - "desktop/src/lib/grokptahBrokerClient.ts"
       - "desktop/src/lib/grokptahBrokerClient.test.ts"
+      - "desktop/src/lib/externalWorkerConformance.test.ts"
       - ".github/workflows/external-worker-contract.yml"
 
 permissions:
@@ -72,4 +76,7 @@ jobs:
         working-directory: desktop
         run: |
           npm ci
-          npx vitest run src/lib/externalWorker.test.ts src/lib/grokptahBrokerClient.test.ts
+          npx vitest run \
+            src/lib/externalWorker.test.ts \
+            src/lib/externalWorkerConformance.test.ts \
+            src/lib/grokptahBrokerClient.test.ts

@@ -33,11 +33,11 @@
       "pattern": "^[^/\\\\][^\\u0000-\\u001f\\r\\n]*$"
     },
     "artifactPath": {
-      "$comment": "Stricter than ref: refuses the absolute forms a ref allows (a Windows drive, a tilde), query/fragment cloaking, and empty, '.', or '..' segments, so joining it onto a containment root cannot leave that root.",
+      "$comment": "One conservative portable grammar: ASCII alphanumerics, dot, underscore and hyphen per segment, never ending in a dot, never a Windows reserved device name. That single shape refuses absolute forms (drive, tilde, leading slash), traversal, query/fragment cloaking, empty and dot segments, separators, and every non-ASCII spelling that two filesystems would normalize differently.",
       "type": "string",
       "minLength": 1,
       "maxLength": 512,
-      "pattern": "^(?!~)(?![A-Za-z]:)(?!\\.{1,2}(?:/|$))[^/\\\\?#\\u0000-\\u001f\\u007f]+(?:/(?!\\.{1,2}(?:/|$))[^/\\\\?#\\u0000-\\u001f\\u007f]+)*$"
+      "pattern": "^(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|/|$))[A-Za-z0-9._-]*[A-Za-z0-9_-](?:/(?!(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9]|[Ll][Pp][Tt][1-9])(?:\\.|/|$))[A-Za-z0-9._-]*[A-Za-z0-9_-])*$"
     },
     "digest": {
       "$comment": "A digest is only a safety property if it names an algorithm and carries a full value.",

@@ -18,7 +18,7 @@ pub use authority::{
 };
 pub use cursor::{
     CursorCloudAdapter, CURSOR_CLOUD_API_BASE, MAX_EXTERNAL_WORKER_ARTIFACT_BYTES,
-    PRODUCTION_ARTIFACT_HOST_PREFIX,
+    MAX_EXTERNAL_WORKER_LISTING_BYTES, PRODUCTION_ARTIFACT_HOST_PREFIX,
 };
 pub use host::ExternalWorkerHost;
 pub use ledger::{

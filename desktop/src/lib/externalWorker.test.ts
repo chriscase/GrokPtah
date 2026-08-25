@@ -3,6 +3,7 @@ import schema from "../../../docs/schemas/grokptah-external-worker.v1.schema.jso
 import {
   applyExternalWorkerNotification,
   createExternalWorkerMonitor,
+  ARTIFACT_PATH_PATTERN,
   EXTERNAL_WORKER_CONTRACT,
   EXTERNAL_WORKER_STREAMING_SUPPORTED,
   MAX_EXTERNAL_WORKER_ARTIFACTS,
@@ -163,6 +164,29 @@ describe("external worker UI contract", () => {
       "artifacts/review.json?sig=secret",
       "artifacts/review.json#fragment",
       "artifacts\\review.json",
+      // Two byte strings that macOS normalizes to one file name.
+      "artifacts/caf\u00e9.md",
+      "artifacts/cafe\u0301.md",
+      // A right-to-left override reorders how the name is displayed.
+      "artifacts/report\u202egnp.md",
+      // A zero-width space is invisible beside a legitimate name.
+      "artifacts/report\u200b.md",
+      // Shell and Windows metacharacters.
+      "artifacts/report;rm -rf.md",
+      "artifacts/report*.md",
+      "artifacts/report:stream",
+      "artifacts/report|pipe",
+      "artifacts/a b.md",
+      // Windows strips these, collapsing two names into one.
+      "artifacts/review.json.",
+      "artifacts/review.json ",
+      "artifacts/ review.json",
+      // Reserved device names, with and without an extension.
+      "artifacts/NUL",
+      "artifacts/nul.txt",
+      "artifacts/COM1",
+      "artifacts/lpt9.log",
+      "CON/review.json",
     ]) {
       expect(
         parseExternalWorkerArtifact({ path, digest: DIGEST, runId: "run-1" }),
@@ -196,6 +220,9 @@ describe("external worker UI contract", () => {
   it("agrees with the published v1 schema on artifact bounds", () => {
     const artifact = schema.$defs.artifact.properties;
     expect(schema.$defs.digest.pattern).toBe(SHA256_DIGEST_PATTERN);
+    // The parser and the schema must not merely agree case by case; they must
+    // be the same rule, or some untested input eventually separates them.
+    expect(schema.$defs.artifactPath.pattern).toBe(ARTIFACT_PATH_PATTERN);
     expect(artifact.sizeBytes.maximum).toBe(MAX_EXTERNAL_WORKER_ARTIFACT_BYTES);
     expect(schema.properties.artifacts.maxItems).toBe(MAX_EXTERNAL_WORKER_ARTIFACTS);
     // The artifact must not fall back to the looser `ref` and `identity` rules.
@@ -211,6 +238,8 @@ describe("external worker UI contract", () => {
       "artifacts/report.md",
       "artifacts/a/b/c.json",
       "artifacts/..hidden",
+      "artifacts/UPPER.TXT",
+      "artifacts/report_v2-final.md",
     ]) {
       expect(schemaPath.test(path), `schema must accept ${path}`).toBe(true);
       expect(parseExternalWorkerArtifact({ path, digest: DIGEST, runId: "run-1" })).not.toBeNull();
@@ -226,6 +255,12 @@ describe("external worker UI contract", () => {
       "artifacts/review.json?sig=secret",
       "artifacts/review.json#fragment",
       "artifacts\\review.json",
+      "artifacts/caf\u00e9.md",
+      "artifacts/report\u200b.md",
+      "artifacts/a b.md",
+      "artifacts/review.json.",
+      "artifacts/NUL",
+      "artifacts/lpt9.log",
     ]) {
       expect(schemaPath.test(path), `schema must refuse ${path}`).toBe(false);
       expect(parseExternalWorkerArtifact({ path, digest: DIGEST, runId: "run-1" })).toBeNull();
