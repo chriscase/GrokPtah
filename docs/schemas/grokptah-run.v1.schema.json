@@ -133,7 +133,16 @@
         },
         "message": { "type": "string", "minLength": 1, "maxLength": 512 },
         "requestId": { "type": ["string", "null"], "maxLength": 256 },
-        "reasonCode": { "type": ["string", "null"], "maxLength": 128 }
+        "reasonCode": { "type": ["string", "null"], "maxLength": 128 },
+        "eventRange": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["startSeq", "endSeq"],
+          "properties": {
+            "startSeq": { "type": "integer", "minimum": 0 },
+            "endSeq": { "type": "integer", "minimum": 0 }
+          }
+        }
       }
     },
     "computerControlRequest": {

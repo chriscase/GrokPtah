@@ -1349,6 +1349,7 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
         code: public_error_code(&e.code),
         message: public_error_message(&e.code).into(),
         request_id,
+        reason_code: Some(e.code.as_str().into()),
     };
     let mut data = serde_json::to_value(public).unwrap_or_else(|_| {
         json!({
@@ -1360,7 +1361,6 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
     // Keep `code` stable for cross-product consumers. The detailed server-side
     // reason is separately named and bounded; never forward arbitrary OrchError
     // data or overwrite the public taxonomy with an internal transport code.
-    data["reasonCode"] = Value::String(e.code.as_str().into());
     if let Some(range) = e
         .data
         .as_ref()

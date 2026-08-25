@@ -189,6 +189,7 @@ describe("GrokPtahClient", () => {
                 code: "stale_or_recovery",
                 reasonCode: "cursor_expired",
                 requestId: "req-2",
+                eventRange: { startSeq: 12, endSeq: 18 },
                 secret: "drop",
               },
             },
@@ -207,6 +208,7 @@ describe("GrokPtahClient", () => {
       code: "stale_or_recovery",
       reasonCode: "cursor_expired",
       requestId: "req-2",
+      eventRange: { startSeq: 12, endSeq: 18 },
     });
   });
 

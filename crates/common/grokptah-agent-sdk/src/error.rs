@@ -34,6 +34,9 @@ pub struct ErrorEnvelope {
     pub message: String,
     /// Request identity for audit/support correlation.
     pub request_id: Option<String>,
+    /// Optional bounded transport reason; `code` remains the stable category.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
 }
 
 #[cfg(test)]
@@ -46,6 +49,7 @@ mod tests {
             code: ErrorCode::ForbiddenScope,
             message: "workspace is not bound".into(),
             request_id: Some("req-1".into()),
+            reason_code: Some("workspace_mismatch".into()),
         };
         let value = serde_json::to_value(error).expect("error serializes");
         assert!(value.get("privilegedPath").is_none());

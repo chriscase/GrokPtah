@@ -16,12 +16,13 @@ The crate covers:
 - isolated-run review receipts and stable error categories;
 - lease- and revision-fenced Computer Use control requests.
 
-Every public request/projection also exposes a `validate()` method. Consumers
-should call it before crossing a process or product boundary; the authority
-still applies its negotiated workspace, capability, and host ceilings after
-validation. Invalid bounds, empty identity fences, absolute review paths,
-oversized event/detail payloads, and zero-duration Computer Use leases fail
-closed.
+The boundary DTOs that accept caller-controlled data expose a `validate()`
+method. Consumers should call those validators before crossing a process or
+product boundary; the authority still applies its negotiated workspace,
+capability, and host ceilings after validation. Read-only page/projection
+wrappers remain data-only and inherit the validation of the records they carry.
+Invalid bounds, empty identity fences, absolute review paths, oversized
+event/detail payloads, and zero-duration Computer Use leases fail closed.
 
 Adapters remain responsible for mapping these contracts to MCP, applying host
 policy, authenticating users, redacting data, and retaining credentials. The

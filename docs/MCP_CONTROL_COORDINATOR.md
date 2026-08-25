@@ -440,8 +440,9 @@ coordinator wants a bounded admission queue for capacity or session contention.
 
 - The host holds at most **32** pending task runs process-wide, even when more
   than one embedded control service shares the host. A full queue returns the
-  stable `capacity` category with `reasonCode=capacity_exhausted` (HTTP 429 at
-  the transport boundary).
+  stable `capacity` category with `reasonCode=capacity_exhausted` (HTTP 409 at
+  the transport boundary). HTTP 429 is reserved for the separate concurrent
+  MCP-request admission limit.
 - A queued response has `state: "queued"` and a one-based `queuedPosition`;
   `ptah_get_capacity` reports `queuedRuns` and `queueLimit`.
 - The durable run record also exposes the current optional `queuePosition`.

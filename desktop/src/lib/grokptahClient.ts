@@ -21,12 +21,15 @@ export type GrokPtahSafeError = {
   requestId?: string;
   /** Optional bounded server reason; `code` remains the stable public category. */
   reasonCode?: string;
+  /** Optional bounded cursor recovery range from a stale-event response. */
+  eventRange?: { startSeq: number; endSeq: number };
 };
 
 export class GrokPtahRemoteError extends Error {
   readonly code: string;
   readonly requestId?: string;
   readonly reasonCode?: string;
+  readonly eventRange?: { startSeq: number; endSeq: number };
 
   constructor(error: GrokPtahSafeError) {
     super(error.message);
@@ -34,6 +37,7 @@ export class GrokPtahRemoteError extends Error {
     this.code = error.code;
     this.requestId = error.requestId;
     this.reasonCode = error.reasonCode;
+    this.eventRange = error.eventRange;
   }
 }
 
@@ -445,6 +449,18 @@ function parseSafeError(value: unknown): GrokPtahSafeError | undefined {
   const data = isRecord(value.data) ? value.data : {};
   const code = typeof data.code === "string" ? data.code : "remote_error";
   const rawMessage = typeof value.message === "string" ? value.message : "GrokPtah request failed";
+  const range = isRecord(data.eventRange) ? data.eventRange : undefined;
+  const startSeq = range?.startSeq;
+  const endSeq = range?.endSeq;
+  const eventRange =
+    typeof startSeq === "number" &&
+    Number.isSafeInteger(startSeq) &&
+    startSeq >= 0 &&
+    typeof endSeq === "number" &&
+    Number.isSafeInteger(endSeq) &&
+    endSeq >= startSeq
+      ? { startSeq, endSeq }
+      : undefined;
   return {
     code: code.slice(0, 128),
     message: rawMessage.slice(0, 512),
@@ -452,5 +468,6 @@ function parseSafeError(value: unknown): GrokPtahSafeError | undefined {
     ...(typeof data.reasonCode === "string"
       ? { reasonCode: data.reasonCode.slice(0, 128) }
       : {}),
+    ...(eventRange ? { eventRange } : {}),
   };
 }
