@@ -16,11 +16,17 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 45
     env:
-      # Keep every restored cache private to this job's disposable runner.
-      CARGO_HOME: ${{ runner.temp }}/grokptah-cargo-home
-      CARGO_TARGET_DIR: ${{ runner.temp }}/grokptah-target
       CARGO_INCREMENTAL: "0"
     steps:
+      # The `runner` context is not available in `jobs.<id>.env` — only in step
+      # contexts — so referencing `runner.temp` there fails workflow parsing
+      # before any step executes. RUNNER_TEMP is exported into every step's
+      # shell, so the same paths are set here instead.
+      - name: Keep every restored cache private to this disposable runner
+        run: |
+          echo "CARGO_HOME=$RUNNER_TEMP/grokptah-cargo-home" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/grokptah-target" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           clean: true
