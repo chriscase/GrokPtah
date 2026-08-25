@@ -1099,6 +1099,20 @@ fn inconsistent_task_dispatch_state_is_refused_on_reload() {
 }
 
 #[test]
+fn a_live_dispatch_without_a_current_task_pointer_is_refused_on_reload() {
+    let mut swarm = SwarmController::new(single_task_spec(), at(0)).expect("valid");
+    let intent = swarm.plan_dispatches(at(1)).remove(0);
+    swarm
+        .record_dispatch_requested(&intent, None, at(1))
+        .expect("write");
+    let mut state = swarm.into_state();
+    state.tasks[0].state = TaskState::Ready;
+    state.tasks[0].current_dispatch = None;
+    let error = SwarmController::load(state).expect_err("live dispatch must remain attached");
+    assert_eq!(error.code, SwarmErrorCode::CorruptState);
+}
+
+#[test]
 fn oversized_reloaded_output_is_refused() {
     let swarm = SwarmController::new(single_task_spec(), at(0)).expect("valid");
     let mut state = swarm.into_state();

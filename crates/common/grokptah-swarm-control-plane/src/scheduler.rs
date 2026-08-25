@@ -358,6 +358,18 @@ fn validate_loaded_state(state: &SwarmState) -> SwarmResult<()> {
             return Err(corrupt("non-successful review task has a verdict"));
         }
     }
+    for dispatch in &state.dispatches {
+        if dispatch.state != DispatchState::Settled
+            && state
+                .task(&dispatch.task_id)
+                .and_then(|task| task.current_dispatch.as_ref())
+                != Some(&dispatch.dispatch_id)
+        {
+            return Err(corrupt(
+                "live or uncertain dispatch is not the task's current dispatch",
+            ));
+        }
+    }
 
     let live = state.tasks.iter().any(|task| task.state.occupies_slot());
     if state.lifecycle.is_terminal() && live {
