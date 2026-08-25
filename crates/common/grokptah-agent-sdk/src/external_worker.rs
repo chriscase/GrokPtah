@@ -21,6 +21,8 @@ pub const MAX_EXTERNAL_WORKER_ID_BYTES: usize = 256;
 pub const MAX_EXTERNAL_WORKER_REF_BYTES: usize = 512;
 /// Maximum UTF-8 bytes accepted for a redacted worker detail string.
 pub const MAX_EXTERNAL_WORKER_DETAIL_BYTES: usize = 4_096;
+/// Maximum number of identity summaries returned in one list page.
+pub const MAX_EXTERNAL_WORKER_LIST_LIMIT: u32 = 100;
 
 /// Known external worker families supported by the contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -199,14 +201,7 @@ impl ExternalWorkerRecord {
         if let Some(url) = &self.worker_url {
             validate_worker_url(url, self.provider)?;
         }
-        if self.created_at.trim().is_empty()
-            || self.updated_at.trim().is_empty()
-            || contains_control(&self.created_at)
-            || contains_control(&self.updated_at)
-        {
-            return Err("worker timestamps must not be empty");
-        }
-        Ok(())
+        validate_timestamps(&self.created_at, &self.updated_at, "worker")
     }
 }
 
@@ -239,14 +234,7 @@ impl ExternalWorkerRunRecord {
         if let Some(result) = &self.terminal_result {
             validate_detail(result, "terminal_result")?;
         }
-        if self.created_at.trim().is_empty()
-            || self.updated_at.trim().is_empty()
-            || contains_control(&self.created_at)
-            || contains_control(&self.updated_at)
-        {
-            return Err("run timestamps must not be empty");
-        }
-        Ok(())
+        validate_timestamps(&self.created_at, &self.updated_at, "run")
     }
 }
 
@@ -267,6 +255,123 @@ impl ExternalWorkerLaunchResult {
         self.run.validate()?;
         if self.run.external_agent_id != self.worker.external_agent_id {
             return Err("launch worker and run identities must match");
+        }
+        Ok(())
+    }
+}
+
+/// Bounded query for listing provider workers.
+///
+/// List pages are identity summaries only. Adapters must not invent repository
+/// or starting-ref fields that the provider list endpoint does not return.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExternalWorkerListQuery {
+    /// Page size. When omitted, adapters send the provider's documented default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Opaque pagination cursor from a previous page's `next_cursor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// When false, archived workers must not be included. Adapters send this
+    /// flag explicitly rather than inheriting a provider default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_archived: bool,
+}
+
+impl ExternalWorkerListQuery {
+    /// Validate list query bounds before they reach a provider adapter.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let Some(limit) = self.limit {
+            if !(1..=MAX_EXTERNAL_WORKER_LIST_LIMIT).contains(&limit) {
+                return Err("list limit must be between 1 and 100");
+            }
+        }
+        if let Some(cursor) = &self.cursor {
+            validate_identity(cursor, "cursor")?;
+        }
+        Ok(())
+    }
+}
+
+/// Identity-only worker summary projected from a provider list page.
+///
+/// This type deliberately omits repository, starting ref, and write/PR flags
+/// because documented list items do not include them. Call `get_worker` for
+/// the full safety-checked record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExternalWorkerSummary {
+    /// Provider family that owns the opaque IDs.
+    pub provider: ExternalWorkerProvider,
+    /// Provider-specific adapter ID for custom providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    /// Opaque provider worker/agent identity.
+    pub external_agent_id: String,
+    /// Current projected lifecycle state.
+    pub state: ExternalWorkerState,
+    /// Provider URL, if share-safe and explicitly allowed by the adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_url: Option<String>,
+    /// Opaque latest run identity, if the provider reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_run_id: Option<String>,
+    /// RFC3339 creation timestamp.
+    pub created_at: String,
+    /// RFC3339 last-update timestamp.
+    pub updated_at: String,
+}
+
+impl ExternalWorkerSummary {
+    /// Validate a redacted list summary before publishing it.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_identity(&self.external_agent_id, "external_agent_id")?;
+        if let Some(provider_id) = &self.provider_id {
+            validate_identity(provider_id, "provider_id")?;
+        }
+        if self.provider == ExternalWorkerProvider::Custom && self.provider_id.is_none() {
+            return Err("custom workers require provider_id");
+        }
+        if let Some(url) = &self.worker_url {
+            validate_worker_url(url, self.provider)?;
+        }
+        if let Some(latest_run_id) = &self.latest_run_id {
+            validate_identity(latest_run_id, "external_run_id")?;
+        }
+        validate_timestamps(&self.created_at, &self.updated_at, "worker")
+    }
+}
+
+/// One page of redacted worker identity summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExternalWorkerListPage {
+    /// Identity summaries for this page, newest first.
+    pub items: Vec<ExternalWorkerSummary>,
+    /// Opaque cursor for the next page. Omitted when no further page exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+impl ExternalWorkerListPage {
+    /// Validate a list page before it crosses a broker boundary.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.items.len() > MAX_EXTERNAL_WORKER_LIST_LIMIT as usize {
+            return Err("list page exceeds its item bound");
+        }
+        if self.items.is_empty() && self.next_cursor.is_some() {
+            return Err("list cursor must not be published for an empty page");
+        }
+        if let Some(cursor) = &self.next_cursor {
+            validate_identity(cursor, "cursor")?;
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for item in &self.items {
+            item.validate()?;
+            if !seen.insert(&item.external_agent_id) {
+                return Err("list page contains duplicate worker identities");
+            }
         }
         Ok(())
     }
@@ -357,6 +462,24 @@ fn contains_control(value: &str) -> bool {
     value
         .chars()
         .any(|character| character.is_control() || character == '\u{7f}')
+}
+
+fn validate_timestamps(
+    created_at: &str,
+    updated_at: &str,
+    field: &str,
+) -> Result<(), &'static str> {
+    if created_at.trim().is_empty()
+        || updated_at.trim().is_empty()
+        || contains_control(created_at)
+        || contains_control(updated_at)
+    {
+        return Err(match field {
+            "run" => "run timestamps must not be empty",
+            _ => "worker timestamps must not be empty",
+        });
+    }
+    Ok(())
 }
 
 fn validate_worker_url(value: &str, provider: ExternalWorkerProvider) -> Result<(), &'static str> {
@@ -591,5 +714,167 @@ mod tests {
             worker.validate(),
             Err("cursor worker_url must use cursor.com")
         );
+    }
+
+    fn summary() -> ExternalWorkerSummary {
+        ExternalWorkerSummary {
+            provider: ExternalWorkerProvider::CursorCloud,
+            provider_id: None,
+            external_agent_id: "bc-00000000-0000-0000-0000-000000000001".into(),
+            state: ExternalWorkerState::Ready,
+            worker_url: Some(
+                "https://cursor.com/agents/bc-00000000-0000-0000-0000-000000000001".into(),
+            ),
+            latest_run_id: Some("run-00000000-0000-0000-0000-000000000001".into()),
+            created_at: "2026-08-24T00:00:00Z".into(),
+            updated_at: "2026-08-24T00:00:01Z".into(),
+        }
+    }
+
+    #[test]
+    fn list_query_is_bounded_and_denies_unknown_fields() {
+        let query: ExternalWorkerListQuery =
+            serde_json::from_str(r#"{"limit":20,"includeArchived":true}"#)
+                .expect("bounded list query deserializes");
+        query.validate().expect("list query is valid");
+        assert_eq!(query.limit, Some(20));
+        assert!(query.include_archived);
+        assert!(serde_json::from_str::<ExternalWorkerListQuery>(
+            r#"{"prUrl":"https://github.com/org/repo/pull/1"}"#
+        )
+        .is_err());
+        let invalid_limit = ExternalWorkerListQuery {
+            limit: Some(0),
+            ..ExternalWorkerListQuery::default()
+        };
+        assert_eq!(
+            invalid_limit.validate(),
+            Err("list limit must be between 1 and 100")
+        );
+        let oversized = ExternalWorkerListQuery {
+            limit: Some(MAX_EXTERNAL_WORKER_LIST_LIMIT + 1),
+            ..ExternalWorkerListQuery::default()
+        };
+        assert_eq!(
+            oversized.validate(),
+            Err("list limit must be between 1 and 100")
+        );
+        let control_cursor = ExternalWorkerListQuery {
+            cursor: Some("page\n2".into()),
+            ..ExternalWorkerListQuery::default()
+        };
+        assert_eq!(
+            control_cursor.validate(),
+            Err("worker identity contains a control character")
+        );
+        let omitted: ExternalWorkerListQuery =
+            serde_json::from_str("{}").expect("empty list query deserializes");
+        omitted
+            .validate()
+            .expect("omitted includeArchived is false");
+        assert!(!omitted.include_archived);
+        assert_eq!(omitted.limit, None);
+    }
+
+    #[test]
+    fn list_summaries_are_identity_only_and_redacted() {
+        let item = summary();
+        item.validate().expect("list summary is valid");
+        let value = serde_json::to_value(&item).expect("summary serializes");
+        assert_eq!(value["provider"], "cursor_cloud");
+        assert!(value.get("repository").is_none());
+        assert!(value.get("startingRef").is_none());
+        assert!(
+            serde_json::from_value::<ExternalWorkerSummary>(serde_json::json!({
+                "provider": "cursor_cloud",
+                "externalAgentId": "agent-1",
+                "repository": "org/repo",
+                "startingRef": "main",
+                "state": "ready",
+                "createdAt": "now",
+                "updatedAt": "now"
+            }))
+            .is_err()
+        );
+        let mut leaked = item.clone();
+        leaked.worker_url = Some("https://cursor.com/agents/agent-1?token=secret".into());
+        assert_eq!(
+            leaked.validate(),
+            Err("worker_url must be a bounded credential-free https URL")
+        );
+        leaked.worker_url = item.worker_url.clone();
+        leaked.latest_run_id = Some("run\0secret".into());
+        assert_eq!(
+            leaked.validate(),
+            Err("worker identity contains a control character")
+        );
+    }
+
+    #[test]
+    fn list_pages_fail_closed_on_duplicates_empty_cursors_and_unknown_fields() {
+        let page = ExternalWorkerListPage {
+            items: vec![summary()],
+            next_cursor: Some("bc-00000000-0000-0000-0000-000000000002".into()),
+        };
+        page.validate().expect("list page is valid");
+        let empty_with_cursor = ExternalWorkerListPage {
+            items: Vec::new(),
+            next_cursor: Some("bc-00000000-0000-0000-0000-000000000002".into()),
+        };
+        assert_eq!(
+            empty_with_cursor.validate(),
+            Err("list cursor must not be published for an empty page")
+        );
+        let mut duplicate = summary();
+        duplicate.updated_at = "2026-08-24T00:00:02Z".into();
+        let duplicates = ExternalWorkerListPage {
+            items: vec![summary(), duplicate],
+            next_cursor: None,
+        };
+        assert_eq!(
+            duplicates.validate(),
+            Err("list page contains duplicate worker identities")
+        );
+        assert!(
+            serde_json::from_value::<ExternalWorkerListPage>(serde_json::json!({
+                "items": [],
+                "rawProvider": {"authorization": "Bearer secret"}
+            }))
+            .is_err()
+        );
+        let mut oversized_items = Vec::new();
+        for index in 0..=MAX_EXTERNAL_WORKER_LIST_LIMIT {
+            oversized_items.push(ExternalWorkerSummary {
+                external_agent_id: format!("agent-{index}"),
+                latest_run_id: None,
+                worker_url: None,
+                ..summary()
+            });
+        }
+        let oversized = ExternalWorkerListPage {
+            items: oversized_items,
+            next_cursor: None,
+        };
+        assert_eq!(
+            oversized.validate(),
+            Err("list page exceeds its item bound")
+        );
+    }
+
+    #[test]
+    fn archived_is_a_distinct_state_from_cancelled_or_completed() {
+        assert_ne!(
+            ExternalWorkerState::Archived,
+            ExternalWorkerState::Cancelled
+        );
+        assert_ne!(
+            ExternalWorkerState::Archived,
+            ExternalWorkerState::Completed
+        );
+        let archived = ExternalWorkerSummary {
+            state: ExternalWorkerState::Archived,
+            ..summary()
+        };
+        archived.validate().expect("archived summary is valid");
     }
 }

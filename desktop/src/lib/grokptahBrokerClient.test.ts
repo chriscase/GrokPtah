@@ -157,6 +157,116 @@ describe("GrokPtahBrokerClient", () => {
     }, "request-1")).rejects.toMatchObject({ code: "invalid_response" });
   });
 
+  it("lists and archives external workers without credentials or implied cancel", async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({
+        items: [{
+          provider: "cursor_cloud",
+          externalAgentId: "agent-1",
+          state: "ready",
+          createdAt: "now",
+          updatedAt: "now",
+        }],
+        nextCursor: "agent-2",
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        provider: "cursor_cloud",
+        externalAgentId: "agent-1",
+        repository: "org/repo",
+        startingRef: "main",
+        state: "archived",
+        createdAt: "now",
+        updatedAt: "now",
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        provider: "cursor_cloud",
+        externalAgentId: "agent-1",
+        repository: "org/repo",
+        startingRef: "main",
+        state: "ready",
+        createdAt: "now",
+        updatedAt: "now",
+      }));
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+
+    const page = await client.listExternalWorkers("binding-1", { limit: 1, includeArchived: false });
+    expect(page.items[0]?.externalAgentId).toBe("agent-1");
+    expect(String(fetcher.mock.calls[0][0])).toBe(
+      "https://contextdesk.example/api/grokptah/v1/bindings/binding-1/external-workers?limit=1&includeArchived=false",
+    );
+    expect(fetcher.mock.calls[0][1]?.headers).not.toHaveProperty("Authorization");
+
+    const archived = await client.archiveExternalWorker("binding-1", "agent-1", "archive-1");
+    expect(archived.state).toBe("archived");
+    expect(String(fetcher.mock.calls[1][0])).toContain("/external-workers/agent-1/archive");
+    expect(fetcher.mock.calls[1][1]).toMatchObject({ method: "POST" });
+
+    const restored = await client.unarchiveExternalWorker("binding-1", "agent-1", "unarchive-1");
+    expect(restored.state).toBe("ready");
+    expect(String(fetcher.mock.calls[2][0])).toContain("/external-workers/agent-1/unarchive");
+  });
+
+  it("fails closed when list or archive projections leak credentials or mismatch identity", async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({
+        items: [{
+          provider: "cursor_cloud",
+          externalAgentId: "agent-1",
+          state: "archived",
+          createdAt: "now",
+          updatedAt: "now",
+        }],
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        items: [{
+          provider: "cursor_cloud",
+          externalAgentId: "agent-1",
+          state: "ready",
+          workerUrl: "https://cursor.com/agents/agent-1?token=secret",
+          createdAt: "now",
+          updatedAt: "now",
+        }],
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        provider: "cursor_cloud",
+        externalAgentId: "other-agent",
+        repository: "org/repo",
+        startingRef: "main",
+        state: "archived",
+        createdAt: "now",
+        updatedAt: "now",
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        provider: "cursor_cloud",
+        externalAgentId: "agent-1",
+        repository: "org/repo",
+        startingRef: "main",
+        state: "archived",
+        createdAt: "now",
+        updatedAt: "now",
+      }));
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+
+    await expect(client.listExternalWorkers("binding-1"))
+      .rejects.toMatchObject({ code: "invalid_response" });
+    await expect(client.listExternalWorkers("binding-1", { includeArchived: true }))
+      .rejects.toMatchObject({ code: "invalid_response" });
+    await expect(client.archiveExternalWorker("binding-1", "agent-1", "archive-1"))
+      .rejects.toMatchObject({ code: "invalid_response" });
+    await expect(client.unarchiveExternalWorker("binding-1", "agent-1", "unarchive-1"))
+      .rejects.toMatchObject({ code: "invalid_response" });
+    await expect(client.listExternalWorkers("binding-1", { limit: 0 }))
+      .rejects.toMatchObject({ code: "invalid_request" });
+  });
+
   it("fails closed when a typed binding or run envelope is malformed", async () => {
     expect(parseBrokerBinding({
       bindingId: "binding-1",

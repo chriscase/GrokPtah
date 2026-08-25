@@ -11,12 +11,16 @@ import {
   parseExternalWorkerFollowUpRequest,
   parseExternalWorkerLaunchRequest,
   parseExternalWorkerLaunchResult,
+  parseExternalWorkerListPage,
+  parseExternalWorkerListQuery,
   parseExternalWorkerRecord,
   parseExternalWorkerRunRecord,
   type ExternalWorkerArtifact,
   type ExternalWorkerFollowUpRequest,
   type ExternalWorkerLaunchRequest,
   type ExternalWorkerLaunchResult,
+  type ExternalWorkerListPage,
+  type ExternalWorkerListQuery,
   type ExternalWorkerRecord,
   type ExternalWorkerRunRecord,
 } from "./externalWorker";
@@ -639,6 +643,72 @@ export class GrokPtahBrokerClient {
     );
     if (worker.externalAgentId !== externalAgentId) {
       throw new GrokPtahBrokerError(0, "invalid_response", "External worker identity does not match the request");
+    }
+    return worker;
+  }
+
+  /** List redacted external-worker identity summaries. */
+  async listExternalWorkers(
+    bindingId: string,
+    query: ExternalWorkerListQuery = {},
+  ): Promise<ExternalWorkerListPage> {
+    const parsed = parseExternalWorkerListQuery(query);
+    if (parsed === null) {
+      throw new GrokPtahBrokerError(0, "invalid_request", "External worker list query is invalid");
+    }
+    const params = new URLSearchParams();
+    if (parsed.limit !== undefined) params.set("limit", String(parsed.limit));
+    if (parsed.cursor !== undefined) params.set("cursor", parsed.cursor);
+    params.set("includeArchived", parsed.includeArchived === true ? "true" : "false");
+    const page = await this.requestValidated(
+      `/bindings/${segment(bindingId)}/external-workers?${params.toString()}`,
+      parseExternalWorkerListPage,
+      {},
+    );
+    if (parsed.includeArchived !== true && page.items.some((item) => item.state === "archived")) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker list included archived workers without includeArchived");
+    }
+    if (parsed.limit !== undefined && page.items.length > parsed.limit) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker list exceeded the requested page size");
+    }
+    return page;
+  }
+
+  /** Archive an external worker; archive is explicit and reversible. */
+  async archiveExternalWorker(
+    bindingId: string,
+    externalAgentId: string,
+    idempotencyKey: string,
+  ): Promise<ExternalWorkerRecord> {
+    const worker = await this.requestValidated(
+      `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/archive`,
+      parseExternalWorkerRecord,
+      { method: "POST", idempotencyKey },
+    );
+    if (worker.externalAgentId !== externalAgentId || worker.state !== "archived") {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker archive did not return an archived identity");
+    }
+    return worker;
+  }
+
+  /** Restore an archived external worker so it can accept new runs. */
+  async unarchiveExternalWorker(
+    bindingId: string,
+    externalAgentId: string,
+    idempotencyKey: string,
+  ): Promise<ExternalWorkerRecord> {
+    const worker = await this.requestValidated(
+      `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/unarchive`,
+      parseExternalWorkerRecord,
+      { method: "POST", idempotencyKey },
+    );
+    if (
+      worker.externalAgentId !== externalAgentId ||
+      worker.state === "archived" ||
+      worker.state === "unknown" ||
+      worker.state === "failed"
+    ) {
+      throw new GrokPtahBrokerError(0, "invalid_response", "External worker unarchive did not restore an active identity");
     }
     return worker;
   }

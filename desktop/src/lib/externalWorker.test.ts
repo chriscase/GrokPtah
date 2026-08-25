@@ -7,8 +7,11 @@ import {
   parseExternalWorkerFollowUpRequest,
   parseExternalWorkerLaunchRequest,
   parseExternalWorkerLaunchResult,
+  parseExternalWorkerListPage,
+  parseExternalWorkerListQuery,
   parseExternalWorkerNotification,
   parseExternalWorkerRecord,
+  parseExternalWorkerSummary,
   replaceExternalWorkerMonitor,
 } from "./externalWorker";
 
@@ -195,5 +198,76 @@ describe("external worker UI contract", () => {
     expect(replaceExternalWorkerMonitor(
       Array.from({ length: 257 }, (_, seq) => ({ seq, ts: "now", kind: "run.progress", detail: "bounded" })),
     )).toBeNull();
+  });
+
+  it("parses identity-only list pages and rejects privileged or unknown fields", () => {
+    expect(parseExternalWorkerListQuery({
+      limit: 20,
+      includeArchived: false,
+    })).toEqual({ limit: 20, includeArchived: false });
+    expect(parseExternalWorkerListQuery({})).toEqual({});
+    expect(parseExternalWorkerListQuery({ limit: 0 })).toBeNull();
+    expect(parseExternalWorkerListQuery({ limit: 101 })).toBeNull();
+    expect(parseExternalWorkerListQuery({
+      prUrl: "https://github.com/org/repo/pull/1",
+    })).toBeNull();
+    expect(parseExternalWorkerListQuery({ cursor: "page\n2" })).toBeNull();
+
+    const page = parseExternalWorkerListPage({
+      items: [{
+        provider: "cursor_cloud",
+        externalAgentId: "agent-1",
+        state: "ready",
+        workerUrl: "https://cursor.com/agents/agent-1",
+        latestRunId: "run-1",
+        createdAt: "now",
+        updatedAt: "now",
+      }],
+      nextCursor: "agent-2",
+    });
+    expect(page?.items[0]?.externalAgentId).toBe("agent-1");
+    expect(page?.nextCursor).toBe("agent-2");
+    expect(parseExternalWorkerSummary({
+      provider: "cursor_cloud",
+      externalAgentId: "agent-1",
+      repository: "org/repo",
+      startingRef: "main",
+      state: "ready",
+      createdAt: "now",
+      updatedAt: "now",
+    })).toBeNull();
+    expect(parseExternalWorkerListPage({
+      items: [{
+        provider: "cursor_cloud",
+        externalAgentId: "agent-1",
+        state: "ready",
+        workerUrl: "https://cursor.com/agents/agent-1?token=secret",
+        createdAt: "now",
+        updatedAt: "now",
+      }],
+    })).toBeNull();
+    expect(parseExternalWorkerListPage({
+      items: [],
+      nextCursor: "agent-2",
+    })).toBeNull();
+    expect(parseExternalWorkerListPage({
+      items: [{
+        provider: "cursor_cloud",
+        externalAgentId: "agent-1",
+        state: "ready",
+        createdAt: "now",
+        updatedAt: "now",
+      }, {
+        provider: "cursor_cloud",
+        externalAgentId: "agent-1",
+        state: "archived",
+        createdAt: "now",
+        updatedAt: "now",
+      }],
+    })).toBeNull();
+    expect(parseExternalWorkerListPage({
+      items: [],
+      rawProvider: { authorization: "Bearer secret" },
+    })).toBeNull();
   });
 });
