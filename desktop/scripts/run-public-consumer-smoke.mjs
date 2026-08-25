@@ -54,6 +54,7 @@ try {
   parseBrokerReviewProjection,
   EXTERNAL_WORKER_CONTRACT,
   parseExternalWorkerLaunchRequest,
+  parseExternalWorkerFollowUpRequest,
   parseExternalWorkerLaunchResult,
   parseExternalWorkerNotification,
   applyExternalWorkerNotification,
@@ -149,6 +150,14 @@ const launch = parseExternalWorkerLaunchRequest({
 });
 if (launch?.executionMode !== "isolated") {
   throw new Error("consumer external-worker launch parser was not usable");
+}
+const followUp = parseExternalWorkerFollowUpRequest({
+  requestId: "consumer-follow-up",
+  prompt: "Re-check the focused candidate",
+  bounds: { maxRounds: 8 },
+});
+if (followUp?.requestId !== "consumer-follow-up") {
+  throw new Error("consumer external-worker follow-up parser was not usable");
 }
 if (parseExternalWorkerLaunchResult({ worker: {}, run: {} }) !== null) {
   throw new Error("consumer external-worker launch result parser failed closed");

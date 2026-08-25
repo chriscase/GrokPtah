@@ -23,7 +23,7 @@ pub const MAX_EXTERNAL_WORKER_REF_BYTES: usize = 512;
 pub const MAX_EXTERNAL_WORKER_DETAIL_BYTES: usize = 4_096;
 
 /// Known external worker families supported by the contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalWorkerProvider {
     /// Cursor's hosted Cloud Agents API.
@@ -114,6 +114,33 @@ impl ExternalWorkerLaunchRequest {
         }
         if self.provider == ExternalWorkerProvider::Custom && self.provider_id.is_none() {
             return Err("custom workers require provider_id");
+        }
+        if let Some(bounds) = &self.bounds {
+            bounds.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Bounded prompt for a follow-up run on an existing external worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExternalWorkerFollowUpRequest {
+    /// Fresh idempotency key for this follow-up intent.
+    pub request_id: String,
+    /// Prompt sent to the provider after policy validation.
+    pub prompt: String,
+    /// Optional host/provider ceilings for this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<Bounds>,
+}
+
+impl ExternalWorkerFollowUpRequest {
+    /// Validate caller data before it reaches a provider adapter.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_identity(&self.request_id, "request_id")?;
+        if self.prompt.trim().is_empty() || self.prompt.len() > MAX_EXTERNAL_WORKER_PROMPT_BYTES {
+            return Err("prompt must be non-empty and bounded");
         }
         if let Some(bounds) = &self.bounds {
             bounds.validate()?;
@@ -215,6 +242,28 @@ impl ExternalWorkerRunRecord {
         }
         if self.created_at.trim().is_empty() || self.updated_at.trim().is_empty() {
             return Err("run timestamps must not be empty");
+        }
+        Ok(())
+    }
+}
+
+/// The share-safe envelope returned after an external worker is created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExternalWorkerLaunchResult {
+    /// Durable worker identity and exact source projection.
+    pub worker: ExternalWorkerRecord,
+    /// Initial run identity and lifecycle projection.
+    pub run: ExternalWorkerRunRecord,
+}
+
+impl ExternalWorkerLaunchResult {
+    /// Validate both projections before publishing a launch result.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.worker.validate()?;
+        self.run.validate()?;
+        if self.run.external_agent_id != self.worker.external_agent_id {
+            return Err("launch worker and run identities must match");
         }
         Ok(())
     }

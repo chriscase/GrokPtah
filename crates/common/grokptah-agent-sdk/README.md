@@ -16,7 +16,8 @@ The crate covers:
 - isolated-run review receipts and stable error categories;
 - lease- and revision-fenced Computer Use control requests.
 - provider-neutral external-worker launch, lifecycle, event, and artifact
-  projections for cloud coding agents.
+  projections for cloud coding agents, including explicitly idempotent
+  follow-up requests.
 
 The boundary DTOs that accept caller-controlled data expose a `validate()`
 method. Consumers should call those validators before crossing a process or

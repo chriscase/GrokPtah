@@ -15,6 +15,7 @@ pub mod eval_report;
 pub mod event_bus;
 mod events;
 mod exec_risk;
+pub mod external_worker;
 mod gateway_config;
 mod hooks;
 mod host;
@@ -113,6 +114,10 @@ pub use discover::{
 };
 pub use event_bus::{EventBus, EventReceiver, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
+pub use external_worker::{
+    CursorCloudAdapter, ExternalWorkerAdapter, ExternalWorkerAdapterError, ExternalWorkerRegistry,
+    CURSOR_CLOUD_API_BASE,
+};
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use mcp_control::{
     discovered_tool_names, start_control_from_env, start_control_server, start_control_server_with,

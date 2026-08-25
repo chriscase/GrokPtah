@@ -45,6 +45,7 @@ const requiredExports = [
   "parseBrokerReviewProjection",
   "EXTERNAL_WORKER_CONTRACT",
   "parseExternalWorkerLaunchRequest",
+  "parseExternalWorkerFollowUpRequest",
   "parseExternalWorkerLaunchResult",
   "parseExternalWorkerNotification",
   "applyExternalWorkerNotification",
@@ -64,6 +65,7 @@ for (const name of [
   "promptQueueReducer",
   "applyAssistantStreamChunk",
   "EXTERNAL_WORKER_CONTRACT",
+  "parseExternalWorkerFollowUpRequest",
   "parseExternalWorkerNotification",
   "applyExternalWorkerNotification",
 ]) {

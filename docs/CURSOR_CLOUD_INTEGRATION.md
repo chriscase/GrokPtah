@@ -1,7 +1,8 @@
 # Cursor Cloud agents from GrokPtah
 
-**Status:** provider-neutral external-worker contract shipped in
-`grokptah-agent-sdk`; Cursor adapter not yet shipped or live-qualified.
+**Status:** provider-neutral external-worker contract and a trusted native
+Cursor Cloud v1 lifecycle adapter are now staged in `grokptah-agent-sdk` and
+`grokptah-agent-bridge`; the adapter is not live-qualified yet.
 
 GrokPtah can manage Cursor's Cloud Agents as an external execution provider.
 This is separate from controlling a local Cursor desktop window. Cursor's
@@ -52,6 +53,16 @@ projections. It deliberately has no provider credentials or network client, so
 another product can import the same contracts from a desktop adapter, service,
 or browser-safe broker without importing GrokPtah's authority implementation.
 
+The native bridge now exposes `CursorCloudAdapter` behind the
+`ExternalWorkerAdapter` trait. It targets Cursor Cloud Agents API v1, keeps the
+API key in the trusted process, sends only an isolated exact-repository/ref
+request, verifies the returned agent/run identity, polls status, enforces
+terminal cancellation, and refuses to publish provider artifact listings that
+do not carry a content digest. Its in-tree fake API fixture covers launch,
+polling, artifact projection, and terminal cancellation without credentials.
+This is an implementation seam and contract fixture, not evidence that a live
+Cursor account has been exercised.
+
 ## Safety contract
 
 1. Keep the Cursor API key in the native/server credential boundary. It must
@@ -76,9 +87,11 @@ or browser-safe broker without importing GrokPtah's authority implementation.
 
 ## Qualification stages
 
-1. **Contract fixture:** fake Cursor API proves create/list/get/follow-up,
-   stream reconnect, stream expiry fallback, cancellation, archive, and
-   idempotent retries without network credentials.
+1. **Contract fixture:** the native fake Cursor API fixture now proves
+   isolated create, exact source projection, status polling, digest-bearing
+   artifacts, redacted terminal text, and terminal cancellation without
+   network credentials. List/follow-up/archive, stream reconnect/expiry, and
+   durable idempotent retry fixtures remain to be added.
 2. **Read-only live probe:** list models/repositories and read an existing
    disposable agent; record API version, limits, retention, and redaction.
 3. **Disposable create:** create one agent from an exact public test ref with
@@ -87,8 +100,8 @@ or browser-safe broker without importing GrokPtah's authority implementation.
 4. **Manager integration:** expose Cursor as a provider-neutral lane in the
    desktop and browser-safe broker, with explicit user-visible provider and
    cost/usage labels. The staged browser client now has typed launch, status,
-   artifact, and cancellation calls; the trusted server routes remain to be
-   implemented and qualified.
+   artifact, and cancellation calls; the trusted native lifecycle adapter is
+   staged, while server routes and live qualification remain to be completed.
 5. **Release gate:** independently review the adapter, run a retry/restart
    soak, and prove that approval, promotion, and Computer Use remain separate.
 

@@ -42,6 +42,16 @@ export type ExternalWorkerLaunchRequest = {
   };
 };
 
+export type ExternalWorkerFollowUpRequest = {
+  requestId: string;
+  prompt: string;
+  bounds?: {
+    maxPromptBytes?: number;
+    maxRounds?: number;
+    maxDurationMs?: number;
+  };
+};
+
 export type ExternalWorkerRecord = {
   provider: ExternalWorkerProvider;
   providerId?: string;
@@ -180,6 +190,17 @@ export function parseExternalWorkerLaunchRequest(value: unknown): ExternalWorker
     (value.provider === "custom" && value.providerId === undefined)
   ) return null;
   return value as ExternalWorkerLaunchRequest;
+}
+
+/** Parse a bounded follow-up prompt before sending it to a broker. */
+export function parseExternalWorkerFollowUpRequest(value: unknown): ExternalWorkerFollowUpRequest | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(["requestId", "prompt", "bounds"]))) return null;
+  if (
+    !identity(value.requestId) ||
+    !boundedString(value.prompt, MAX_PROMPT_BYTES) ||
+    (value.bounds !== undefined && !validBounds(value.bounds))
+  ) return null;
+  return value as ExternalWorkerFollowUpRequest;
 }
 
 /** Parse a redacted external-worker identity returned by a trusted broker. */

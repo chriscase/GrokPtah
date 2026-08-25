@@ -4,6 +4,7 @@ import {
   createExternalWorkerMonitor,
   parseExternalWorkerArtifact,
   parseExternalWorkerEvent,
+  parseExternalWorkerFollowUpRequest,
   parseExternalWorkerLaunchRequest,
   parseExternalWorkerLaunchResult,
   parseExternalWorkerNotification,
@@ -66,6 +67,23 @@ describe("external worker UI contract", () => {
     })).toBeNull();
     expect(parseExternalWorkerArtifact({ path: "reports/review.json", digest: "sha256:abc" })).not.toBeNull();
     expect(parseExternalWorkerArtifact({ path: "../secret", digest: "sha256:abc" })).toBeNull();
+  });
+
+  it("accepts bounded follow-ups but rejects empty prompts and unknown fields", () => {
+    expect(parseExternalWorkerFollowUpRequest({
+      requestId: "follow-up-1",
+      prompt: "Re-check the focused change",
+      bounds: { maxRounds: 8 },
+    })?.requestId).toBe("follow-up-1");
+    expect(parseExternalWorkerFollowUpRequest({
+      requestId: "follow-up-1",
+      prompt: "",
+    })).toBeNull();
+    expect(parseExternalWorkerFollowUpRequest({
+      requestId: "follow-up-1",
+      prompt: "Re-check",
+      unexpected: true,
+    })).toBeNull();
   });
 
   it("parses a launch envelope only when both worker and run projections are valid", () => {

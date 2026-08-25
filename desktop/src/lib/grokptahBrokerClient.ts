@@ -8,11 +8,13 @@
 
 import {
   parseExternalWorkerArtifact,
+  parseExternalWorkerFollowUpRequest,
   parseExternalWorkerLaunchRequest,
   parseExternalWorkerLaunchResult,
   parseExternalWorkerRecord,
   parseExternalWorkerRunRecord,
   type ExternalWorkerArtifact,
+  type ExternalWorkerFollowUpRequest,
   type ExternalWorkerLaunchRequest,
   type ExternalWorkerLaunchResult,
   type ExternalWorkerRecord,
@@ -583,6 +585,23 @@ export class GrokPtahBrokerClient {
     return this.requestValidated(
       `/bindings/${segment(bindingId)}/external-workers`,
       parseExternalWorkerLaunchResult,
+      { method: "POST", idempotencyKey, body: request },
+    );
+  }
+
+  /** Queue a bounded follow-up run on an existing external worker. */
+  async followUpExternalWorker(
+    bindingId: string,
+    externalAgentId: string,
+    request: ExternalWorkerFollowUpRequest,
+    idempotencyKey: string,
+  ): Promise<ExternalWorkerRunRecord> {
+    if (parseExternalWorkerFollowUpRequest(request) === null) {
+      throw new GrokPtahBrokerError(0, "invalid_request", "External worker follow-up request is invalid");
+    }
+    return this.requestValidated(
+      `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/runs`,
+      parseExternalWorkerRunRecord,
       { method: "POST", idempotencyKey, body: request },
     );
   }

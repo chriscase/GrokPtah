@@ -81,6 +81,7 @@ binding and run ids to the exact GrokPtah `session_id`, `workspace`, and
 | `GET /bindings/{bindingId}/runs/{runId}/review` | `ptah_review_run` | read-only | Isolated-run diff/fingerprint. |
 | `POST /bindings/{bindingId}/external-workers` | external worker adapter | execute | Launches an isolated exact-ref cloud worker; requires idempotency and CSRF. |
 | `GET /bindings/{bindingId}/external-workers/{agentId}` | external worker adapter | read-only | Redacted provider worker identity and lifecycle. |
+| `POST /bindings/{bindingId}/external-workers/{agentId}/runs` | external worker adapter | execute | Queues one bounded follow-up run; only one active provider run is allowed; requires idempotency and CSRF. |
 | `GET /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}` | external worker adapter | read-only | Redacted provider run status and cursor. |
 | `GET /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/artifacts` | external worker adapter | read-only | Bounded relative artifact references only. |
 | `POST /bindings/{bindingId}/external-workers/{agentId}/runs/{runId}/cancel` | external worker adapter | execute | Explicit terminal cancellation; requires idempotency and CSRF. |

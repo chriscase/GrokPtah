@@ -29,8 +29,9 @@ pub use computer::{
 pub use error::{ErrorCode, ErrorEnvelope, ErrorEventRange};
 pub use external_worker::{
     ExternalWorkerArtifact, ExternalWorkerEvent, ExternalWorkerExecutionMode,
-    ExternalWorkerLaunchRequest, ExternalWorkerProvider, ExternalWorkerRecord,
-    ExternalWorkerRunRecord, ExternalWorkerState, EXTERNAL_WORKER_CONTRACT_VERSION,
+    ExternalWorkerFollowUpRequest, ExternalWorkerLaunchRequest, ExternalWorkerLaunchResult,
+    ExternalWorkerProvider, ExternalWorkerRecord, ExternalWorkerRunRecord, ExternalWorkerState,
+    EXTERNAL_WORKER_CONTRACT_VERSION,
 };
 pub use run::{
     Bounds, ChangedFile, DurableRun, DurableRunState, ExecutionMode, IdempotencyKey, ReviewReceipt,
