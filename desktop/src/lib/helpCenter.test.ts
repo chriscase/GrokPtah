@@ -25,7 +25,9 @@ function escapeRegExp(value: string): string {
 
 describe("offline Help Center corpus", () => {
   it("keeps a stable, non-empty article inventory", () => {
-    expect(HELP_ARTICLES).toHaveLength(19);
+    // 19 original articles plus the five source-cited articles folded in from
+    // the former `grokptah.help.v1` entry corpus during consolidation.
+    expect(HELP_ARTICLES).toHaveLength(24);
     expect(new Set(HELP_ARTICLES.map((article) => article.id)).size).toBe(
       HELP_ARTICLES.length,
     );

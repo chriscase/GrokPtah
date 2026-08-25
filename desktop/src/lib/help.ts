@@ -7,6 +7,8 @@
  * future published UI package.
  */
 
+import { PROJECTED_HELP_ENTRIES } from "./help/canonical/projections";
+
 export const HELP_CONTRACT = "grokptah.help.v1" as const;
 
 export type HelpAudience = "everyone" | "power_user" | "operator";
@@ -59,154 +61,14 @@ const HELP_ASSISTANT_HARD_MAX_BYTES = 65_536;
 const HELP_ASSISTANT_INSTRUCTION =
   "Explain only the supplied help entries. Do not claim live capability, approval, lease, quota, or authority state; require a fresh scoped check before suggesting an operation.";
 
-/** The shipped corpus is intentionally small, explicit, and reviewable. */
-const HELP_ENTRY_DATA: HelpEntry[] = [
-  {
-    id: "capabilities-and-integrations",
-    title: "Use GrokPtah from another project",
-    summary:
-      "Embed the versioned Rust and TypeScript capability contracts in a desktop app, web broker, or service.",
-    body:
-      "Start with the grokptah-agent-sdk contracts and the transport-neutral TypeScript clients. Consumers discover capabilities, scope every run, and preserve the same approval, replay, and redaction rules. The browser-safe broker keeps credentials server-side and exposes opaque run identifiers only.",
-    tags: ["sdk", "integration", "broker", "cross-project"],
-    keywords: ["embed", "reuse", "package", "contextdesk", "web", "api"],
-    audience: ["everyone", "power_user", "operator"],
-    access: "public",
-    capabilityIds: ["session.observe", "run.execute", "run.review"],
-  },
-  {
-    id: "durable-runs-and-recovery",
-    title: "Recover a long-running agent safely",
-    summary:
-      "Durable runs survive restarts through explicit checkpoints, replay cursors, and continuation gates.",
-    body:
-      "A restart is not permission to resend. Resume only from a durable checkpoint with the same scoped run identity, idempotency key, and evidence of the last accepted transport attempt. Unknown delivery stays unknown until the reconciliation oracle proves whether a new send is allowed.",
-    tags: ["durability", "restart", "recovery", "always-on"],
-    keywords: ["soak", "resume", "checkpoint", "duplicate", "replay", "uncertain"],
-    audience: ["everyone", "power_user", "operator"],
-    access: "public",
-    capabilityIds: ["session.observe", "run.execute", "run.review"],
-  },
-  {
-    id: "persistent-agents",
-    title: "Operate persistent agents",
-    summary:
-      "Persistent agents have explicit ownership, bounded rounds, continuation plans, and terminal evidence.",
-    body:
-      "Create a persistent agent only with a declared workspace, owner, model policy, and maximum round budget. Inspect its plan before resuming it, and keep human approval in the loop for any mutating or computer-control capability. An agent is operationally complete only when its terminal evidence is durable and auditable.",
-    tags: ["agents", "operations", "budgets", "continuation"],
-    keywords: ["long running", "always on", "worker", "supervisor", "background"],
-    audience: ["power_user", "operator"],
-    access: "gated",
-    capabilityIds: ["agent.continuity", "agent.resume"],
-  },
-  {
-    id: "computer-use-safety",
-    title: "Use Computer Use without losing control",
-    summary:
-      "Computer Use is observation-first, semantic, lease-fenced, and fail-closed on stale or sensitive state.",
-    body:
-      "Observe a redacted semantic snapshot before every action. The action must name the observed target, revision, enabled state, and bounded action class. Lease expiry, stale observations, helper failure, or cleanup uncertainty deny control; raw global input and unredacted clipboard, credential, path, and network data are not part of the public contract.",
-    tags: ["computer use", "safety", "leases", "redaction"],
-    keywords: ["cu", "desktop", "vm", "isolated", "mouse", "keyboard", "screen"],
-    audience: ["everyone", "power_user", "operator"],
-    access: "gated",
-    capabilityIds: ["computer.observe", "computer.control"],
-  },
-  {
-    id: "approvals-and-permissions",
-    title: "Understand approvals and permissions",
-    summary:
-      "A visible capability is not automatically executable; mutating and computer actions require their declared gate.",
-    body:
-      "Review the requested scope, target, risk, and expiry before approving. Deny or pause when the observed target changed. Approval is scoped to the current run and capability; it never silently expands to raw input, another workspace, another agent, or a future revision.",
-    tags: ["permissions", "approval", "security", "scope"],
-    keywords: ["consent", "human gate", "authorize", "deny", "risk"],
-    audience: ["everyone", "power_user", "operator"],
-    access: "public",
-    capabilityIds: ["run.execute", "run.promote", "computer.control"],
-  },
-  {
-    id: "queue-and-steering",
-    title: "Queue and steer work without losing scope",
-    summary:
-      "Queue, steer, or cancel a run with explicit request ids and the same workspace and run fence.",
-    body:
-      "Queue and steer are separate bounded operations, not hidden prompt injection. Use a fresh idempotency key for each intent, preserve the run and workspace identity, and reconcile the queue revision before editing or removing an entry. A retry after an uncertain response is allowed only when the durable oracle proves the original request was not accepted.",
-    tags: ["queue", "steer", "idempotency", "scope"],
-    keywords: ["queued", "cancel", "request id", "revision", "retry", "prompt"],
-    audience: ["power_user", "operator"],
-    access: "gated",
-    capabilityIds: ["run.queue", "run.execute"],
-  },
-  {
-    id: "promotion-and-discard",
-    title: "Promote or discard an isolated review safely",
-    summary:
-      "Promotion consumes a short-lived approval bound to exact fingerprints, changed files, and the same run.",
-    body:
-      "Show the exact source and final fingerprints and the bounded changed-file summaries before approval. A promotion request must consume the matching approval id with a new idempotency key; stale, expired, mismatched, or replayed approvals deny without mutation. Discard is explicit and must leave an auditable terminal receipt.",
-    tags: ["promotion", "discard", "review", "fingerprint"],
-    keywords: ["approve", "promote", "merge", "isolated", "receipt", "expiry"],
-    audience: ["power_user", "operator"],
-    access: "operator",
-    capabilityIds: ["run.promote", "run.review"],
-  },
-  {
-    id: "enterprise-gateway-review",
-    title: "Review code through a restricted company gateway",
-    summary:
-      "Use a permitted gateway for code review even when its model is weaker, while preserving evidence and policy boundaries.",
-    body:
-      "Select a provider profile that identifies the gateway, allowed routes, token scope, quota observability, and retry policy. Treat provider identity and quota truth as evidence, not assumptions. The review receipt records the exact repository, base/head, gateway route, model, and findings without copying credentials or account balances.",
-    tags: ["enterprise", "gateway", "review", "audit"],
-    keywords: ["company", "restricted", "weak model", "quota", "provider", "compliance"],
-    audience: ["power_user", "operator"],
-    access: "operator",
-    capabilityIds: ["run.review"],
-  },
-  {
-    id: "help-search-and-assistant",
-    title: "Search Help Center and ask for guidance",
-    summary:
-      "Search is local and deterministic; an optional assistant may explain results but cannot grant authority.",
-    body:
-      "Use natural language, capability names, or tags such as ‘stale frame’, ‘restricted gateway’, or ‘restart duplicate’. Search results are permission-safe help content. Any assistant context is bounded to those results and must re-check live capabilities, approvals, leases, and scope before suggesting an action.",
-    tags: ["help", "search", "assistant", "accessibility"],
-    keywords: ["semantic", "documentation", "how do I", "explain", "guide"],
-    audience: ["everyone", "power_user", "operator"],
-    access: "public",
-    capabilityIds: [],
-  },
-  {
-    id: "power-user-accessibility",
-    title: "Work quickly with keyboard and screen reader",
-    summary:
-      "Power-user speed and accessibility are designed together: named landmarks, predictable focus, and visible state.",
-    body:
-      "Use the Sessions, Tools, Live, and Computer landmarks to move between work areas. Running state, permission requests, stale observations, and recovery actions must be announced and remain visible. Reduced motion and large text settings preserve the same information hierarchy rather than hiding status.",
-    tags: ["accessibility", "keyboard", "screen reader", "ux"],
-    keywords: ["focus", "shortcut", "contrast", "reduced motion", "large text"],
-    audience: ["everyone", "power_user"],
-    access: "public",
-    capabilityIds: [],
-  },
-];
-
-function freezeHelpEntry(entry: HelpEntry): HelpEntry {
-  return Object.freeze({
-    ...entry,
-    tags: Object.freeze([...entry.tags]),
-    keywords: Object.freeze([...entry.keywords]),
-    audience: Object.freeze([...entry.audience]),
-    capabilityIds: Object.freeze([...entry.capabilityIds]),
-  });
-}
-
-/** Immutable capability-aware corpus for desktop and external consumers. */
-export const HELP_ENTRIES: readonly HelpEntry[] = Object.freeze(
-  HELP_ENTRY_DATA.map(freezeHelpEntry),
-);
+/**
+ * The shipped corpus is generated from the canonical Help corpus.
+ *
+ * `desktop/src/lib/help/canonical/data.ts` is the only hand-maintained corpus
+ * in the tree; this contract keeps its published shape, ranking, and immutability
+ * guarantees while its content is projected from that single source.
+ */
+export const HELP_ENTRIES: readonly HelpEntry[] = PROJECTED_HELP_ENTRIES;
 
 const SYNONYMS: Record<string, string[]> = {
   agent: ["agents", "worker", "persistent"],
