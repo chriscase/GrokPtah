@@ -190,6 +190,9 @@ fn an_unmeasured_capability_mode_is_rejected() {
     // catalog check is the one that refuses it.
     spec.workers[1].capability_mode = SubagentCapabilityMode::Execute;
     spec.workers[1].isolation = IsolationRequirement::Worktree;
+    spec.workers[1]
+        .capabilities
+        .insert(WorkerCapability::ExecuteInWorktree);
     let message = expect_rejected(spec, SwarmErrorCode::CapabilityNotGranted);
     assert!(message.contains("capability mode 'execute'"), "{message}");
 }
@@ -380,6 +383,10 @@ fn review_and_synthesis_tasks_require_their_capability() {
     spec.workers[2]
         .capabilities
         .remove(&WorkerCapability::Synthesize);
+    expect_rejected(spec, SwarmErrorCode::CapabilityNotGranted);
+
+    let mut spec = diamond_spec(QuorumRule::Unanimous);
+    spec.workers[0].capability_mode = SubagentCapabilityMode::All;
     expect_rejected(spec, SwarmErrorCode::CapabilityNotGranted);
 }
 

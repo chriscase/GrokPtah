@@ -406,6 +406,37 @@ impl WorkerSpec {
                 self.worker_id
             )));
         }
+        match self.capability_mode {
+            SubagentCapabilityMode::All => {
+                return Err(SwarmError::capability(
+                    "the unrestricted capability mode is not admissible in the closed swarm contract",
+                ));
+            }
+            SubagentCapabilityMode::ReadWrite
+                if !self
+                    .capabilities
+                    .contains(&WorkerCapability::WriteWorkspace)
+                    && !self
+                        .capabilities
+                        .contains(&WorkerCapability::ExecuteInWorktree) =>
+            {
+                return Err(SwarmError::capability(format!(
+                    "worker '{}' requests read-write mode without a declared mutating capability",
+                    self.worker_id
+                )));
+            }
+            SubagentCapabilityMode::Execute
+                if !self
+                    .capabilities
+                    .contains(&WorkerCapability::ExecuteInWorktree) =>
+            {
+                return Err(SwarmError::capability(format!(
+                    "worker '{}' requests execute mode without ExecuteInWorktree",
+                    self.worker_id
+                )));
+            }
+            _ => {}
+        }
         if self
             .capabilities
             .contains(&WorkerCapability::ComputerUseLeased)
