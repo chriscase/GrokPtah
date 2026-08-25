@@ -74,6 +74,25 @@ async fn http_probe(
     Ok((status, value))
 }
 
+fn public_json_is_needle_free(value: &serde_json::Value) {
+    let serialized = value.to_string().to_ascii_lowercase();
+    for needle in [
+        "api_key",
+        "authorization",
+        "bearer",
+        "[redacted]",
+        "sk-",
+        "http://",
+        "https://",
+        "evil.example",
+    ] {
+        assert!(
+            !serialized.contains(needle),
+            "public envelope contained needle `{needle}`: {value}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn loopback_http_fixture_records_identity_quota_and_replay_but_refuses_release() {
     let (base, server) = start_fake_gateway(FakeRestrictedGateway::restricted_loopback(
@@ -95,9 +114,18 @@ async fn loopback_http_fixture_records_identity_quota_and_replay_but_refuses_rel
     assert_eq!(first["quota"]["truth"]["kind"], "provider_receipt");
     assert_eq!(first["quota"]["truth"]["source"], "provider");
     assert_eq!(first["quota"]["truth"]["evidenceKind"], "offline_fixture");
+    assert_eq!(first["quota"]["requestId"], "req-http");
+    assert_eq!(first["quota"]["profileId"], first["identity"]["profileId"]);
+    assert_eq!(first["quota"]["modelId"], first["identity"]["modelId"]);
+    assert_eq!(
+        first["quota"]["providerKind"],
+        first["identity"]["providerKind"]
+    );
+    assert_eq!(first["quota"]["baseUrl"], first["identity"]["baseUrl"]);
 
     let mut bundle: grokptah_agent_bridge::CampaignBundle = serde_json::from_value(json!({
         "schema": ENTERPRISE_GATEWAY_CAMPAIGN_SCHEMA,
+        "requestId": "req-http",
         "requested": {
             "profileId": "corp-restricted",
             "baseUrl": "http://127.0.0.1:9/v1",
@@ -134,6 +162,14 @@ async fn loopback_http_fixture_records_identity_quota_and_replay_but_refuses_rel
         .remaining_live_gates
         .iter()
         .any(|gate| gate.contains("live Cursor-account")));
+    assert!(verdict
+        .remaining_live_gates
+        .iter()
+        .any(|gate| gate.contains("live HTTPS retry/idempotency")));
+    assert!(verdict
+        .remaining_live_gates
+        .iter()
+        .any(|gate| gate.contains("release artifact")));
     server.abort();
 }
 
@@ -154,6 +190,7 @@ async fn loopback_http_fallback_to_frontier_is_detected() {
     assert_eq!(first["identity"]["profileId"], "xai");
     let bundle: grokptah_agent_bridge::CampaignBundle = serde_json::from_value(json!({
         "schema": ENTERPRISE_GATEWAY_CAMPAIGN_SCHEMA,
+        "requestId": "req-http-fallback",
         "requested": {
             "profileId": "corp-restricted",
             "baseUrl": "http://127.0.0.1:9/v1",
@@ -186,7 +223,7 @@ async fn loopback_http_fallback_to_frontier_is_detected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn loopback_http_unknown_quota_and_unavailable_stay_fail_closed_and_redacted() {
+async fn loopback_http_unknown_quota_and_unavailable_stay_fail_closed_and_needle_free() {
     let quota_gateway = FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:0/v1")
         .with_quota_mode(FakeQuotaMode::Unknown);
     let (base, server) = start_fake_gateway(quota_gateway).await;
@@ -205,14 +242,68 @@ async fn loopback_http_unknown_quota_and_unavailable_stay_fail_closed_and_redact
     let (status, error) = http_probe(&client, &base, "req-http-down", "review")
         .await
         .unwrap();
+    let (retry_status, retry) = http_probe(&client, &base, "req-http-down", "review")
+        .await
+        .unwrap();
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(retry_status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(error["code"], "authority_unavailable");
-    let serialized = error.to_string();
-    assert!(!serialized.contains(secret));
-    assert!(!serialized.contains("evil.example"));
-    assert!(!serialized.contains("api_key=sk-"));
     assert_eq!(error["reasonCode"], "provider_unavailable");
+    assert_eq!(error["message"], "The requested provider is unavailable.");
+    assert_eq!(retry["code"], error["code"]);
+    assert_eq!(retry["message"], error["message"]);
+    public_json_is_needle_free(&error);
+    public_json_is_needle_free(&retry);
     server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn loopback_http_canonical_duplicate_retry_and_failure_replay() {
+    let (base, server) = start_fake_gateway(FakeRestrictedGateway::restricted_loopback(
+        "http://127.0.0.1:0/v1",
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let left = r#"{"task":"review","n":1}"#;
+    let right = r#"{ "n": 1, "task": "review" }"#;
+    let (first_status, first) = http_probe(&client, &base, "req-http-canon", left)
+        .await
+        .unwrap();
+    let (retry_status, retry) = http_probe(&client, &base, "req-http-canon", right)
+        .await
+        .unwrap();
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(retry_status, StatusCode::OK);
+    assert_eq!(retry["attempt"]["outcome"], "replayed");
+    assert_eq!(
+        first["attempt"]["payloadHash"],
+        retry["attempt"]["payloadHash"]
+    );
+    assert!(retry["attempt"]["error"].is_null());
+    server.abort();
+
+    let down =
+        FakeRestrictedGateway::restricted_loopback("http://127.0.0.1:0/v1").with_unavailable();
+    let bundle = down
+        .collect_offline_campaign("req-http-fail-replay", left)
+        .unwrap();
+    assert_eq!(bundle.attempts[0].outcome, AttemptOutcome::Failed);
+    assert_eq!(bundle.attempts[1].outcome, AttemptOutcome::Replayed);
+    assert_eq!(bundle.attempts[0].error, bundle.attempts[1].error);
+    let verdict = verify_campaign(&bundle);
+    assert!(!verdict.qualified_for_release);
+    let retry = verdict
+        .checks
+        .iter()
+        .find(|check| check.name == "idempotent_retry_receipts")
+        .unwrap();
+    assert!(retry.passed, "{verdict:#?}");
+    let redaction = verdict
+        .checks
+        .iter()
+        .find(|check| check.name == "bounded_errors_and_redaction")
+        .unwrap();
+    assert!(redaction.passed, "{verdict:#?}");
 }
 
 #[test]
