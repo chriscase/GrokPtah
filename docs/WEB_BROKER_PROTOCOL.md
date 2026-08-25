@@ -185,7 +185,9 @@ Content-Type: application/json
 ```
 
 The browser-facing client may carry these two routes as typed calls, but the
-client is not the authority: the broker must recompute or verify the review
+client validates the approval envelope (including the opaque binding/run ids,
+fingerprints, expiry, and repository-relative changed-file summaries) before
+exposing promotion evidence, but it is not the authority: the broker must recompute or verify the review
 receipt, bind the approval to the same opaque run and fingerprints, enforce a
 short expiry, and require the desktop-side human gate before forwarding a
 promotion. A stale, expired, mismatched, or replayed approval is rejected
