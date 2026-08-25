@@ -1363,7 +1363,7 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
         reason_code: Some(e.code.as_str().into()),
         event_range,
     };
-    let data = serde_json::to_value(public).unwrap_or_else(|_| {
+    let mut data = serde_json::to_value(public).unwrap_or_else(|_| {
         json!({
             "code": "internal",
             "message": "The operation failed.",
@@ -1373,6 +1373,17 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
     // Keep `code` stable for cross-product consumers. The detailed server-side
     // reason is separately named and bounded; never forward arbitrary OrchError
     // data or overwrite the public taxonomy with an internal transport code.
+    //
+    // `unsupported` is the documented MCP fail-closed public code (HTTP 405)
+    // when a method or host capability such as the Computer Use ledger is
+    // unavailable. The SDK ErrorCode taxonomy has no matching variant; do not
+    // collapse it to `invalid_request`, which is the HTTP 400 request-shape
+    // category.
+    if e.code == OrchErrorCode::Unsupported {
+        if let Some(object) = data.as_object_mut() {
+            object.insert("code".into(), json!("unsupported"));
+        }
+    }
     let message = data
         .get("message")
         .and_then(Value::as_str)
@@ -1404,9 +1415,10 @@ fn public_error_code(code: &OrchErrorCode) -> PublicErrorCode {
             PublicErrorCode::StaleOrRecovery
         }
         OrchErrorCode::Timeout => PublicErrorCode::Internal,
-        OrchErrorCode::InvalidRequest | OrchErrorCode::Unsupported | OrchErrorCode::Conflict => {
-            PublicErrorCode::InvalidRequest
-        }
+        OrchErrorCode::InvalidRequest | OrchErrorCode::Conflict => PublicErrorCode::InvalidRequest,
+        // Placeholder only: json_err projects the documented wire code
+        // `unsupported`. SDK ErrorCode has no Unsupported variant.
+        OrchErrorCode::Unsupported => PublicErrorCode::InvalidRequest,
         OrchErrorCode::Internal => PublicErrorCode::Internal,
     }
 }
@@ -3061,8 +3073,20 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(body["error"]["data"]["code"], "invalid_request");
+        assert_eq!(body["error"]["data"]["code"], "unsupported");
         assert_eq!(body["error"]["data"]["reasonCode"], "unsupported");
+        assert_eq!(
+            body["error"]["data"]["message"],
+            "The operation is unsupported."
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| !message.to_ascii_lowercase().contains("ledger")
+                    && !message.to_ascii_lowercase().contains("lock")
+                    && !message.to_ascii_lowercase().contains("computer-use")),
+            "fail-closed errors must not leak ledger details: {body}"
+        );
 
         fixture.srv.stop();
         set_grokptah_home_override(None);
