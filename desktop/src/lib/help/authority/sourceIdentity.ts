@@ -90,6 +90,12 @@ export const HELP_AUTHORITY_IDENTITY: HelpAuthorityIdentity = Object.freeze({
   modelVersion: HELP_MODEL_PROVENANCE.modelVersion,
 });
 
+const RECOMPUTED_SOURCE_DIGEST = helpSourceBindingDigest();
+if (RECOMPUTED_SOURCE_DIGEST !== HELP_SOURCE_BYTE_DIGEST) {
+  throw new Error(
+    `help authority: source-byte manifest digest mismatch (${RECOMPUTED_SOURCE_DIGEST} != ${HELP_SOURCE_BYTE_DIGEST})`,
+  );
+}
 if (HELP_AUTHORITY_IDENTITY.sourceDigest !== HELP_SOURCE_BYTE_DIGEST) {
   throw new Error("help authority: source-byte digest is not bound");
 }
