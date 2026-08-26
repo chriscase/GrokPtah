@@ -82,25 +82,66 @@ const requiredExports = [
   "searchHelpCorpus",
   "createHelpSearchController",
   "describeHelpResultForAssistiveTech",
-  "buildHelpAnswerRequest",
-  "createHelpAnswerRoute",
   "validateHelpAnswerResponse",
-  "requestHelpAnswer",
   "redactHelpText",
+  "scanHelpForSecrets",
   "sanitizeHelpText",
   "verifyHelpModelChecksum",
-  // Authority, spans, provenance, and the task runtime.
-  "authorizeHelpDecision",
-  "parseHelpDecisionRequest",
-  "createHelpExecutor",
+  // Verification, provenance, and the task runtime.
   "buildHelpClaimSpan",
   "verifyHelpClaimSpan",
+  "checkHelpClaimCoverage",
+  "segmentHelpClaims",
   "HELP_INDEX_PROVENANCE",
   "createHelpTaskScheduler",
 ];
 const missing = requiredExports.filter((name) => !(name in publicApi));
 if (missing.length > 0) {
   throw new Error(`public bundle is missing required exports: ${missing.join(", ")}`);
+}
+
+// The published client may ask the server for a decision. It may not make one.
+//
+// Shipping `authorizeHelpDecision` and `createHelpExecutor` in a browser bundle
+// let a consumer decide, in code it controls, whether it was allowed to see a
+// source — a decision made by the party it constrains. Shipping
+// `requestHelpAnswer` let it point the answer contract at any endpoint it liked
+// from a bundle carrying GrokPtah's name. Neither is publishable.
+const forbiddenExports = [
+  "authorizeHelpDecision",
+  "authorizeHelpDecisionJson",
+  "parseHelpDecisionRequest",
+  "createHelpExecutor",
+  "HelpAuthorityMalformedError",
+  "requestHelpAnswer",
+  "buildHelpAnswerRequestCore",
+  "sealHelpAnswerRequest",
+  "helpAnswerRequestDigest",
+  "validateHelpAnswerRequest",
+];
+for (const [name, api] of [
+  ["public", publicApi],
+  ["ui-core", uiCoreApi],
+  ["help-react", await import(helpReactBundlePath.href)],
+]) {
+  const exposed = forbiddenExports.filter((symbol) => symbol in api);
+  if (exposed.length > 0) {
+    throw new Error(
+      `${name} bundle exposes local Help authority or transport: ${exposed.join(", ")}`,
+    );
+  }
+}
+
+// The corpus ships in the bundle, so every source in it is published. A source
+// that is not public must never reach a published corpus in the first place.
+const nonPublicSources = publicApi.HELP_CORPUS.articles
+  .flatMap((article) => article.sources ?? [])
+  .filter((source) => source.visibility !== "public")
+  .map((source) => `${source.id} (${source.visibility})`);
+if (nonPublicSources.length > 0) {
+  throw new Error(
+    `published Help corpus contains non-public sources: ${nonPublicSources.join(", ")}`,
+  );
 }
 for (const name of [
   "HELP_ARTICLES",
@@ -173,33 +214,44 @@ if (Object.isFrozen(publicApi.HELP_CORPUS) !== true) {
 }
 
 const helpReactApi = await import(helpReactBundlePath.href);
-for (const name of ["HelpResults", "HelpSearchInput", "HelpCitationList", "HelpHighlightedText", "useHelpSearch", "searchHelpCorpus"]) {
+for (const name of ["HelpResults", "HelpSearchInput", "HelpCitationList", "HelpHighlightedText", "useHelpSearch", "searchHelpCorpus", "HelpRoute"]) {
   if (!(name in helpReactApi)) throw new Error(`help-react bundle is missing required export: ${name}`);
 }
 
-// A consumer must be able to authorize, and must be denied by default.
-const denied = publicApi.authorizeHelpDecision(
+// A consumer must be able to *verify*, and must not be able to authorize.
+//
+// The previous version of this file asserted the opposite: that a consumer
+// could call `authorizeHelpDecision` and be denied by default. Denying by
+// default is the right rule in the wrong place — running it inside the
+// consumer's own bundle means the consumer chooses whether to run it.
+const answerValidation = publicApi.validateHelpAnswerResponse(
+  { schema: "grokptah.help-answer-response.v1" },
   {
-    schema: "grokptah.help-authority-request.v1",
-    action: "search",
-    principal: { principal_id: "p", tenant_id: "t", capabilities: [] },
-    corpus_digest: publicApi.HELP_CORPUS_DIGEST,
-    index_digest: publicApi.HELP_INDEX_PROVENANCE.indexDigest,
-    sources: [],
+    schema: "grokptah.help-answer-request.v1",
+    corpusDigest: publicApi.HELP_CORPUS_DIGEST,
+    indexDigest: publicApi.HELP_INDEX_PROVENANCE.indexDigest,
+    context: [],
+    admission: { admissionId: "sha256:none" },
   },
-  publicApi.HELP_CORPUS_DIGEST,
-  publicApi.HELP_INDEX_PROVENANCE.indexDigest,
 );
-if (denied.allowed || denied.denied_because !== "missing_capability") {
-  throw new Error("published authority did not deny a principal with no capability");
+if (answerValidation.accepted !== false) {
+  throw new Error("published response validation accepted a malformed reply");
 }
-let rejected = false;
-try {
-  publicApi.parseHelpDecisionRequest({ schema: "x", action: "search", bypass: true });
-} catch {
-  rejected = true;
+
+// Claim coverage must be decidable by the consumer, over its own segmentation.
+const coverage = publicApi.checkHelpClaimCoverage("Resume safely. Quota is separate.", []);
+if (coverage.ok !== false || coverage.reason !== "uncovered-claim") {
+  throw new Error("published claim coverage did not refuse an uncited answer");
 }
-if (!rejected) throw new Error("published authority accepted an unknown field");
+if (publicApi.segmentHelpClaims("One. Two.").length !== 2) {
+  throw new Error("published claim segmentation did not segment an answer");
+}
+
+// The secret scan must report uncertainty rather than clearing what it cannot
+// rule out.
+if (publicApi.scanHelpForSecrets("aGVsbG8gd29ybGQ=").confidence !== "possible") {
+  throw new Error("published secret scan reported certainty it does not have");
+}
 
 // Claim spans must be re-verifiable by a consumer that did not produce them.
 const spanChunk = publicApi.HELP_CORPUS.chunks[0];

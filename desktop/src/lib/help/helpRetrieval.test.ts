@@ -5,10 +5,10 @@ import {
   HelpCorpusDigestMismatchError,
   searchHelpCorpus,
 } from "./retrieval/hybrid";
-import { HELP_CORPUS_DIGEST, getHelpArticle } from "./canonical/corpus";
+import { HELP_CORPUS, HELP_CORPUS_DIGEST, getHelpArticle } from "./canonical/corpus";
 import { HELP_QUERY_MAX_CHARS } from "./retrieval/text";
 import { buildHelpExcerpt, sanitizeHelpText } from "./retrieval/highlight";
-import { containsHelpSecret, redactHelpText } from "./retrieval/redact";
+import { containsHelpSecret, redactHelpText, scanHelpForSecrets } from "./retrieval/redact";
 import { verifyHelpModelChecksum, HELP_MODEL_PROVENANCE, HELP_MODEL_STATS } from "./model/artifact";
 
 describe("Help embedding model", () => {
@@ -243,5 +243,57 @@ describe("Help query redaction", () => {
     const value = "how do I recover a durable run after a restart";
     expect(redactHelpText(value).redacted).toBe(false);
     expect(redactHelpText(value).text).toBe(value);
+  });
+});
+
+describe("secret scan uncertainty", () => {
+  it("reports every corpus chunk as clean", () => {
+    // The calibration gate. A scan that flags ordinary Help prose is a scan
+    // that refuses the product: an answer about providers is made of sentences
+    // like "rotate the key regularly".
+    expect(HELP_CORPUS.chunks.length).toBeGreaterThan(0);
+    const flagged = HELP_CORPUS.chunks
+      .map((chunk) => ({ id: chunk.id, scan: scanHelpForSecrets(chunk.text) }))
+      .filter((entry) => entry.scan.confidence !== "clean");
+    expect(flagged.map((entry) => `${entry.id}: ${entry.scan.indicators.join(",")}`)).toEqual([]);
+  });
+
+  it.each([
+    "Rotate the key regularly.",
+    "Use token rotation.",
+    "The API key is stored in the provider profile.",
+    "Keys and tokens are never written to the transcript.",
+    "Resume only from a checkpoint.",
+  ])("leaves ordinary Help prose clean: %s", (sentence) => {
+    expect(scanHelpForSecrets(sentence).confidence).toBe("clean");
+  });
+
+  it("reports certainty with the rule kinds that matched", () => {
+    const scan = scanHelpForSecrets("my key is xai-AbCdEf0123456789AbCdEf");
+    expect(scan.confidence).toBe("certain");
+    expect(scan.kinds.length).toBeGreaterThan(0);
+    // Never the matched text.
+    expect(JSON.stringify(scan)).not.toContain("AbCdEf");
+  });
+
+  it.each([
+    ["padded-base64", "aGVsbG8gd29ybGQ="],
+    ["short-high-entropy", "Ab3Cd4Ef5Gh6Ij7Kl"],
+    ["unknown-prefixed-key", "zz_A1b2C3d4E5f6G7h8"],
+  ])("reports %s as possible rather than clean", (indicator, sample) => {
+    // The third answer the scan used to lack. None of these is enough to
+    // redact on; each is enough to refuse untrusted provider output on.
+    const scan = scanHelpForSecrets(sample);
+    expect(scan.confidence).toBe("possible");
+    expect(scan.indicators).toContain(indicator);
+  });
+
+  it("does not treat a named digest as an unexplained blob", () => {
+    // The contracts, receipts, and corpus are full of these.
+    expect(
+      scanHelpForSecrets(
+        "The corpus digest is sha256:1111111111111111111111111111111111111111111111111111111111111111.",
+      ).indicators,
+    ).not.toContain("long-hex");
   });
 });

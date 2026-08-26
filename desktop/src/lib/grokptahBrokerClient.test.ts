@@ -770,3 +770,90 @@ describe("GrokPtahBrokerClient", () => {
     });
   });
 });
+
+describe("broker Help authority", () => {
+  function clientWith(response: unknown, status = 200) {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fetcher = (async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify(response), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://broker.example",
+      fetcher,
+      csrfToken: "csrf-token",
+    });
+    return { client, calls };
+  }
+
+  const decision = {
+    allowed: true,
+    allowedSourceIds: ["durable.lifecycle"],
+    corpusDigest: "sha256:corpus",
+    indexDigest: "sha256:index",
+    receiptDigest: "sha256:receipt",
+  };
+
+  it("asks the broker for a decision rather than making one", async () => {
+    const { client, calls } = clientWith(decision);
+    const result = await client.authorizeHelp("binding-1", "search", "idem-1");
+    expect(result.allowed).toBe(true);
+    expect(result.allowedSourceIds).toEqual(["durable.lifecycle"]);
+    expect(calls[0]!.url).toContain("/bindings/binding-1/help/authorize");
+    expect(calls[0]!.init.method).toBe("POST");
+  });
+
+  it("refuses a decision payload that is not the closed shape", async () => {
+    const { client } = clientWith({ allowed: true });
+    await expect(client.authorizeHelp("binding-1", "search", "idem-1")).rejects.toThrow();
+  });
+
+  it("returns an answer receipt and nothing about the exchange", async () => {
+    const receipt = {
+      admissionId: "sha256:admission",
+      requestDigest: "sha256:request",
+      corpusDigest: "sha256:corpus",
+      indexDigest: "sha256:index",
+      outcome: "answered",
+      outcomeDigest: "sha256:outcome",
+      citedSourceIds: ["durable.lifecycle"],
+      claimCount: 2,
+    };
+    const { client } = clientWith(receipt);
+    const result = await client.answerHelp("binding-1", "durable run recovery", "idem-2");
+    expect(result.outcome).toBe("answered");
+    expect(result.claimCount).toBe(2);
+    expect(JSON.stringify(result)).not.toContain("durable run recovery");
+  });
+
+  it("refuses a receipt carrying an artifact of the exchange", async () => {
+    // A receipt is artifact-free by contract. One that is not did not come
+    // from a broker holding that contract, and rendering it anyway would make
+    // the client the place the guarantee breaks.
+    const { client } = clientWith({
+      admissionId: "sha256:admission",
+      requestDigest: "sha256:request",
+      corpusDigest: "sha256:corpus",
+      indexDigest: "sha256:index",
+      outcome: "answered",
+      citedSourceIds: [],
+      claimCount: 1,
+      answer: "Resume freely after a restart.",
+    });
+    await expect(client.answerHelp("binding-1", "q", "idem-3")).rejects.toThrow();
+  });
+
+  it("requires a CSRF token and an idempotency key for both", async () => {
+    const tokenless = new GrokPtahBrokerClient({
+      baseUrl: "https://broker.example",
+      fetcher: (async () => new Response("{}")) as unknown as typeof fetch,
+    });
+    await expect(tokenless.authorizeHelp("binding-1", "search", "idem")).rejects.toThrow();
+
+    const { client } = clientWith(decision);
+    await expect(client.authorizeHelp("binding-1", "search", "  ")).rejects.toThrow();
+  });
+});

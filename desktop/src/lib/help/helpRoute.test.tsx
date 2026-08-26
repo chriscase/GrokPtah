@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { useEffect, useRef } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { HelpRoute, useHelpPaletteShortcut } from "./react/HelpRoute";
 
@@ -58,6 +59,114 @@ describe("Help route", () => {
     const background = document.getElementById("root")!;
     expect(background.hasAttribute("inert")).toBe(false);
     expect(background.hasAttribute("aria-hidden")).toBe(false);
+  });
+
+  it("does not inert itself when it renders inside the app root", () => {
+    // The arrangement every React app actually has, and the one the previous
+    // `document.getElementById("root")` default got wrong: the route renders
+    // *inside* `#root`, so inerting `#root` inerted the palette. The surface
+    // built for keyboard and screen-reader users became the one surface
+    // neither could reach.
+    const root = document.createElement("div");
+    root.id = "root";
+    document.body.append(root);
+
+    render(
+      <>
+        <nav data-testid="chrome">app chrome</nav>
+        <HelpRoute open onClose={vi.fn()} />
+      </>,
+      { container: root },
+    );
+
+    const dialog = screen.getByRole("dialog");
+    expect(root.hasAttribute("inert")).toBe(false);
+    expect(root.hasAttribute("aria-hidden")).toBe(false);
+    // Nothing between the dialog and the body is inert.
+    for (let node = dialog.parentElement; node; node = node.parentElement) {
+      expect(node.hasAttribute("inert"), node.tagName).toBe(false);
+    }
+    // The dialog itself is reachable.
+    expect(dialog.closest("[inert]")).toBeNull();
+    // What is beside it is not.
+    const chrome = screen.getByTestId("chrome");
+    expect(chrome.hasAttribute("inert")).toBe(true);
+    expect(chrome).toHaveAttribute("aria-hidden", "true");
+
+    root.remove();
+  });
+
+  it("restores a sibling that was already hidden for its own reasons", () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+
+    const tree = (open: boolean) => (
+      <>
+        <div data-testid="already" aria-hidden="true" />
+        <HelpRoute open={open} onClose={vi.fn()} />
+      </>
+    );
+    const { rerender } = render(tree(true), { container: root });
+    const already = screen.getByTestId("already");
+    expect(already.hasAttribute("inert")).toBe(true);
+
+    rerender(tree(false));
+    // The palette added `inert`, so it removes `inert`. It did not add
+    // `aria-hidden`, so it must not remove it.
+    expect(already.hasAttribute("inert")).toBe(false);
+    expect(already).toHaveAttribute("aria-hidden", "true");
+
+    root.remove();
+  });
+
+  it("ignores a named background that would capture the dialog", () => {
+    const root = document.createElement("div");
+    document.body.append(root);
+
+    // A caller naming an ancestor is asking for the palette to be inerted.
+    // The route inerts the dialog's siblings instead of obeying.
+    render(
+      <>
+        <div data-testid="beside" />
+        <HelpRoute open onClose={vi.fn()} backgroundRef={{ current: root }} />
+      </>,
+      { container: root },
+    );
+
+    expect(root.hasAttribute("inert")).toBe(false);
+    expect(screen.getByTestId("beside").hasAttribute("inert")).toBe(true);
+    expect(screen.getByRole("dialog").closest("[inert]")).toBeNull();
+
+    root.remove();
+  });
+
+  it("honors a named background that is genuinely beside the dialog", () => {
+    // The escape hatch still works when it does not capture the palette.
+    const named = { current: null as HTMLElement | null };
+    const Named = () => {
+      const ref = useRef<HTMLDivElement | null>(null);
+      useEffect(() => {
+        named.current = ref.current;
+      }, []);
+      return <div ref={ref} data-testid="named" />;
+    };
+    const { rerender } = render(
+      <>
+        <Named />
+        <div data-testid="other" />
+        <HelpRoute open={false} onClose={vi.fn()} backgroundRef={named} />
+      </>,
+    );
+    rerender(
+      <>
+        <Named />
+        <div data-testid="other" />
+        <HelpRoute open onClose={vi.fn()} backgroundRef={named} />
+      </>,
+    );
+    expect(screen.getByTestId("named").hasAttribute("inert")).toBe(true);
+    // Only the named element; sibling inerting is the fallback, not an addition.
+    expect(screen.getByTestId("other").hasAttribute("inert")).toBe(false);
   });
 
   it("restores focus to the opener on close", () => {

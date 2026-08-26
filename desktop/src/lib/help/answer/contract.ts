@@ -32,7 +32,7 @@
 import { HELP_CORPUS_DIGEST, getHelpArticle, getHelpChunk } from "../canonical/corpus";
 import { domainDigest } from "../canonical/digest";
 import { sanitizeHelpText } from "../retrieval/highlight";
-import { containsHelpSecret, redactHelpText } from "../retrieval/redact";
+import { redactHelpText, scanHelpForSecrets } from "../retrieval/redact";
 import { buildHelpClaimSpan, verifyHelpClaimSpan, type HelpClaimSpan } from "../retrieval/spans";
 import type { HelpRetrievalResult } from "../retrieval/hybrid";
 import { checkHelpClaimCoverage, type HelpAnswerClaim } from "./claims";
@@ -457,8 +457,21 @@ export function validateHelpAnswerResponse(
   if (MARKUP_PATTERN.test(answer)) {
     return { accepted: false, reason: "markup-in-answer", detail: "provider text contained markup" };
   }
-  if (containsHelpSecret(answer)) {
-    return { accepted: false, reason: "secret-in-answer", detail: "provider text contained a credential pattern" };
+  // Untrusted provider text is held to the scan's *uncertainty*, not only to
+  // its certainty. A shape the scan cannot rule out is refused, because the
+  // cost of refusing is that the user keeps the offline results they already
+  // have, and the cost of being wrong the other way is a credential rendered
+  // into the UI.
+  const answerScan = scanHelpForSecrets(answer);
+  if (answerScan.confidence !== "clean") {
+    return {
+      accepted: false,
+      reason: "secret-in-answer",
+      detail:
+        answerScan.confidence === "certain"
+          ? `provider text matched: ${answerScan.kinds.join(", ")}`
+          : `provider text could not be cleared: ${answerScan.indicators.join(", ")}`,
+    };
   }
 
   const uncertainty = typeof value.uncertainty === "string" ? value.uncertainty : "";
@@ -470,6 +483,15 @@ export function validateHelpAnswerResponse(
   }
   if (MARKUP_PATTERN.test(uncertainty)) {
     return { accepted: false, reason: "markup-in-answer", detail: "uncertainty contained markup" };
+  }
+  // The uncertainty field is provider text too, and is rendered too.
+  const uncertaintyScan = scanHelpForSecrets(uncertainty);
+  if (uncertaintyScan.confidence !== "clean") {
+    return {
+      accepted: false,
+      reason: "secret-in-answer",
+      detail: `uncertainty could not be cleared: ${[...uncertaintyScan.kinds, ...uncertaintyScan.indicators].join(", ")}`,
+    };
   }
 
   if (!Array.isArray(value.citations) || value.citations.length === 0) {

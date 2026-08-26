@@ -485,6 +485,86 @@ export function parseBrokerEventUpdate(value: unknown): GrokPtahBrokerEventUpdat
   };
 }
 
+/** A Help decision the broker made, as the browser is allowed to see it. */
+export type GrokPtahBrokerHelpDecision = {
+  allowed: boolean;
+  deniedBecause?: string | null;
+  /** Source ids the caller may be shown. Never the ones it may not. */
+  allowedSourceIds: string[];
+  corpusDigest: string;
+  indexDigest: string;
+  receiptDigest: string;
+};
+
+/** An answer execution receipt, carrying no artifact of the exchange. */
+export type GrokPtahBrokerHelpReceipt = {
+  admissionId: string;
+  requestDigest: string;
+  corpusDigest: string;
+  indexDigest: string;
+  outcome: string;
+  failure?: string | null;
+  outcomeDigest?: string | null;
+  citedSourceIds: string[];
+  claimCount: number;
+};
+
+function parseBrokerHelpDecision(value: unknown): GrokPtahBrokerHelpDecision | null {
+  if (!isRecord(value)) return null;
+  const allowedSourceIds = value.allowedSourceIds;
+  if (typeof value.allowed !== "boolean") return null;
+  if (!Array.isArray(allowedSourceIds) || allowedSourceIds.some((id) => typeof id !== "string")) {
+    return null;
+  }
+  if (
+    typeof value.corpusDigest !== "string" ||
+    typeof value.indexDigest !== "string" ||
+    typeof value.receiptDigest !== "string"
+  ) {
+    return null;
+  }
+  return {
+    allowed: value.allowed,
+    deniedBecause: typeof value.deniedBecause === "string" ? value.deniedBecause : null,
+    allowedSourceIds: allowedSourceIds as string[],
+    corpusDigest: value.corpusDigest,
+    indexDigest: value.indexDigest,
+    receiptDigest: value.receiptDigest,
+  };
+}
+
+function parseBrokerHelpReceipt(value: unknown): GrokPtahBrokerHelpReceipt | null {
+  if (!isRecord(value)) return null;
+  const cited = value.citedSourceIds;
+  if (
+    typeof value.admissionId !== "string" ||
+    typeof value.requestDigest !== "string" ||
+    typeof value.corpusDigest !== "string" ||
+    typeof value.indexDigest !== "string" ||
+    typeof value.outcome !== "string" ||
+    typeof value.claimCount !== "number"
+  ) {
+    return null;
+  }
+  if (!Array.isArray(cited) || cited.some((id) => typeof id !== "string")) return null;
+  // A receipt is supposed to be artifact-free. Refuse one that is not, rather
+  // than rendering whatever a compromised broker decided to attach.
+  for (const key of ["answer", "query", "quote", "citations", "uncertainty", "text", "path"]) {
+    if (key in value) return null;
+  }
+  return {
+    admissionId: value.admissionId,
+    requestDigest: value.requestDigest,
+    corpusDigest: value.corpusDigest,
+    indexDigest: value.indexDigest,
+    outcome: value.outcome,
+    failure: typeof value.failure === "string" ? value.failure : null,
+    outcomeDigest: typeof value.outcomeDigest === "string" ? value.outcomeDigest : null,
+    citedSourceIds: cited as string[],
+    claimCount: value.claimCount,
+  };
+}
+
 export class GrokPtahBrokerError extends Error {
   readonly status: number;
   readonly code: string;
@@ -546,6 +626,48 @@ export class GrokPtahBrokerClient {
       idempotencyKey,
       body: { investigationId, workspace, requestedCapabilities: [...requestedCapabilities] },
     });
+  }
+
+  /**
+   * Ask the broker to authorize a Help action.
+   *
+   * The decision is made server-side and returned; the browser applies it. The
+   * published client used to carry `authorizeHelpDecision` and decide locally,
+   * which put the decision in the hands of the party it constrains.
+   *
+   * Only the allowed source ids come back. A response listing what was denied
+   * would tell a caller what exists, which is the leak the coarse deny reasons
+   * on the server side exist to avoid.
+   */
+  async authorizeHelp(
+    bindingId: string,
+    action: "search" | "answer" | "read_source",
+    idempotencyKey: string,
+  ): Promise<GrokPtahBrokerHelpDecision> {
+    return this.requestValidated(
+      `/bindings/${segment(bindingId)}/help/authorize`,
+      parseBrokerHelpDecision,
+      { method: "POST", idempotencyKey, body: { action } },
+    );
+  }
+
+  /**
+   * Ask the broker to execute one bounded Help answer.
+   *
+   * The request body, the route admission, and the provider call all live on
+   * the server. What comes back is the receipt — ids, digests, and counts — so
+   * this method cannot become a way to reach a provider from a browser.
+   */
+  async answerHelp(
+    bindingId: string,
+    query: string,
+    idempotencyKey: string,
+  ): Promise<GrokPtahBrokerHelpReceipt> {
+    return this.requestValidated(
+      `/bindings/${segment(bindingId)}/help/answer`,
+      parseBrokerHelpReceipt,
+      { method: "POST", idempotencyKey, body: { query } },
+    );
   }
 
   async listSessions<T = unknown>(bindingId: string): Promise<T> {

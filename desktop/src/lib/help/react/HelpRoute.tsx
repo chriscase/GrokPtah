@@ -7,6 +7,12 @@
  *   - **Inert background.** While the palette is open the rest of the page is
  *     marked `aria-hidden` and `inert`, so a screen reader cannot walk into
  *     content the user cannot see and Tab cannot land behind the overlay.
+ *     "The rest of the page" means the dialog's siblings, walked up to
+ *     `document.body` — never an ancestor of the dialog. Defaulting to
+ *     `#root` was wrong in the ordinary React arrangement, where the route
+ *     renders *inside* `#root`: the palette inerted itself, and the surface
+ *     built for keyboard and screen-reader users became the one surface
+ *     neither could reach.
  *   - **Focus is restored.** Whatever was focused before opening is refocused
  *     on close, including when the close came from Escape rather than a click.
  *   - **Status is announced.** One polite live region carries result counts,
@@ -41,10 +47,64 @@ export type HelpRouteProps = {
   readonly retrieval?: HelpRetrievalOptions;
   readonly onActivate?: (result: HelpRetrievalResult) => void;
   readonly hrefFor?: (citation: HelpCitation) => string | undefined;
-  /** Element made inert while the palette is open. Defaults to the app root. */
+  /**
+   * Element to make inert while the palette is open.
+   *
+   * Optional, and ignored when it contains the dialog — inerting an ancestor
+   * would inert the palette too. With no ref, or with one that would capture
+   * the dialog, the route inerts the dialog's siblings instead, which is
+   * correct wherever the route is mounted or portaled.
+   */
   readonly backgroundRef?: { current: HTMLElement | null };
   readonly showScoreComponents?: boolean;
 };
+
+/**
+ * Every element that is beside the dialog rather than around it.
+ *
+ * Walks from the dialog to `document.body`, collecting each level's other
+ * children. This is what makes the result independent of where the route is
+ * mounted: rendered inside the app root, portaled to the body, or nested
+ * arbitrarily, the set is always "everything the dialog is not inside of".
+ */
+function siblingsOf(dialog: HTMLElement): HTMLElement[] {
+  const siblings: HTMLElement[] = [];
+  let node: HTMLElement | null = dialog;
+  while (node && node !== document.body && node.parentElement) {
+    for (const child of Array.from(node.parentElement.children)) {
+      if (child !== node && child instanceof HTMLElement) siblings.push(child);
+    }
+    node = node.parentElement;
+  }
+  return siblings;
+}
+
+/**
+ * Make elements inert, and restore exactly what was there before.
+ *
+ * Prior state is recorded per element rather than blanket-removed on cleanup:
+ * a sibling that was already `aria-hidden` for its own reasons must still be
+ * `aria-hidden` after the palette closes.
+ */
+function applyInert(elements: readonly HTMLElement[]): () => void {
+  const restore = elements.map((element) => {
+    const previous = {
+      element,
+      hadInert: element.hasAttribute("inert"),
+      ariaHidden: element.getAttribute("aria-hidden"),
+    };
+    element.setAttribute("inert", "");
+    element.setAttribute("aria-hidden", "true");
+    return previous;
+  });
+  return () => {
+    for (const entry of restore) {
+      if (!entry.hadInert) entry.element.removeAttribute("inert");
+      if (entry.ariaHidden === null) entry.element.removeAttribute("aria-hidden");
+      else entry.element.setAttribute("aria-hidden", entry.ariaHidden);
+    }
+  };
+}
 
 function describeProvider(provider: HelpProviderState): string {
   switch (provider.kind) {
@@ -94,14 +154,16 @@ export function HelpRoute({
   // Mark the rest of the app inert. `inert` is what actually stops Tab and
   // assistive-technology traversal; `aria-hidden` alone leaves it tabbable.
   useEffect(() => {
-    const background = backgroundRef?.current ?? document.getElementById("root");
-    if (!open || !background) return undefined;
-    background.setAttribute("aria-hidden", "true");
-    background.setAttribute("inert", "");
-    return () => {
-      background.removeAttribute("aria-hidden");
-      background.removeAttribute("inert");
-    };
+    if (!open) return undefined;
+    const dialog = dialogRef.current;
+    const named = backgroundRef?.current ?? null;
+    // An explicitly named background is honored only when it does not contain
+    // the dialog. Silently inerting an ancestor would take the palette with it.
+    if (named && dialog && !named.contains(dialog)) {
+      return applyInert([named]);
+    }
+    if (!dialog) return undefined;
+    return applyInert(siblingsOf(dialog));
   }, [open, backgroundRef]);
 
   useEffect(() => {

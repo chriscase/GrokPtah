@@ -84,9 +84,9 @@ try {
   HELP_CORPUS_DIGEST,
   searchHelpCorpus,
   createHelpSearchController,
-  createHelpAnswerRoute,
-  buildHelpAnswerRequest,
   validateHelpAnswerResponse,
+  checkHelpClaimCoverage,
+  scanHelpForSecrets,
   verifyHelpModelChecksum,
 } from "@grokptah/client";
 import {
@@ -226,13 +226,48 @@ if (helpController.getState().results.length < 1) {
 }
 helpController.dispose();
 
-const helpRoute = createHelpAnswerRoute("consumer-provider", "consumer-tenant", "consumer-model");
-const helpRequest = buildHelpAnswerRequest("durable run recovery", helpOutcome.results, helpRoute);
-if (helpRequest.toolsDisabled !== true || helpRequest.conversationDisabled !== true) {
-  throw new Error("consumer Help answer request did not disable tools and conversation");
+// A consumer can verify what a server returned. It cannot build a request,
+// choose a route, or make an authorization decision — those are not in the
+// published surface, and this fixture is where that stops being a claim.
+for (const forbidden of [
+  "authorizeHelpDecision",
+  "createHelpExecutor",
+  "parseHelpDecisionRequest",
+  "requestHelpAnswer",
+  "buildHelpAnswerRequestCore",
+  "sealHelpAnswerRequest",
+]) {
+  const surface = await import("@grokptah/client");
+  if (forbidden in surface) {
+    throw new Error("consumer surface exposes local Help authority or transport: " + forbidden);
+  }
 }
-if (validateHelpAnswerResponse({ schema: "grokptah.help-answer-response.v1", answer: "x", citations: [], uncertainty: "y", corpusDigest: helpRequest.corpusDigest, routeDigest: helpRoute.routeDigest }, helpRequest).accepted) {
+
+const uncitedReply = validateHelpAnswerResponse(
+  {
+    schema: "grokptah.help-answer-response.v1",
+    answer: "x",
+    citations: [],
+    uncertainty: "y",
+    corpusDigest: HELP_CORPUS_DIGEST,
+    admissionId: "sha256:none",
+  },
+  {
+    schema: "grokptah.help-answer-request.v1",
+    corpusDigest: HELP_CORPUS_DIGEST,
+    indexDigest: "sha256:none",
+    context: [],
+    admission: { admissionId: "sha256:none" },
+  },
+);
+if (uncitedReply.accepted) {
   throw new Error("consumer Help answer validation accepted an uncited reply");
+}
+if (checkHelpClaimCoverage("Resume safely. Quota is separate.", []).ok !== false) {
+  throw new Error("consumer claim coverage accepted an uncited answer");
+}
+if (scanHelpForSecrets("aGVsbG8gd29ybGQ=").confidence !== "possible") {
+  throw new Error("consumer secret scan reported certainty it does not have");
 }
 
 const helpReact = await import("@grokptah/client/help-react");
