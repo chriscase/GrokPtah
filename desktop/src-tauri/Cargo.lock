@@ -1370,6 +1370,7 @@ dependencies = [
  "tauri-plugin-shell",
  "tempfile",
  "tokio",
+ "tokio-util",
  "uuid",
 ]
 
