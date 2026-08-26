@@ -35,6 +35,10 @@ mod isolated_visual_runtime;
 mod isolated_visual_selfcheck;
 mod isolated_visual_status;
 mod isolated_visual_stream;
+#[cfg(target_os = "macos")]
+mod macos_isolated_artifacts;
+#[cfg(target_os = "macos")]
+mod macos_isolated_runtime;
 mod macos_observation;
 mod platform;
 mod policy;
