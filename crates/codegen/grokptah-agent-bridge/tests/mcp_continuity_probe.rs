@@ -16,8 +16,8 @@ use grokptah_agent_bridge::orchestration::{
     WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    home_override_serial, set_grokptah_home_override, start_control_server, AgentHost, HostConfig,
-    SessionKind, SessionUpdate,
+    home_override_serial, set_grokptah_home_override, start_control_server, AgentHost, EventBus,
+    HostConfig, SessionKind, SessionUpdate,
 };
 use tempfile::tempdir;
 
@@ -94,9 +94,18 @@ async fn wait_for_file(path: &Path) {
     );
 }
 
-async fn wait_for_durable_seq(path: &Path, expected: u64) {
+async fn wait_for_persisted_seq(
+    event_bus: &EventBus,
+    path: &Path,
+    expected: u64,
+) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while tokio::time::Instant::now() < deadline {
+        if let Some(error) = event_bus.last_persistence_error() {
+            return Err(format!(
+                "event journal persistence failed before sequence {expected}: {error}"
+            ));
+        }
         let durable_seq = std::fs::read_to_string(path).ok().and_then(|text| {
             text.lines().next_back().and_then(|line| {
                 serde_json::from_str::<serde_json::Value>(line)
@@ -105,14 +114,33 @@ async fn wait_for_durable_seq(path: &Path, expected: u64) {
             })
         });
         if durable_seq.is_some_and(|seq| seq >= expected) {
-            return;
+            return event_bus.last_persistence_error().map_or(Ok(()), |error| {
+                Err(format!(
+                    "event journal persistence failed before sequence {expected}: {error}"
+                ))
+            });
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!(
-        "event journal did not durably reach sequence {expected}: {}",
+    Err(format!(
+        "event journal did not reach persisted sequence {expected}: {}",
         path.display()
-    );
+    ))
+}
+
+#[tokio::test]
+async fn persisted_seq_waiter_rejects_hidden_persistence_failure() {
+    let dir = tempdir().unwrap();
+    let blocker = dir.path().join("not-a-directory");
+    std::fs::write(&blocker, b"x").unwrap();
+    let event_bus = EventBus::new(8).with_persist_dir(&blocker);
+    let apparent_tail = dir.path().join("apparent-tail.jsonl");
+    std::fs::write(&apparent_tail, b"{\"seq\":100}\n").unwrap();
+
+    let error = wait_for_persisted_seq(&event_bus, &apparent_tail, 100)
+        .await
+        .expect_err("a later visible tail must not hide an earlier persistence failure");
+    assert!(error.contains("persistence failed"), "{error}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -223,7 +251,10 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
             text: format!("continuity-gap-{index}"),
         });
         if index % 100 == 99 {
-            wait_for_durable_seq(&journal_path, host.event_bus().current_seq()).await;
+            let event_bus = host.event_bus();
+            wait_for_persisted_seq(&event_bus, &journal_path, event_bus.current_seq())
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
         }
     }
     std::fs::write(&release_file, "release").unwrap();

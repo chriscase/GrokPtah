@@ -482,7 +482,7 @@ impl EventBus {
                 };
             }
         }
-        if after_seq > 0 && after_seq + 1 < g.oldest_seq && !g.journal.is_empty() {
+        if after_seq > 0 && after_seq.saturating_add(1) < g.oldest_seq && !g.journal.is_empty() {
             return JournalPage {
                 entries: Vec::new(),
                 next_cursor: None,
@@ -1622,6 +1622,21 @@ mod tests {
         let page = bus.read_after(0, 8);
         assert!(page.entries.is_empty());
         assert!(page.cursor_expired);
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn maximum_cursor_is_empty_without_overflow_or_expiry() {
+        let bus = EventBus::new(2);
+        let sid = Uuid::new_v4();
+        bus.publish(SessionUpdate::AgentMessageChunk {
+            session_id: sid,
+            text: "message".into(),
+        });
+
+        let page = bus.read_after(u64::MAX, 8);
+        assert!(page.entries.is_empty());
+        assert!(!page.cursor_expired);
         assert!(page.next_cursor.is_none());
     }
 
