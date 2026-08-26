@@ -9,6 +9,12 @@
 export * from "./capabilities";
 export * from "./externalWorker";
 export * from "./help";
+// The canonical, source-cited Help authority: one corpus with stable article
+// IDs, a digest manifest, offline hybrid retrieval with citations and
+// abstention, and the bounded optional answer seam built on top of it. Both
+// modules are transport-free and grant no capability.
+export * from "./helpAuthority";
+export * from "./helpAnswer";
 // The source-cited Help Center corpus is exported under explicit names so the
 // original bounded `searchHelp` contract remains backward compatible while
 // consumers can opt into semantic-ranking and assistant request validation.
@@ -25,6 +31,7 @@ export {
 } from "./helpCenter";
 export type {
   HelpArticle,
+  HelpSource,
   HelpAssistantAnswer,
   HelpAssistantRequest,
   HelpAssistantValidation,
