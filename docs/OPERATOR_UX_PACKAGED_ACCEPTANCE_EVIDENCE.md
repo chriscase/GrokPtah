@@ -109,16 +109,19 @@ Result log (pending — not filled by JSDOM):
 
 ## Source gates (not packaged AT)
 
-Recorded in the PR body after they are run. Lint and Playwright are **not**
-claimed; neither exists in this desktop package.
+Lint and Playwright are **not** claimed; neither exists in this desktop package.
 
-- `npx tsc --noEmit` / `npm run typecheck`
-- focused Vitest: presentation, PermissionModal, App.operatorUx
-- full `npx vitest run`
-- production `npx vite build`
-- `npm run verify:public` (regression only)
-- `git diff --check`
-- privacy scan of the allowlisted delta
+| Command | Result |
+| --- | --- |
+| `npx tsc --noEmit` | pass (after wrapping `onRespond` in `Promise.resolve`) |
+| focused Vitest (`operatorConsentPresentation`, `PermissionModal`, `App.operatorUx`) | 25/25 pass |
+| `npx vitest run` | 50 files / 304 tests pass |
+| `npx vite build` | pass (client production; chunk-size warning only) |
+| `npm run verify:public` | pass (regression only; public bundle + consumer fixture) |
+| `git diff --check` | clean |
+| privacy scan | no live credentials or private identity paths; tests use absence needles only (`sk-test-not-a-real-key`, `/Users/secret`) |
+
+JSDOM printed `HTMLCanvasElement.prototype.getContext` when `App.operatorUx.test.tsx` imported `App.tsx` (xterm). Tests still passed. That is not packaged AT.
 
 ## Residuals
 

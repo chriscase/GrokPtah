@@ -101,7 +101,7 @@ export function PermissionModal({
       submitGate.current = request.id;
       setLock({ id: request.id, phase: "pending" });
       const ack = await settleOperatorConsentAcknowledgement(
-        () => onRespond(request.id, decision, sessionId),
+        () => Promise.resolve(onRespond(request.id, decision, sessionId)),
         acknowledgementTimeoutMs,
       );
       if (ack === "acknowledged") {

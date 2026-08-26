@@ -54,7 +54,6 @@ import {
   loadAppearanceChrome,
 } from "./lib/appearance";
 import {
-  dequeuePermission,
   enqueuePermission,
   headPermission,
 } from "./lib/permissionQueue";
