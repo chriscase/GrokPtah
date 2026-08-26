@@ -24,6 +24,8 @@ mod isolated_visual_artifacts;
 mod isolated_visual_channel;
 mod isolated_visual_driver;
 mod isolated_visual_frames;
+#[cfg(test)]
+mod isolated_visual_gates;
 mod isolated_visual_harness;
 mod isolated_visual_helper;
 mod isolated_visual_helper_control;

@@ -67,6 +67,20 @@ Each row records the exact SHA, the semantics admitted, and the hunks deliberate
 | `.github/workflows/isolated-visual-guest.yml` | `295a4ff` | Actions are not mutated by this reconstruction |
 | `src/computer_use/coordination.rs` | `295a4ff` | separate surface-coordination feature, not the isolated visual substrate |
 
+## Applicability at this base
+
+Three admitted donors turned out to have nothing to apply at `6c1c4c3`, because what they
+repair does not exist on this side of the divergence. They are recorded here rather than
+quietly dropped, and in each case the property they protect is either already held or is
+carried instead by a gate written against this base's API.
+
+| Donor | Why it does not apply | What holds the property here |
+| --- | --- | --- |
+| `811ece3d` (private `SurfaceAuditInput`) | `SurfaceAuditInput` is part of the donor's authority spine (`ComputerSurfaceEvent`, `ComputerAttentionPoint`, …) and does not exist at `6c1c4c3`, so there is no import to move | The lint discipline it encodes — a `pub(crate)` item used only by a test is imported in the test, not the lib — is what the whole reconstruction follows, and the lib's dead-code count is held at the untouched head's baseline |
+| `3e6bde2` (matching-tree merge detector) | Its only in-scope target is `tests/common/shared_black_box_v1.rs`, which does not exist at this base; its other hunk is a workflow change, which is denied | Nothing at this base infers a golden from a merge SHA, so there is no detector to harden |
+| `097301de` (fail-closed ungranted remote bearer) | The `AuthCredential::with_computer_read_grant` fixture and the `remote_bearer_computer_reads_fail_closed` test it repairs are both donor-side; this base has neither, and its Computer-read surface is already gated by `ComputerReadBinding` with its own scoping tests | The base-appropriate form of "ungranted means denied" is enforced for this substrate by the gate asserting the isolated runtime has **no public surface at all**: there is no entrypoint an ungranted caller could reach |
+| `a5705779` (pointer sampling without Quartz `CGEvent`) | Partially applies. Its shim change edits `GPTCaptureUserInteractionState`, which this reconstruction deliberately does not import, because that sampler exists to serve the denied measured-background act path | Its actual security property is preserved and strengthened: this base already forbids `CGEventCreate`, the M3 shim additions introduce no `CGEvent` use at all, and a new gate enforces the whole Quartz sampling and injection family on **every** platform rather than only on macOS |
+
 ## Dependency delta
 
 `ring` is the donor's HMAC primitive for the channel binding, frame carrier, input wire, and
