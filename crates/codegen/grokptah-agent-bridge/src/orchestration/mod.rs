@@ -7,6 +7,7 @@ mod continuation;
 pub(crate) mod managed;
 mod manager;
 mod message;
+pub mod provider_authority;
 mod routine;
 mod service;
 mod store;
@@ -44,6 +45,20 @@ pub use manager::{
 pub use message::{
     message_activation_unsupported, MessageKind, MessagePage, WorkMessage, MAX_MESSAGE_BODY_BYTES,
     MESSAGE_SCHEMA_VERSION,
+};
+pub use provider_authority::{
+    authority_policy_digest, confirmation_nonce_digest, installation_identity,
+    new_confirmation_nonce, provider_payload_digest, provider_request_fingerprint,
+    resolve_authority_scope, single_tenant_identity, AuthorityBindingSummary, CancelDisposition,
+    ConfirmationGrant, FollowUpDisposition, ProviderAttemptReceipt, ProviderAttemptRecord,
+    ProviderAttemptRequest, ProviderAuthorityBinding, ProviderAuthorityDenial,
+    ProviderAuthorityInputs, ProviderAuthorityLedger, ProviderAuthorityScope,
+    ProviderContinuationIntent, ProviderRepositoryBinding, ProviderRequestIdentity,
+    ProviderRouteAuthority, ProviderSendState, ProviderSendTransition, ProviderSettledOutcome,
+    ProviderUncertaintyReason, ProviderUncertaintyResolution, ProviderUnknown,
+    DEFAULT_BINDING_TTL_MS, DEFAULT_GRANT_TTL_MS, MAX_PROVIDER_ATTEMPT_TRANSITIONS,
+    MAX_PROVIDER_BINDING_FIELD_BYTES, MAX_PROVIDER_RECEIPTS_PER_RUN, MIN_CONFIRMATION_NONCE_BYTES,
+    PROVIDER_ATTEMPT_RECEIPT_SCHEMA, PROVIDER_AUTHORITY_SCHEMA_VERSION,
 };
 pub use routine::{
     occurrence_dedupe_key, ActivationCause, ActivationDisposition, ActivationRecord,
