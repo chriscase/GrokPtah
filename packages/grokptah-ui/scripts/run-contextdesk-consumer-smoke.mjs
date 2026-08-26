@@ -188,11 +188,11 @@ try {
     { cwd: consumerRoot },
   );
 
-  const listedPeerPaths = run(
+  const listedPeerPaths = (await run(
     npm,
     ["ls", "react", "react-dom", "--parseable", "--all", "--silent", "--prefix", consumerRoot],
     { cwd: consumerRoot },
-  )
+  ))
     .split(/\r?\n/)
     .filter(Boolean)
     .map((path) => resolve(path));
