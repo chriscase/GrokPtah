@@ -1,0 +1,49 @@
+{
+  "name": "@grokptah/ui",
+  "version": "0.0.0-development",
+  "private": true,
+  "description": "Passive, browser-neutral GrokPtah run status presentation.",
+  "type": "module",
+  "sideEffects": [
+    "./dist/theme.css"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/grokptah-ui.js"
+    },
+    "./theme.css": "./dist/theme.css"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "package.json"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:focused": "vitest run src/RunStatusCard.test.tsx",
+    "build": "vite build && tsc -p tsconfig.build.json",
+    "pack:dry-run": "npm pack --dry-run --ignore-scripts --json",
+    "verify": "node scripts/verify-package.mjs",
+    "smoke:contextdesk": "node scripts/run-contextdesk-consumer-smoke.mjs"
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0",
+    "react-dom": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^26.3.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "^6.1.0",
+    "jsdom": "^29.1.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11"
+  }
+}

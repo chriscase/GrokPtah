@@ -1,0 +1,233 @@
+.gpt-ui-run-status-card {
+  --gpt-ui-color-surface: Canvas;
+  --gpt-ui-color-text: CanvasText;
+  --gpt-ui-color-muted: GrayText;
+  --gpt-ui-color-border: ButtonText;
+  --gpt-ui-color-track: ButtonFace;
+  --gpt-ui-color-progress: Highlight;
+  --gpt-ui-color-queued: #8a5a00;
+  --gpt-ui-color-running: #005ea8;
+  --gpt-ui-color-completed: #176b36;
+  --gpt-ui-color-failed: #b42318;
+  --gpt-ui-color-cancelled: #5b4b8a;
+  --gpt-ui-color-interrupted: #8a4b08;
+  --gpt-ui-color-limit: #7a3e00;
+  --gpt-ui-state-color: var(--gpt-ui-color-border);
+  --gpt-ui-radius: 0.75rem;
+  --gpt-ui-space-1: 0.5rem;
+  --gpt-ui-space-2: 0.75rem;
+  --gpt-ui-space-3: 1rem;
+  --gpt-ui-focus: Highlight;
+
+  box-sizing: border-box;
+  container: gpt-ui-run-status / inline-size;
+  display: block;
+  max-inline-size: 100%;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+  padding: var(--gpt-ui-space-3);
+  color: var(--gpt-ui-color-text);
+  background: var(--gpt-ui-color-surface);
+  border: 1px solid var(--gpt-ui-color-border);
+  border-inline-start: 0.3rem solid var(--gpt-ui-state-color);
+  border-radius: var(--gpt-ui-radius);
+  color-scheme: light dark;
+}
+
+.gpt-ui-host-light .gpt-ui-run-status-card {
+  --gpt-ui-color-surface: #ffffff;
+  --gpt-ui-color-text: #17202a;
+  --gpt-ui-color-muted: #4f5b66;
+  --gpt-ui-color-border: #52606d;
+  --gpt-ui-color-track: #d9e2ec;
+  --gpt-ui-color-progress: #005ea8;
+  --gpt-ui-focus: #005ea8;
+  color-scheme: light;
+}
+
+.gpt-ui-host-dark .gpt-ui-run-status-card {
+  --gpt-ui-color-surface: #17202a;
+  --gpt-ui-color-text: #f0f4f8;
+  --gpt-ui-color-muted: #bcccdc;
+  --gpt-ui-color-border: #9fb3c8;
+  --gpt-ui-color-track: #334e68;
+  --gpt-ui-color-progress: #70b7ff;
+  --gpt-ui-color-queued: #f7c948;
+  --gpt-ui-color-running: #70b7ff;
+  --gpt-ui-color-completed: #68d391;
+  --gpt-ui-color-failed: #ff8a80;
+  --gpt-ui-color-cancelled: #c4b5fd;
+  --gpt-ui-color-interrupted: #f6ad55;
+  --gpt-ui-color-limit: #f6ad55;
+  --gpt-ui-focus: #70b7ff;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  .gpt-ui-run-status-card {
+    --gpt-ui-color-surface: #ffffff;
+    --gpt-ui-color-text: #17202a;
+    --gpt-ui-color-muted: #4f5b66;
+    --gpt-ui-color-border: #52606d;
+    --gpt-ui-color-track: #d9e2ec;
+    --gpt-ui-color-progress: #005ea8;
+    --gpt-ui-focus: #005ea8;
+    color-scheme: light;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .gpt-ui-run-status-card {
+    --gpt-ui-color-surface: #17202a;
+    --gpt-ui-color-text: #f0f4f8;
+    --gpt-ui-color-muted: #bcccdc;
+    --gpt-ui-color-border: #9fb3c8;
+    --gpt-ui-color-track: #334e68;
+    --gpt-ui-color-progress: #70b7ff;
+    --gpt-ui-color-queued: #f7c948;
+    --gpt-ui-color-running: #70b7ff;
+    --gpt-ui-color-completed: #68d391;
+    --gpt-ui-color-failed: #ff8a80;
+    --gpt-ui-color-cancelled: #c4b5fd;
+    --gpt-ui-color-interrupted: #f6ad55;
+    --gpt-ui-color-limit: #f6ad55;
+    --gpt-ui-focus: #70b7ff;
+    color-scheme: dark;
+  }
+}
+
+.gpt-ui-run-status-card[data-state="queued"] {
+  --gpt-ui-state-color: var(--gpt-ui-color-queued);
+}
+
+.gpt-ui-run-status-card[data-state="running"] {
+  --gpt-ui-state-color: var(--gpt-ui-color-running);
+}
+
+.gpt-ui-run-status-card[data-state="completed"] {
+  --gpt-ui-state-color: var(--gpt-ui-color-completed);
+}
+
+.gpt-ui-run-status-card[data-state="failed"] {
+  --gpt-ui-state-color: var(--gpt-ui-color-failed);
+}
+
+.gpt-ui-run-status-card[data-state="cancelled"] {
+  --gpt-ui-state-color: var(--gpt-ui-color-cancelled);
+}
+
+.gpt-ui-run-status-card[data-state="interrupted"] {
+  --gpt-ui-state-color: var(--gpt-ui-color-interrupted);
+}
+
+.gpt-ui-run-status-card[data-state="limit_reached"] {
+  --gpt-ui-state-color: var(--gpt-ui-color-limit);
+}
+
+.gpt-ui-run-status-card__header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gpt-ui-space-1) var(--gpt-ui-space-2);
+  align-items: baseline;
+  justify-content: space-between;
+  min-inline-size: 0;
+}
+
+.gpt-ui-run-status-card__title,
+.gpt-ui-run-status-card__description,
+.gpt-ui-run-status-card__live {
+  margin: 0;
+}
+
+.gpt-ui-run-status-card__title {
+  min-inline-size: 0;
+  font-size: 1.1rem;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.gpt-ui-run-status-card__state {
+  max-inline-size: 100%;
+  color: var(--gpt-ui-state-color);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.gpt-ui-run-status-card__description {
+  margin-block-start: var(--gpt-ui-space-1);
+  color: var(--gpt-ui-color-muted);
+  line-height: 1.5;
+}
+
+.gpt-ui-run-status-card__live {
+  margin-block-start: var(--gpt-ui-space-2);
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.gpt-ui-run-status-card__progress {
+  display: block;
+  inline-size: 100%;
+  max-inline-size: 100%;
+  block-size: 0.75rem;
+  margin-block-start: var(--gpt-ui-space-2);
+  accent-color: var(--gpt-ui-color-progress);
+  background: var(--gpt-ui-color-track);
+}
+
+.gpt-ui-run-status-card progress:focus-visible {
+  outline: 0.15rem solid var(--gpt-ui-focus);
+  outline-offset: 0.15rem;
+}
+
+@container gpt-ui-run-status (max-width: 24rem) {
+  .gpt-ui-run-status-card {
+    padding: var(--gpt-ui-space-2);
+  }
+
+  .gpt-ui-run-status-card__header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* A narrow viewport at 400% zoom still gets a single, reflowed column. */
+@media (max-width: 20rem) {
+  .gpt-ui-run-status-card {
+    padding: var(--gpt-ui-space-1);
+  }
+
+  .gpt-ui-run-status-card__header {
+    display: block;
+  }
+
+  .gpt-ui-run-status-card__state {
+    display: block;
+    margin-block-start: var(--gpt-ui-space-1);
+  }
+}
+
+@media (forced-colors: active) {
+  .gpt-ui-run-status-card {
+    --gpt-ui-color-surface: Canvas;
+    --gpt-ui-color-text: CanvasText;
+    --gpt-ui-color-muted: GrayText;
+    --gpt-ui-color-border: ButtonText;
+    --gpt-ui-color-track: ButtonFace;
+    --gpt-ui-color-progress: Highlight;
+    --gpt-ui-focus: Highlight;
+  }
+
+  .gpt-ui-run-status-card__state {
+    color: CanvasText;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gpt-ui-run-status-card,
+  .gpt-ui-run-status-card * {
+    animation: none;
+    transition: none;
+    scroll-behavior: auto;
+  }
+}
