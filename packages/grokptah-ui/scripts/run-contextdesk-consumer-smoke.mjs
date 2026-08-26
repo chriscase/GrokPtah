@@ -216,9 +216,13 @@ createRoot(root).render(createElement(RunStatusCard, {
     { cwd: consumerRoot },
   );
 
-  const browserText = (await collectTextFiles(browserOutput))
-    .map((filePath) => readFile(filePath, "utf8"))
-    .join("\n");
+  const browserText = (
+    await Promise.all(
+      (await collectTextFiles(browserOutput)).map((filePath) =>
+        readFile(filePath, "utf8"),
+      ),
+    )
+  ).join("\n");
   const forbiddenGraphMarkers = [
     "@tauri-apps",
     "src-tauri",
