@@ -7,10 +7,13 @@
  *
  * Three things make spans survive real text:
  *
- * 1. **Two coordinate systems.** JavaScript string indices are UTF-16 code
+ * 1. **Three coordinate systems.** JavaScript string indices are UTF-16 code
  *    units, so an emoji is two units wide and a naive offset can split it.
- *    Spans carry UTF-16 offsets for JS slicing *and* code-point offsets for
- *    any consumer that does not use UTF-16.
+ *    Spans carry UTF-16 offsets for JS slicing, code-point offsets for
+ *    consumers that are not UTF-16, and UTF-8 byte offsets, which are the
+ *    coordinates the source bytes are actually digested in. Only the UTF-8
+ *    range is comparable across a Rust authority and a browser renderer, so
+ *    it is the range coverage and overlap are decided in.
  * 2. **The quote travels with the span.** `verifyHelpClaimSpan` re-derives the
  *    text from the corpus and compares. A span whose offsets drifted is
  *    detected instead of silently highlighting the wrong words.
@@ -30,12 +33,29 @@ export const HELP_MAX_QUOTE_CODE_POINTS = 320;
 
 export type HelpClaimSpan = {
   readonly chunkId: string;
+  /**
+   * Digest of the chunk the offsets are into.
+   *
+   * This is what binds a span to *exact source bytes* rather than to a name.
+   * Offsets alone address a position in whatever text currently answers to
+   * `chunkId`; carrying the digest means a rebuilt corpus invalidates the
+   * span instead of silently re-pointing it at different words.
+   */
+  readonly chunkDigest: string;
   /** Offsets in UTF-16 code units, for JS `slice`. */
   readonly startUtf16: number;
   readonly endUtf16: number;
   /** Offsets in Unicode code points, for consumers that are not UTF-16. */
   readonly startCodePoint: number;
   readonly endCodePoint: number;
+  /**
+   * Offsets in UTF-8 bytes — the coordinates the source is digested in.
+   *
+   * Coverage and overlap are decided here because these are the only offsets
+   * a Rust authority and a JS renderer agree on without re-encoding.
+   */
+  readonly startUtf8: number;
+  readonly endUtf8: number;
   /** The exact text the span covers, as it appears in the chunk. */
   readonly quote: string;
 };
@@ -49,6 +69,8 @@ export type HelpSpanFailure =
   | "out-of-range"
   | "quote-mismatch"
   | "code-point-mismatch"
+  | "utf8-mismatch"
+  | "chunk-digest-mismatch"
   | "splits-code-point"
   | "quote-too-long"
   | "empty-quote";
@@ -63,6 +85,13 @@ function codePointsBefore(text: string, utf16Index: number): number {
     count += 1;
   }
   return count;
+}
+
+const UTF8_ENCODER = new TextEncoder();
+
+/** Count UTF-8 bytes, not code units, up to a UTF-16 index. */
+function utf8BytesBefore(text: string, utf16Index: number): number {
+  return UTF8_ENCODER.encode(text.slice(0, utf16Index)).byteLength;
 }
 
 /** True when the index falls inside a surrogate pair rather than between characters. */
@@ -94,10 +123,13 @@ export function buildHelpClaimSpan(chunkId: string, quote: string): HelpClaimSpa
 
   return Object.freeze({
     chunkId,
+    chunkDigest: chunk.digest,
     startUtf16,
     endUtf16,
     startCodePoint: codePointsBefore(chunk.text, startUtf16),
     endCodePoint: codePointsBefore(chunk.text, endUtf16),
+    startUtf8: utf8BytesBefore(chunk.text, startUtf16),
+    endUtf8: utf8BytesBefore(chunk.text, endUtf16),
     quote: normalizedQuote,
   });
 }
@@ -111,6 +143,9 @@ export function buildHelpClaimSpan(chunkId: string, quote: string): HelpClaimSpa
 export function verifyHelpClaimSpan(span: HelpClaimSpan): HelpSpanVerification {
   const chunk = getHelpChunk(span.chunkId);
   if (!chunk) return { ok: false, reason: "unknown-chunk", detail: span.chunkId };
+  if (chunk.digest !== span.chunkDigest) {
+    return { ok: false, reason: "chunk-digest-mismatch", detail: span.chunkId };
+  }
   if (span.quote.length === 0) return { ok: false, reason: "empty-quote", detail: span.chunkId };
   if ([...span.quote].length > HELP_MAX_QUOTE_CODE_POINTS) {
     return { ok: false, reason: "quote-too-long", detail: String([...span.quote].length) };
@@ -139,7 +174,26 @@ export function verifyHelpClaimSpan(span: HelpClaimSpan): HelpSpanVerification {
       detail: `${span.startCodePoint}..${span.endCodePoint}`,
     };
   }
+  if (
+    utf8BytesBefore(chunk.text, span.startUtf16) !== span.startUtf8 ||
+    utf8BytesBefore(chunk.text, span.endUtf16) !== span.endUtf8
+  ) {
+    return { ok: false, reason: "utf8-mismatch", detail: `${span.startUtf8}..${span.endUtf8}` };
+  }
   return { ok: true };
+}
+
+/**
+ * True when two spans claim any of the same source bytes.
+ *
+ * Overlap is decided in UTF-8 because that is the coordinate system the source
+ * digest is over. Two citations that quote the same passage are not two pieces
+ * of evidence; letting them count twice is how a support budget gets satisfied
+ * by repetition rather than by coverage.
+ */
+export function helpSpansOverlap(left: HelpClaimSpan, right: HelpClaimSpan): boolean {
+  if (left.chunkId !== right.chunkId) return false;
+  return left.startUtf8 < right.endUtf8 && right.startUtf8 < left.endUtf8;
 }
 
 export type SanitizedWithMap = {

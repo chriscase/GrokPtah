@@ -82,25 +82,66 @@ const requiredExports = [
   "searchHelpCorpus",
   "createHelpSearchController",
   "describeHelpResultForAssistiveTech",
-  "buildHelpAnswerRequest",
-  "createHelpAnswerRoute",
   "validateHelpAnswerResponse",
-  "requestHelpAnswer",
   "redactHelpText",
+  "scanHelpForSecrets",
   "sanitizeHelpText",
   "verifyHelpModelChecksum",
-  // Authority, spans, provenance, and the task runtime.
-  "authorizeHelpDecision",
-  "parseHelpDecisionRequest",
-  "createHelpExecutor",
+  // Verification, provenance, and the task runtime.
   "buildHelpClaimSpan",
   "verifyHelpClaimSpan",
+  "checkHelpClaimCoverage",
+  "segmentHelpClaims",
   "HELP_INDEX_PROVENANCE",
   "createHelpTaskScheduler",
 ];
 const missing = requiredExports.filter((name) => !(name in publicApi));
 if (missing.length > 0) {
   throw new Error(`public bundle is missing required exports: ${missing.join(", ")}`);
+}
+
+// The published client may ask the server for a decision. It may not make one.
+//
+// Shipping `authorizeHelpDecision` and `createHelpExecutor` in a browser bundle
+// let a consumer decide, in code it controls, whether it was allowed to see a
+// source — a decision made by the party it constrains. Shipping
+// `requestHelpAnswer` let it point the answer contract at any endpoint it liked
+// from a bundle carrying GrokPtah's name. Neither is publishable.
+const forbiddenExports = [
+  "authorizeHelpDecision",
+  "authorizeHelpDecisionJson",
+  "parseHelpDecisionRequest",
+  "createHelpExecutor",
+  "HelpAuthorityMalformedError",
+  "requestHelpAnswer",
+  "buildHelpAnswerRequestCore",
+  "sealHelpAnswerRequest",
+  "helpAnswerRequestDigest",
+  "validateHelpAnswerRequest",
+];
+for (const [name, api] of [
+  ["public", publicApi],
+  ["ui-core", uiCoreApi],
+  ["help-react", await import(helpReactBundlePath.href)],
+]) {
+  const exposed = forbiddenExports.filter((symbol) => symbol in api);
+  if (exposed.length > 0) {
+    throw new Error(
+      `${name} bundle exposes local Help authority or transport: ${exposed.join(", ")}`,
+    );
+  }
+}
+
+// The corpus ships in the bundle, so every source in it is published. A source
+// that is not public must never reach a published corpus in the first place.
+const nonPublicSources = publicApi.HELP_CORPUS.articles
+  .flatMap((article) => article.sources ?? [])
+  .filter((source) => source.visibility !== "public")
+  .map((source) => `${source.id} (${source.visibility})`);
+if (nonPublicSources.length > 0) {
+  throw new Error(
+    `published Help corpus contains non-public sources: ${nonPublicSources.join(", ")}`,
+  );
 }
 for (const name of [
   "HELP_ARTICLES",
@@ -173,33 +214,44 @@ if (Object.isFrozen(publicApi.HELP_CORPUS) !== true) {
 }
 
 const helpReactApi = await import(helpReactBundlePath.href);
-for (const name of ["HelpResults", "HelpSearchInput", "HelpCitationList", "HelpHighlightedText", "useHelpSearch", "searchHelpCorpus"]) {
+for (const name of ["HelpResults", "HelpSearchInput", "HelpCitationList", "HelpHighlightedText", "useHelpSearch", "searchHelpCorpus", "HelpRoute"]) {
   if (!(name in helpReactApi)) throw new Error(`help-react bundle is missing required export: ${name}`);
 }
 
-// A consumer must be able to authorize, and must be denied by default.
-const denied = publicApi.authorizeHelpDecision(
+// A consumer must be able to *verify*, and must not be able to authorize.
+//
+// The previous version of this file asserted the opposite: that a consumer
+// could call `authorizeHelpDecision` and be denied by default. Denying by
+// default is the right rule in the wrong place — running it inside the
+// consumer's own bundle means the consumer chooses whether to run it.
+const answerValidation = publicApi.validateHelpAnswerResponse(
+  { schema: "grokptah.help-answer-response.v1" },
   {
-    schema: "grokptah.help-authority-request.v1",
-    action: "search",
-    principal: { principal_id: "p", tenant_id: "t", capabilities: [] },
-    corpus_digest: publicApi.HELP_CORPUS_DIGEST,
-    index_digest: publicApi.HELP_INDEX_PROVENANCE.indexDigest,
-    sources: [],
+    schema: "grokptah.help-answer-request.v1",
+    corpusDigest: publicApi.HELP_CORPUS_DIGEST,
+    indexDigest: publicApi.HELP_INDEX_PROVENANCE.indexDigest,
+    context: [],
+    admission: { admissionId: "sha256:none" },
   },
-  publicApi.HELP_CORPUS_DIGEST,
-  publicApi.HELP_INDEX_PROVENANCE.indexDigest,
 );
-if (denied.allowed || denied.denied_because !== "missing_capability") {
-  throw new Error("published authority did not deny a principal with no capability");
+if (answerValidation.accepted !== false) {
+  throw new Error("published response validation accepted a malformed reply");
 }
-let rejected = false;
-try {
-  publicApi.parseHelpDecisionRequest({ schema: "x", action: "search", bypass: true });
-} catch {
-  rejected = true;
+
+// Claim coverage must be decidable by the consumer, over its own segmentation.
+const coverage = publicApi.checkHelpClaimCoverage("Resume safely. Quota is separate.", []);
+if (coverage.ok !== false || coverage.reason !== "uncovered-claim") {
+  throw new Error("published claim coverage did not refuse an uncited answer");
 }
-if (!rejected) throw new Error("published authority accepted an unknown field");
+if (publicApi.segmentHelpClaims("One. Two.").length !== 2) {
+  throw new Error("published claim segmentation did not segment an answer");
+}
+
+// The secret scan must report uncertainty rather than clearing what it cannot
+// rule out.
+if (publicApi.scanHelpForSecrets("aGVsbG8gd29ybGQ=").confidence !== "possible") {
+  throw new Error("published secret scan reported certainty it does not have");
+}
 
 // Claim spans must be re-verifiable by a consumer that did not produce them.
 const spanChunk = publicApi.HELP_CORPUS.chunks[0];
@@ -214,6 +266,107 @@ if (publicApi.verifyHelpClaimSpan({ ...span, startUtf16: span.startUtf16 + 1 }).
 // The index digest must bind the corpus actually shipped.
 if (publicApi.HELP_INDEX_PROVENANCE.corpusDigest !== publicApi.HELP_CORPUS_DIGEST) {
   throw new Error("published index provenance is not bound to the published corpus");
+}
+
+// ---- packaged accessibility ------------------------------------------------
+//
+// Rendered from the *bundle*, not the source. A component whose accessibility
+// is asserted only against `src/` is asserted against something no consumer
+// installs: a bundler that drops an attribute, a minifier that mangles a
+// generated id, or an entry that exports a different component all leave the
+// source tests green.
+//
+// Effect-driven behaviour (background inerting, focus restoration) needs a DOM
+// and is covered by `helpRoute.test.tsx`; what is checked here is the markup
+// every consumer receives.
+{
+  const { JSDOM } = await import("jsdom");
+  const dom = new JSDOM("<!doctype html><html><body><div id=\"app\"></div></body></html>", {
+    pretendToBeVisual: true,
+  });
+  // `navigator` is a getter-only global on modern Node, so install these with
+  // property descriptors rather than assignment, and restore the exact
+  // descriptors afterwards.
+  const installed = ["window", "document", "HTMLElement", "Node", "Element", "getComputedStyle", "navigator"];
+  const priorDescriptors = new Map();
+  for (const key of installed) {
+    priorDescriptors.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+    Object.defineProperty(globalThis, key, {
+      value: key === "window" ? dom.window : dom.window[key],
+      configurable: true,
+      writable: true,
+    });
+  }
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+
+  try {
+    const React = await import("react");
+    const { createRoot } = await import("react-dom/client");
+    const { act } = React;
+
+    const container = dom.window.document.getElementById("app");
+    const beside = dom.window.document.createElement("div");
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        React.createElement(
+          React.Fragment,
+          null,
+          React.createElement("nav", { "data-testid": "chrome" }, "app chrome"),
+          React.createElement(helpReactApi.HelpRoute, { open: true, onClose: () => {} }),
+        ),
+      );
+    });
+    beside.remove();
+
+    const dialog = dom.window.document.querySelector('[role="dialog"]');
+    if (!dialog) throw new Error("packaged Help route rendered no dialog");
+    if (dialog.getAttribute("aria-modal") !== "true") {
+      throw new Error("packaged Help dialog is not modal to assistive technology");
+    }
+    const labelledBy = dialog.getAttribute("aria-labelledby");
+    if (!labelledBy || !dom.window.document.getElementById(labelledBy)) {
+      throw new Error("packaged Help dialog has no resolvable accessible name");
+    }
+    if (!dom.window.document.querySelector('[aria-live="polite"]')) {
+      throw new Error("packaged Help route has no polite live region for status");
+    }
+    const search = dom.window.document.querySelector("input");
+    if (!search) throw new Error("packaged Help route rendered no search input");
+    // A real `<label for>` is the preferred accessible name, so accept it
+    // alongside the ARIA forms rather than demanding one particular mechanism.
+    const named =
+      search.getAttribute("aria-label") ||
+      (search.getAttribute("aria-labelledby") &&
+        dom.window.document.getElementById(search.getAttribute("aria-labelledby"))) ||
+      (search.id && dom.window.document.querySelector(`label[for="${search.id}"]`));
+    if (!named) throw new Error("packaged Help search input has no accessible name");
+    // The palette must not inert itself: the route renders inside the app
+    // container, so an ancestor carrying `inert` would take the dialog with it.
+    for (let node = dialog.parentElement; node; node = node.parentElement) {
+      if (node.hasAttribute("inert")) {
+        throw new Error("packaged Help dialog is inside an inert ancestor");
+      }
+    }
+    const chrome = dom.window.document.querySelector('[data-testid="chrome"]');
+    if (!chrome?.hasAttribute("inert")) {
+      throw new Error("packaged Help route did not make the background inert");
+    }
+    // Provider and corpus text is plain text, everywhere in the packaged tree.
+    if (dom.window.document.body.querySelector("script")) {
+      throw new Error("packaged Help route rendered a script element");
+    }
+
+    await act(async () => root.unmount());
+    console.log("packaged accessibility verified: modal dialog, named, live region, inert background");
+  } finally {
+    for (const [key, descriptor] of priorDescriptors) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+      else delete globalThis[key];
+    }
+    delete globalThis.IS_REACT_ACT_ENVIRONMENT;
+    dom.window.close();
+  }
 }
 
 console.log(`public bundle verified: ${requiredExports.join(", ")}`);

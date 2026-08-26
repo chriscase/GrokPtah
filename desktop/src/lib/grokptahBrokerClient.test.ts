@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
   type GrokPtahBrokerApprovalRequest,
@@ -768,5 +771,161 @@ describe("GrokPtahBrokerClient", () => {
       code: "invalid_response",
       status: 200,
     });
+  });
+});
+
+describe("broker Help authority", () => {
+  function clientWith(response: unknown, status = 200) {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fetcher = (async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return new Response(JSON.stringify(response), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://broker.example",
+      fetcher,
+      csrfToken: "csrf-token",
+    });
+    return { client, calls };
+  }
+
+  const decision = {
+    allowed: true,
+    allowedSourceIds: ["durable.lifecycle"],
+    corpusDigest: "sha256:corpus",
+    indexDigest: "sha256:index",
+    receiptDigest: "sha256:receipt",
+  };
+
+  it("asks the broker for a decision rather than making one", async () => {
+    const { client, calls } = clientWith(decision);
+    const result = await client.authorizeHelp("binding-1", "search", "idem-1");
+    expect(result.allowed).toBe(true);
+    expect(result.allowedSourceIds).toEqual(["durable.lifecycle"]);
+    expect(calls[0]!.url).toContain("/bindings/binding-1/help/authorize");
+    expect(calls[0]!.init.method).toBe("POST");
+  });
+
+  it("refuses a decision payload that is not the closed shape", async () => {
+    const { client } = clientWith({ allowed: true });
+    await expect(client.authorizeHelp("binding-1", "search", "idem-1")).rejects.toThrow();
+  });
+
+  it("returns an answer receipt and nothing about the exchange", async () => {
+    const receipt = {
+      admissionId: "sha256:admission",
+      requestDigest: "sha256:request",
+      corpusDigest: "sha256:corpus",
+      indexDigest: "sha256:index",
+      outcome: "answered",
+      outcomeDigest: "sha256:outcome",
+      citedSourceIds: ["durable.lifecycle"],
+      claimCount: 2,
+    };
+    const { client } = clientWith(receipt);
+    const result = await client.answerHelp("binding-1", "durable run recovery", "idem-2");
+    expect(result.outcome).toBe("answered");
+    expect(result.claimCount).toBe(2);
+    expect(JSON.stringify(result)).not.toContain("durable run recovery");
+  });
+
+  it("refuses a receipt carrying an artifact of the exchange", async () => {
+    // A receipt is artifact-free by contract. One that is not did not come
+    // from a broker holding that contract, and rendering it anyway would make
+    // the client the place the guarantee breaks.
+    const { client } = clientWith({
+      admissionId: "sha256:admission",
+      requestDigest: "sha256:request",
+      corpusDigest: "sha256:corpus",
+      indexDigest: "sha256:index",
+      outcome: "answered",
+      citedSourceIds: [],
+      claimCount: 1,
+      answer: "Resume freely after a restart.",
+    });
+    await expect(client.answerHelp("binding-1", "q", "idem-3")).rejects.toThrow();
+  });
+
+  it("requires a CSRF token and an idempotency key for both", async () => {
+    const tokenless = new GrokPtahBrokerClient({
+      baseUrl: "https://broker.example",
+      fetcher: (async () => new Response("{}")) as unknown as typeof fetch,
+    });
+    await expect(tokenless.authorizeHelp("binding-1", "search", "idem")).rejects.toThrow();
+
+    const { client } = clientWith(decision);
+    await expect(client.authorizeHelp("binding-1", "search", "  ")).rejects.toThrow();
+  });
+});
+
+describe("broker/Tauri receipt parity", () => {
+  /**
+   * The exact receipts the Rust executor emits.
+   *
+   * The desktop reaches the executor through a Tauri command and the browser
+   * through the broker, but both hand the same receipt to a renderer. If the
+   * Rust serialization and this parser disagreed about a field name, one of
+   * those two paths would silently show nothing.
+   *
+   * Regenerate with
+   * `cargo run -p grokptah-help-answer --example emit_receipt`.
+   */
+  const RECEIPTS = JSON.parse(
+    readFileSync(
+      resolve(
+        dirname(fileURLToPath(import.meta.url)),
+        "..", "..", "..",
+        "crates", "common", "grokptah-help-answer", "fixtures", "receipt-shape.json",
+      ),
+      "utf8",
+    ),
+  ) as Array<Record<string, unknown>>;
+
+  function clientReturning(body: unknown) {
+    const fetcher = (async () =>
+      new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })) as unknown as typeof fetch;
+    return new GrokPtahBrokerClient({
+      baseUrl: "https://broker.example",
+      fetcher,
+      csrfToken: "csrf-token",
+    });
+  }
+
+  it("covers the outcomes the executor can produce", () => {
+    expect(RECEIPTS.map((receipt) => receipt.outcome)).toEqual([
+      "answered",
+      "denied",
+      "abandoned",
+    ]);
+  });
+
+  it.each(RECEIPTS.map((receipt) => [String(receipt.outcome), receipt] as const))(
+    "parses a %s receipt exactly as the executor emits it",
+    async (outcome, receipt) => {
+      const parsed = await clientReturning(receipt).answerHelp("binding-1", "q", "idem");
+      expect(parsed.outcome).toBe(outcome);
+      expect(parsed.admissionId).toBe(receipt.admissionId);
+      expect(parsed.requestDigest).toBe(receipt.requestDigest);
+      expect(parsed.corpusDigest).toBe(receipt.corpusDigest);
+      expect(parsed.indexDigest).toBe(receipt.indexDigest);
+      expect(parsed.claimCount).toBe(receipt.claimCount);
+      expect(parsed.citedSourceIds).toEqual(receipt.citedSourceIds);
+      // An omitted `failure` reads as "no failure", not as a parse error.
+      expect(parsed.failure).toBe(receipt.failure ?? null);
+      expect(parsed.outcomeDigest).toBe(receipt.outcomeDigest ?? null);
+    },
+  );
+
+  it("refuses a receipt whose fields were renamed", async () => {
+    // The failure this fixture exists to catch: a field renamed on one side.
+    const renamed = { ...RECEIPTS[0], admission_id: RECEIPTS[0]!.admissionId };
+    delete (renamed as Record<string, unknown>).admissionId;
+    await expect(clientReturning(renamed).answerHelp("binding-1", "q", "idem")).rejects.toThrow();
   });
 });

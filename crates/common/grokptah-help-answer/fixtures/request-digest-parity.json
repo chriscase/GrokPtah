@@ -1,0 +1,115 @@
+{
+  "schemaVersion": "grokptah.help-answer-parity.v1",
+  "note": "Executed by both the Rust answer crate and the TypeScript contract. The admission binds the request digest, so a disagreement here would either fail every admission or accept one that should not verify.",
+  "cases": [
+    {
+      "name": "empty context",
+      "core": {
+        "schema": "grokptah.help-answer-request.v1",
+        "query": "durable run recovery",
+        "corpusDigest": "sha256:corpus",
+        "indexDigest": "sha256:index",
+        "context": [],
+        "instruction": "Answer only from the supplied Help context.",
+        "toolsDisabled": true,
+        "conversationDisabled": true,
+        "maxAnswerChars": 4000
+      }
+    },
+    {
+      "name": "one chunk",
+      "core": {
+        "schema": "grokptah.help-answer-request.v1",
+        "query": "durable run recovery",
+        "corpusDigest": "sha256:corpus",
+        "indexDigest": "sha256:index",
+        "context": [
+          {
+            "chunkId": "operations.durable-recovery#en.title.0",
+            "articleId": "operations.durable-recovery",
+            "chunkDigest": "sha256:chunk-a",
+            "text": "Recover a durable run safely",
+            "sourceIds": ["durable.lifecycle"]
+          }
+        ],
+        "instruction": "Answer only from the supplied Help context.",
+        "toolsDisabled": true,
+        "conversationDisabled": true,
+        "maxAnswerChars": 4000
+      }
+    },
+    {
+      "name": "source ids out of order digest the same as sorted",
+      "core": {
+        "schema": "grokptah.help-answer-request.v1",
+        "query": "durable run recovery",
+        "corpusDigest": "sha256:corpus",
+        "indexDigest": "sha256:index",
+        "context": [
+          {
+            "chunkId": "operations.durable-recovery#en.body.0",
+            "articleId": "operations.durable-recovery",
+            "chunkDigest": "sha256:chunk-b",
+            "text": "Resume only from a checkpoint.",
+            "sourceIds": ["zeta.anchor", "alpha.anchor", "mid.anchor"]
+          }
+        ],
+        "instruction": "Answer only from the supplied Help context.",
+        "toolsDisabled": true,
+        "conversationDisabled": true,
+        "maxAnswerChars": 4000
+      }
+    },
+    {
+      "name": "multi-byte and astral text",
+      "core": {
+        "schema": "grokptah.help-answer-request.v1",
+        "query": "cómo recuperar una ejecución duradera 𝔘",
+        "corpusDigest": "sha256:corpus",
+        "indexDigest": "sha256:index",
+        "context": [
+          {
+            "chunkId": "operations.durable-recovery#es.title.0",
+            "articleId": "operations.durable-recovery",
+            "chunkDigest": "sha256:chunk-c",
+            "text": "Recuperar una ejecución duradera de forma segura ✅",
+            "sourceIds": ["durable.lifecycle"]
+          }
+        ],
+        "instruction": "Responde solo con el contexto de Ayuda proporcionado.",
+        "toolsDisabled": true,
+        "conversationDisabled": true,
+        "maxAnswerChars": 4000
+      }
+    },
+    {
+      "name": "two chunks, order significant",
+      "core": {
+        "schema": "grokptah.help-answer-request.v1",
+        "query": "gateway quota",
+        "corpusDigest": "sha256:corpus",
+        "indexDigest": "sha256:index",
+        "context": [
+          {
+            "chunkId": "providers.gateway#en.title.0",
+            "articleId": "providers.gateway",
+            "chunkDigest": "sha256:chunk-d",
+            "text": "Provider routes and gateway policy",
+            "sourceIds": ["providers.profiles"]
+          },
+          {
+            "chunkId": "providers.gateway#en.body.0",
+            "articleId": "providers.gateway",
+            "chunkDigest": "sha256:chunk-e",
+            "text": "Quota is enforced per tenant.",
+            "sourceIds": ["providers.profiles", "providers.quota"]
+          }
+        ],
+        "instruction": "Answer only from the supplied Help context.",
+        "toolsDisabled": true,
+        "conversationDisabled": true,
+        "maxAnswerChars": 4000
+      }
+    }
+  ]
+}

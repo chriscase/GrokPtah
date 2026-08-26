@@ -82,15 +82,17 @@ export {
 
 // ---- bounded answer contract ---------------------------------------------
 export {
+  HELP_ANSWER_ADMISSION_SCHEMA,
   HELP_ANSWER_LIMITS,
   HELP_ANSWER_REQUEST_SCHEMA,
   HELP_ANSWER_RESPONSE_SCHEMA,
-  buildHelpAnswerRequest,
-  createHelpAnswerRoute,
-  isHelpAnswerRouteIntact,
+  buildHelpAnswerRequestCore,
+  helpAnswerRequestDigest,
   requestHelpAnswer,
+  sealHelpAnswerRequest,
   validateHelpAnswerRequest,
   validateHelpAnswerResponse,
+  type HelpAnswerAdmission,
   type HelpAnswerCitation,
   type HelpAnswerContextChunk,
   type HelpAnswerFailure,
@@ -98,11 +100,24 @@ export {
   type HelpAnswerOutcome,
   type HelpAnswerRejection,
   type HelpAnswerRequest,
+  type HelpAnswerRequestCore,
   type HelpAnswerResponse,
   type HelpAnswerRoute,
   type HelpAnswerTransport,
   type HelpAnswerValidation,
 } from "./answer/contract";
+
+// ---- claim-bound coverage -------------------------------------------------
+export {
+  HELP_CLAIM_MIN_TOKENS_FOR_RELEVANCE,
+  HELP_CLAIM_SUPPORT_FRACTION,
+  HELP_MAX_CLAIMS,
+  checkHelpClaimCoverage,
+  segmentHelpClaims,
+  type HelpAnswerClaim,
+  type HelpCoverageFailure,
+  type HelpCoverageResult,
+} from "./answer/claims";
 
 // ---- headless consumer ----------------------------------------------------
 export {

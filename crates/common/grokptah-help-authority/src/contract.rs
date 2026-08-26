@@ -144,6 +144,14 @@ pub enum DenyReason {
     StaleIndex,
     /// A bound was exceeded (source count, id length).
     Bounds,
+    /// The presented grant was not minted by this host, or was edited.
+    ForgedGrant,
+    /// The presented grant is outside its validity window.
+    ExpiredGrant,
+    /// Allowed by capability, but wider than the grant's visibility cap.
+    VisibilityCapped,
+    /// The presented source record is not the one the manifest holds.
+    SourceDigestMismatch,
 }
 
 /// Per-source outcome.
