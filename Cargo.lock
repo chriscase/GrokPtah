@@ -4689,6 +4689,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "grokptah-help-authority"
+version = "0.1.0"
+dependencies = [
+ "grokptah-help-contract",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "grokptah-help-contract"
 version = "0.1.0"
 dependencies = [
