@@ -31,7 +31,7 @@ impl RunState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunBounds {
     pub max_prompt_bytes: usize,
@@ -795,6 +795,12 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_approve_run",
     "ptah_promote_run",
     "ptah_discard_run",
+    "ptah_list_work_graphs",
+    "ptah_get_work_graph",
+    "ptah_get_work_graph_evidence",
+    "ptah_cancel_work_graph",
+    "ptah_cancel_work_item",
+    "ptah_review_work_item",
     "ptah_get_queue",
     "ptah_queue_prompt",
     "ptah_edit_queue",

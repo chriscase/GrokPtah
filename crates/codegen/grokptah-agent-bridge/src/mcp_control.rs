@@ -797,6 +797,49 @@ struct ComputerScopeArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct WorkGraphScopeArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkGraphArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    graph_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkGraphCancelArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    graph_id: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkItemArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    graph_id: String,
+    work_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkItemReviewArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    graph_id: String,
+    work_id: String,
+    decision: crate::orchestration::swarm::ReviewDecision,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ComputerEventsArgs {
     session_id: Uuid,
     workspace: PathBuf,
@@ -1455,6 +1498,8 @@ fn tool_input_schema(name: &str) -> Value {
     let session = json!({"type": "string", "format": "uuid"});
     let workspace = json!({"type": "string", "minLength": 1});
     let run_id = json!({"type": "string", "minLength": 1, "maxLength": 256});
+    let graph_id = json!({"type": "string", "minLength": 1, "maxLength": 128});
+    let work_id = json!({"type": "string", "minLength": 1, "maxLength": 128});
     let bounds = json!({
         "type": "object",
         "additionalProperties": false,
@@ -1494,6 +1539,59 @@ fn tool_input_schema(name: &str) -> Value {
                 "session_id": session,
                 "workspace": workspace,
                 "run_id": run_id
+            }
+        }),
+        "ptah_list_work_graphs" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace
+            }
+        }),
+        "ptah_get_work_graph" | "ptah_get_work_graph_evidence" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "graph_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "graph_id": graph_id
+            }
+        }),
+        "ptah_cancel_work_graph" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "graph_id", "reason"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "graph_id": graph_id,
+                "reason": {"type": "string", "minLength": 1, "maxLength": 1024}
+            }
+        }),
+        "ptah_cancel_work_item" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "graph_id", "work_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "graph_id": graph_id,
+                "work_id": work_id
+            }
+        }),
+        "ptah_review_work_item" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "graph_id", "work_id", "decision"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "graph_id": graph_id,
+                "work_id": work_id,
+                "decision": {"type": "string", "enum": ["keep", "discard"]}
             }
         }),
         "ptah_list_computer_runs" | "ptah_get_computer_capacity" => json!({
@@ -1893,6 +1991,62 @@ async fn dispatch_tool(
             let args: RunArgs = parse_value(args)?;
             require_nonempty(&args.run_id, "run_id")?;
             orch.review_run(auth, args.session_id, &args.workspace, &args.run_id)
+        }
+        "ptah_list_work_graphs" => {
+            let args: WorkGraphScopeArgs = parse_value(args)?;
+            orch.list_work_graphs_scoped(auth, args.session_id, &args.workspace)
+        }
+        "ptah_get_work_graph" => {
+            let args: WorkGraphArgs = parse_value(args)?;
+            require_nonempty(&args.graph_id, "graph_id")?;
+            orch.get_work_graph_scoped(auth, args.session_id, &args.workspace, &args.graph_id)
+        }
+        "ptah_get_work_graph_evidence" => {
+            let args: WorkGraphArgs = parse_value(args)?;
+            require_nonempty(&args.graph_id, "graph_id")?;
+            orch.get_work_graph_evidence_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.graph_id,
+            )
+        }
+        "ptah_cancel_work_graph" => {
+            let args: WorkGraphCancelArgs = parse_value(args)?;
+            require_nonempty(&args.graph_id, "graph_id")?;
+            require_nonempty(&args.reason, "reason")?;
+            orch.cancel_work_graph_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.graph_id,
+                &args.reason,
+            )
+        }
+        "ptah_cancel_work_item" => {
+            let args: WorkItemArgs = parse_value(args)?;
+            require_nonempty(&args.graph_id, "graph_id")?;
+            require_nonempty(&args.work_id, "work_id")?;
+            orch.cancel_work_item_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.graph_id,
+                &args.work_id,
+            )
+        }
+        "ptah_review_work_item" => {
+            let args: WorkItemReviewArgs = parse_value(args)?;
+            require_nonempty(&args.graph_id, "graph_id")?;
+            require_nonempty(&args.work_id, "work_id")?;
+            orch.review_work_item_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                &args.graph_id,
+                &args.work_id,
+                args.decision,
+            )
         }
         "ptah_list_computer_runs" => {
             let args: ComputerScopeArgs = parse_value(args)?;
@@ -3113,6 +3267,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn work_graph_tools_are_strictly_scoped_and_never_accept_extra_fields() {
+        // Every work-graph tool is session- and workspace-scoped, so no client
+        // can reach a graph by id alone.
+        for name in [
+            "ptah_list_work_graphs",
+            "ptah_get_work_graph",
+            "ptah_get_work_graph_evidence",
+            "ptah_cancel_work_graph",
+            "ptah_cancel_work_item",
+            "ptah_review_work_item",
+        ] {
+            let schema = tool_input_schema(name);
+            assert_eq!(
+                schema["additionalProperties"],
+                json!(false),
+                "{name} must reject unknown fields"
+            );
+            let required = schema["required"].as_array().unwrap();
+            for key in ["session_id", "workspace"] {
+                assert!(
+                    required.iter().any(|item| item == key),
+                    "{name} missing {key}"
+                );
+            }
+        }
+
+        // The graph-addressed tools additionally require a graph id.
+        for name in [
+            "ptah_get_work_graph",
+            "ptah_get_work_graph_evidence",
+            "ptah_cancel_work_graph",
+            "ptah_cancel_work_item",
+            "ptah_review_work_item",
+        ] {
+            let schema = tool_input_schema(name);
+            assert!(schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item == "graph_id"));
+        }
+
+        // Review is a closed choice: nothing else is expressible.
+        let review = tool_input_schema("ptah_review_work_item");
+        assert_eq!(
+            review["properties"]["decision"]["enum"],
+            json!(["keep", "discard"])
+        );
+    }
+
+    #[test]
+    fn work_graph_capabilities_are_advertised_with_control_gated() {
+        let set = crate::capability_contract::advertised_capabilities();
+        assert_eq!(
+            set.get("work.graph.observe").map(|c| c.availability),
+            Some(crate::capability_contract::CapabilityAvailability::Available)
+        );
+        let control = set.get("work.graph.control").expect("control capability");
+        assert!(control.human_gate, "discarding a result stays human-gated");
+        assert_eq!(
+            control.availability,
+            crate::capability_contract::CapabilityAvailability::Gated
+        );
     }
 
     #[test]
