@@ -6909,3 +6909,133 @@ html[data-accent="violet"] {
     outline-color: Highlight;
   }
 }
+
+/* Operator consent / recovery — source evidence only; not packaged AT. */
+.modal.permission-modal {
+  width: min(42rem, 96vw);
+  max-height: 92vh;
+  overflow: auto;
+  font-size: 1rem;
+  line-height: 1.45;
+}
+
+.modal.permission-modal h3 {
+  font-size: 1.15rem;
+  color: var(--accent);
+}
+
+.modal.permission-modal .permission-queue-hint,
+.modal.permission-modal .permission-meta,
+.modal.permission-modal .permission-risk-note,
+.modal.permission-modal .permission-standing-grant,
+.modal.permission-modal .permission-next-action,
+.modal.permission-modal .permission-recovery,
+.modal.permission-modal .permission-details {
+  margin: 0 0 0.75rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.modal.permission-modal .permission-risk {
+  margin: 0 0 0.75rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--accent-bg);
+}
+
+.modal.permission-modal .permission-deny-history {
+  margin: 0 0 0.75rem;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-height: 8rem;
+  overflow: auto;
+}
+
+.modal.permission-modal .permission-deny-history ul,
+.modal.permission-modal .permission-details ul {
+  margin: 0.35rem 0 0;
+  padding-left: 1.1rem;
+}
+
+.modal.permission-modal .permission-recovery,
+.modal.permission-modal .permission-next-action {
+  font-size: 1rem;
+}
+
+.modal.permission-modal .modal-actions {
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.modal.permission-modal .modal-actions button {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0.55rem 0.9rem;
+}
+
+.modal.permission-modal :focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 3px;
+}
+
+/* 200%–400% text: root-relative type, wrap, viewport-bounded height, no px clip. */
+.modal.permission-modal p,
+.modal.permission-modal li,
+.modal.permission-modal summary {
+  overflow-wrap: anywhere;
+  font-size: 1rem;
+}
+
+@media (max-width: 36rem) {
+  .modal.permission-modal {
+    width: 96vw;
+    padding: 0.75rem;
+  }
+
+  .modal.permission-modal .modal-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .modal.permission-modal .modal-actions button {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .modal-backdrop[data-modal-layer="consent"],
+  .modal.permission-modal,
+  .modal.permission-modal * {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+@media (forced-colors: active) {
+  .modal.permission-modal,
+  .modal.permission-modal .permission-risk,
+  .modal.permission-modal .permission-deny-history,
+  .modal.permission-modal .permission-details,
+  .modal.permission-modal .permission-recovery {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    color: CanvasText;
+    forced-color-adjust: none;
+  }
+
+  .modal.permission-modal :focus-visible,
+  .modal.permission-modal button:focus-visible,
+  .modal.permission-modal summary:focus-visible {
+    outline: 3px solid Highlight;
+    outline-offset: 3px;
+  }
+
+  .modal.permission-modal h3,
+  .modal.permission-modal .danger,
+  .modal.permission-modal .primary {
+    color: CanvasText;
+    border-color: CanvasText;
+  }
+}
