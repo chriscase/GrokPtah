@@ -22,6 +22,8 @@ mod isolated_guest;
 mod isolated_visual;
 mod isolated_visual_artifacts;
 mod isolated_visual_channel;
+#[cfg(test)]
+mod isolated_visual_cleanup_gates;
 mod isolated_visual_driver;
 mod isolated_visual_frames;
 #[cfg(test)]

@@ -229,6 +229,19 @@ impl IsolatedVisualRuntimeSession {
     /// Completes cleanup from host-observed process/handle/overlay/cache facts.
     /// Evidence construction stays crate-private so a coordinator cannot
     /// manufacture terminal authority from serialized booleans.
+    ///
+    /// The guest-stopped fact is deliberately **not** a caller argument. It is
+    /// derived from the helper state this session actually observed, so a
+    /// caller cannot assert a stop the driver never saw: writing the stop
+    /// control byte is not the same as the helper acknowledging it, and a
+    /// lifecycle can reach `CleanupPending` from `StopSent` without any
+    /// terminal helper report.
+    ///
+    /// A run interrupted by restart is the single exception, and only together
+    /// with observed helper-process absence. The helper owns the guest, so a
+    /// helper that is gone across a restart leaves no guest behind, and the
+    /// lifecycle already records the outcome as `Interrupted` rather than as a
+    /// clean stop.
     pub fn complete_observed_cleanup(
         &mut self,
         helper_process_absent: bool,
@@ -236,8 +249,13 @@ impl IsolatedVisualRuntimeSession {
         overlay_removed: bool,
         frame_cache_removed: bool,
     ) -> ComputerResult<()> {
+        let interrupted = self.lifecycle.terminal_disposition
+            == Some(IsolatedVisualTerminalDisposition::Interrupted);
+        let guest_stopped = self.helper.state().proves_guest_not_running()
+            || (interrupted && helper_process_absent);
         let evidence = IsolatedVisualCleanupEvidence::verified(
             self.lifecycle.contract().surface.clone(),
+            guest_stopped,
             helper_process_absent,
             no_open_handles,
             overlay_removed,

@@ -75,8 +75,15 @@ fn helper_event(code: IsolatedVisualHelperEventCode) -> [u8; ISOLATED_VISUAL_HEL
 }
 
 fn cleanup_evidence() -> IsolatedVisualCleanupEvidence {
-    IsolatedVisualCleanupEvidence::verified(contract().surface.clone(), true, true, true, true)
-        .expect("complete evidence")
+    IsolatedVisualCleanupEvidence::verified(
+        contract().surface.clone(),
+        true,
+        true,
+        true,
+        true,
+        true,
+    )
+    .expect("complete evidence")
 }
 
 /// The kernel object each open descriptor points at, e.g. `socket:[12345]`.
@@ -332,15 +339,17 @@ fn a_bounded_frame_read_against_a_silent_peer_returns_instead_of_hanging() {
 #[test]
 fn cleanup_evidence_cannot_be_minted_while_anything_survives() {
     let surface = contract().surface.clone();
-    for (process_absent, no_handles, overlay_removed, cache_removed, survivor) in [
-        (false, true, true, true, "helper process"),
-        (true, false, true, true, "open handle"),
-        (true, true, false, true, "overlay"),
-        (true, true, true, false, "frame cache"),
+    for (guest_stopped, process_absent, no_handles, overlay_removed, cache_removed, survivor) in [
+        (false, true, true, true, true, "running guest"),
+        (true, false, true, true, true, "helper process"),
+        (true, true, false, true, true, "open handle"),
+        (true, true, true, false, true, "overlay"),
+        (true, true, true, true, false, "frame cache"),
     ] {
         assert!(
             IsolatedVisualCleanupEvidence::verified(
                 surface.clone(),
+                guest_stopped,
                 process_absent,
                 no_handles,
                 overlay_removed,
@@ -350,16 +359,22 @@ fn cleanup_evidence_cannot_be_minted_while_anything_survives() {
             "cleanup evidence was minted with a surviving {survivor}"
         );
     }
-    IsolatedVisualCleanupEvidence::verified(surface, true, true, true, true).unwrap();
+    IsolatedVisualCleanupEvidence::verified(surface, true, true, true, true, true).unwrap();
 }
 
 #[test]
 fn cleanup_evidence_from_another_surface_is_refused() {
     let mut other = contract();
     other.surface.incarnation = "a-different-incarnation".into();
-    let foreign =
-        IsolatedVisualCleanupEvidence::verified(other.surface.clone(), true, true, true, true)
-            .unwrap();
+    let foreign = IsolatedVisualCleanupEvidence::verified(
+        other.surface.clone(),
+        true,
+        true,
+        true,
+        true,
+        true,
+    )
+    .unwrap();
 
     let mut lifecycle = IsolatedVisualLifecycle::new(contract()).unwrap();
     lifecycle.begin_start().unwrap();

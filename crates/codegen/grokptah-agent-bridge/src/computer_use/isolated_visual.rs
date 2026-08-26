@@ -258,6 +258,7 @@ pub enum IsolatedVisualTerminalDisposition {
 #[serde(rename_all = "camelCase")]
 pub struct IsolatedVisualCleanupEvidence {
     surface: ComputerSurfaceBinding,
+    guest_stopped: bool,
     helper_process_absent: bool,
     no_open_handles: bool,
     overlay_removed: bool,
@@ -266,11 +267,19 @@ pub struct IsolatedVisualCleanupEvidence {
 
 impl IsolatedVisualCleanupEvidence {
     /// Construct evidence only after the host supervisor has completed every
-    /// exact process, handle, overlay, and frame-cache check. This constructor
-    /// is crate-private so a model, provider, or external coordinator cannot
-    /// manufacture terminal cleanup authority from serialized booleans.
+    /// exact guest-stopped, process, handle, overlay, and frame-cache check.
+    /// This constructor is crate-private so a model, provider, or external
+    /// coordinator cannot manufacture terminal cleanup authority from
+    /// serialized booleans.
+    ///
+    /// `guest_stopped` records that the host established the guest itself is
+    /// no longer running. It is a distinct fact from `helper_process_absent`:
+    /// the supervisor derives it from an observed terminal helper report rather
+    /// than inferring it from process absence, so the terminal record says
+    /// which observation justified it.
     pub(crate) fn verified(
         surface: ComputerSurfaceBinding,
+        guest_stopped: bool,
         helper_process_absent: bool,
         no_open_handles: bool,
         overlay_removed: bool,
@@ -279,6 +288,7 @@ impl IsolatedVisualCleanupEvidence {
         surface.validate()?;
         let evidence = Self {
             surface,
+            guest_stopped,
             helper_process_absent,
             no_open_handles,
             overlay_removed,
@@ -294,6 +304,12 @@ impl IsolatedVisualCleanupEvidence {
             return Err(ComputerError::new(
                 ComputerErrorCode::ForbiddenTarget,
                 "cleanup evidence belongs to another isolated surface",
+            ));
+        }
+        if !self.guest_stopped {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "isolated guest was never observed to stop",
             ));
         }
         if !self.helper_process_absent || !self.no_open_handles {
@@ -527,6 +543,7 @@ mod tests {
     fn cleanup(surface: &ComputerSurfaceBinding) -> IsolatedVisualCleanupEvidence {
         IsolatedVisualCleanupEvidence {
             surface: surface.clone(),
+            guest_stopped: true,
             helper_process_absent: true,
             no_open_handles: true,
             overlay_removed: true,

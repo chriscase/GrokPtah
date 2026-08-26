@@ -367,6 +367,11 @@ impl IsolatedVisualPackagedRuntime {
 
     /// Completes cleanup from host-observed facts. Does not claim a signed
     /// helper, guest boot, or Virtualization.framework launch succeeded.
+    ///
+    /// This supervisor owns the helper PID and its reap state, so the caller's
+    /// process-absence claim is intersected with what this supervisor actually
+    /// observed. A helper this supervisor has not reaped fails cleanup closed
+    /// instead of terminating the run on an unverified assertion.
     pub fn complete_observed_cleanup(
         &mut self,
         helper_process_absent: bool,
@@ -375,7 +380,7 @@ impl IsolatedVisualPackagedRuntime {
         frame_cache_removed: bool,
     ) -> ComputerResult<()> {
         self.driver.complete_observed_cleanup(
-            helper_process_absent,
+            helper_process_absent && self.exited,
             no_open_handles,
             overlay_removed,
             frame_cache_removed,

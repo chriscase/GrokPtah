@@ -479,6 +479,7 @@ mod tests {
             true,
             true,
             true,
+            true,
         )
         .unwrap()
     }

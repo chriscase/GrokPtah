@@ -298,6 +298,57 @@ campaign, and nothing in this branch can write a measured visual capability reco
    configuration after independent security review. Unknown helpers and serialized claims remain
    unproven.
 
+## Qualification handoff
+
+This is the standing answer to "what would it take to call the packaged path qualified?". It is
+scoped to the packaged helper/guest lane. Provider execution authority, Semantic Help, and the
+semantic macOS adapter are deliberately out of scope here.
+
+Everything in the **Proven now** column is deterministic and provider-free: it runs on any host
+with `cargo test`, opens no VM, helper, socket, or package, and needs no credentials. None of it
+certifies real hardware. A scripted adapter yields whatever it was scripted with, and the measured
+harness refuses before it reaches a guest, so no column below may be read as a launch result.
+
+| Gate | Proven now (provider-free) | Remaining to qualify |
+|---|---|---|
+| Signed packaging | Shipped profile and limits deserialize into exactly the locked-down Rust contract; the kernel fragment compiles out network, storage, USB, and audio bridges rather than leaving them unconfigured; the helper declares only sandbox and virtualization entitlements and the main app declares none; guest source is pinned to a TLS URL and lowercase SHA-256 (`isolated_visual_package`) | A Developer ID-signed, notarized build, and the packaged verifier run against that real bundle. Source tests are not runtime evidence. A reproducible guest image built twice on a clean runner, published with its digest |
+| Real guest boot | Launch-stage ordering, fail-closed refusal, and the never-retry-an-uncertain-step rule over `MeasuredLaunchSteps`; the real harness refuses without an operator opt-in and a measured signed package (`isolated_visual_harness`) | An actual Virtualization.framework boot on Apple silicon reaching `GuestBooted`, with `Prepared` and `Running` observed over the private descriptor topology |
+| Rendered frames | Authenticated frame sealing, chunked open, freshness fencing, and that frame bytes reach neither a report nor a projection (`isolated_visual_frames`, `project_captured_artifact`) | A real virtio-gpu frame rendered by a booted guest and opened by the host: at least four frames, each strictly fresher and visibly different from the last |
+| Host input | Input-wire sealing with sequence and nonce binding, refusal before guest binding, and the rule that an acknowledgement is not a postcondition — the next frame is (`isolated_visual_input_wire`, `isolated_visual_harness`) | Pointer, keyboard, and Unicode events delivered to a real guest, each with a visible postcondition in the following frame |
+| Live cleanup | Terminal cleanup requires all five facts — guest stopped, helper absent, no open handles, overlay removed, frame cache removed — and the guest-stopped fact is derived from observed helper state rather than accepted from the caller (`isolated_visual_cleanup_gates`) | A live run whose overlay, frame cache, open handles, and helper process are checked against the OS after stop, including the crash, kill, and restart paths |
+| Soak | The source canary repeats the contract rehearsal identically across iterations; a hardware soak is structurally unstartable because `HardwareGateEvidence` cannot be constructed without a measured launch (`isolated_visual_soak`) | A bounded repeated real-guest campaign, which cannot begin until a measured launch exists and both independent reviews have passed |
+| Accessibility | Nothing. The isolated surface is not dispatchable and has no cockpit surface on this branch | An independent accessibility review of the agent-cursor, focus, drag preview, activity, timeline, Stop, and Take over states, including keyboard-only operation and reduced-motion behaviour, before the tier is offered |
+| Licensing | The guest source is pinned to an exact upstream release and digest | License review and attribution for the guest kernel and any guest-side agent shipped inside the image, recorded in `THIRD-PARTY-NOTICES`, plus confirmation that redistributing the built image meets its terms |
+
+### The guest-stopped fact
+
+Terminating a run is the strongest statement this lifecycle makes: it asserts that no guest,
+helper, handle, overlay, or frame cache survives. Four of those are host-observed resource checks.
+The fifth — *the guest itself stopped* — is now recorded as its own fact and **derived**, because
+writing the stop control byte is not the same as the helper acknowledging it.
+
+`IsolatedVisualRuntimeSession::complete_observed_cleanup` therefore does not take the guest-stopped
+fact as an argument. It reads the helper state the session actually observed:
+
+- a clean acknowledged stop, a helper report that the guest stopped, or a failure raised before any
+  guest could exist proves the guest is not running;
+- a control byte written but never acknowledged (`StartSent`, `StopSent`), a live guest (`Running`,
+  `BindingSent`, `Bound`), and a failure that can leave a guest behind (`StartFailed`,
+  `ControlLost`, `StopFailed`, `GuestProtocol`) prove nothing and fail cleanup closed.
+
+A run interrupted by restart is the single exception, and only together with observed helper-process
+absence: the helper owns the guest, so a helper that is gone across a restart leaves none behind,
+and the lifecycle already records `Interrupted` rather than a clean stop. On macOS the supervisor
+owns the helper PID and its reap state, so a caller's process-absence claim is intersected with what
+that supervisor observed; an unreaped helper fails cleanup closed.
+
+### Verification command
+
+```sh
+cargo test --locked --manifest-path crates/codegen/grokptah-agent-bridge/Cargo.toml \
+  --lib computer_use:: -- --test-threads=1
+```
+
 ## Status and nonclaims
 
 The existing simulator remains the only dispatchable isolated proof. The Stage 8 measured
