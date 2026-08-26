@@ -209,7 +209,7 @@ try {
     npm,
     [
       "install",
-      "--offline",
+      "--prefer-offline",
       "--ignore-scripts",
       "--no-audit",
       "--no-fund",
