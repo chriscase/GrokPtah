@@ -539,7 +539,7 @@ struct CursorAgent {
     status: String,
     #[serde(default)]
     repos: Vec<CursorRepo>,
-    #[serde(default)]
+    #[serde(default, rename = "autoCreatePR")]
     auto_create_pr: Option<bool>,
     #[serde(default)]
     work_on_current_branch: Option<bool>,
