@@ -606,11 +606,11 @@ struct CursorArtifact {
 }
 
 fn github_repository_url(repository: &str) -> Result<String, ExternalWorkerAdapterError> {
-    if repository.starts_with("https://github.com/") {
+    if let Some(suffix) = repository.strip_prefix("https://github.com/") {
         if repository.contains('?')
             || repository.contains('#')
             || repository.ends_with('/')
-            || repository[19..].split('/').count() != 2
+            || suffix.split('/').count() != 2
         {
             return Err(ExternalWorkerAdapterError::InvalidRequest(
                 "repository must identify exactly one GitHub repository",
@@ -745,7 +745,7 @@ fn safe_terminal_result(value: &str) -> Option<String> {
     }
     // Preserve readable multi-line final replies without allowing control
     // characters to cross the browser projection.
-    let value = value.replace('\r', " ").replace('\n', " ");
+    let value = value.replace(['\r', '\n'], " ");
     let lower = value.to_ascii_lowercase();
     if value.trim().is_empty()
         || value.len() > 4_096
@@ -998,6 +998,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn fake_cursor_api_covers_launch_poll_artifacts_and_terminal_cancel() {
         let state = FakeCursorState::default();
         let app = Router::new()

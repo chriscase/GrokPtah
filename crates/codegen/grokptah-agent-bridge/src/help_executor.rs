@@ -161,7 +161,7 @@ impl HelpExecutor {
         provider: Arc<dyn HelpProvider>,
         caller_cancel: CancellationToken,
     ) -> HelpExecution {
-        if let Err(_) = validate_help_request(&request) {
+        if validate_help_request(&request).is_err() {
             return HelpExecution {
                 response: None,
                 failure: Some(HelpExecutionFailure::Rejected),
