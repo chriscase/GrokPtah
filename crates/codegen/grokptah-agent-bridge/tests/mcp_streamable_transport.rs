@@ -838,15 +838,12 @@ async fn request_timeout_returns_error() {
         "expected 504 Gateway Timeout"
     );
     let body: serde_json::Value = resp.json().await.unwrap();
-    let msg = body["error"]["message"]
-        .as_str()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    assert!(
-        msg.contains("timed out") || msg.contains("timeout"),
-        "expected timeout error message, got {body}"
+    assert_eq!(
+        body["error"]["message"],
+        "The request exceeded its bounded deadline."
     );
-    assert_eq!(body["error"]["data"]["code"], "timeout");
+    assert_eq!(body["error"]["data"]["code"], "internal");
+    assert_eq!(body["error"]["data"]["reasonCode"], "timeout");
     assert_eq!(body["id"], 42);
     srv.stop();
     set_grokptah_home_override(None);
@@ -859,11 +856,11 @@ async fn unknown_and_forbidden_tools_fail_closed_over_http() {
     let srv = start_control_server(orch.clone(), 0).await.unwrap();
     let url = format!("http://{}/mcp", srv.addr);
     let http = reqwest::Client::new();
-    for (name, expect_fragment) in [
-        ("run_terminal_cmd", "not available"),
-        ("ptah_shell", "not available"),
-        ("ptah_manage_mcp", "not available"),
-        ("no_such_tool_xyz", "not available"),
+    for name in [
+        "run_terminal_cmd",
+        "ptah_shell",
+        "ptah_manage_mcp",
+        "no_such_tool_xyz",
     ] {
         let resp = http
             .post(&url)
@@ -882,10 +879,9 @@ async fn unknown_and_forbidden_tools_fail_closed_over_http() {
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        let msg = body["error"]["message"].as_str().unwrap_or_default();
-        assert!(
-            msg.contains(expect_fragment),
-            "{name}: expected '{expect_fragment}' in {body}"
+        assert_eq!(
+            body["error"]["message"], "The requested scope is not allowed.",
+            "{name}: {body}"
         );
         assert_eq!(body["error"]["data"]["code"], "forbidden_scope");
     }
