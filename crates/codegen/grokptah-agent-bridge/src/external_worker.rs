@@ -606,11 +606,11 @@ struct CursorArtifact {
 }
 
 fn github_repository_url(repository: &str) -> Result<String, ExternalWorkerAdapterError> {
-    if repository.starts_with("https://github.com/") {
+    if let Some(rest) = repository.strip_prefix("https://github.com/") {
         if repository.contains('?')
             || repository.contains('#')
             || repository.ends_with('/')
-            || repository[19..].split('/').count() != 2
+            || rest.split('/').count() != 2
         {
             return Err(ExternalWorkerAdapterError::InvalidRequest(
                 "repository must identify exactly one GitHub repository",
@@ -745,7 +745,7 @@ fn safe_terminal_result(value: &str) -> Option<String> {
     }
     // Preserve readable multi-line final replies without allowing control
     // characters to cross the browser projection.
-    let value = value.replace('\r', " ").replace('\n', " ");
+    let value = value.replace(['\r', '\n'], " ");
     let lower = value.to_ascii_lowercase();
     if value.trim().is_empty()
         || value.len() > 4_096
@@ -1045,12 +1045,13 @@ mod tests {
             "bc-00000000-0000-0000-0000-000000000001"
         );
         assert_eq!(launch.run.state, ExternalWorkerState::Provisioning);
-        let sent = state.launch_requests.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0]["repos"][0]["startingRef"], "main");
-        assert_eq!(sent[0]["autoCreatePR"], false);
-        assert!(sent[0].get("env").is_none());
-        drop(sent);
+        {
+            let sent = state.launch_requests.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0]["repos"][0]["startingRef"], "main");
+            assert_eq!(sent[0]["autoCreatePR"], false);
+            assert!(sent[0].get("env").is_none());
+        }
 
         let worker = adapter
             .get_worker(&launch.worker.external_agent_id)

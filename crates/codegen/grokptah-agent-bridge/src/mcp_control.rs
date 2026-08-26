@@ -1363,7 +1363,7 @@ fn json_err(id: Option<Value>, status: StatusCode, e: &OrchError) -> Response {
         reason_code: Some(e.code.as_str().into()),
         event_range,
     };
-    let mut data = serde_json::to_value(public).unwrap_or_else(|_| {
+    let data = serde_json::to_value(public).unwrap_or_else(|_| {
         json!({
             "code": "internal",
             "message": "The operation failed.",
