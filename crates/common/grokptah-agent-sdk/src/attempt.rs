@@ -493,12 +493,15 @@ impl ProviderAttempt {
 
     /// Whether a *new* attempt may be opened for the same intent.
     ///
-    /// False while this attempt still needs provider-side reconciliation:
-    /// issuing an equivalent request then is exactly the duplicate charge the
-    /// idempotency key exists to prevent, and the key alone is not a
-    /// guarantee unless the provider honours it.
+    /// Only a provably unsent request or a fully settled one may be followed
+    /// by an equivalent send. `Sent` and `Responding` have already left the
+    /// host; opening another attempt beside them is a duplicate charge even
+    /// when the operator does not yet need to reconcile an `Uncertain` gap.
     pub const fn permits_equivalent_retry(&self) -> bool {
-        !self.send_state.requires_reconciliation()
+        matches!(
+            self.send_state,
+            SendState::KnownNotSent | SendState::Settled
+        )
     }
 
     /// Validate a durable attempt record before writing or publishing it.
@@ -793,8 +796,13 @@ mod tests {
         assert_eq!(honest.validate(), Ok(()));
         assert!(!honest.may_auto_retry());
         assert!(
+            !honest.permits_equivalent_retry(),
+            "a delivered but unsettled attempt must not be followed by a duplicate"
+        );
+        honest.advance(SendState::Settled).unwrap();
+        assert!(
             honest.permits_equivalent_retry(),
-            "a finished attempt needs no reconciliation"
+            "only a settled attempt stops blocking a later intent"
         );
     }
 

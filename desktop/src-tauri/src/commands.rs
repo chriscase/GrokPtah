@@ -963,6 +963,45 @@ pub async fn run_discard(
     run_blocking(move || host.discard_run(id, &run_id).map_err(map_err)).await
 }
 
+/// Submit a supervised coding task through the shared orchestration service.
+///
+/// Chat `session_prompt` remains a local turn and does not mint a provider
+/// attempt. This command is the desktop backend surface for the authority
+/// and physical-send lattice (envelope, `Sending` before the wire, Review).
+#[tauri::command]
+pub async fn run_submit(
+    state: State<'_, AppState>,
+    session_id: String,
+    prompt: String,
+    execution_mode: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let session_id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let (orch, token) = desktop_mcp_orchestration(&state)?;
+    let auth = orch
+        .auth_header(Some(&format!("Bearer {token}")))
+        .map_err(map_err)?;
+    let session = state.host.session_load(session_id).map_err(map_err)?;
+    if session.cwd.is_empty() {
+        return Err("the session has no workspace".into());
+    }
+    let mode = match execution_mode.as_deref() {
+        None | Some("isolated_worktree") => RunExecutionMode::IsolatedWorktree,
+        Some("shared") => RunExecutionMode::Shared,
+        Some(other) => return Err(format!("unknown execution mode {other}")),
+    };
+    orch.submit_task_with_execution_mode(
+        &auth,
+        &Uuid::new_v4().to_string(),
+        session_id,
+        &PathBuf::from(&session.cwd),
+        prompt,
+        None,
+        mode,
+    )
+    .await
+    .map_err(map_err)
+}
+
 /// Explicitly retry an interrupted MCP-owned run through the shared
 /// orchestration policy service. The desktop supplies only a fresh prompt;
 /// the service preserves ownership, mode, bounds, idempotency, and queueing.

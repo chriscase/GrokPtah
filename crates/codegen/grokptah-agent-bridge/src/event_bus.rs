@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -38,6 +38,10 @@ pub struct JournalPage {
     pub entries: Vec<JournalEntry>,
     pub next_cursor: Option<u64>,
     pub cursor_expired: bool,
+    /// Writer has not acked the requested range. An empty page with this set
+    /// is not a durable catch-up; callers must retry or fail closed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub writer_pending: bool,
 }
 
 struct BusInner {
@@ -66,6 +70,10 @@ pub struct EventBus {
     lagged_events: Arc<AtomicU64>,
     persistence_error: Arc<Mutex<Option<String>>>,
     journal_gap: Arc<Mutex<Option<(u64, u64)>>>,
+    /// Last sequence the durable writer has acked. 0 when persistence is off.
+    durable_through: Arc<AtomicU64>,
+    /// `with_persist_dir` was requested; RAM must not be served as durable.
+    persist_configured: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -90,6 +98,7 @@ struct JournalWriterCtx {
     persistence_error: Arc<Mutex<Option<String>>>,
     journal_gap: Arc<Mutex<Option<(u64, u64)>>>,
     space: JournalSpace,
+    durable_through: Arc<AtomicU64>,
 }
 
 impl Drop for PersistenceHandle {
@@ -268,6 +277,8 @@ impl EventBus {
             lagged_events: Arc::new(AtomicU64::new(0)),
             persistence_error: Arc::new(Mutex::new(None)),
             journal_gap: Arc::new(Mutex::new(None)),
+            durable_through: Arc::new(AtomicU64::new(0)),
+            persist_configured: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -299,6 +310,7 @@ impl EventBus {
 
     /// Persist journal under `dir/event_journal.jsonl`; reload tail; compact file.
     pub fn with_persist_dir(self, dir: impl AsRef<Path>) -> Self {
+        self.persist_configured.store(true, Ordering::Release);
         let path = dir.as_ref().join("event_journal.jsonl");
         let sequence_path = dir.as_ref().join("event_journal.seq");
         let gap_path = dir.as_ref().join("event_journal.gap.json");
@@ -336,6 +348,7 @@ impl EventBus {
                         g.journal_bytes = loaded.iter().map(journal_entry_size).sum();
                         g.journal = loaded.clone();
                         durable_tail = loaded;
+                        self.durable_through.store(g.last_seq, Ordering::Release);
                         // Compact durable file to current in-memory tail.
                         if let Err(e) = rewrite_journal_file(&path, &g.journal) {
                             *self.persistence_error.lock() = Some(e.to_string());
@@ -378,6 +391,7 @@ impl EventBus {
                     persistence_error,
                     journal_gap,
                     space: space.clone(),
+                    durable_through: self.durable_through.clone(),
                 };
                 let join = std::thread::Builder::new()
                     .name("grokptah-event-journal".into())
@@ -495,14 +509,21 @@ impl EventBus {
     }
 
     /// Cursor is exclusive: return entries with `seq > after_seq`.
+    ///
+    /// When persistence is configured this page is the durable prefix only.
+    /// RAM ahead of [`Self::durable_through`] is never returned as a successful
+    /// catch-up; the reader waits on the writer condvar, then either returns
+    /// acked entries or marks `writer_pending`.
     pub fn read_after(&self, after_seq: u64, limit: usize) -> JournalPage {
         let limit = limit.clamp(1, 500);
+        self.wait_for_durable(after_seq, limit);
         let g = self.inner.lock();
         let gap = *self.journal_gap.lock();
         let expired = JournalPage {
             entries: Vec::new(),
             next_cursor: None,
             cursor_expired: true,
+            writer_pending: false,
         };
         if let Some((start, end)) = gap {
             if after_seq >= start.saturating_sub(1) && after_seq < end {
@@ -529,13 +550,79 @@ impl EventBus {
                 }
             }
         }
+        let persist = self.persist_configured.load(Ordering::Acquire);
+        let durable = self.durable_through.load(Ordering::Acquire);
+        let unpublished = if persist {
+            let before = entries.len();
+            entries.retain(|entry| entry.seq <= durable);
+            before > entries.len()
+        } else {
+            false
+        };
         entries.truncate(limit);
+        let writer_pending = persist && unpublished && entries.len() < limit;
         let next_cursor = entries.last().map(|e| e.seq);
         JournalPage {
             entries,
             next_cursor,
             cursor_expired: false,
+            writer_pending,
         }
+    }
+
+    /// Wait until the durable writer has acked enough of the requested range
+    /// or the bounded backpressure timeout elapses.
+    fn wait_for_durable(&self, after_seq: u64, limit: usize) {
+        if !self.persist_configured.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(handle) = self.inner.lock().persistence.clone() else {
+            return;
+        };
+        let deadline = Instant::now() + WRITER_SEND_TIMEOUT;
+        loop {
+            if self.last_persistence_error().is_some() {
+                return;
+            }
+            if let Some((start, end)) = *self.journal_gap.lock() {
+                if after_seq >= start.saturating_sub(1) && after_seq < end {
+                    return;
+                }
+            }
+            if self.durable_caught_up(after_seq, limit) {
+                return;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            let mut guard = handle.space.mu.lock();
+            if self.durable_caught_up(after_seq, limit) {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            handle.space.cv.wait_for(&mut guard, remaining);
+        }
+    }
+
+    fn durable_caught_up(&self, after_seq: u64, limit: usize) -> bool {
+        let last = self.current_seq();
+        let durable = self.durable_through.load(Ordering::Acquire);
+        if durable >= last {
+            return true;
+        }
+        let oldest = self.oldest_seq();
+        // A watermark in the evicted prefix cannot satisfy this cursor.
+        // Leave the wait so read_after can mark writer_pending / expire.
+        if oldest > 1 && durable + 1 < oldest {
+            return false;
+        }
+        let retained_start = oldest.max(after_seq.saturating_add(1));
+        durable.saturating_add(1) > retained_start
+            && durable.saturating_sub(after_seq) >= limit as u64
     }
 
     /// Page through entire run range (honors cursor expiry; no silent 500 cutoff).
@@ -553,6 +640,8 @@ impl EventBus {
                 return Err(CursorExpiredError);
             }
             if page.entries.is_empty() {
+                // An empty page with writer_pending is not EOF. Callers must
+                // fail closed or retry rather than treat this as catch-up.
                 break;
             }
             for e in page.entries {
@@ -599,6 +688,20 @@ impl EventBus {
 
     pub fn last_persistence_error(&self) -> Option<String> {
         self.persistence_error.lock().clone()
+    }
+
+    /// Last sequence acked by the durable writer, or 0 when persistence is off.
+    pub fn durable_through(&self) -> u64 {
+        self.durable_through.load(Ordering::Acquire)
+    }
+
+    /// Whether this bus was asked to persist; RAM must not be treated as durable.
+    pub fn persist_configured(&self) -> bool {
+        self.persist_configured.load(Ordering::Acquire)
+    }
+
+    pub fn durable_writer_alive(&self) -> bool {
+        self.inner.lock().persistence.is_some()
     }
 }
 
@@ -729,6 +832,12 @@ fn run_journal_writer(
         if let Err(error) = result {
             *ctx.persistence_error.lock() = Some(error.to_string());
             record_journal_gap(&ctx.journal_gap, entry.seq);
+        } else {
+            ctx.durable_through.store(entry.seq, Ordering::Release);
+        }
+        {
+            let _guard = ctx.space.mu.lock();
+            ctx.space.cv.notify_all();
         }
         flush_journal_gap(
             &ctx.gap_path,
@@ -2020,5 +2129,52 @@ mod tests {
         }
         assert!(reopened.journal_gap.lock().is_none());
         assert_eq!(reopened.last_persistence_error(), None);
+    }
+
+    #[test]
+    fn durable_read_only_returns_writer_acked_seqs() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new(64).with_persist_dir(dir.path());
+        let sid = Uuid::new_v4();
+        for i in 0..24 {
+            bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: sid,
+                text: format!("ack-{i}"),
+            });
+        }
+        let page = bus.read_after(0, 500);
+        assert!(!page.cursor_expired, "{page:?}");
+        assert!(!page.writer_pending, "{page:?}");
+        assert_eq!(page.entries.len(), 24);
+        assert_eq!(bus.durable_through(), 24);
+        let disk = std::fs::read_to_string(dir.path().join("event_journal.jsonl")).unwrap();
+        for entry in &page.entries {
+            assert!(
+                disk.contains(&format!("\"seq\":{}", entry.seq)),
+                "seq {} missing from durable file",
+                entry.seq
+            );
+        }
+        assert_eq!(
+            page.entries.last().map(|entry| entry.seq),
+            Some(bus.durable_through())
+        );
+    }
+
+    #[test]
+    fn durable_read_does_not_present_ram_ahead_of_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new(32).with_persist_dir(dir.path());
+        let sid = Uuid::new_v4();
+        bus.publish(SessionUpdate::AgentMessageChunk {
+            session_id: sid,
+            text: "first".into(),
+        });
+        let _ = bus.read_after(0, 8);
+        bus.durable_through.store(0, Ordering::Release);
+        let page = bus.read_after(0, 8);
+        assert!(!page.cursor_expired);
+        assert!(page.entries.is_empty(), "{page:?}");
+        assert!(page.writer_pending);
     }
 }

@@ -267,8 +267,8 @@ fn an_unreadable_reply_settles_as_uncertain_and_blocks_an_equivalent_request() {
     assert!(!RunFailureKind::MalformedOutput.verdict().claims_success());
 }
 
-/// Cut 4: the provider answered. The attempt is finished, so a *new* intent
-/// may proceed — what is forbidden is repeating this one blindly.
+/// Cut 4: the provider answered. `Sent` is not terminal; a later intent is
+/// only safe after `Settled`. Repeating this attempt is always forbidden.
 #[test]
 fn an_acknowledged_attempt_is_finished_and_stops_blocking_the_run() {
     let home = tempdir().unwrap();
@@ -304,6 +304,20 @@ fn an_acknowledged_attempt_is_finished_and_stops_blocking_the_run() {
         !recovered[0].may_auto_retry(),
         "a delivered request was re-sent"
     );
+    assert!(
+        !store.run_permits_new_attempt("run-0006").unwrap(),
+        "Sent is still in-flight at the provider and must not be duplicated"
+    );
+    store
+        .update_attempt(recovered[0].attempt_id.as_str(), |attempt| {
+            attempt
+                .advance(SendState::Settled)
+                .map_err(anyhow::Error::msg)
+        })
+        .unwrap();
+    let store = restart(&home, Some(store));
+    let recovered = store.list_attempts_for_run("run-0006").unwrap();
+    assert_eq!(recovered[0].send_state, SendState::Settled);
     assert!(store.run_permits_new_attempt("run-0006").unwrap());
     assert!(store.unreconciled_attempts("run-0006").unwrap().is_empty());
     // The usage is a count and nothing else.
@@ -413,4 +427,124 @@ fn the_ledger_refuses_to_open_an_attempt_that_already_claims_to_have_been_sent()
     let once = attempt("run-0013", 1);
     store.open_attempt(&once).unwrap();
     assert!(store.open_attempt(&once).is_err());
+}
+
+fn with_receipts(attempt: &mut grokptah_agent_sdk::attempt::ProviderAttempt) {
+    attempt.receipts = ProviderReceipts {
+        request: Some(bounded("prq-wire-1")),
+        run: None,
+        usage: None,
+        provider_replied: true,
+    };
+}
+
+/// Cut: HTTP left the host (`Sent`) but the turn has not settled. Restart
+/// must not open a second equivalent request.
+#[test]
+fn a_sent_but_unsettled_attempt_blocks_a_duplicate_after_restart() {
+    let home = tempdir().unwrap();
+    let store = restart(&home, None);
+    let opened = attempt("run-0014", 1);
+    store.open_attempt(&opened).unwrap();
+    store
+        .update_attempt(opened.attempt_id.as_str(), |attempt| {
+            attempt
+                .advance(SendState::Sending)
+                .map_err(anyhow::Error::msg)
+        })
+        .unwrap();
+    store
+        .update_attempt(opened.attempt_id.as_str(), |attempt| {
+            with_receipts(attempt);
+            attempt.advance(SendState::Sent).map_err(anyhow::Error::msg)
+        })
+        .unwrap();
+
+    let store = restart(&home, Some(store));
+    let recovered = store.list_attempts_for_run("run-0014").unwrap();
+    assert_eq!(recovered[0].send_state, SendState::Sent);
+    assert!(!recovered[0].may_auto_retry());
+    assert!(!store.run_permits_new_attempt("run-0014").unwrap());
+    assert_eq!(
+        recovered[0].intent.provider_idempotency_key,
+        binding::provider_idempotency_key("run-0014", 1)
+    );
+}
+
+/// Cut: the response body has begun (`Responding`). Capacity and the attempt
+/// stay held; restart must not retry.
+#[test]
+fn responding_after_the_first_byte_still_blocks_a_duplicate() {
+    let home = tempdir().unwrap();
+    let store = restart(&home, None);
+    let opened = attempt("run-0015", 1);
+    store.open_attempt(&opened).unwrap();
+    store
+        .update_attempt(opened.attempt_id.as_str(), |attempt| {
+            attempt
+                .advance(SendState::Sending)
+                .map_err(anyhow::Error::msg)
+        })
+        .unwrap();
+    store
+        .update_attempt(opened.attempt_id.as_str(), |attempt| {
+            with_receipts(attempt);
+            attempt.advance(SendState::Sent).map_err(anyhow::Error::msg)
+        })
+        .unwrap();
+    store
+        .update_attempt(opened.attempt_id.as_str(), |attempt| {
+            attempt
+                .advance(SendState::Responding)
+                .map_err(anyhow::Error::msg)
+        })
+        .unwrap();
+
+    let store = restart(&home, Some(store));
+    let recovered = store.list_attempts_for_run("run-0015").unwrap();
+    assert_eq!(recovered[0].send_state, SendState::Responding);
+    assert!(!recovered[0].may_auto_retry());
+    assert!(!store.run_permits_new_attempt("run-0015").unwrap());
+    assert_eq!(store.unreconciled_attempts("run-0015").unwrap().len(), 1);
+}
+
+/// Cut: worker exited and the receipt was finalized. Restart still exposes
+/// the same attempt, provider-request identity, and `Settled` state.
+#[test]
+fn a_settled_attempt_survives_restart_without_duplication() {
+    let home = tempdir().unwrap();
+    let store = restart(&home, None);
+    let opened = attempt("run-0016", 1);
+    let attempt_id = opened.attempt_id.as_str().to_string();
+    let key = opened.intent.provider_idempotency_key.clone();
+    store.open_attempt(&opened).unwrap();
+    store
+        .update_attempt(&attempt_id, |attempt| {
+            attempt
+                .advance(SendState::Sending)
+                .map_err(anyhow::Error::msg)
+        })
+        .unwrap();
+    store
+        .update_attempt(&attempt_id, |attempt| {
+            with_receipts(attempt);
+            attempt.advance(SendState::Sent).map_err(anyhow::Error::msg)
+        })
+        .unwrap();
+    store
+        .update_attempt(&attempt_id, |attempt| {
+            attempt
+                .advance(SendState::Settled)
+                .map_err(anyhow::Error::msg)
+        })
+        .unwrap();
+
+    let store = restart(&home, Some(store));
+    let recovered = store.list_attempts_for_run("run-0016").unwrap();
+    assert_eq!(recovered[0].attempt_id.as_str(), attempt_id);
+    assert_eq!(recovered[0].intent.provider_idempotency_key, key);
+    assert_eq!(recovered[0].send_state, SendState::Settled);
+    assert!(!recovered[0].may_auto_retry());
+    assert!(store.run_permits_new_attempt("run-0016").unwrap());
+    assert!(store.unreconciled_attempts("run-0016").unwrap().is_empty());
 }

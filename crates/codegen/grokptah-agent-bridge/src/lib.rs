@@ -44,6 +44,7 @@ mod memory;
 mod models_catalog;
 pub mod orchestration;
 mod permission;
+mod physical_send;
 mod process_tree;
 mod project_context;
 mod prompt_combine;

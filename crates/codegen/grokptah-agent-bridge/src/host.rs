@@ -1269,9 +1269,16 @@ impl AgentHostHandle {
                 entries: Vec::new(),
                 next_cursor: None,
                 cursor_expired: false,
+                writer_pending: false,
             });
         };
         let mut page = self.event_bus().read_after(after_seq, limit);
+        if page.cursor_expired {
+            return Ok(page);
+        }
+        if page.writer_pending && page.entries.is_empty() {
+            bail!("durable journal has not reached the requested watermark; retry");
+        }
         page.entries.retain(|entry| {
             session_id_of(&entry.update) == Some(session_id)
                 && entry.seq >= start_seq

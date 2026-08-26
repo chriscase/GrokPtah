@@ -441,10 +441,11 @@ fn reconcile_run_attempts(store: &OrchStore, run_id: &str) {
 
 /// Settle this run's in-flight attempt once the turn is over.
 ///
-/// A parsed reply is an acknowledgement even when the provider returned no
-/// identifier, so it settles as `sent`. Anything else — an error, a broken
-/// connection, a reply we could not read — settles as `uncertain`, because
-/// the request may well have executed.
+/// A parsed reply is an acknowledgement. The lattice is one step per durable
+/// write: `Sending` becomes `Sent` then `Settled` on success, or `Uncertain`
+/// when we never learned whether the request executed. `Sent`/`Responding`
+/// always finish as `Settled` — they already left the host and must not be
+/// auto-retried.
 fn settle_run_attempts(
     store: &OrchStore,
     run_id: &str,
@@ -459,18 +460,51 @@ fn settle_run_attempts(
         candidate.aggregates.usage.completion_tokens,
     );
     for attempt in attempts {
-        if attempt.send_state != SendState::Sending {
-            continue;
-        }
-        let _ = store.update_attempt(attempt.attempt_id.as_str(), |attempt| match result {
+        let id = attempt.attempt_id.as_str().to_string();
+        match result {
             Ok(_) => {
-                attempt.receipts = attempt_binding::replied(usage);
-                attempt.advance(SendState::Sent).map_err(anyhow::Error::msg)
+                let _ = store.update_attempt(&id, |attempt| {
+                    attempt.receipts = attempt_binding::replied(usage);
+                    match attempt.send_state {
+                        SendState::Sending => {
+                            attempt.advance(SendState::Sent).map_err(anyhow::Error::msg)
+                        }
+                        SendState::Sent | SendState::Responding | SendState::Uncertain => attempt
+                            .advance(SendState::Settled)
+                            .map_err(anyhow::Error::msg),
+                        _ => Ok(()),
+                    }
+                });
+                let _ = store.update_attempt(&id, |attempt| {
+                    if attempt.send_state == SendState::Sent
+                        || attempt.send_state == SendState::Responding
+                    {
+                        attempt
+                            .advance(SendState::Settled)
+                            .map_err(anyhow::Error::msg)
+                    } else {
+                        Ok(())
+                    }
+                });
             }
-            Err(_) => attempt
-                .advance(SendState::Uncertain)
-                .map_err(anyhow::Error::msg),
-        });
+            Err(_) => match attempt.send_state {
+                SendState::Sending => {
+                    let _ = store.update_attempt(&id, |attempt| {
+                        attempt
+                            .advance(SendState::Uncertain)
+                            .map_err(anyhow::Error::msg)
+                    });
+                }
+                SendState::Sent | SendState::Responding => {
+                    let _ = store.update_attempt(&id, |attempt| {
+                        attempt
+                            .advance(SendState::Settled)
+                            .map_err(anyhow::Error::msg)
+                    });
+                }
+                _ => {}
+            },
+        }
     }
 }
 
@@ -1693,6 +1727,57 @@ impl OrchestrationService {
         // entirely of other sessions and advance the cursor past this run's
         // events. `read_range_all` is bounded by the journal retention policy
         // and preserves cursor-expiry failures instead of silently skipping.
+        if let Some(end) = run.end_seq {
+            let oldest = self.bus.oldest_seq();
+            if end > 0 && oldest > 1 && end < oldest.saturating_sub(1) {
+                return Err(OrchError::new(
+                    OrchErrorCode::CursorExpired,
+                    "event cursor expired; restart from seq 0 or latest",
+                ));
+            }
+        }
+        let mut entries = self.read_run_journal(&run, after_seq, limit)?;
+        if entries.is_empty() {
+            let probe = self.bus.read_after(after_seq, 1);
+            if probe.cursor_expired {
+                return Err(OrchError::new(
+                    OrchErrorCode::CursorExpired,
+                    "event cursor expired; restart from seq 0 or latest",
+                ));
+            }
+            if probe.writer_pending && probe.entries.is_empty() {
+                if self.bus.last_persistence_error().is_some() || !self.bus.durable_writer_alive() {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Internal,
+                        "durable journal writer failed before the requested watermark",
+                    ));
+                }
+                return Err(OrchError::new(
+                    OrchErrorCode::Timeout,
+                    "durable journal has not reached the requested watermark; retry",
+                ));
+            }
+            if !probe.entries.is_empty() {
+                // Writer caught up after the first range walk; never return
+                // the stale empty page as a durable catch-up.
+                entries = self.read_run_journal(&run, after_seq, limit)?;
+            }
+        }
+        let next_cursor = entries.last().map(|e| e.seq);
+        Ok(JournalPage {
+            entries,
+            next_cursor,
+            cursor_expired: false,
+            writer_pending: false,
+        })
+    }
+
+    fn read_run_journal(
+        &self,
+        run: &RunRecord,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<crate::event_bus::JournalEntry>, OrchError> {
         let mut entries = self
             .bus
             .read_range_all(after_seq, run.end_seq, Some(run.session_id))
@@ -1707,12 +1792,7 @@ impl OrchestrationService {
                 && run.end_seq.map(|s| e.seq <= s).unwrap_or(true)
         });
         entries.truncate(limit.clamp(1, 500));
-        let next_cursor = entries.last().map(|e| e.seq);
-        Ok(JournalPage {
-            entries,
-            next_cursor,
-            cursor_expired: false,
-        })
+        Ok(entries)
     }
 
     pub fn get_changes(
@@ -2688,7 +2768,7 @@ impl OrchestrationService {
                     session_id,
                     Path::new(&run.workspace),
                     error,
-                ))
+                ));
             }
         };
         let Some(execution) = run.execution.as_ref() else {
@@ -2820,7 +2900,7 @@ impl OrchestrationService {
                         session_id,
                         Path::new(&run.workspace),
                         OrchError::new(OrchErrorCode::Conflict, error.to_string()),
-                    ))
+                    ));
                 }
             };
         let response = serde_json::to_value(promoted)
@@ -2873,7 +2953,7 @@ impl OrchestrationService {
                     session_id,
                     Path::new(&run.workspace),
                     OrchError::new(OrchErrorCode::Conflict, error.to_string()),
-                ))
+                ));
             }
         };
         let response = serde_json::to_value(discarded)
@@ -3407,7 +3487,22 @@ impl OrchestrationService {
                 drop(admission_guard);
                 return;
             }
-            let prompt_fut = host.session_prompt_reserved_with_max_rounds_for_run(
+            let send_binding = store.list_attempts_for_run(&rid).ok().and_then(|attempts| {
+                attempts.into_iter().rev().find_map(|attempt| {
+                    (attempt.send_state == SendState::Sending).then(|| {
+                        crate::physical_send::PhysicalSendBinding {
+                            store: store.clone(),
+                            attempt_id: attempt.attempt_id.as_str().to_string(),
+                            provider_request_id: attempt
+                                .intent
+                                .provider_idempotency_key
+                                .as_str()
+                                .to_string(),
+                        }
+                    })
+                })
+            });
+            let prompt_call = host.session_prompt_reserved_with_max_rounds_for_run(
                 session_id,
                 prompt,
                 Some(max_rounds.max(1)),
@@ -3415,6 +3510,7 @@ impl OrchestrationService {
                 &rid,
                 execution_mode,
             );
+            let prompt_fut = crate::physical_send::scope_optional(send_binding, prompt_call);
             tokio::pin!(prompt_fut);
             let deadline = tokio::time::sleep(Duration::from_millis(max_ms.max(1)));
             tokio::pin!(deadline);

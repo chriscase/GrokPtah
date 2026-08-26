@@ -55,7 +55,7 @@ async fn supervised_grokptah_on_grokptah_live_smoke() {
     if dogfood.exists() {
         let _ = std::fs::remove_dir_all(&dogfood);
     }
-    let src = repo_root().canonicalize().unwrap();
+    let src = dunce::canonicalize(repo_root()).unwrap();
     let cloned = git(
         &[
             "clone",
@@ -180,5 +180,30 @@ Do not commit, push, open a PR, promote, or access paths outside this disposable
     }
 
     host.stop().unwrap();
+    drop(orch);
+    let replayed = OrchStore::open(home.path().join("orch")).expect("reopen orch store");
+    let run = replayed
+        .load_run(&run_id)
+        .expect("load replayed run")
+        .expect("completed run must survive restart");
+    eprintln!(
+        "LIVE_SELF_HOST_RESTART state={:?} run={}",
+        run.state, run.run_id
+    );
+    let attempts = replayed
+        .list_attempts_for_run(&run_id)
+        .expect("replay attempts");
+    if let Some(attempt) = attempts.last() {
+        eprintln!(
+            "LIVE_SELF_HOST_RESTART_ATTEMPT send={} attempt={} providerRequest={}",
+            attempt.send_state.as_str(),
+            attempt.attempt_id.as_str(),
+            attempt.intent.provider_idempotency_key.as_str()
+        );
+        assert!(
+            !attempt.may_auto_retry(),
+            "restart must not auto-retry a completed live attempt"
+        );
+    }
     set_grokptah_home_override(None);
 }

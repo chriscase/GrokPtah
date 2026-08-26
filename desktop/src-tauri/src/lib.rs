@@ -129,6 +129,7 @@ pub fn run() {
             commands::run_approve,
             commands::run_promote,
             commands::run_discard,
+            commands::run_submit,
             commands::run_retry,
             commands::run_steer,
             commands::run_cancel,
