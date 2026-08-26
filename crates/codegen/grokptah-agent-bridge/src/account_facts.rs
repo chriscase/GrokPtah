@@ -281,4 +281,39 @@ mod tests {
         assert_eq!(facts.readiness_reason, ReadinessReason::ExpiryUnparseable);
         assert!(facts.permits_launch());
     }
+
+    /// Opt-in probe of the operator host. Never prints credentials.
+    #[test]
+    fn live_operator_account_facts_are_secret_free() {
+        if std::env::var("GROKPTAH_PROBE_LIVE_ACCOUNT").ok().as_deref() != Some("1") {
+            return;
+        }
+        let _guard = crate::home_override_serial();
+        crate::set_grokptah_home_override(None);
+        let facts = grok_account_facts(chrono::Utc::now().timestamp());
+        let encoded = serde_json::to_string(&facts).expect("facts serialize");
+        for needle in [
+            "Bearer ",
+            "refresh_token",
+            "refreshToken",
+            "XAI_API_KEY",
+            "BEGIN ",
+            "/Users/",
+            "/home/",
+            "mac_key",
+            "hmac",
+        ] {
+            assert!(
+                !encoded.contains(needle),
+                "live account facts leaked {needle:?}: {encoded}"
+            );
+        }
+        eprintln!(
+            "LIVE_ACCOUNT_FACTS method={} readiness={:?} reason={:?} launch={}",
+            facts.credential_method.as_str(),
+            facts.readiness,
+            facts.readiness_reason,
+            facts.permits_launch()
+        );
+    }
 }
