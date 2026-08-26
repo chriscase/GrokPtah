@@ -111,7 +111,7 @@ fn a_crash_during_dispatch_is_never_auto_retried() {
     // The process dies here, mid-flight.
     let store = restart(&home, Some(store));
     let recovered = store.list_attempts_for_run("run-0002").unwrap();
-    assert_eq!(recovered[0].send_state, SendState::Sending);
+    assert_eq!(recovered[0].send_state, SendState::Uncertain);
     assert!(
         !recovered[0].may_auto_retry(),
         "an interrupted send was treated as retryable"
@@ -152,11 +152,21 @@ fn the_durable_record_refuses_to_rewind_an_interrupted_send() {
         Ok(())
     });
     assert!(outcome.is_err(), "{forbidden:?} rewind was accepted");
-    // And the record on disk is untouched by the rejected write.
+    // The rejected write left the in-process record as Sending.
+    assert_eq!(
+        store
+            .load_attempt(opened.attempt_id.as_str())
+            .unwrap()
+            .unwrap()
+            .send_state,
+        SendState::Sending
+    );
+    // A process restart then fail-closes Sending into Uncertain.
     let recovered = restart(&home, Some(store))
         .list_attempts_for_run("run-0003")
         .unwrap();
-    assert_eq!(recovered[0].send_state, SendState::Sending);
+    assert_eq!(recovered[0].send_state, SendState::Uncertain);
+    assert!(!recovered[0].may_auto_retry());
 }
 
 /// The binding is what makes a drift detectable after the fact, so it is

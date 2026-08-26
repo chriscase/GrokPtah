@@ -96,6 +96,7 @@ impl OrchStore {
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
         fs::create_dir_all(root.join("authority"))?;
+        fs::create_dir_all(root.join("attempts"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -143,6 +144,7 @@ impl OrchStore {
         };
         store.recover_finalization_intents()?;
         store.mark_unfinished_interrupted()?;
+        store.reconcile_interrupted_attempts()?;
         store.fail_orphaned_idempotency_claims()?;
         // Cleanup is best-effort at the record level, but directory access
         // failures still surface so a broken ledger cannot look healthy.
@@ -975,6 +977,37 @@ impl OrchStore {
 
     pub fn last_run_error(&self) -> Option<String> {
         self.inner.last_run_error.lock().clone()
+    }
+
+    /// A process that died while an attempt was `Sending` cannot still be
+    /// sending. Move those records to `Uncertain` so restart never auto-retries.
+    pub fn reconcile_interrupted_attempts(&self) -> anyhow::Result<usize> {
+        let dir = self.inner.root.join("attempts");
+        if !dir.is_dir() {
+            return Ok(0);
+        }
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(text) = fs::read_to_string(entry.path()) {
+                if let Ok(attempt) = serde_json::from_str::<ProviderAttempt>(&text) {
+                    if attempt.send_state == SendState::Sending {
+                        ids.push(attempt.attempt_id.as_str().to_string());
+                    }
+                }
+            }
+        }
+        let mut n = 0;
+        for attempt_id in ids {
+            self.update_attempt(&attempt_id, |attempt| {
+                crate::attempt_binding::reconcile_interrupted(attempt).map_err(anyhow::Error::msg)
+            })?;
+            n += 1;
+        }
+        Ok(n)
     }
 
     pub fn mark_unfinished_interrupted(&self) -> anyhow::Result<usize> {

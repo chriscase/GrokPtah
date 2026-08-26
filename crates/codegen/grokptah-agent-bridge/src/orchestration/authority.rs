@@ -389,13 +389,24 @@ fn canonical_mac_bytes(fields: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 fn hmac_tag(key: &AuthorityKey, fields: &[(&str, &[u8])]) -> Result<[u8; 32], SpineError> {
-    let bytes = canonical_mac_bytes(fields);
-    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).map_err(|_| SpineError::WeakKey)?;
-    mac.update(&bytes);
+    let mac = hmac_context(key, fields)?;
     let finalized = mac.finalize().into_bytes();
     let mut tag = [0u8; 32];
     tag.copy_from_slice(&finalized);
     Ok(tag)
+}
+
+fn hmac_verify(key: &AuthorityKey, fields: &[(&str, &[u8])], tag: &[u8]) -> Result<(), SpineError> {
+    hmac_context(key, fields)?
+        .verify_slice(tag)
+        .map_err(|_| SpineError::MacInvalid)
+}
+
+fn hmac_context(key: &AuthorityKey, fields: &[(&str, &[u8])]) -> Result<HmacSha256, SpineError> {
+    let bytes = canonical_mac_bytes(fields);
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes()).map_err(|_| SpineError::WeakKey)?;
+    mac.update(&bytes);
+    Ok(mac)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -452,7 +463,10 @@ fn identities_canonical(ids: &[ClassifiedId]) -> Vec<u8> {
     out
 }
 
-fn mac_envelope(key: &AuthorityKey, envelope: &UnverifiedEnvelope) -> Result<[u8; 32], SpineError> {
+fn with_envelope_fields<T>(
+    envelope: &UnverifiedEnvelope,
+    f: impl FnOnce(&[(&str, &[u8])]) -> T,
+) -> T {
     let identities = identities_canonical(&envelope.identities);
     let duration = envelope.bounds.max_duration_ms.to_be_bytes();
     let rounds = envelope.bounds.max_rounds.to_be_bytes();
@@ -466,43 +480,52 @@ fn mac_envelope(key: &AuthorityKey, envelope: &UnverifiedEnvelope) -> Result<[u8
     let source = envelope.source_revision.to_be_bytes();
     let expires = envelope.expires_unix.to_be_bytes();
     let key_version = envelope.key_version.to_be_bytes();
-    hmac_tag(
-        key,
-        &[
-            ("principal", envelope.principal.as_bytes()),
-            ("tenant", envelope.tenant.as_bytes()),
-            ("project", envelope.project.as_bytes()),
-            ("workspace", envelope.workspace.as_bytes()),
-            ("session", envelope.session.as_bytes()),
-            ("agent", envelope.agent.as_deref().unwrap_or("").as_bytes()),
-            ("provider", envelope.provider.as_bytes()),
-            ("profile", envelope.profile.as_bytes()),
-            ("endpoint", envelope.endpoint_fingerprint.as_bytes()),
-            ("model", envelope.model.as_bytes()),
-            (
-                "effort",
-                envelope.effort.as_deref().unwrap_or("").as_bytes(),
-            ),
-            ("auth_rev", &auth),
-            ("policy_rev", &policy),
-            ("capability_rev", &capability),
-            ("credential_rev", &credential),
-            ("source_rev", &source),
-            ("max_duration_ms", &duration),
-            ("max_rounds", &rounds),
-            ("max_tokens", &tokens),
-            ("max_cost_cents", &cost),
-            ("max_tools", &tools),
-            ("grant", envelope.grant_class.label().as_bytes()),
-            ("identities", identities.as_slice()),
-            ("intent_digest", envelope.intent_digest.as_bytes()),
-            ("expires_unix", &expires),
-            ("key_id", envelope.key_id.as_bytes()),
-            ("key_version", &key_version),
-            ("encoding", b"1"),
-            ("domain", MAC_DOMAIN_ENVELOPE.as_bytes()),
-        ],
-    )
+    f(&[
+        ("principal", envelope.principal.as_bytes()),
+        ("tenant", envelope.tenant.as_bytes()),
+        ("project", envelope.project.as_bytes()),
+        ("workspace", envelope.workspace.as_bytes()),
+        ("session", envelope.session.as_bytes()),
+        ("agent", envelope.agent.as_deref().unwrap_or("").as_bytes()),
+        ("provider", envelope.provider.as_bytes()),
+        ("profile", envelope.profile.as_bytes()),
+        ("endpoint", envelope.endpoint_fingerprint.as_bytes()),
+        ("model", envelope.model.as_bytes()),
+        (
+            "effort",
+            envelope.effort.as_deref().unwrap_or("").as_bytes(),
+        ),
+        ("auth_rev", &auth),
+        ("policy_rev", &policy),
+        ("capability_rev", &capability),
+        ("credential_rev", &credential),
+        ("source_rev", &source),
+        ("max_duration_ms", &duration),
+        ("max_rounds", &rounds),
+        ("max_tokens", &tokens),
+        ("max_cost_cents", &cost),
+        ("max_tools", &tools),
+        ("grant", envelope.grant_class.label().as_bytes()),
+        ("identities", identities.as_slice()),
+        ("intent_digest", envelope.intent_digest.as_bytes()),
+        ("expires_unix", &expires),
+        ("key_id", envelope.key_id.as_bytes()),
+        ("key_version", &key_version),
+        ("encoding", b"1"),
+        ("domain", MAC_DOMAIN_ENVELOPE.as_bytes()),
+    ])
+}
+
+fn mac_envelope(key: &AuthorityKey, envelope: &UnverifiedEnvelope) -> Result<[u8; 32], SpineError> {
+    with_envelope_fields(envelope, |fields| hmac_tag(key, fields))
+}
+
+fn verify_envelope_mac(
+    key: &AuthorityKey,
+    envelope: &UnverifiedEnvelope,
+    tag: &[u8],
+) -> Result<(), SpineError> {
+    with_envelope_fields(envelope, |fields| hmac_verify(key, fields, tag))
 }
 
 fn require_exact_identities(
@@ -564,18 +587,8 @@ impl UnverifiedEnvelope {
         if self.key_id != key.id() || self.key_version != key.version() {
             return Err(SpineError::MacInvalid);
         }
-        let expected = mac_envelope(key, &self)?;
-        let got = hex_decode(&self.envelope_mac_hex)?;
-        if got.len() != expected.len() {
-            return Err(SpineError::MacInvalid);
-        }
-        let mut diff = 0u8;
-        for (left, right) in expected.iter().zip(got.iter()) {
-            diff |= left ^ right;
-        }
-        if diff != 0 {
-            return Err(SpineError::MacInvalid);
-        }
+        let tag = hex_decode(&self.envelope_mac_hex)?;
+        verify_envelope_mac(key, &self, &tag)?;
         require_exact_identities(&self.identities, self.grant_class.required_identities())?;
         Ok(VerifiedEnvelope { inner: self })
     }
