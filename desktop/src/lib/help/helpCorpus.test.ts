@@ -6,6 +6,7 @@ import {
   getHelpArticle,
   getHelpChunk,
   getHelpSource,
+  recomputeHelpCorpusDigest,
   serializeHelpCorpus,
 } from "./canonical/corpus";
 import { canonicalDigest, canonicalJson, sha256Hex } from "./canonical/digest";
@@ -68,14 +69,9 @@ describe("canonical Help corpus", () => {
 
   it("serializes canonically and reproduces its digest", () => {
     expect(HELP_CORPUS_DIGEST).toMatch(/^sha256:[0-9a-f]{64}$/);
-    expect(
-      canonicalDigest({
-        schemaVersion: HELP_CORPUS.schemaVersion,
-        contentVersion: HELP_CORPUS.contentVersion,
-        articles: HELP_CORPUS.articles,
-        chunks: HELP_CORPUS.chunks,
-      }),
-    ).toBe(HELP_CORPUS_DIGEST);
+    // An external verifier hashes the published serialization; it does not
+    // re-implement the record rules.
+    expect(recomputeHelpCorpusDigest(serializeHelpCorpus())).toBe(HELP_CORPUS_DIGEST);
     expect(`sha256:${sha256Hex(serializeHelpCorpus())}`).toBe(
       `sha256:${CORPUS_LOCK.serializationSha256}`,
     );

@@ -4,7 +4,7 @@
  * Chunk IDs are derived from `articleId`, locale, kind, and ordinal, so they
  * are stable across rebuilds and can be cited verbatim by an answer contract.
  */
-import { canonicalDigest, canonicalJson } from "./digest";
+import { HELP_DIGEST_DOMAINS, canonicalJson, domainDigest } from "./digest";
 import { HELP_ARTICLE_SEEDS, HELP_SOURCE_REGISTRY } from "./data";
 import {
   HELP_CANONICAL_CONTENT_VERSION,
@@ -69,9 +69,12 @@ function chunkId(articleId: string, locale: string, kind: HelpChunk["kind"], ord
   return `${articleId}#${locale}.${kind}.${ordinal}`;
 }
 
-function buildChunks(article: HelpCanonicalArticle): HelpChunk[] {
+/** A chunk before its digest is computed; `buildCorpus` seals them. */
+type HelpChunkSeed = Omit<HelpChunk, "digest">;
+
+function buildChunks(article: HelpCanonicalArticle): HelpChunkSeed[] {
   const sourceIds = Object.freeze(article.sources.map((source) => source.id));
-  const chunks: HelpChunk[] = [
+  const chunks: HelpChunkSeed[] = [
     {
       id: chunkId(article.id, "en", "title", 0),
       articleId: article.id,
@@ -137,11 +140,43 @@ function resolveArticle(seed: (typeof HELP_ARTICLE_SEEDS)[number]): HelpCanonica
   const sources = seed.sourceIds.map((sourceId) => {
     const anchor = HELP_SOURCE_REGISTRY[sourceId];
     if (!anchor) throw new Error(`help corpus: article ${seed.id} cites unknown source ${sourceId}`);
-    return Object.freeze({ ...anchor });
+    return Object.freeze({
+      ...anchor,
+      digest: domainDigest(HELP_DIGEST_DOMAINS.source, [anchor.id, anchor.path, anchor.heading]),
+    });
   });
   const { sourceIds: _unused, ...rest } = seed;
+  // Each article carries its own digest, so the corpus digest is a digest of
+  // digests: a consumer that sees the corpus move can say which article moved.
+  const digest = domainDigest(HELP_DIGEST_DOMAINS.article, [
+    seed.id,
+    seed.title,
+    seed.topic,
+    seed.summary,
+    seed.body,
+    seed.access,
+    String(seed.aliases.length),
+    ...seed.aliases,
+    String(seed.keywords.length),
+    ...seed.keywords,
+    String(seed.audience.length),
+    ...seed.audience,
+    String(seed.capabilityIds.length),
+    ...seed.capabilityIds,
+    String(sources.length),
+    ...sources.map((source) => source.digest),
+    String(seed.localizations.length),
+    ...seed.localizations.flatMap((localization) => [
+      localization.locale,
+      localization.title,
+      localization.summary,
+      String(localization.keywords.length),
+      ...localization.keywords,
+    ]),
+  ]);
   return Object.freeze({
     ...rest,
+    digest,
     aliases: Object.freeze([...seed.aliases]),
     keywords: Object.freeze([...seed.keywords]),
     audience: Object.freeze([...seed.audience]),
@@ -153,6 +188,21 @@ function resolveArticle(seed: (typeof HELP_ARTICLE_SEEDS)[number]): HelpCanonica
     ),
     sources: Object.freeze(sources),
   }) as HelpCanonicalArticle;
+}
+
+/** The exact bytes the corpus digest covers. */
+function serializeCorpusRecord(
+  articles: readonly HelpCanonicalArticle[],
+  chunks: readonly HelpChunk[],
+  sources: readonly HelpSourceAnchor[],
+): string {
+  return canonicalJson({
+    schemaVersion: HELP_CANONICAL_SCHEMA_VERSION,
+    contentVersion: HELP_CANONICAL_CONTENT_VERSION,
+    articles,
+    chunks,
+    sources,
+  });
 }
 
 function buildCorpus(): HelpCanonicalCorpus {
@@ -190,7 +240,25 @@ function buildCorpus(): HelpCanonicalCorpus {
     .flatMap(buildChunks)
     .slice()
     .sort((left, right) => compare(left.id, right.id))
-    .map((chunk) => Object.freeze({ ...chunk, sourceIds: Object.freeze([...chunk.sourceIds]) }));
+    .map((chunk) =>
+      Object.freeze({
+        ...chunk,
+        sourceIds: Object.freeze([...chunk.sourceIds]),
+        // Bound to the bytes, not to the id. A citation span carries this so a
+        // rebuilt corpus invalidates the span instead of silently re-pointing
+        // it at different words.
+        digest: domainDigest(HELP_DIGEST_DOMAINS.chunk, [
+          chunk.id,
+          chunk.articleId,
+          chunk.kind,
+          String(chunk.ordinal),
+          chunk.locale,
+          chunk.text,
+          String(chunk.sourceIds.length),
+          ...chunk.sourceIds,
+        ]),
+      }),
+    );
 
   const chunkIds = new Set<string>();
   for (const chunk of chunks) {
@@ -203,21 +271,34 @@ function buildCorpus(): HelpCanonicalCorpus {
   }
 
   const usedSourceIds = new Set(articles.flatMap((article) => article.sources.map((source) => source.id)));
-  const sources: HelpSourceAnchor[] = [...usedSourceIds]
-    .sort(compare)
-    .map((sourceId) => Object.freeze({ ...HELP_SOURCE_REGISTRY[sourceId]! }));
+  const sources: HelpSourceAnchor[] = [...usedSourceIds].sort(compare).map((sourceId) => {
+    const seed = HELP_SOURCE_REGISTRY[sourceId]!;
+    return Object.freeze({
+      ...seed,
+      digest: domainDigest(HELP_DIGEST_DOMAINS.source, [seed.id, seed.path, seed.heading]),
+    });
+  });
 
   // Content digest covers everything a consumer can observe; the source digest
   // covers only the cited anchors so anchor drift is separately detectable.
-  const digest = canonicalDigest({
-    schemaVersion: HELP_CANONICAL_SCHEMA_VERSION,
-    contentVersion: HELP_CANONICAL_CONTENT_VERSION,
-    articles,
-    chunks,
-  });
-  const sourceDigest = canonicalDigest(
-    sources.map((source) => `${source.id}|${source.path}#${source.heading}`),
-  );
+  //
+  // Both are length-prefixed rather than separator-joined. The previous source
+  // digest joined `${id}|${path}#${heading}`, which is not injective: a source
+  // whose id contains `|` produces the same string as a different source whose
+  // path begins with the rest of it, and the two hash identically.
+  //
+  // The corpus digest is taken over the canonical serialization rather than
+  // over a field list, so `serializeHelpCorpus()` remains exactly the bytes it
+  // covers: an external verifier hashes one string instead of re-implementing
+  // the record rules. Those per-record digests are inside that serialization,
+  // so a substitution anywhere moves both the record's digest and the corpus's.
+  const digest = domainDigest(HELP_DIGEST_DOMAINS.corpus, [
+    serializeCorpusRecord(articles, chunks, sources),
+  ]);
+  const sourceDigest = domainDigest(HELP_DIGEST_DOMAINS.sourceSet, [
+    String(sources.length),
+    ...sources.map((source) => source.digest),
+  ]);
 
   return Object.freeze({
     schemaVersion: HELP_CANONICAL_SCHEMA_VERSION,
@@ -257,10 +338,10 @@ export function getHelpSource(sourceId: string): HelpSourceAnchor | undefined {
  * can recompute the digest without re-implementing the serialization rules.
  */
 export function serializeHelpCorpus(): string {
-  return canonicalJson({
-    schemaVersion: HELP_CORPUS.schemaVersion,
-    contentVersion: HELP_CORPUS.contentVersion,
-    articles: HELP_CORPUS.articles,
-    chunks: HELP_CORPUS.chunks,
-  });
+  return serializeCorpusRecord(HELP_CORPUS.articles, HELP_CORPUS.chunks, HELP_CORPUS.sources);
+}
+
+/** Recompute the corpus digest from the published serialization. */
+export function recomputeHelpCorpusDigest(serialized: string): string {
+  return domainDigest(HELP_DIGEST_DOMAINS.corpus, [serialized]);
 }

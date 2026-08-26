@@ -10,7 +10,7 @@
  * the former entry corpus is folded onto the article that replaced it via
  * `legacyEntryId`, so no content and no contract was dropped in the merge.
  */
-import type { HelpArticleSeed, HelpSourceAnchor } from "./types";
+import type { HelpArticleSeed, HelpSourceSeed } from "./types";
 
 /**
  * Every citable source, keyed by a stable citation id.
@@ -20,7 +20,7 @@ import type { HelpArticleSeed, HelpSourceAnchor } from "./types";
  * across two different headings each, so a citation could not identify which
  * section backed a claim. Those are split here.
  */
-export const HELP_SOURCE_REGISTRY: Readonly<Record<string, HelpSourceAnchor>> = Object.freeze({
+export const HELP_SOURCE_REGISTRY: Readonly<Record<string, HelpSourceSeed>> = Object.freeze({
   "product.readme.quick-start": { id: "product.readme.quick-start", path: "README.md", heading: "Quick start" },
   "product.readme.features": { id: "product.readme.features", path: "README.md", heading: "Features (desktop)" },
   "provider.profiles": { id: "provider.profiles", path: "docs/PROVIDER_PROFILES.md", heading: "Provider profiles" },
