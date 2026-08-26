@@ -8,5 +8,5 @@
     "outDir": "dist/public/types",
     "rootDir": "src/lib"
   },
-  "include": ["src/lib/public.ts", "src/lib/uiCore.ts"]
+  "include": ["src/lib/public.ts", "src/lib/uiCore.ts", "src/lib/grokAccountFacts.ts"]
 }

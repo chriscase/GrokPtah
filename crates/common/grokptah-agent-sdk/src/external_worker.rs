@@ -193,16 +193,15 @@ impl ExternalWorkerRecord {
         if let Some(branch) = &self.branch {
             validate_ref(branch, "branch")?;
         }
-        if let Some(url) = &self.worker_url {
-            if url.trim().is_empty()
+        if let Some(url) = &self.worker_url
+            && (url.trim().is_empty()
                 || url.len() > MAX_EXTERNAL_WORKER_REF_BYTES
                 || !url.starts_with("https://")
                 || url
                     .chars()
-                    .any(|character| matches!(character, '\n' | '\r' | '\0'))
-            {
-                return Err("worker_url must be a bounded https URL");
-            }
+                    .any(|character| matches!(character, '\n' | '\r' | '\0')))
+        {
+            return Err("worker_url must be a bounded https URL");
         }
         if self.created_at.trim().is_empty() || self.updated_at.trim().is_empty() {
             return Err("worker timestamps must not be empty");

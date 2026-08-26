@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokptah:schema:attempt:v1",
+  "title": "GrokPtah provider attempt",
+  "description": "One provider request: what it was bound to, and whether it left this host. `sendState` is the safety-critical field: only `known_not_sent` may be retried automatically. No property here can carry a bearer, refresh token, API key, keychain reference, endpoint URL, hostname, prompt text, or response body, and nothing here is an entitlement, quota, balance, or billing statement.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "schemaVersion",
+    "attemptId",
+    "runId",
+    "ordinal",
+    "subject",
+    "authority",
+    "route",
+    "intent",
+    "sendState"
+  ],
+  "properties": {
+    "contract": { "const": "grokptah.attempt.v1" },
+    "schemaVersion": { "const": 1 },
+    "attemptId": { "$ref": "#/$defs/boundedId" },
+    "runId": { "$ref": "#/$defs/boundedId" },
+    "ordinal": { "type": "integer", "minimum": 1 },
+    "subject": { "$ref": "#/$defs/subject" },
+    "authority": { "$ref": "#/$defs/authority" },
+    "route": { "$ref": "#/$defs/route" },
+    "intent": { "$ref": "#/$defs/intent" },
+    "sendState": { "$ref": "#/$defs/sendState" },
+    "receipts": { "$ref": "#/$defs/receipts" },
+    "failure": { "$ref": "#/$defs/failureKind" }
+  },
+  "$defs": {
+    "boundedId": {
+      "description": "An opaque identifier safe to record verbatim: no whitespace, control characters, markup, or traversal shapes.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^(?!.*\\.\\.)[A-Za-z0-9](?:[A-Za-z0-9._:/-]*[A-Za-z0-9])?$"
+    },
+    "revision": { "type": "integer", "minimum": 0 },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspace", "session"],
+      "properties": {
+        "principal": { "$ref": "#/$defs/boundedId" },
+        "tenant": { "$ref": "#/$defs/boundedId" },
+        "project": { "$ref": "#/$defs/boundedId" },
+        "workspace": { "$ref": "#/$defs/boundedId" },
+        "session": { "$ref": "#/$defs/boundedId" }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["auth", "policy", "capability", "credential"],
+      "properties": {
+        "auth": { "$ref": "#/$defs/revision" },
+        "policy": { "$ref": "#/$defs/revision" },
+        "capability": { "$ref": "#/$defs/revision" },
+        "credential": { "$ref": "#/$defs/revision" }
+      }
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "credentialMethod", "route", "base", "dialect", "model"],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["xai", "openai_compatible", "unrecognized"]
+        },
+        "profile": { "$ref": "#/$defs/boundedId" },
+        "credentialMethod": {
+          "type": "string",
+          "enum": [
+            "absent",
+            "api_key",
+            "token_command",
+            "provider_env",
+            "provider_keychain",
+            "grok_build_oidc",
+            "grok_build_api_key",
+            "unknown"
+          ]
+        },
+        "route": {
+          "type": "string",
+          "enum": ["xai_first_party", "compatible_provider", "unrecognized"]
+        },
+        "base": {
+          "type": "string",
+          "enum": [
+            "xai_official",
+            "compatible_https",
+            "compatible_loopback",
+            "unset",
+            "insecure_transport",
+            "malformed"
+          ]
+        },
+        "dialect": {
+          "type": "string",
+          "enum": ["xai_chat_completions", "openai_chat_completions", "unrecognized"]
+        },
+        "model": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["value"],
+          "properties": {
+            "value": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^(?!.*\\.\\.)[A-Za-z0-9](?:[A-Za-z0-9._:/-]*[A-Za-z0-9])?$"
+            }
+          }
+        },
+        "effort": { "$ref": "#/$defs/boundedId" },
+        "accountReference": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["value", "source"],
+          "properties": {
+            "value": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "pattern": "^[A-Za-z0-9._:-]+$"
+            },
+            "source": {
+              "type": "string",
+              "enum": ["user_id", "principal_id", "team_id"]
+            }
+          }
+        }
+      }
+    },
+    "intent": {
+      "description": "An opaque digest rather than the request text, so a retry is recognisable as the same intent without any durable record holding user content.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest", "requestId", "providerIdempotencyKey"],
+      "properties": {
+        "digest": { "$ref": "#/$defs/boundedId" },
+        "requestId": { "$ref": "#/$defs/boundedId" },
+        "providerIdempotencyKey": { "$ref": "#/$defs/boundedId" }
+      }
+    },
+    "sendState": {
+      "description": "Only `known_not_sent` may be retried automatically. `sending` and `uncertain` must be reconciled against the provider using `intent.providerIdempotencyKey`; `sent` is finished.",
+      "type": "string",
+      "enum": ["known_not_sent", "sending", "sent", "uncertain"]
+    },
+    "receipts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "request": { "$ref": "#/$defs/boundedId" },
+        "run": { "$ref": "#/$defs/boundedId" },
+        "usage": { "$ref": "#/$defs/usage" },
+        "providerReplied": { "type": "boolean" }
+      }
+    },
+    "usage": {
+      "description": "Counts only. Never an entitlement, quota, balance, or cost statement.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inputTokens", "outputTokens"],
+      "properties": {
+        "inputTokens": { "type": "integer", "minimum": 0 },
+        "outputTokens": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "failureKind": {
+      "type": "string",
+      "enum": [
+        "credential_missing",
+        "credential_revoked",
+        "credential_expired",
+        "credential_refresh_failed",
+        "route_mismatch",
+        "model_mismatch",
+        "launch_blocked",
+        "provider_unauthorized",
+        "provider_rate_limited",
+        "provider_error",
+        "transport_error",
+        "malformed_output"
+      ]
+    }
+  }
+}

@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::account::RunAttribution;
+
 /// Maximum model rounds accepted by the versioned public contract.
 pub const MAX_ROUNDS: u16 = 24;
 /// Maximum UTF-8 bytes in a public request identity.
@@ -165,6 +167,13 @@ pub struct DurableRun {
     pub created_at: String,
     /// Last update timestamp as an RFC3339 string.
     pub updated_at: String,
+    /// Bounded credential attribution, when the host recorded one.
+    ///
+    /// Added after v1 shipped and therefore optional in both directions: a
+    /// receipt written before this field existed still decodes, and a run with
+    /// no recorded attribution still serializes to the original shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<RunAttribution>,
 }
 
 impl DurableRun {
@@ -179,6 +188,9 @@ impl DurableRun {
         }
         if self.created_at.trim().is_empty() || self.updated_at.trim().is_empty() {
             return Err("durable timestamps must not be empty");
+        }
+        if let Some(attribution) = &self.attribution {
+            attribution.validate()?;
         }
         Ok(())
     }
@@ -228,7 +240,7 @@ pub struct RunEventPage {
 pub enum RunNotification {
     /// A scoped event journal update.
     Event {
-        /// Exact run identity for the journal entry.
+        /// Exact run identity the event belongs to.
         scope: RunScope,
         /// Share-safe event payload.
         event: RunEvent,
@@ -355,30 +367,176 @@ mod tests {
     }
 
     #[test]
+    fn a_receipt_written_before_attribution_existed_still_decodes() {
+        // Byte-for-byte the v1 shape, with no `attribution` key at all.
+        let legacy = r#"{
+            "runId": "run-1",
+            "sessionId": "session-1",
+            "workspace": "/approved",
+            "requestId": "req-1",
+            "state": "completed",
+            "promptPreview": "review",
+            "createdAt": "2026-08-24T00:00:00Z",
+            "updatedAt": "2026-08-24T00:01:00Z"
+        }"#;
+        let run: DurableRun = serde_json::from_str(legacy).expect("legacy receipt decodes");
+        assert_eq!(run.attribution, None);
+        assert_eq!(run.validate(), Ok(()));
+        // ...and re-serializes to the original shape, so old readers still parse it.
+        let value = serde_json::to_value(&run).expect("run serializes");
+        assert!(value.get("attribution").is_none());
+        let mut keys = value
+            .as_object()
+            .expect("run is an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "createdAt",
+                "promptPreview",
+                "requestId",
+                "runId",
+                "sessionId",
+                "state",
+                "updatedAt",
+                "workspace"
+            ]
+        );
+    }
+
+    #[test]
+    fn attribution_rides_along_without_disturbing_the_v1_fields() {
+        let run = DurableRun {
+            run_id: "run-1".into(),
+            session_id: "session-1".into(),
+            workspace: "/approved".into(),
+            request_id: "req-1".into(),
+            state: DurableRunState::Running,
+            prompt_preview: "review".into(),
+            created_at: "2026-08-24T00:00:00Z".into(),
+            updated_at: "2026-08-24T00:01:00Z".into(),
+            attribution: Some(RunAttribution {
+                credential_method: crate::account::CredentialMethod::GrokBuildOidc,
+                account_reference: crate::account::AccountReference::new(
+                    "usr-0a1b2c3d",
+                    crate::account::AccountReferenceSource::UserId,
+                ),
+            }),
+        };
+        assert_eq!(run.validate(), Ok(()));
+        let value = serde_json::to_value(&run).expect("run serializes");
+        assert_eq!(value["runId"], "run-1");
+        assert_eq!(value["attribution"]["credentialMethod"], "grok_build_oidc");
+        assert_eq!(
+            value["attribution"]["accountReference"]["source"],
+            "user_id"
+        );
+        let encoded = value.to_string();
+        for needle in ["bearer", "Bearer", "refresh", "apiKey", "credentialRef"] {
+            assert!(!encoded.contains(needle), "run receipt leaked {needle:?}");
+        }
+    }
+
+    #[test]
+    fn an_out_of_band_attribution_reference_fails_run_validation() {
+        let run = DurableRun {
+            run_id: "run-1".into(),
+            session_id: "session-1".into(),
+            workspace: "/approved".into(),
+            request_id: "req-1".into(),
+            state: DurableRunState::Running,
+            prompt_preview: "review".into(),
+            created_at: "2026-08-24T00:00:00Z".into(),
+            updated_at: "2026-08-24T00:01:00Z".into(),
+            attribution: Some(RunAttribution {
+                credential_method: crate::account::CredentialMethod::GrokBuildOidc,
+                account_reference: Some(crate::account::AccountReference {
+                    value: "usr/../../etc/passwd".into(),
+                    source: crate::account::AccountReferenceSource::UserId,
+                }),
+            }),
+        };
+        assert!(run.validate().is_err());
+    }
+
+    #[test]
+    fn the_run_schema_mirrors_the_account_contract_definitions_exactly() {
+        let run_schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../docs/schemas/grokptah-run.v1.schema.json"
+        ))
+        .expect("run schema parses");
+        let account_schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../docs/schemas/grokptah-account.v1.schema.json"
+        ))
+        .expect("account schema parses");
+        for name in [
+            "credentialMethod",
+            "accountReferenceSource",
+            "runAttribution",
+        ] {
+            let mirrored = &run_schema["$defs"][name];
+            let canonical = &account_schema["$defs"][name];
+            // Descriptions are allowed to differ; the validating shape is not.
+            let strip = |value: &serde_json::Value| {
+                let mut value = value.clone();
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("description");
+                }
+                value
+            };
+            assert_eq!(
+                strip(mirrored),
+                strip(canonical),
+                "run schema drifted from the account contract for {name}"
+            );
+        }
+        // `attribution` is published but never required, so v1 receipts validate.
+        let durable = &run_schema["$defs"]["durableRun"];
+        assert!(durable["properties"]["attribution"].is_object());
+        assert!(
+            !durable["required"]
+                .as_array()
+                .expect("durableRun declares required fields")
+                .iter()
+                .any(|field| field == "attribution")
+        );
+        assert_eq!(durable["additionalProperties"], false);
+    }
+
+    #[test]
     fn public_contract_validators_reject_unbounded_values() {
-        assert!(Bounds {
-            max_rounds: Some(25),
-            ..Bounds::default()
-        }
-        .validate()
-        .is_err());
-        assert!(RunEvent {
-            seq: 1,
-            ts: "2026-01-01T00:00:00Z".into(),
-            update: serde_json::json!({"text": "x"}),
-        }
-        .validate()
-        .is_ok());
-        assert!(ReviewReceipt {
-            changed_files: vec![ChangedFile {
-                path: "../secret".into(),
-                summary: "x".into()
-            }],
-            diff: String::new(),
-            diff_truncated: false,
-            fingerprint: "fp".into(),
-        }
-        .validate()
-        .is_err());
+        assert!(
+            Bounds {
+                max_rounds: Some(25),
+                ..Bounds::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RunEvent {
+                seq: 1,
+                ts: "2026-01-01T00:00:00Z".into(),
+                update: serde_json::json!({"text": "x"}),
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ReviewReceipt {
+                changed_files: vec![ChangedFile {
+                    path: "../secret".into(),
+                    summary: "x".into()
+                }],
+                diff: String::new(),
+                diff_truncated: false,
+                fingerprint: "fp".into(),
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

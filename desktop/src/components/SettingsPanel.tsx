@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
+import { GrokAccountBadge } from "./GrokAccountBadge";
+import type { GrokAccountFacts } from "../lib/grokAccountFacts";
 import type {
   AuthState,
   ComputerObservationPreview,
@@ -28,6 +30,11 @@ export type SettingsPanelProps = {
   models: ModelInfo[];
   auth: AuthState;
   onAuthChange: (a: AuthState) => void;
+  /**
+   * Bounded Grok Build readiness facts. `undefined` while unprobed, `null`
+   * when the host reported something off-contract.
+   */
+  grokAccount?: GrokAccountFacts | null;
   /** After host chrome changes (model/effort/etc). */
   onChromeChange: () => void;
   /**
@@ -66,6 +73,7 @@ export function SettingsPanel({
   models,
   auth,
   onAuthChange,
+  grokAccount,
   onChromeChange,
   placement = "dock",
 }: SettingsPanelProps) {
@@ -772,6 +780,11 @@ export function SettingsPanel({
                       ? `${auth.display_name || "Signed in"} · ${auth.method}`
                       : "Not signed in"}
                   </div>
+                  <GrokAccountBadge
+                    facts={grokAccount ?? null}
+                    placement="settings"
+                    onReauthenticate={() => void api.authOpenLogin()}
+                  />
                   <div className="settings-auth-actions">
                     <button
                       type="button"

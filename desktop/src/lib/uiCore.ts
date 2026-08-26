@@ -8,6 +8,7 @@
  */
 export * from "./capabilities";
 export * from "./externalWorker";
+export * from "./grokAccountFacts";
 export * from "./help";
 // The source-cited Help Center corpus is exported under explicit names so the
 // original bounded `searchHelp` contract remains backward compatible while

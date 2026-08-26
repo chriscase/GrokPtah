@@ -234,6 +234,15 @@ pub struct Session {
     /// Execution policy for future Build turns in this session.
     #[serde(default)]
     pub execution_mode: RunExecutionMode,
+    /// Whether [`Session::execution_mode`] was chosen by the operator.
+    ///
+    /// A mode this host defaulted follows the workspace: rebinding a session
+    /// to a repository that cannot back a worktree must not leave it pinned to
+    /// isolation it can never prepare. A mode the operator chose is theirs and
+    /// is never recomputed. Sessions written before this field existed decode
+    /// as "defaulted", which is what they were.
+    #[serde(default)]
+    pub execution_mode_explicit: bool,
     /// Bounded per-turn completion evidence, restored independently of the transcript.
     #[serde(default)]
     pub completion_history: Vec<SessionCompletion>,
@@ -253,12 +262,28 @@ impl Session {
         Self::new_with_kind(cwd, model, effort, SessionKind::Build)
     }
 
+    /// Create a session, defaulting a Build session on a clean Git workspace
+    /// to an isolated worktree.
+    ///
+    /// Isolation is the safe default because it is the only mode whose changes
+    /// can be reviewed before they touch the operator's checkout. It is chosen
+    /// only when [`crate::run_promotion::isolation_readiness`] says the
+    /// workspace can actually back one: on a dirty or non-Git workspace an
+    /// isolated run would fail on its first turn, so those fall back to shared
+    /// execution rather than producing a session that cannot run.
     pub fn new_with_kind(
         cwd: std::path::PathBuf,
         model: String,
         effort: crate::types::EffortLevel,
         kind: SessionKind,
     ) -> Self {
+        let execution_mode = if kind == SessionKind::Build
+            && crate::run_promotion::isolation_readiness(&cwd).permits_default_isolation()
+        {
+            RunExecutionMode::IsolatedWorktree
+        } else {
+            RunExecutionMode::Shared
+        };
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
@@ -285,7 +310,8 @@ impl Session {
             archived: false,
             archived_at: None,
             kind,
-            execution_mode: RunExecutionMode::Shared,
+            execution_mode,
+            execution_mode_explicit: false,
             completion_history: Vec::new(),
             transcript_loaded: true,
             persisted_len: 0,
@@ -317,5 +343,127 @@ impl Session {
             execution_mode: self.execution_mode,
             workspace_status: workspace_status(&self.cwd),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::EffortLevel;
+    use std::fs;
+    use std::process::Command;
+
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_AUTHOR_NAME", "GrokPtah tests")
+            .env("GIT_AUTHOR_EMAIL", "tests@grokptah.invalid")
+            .env("GIT_COMMITTER_NAME", "GrokPtah tests")
+            .env("GIT_COMMITTER_EMAIL", "tests@grokptah.invalid")
+            .output()
+            .expect("start git");
+        assert!(output.status.success(), "git {args:?} failed");
+    }
+
+    fn clean_repository() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        fs::write(dir.path().join("README.md"), "base\n").unwrap();
+        git(dir.path(), &["add", "README.md"]);
+        git(dir.path(), &["commit", "-qm", "base"]);
+        dir
+    }
+
+    fn session(cwd: &std::path::Path, kind: SessionKind) -> Session {
+        Session::new_with_kind(cwd.to_path_buf(), "grok-4".into(), EffortLevel::None, kind)
+    }
+
+    /// Isolation is the safe default because it is the only mode whose changes
+    /// can be reviewed before they touch the operator's checkout.
+    #[test]
+    fn a_new_build_session_on_a_clean_git_workspace_defaults_to_isolation() {
+        let repository = clean_repository();
+        let session = session(repository.path(), SessionKind::Build);
+        assert_eq!(session.execution_mode, RunExecutionMode::IsolatedWorktree);
+        assert_eq!(
+            session.summary().execution_mode,
+            RunExecutionMode::IsolatedWorktree
+        );
+        assert!(session.execution_mode.rollback_guarantee().is_durable());
+    }
+
+    /// Where isolation cannot actually be prepared, defaulting to it would
+    /// produce a session whose first turn always fails. Those fall back to
+    /// shared execution, which is honest about promising no rollback.
+    #[test]
+    fn a_build_session_falls_back_to_shared_where_isolation_cannot_be_prepared() {
+        let dirty = clean_repository();
+        fs::write(dirty.path().join("scratch.txt"), "uncommitted\n").unwrap();
+        assert_eq!(
+            session(dirty.path(), SessionKind::Build).execution_mode,
+            RunExecutionMode::Shared
+        );
+
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(
+            session(plain.path(), SessionKind::Build).execution_mode,
+            RunExecutionMode::Shared
+        );
+
+        let missing = plain.path().join("does-not-exist");
+        assert_eq!(
+            session(&missing, SessionKind::Build).execution_mode,
+            RunExecutionMode::Shared
+        );
+    }
+
+    /// Isolated execution is a Build-session concept; a chat has no workspace
+    /// changes to isolate, so it must not silently acquire a worktree.
+    #[test]
+    fn a_chat_session_never_defaults_to_isolation_even_on_a_clean_repository() {
+        let repository = clean_repository();
+        assert_eq!(
+            session(repository.path(), SessionKind::Chat).execution_mode,
+            RunExecutionMode::Shared
+        );
+    }
+
+    /// The guarantee is stated, not inferred, and shared execution states that
+    /// it has none. Review and promotion already refuse shared runs, so any
+    /// rollback claim here would be one the runtime cannot honour.
+    #[test]
+    fn shared_execution_claims_no_durable_rollback() {
+        use crate::orchestration::RollbackGuarantee;
+        assert_eq!(
+            RunExecutionMode::Shared.rollback_guarantee(),
+            RollbackGuarantee::None
+        );
+        assert!(!RunExecutionMode::Shared.rollback_guarantee().is_durable());
+        assert!(RunExecutionMode::Shared.requires_unsafe_acknowledgement());
+
+        assert_eq!(
+            RunExecutionMode::IsolatedWorktree.rollback_guarantee(),
+            RollbackGuarantee::ReviewedWorktree
+        );
+        assert!(RunExecutionMode::IsolatedWorktree
+            .rollback_guarantee()
+            .is_durable());
+        assert!(
+            !RunExecutionMode::IsolatedWorktree.requires_unsafe_acknowledgement(),
+            "the safe mode must never demand an unsafe acknowledgement"
+        );
+    }
+
+    /// A persisted session keeps whatever mode it was created with, so an
+    /// existing shared session is not silently migrated under the operator.
+    #[test]
+    fn a_persisted_execution_mode_survives_a_round_trip() {
+        let repository = clean_repository();
+        let session = session(repository.path(), SessionKind::Build);
+        let encoded = serde_json::to_value(&session).expect("session serializes");
+        assert_eq!(encoded["execution_mode"], "isolated_worktree");
+        let decoded: Session = serde_json::from_value(encoded).expect("session round-trips");
+        assert_eq!(decoded.execution_mode, RunExecutionMode::IsolatedWorktree);
     }
 }

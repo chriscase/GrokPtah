@@ -4,6 +4,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use grokptah_agent_sdk::account::RunAttribution;
+use grokptah_agent_sdk::launch::LaunchRequirement;
+
 use crate::completion::{CompletionEvidence, CompletionUsage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +88,68 @@ pub enum RunExecutionMode {
     #[default]
     Shared,
     IsolatedWorktree,
+}
+
+/// What an execution mode can actually promise about undoing a run.
+///
+/// Stated as a closed vocabulary so no caller has to infer it, and so the
+/// answer for shared execution is written down rather than left to optimism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackGuarantee {
+    /// Changes land in a managed worktree, are reviewable as a diff, and are
+    /// discardable without touching the operator's checkout.
+    ReviewedWorktree,
+    /// None. Edits land directly in the operator's workspace as the run makes
+    /// them. Git history, if any, is the operator's own and is not managed by
+    /// this host, so nothing here can undo a shared run.
+    None,
+}
+
+impl RollbackGuarantee {
+    /// The exact wire value used for logging and diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReviewedWorktree => "reviewed_worktree",
+            Self::None => "none",
+        }
+    }
+
+    /// Whether this guarantee lets a completed run be undone by the host.
+    pub const fn is_durable(self) -> bool {
+        matches!(self, Self::ReviewedWorktree)
+    }
+}
+
+impl RunExecutionMode {
+    /// The exact wire value used for logging and diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::IsolatedWorktree => "isolated_worktree",
+        }
+    }
+
+    /// What this mode can promise about undoing a run.
+    ///
+    /// Shared execution promises nothing. Review and promotion already refuse
+    /// shared runs, so claiming a rollback here would be a claim the rest of
+    /// the runtime cannot honour.
+    pub const fn rollback_guarantee(self) -> RollbackGuarantee {
+        match self {
+            Self::Shared => RollbackGuarantee::None,
+            Self::IsolatedWorktree => RollbackGuarantee::ReviewedWorktree,
+        }
+    }
+
+    /// Whether choosing this mode needs an explicit unsafe acknowledgement.
+    ///
+    /// Only shared execution does, and only where isolation was actually
+    /// available: demanding an acknowledgement on a workspace that cannot
+    /// support a worktree would be theatre, not consent.
+    pub const fn requires_unsafe_acknowledgement(self) -> bool {
+        matches!(self, Self::Shared)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -373,6 +438,23 @@ pub struct RunRecord {
     /// Optional persisted approval for an exact isolated-run review.
     #[serde(default)]
     pub approval: Option<RunApproval>,
+    /// Exact launch facts this run was admitted on.
+    ///
+    /// Write-once alongside `attribution`, and re-enforced against freshly
+    /// re-resolved truth before the model turn starts, so a run that was
+    /// queued cannot begin against a different provider, route, endpoint,
+    /// dialect, model, or account than the one it was admitted for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_requirement: Option<LaunchRequirement>,
+    /// Bounded, credential-free attribution recorded at durable admission.
+    ///
+    /// Write-once: [`crate::orchestration::store::OrchStore::update_run`]
+    /// refuses any mutation that changes it, so a run cannot be re-pointed at
+    /// a different account or credential route after it was admitted.
+    /// Optional in both directions so receipts written before this field
+    /// existed still decode and still re-serialize to their original shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<RunAttribution>,
 }
 
 pub const MAX_AGENT_CONTEXT_BYTES: usize = 16 * 1024;

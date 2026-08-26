@@ -3,7 +3,20 @@
 //! No child `grok agent stdio` process on the happy path. The host owns
 //! sessions, streams typed updates, and completes permission futures from the UI.
 
+pub mod account_facts;
 mod agents_personas;
+mod attempt_binding;
+
+/// Attempt-binding helpers exposed for the crash-cut integration suite.
+///
+/// The send boundary is the most expensive thing in this crate to get wrong,
+/// so its rules are exercised from an integration test against the real
+/// ledger rather than only from inside the module that defines them.
+pub mod attempt_binding_testkit {
+    pub use crate::attempt_binding::{
+        intent_digest, provider_idempotency_key, reconcile_interrupted, workspace_handle,
+    };
+}
 mod auth_store;
 pub mod capability_contract;
 mod completion;
@@ -22,6 +35,7 @@ mod host;
 mod host_helpers;
 mod instance_lock;
 mod isolation;
+pub mod launch_truth;
 mod local_tools;
 pub mod mcp_control;
 pub mod mcp_control_client;
@@ -137,7 +151,7 @@ pub use orchestration::{
     WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
 };
 pub use permission::{PermissionDecision, PermissionRequest};
-pub use run_promotion::RunReview;
+pub use run_promotion::{isolation_readiness, IsolationReadiness, RunReview};
 pub use search_engine::{SearchHit, SearchQuery};
 pub use session::{
     SessionCompletion, SessionKind, SessionSummary, TranscriptEntry, WorkspaceStatus,

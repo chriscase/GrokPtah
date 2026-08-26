@@ -1071,6 +1071,8 @@ fn restart_interrupted_no_auto_resume() {
         progress: None,
         execution: None,
         approval: None,
+        launch_requirement: None,
+        attribution: None,
     };
     store.save_run(&run).unwrap();
     drop(store);
@@ -1107,6 +1109,8 @@ fn restart_clears_queued_admission_position() {
         progress: None,
         execution: None,
         approval: None,
+        launch_requirement: None,
+        attribution: None,
     };
     store.save_run(&run).unwrap();
     drop(store);
@@ -1161,6 +1165,8 @@ async fn interrupted_run_retry_is_explicit_linked_and_idempotent() {
             progress: None,
             execution: None,
             approval: None,
+            launch_requirement: None,
+            attribution: None,
         })
         .unwrap();
 
@@ -1768,6 +1774,8 @@ fn run_event_pages_filter_before_limit_across_sessions() {
             progress: None,
             execution: None,
             approval: None,
+            launch_requirement: None,
+            attribution: None,
         })
         .unwrap();
 

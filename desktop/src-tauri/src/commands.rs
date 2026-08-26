@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use grokptah_agent_bridge::account_facts::{self, GrokAccountFacts};
 use grokptah_agent_bridge::{
     desktop_auto_update_enabled, AuthState, BackgroundTask, ComputerAction, ComputerPermission,
     ComputerPermissionStatus, ComputerPlatformStatus, ComputerTargetCandidate, EffortLevel,
@@ -530,11 +531,16 @@ pub fn session_set_cwd(
 }
 
 /// Set the execution policy for future Build turns in one session.
+///
+/// `acknowledge_unsafe` is optional and defaults to *not* acknowledged, so a
+/// caller that omits it can never opt into shared execution by accident on a
+/// workspace that could have been isolated.
 #[tauri::command]
 pub fn session_set_execution_mode(
     state: State<'_, AppState>,
     session_id: String,
     mode: String,
+    acknowledge_unsafe: Option<bool>,
 ) -> Result<SessionSummary, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     let mode = match mode.trim().to_ascii_lowercase().as_str() {
@@ -544,7 +550,7 @@ pub fn session_set_execution_mode(
     };
     state
         .host
-        .session_set_execution_mode(id, mode)
+        .session_set_execution_mode(id, mode, acknowledge_unsafe.unwrap_or(false))
         .map_err(map_err)
 }
 
@@ -1164,6 +1170,19 @@ pub fn set_always_approve(state: State<'_, AppState>, value: bool) {
 #[tauri::command]
 pub fn auth_state(state: State<'_, AppState>) -> AuthState {
     state.host.auth_state()
+}
+
+/// Bounded, credential-free Grok Build account readiness for the editor.
+///
+/// The projection itself lives in `grokptah-agent-sdk` and carries no bearer,
+/// refresh token, API key, credential reference, or raw auth mode, so this
+/// command is safe to expose to the webview.
+#[tauri::command]
+pub fn grok_account_facts() -> GrokAccountFacts {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64);
+    account_facts::grok_account_facts(now_unix)
 }
 
 #[tauri::command]
