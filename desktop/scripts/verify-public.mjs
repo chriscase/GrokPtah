@@ -82,10 +82,13 @@ const requiredExports = [
   "searchHelpCorpus",
   "createHelpSearchController",
   "describeHelpResultForAssistiveTech",
-  "buildHelpAnswerRequest",
-  "createHelpAnswerRoute",
+  "askHelp",
   "validateHelpAnswerResponse",
-  "requestHelpAnswer",
+  "checkHelpClaimCoverage",
+  "segmentHelpClaims",
+  "buildHelpClaimSpan",
+  "verifyHelpClaimSpan",
+  "scanHelpForSecrets",
   "redactHelpText",
   "sanitizeHelpText",
   "verifyHelpModelChecksum",
@@ -93,6 +96,60 @@ const requiredExports = [
 const missing = requiredExports.filter((name) => !(name in publicApi));
 if (missing.length > 0) {
   throw new Error(`public bundle is missing required exports: ${missing.join(", ")}`);
+}
+
+// The published client may ask across a host-bound seam. It may not authorize,
+// and it may not send a request somewhere of its own choosing.
+//
+// A decision made inside the consumer's own bundle is a decision the consumer
+// can decline to make, and a request builder plus a transport is a way to reach
+// any endpoint from a bundle carrying GrokPtah's name.
+const forbiddenExports = [
+  "buildHelpAnswerRequest",
+  "validateHelpAnswerRequest",
+  "createHelpAnswerRoute",
+  "isHelpAnswerRouteIntact",
+  "requestHelpAnswer",
+  "authorizeHelpDecision",
+  "createHelpExecutor",
+];
+for (const [name, api] of [
+  ["public", publicApi],
+  ["ui-core", uiCoreApi],
+  ["help-react", await import(helpReactBundlePath.href)],
+]) {
+  const exposed = forbiddenExports.filter((symbol) => symbol in api);
+  if (exposed.length > 0) {
+    throw new Error(`${name} bundle exposes Help request plumbing or authority: ${exposed.join(", ")}`);
+  }
+}
+
+// With no authority bound, asking is unavailable and retrieval is untouched.
+const unbound = await publicApi.askHelp(
+  "durable run recovery",
+  publicApi.searchHelpCorpus("durable run recovery", { limit: 3 }).results,
+);
+if (unbound.ok !== false || unbound.failure !== "no-authority-bound") {
+  throw new Error("published askHelp did not report an unbound authority");
+}
+
+// The corpus ships in the bundle, so every source in it is published.
+const nonPublicSources = publicApi.HELP_CORPUS.sources.filter(
+  (source) => "visibility" in source && source.visibility !== "public",
+);
+if (nonPublicSources.length > 0) {
+  throw new Error(
+    `published Help corpus contains non-public sources: ${nonPublicSources.map((s) => s.id).join(", ")}`,
+  );
+}
+
+// Verification must be usable by a consumer that did not produce the answer.
+const coverage = publicApi.checkHelpClaimCoverage("Resume safely. Quota is separate.", []);
+if (coverage.ok !== false || coverage.reason !== "uncovered-claim") {
+  throw new Error("published claim coverage did not refuse an uncited answer");
+}
+if (publicApi.scanHelpForSecrets("aGVsbG8gd29ybGQ=").confidence !== "possible") {
+  throw new Error("published secret scan reported certainty it does not have");
 }
 for (const name of [
   "HELP_ARTICLES",

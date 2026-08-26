@@ -21,6 +21,16 @@ export type HelpAudience = "everyone" | "power_user" | "operator";
 export type HelpAccess = "public" | "gated" | "operator";
 
 /** A citation target: an exact repository path plus an exact heading. */
+/** The authored form of a citation target, before its digest is computed. */
+export type HelpSourceSeed = {
+  /** Stable citation id used in answers, e.g. `provider.profiles`. */
+  readonly id: string;
+  /** Repository-relative path. Must exist in the tree. */
+  readonly path: string;
+  /** Exact Markdown heading text within `path`. */
+  readonly heading: string;
+};
+
 export type HelpSourceAnchor = {
   /** Stable citation id used in answers, e.g. `provider.profiles`. */
   readonly id: string;
@@ -28,6 +38,8 @@ export type HelpSourceAnchor = {
   readonly path: string;
   /** Exact Markdown heading text within `path`. */
   readonly heading: string;
+  /** `domainDigest(source, [id, path, heading])`. */
+  readonly digest: string;
 };
 
 /** Locale-tagged surface text so supported articles are retrievable in-language. */
@@ -53,6 +65,14 @@ export type HelpChunk = {
   readonly locale: string;
   /** Source anchor ids that back this chunk. Never empty. */
   readonly sourceIds: readonly string[];
+  /**
+   * `domainDigest(chunk, [id, articleId, kind, ordinal, locale, text, ...sources])`.
+   *
+   * A citation span carries this so it is bound to the bytes it indexes, not
+   * merely to whatever text currently answers to `id`. Without it a rebuilt
+   * corpus would silently re-point every span rather than invalidating it.
+   */
+  readonly digest: string;
 };
 
 export type HelpCanonicalArticle = {
@@ -76,6 +96,8 @@ export type HelpCanonicalArticle = {
    * consolidated article replaces a former standalone entry.
    */
   readonly legacyEntryId?: string;
+  /** `domainDigest(article, [...fields, ...sourceDigests, ...localizations])`. */
+  readonly digest: string;
 };
 
 /** The frozen, digest-bound corpus handed to every retriever. */
@@ -100,6 +122,8 @@ export type HelpCanonicalCorpus = {
  * Authoring shape. Articles reference sources by id so a citation id always
  * resolves to exactly one `path#heading`; `corpus.ts` resolves them.
  */
-export type HelpArticleSeed = Omit<HelpCanonicalArticle, "sources"> & {
+// Digests are computed from the seeds, never authored alongside them: a
+// hand-written digest is a value that can disagree with what it describes.
+export type HelpArticleSeed = Omit<HelpCanonicalArticle, "sources" | "digest"> & {
   readonly sourceIds: readonly string[];
 };

@@ -16,8 +16,10 @@ import { dirname, join, resolve } from "node:path";
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..", "..");
 
-const { HELP_CORPUS, serializeHelpCorpus } = await import("../src/lib/help/canonical/corpus.ts");
-const { canonicalDigest, sha256Hex } = await import("../src/lib/help/canonical/digest.ts");
+const { HELP_CORPUS, recomputeHelpCorpusDigest, serializeHelpCorpus } = await import(
+  "../src/lib/help/canonical/corpus.ts"
+);
+const { sha256Hex } = await import("../src/lib/help/canonical/digest.ts");
 const { PROJECTED_HELP_ARTICLES, PROJECTED_HELP_ENTRIES } = await import(
   "../src/lib/help/canonical/projections.ts"
 );
@@ -91,13 +93,24 @@ if (process.argv.includes("--write")) {
 }
 
 // Recomputing the digest from the serialization must reproduce it exactly.
-if (canonicalDigest({
-  schemaVersion: HELP_CORPUS.schemaVersion,
-  contentVersion: HELP_CORPUS.contentVersion,
-  articles: HELP_CORPUS.articles,
-  chunks: HELP_CORPUS.chunks,
-}) !== HELP_CORPUS.digest) {
-  fail("canonical digest is not reproducible from the corpus content");
+//
+// Through the exported path, not a copy of the rules: a verifier that
+// re-implements the record rules can agree with a corpus that has drifted,
+// because both sides drifted together.
+if (recomputeHelpCorpusDigest(serializeHelpCorpus()) !== HELP_CORPUS.digest) {
+  fail("canonical digest is not reproducible from the published serialization");
+}
+
+// Every record carries its own digest, and a citation span binds to the chunk's.
+for (const chunk of HELP_CORPUS.chunks) {
+  if (!/^sha256:[0-9a-f]{64}$/.test(chunk.digest ?? "")) {
+    fail(`chunk ${chunk.id} has no digest; citation spans would bind to nothing`);
+  }
+}
+for (const source of HELP_CORPUS.sources) {
+  if (!/^sha256:[0-9a-f]{64}$/.test(source.digest ?? "")) {
+    fail(`source ${source.id} has no digest`);
+  }
 }
 
 // 3. Chunk invariants.

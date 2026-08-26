@@ -99,3 +99,44 @@ export function canonicalJson(value: unknown): string {
 export function canonicalDigest(value: unknown): string {
   return `sha256:${sha256Hex(canonicalJson(value))}`;
 }
+
+/**
+ * Length-prefixed encoding of a field list.
+ *
+ * Each field is emitted as `<utf8ByteLength>:<field>`. The encoding is
+ * injective, so no two distinct field lists can produce the same byte string.
+ * Joining with a separator instead — `id|path#heading` — is not: a separator
+ * appearing inside a field makes the parse ambiguous, and two different
+ * triples can hash identically.
+ */
+export function lengthPrefixed(fields: readonly string[]): string {
+  const encoder = new TextEncoder();
+  let encoded = "";
+  for (const field of fields) {
+    encoded += `${encoder.encode(field).byteLength}:${field}`;
+  }
+  return encoded;
+}
+
+/**
+ * Domain-separated digest over a field list.
+ *
+ * The domain tag is itself length-prefixed and hashed first, so a digest
+ * computed for one kind of record can never collide with a digest computed
+ * for another kind that happens to carry the same field values — a chunk id
+ * and a source id that share a string still land in different digest spaces.
+ */
+export function domainDigest(domain: string, fields: readonly string[]): string {
+  return `sha256:${sha256Hex(lengthPrefixed([domain, ...fields]))}`;
+}
+
+/** Digest domains. Each record kind gets its own separated space. */
+export const HELP_DIGEST_DOMAINS = Object.freeze({
+  source: "grokptah.help.source.v1",
+  article: "grokptah.help.article.v1",
+  chunk: "grokptah.help.chunk.v1",
+  sourceSet: "grokptah.help.source-set.v1",
+  corpus: "grokptah.help.corpus.v1",
+  answerRequest: "grokptah.help.answer-request.v1",
+  answer: "grokptah.help.answer.v1",
+});
