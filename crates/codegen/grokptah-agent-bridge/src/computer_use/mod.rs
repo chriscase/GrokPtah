@@ -13,6 +13,38 @@
 //! session-scoped; coordinator reads take [`ComputerReadBinding`].
 
 mod control;
+// Isolated visual substrate. Every module here is private to `computer_use`:
+// nothing below is re-exported from this module or from the crate root, and
+// no dispatch path reaches it. It stays that way until the measured
+// signed-hardware gates and the independent security/accessibility reviews
+// pass.
+mod isolated_guest;
+mod isolated_visual;
+mod isolated_visual_artifacts;
+mod isolated_visual_channel;
+mod isolated_visual_driver;
+mod isolated_visual_frames;
+#[cfg(test)]
+mod isolated_visual_gates;
+mod isolated_visual_harness;
+mod isolated_visual_helper;
+mod isolated_visual_helper_control;
+mod isolated_visual_input;
+mod isolated_visual_input_wire;
+#[cfg(all(test, unix))]
+mod isolated_visual_leak_gates;
+#[cfg(test)]
+mod isolated_visual_package;
+mod isolated_visual_protocol;
+mod isolated_visual_runtime;
+mod isolated_visual_selfcheck;
+mod isolated_visual_soak;
+mod isolated_visual_status;
+mod isolated_visual_stream;
+#[cfg(target_os = "macos")]
+mod macos_isolated_artifacts;
+#[cfg(target_os = "macos")]
+mod macos_isolated_runtime;
 mod macos_observation;
 mod platform;
 mod policy;
@@ -26,6 +58,9 @@ mod types;
 pub use control::{
     ComputerAgentObservation, ComputerClientIdentity, ComputerGrantRequest,
     ComputerRunAgentController, ComputerRunController,
+};
+pub use isolated_visual_status::{
+    computer_isolated_visual_status, ComputerIsolatedVisualBlocker, ComputerIsolatedVisualStatus,
 };
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{

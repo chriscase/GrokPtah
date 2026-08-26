@@ -295,6 +295,68 @@ pub enum PointerButton {
     Secondary,
 }
 
+/// Explicit pointer button edge for an independently isolated visual input
+/// domain. Keeping down/up separate makes drag and hold behavior auditable and
+/// prevents a guest bridge from inventing an implicit release.
+///
+/// Crate-private: the isolated visual substrate is not dispatched and this
+/// type is deliberately absent from the crate's public surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PointerButtonState {
+    Down,
+    Up,
+}
+
+/// Host-minted opaque surface identity plus incarnation. Native process and
+/// window handles must never appear here. Prefixes are not proof of issuance;
+/// only the host surface registry mints these identities.
+///
+/// Crate-private for the same reason as [`PointerButtonState`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ComputerSurfaceBinding {
+    #[serde(default)]
+    pub(crate) surface_id: String,
+    #[serde(default)]
+    pub(crate) incarnation: String,
+}
+
+impl ComputerSurfaceBinding {
+    pub(crate) fn surface_id(&self) -> &str {
+        &self.surface_id
+    }
+
+    pub(crate) fn incarnation(&self) -> &str {
+        &self.incarnation
+    }
+
+    pub(crate) fn issue() -> Self {
+        Self {
+            surface_id: Uuid::new_v4().to_string(),
+            incarnation: Uuid::new_v4().to_string(),
+        }
+    }
+
+    pub(crate) fn rotate_incarnation(&self) -> ComputerResult<Self> {
+        validate_id("surface_id", &self.surface_id)?;
+        Ok(Self {
+            surface_id: self.surface_id.clone(),
+            incarnation: Uuid::new_v4().to_string(),
+        })
+    }
+
+    pub(crate) fn is_issued(&self) -> bool {
+        self.validate().is_ok()
+    }
+
+    pub(crate) fn validate(&self) -> ComputerResult<()> {
+        validate_id("surface_id", &self.surface_id)?;
+        validate_id("incarnation", &self.incarnation)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputerKey {

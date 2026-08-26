@@ -1,0 +1,175 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  echo "usage: verify-guest-source.sh" >&2
+  exit 64
+fi
+
+script_dir=$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd -P)
+guest_source="$script_dir/guest-init.c"
+protocol_header="$script_dir/protocol.h"
+fragment="$script_dir/kernel.config.fragment"
+lock="$script_dir/guest-source.lock.json"
+work=$(mktemp -d "${TMPDIR:-/tmp}/grokptah-guest-source-proof.XXXXXX")
+cleanup() {
+  rm -rf -- "$work"
+}
+trap cleanup EXIT HUP INT TERM
+
+sh -n "$script_dir/fetch-kernel-source.sh"
+sh -n "$script_dir/build-guest-image.sh"
+# shellcheck disable=SC2016 # literal source fragments are intentional
+for required in '--proto-redir' '--connect-timeout 15' '--max-time 900' \
+  '--max-filesize 2147483648' \
+  'output appeared during source fetch' 'mv "$temporary" "$output"'; do
+  grep -F -- "$required" "$script_dir/fetch-kernel-source.sh" >/dev/null
+done
+# shellcheck disable=SC2016 # literal source fragments are intentional
+for required in staged_output_image staged_output_manifest \
+  published_image published_manifest \
+  'trap - EXIT HUP INT TERM' \
+  "trap 'exit 129' HUP" "trap 'exit 130' INT" "trap 'exit 143' TERM" \
+  'mv "$staged_output_image" "$output_image"' \
+  'mv "$staged_output_manifest" "$output_manifest"' \
+  'guest image or manifest output appeared during staged build' \
+  -fuse-ld=lld -nostdlib -static -fno-builtin -fno-pie -O2 \
+  '-Wl,-e,_start' '-Wl,--build-id=none' '-Wl,-z,noexecstack' \
+  '-O "$kernel"' \
+  'CONFIG_BLK_DEV_INITRD=y' \
+  'CONFIG_*=n)' \
+  '# ${name} is not set'; do
+  grep -F -- "$required" "$script_dir/build-guest-image.sh" >/dev/null
+done
+jq -e '
+  .schemaVersion == 1 and
+  .kernelVersion == "6.12.104" and
+  .architecture == "arm64" and
+  .sourceUrl == "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.104.tar.xz" and
+  (.sourceSha256 | test("^[0-9a-f]{64}$"))
+' "$lock" >/dev/null
+
+clang -std=c11 -Wall -Wextra -Werror "$script_dir/protocol-selftest.c" \
+  -o "$work/protocol-selftest"
+"$work/protocol-selftest" | grep -Fx 'isolated guest bootstrap protocol self-test: ok'
+clang --target=aarch64-linux-gnu -std=c11 -ffreestanding -fno-builtin \
+  -fno-stack-protector -fsyntax-only -Wall -Wextra -Werror "$guest_source"
+if [ "$(uname -s)" = Linux ]; then
+  command -v ld.lld >/dev/null 2>&1 || {
+    echo "ld.lld is required to prove guest-init links with CI flags" >&2
+    exit 69
+  }
+  clang --target=aarch64-linux-gnu \
+    -fuse-ld=lld \
+    -std=c11 \
+    -ffreestanding \
+    -nostdlib \
+    -static \
+    -fno-builtin \
+    -fno-stack-protector \
+    -fno-pie \
+    -O2 \
+    -Wall \
+    -Wextra \
+    -Werror \
+    -Wl,-e,_start \
+    -Wl,--build-id=none \
+    -Wl,-z,noexecstack \
+    "$guest_source" \
+    -o "$work/guest-init"
+  file "$work/guest-init" | grep -F 'ELF 64-bit LSB pie executable' >/dev/null ||
+    file "$work/guest-init" | grep -F 'ELF 64-bit LSB executable' >/dev/null
+  if command -v llvm-nm >/dev/null 2>&1; then
+    nm_cmd=llvm-nm
+  elif command -v nm >/dev/null 2>&1; then
+    nm_cmd=nm
+  else
+    echo "nm is required to prove guest-init has no libc memory helpers" >&2
+    exit 69
+  fi
+  if "$nm_cmd" "$work/guest-init" | grep -E '[[:space:]]U[[:space:]]+(memset|memcpy|memmove)$' >/dev/null; then
+    echo "freestanding guest-init linked an undefined libc memory helper" >&2
+    exit 1
+  fi
+fi
+
+for required in \
+  'CONFIG_BLK_DEV_INITRD=y' \
+  'CONFIG_INITRAMFS_SOURCE="grokptah-initramfs.cpio"' \
+  'CONFIG_VSOCKETS=y' \
+  'CONFIG_VIRTIO_VSOCKETS=y' \
+  'CONFIG_DRM_VIRTIO_GPU=y' \
+  'CONFIG_DRM_FBDEV_EMULATION=y' \
+  'CONFIG_PCI_HOST_GENERIC=y' \
+  'CONFIG_MODULES=n'; do
+  grep -Fx "$required" "$fragment" >/dev/null
+done
+# Post-olddefconfig matcher must accept both canonical disabled spellings and
+# must not treat an absent key as disabled or weaken required =y settings.
+kconfig_has_disabled() {
+  grep -Fx "$2=n" "$1" >/dev/null || grep -Fx "# $2 is not set" "$1" >/dev/null
+}
+kconfig_probe="$work/kconfig-disabled-spellings.config"
+printf '%s\n' \
+  'CONFIG_BLK_DEV_INITRD=y' \
+  'CONFIG_INITRAMFS_SOURCE="grokptah-initramfs.cpio"' \
+  'CONFIG_VSOCKETS=y' \
+  '# CONFIG_MODULES is not set' \
+  'CONFIG_INET=n' \
+  >"$kconfig_probe"
+kconfig_has_disabled "$kconfig_probe" CONFIG_MODULES
+kconfig_has_disabled "$kconfig_probe" CONFIG_INET
+grep -Fx 'CONFIG_BLK_DEV_INITRD=y' "$kconfig_probe" >/dev/null
+grep -Fx 'CONFIG_INITRAMFS_SOURCE="grokptah-initramfs.cpio"' "$kconfig_probe" >/dev/null
+grep -Fx 'CONFIG_VSOCKETS=y' "$kconfig_probe" >/dev/null
+if kconfig_has_disabled "$kconfig_probe" CONFIG_SOUND; then
+  echo "absent kconfig key must not count as disabled" >&2
+  exit 1
+fi
+if kconfig_has_disabled "$kconfig_probe" CONFIG_VSOCKETS; then
+  echo "required enabled kconfig setting must not match a disabled spelling" >&2
+  exit 1
+fi
+for forbidden in \
+  CONFIG_INET=y CONFIG_IPV6=y CONFIG_VIRTIO_NET=y CONFIG_USB_SUPPORT=y \
+  CONFIG_SOUND=y CONFIG_SCSI=y CONFIG_ATA=y CONFIG_VIRTIO_BLK=y CONFIG_VIRTIO_FS=y; do
+  if grep -Fx "$forbidden" "$fragment" >/dev/null; then
+    echo "fragment contains a forbidden enabled setting: $forbidden" >&2
+    exit 1
+  fi
+done
+for forbidden in AF_INET execve '/bin/sh' mount ptrace 'memset(' 'memcpy(' 'memmove('; do
+  if grep -F "$forbidden" "$guest_source" >/dev/null; then
+    echo "guest PID 1 contains forbidden surface: $forbidden" >&2
+    exit 1
+  fi
+done
+for required in GPT_AF_VSOCK GPT_GUEST_BOOTSTRAP_PORT GPT_GUEST_BOOTSTRAP_BIND \
+  GPT_GUEST_BOOTSTRAP_INPUT GPT_GUEST_BOOTSTRAP_EVENT_BINDING_ACK GPT_SYS_REBOOT GPT_SYS_SOCKET \
+  GPT_SYS_OPENAT GPT_SYS_LSEEK GPT_SYS_POLL GPT_SYS_GETRANDOM GPT_GUEST_FRAME_BYTES \
+  GPT_POLLOUT GPT_POLLNVAL GPT_GUEST_IO_ATTEMPTS GPT_GUEST_IO_WAIT_MILLISECONDS \
+  gpt_wait_for_io 'attempts < GPT_GUEST_IO_ATTEMPTS' GPT_O_RDWR gpt_open_framebuffer \
+  gpt_sleep_retry GPT_SYS_NANOSLEEP gpt_fill_bytes \
+  'ready < 0' \
+  gpt_render_fixture gpt_capture_frame gpt_send_frame \
+  gpt_apply_fixture_input; do
+  grep -F "$required" "$guest_source" >/dev/null
+done
+grep -F '"/dev/fb0"' "$guest_source" >/dev/null
+for required in \
+  GPT_ISOLATED_VISUAL_FRAME_MAGIC GPT_ISOLATED_VISUAL_FRAME_HEADER_BYTES \
+  GPT_ISOLATED_VISUAL_FRAME_MAX_PACKET_BYTES \
+  gpt_isolated_visual_frame_header GPT_ISOLATED_VISUAL_INPUT_MAGIC \
+  GPT_ISOLATED_VISUAL_INPUT_HEADER_BYTES GPT_ISOLATED_VISUAL_INPUT_MAX_PACKET_BYTES \
+  gpt_isolated_visual_input_header gpt_isolated_visual_input_valid \
+  gpt_isolated_visual_frame_seal \
+  GPT_ISOLATED_VISUAL_BINDING_MAGIC GPT_ISOLATED_VISUAL_BINDING_HEADER_BYTES \
+  gpt_isolated_visual_binding_header gpt_isolated_visual_binding_digest \
+  gpt_isolated_visual_channel_secret gpt_isolated_visual_binding_valid; do
+  grep -F "$required" "$protocol_header" >/dev/null
+done
+if grep -F 'while (gpt_syscall3(GPT_SYS_NANOSLEEP' "$guest_source" >/dev/null; then
+  echo "guest reconnect backoff must not retry nanosleep inside an unbounded loop" >&2
+  exit 1
+fi
+printf 'isolated guest source, protocol, and closed kernel fragment: pass\n'
