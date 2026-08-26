@@ -226,12 +226,12 @@ try {
     ["ls", "--json", "--all", "--silent", "--prefix", consumerRoot],
     { cwd: consumerRoot },
   );
-  function dependencyVersions(tree, packageName, found = []) {
+  function dependencyVersions(tree, packageName, path = [], found = []) {
     for (const [name, dependency] of Object.entries(tree.dependencies ?? {})) {
       if (name === packageName && dependency.version) {
-        found.push(dependency.version);
+        found.push({ version: dependency.version, path: [...path, name].join(" > ") });
       }
-      dependencyVersions(dependency, packageName, found);
+      dependencyVersions(dependency, packageName, [...path, name], found);
     }
     return found;
   }
@@ -239,10 +239,12 @@ try {
     const versions = dependencyVersions(dependencyTree, packageName);
     if (
       versions.length !== 1 ||
-      versions[0] !== hostConfiguration.expected[packageName]
+      versions[0]?.version !== hostConfiguration.expected[packageName]
     ) {
       throw new Error(
-        `${reactHost} host must have one deduplicated ${packageName} at ${hostConfiguration.expected[packageName]}, found ${versions.join(", ")}`,
+        `${reactHost} host must have one deduplicated ${packageName} at ${hostConfiguration.expected[packageName]}, found ${versions
+          .map(({ version, path }) => `${version} (${path})`)
+          .join(", ")}`,
       );
     }
   }
