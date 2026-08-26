@@ -147,7 +147,20 @@ const UNCERTAIN: readonly RedactionRule[] = Object.freeze([
  * it.
  */
 export function scanHelpForSecrets(value: string): HelpSecretScan {
-  const redaction = redactHelpText(value);
+  // Digests are named with their algorithm throughout the corpus, the
+  // contracts, and the answers, so the hex that follows one is not an
+  // unexplained blob.
+  //
+  // The exemption has to run *before* the redaction rules, not after them. The
+  // generic high-entropy rule matches a 64-character hex string, so a sentence
+  // naming the corpus digest scanned as a `certain` credential — and since
+  // untrusted provider text is refused on anything but `clean`, every answer
+  // that mentioned a digest was rejected.
+  const withoutDigests = value.replace(
+    /\b(?:sha256|sha1|md5|blake3|hmac-sha256):[0-9a-f]+/gi,
+    " ",
+  );
+  const redaction = redactHelpText(withoutDigests);
   if (redaction.redacted) {
     return Object.freeze({
       confidence: "certain" as const,
@@ -156,9 +169,6 @@ export function scanHelpForSecrets(value: string): HelpSecretScan {
     });
   }
 
-  // Digests are named with their algorithm throughout the contracts, so the
-  // hex that follows one is not an unexplained blob.
-  const withoutDigests = value.replace(/\b(?:sha256|sha1|md5|blake3|hmac-sha256):[0-9a-f]+/gi, " ");
   const indicators: string[] = [];
   for (const rule of UNCERTAIN) {
     if (new RegExp(rule.pattern.source, rule.pattern.flags).test(withoutDigests)) {
@@ -172,4 +182,3 @@ export function scanHelpForSecrets(value: string): HelpSecretScan {
     indicators: Object.freeze(indicators),
   });
 }
-

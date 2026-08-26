@@ -13,7 +13,7 @@ export * from "./help";
 // answer contract, and a framework-agnostic controller. React primitives are
 // published separately at `@grokptah/client/help-react` so this entry stays
 // dependency-free.
-export * from "./help/index";
+export * from "./help/publicSurface";
 // The source-cited Help Center corpus is exported under explicit names so the
 // original bounded `searchHelp` contract remains backward compatible while
 // consumers can opt into semantic-ranking and assistant request validation.

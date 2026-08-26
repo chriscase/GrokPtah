@@ -98,10 +98,13 @@ describe("Help answer request", () => {
     // caller-hashed route digest proved only that the caller had not edited
     // its own choice after making it.
     const request = fixture();
+    // Checked as JSON keys: "route" is an ordinary word in Help prose, so a
+    // substring check would pass or fail on which article was retrieved.
     const serialized = JSON.stringify(request);
     for (const key of ["route", "routeDigest", "providerId", "tenantId", "modelId", "principal"]) {
-      expect(serialized.includes(key), key).toBe(false);
+      expect(serialized.includes(`"${key}":`), key).toBe(false);
     }
+    expect(Object.keys(request)).not.toContain("route");
   });
 
   it("redacts a credential out of the question before it can be sent", () => {

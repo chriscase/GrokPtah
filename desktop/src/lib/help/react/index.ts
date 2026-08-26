@@ -17,3 +17,10 @@ export {
   type HelpResultsProps,
   type HelpSearchInputProps,
 } from "./primitives";
+
+export {
+  HelpRoute,
+  useHelpPaletteShortcut,
+  type HelpAnsweringState,
+  type HelpRouteProps,
+} from "./HelpRoute";
