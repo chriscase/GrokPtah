@@ -85,3 +85,35 @@ if (failed > 0) {
   process.exit(1);
 }
 console.log("\nAll retrieval metrics met their thresholds.");
+
+// ---- claim-bound citation coverage -----------------------------------------
+const { evaluateHelpCitationBinding, HELP_CITATION_THRESHOLDS } = await import(
+  "../src/lib/help/eval/citations.ts"
+);
+const citations = evaluateHelpCitationBinding();
+console.log(
+  `\nClaim-bound citations: ${citations.evaluated} answers built from gold queries, ` +
+    `${citations.swapEvaluated} with a disjoint chunk to swap in`,
+);
+let citationFailures = 0;
+for (const [label, actual, min] of [
+  ["Faithful answer accepted", citations.faithfulAcceptanceRate, HELP_CITATION_THRESHOLDS.faithfulAcceptanceRate],
+  ["Swapped citation rejected", citations.swapRejectionRate, HELP_CITATION_THRESHOLDS.swapRejectionRate],
+]) {
+  const ok = actual >= min;
+  if (!ok) citationFailures += 1;
+  console.log(
+    `  ${ok ? "PASS" : "FAIL"}  ${label.padEnd(26)}${(actual * 100).toFixed(1)}%  (min ${(min * 100).toFixed(1)}%)`,
+  );
+}
+for (const entry of citations.cases.filter((c) => !c.faithfulAccepted).slice(0, 10)) {
+  console.log(`    [${entry.query.id}] faithful answer refused: ${entry.faithfulDetail}`);
+}
+for (const entry of citations.cases.filter((c) => c.swapRejected === false)) {
+  console.log(`    [${entry.query.id}] swapped citation accepted: ${entry.swapDetail}`);
+}
+if (citationFailures > 0) {
+  console.error(`\n${citationFailures} citation metric(s) below threshold`);
+  process.exit(1);
+}
+console.log("All citation-binding metrics met their thresholds.");

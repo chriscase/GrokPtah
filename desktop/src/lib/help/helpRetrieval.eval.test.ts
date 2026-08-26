@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { HELP_CITATION_THRESHOLDS, evaluateHelpCitationBinding } from "./eval/citations";
 import { HELP_EVAL_THRESHOLDS, evaluateHelpGoldSet } from "./eval/harness";
 import { HELP_GOLD_ANSWERABLE, HELP_GOLD_MUST_ABSTAIN, HELP_GOLD_SET } from "./eval/goldset";
 
@@ -77,5 +78,33 @@ describe("Help retrieval quality", () => {
     expect(repeat.outcomes.map((outcome) => outcome.topArticleId)).toEqual(
       metrics.outcomes.map((outcome) => outcome.topArticleId),
     );
+  });
+});
+
+describe("claim-bound citation binding over the gold set", () => {
+  const metrics = evaluateHelpCitationBinding();
+
+  it("builds an answer from a real retrieval for most gold queries", () => {
+    // If this collapses, the two rates below stop meaning anything.
+    expect(metrics.evaluated).toBeGreaterThan(80);
+    expect(metrics.swapEvaluated).toBeGreaterThan(40);
+  });
+
+  it("accepts a faithful answer over its own top chunk", () => {
+    const refused = metrics.cases.filter((entry) => !entry.faithfulAccepted);
+    // Named individually: a gate that rejects honest answers is an outage, and
+    // a bare rate would not say which article broke.
+    expect(refused.map((entry) => `${entry.query.id}: ${entry.faithfulDetail}`)).toEqual([]);
+    expect(metrics.faithfulAcceptanceRate).toBeGreaterThanOrEqual(
+      HELP_CITATION_THRESHOLDS.faithfulAcceptanceRate,
+    );
+  });
+
+  it("always rejects a verbatim citation from an unrelated chunk", () => {
+    // Verbatim, in-context, correctly shaped, and about something else. This
+    // is a correctness property, so the bar is every case.
+    const accepted = metrics.cases.filter((entry) => entry.swapRejected === false);
+    expect(accepted.map((entry) => `${entry.query.id}: ${entry.swapDetail}`)).toEqual([]);
+    expect(metrics.swapRejectionRate).toBe(HELP_CITATION_THRESHOLDS.swapRejectionRate);
   });
 });
