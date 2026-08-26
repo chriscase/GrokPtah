@@ -242,7 +242,7 @@ fn safe_text(value: &str, max_bytes: usize) -> bool {
         return false;
     }
     let lower = value.to_ascii_lowercase();
-    ![
+    [
         "authorization:",
         "bearer ",
         "xai-",
