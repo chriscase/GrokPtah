@@ -106,6 +106,32 @@ pub fn advertised_capabilities() -> CapabilitySet {
             description: "Resume a persistent agent with an explicit fresh prompt.".into(),
         });
     }
+    if has("ptah_list_work_graphs")
+        && has("ptah_get_work_graph")
+        && has("ptah_get_work_graph_evidence")
+    {
+        capabilities.push(CapabilityDescriptor {
+            id: "work.graph.observe".into(),
+            tier: CapabilityTier::Observe,
+            mutating: false,
+            human_gate: false,
+            availability: CapabilityAvailability::Available,
+            description: "Read secret-free durable work-graph status, leases, and evidence.".into(),
+        });
+    }
+    if has("ptah_cancel_work_graph") && has("ptah_cancel_work_item") && has("ptah_review_work_item")
+    {
+        capabilities.push(CapabilityDescriptor {
+            id: "work.graph.control".into(),
+            tier: CapabilityTier::Review,
+            mutating: true,
+            // Discarding a reviewed result is destructive and stays gated.
+            human_gate: true,
+            availability: CapabilityAvailability::Gated,
+            description: "Cancel work-graph items or graphs and keep or discard reviewed results."
+                .into(),
+        });
+    }
     if has("ptah_list_computer_runs")
         && has("ptah_get_computer_run")
         && has("ptah_get_computer_run_events")

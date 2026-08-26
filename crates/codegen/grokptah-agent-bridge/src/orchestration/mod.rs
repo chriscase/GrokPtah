@@ -5,6 +5,7 @@
 mod authz;
 mod service;
 mod store;
+pub mod swarm;
 mod types;
 
 pub use authz::{canonical_workspace, constant_time_eq, AuthContext, WorkspaceAllowlist};

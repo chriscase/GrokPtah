@@ -3682,3 +3682,323 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         BackgroundTask { session_id, .. } => *session_id,
     }
 }
+
+/// Durable work-graph control and status, on the one canonical service.
+///
+/// These methods deliberately live on `OrchestrationService` rather than on a
+/// separate coordinator: admission reuses the host's existing capacity, the
+/// ledger is the existing `OrchStore` root, and every request passes the same
+/// session/workspace authorization as a run request. There is no second
+/// control plane to keep in sync.
+impl OrchestrationService {
+    fn swarm_store(&self) -> super::swarm::SwarmStore {
+        super::swarm::SwarmStore::new(self.store.clone())
+    }
+
+    /// Slots the host's existing orchestration capacity currently leaves free.
+    ///
+    /// A graph can only narrow this. It never invents capacity of its own.
+    fn available_admission_slots(&self) -> usize {
+        self.host
+            .orchestration_capacity_limit()
+            .saturating_sub(self.host.orchestration_active_count())
+    }
+
+    fn graph_redactor(&self) -> impl super::swarm::Redactor + '_ {
+        move |text: &str, max: usize| self.bus.redact_text(text, max)
+    }
+
+    /// Resolve a graph for an exact session and workspace, or refuse.
+    ///
+    /// Every axis is checked: the session must be a ready Build session, the
+    /// claimed workspace must be allowlisted and match the session's, and the
+    /// durable record must name that same session and workspace. A graph
+    /// belonging to another session or workspace is not found, not borrowed.
+    fn authorize_graph_request(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+        graph_id: &str,
+    ) -> Result<(super::swarm::WorkGraphRecord, String), OrchError> {
+        let graph_id = super::swarm::GraphId::parse(graph_id)?;
+        let session = self.require_build_session(session_id)?;
+        let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
+        let allowlist = self.config.lock().allowlist.clone();
+        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
+        let claimed_display = claimed.display().to_string();
+        let record = self
+            .swarm_store()
+            .load_graph(&graph_id)?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown graph_id"))?;
+        if record.session_id != session_id {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "work graph does not belong to the requested session",
+            ));
+        }
+        if record.workspace != claimed_display {
+            return Err(OrchError::new(
+                OrchErrorCode::WorkspaceMismatch,
+                "work graph workspace does not match the requested workspace",
+            ));
+        }
+        Ok((record, claimed_display))
+    }
+
+    /// Create a durable work graph bound to one session and workspace.
+    pub fn create_work_graph_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        graph_id: &str,
+        agent_id: &str,
+        spec: super::swarm::WorkGraphSpec,
+    ) -> Result<serde_json::Value, OrchError> {
+        let graph_id = super::swarm::GraphId::parse(graph_id)?;
+        let session = self.require_build_session(session_id)?;
+        let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
+        let allowlist = self.config.lock().allowlist.clone();
+        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
+        let claimed_display = claimed.display().to_string();
+        let now = Utc::now();
+        let record = super::swarm::WorkGraphRecord::new(
+            graph_id,
+            session_id,
+            claimed_display.clone(),
+            agent_id,
+            spec,
+            now,
+        )
+        .inspect_err(|error| {
+            self.audit_err(
+                "ptah_create_work_graph",
+                None,
+                Some(session_id),
+                Some(&claimed_display),
+                error,
+            )
+        })?;
+        self.swarm_store()
+            .create_graph(&record)
+            .inspect_err(|error| {
+                self.audit_err(
+                    "ptah_create_work_graph",
+                    None,
+                    Some(session_id),
+                    Some(&claimed_display),
+                    error,
+                )
+            })?;
+        self.audit(
+            "ptah_create_work_graph",
+            None,
+            Some(session_id),
+            Some(&claimed_display),
+            "ok",
+            None,
+            &format!("graph {} with {} items", record.graph_id, record.work.len()),
+        );
+        self.graph_value(&record)
+    }
+
+    /// Full secret-free projection for one graph.
+    pub fn get_work_graph_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        graph_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let (record, _) = self.authorize_graph_request(session_id, workspace, graph_id)?;
+        self.graph_value(&record)
+    }
+
+    /// Bounded, redacted evidence for one graph.
+    pub fn get_work_graph_evidence_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        graph_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let (record, _) = self.authorize_graph_request(session_id, workspace, graph_id)?;
+        let redactor = self.graph_redactor();
+        let rows = super::swarm::project_evidence(&record, &redactor);
+        serde_json::to_value(serde_json::json!({
+            "graphId": record.graph_id.to_string(),
+            "evidence": rows,
+        }))
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    /// Every graph visible to one session and workspace.
+    pub fn list_work_graphs_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<serde_json::Value, OrchError> {
+        let session = self.require_build_session(session_id)?;
+        let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
+        let allowlist = self.config.lock().allowlist.clone();
+        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
+        let claimed_display = claimed.display().to_string();
+        let (records, skipped) = self.swarm_store().list_graphs()?;
+        let redactor = self.graph_redactor();
+        let graphs: Vec<_> = records
+            .iter()
+            .filter(|record| record.session_id == session_id && record.workspace == claimed_display)
+            .map(|record| super::swarm::project_status(record, None, &redactor))
+            .collect();
+        serde_json::to_value(serde_json::json!({
+            "graphs": graphs,
+            // Reported rather than hidden: a ledger with unreadable records
+            // must not be able to look healthy.
+            "unreadableRecords": skipped,
+        }))
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    /// Stop admission for a whole graph and begin winding down live children.
+    pub fn cancel_work_graph_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        graph_id: &str,
+        reason: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let (mut record, claimed) =
+            self.authorize_graph_request(session_id, workspace, graph_id)?;
+        let expected = record.revision;
+        let now = Utc::now();
+        super::swarm::cancel_graph(&mut record, reason, now)?;
+        super::swarm::settle_lifecycle(&mut record, now);
+        let committed = self
+            .swarm_store()
+            .compare_and_swap(expected, &record, now)
+            .inspect_err(|error| {
+                self.audit_err(
+                    "ptah_cancel_work_graph",
+                    None,
+                    Some(session_id),
+                    Some(&claimed),
+                    error,
+                )
+            })?;
+        self.audit(
+            "ptah_cancel_work_graph",
+            None,
+            Some(session_id),
+            Some(&claimed),
+            "ok",
+            None,
+            &format!("graph {} is {:?}", committed.graph_id, committed.lifecycle),
+        );
+        self.graph_value(&committed)
+    }
+
+    /// Cancel one work item.
+    pub fn cancel_work_item_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        graph_id: &str,
+        work_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let (mut record, claimed) =
+            self.authorize_graph_request(session_id, workspace, graph_id)?;
+        let work_id = super::swarm::WorkId::parse(work_id)?;
+        let expected = record.revision;
+        let now = Utc::now();
+        let state = super::swarm::cancel_work(&mut record, &work_id, now)?;
+        super::swarm::settle_lifecycle(&mut record, now);
+        let committed = self
+            .swarm_store()
+            .compare_and_swap(expected, &record, now)?;
+        self.audit(
+            "ptah_cancel_work_item",
+            None,
+            Some(session_id),
+            Some(&claimed),
+            "ok",
+            None,
+            &format!("work {work_id} is {state:?}"),
+        );
+        self.graph_value(&committed)
+    }
+
+    /// Keep or discard a reviewed work item.
+    pub fn review_work_item_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        graph_id: &str,
+        work_id: &str,
+        decision: super::swarm::ReviewDecision,
+    ) -> Result<serde_json::Value, OrchError> {
+        let (mut record, claimed) =
+            self.authorize_graph_request(session_id, workspace, graph_id)?;
+        let work_id = super::swarm::WorkId::parse(work_id)?;
+        let expected = record.revision;
+        let now = Utc::now();
+        let state = super::swarm::review_work(&mut record, &work_id, decision, now)?;
+        super::swarm::settle_lifecycle(&mut record, now);
+        let committed = self
+            .swarm_store()
+            .compare_and_swap(expected, &record, now)?;
+        self.audit(
+            "ptah_review_work_item",
+            None,
+            Some(session_id),
+            Some(&claimed),
+            "ok",
+            None,
+            &format!("work {work_id} is {state:?}"),
+        );
+        self.graph_value(&committed)
+    }
+
+    /// The narrow desktop/UI DTO. Carries no authority material.
+    pub fn desktop_work_graph_dto_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        graph_id: &str,
+    ) -> Result<super::swarm::DesktopGraphDto, OrchError> {
+        let (record, _) = self.authorize_graph_request(session_id, workspace, graph_id)?;
+        let redactor = self.graph_redactor();
+        let status = super::swarm::project_status(
+            &record,
+            Some(self.graph_admission_block(&record)),
+            &redactor,
+        );
+        Ok(super::swarm::project_desktop(&status))
+    }
+
+    fn graph_admission_block(
+        &self,
+        record: &super::swarm::WorkGraphRecord,
+    ) -> super::swarm::AdmissionBlock {
+        super::swarm::plan_admissions(record, self.available_admission_slots(), Utc::now())
+            .blocked_by
+    }
+
+    fn graph_value(
+        &self,
+        record: &super::swarm::WorkGraphRecord,
+    ) -> Result<serde_json::Value, OrchError> {
+        let redactor = self.graph_redactor();
+        let projection = super::swarm::project_graph(
+            record,
+            Some(self.graph_admission_block(record)),
+            &redactor,
+        );
+        serde_json::to_value(projection)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+}
