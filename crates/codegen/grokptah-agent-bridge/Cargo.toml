@@ -30,7 +30,7 @@ bytes = "1"
 sha2 = "0.10"
 grokptah-agent-sdk = { path = "../../common/grokptah-agent-sdk" }
 
-keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native"] }
+keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native", "vendored"] }
 open = "5"
 fs2 = "0.4"
 dunce = "1"
