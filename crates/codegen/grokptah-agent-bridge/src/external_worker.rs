@@ -2,7 +2,14 @@
 //!
 //! The browser and public SDK see only the projections from
 //! `grokptah-agent-sdk`. Provider credentials stay in this native/server
-//! boundary. The first adapter targets Cursor's Cloud Agents API v1; it does
+//! boundary.
+//!
+//! An [`ExternalWorkerAdapter`] is a transport, not an authority: calling one
+//! directly performs a provider mutation with no admission, receipt, or
+//! duplicate protection. The registry therefore does not hand adapters out of
+//! this crate, and the only supported way to launch, follow up, or cancel is
+//! [`crate::external_worker_authority::ExternalWorkerAuthority`]. A host that
+//! constructs an adapter and drives it itself is outside that guarantee. The first adapter targets Cursor's Cloud Agents API v1; it does
 //! not control a foreground Cursor desktop window and it never grants native
 //! Computer Use authority.
 
@@ -237,7 +244,13 @@ impl ExternalWorkerRegistry {
     }
 
     /// Return the adapter for an exact provider identity, if installed.
-    pub fn get(
+    ///
+    /// Deliberately crate-private: handing an adapter to an out-of-crate
+    /// caller would be a way around
+    /// [`crate::external_worker_authority::ExternalWorkerAuthority`], which is
+    /// the only supported path to a mutation. Consumers observe availability
+    /// through [`Self::capability_status`] instead.
+    pub(crate) fn get(
         &self,
         provider: ExternalWorkerProvider,
         provider_id: Option<&str>,
