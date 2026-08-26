@@ -20,6 +20,7 @@ mod control;
 // pass.
 mod isolated_guest;
 mod isolated_visual;
+mod isolated_visual_artifacts;
 mod isolated_visual_channel;
 mod isolated_visual_driver;
 mod isolated_visual_frames;
@@ -27,6 +28,8 @@ mod isolated_visual_helper;
 mod isolated_visual_helper_control;
 mod isolated_visual_input;
 mod isolated_visual_input_wire;
+#[cfg(test)]
+mod isolated_visual_package;
 mod isolated_visual_protocol;
 mod isolated_visual_runtime;
 mod isolated_visual_selfcheck;

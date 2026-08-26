@@ -35,6 +35,12 @@ use super::isolated_visual::{
     ISOLATED_VISUAL_GUEST_PROTOCOL_VERSION, ISOLATED_VISUAL_MANIFEST_SCHEMA_VERSION,
     MACOS_ISOLATED_VISUAL_CANDIDATE_BACKEND_ID,
 };
+use super::isolated_visual_artifacts::{
+    measure_open_isolated_visual_artifact, measure_open_isolated_visual_artifacts,
+    measure_packaged_isolated_visual_artifacts, IsolatedVisualArtifactMeasurement,
+    IsolatedVisualArtifactMeasurements, IsolatedVisualArtifactRole,
+    IsolatedVisualPackagedArtifactReceipt,
+};
 use super::isolated_visual_channel::IsolatedVisualChannelBinding;
 use super::isolated_visual_driver::IsolatedVisualRuntimeDriver;
 use super::isolated_visual_frames::IsolatedVisualFrameCarrier;
@@ -135,6 +141,7 @@ pub(crate) fn run_isolated_visual_selfcheck() -> ComputerResult<()> {
     check_helper_supervisor()?;
     check_driven_session()?;
     check_driven_failure()?;
+    check_artifact_receipts()?;
     #[cfg(unix)]
     bind_deadline_entrypoints();
     Ok(())
@@ -813,6 +820,125 @@ fn check_driven_session() -> ComputerResult<()> {
         runtime.terminal_check().is_err(),
         "restart interruption left the isolated input gate live",
     )
+}
+
+/// A packaged receipt only validates against the manifest it was measured for,
+/// and every signed-helper boundary flag must hold for it to exist at all.
+fn check_artifact_receipts() -> ComputerResult<()> {
+    let contract = rehearsal_contract();
+    let manifest = &contract.manifest;
+
+    let measurements = IsolatedVisualArtifactMeasurements {
+        helper: IsolatedVisualArtifactMeasurement {
+            role: IsolatedVisualArtifactRole::HelperExecutable,
+            content_sha256: manifest.helper_content_sha256.clone(),
+            bytes: 1024,
+        },
+        guest_image: IsolatedVisualArtifactMeasurement {
+            role: IsolatedVisualArtifactRole::GuestImage,
+            content_sha256: manifest.guest_image_sha256.clone(),
+            bytes: 4096,
+        },
+        configuration: IsolatedVisualArtifactMeasurement {
+            role: IsolatedVisualArtifactRole::Configuration,
+            content_sha256: manifest.configuration_sha256.clone(),
+            bytes: 512,
+        },
+    };
+    measurements.validate()?;
+    measurements.validate_content_against_manifest(manifest)?;
+
+    // An empty artifact and a role swap are both refused.
+    require(
+        IsolatedVisualArtifactMeasurement {
+            role: IsolatedVisualArtifactRole::HelperExecutable,
+            content_sha256: manifest.helper_content_sha256.clone(),
+            bytes: 0,
+        }
+        .validate()
+        .is_err(),
+        "artifact measurement admitted an empty artifact",
+    )?;
+    let mut swapped = measurements.clone();
+    swapped.helper.role = IsolatedVisualArtifactRole::Configuration;
+    require(
+        swapped.validate().is_err(),
+        "artifact receipt admitted an artifact in the wrong role",
+    )?;
+
+    // Content that does not match the manifest is unauthorized, not merely invalid.
+    let mut foreign = measurements.clone();
+    foreign.guest_image.content_sha256 = "9".repeat(64);
+    require(
+        foreign.validate_content_against_manifest(manifest).is_err(),
+        "artifact receipt matched a manifest it was not measured for",
+    )?;
+
+    let receipt = IsolatedVisualPackagedArtifactReceipt::verified(
+        manifest.helper_signing_requirement_sha256.clone(),
+        measurements.clone(),
+    )?;
+    receipt.validate()?;
+    receipt.validate_against_manifest(manifest)?;
+    require(
+        receipt.measurements() == &measurements,
+        "packaged receipt lost its exact measurements",
+    )?;
+    require(
+        receipt.helper_signing_requirement_sha256() == manifest.helper_signing_requirement_sha256,
+        "packaged receipt lost its signing requirement digest",
+    )?;
+    require(
+        IsolatedVisualPackagedArtifactReceipt::verified(
+            "not-a-digest".into(),
+            measurements.clone(),
+        )
+        .is_err(),
+        "packaged receipt was minted without a signing requirement digest",
+    )?;
+
+    // A receipt measured for one manifest must not satisfy another.
+    let mut other = contract.clone();
+    other.manifest.helper_signing_requirement_sha256 = "8".repeat(64);
+    require(
+        receipt.validate_against_manifest(&other.manifest).is_err(),
+        "packaged receipt satisfied a foreign signing requirement",
+    )?;
+
+    let encoded = serde_json::to_string(&receipt)
+        .map_err(|_| selfcheck_error("packaged receipt is not serializable"))?;
+    for needle in ["/", "\\", "descriptor", "pid", "challenge", "secret"] {
+        require(
+            !encoded.contains(needle),
+            "packaged receipt leaked a path, descriptor, or secret",
+        )?;
+    }
+
+    bind_measurement_entrypoints();
+    Ok(())
+}
+
+/// Binds the artifact measurement entrypoints.
+///
+/// Measuring an artifact needs a real read-only descriptor, and the packaged
+/// variant needs a signed application bundle, so neither belongs inside a
+/// status read. Their addresses are bound here; the unit tests measure real
+/// files, and the packaged supervisor is what discovers a real bundle.
+fn bind_measurement_entrypoints() {
+    let _: fn(
+        &mut std::fs::File,
+        IsolatedVisualArtifactRole,
+    ) -> ComputerResult<IsolatedVisualArtifactMeasurement> = measure_open_isolated_visual_artifact;
+    let _: fn(
+        &mut std::fs::File,
+        &mut std::fs::File,
+        &mut std::fs::File,
+    ) -> ComputerResult<IsolatedVisualArtifactMeasurements> =
+        measure_open_isolated_visual_artifacts;
+    let _: fn(
+        &super::isolated_visual::IsolatedVisualManifest,
+    ) -> ComputerResult<IsolatedVisualPackagedArtifactReceipt> =
+        measure_packaged_isolated_visual_artifacts;
 }
 
 /// A helper failure mid-session poisons input, blocks a later stop, and still
