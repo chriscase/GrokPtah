@@ -238,4 +238,4 @@ export const HELP_SOURCE_BYTE_IDENTITIES = Object.freeze({
   Record<string, HelpSourceByteIdentity>
 >;
 
-export const HELP_SOURCE_BYTE_DIGEST = "sha256:87c5a4c2082880e8e0b6eaf134002d1338c6e7b5a2b4f34ada53c030efabc10d" as const;
+export const HELP_SOURCE_BYTE_DIGEST = "sha256:f288bacec43fbd755c6e3f1375da1a4c1d69a1be3e42a67e261ebb5d6090834d" as const;

@@ -79,8 +79,8 @@ async function buildManifest() {
     canonicalJson(
       Object.values(sources).map(({ sourceId, byteLength, digest }) => ({
         sourceId,
-        byteLength,
-        digest,
+        sourceSectionDigest: digest,
+        sourceByteLength: byteLength,
       })),
     ),
   );
