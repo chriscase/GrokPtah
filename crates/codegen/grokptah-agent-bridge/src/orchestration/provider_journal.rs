@@ -933,6 +933,17 @@ mod tests {
         assert_eq!(recovered.state, ProviderAttemptState::Settled);
         assert_eq!(recovered.outcome, Some(ProviderAttemptOutcome::NotSent));
         assert!(journal.unresolved_for_run("run-a").unwrap().is_empty());
+
+        // Reopen twice at this cut too: the proof is stable, and a second
+        // pass neither re-derives it nor invents uncertainty.
+        let second = journal.reopen().unwrap();
+        assert_eq!(second.settled_not_sent, 0);
+        assert_eq!(second.marked_uncertain, 0);
+        assert_eq!(second.already_uncertain, 0);
+        let again = journal.load("run-a", record.ordinal).unwrap();
+        assert_eq!(again.outcome, Some(ProviderAttemptOutcome::NotSent));
+        assert_eq!(again.updated_at, recovered.updated_at);
+        assert!(journal.unresolved_for_run("run-a").unwrap().is_empty());
     }
 
     /// Every cut past the physical-send boundary is uncertain, and stays
