@@ -79,6 +79,7 @@ members = [
     "crates/common/grokptah-agent-sdk",
     "crates/common/grokptah-help-authority",
     "crates/common/grokptah-help-contract",
+    "crates/common/grokptah-help-runtime",
     "crates/common/xai-grok-compaction",
     "crates/common/xai-interjection-core",
     "crates/common/xai-test-utils",
@@ -283,6 +284,7 @@ xai-acp-lib = { path = "crates/codegen/xai-acp-lib" }
 xai-agent-lifecycle = { path = "crates/codegen/xai-agent-lifecycle" }
 grokptah-help-authority = { path = "crates/common/grokptah-help-authority" }
 grokptah-help-contract = { path = "crates/common/grokptah-help-contract" }
+grokptah-help-runtime = { path = "crates/common/grokptah-help-runtime" }
 xai-circuit-breaker = { path = "crates/common/xai-circuit-breaker" }
 xai-computer-hub-core = { path = "crates/common/xai-computer-hub-core" }
 xai-computer-hub-sdk = { path = "crates/common/xai-computer-hub-sdk" }
