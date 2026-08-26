@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+/// Redacted public authority projection. Not a grant constructor.
+pub mod authority;
 /// Versioned capability discovery types.
 pub mod capability;
 /// Lease- and revision-fenced Computer Use types.
@@ -21,6 +23,11 @@ pub mod run;
 /// Stable contract identifier advertised during MCP initialization.
 pub const CONTRACT_VERSION: &str = "grokptah.capabilities.v1";
 
+pub use authority::{
+    PublicArtifactIdentity, PublicAuthorityProjection, PublicExecutionLifecycle, PublicGrantClass,
+    PublicIdentity, PublicIdentityClass, PublicRevisionSet, PublicSendState,
+    PUBLIC_AUTHORITY_CONTRACT_VERSION, PUBLIC_AUTHORITY_SCHEMA_VERSION,
+};
 pub use capability::{CapabilityAvailability, CapabilityDescriptor, CapabilitySet, CapabilityTier};
 pub use computer::{
     ComputerActionClass, ComputerControlRequest, ComputerControlResponse, ComputerEvent,

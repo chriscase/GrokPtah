@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokptah:schema:authority:v1",
+  "title": "GrokPtah Public Authority Projection v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "schemaVersion",
+    "grantClass",
+    "lifecycle",
+    "sendState",
+    "identities",
+    "attemptGeneration",
+    "leaseGeneration",
+    "workspace",
+    "session",
+    "provider",
+    "model",
+    "revisions",
+    "cancellationRequested",
+    "reconciliationRequired",
+    "promotionReady"
+  ],
+  "properties": {
+    "contract": { "const": "grokptah.authority.public.v1" },
+    "schemaVersion": { "const": 1 },
+    "grantClass": {
+      "enum": [
+        "provider_run",
+        "external_worker_action",
+        "read_only_document",
+        "help_answer"
+      ]
+    },
+    "lifecycle": {
+      "enum": [
+        "requested",
+        "admitted",
+        "queued",
+        "starting",
+        "running",
+        "stopping",
+        "reconciling",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "uncertain",
+        "finalized"
+      ]
+    },
+    "sendState": {
+      "enum": [
+        "known_not_sent",
+        "sending",
+        "uncertain",
+        "sent",
+        "streaming",
+        "completed",
+        "failed"
+      ]
+    },
+    "identities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["class", "value"],
+        "properties": {
+          "class": {
+            "enum": [
+              "request",
+              "work",
+              "run",
+              "attempt",
+              "lease",
+              "provider_request"
+            ]
+          },
+          "value": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._:-]+$"
+          }
+        }
+      }
+    },
+    "attemptGeneration": { "type": "integer", "minimum": 1 },
+    "leaseGeneration": { "type": "integer", "minimum": 1 },
+    "principal": { "type": ["string", "null"], "maxLength": 128 },
+    "tenant": { "type": ["string", "null"], "maxLength": 128 },
+    "project": { "type": ["string", "null"], "maxLength": 128 },
+    "workspace": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "session": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "agent": { "type": ["string", "null"], "maxLength": 128 },
+    "provider": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "model": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "effort": { "type": ["string", "null"], "maxLength": 128 },
+    "heartbeatUnixMs": { "type": ["integer", "null"], "minimum": 0 },
+    "revisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["auth", "policy", "capability", "credential", "source", "route"],
+      "properties": {
+        "auth": { "type": "integer", "minimum": 0 },
+        "policy": { "type": "integer", "minimum": 0 },
+        "capability": { "type": "integer", "minimum": 0 },
+        "credential": { "type": "integer", "minimum": 0 },
+        "source": { "type": "integer", "minimum": 0 },
+        "route": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "resultRevision": { "type": ["string", "null"], "maxLength": 128 },
+    "progress": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
+    "cancellationRequested": { "type": "boolean" },
+    "reconciliationRequired": { "type": "boolean" },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["artifactId", "digestSha256", "byteLen"],
+        "properties": {
+          "artifactId": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "digestSha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+          "byteLen": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "errorCode": { "type": ["string", "null"], "maxLength": 128 },
+    "reasonCode": { "type": ["string", "null"], "maxLength": 128 },
+    "promotionReady": { "type": "boolean" }
+  }
+}
