@@ -83,7 +83,11 @@ function runJson(command, args, options = {}) {
     child.on("error", reject);
     child.on("close", (code) => {
       if (code !== 0) {
-        reject(new Error(`${command} ${args.join(" ")} exited ${code}:\n${stderr}`));
+        reject(
+          new Error(
+            `${command} ${args.join(" ")} exited ${code}:\n${stdout}\n${stderr}`,
+          ),
+        );
       } else {
         try {
           resolveRun(JSON.parse(stdout));
