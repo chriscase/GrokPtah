@@ -28,6 +28,9 @@ dirs = "6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 bytes = "1"
 sha2 = "0.10"
+hmac = "0.12"
+zeroize = { version = "1.8", features = ["derive"] }
+getrandom = "0.2"
 grokptah-agent-sdk = { path = "../../common/grokptah-agent-sdk" }
 
 keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native"] }
