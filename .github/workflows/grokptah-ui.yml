@@ -22,6 +22,8 @@ jobs:
     name: React ${{ matrix.react-host }} consumer
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      EXACT_CANDIDATE: ${{ github.event_name == 'pull_request' && github.event.pull_request.number == 420 && github.event.pull_request.base.sha == '8ad3be07eb27087acb67704fdf463ecb95b64505' }}
     strategy:
       fail-fast: false
       matrix:
@@ -40,13 +42,14 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "20.19.0"
+          node-version: "22.12.0"
           cache: npm
           cache-dependency-path: |
             desktop/package-lock.json
             packages/grokptah-ui/package-lock.json
 
       - name: Fetch audited parent
+        if: env.EXACT_CANDIDATE == 'true'
         run: git fetch --no-tags origin codex/external-worker-hardening-v1
 
       - name: Install desktop dependencies
@@ -82,15 +85,28 @@ jobs:
         run: npm run pack:dry-run
 
       - name: Verify exact candidate
+        if: env.EXACT_CANDIDATE == 'true'
         working-directory: packages/grokptah-ui
         run: npm run verify -- --exact-candidate
+
+      - name: Verify ordinary candidate
+        if: env.EXACT_CANDIDATE != 'true'
+        working-directory: packages/grokptah-ui
+        run: npm run verify
 
       - name: Run selected consumer smoke
         working-directory: packages/grokptah-ui
         run: npm run smoke:contextdesk -- --react-host=${{ matrix.react-host }}
 
       - name: Check committed diff
+        if: env.EXACT_CANDIDATE == 'true'
         run: git diff --check 8ad3be07eb27087acb67704fdf463ecb95b64505...HEAD
+
+      - name: Check event-base diff
+        if: env.EXACT_CANDIDATE != 'true'
+        env:
+          EVENT_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: git diff --check "${EVENT_BASE}...HEAD"
 
       - name: Check clean tree
         run: test -z "$(git status --porcelain --untracked-files=all)"

@@ -188,6 +188,27 @@ try {
     { cwd: consumerRoot },
   );
 
+  const listedPeerPaths = run(
+    npm,
+    ["ls", "react", "react-dom", "--parseable", "--all", "--silent", "--prefix", consumerRoot],
+    { cwd: consumerRoot },
+  )
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((path) => resolve(path));
+  const expectedPeerPaths = [
+    resolve(consumerRoot, "node_modules/react"),
+    resolve(consumerRoot, "node_modules/react-dom"),
+  ];
+  if (
+    listedPeerPaths.length !== expectedPeerPaths.length ||
+    expectedPeerPaths.some((path) => !listedPeerPaths.includes(path))
+  ) {
+    throw new Error(
+      `${reactHost} host npm ls must list only root React peers: ${listedPeerPaths.join(", ")}`,
+    );
+  }
+
   async function installedPackagePaths(nodeModulesRoot, packageName) {
     const packageParts = packageName.split("/");
     const installations = [];
@@ -253,8 +274,14 @@ const positive = {
 if (parseBrokerRunProjection(positive)?.state !== "running") {
   throw new Error("positive parser fixture failed");
 }
+if (parseBrokerRunProjection({
+  ...positive,
+  promptPreview: "read /private/secret; Authorization: Bearer credential",
+}) !== null) {
+  throw new Error("privacy parser fixture did not fail closed");
+}
 if (parseBrokerRunProjection({ ...positive, privileged: "hidden" }) !== null) {
-  throw new Error("privileged parser fixture did not fail closed");
+  throw new Error("unknown-key parser fixture did not fail closed");
 }
 if (parseBrokerRunProjection({
   ...positive,
@@ -428,6 +455,31 @@ createRoot(root).render(createElement(RunStatusCard, {
   ]) {
     if (!moduleIds.some((moduleId) => moduleId.endsWith(requiredModuleId))) {
       throw new Error(`Rollup graph did not record ${requiredModuleId}`);
+    }
+  }
+  const expectedRollupPeerRoots = new Map([
+    [
+      "react",
+      resolve(consumerRoot, "node_modules/react").replaceAll("\\", "/"),
+    ],
+    [
+      "react-dom",
+      resolve(consumerRoot, "node_modules/react-dom").replaceAll("\\", "/"),
+    ],
+  ]);
+  for (const [packageName, expectedRoot] of expectedRollupPeerRoots) {
+    const peerModuleIds = moduleIds.filter((moduleId) =>
+      new RegExp(`/node_modules/${packageName}(?:/|$)`).test(moduleId),
+    );
+    if (
+      peerModuleIds.length === 0 ||
+      peerModuleIds.some(
+        (moduleId) => !moduleId.startsWith(`${expectedRoot}/`),
+      )
+    ) {
+      throw new Error(
+        `Rollup graph resolved ${packageName} outside its expected root: ${peerModuleIds.join(", ")}`,
+      );
     }
   }
   const forbiddenModuleMarkers = [

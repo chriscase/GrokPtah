@@ -124,7 +124,7 @@ function verifyExactCandidate() {
     expectedPaths.some((path) => !actualPaths.includes(path))
   ) {
     fail(
-      `exact candidate diff must be fourteen additions; got ${records
+      `exact candidate diff must be fifteen additions (fourteen package paths plus workflow); got ${records
         .map(({ status: statusToken, path }) => `${statusToken} ${path}`)
         .join(", ")}`,
     );
