@@ -49,9 +49,12 @@ const requiredExports = [
   "parseExternalWorkerLaunchResult",
   "parseExternalWorkerNotification",
   "applyExternalWorkerNotification",
-  "searchHelp",
-  "searchHelpArticles",
-  "HELP_ARTICLES",
+  "HELP_PUBLIC_CORPUS",
+  "HELP_PUBLIC_CORPUS_DIGEST",
+  "searchHelpCorpus",
+  "verifyHelpCorpus",
+  "verifyHelpProjection",
+  "assertPublicOnly",
   "promptQueueReducer",
   "applyAssistantStreamChunk",
 ];
@@ -60,8 +63,8 @@ if (missing.length > 0) {
   throw new Error(`public bundle is missing required exports: ${missing.join(", ")}`);
 }
 for (const name of [
-  "HELP_ARTICLES",
-  "searchHelpArticles",
+  "HELP_PUBLIC_CORPUS",
+  "searchHelpCorpus",
   "promptQueueReducer",
   "applyAssistantStreamChunk",
   "EXTERNAL_WORKER_CONTRACT",
@@ -74,23 +77,91 @@ for (const name of [
 if ("GrokPtahBrokerClient" in uiCoreApi) {
   throw new Error("ui-core bundle must not expose the browser broker client");
 }
-if (!Object.isFrozen(publicApi.HELP_ARTICLES) || !Object.isFrozen(uiCoreApi.HELP_ARTICLES)) {
-  throw new Error("published Help corpus must be immutable");
-}
-if (!Object.isFrozen(publicApi.HELP_ENTRIES) || !Object.isFrozen(uiCoreApi.HELP_ENTRIES)) {
-  throw new Error("published capability-aware Help corpus must be immutable");
+// Semantic Help must ship its offline half and nothing else. These names are
+// the authority constructors, the executor, and the transport: a bundle that
+// exports any of them lets a consumer decide, in code it controls, what it is
+// allowed to see, or point GrokPtah's contract at an endpoint of its choosing.
+const forbiddenHelpExports = [
+  "issueGrant",
+  "authorizeHelpDecision",
+  "authorizeHelpDecisionJson",
+  "parseHelpDecisionRequest",
+  "buildHelpManifest",
+  "createHelpGrant",
+  "createHelpAdmission",
+  "createHelpExecutor",
+  "HelpExecutor",
+  "runHelpTask",
+  "helpAsk",
+  "helpFollow",
+  "helpCancel",
+  "helpBounds",
+  "helpSession",
+  "helpVisibleCorpus",
+  "requestHelpAnswer",
+  "HelpAnswerTransport",
+  "selectHelpRoute",
+  "invoke",
+];
+for (const [label, api] of [["public", publicApi], ["ui-core", uiCoreApi]]) {
+  const exported = forbiddenHelpExports.filter((name) => name in api);
+  if (exported.length > 0) {
+    throw new Error(
+      `${label} bundle exports Help authority or transport: ${exported.join(", ")}`,
+    );
+  }
 }
 
-const helpHits = publicApi.searchHelp("restricted gateway", {
-  audience: "operator",
-  includeRestricted: true,
-});
-if (!helpHits.some(({ entry }) => entry.id === "enterprise-gateway-review")) {
-  throw new Error("public Help Center search did not return the enterprise gateway entry");
+// The published corpus must be public-only, and must not merely hide the rest
+// behind a filtered index: a bundle that carries restricted text has leaked it.
+publicApi.assertPublicOnly(publicApi.HELP_PUBLIC_CORPUS);
+publicApi.verifyHelpCorpus(publicApi.HELP_PUBLIC_CORPUS);
+for (const record of [
+  ...publicApi.HELP_PUBLIC_CORPUS.sources,
+  ...publicApi.HELP_PUBLIC_CORPUS.articles,
+  ...publicApi.HELP_PUBLIC_CORPUS.chunks,
+]) {
+  if (record.visibility !== "public") {
+    throw new Error(`published Help bundle carries a non-public record: ${record.id}`);
+  }
 }
-const articleHits = publicApi.searchHelpArticles("restricted company gateway");
-if (articleHits[0]?.article?.id !== "providers.restricted-gateway-review") {
-  throw new Error("public source-cited Help Center search did not rank the restricted gateway article");
+
+// The restricted text must be absent from the emitted bytes, not merely
+// unexported. This is the check that matters: an earlier version of the public
+// surface imported its verifier from a module that loaded the full corpus at
+// the top level, so all 27 restricted chunks were bundled while every
+// export-level assertion still passed. An export list does not describe what a
+// bundler emits.
+const privateCorpus = JSON.parse(
+  await readFile(new URL("../src/lib/help/canonical/help-corpus.v1.json", import.meta.url), "utf8"),
+);
+const restricted = [
+  ...privateCorpus.chunks.filter((chunk) => chunk.visibility !== "public"),
+  ...privateCorpus.articles.filter((article) => article.visibility !== "public"),
+];
+if (restricted.length === 0) {
+  throw new Error("the corpus has no restricted records, so this check proves nothing");
+}
+for (const [label, text] of [["public", bundle], ["ui-core", uiCoreBundle]]) {
+  const leaked = restricted
+    .filter((record) => text.includes((record.text ?? record.summary).slice(0, 48)))
+    .map((record) => record.id);
+  if (leaked.length > 0) {
+    throw new Error(
+      `${label} bundle carries ${leaked.length} restricted Help record(s): ${leaked
+        .slice(0, 5)
+        .join(", ")}`,
+    );
+  }
+}
+
+const helpOutcome = publicApi.searchHelpCorpus("recover an interrupted run");
+if (helpOutcome.kind !== "results" || helpOutcome.results[0]?.articleId !== "operations.durable-recovery") {
+  throw new Error("public Help retrieval did not rank the durable recovery article");
+}
+// Abstention is part of the shipped behaviour, not an accident of ranking.
+if (publicApi.searchHelpCorpus("what is the capital of Portugal").kind !== "abstained") {
+  throw new Error("public Help retrieval answered a question the corpus cannot answer");
 }
 const streamResult = publicApi.applyAssistantStreamChunk("", "consumer");
 if (streamResult.kind !== "replace" || streamResult.text !== "consumer") {

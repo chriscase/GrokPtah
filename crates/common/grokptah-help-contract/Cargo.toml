@@ -1,0 +1,18 @@
+[package]
+name = "grokptah-help-contract"
+description = "Rust-owned Semantic Help authority, request, result, and receipt contracts and their generated artifacts"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "help-codegen"
+path = "src/bin/help-codegen.rs"

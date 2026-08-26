@@ -1,26 +1,48 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+/**
+ * The Help Center: one surface over one corpus.
+ *
+ * This replaces two surfaces that answered the same questions from two
+ * separately edited corpora — `HelpPanel` over `grokptah.help.v1` and the old
+ * `HelpCenter` over `product-corpus-v1`. Two corpora meant two answers to the
+ * same question and no way to tell which was current.
+ *
+ * # Offline first, and offline is the product
+ *
+ * Search runs in this process against corpus bytes the app already has. It is
+ * not a degraded mode for when a provider is unreachable — it is what the Help
+ * Center does. Asking the host for a written answer is a separate, explicit
+ * action, and the host may abstain; the search results stay on screen either
+ * way, so the reader is never left with nothing because a model declined.
+ *
+ * # It cannot open a chat
+ *
+ * The previous version answered questions by minting a generic chat session
+ * and prompting it. That put Help's content on the ordinary Chat path, with
+ * its history, its tools, and its workspace — none of which Help needs and all
+ * of which it then had to be trusted not to use. There is no session call in
+ * this file. `lib/help/host.ts` is the only way out, and it can send three
+ * things: a question, a locale, and handles the host issued.
+ */
+
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+
+import type { HelpCorpus, HelpProjection, HelpTopic } from "../lib/help/generated/contract";
+import { HELP_PUBLIC_CORPUS } from "../lib/help/canonical/corpus";
+import { findArticleIn, findSourceIn } from "../lib/help/canonical/corpus";
+import { verifyHelpCorpus } from "../lib/help/canonical/verify";
 import {
-  buildHelpAssistantRequest,
-  buildHelpSemanticRequest,
-  HELP_ARTICLES,
-  searchHelp,
-  validateHelpAssistantAnswer,
-  validateHelpSemanticAnswer,
-  type HelpAssistantAnswer,
-  type HelpAssistantRequest,
-  type HelpSemanticAnswer,
-  type HelpSemanticRequest,
-  type HelpTopic,
-} from "../lib/helpCenter";
+  HELP_RETRIEVAL_DEFAULT_LIMIT,
+  searchHelpCorpus,
+  type HelpRetrievalOutcome,
+} from "../lib/help/retrieval/hybrid";
+import { helpAsk, helpCancel, helpFollow, helpVisibleCorpus } from "../lib/help/host";
+import { verifyHelpProjection } from "../lib/help/verify";
 
 export type HelpCenterProps = {
   open: boolean;
   onClose: () => void;
-  /** Optional provider adapter; the UI still requires confirmation before it is called. */
-  onAskAssistant?: (request: HelpAssistantRequest) => Promise<HelpAssistantAnswer>;
-  /** Optional meaning-based ranking adapter; the UI requires confirmation before it is called. */
-  onSearchSemantic?: (request: HelpSemanticRequest) => Promise<HelpSemanticAnswer>;
-  assistantProviderLabel?: string;
+  /** Opaque session token the host issued. */
+  sessionToken: string;
 };
 
 const TOPICS: Array<{ value: HelpTopic | "all"; label: string }> = [
@@ -31,530 +53,384 @@ const TOPICS: Array<{ value: HelpTopic | "all"; label: string }> = [
   { value: "operations", label: "Operations" },
 ];
 
-type AssistantState =
-  | { status: "idle" }
-  | { status: "confirm"; request: HelpAssistantRequest }
-  | { status: "loading" }
-  | { status: "answer"; answer: HelpAssistantAnswer }
-  | { status: "error"; message: string };
-
-type SemanticState =
-  | { status: "idle" }
-  | { status: "confirm"; request: HelpSemanticRequest }
-  | { status: "loading" }
-  | { status: "results"; results: ReturnType<typeof searchHelp>; uncertainty: string }
-  | { status: "error"; message: string };
-
-type ConfirmKind = "semantic" | "assistant";
-
 const FOCUSABLE_SELECTOR =
   'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
 
 function focusableIn(root: HTMLElement | null): HTMLElement[] {
   if (!root) return [];
   return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-    (element) => !element.closest("[inert]"),
+    (element) => element.offsetParent !== null || element === document.activeElement,
   );
 }
 
-export function HelpCenter({
-  open,
-  onClose,
-  onAskAssistant,
-  onSearchSemantic,
-  assistantProviderLabel,
-}: HelpCenterProps) {
+/** What the host is doing about a written answer, as this surface knows it. */
+type AnswerState =
+  | { status: "idle" }
+  | { status: "asking"; handle: string | null }
+  | { status: "answered"; projection: HelpProjection }
+  | { status: "abstained" }
+  | { status: "unavailable"; message: string };
+
+export function HelpCenter({ open, onClose, sessionToken }: HelpCenterProps) {
   const [query, setQuery] = useState("");
   const [topic, setTopic] = useState<HelpTopic | "all">("all");
-  const [selectedId, setSelectedId] = useState(HELP_ARTICLES[0]?.id ?? "");
-  const [assistant, setAssistant] = useState<AssistantState>({ status: "idle" });
-  const [semantic, setSemantic] = useState<SemanticState>({ status: "idle" });
-  const [confirmStack, setConfirmStack] = useState<ConfirmKind[]>([]);
+  /**
+   * The corpus in hand.
+   *
+   * Starts as the public set this bundle ships, so search works before any
+   * host round-trip and works at all if the host is unreachable. The host then
+   * returns the corpus this principal is entitled to, which may be larger. The
+   * renderer never filters: what it holds is what it may see, so a modified
+   * renderer has nothing extra to reveal.
+   */
+  const [corpus, setCorpus] = useState<HelpCorpus>(HELP_PUBLIC_CORPUS);
+  const [selectedId, setSelectedId] = useState<string>(
+    HELP_PUBLIC_CORPUS.articles[0]?.id ?? "",
+  );
+  const [answer, setAnswer] = useState<AnswerState>({ status: "idle" });
+
   const dialogRef = useRef<HTMLDivElement>(null);
-  const surfaceRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
-  const confirmDialogRef = useRef<HTMLDivElement>(null);
-  const onCloseRef = useRef(onClose);
-  const topConfirmRef = useRef<ConfirmKind | null>(null);
-  const prevTopConfirmRef = useRef<ConfirmKind | null>(null);
-  const layerReturnFocusRef = useRef<Partial<Record<ConfirmKind, HTMLElement | null>>>({});
+  const pollRef = useRef<number | null>(null);
 
-  onCloseRef.current = onClose;
+  const titleId = useId();
+  const statusId = useId();
+  const resultsId = useId();
 
-  const lexicalResults = useMemo(() => {
-    if (!query.trim()) {
-      return HELP_ARTICLES.filter(
-        (article) => topic === "all" || article.topic === topic,
-      ).map((article) => ({
-        article,
-        score: 0,
-        confidence: 0,
-        matchedTerms: [],
-        retrievalMode: "offline-lexical" as const,
-      }));
+  // Retrieval is synchronous and local, so results are just derived state.
+  const outcome: HelpRetrievalOutcome = useMemo(
+    () => searchHelpCorpus(query, { topic, limit: HELP_RETRIEVAL_DEFAULT_LIMIT, corpus }),
+    [query, topic, corpus],
+  );
+
+  const results = outcome.kind === "results" ? outcome.results : [];
+
+  const browseArticles = useMemo(
+    () => corpus.articles.filter((article) => topic === "all" || article.topic === topic),
+    [topic, corpus],
+  );
+
+  const visibleArticles = query.trim()
+    ? results
+        .map((result) => findArticleIn(corpus, result.articleId))
+        .filter((article) => article !== undefined)
+    : browseArticles;
+
+  const selected = findArticleIn(corpus, selectedId) ?? visibleArticles[0];
+
+  // Keep the selection inside what is on screen, so the detail pane never
+  // shows an article the list no longer offers.
+  useEffect(() => {
+    if (!visibleArticles.some((article) => article.id === selectedId)) {
+      setSelectedId(visibleArticles[0]?.id ?? "");
     }
-    return searchHelp(query, topic);
-  }, [query, topic]);
+  }, [visibleArticles, selectedId]);
 
-  const results = semantic.status === "results" ? semantic.results : lexicalResults;
-  const retrievalMode = semantic.status === "results"
-    ? "provider-semantic"
-    : "offline-lexical";
-
-  const selectedResult =
-    results.find((result) => result.article.id === selectedId) ??
-    results[0] ??
-    null;
-  const selected = selectedResult?.article ?? null;
-
-  const topConfirm = (() => {
-    for (let index = confirmStack.length - 1; index >= 0; index -= 1) {
-      const kind = confirmStack[index];
-      if (kind === "assistant" && assistant.status === "confirm") return "assistant";
-      if (kind === "semantic" && semantic.status === "confirm") return "semantic";
+  const stopPolling = useCallback(() => {
+    if (pollRef.current !== null) {
+      window.clearTimeout(pollRef.current);
+      pollRef.current = null;
     }
-    return null;
-  })();
-  topConfirmRef.current = topConfirm;
+  }, []);
 
-  const dismissConfirm = (kind: ConfirmKind) => {
-    if (kind === "assistant") setAssistant({ status: "idle" });
-    else setSemantic({ status: "idle" });
-    setConfirmStack((stack) => stack.filter((entry) => entry !== kind));
-  };
+  const applyProjection = useCallback(
+    (projection: HelpProjection) => {
+    // The host already validated. Re-checking here can only remove claims,
+    // never add one, and it catches a projection altered in transit. It runs
+    // against the corpus the host said this principal may see, not against the
+    // public floor: checking an entitled reader's answer against the public
+    // set would drop every citation into gated content and read as the host
+    // having lied.
+    const { projection: verified } = verifyHelpProjection(projection, corpus);
+    switch (verified.status) {
+      case "answered":
+        setAnswer({ status: "answered", projection: verified });
+        return true;
+      case "abstained":
+        setAnswer({ status: "abstained" });
+        return true;
+      case "unavailable":
+        setAnswer({
+          status: "unavailable",
+          message: verified.message ?? "Help cannot answer that right now.",
+        });
+        return true;
+      default:
+        setAnswer({ status: "asking", handle: verified.handle });
+        return false;
+    }
+    },
+    [corpus],
+  );
 
-  const pushConfirm = (kind: ConfirmKind, opener: HTMLElement | null) => {
-    layerReturnFocusRef.current[kind] = opener;
-    setConfirmStack((stack) => [...stack.filter((entry) => entry !== kind), kind]);
-  };
+  const poll = useCallback(
+    (handle: string) => {
+      stopPolling();
+      pollRef.current = window.setTimeout(() => {
+        void helpFollow({ session: sessionToken, handle })
+          .then((projection) => {
+            if (!applyProjection(projection)) poll(handle);
+          })
+          .catch(() => {
+            setAnswer({
+              status: "unavailable",
+              message: "Help cannot answer that right now.",
+            });
+          });
+      }, 250);
+    },
+    [applyProjection, sessionToken, stopPolling],
+  );
+
+  const askForAnswer = useCallback(() => {
+    const question = query.trim();
+    if (!question) return;
+    setAnswer({ status: "asking", handle: null });
+    void helpAsk({ session: sessionToken, question, locale: null })
+      .then((projection) => {
+        if (!applyProjection(projection) && projection.handle) poll(projection.handle);
+      })
+      .catch(() => {
+        setAnswer({ status: "unavailable", message: "Help cannot answer that right now." });
+      });
+  }, [applyProjection, poll, query, sessionToken]);
+
+  const cancelAnswer = useCallback(() => {
+    stopPolling();
+    const handle = answer.status === "asking" ? answer.handle : null;
+    if (!handle) {
+      setAnswer({ status: "idle" });
+      return;
+    }
+    void helpCancel({ session: sessionToken, handle })
+      .then(applyProjection)
+      .catch(() => setAnswer({ status: "idle" }));
+  }, [answer, applyProjection, sessionToken, stopPolling]);
+
+  useEffect(() => stopPolling, [stopPolling]);
+
+  // Reset the answer when the question changes: an answer to a previous
+  // question shown beside a new one is a claim about the wrong thing.
+  useEffect(() => {
+    stopPolling();
+    setAnswer({ status: "idle" });
+  }, [query, stopPolling]);
+
+  // Ask the host what this principal may see. Verified before adoption: a
+  // corpus that does not match its own digests is not adopted at all, and the
+  // public floor stays in place rather than being replaced by something
+  // unverifiable.
+  useEffect(() => {
+    if (!open || !sessionToken) return;
+    let cancelled = false;
+    void helpVisibleCorpus(sessionToken)
+      .then((visible) => {
+        if (cancelled || !visible || visible.articles.length === 0) return;
+        verifyHelpCorpus(visible);
+        setCorpus(visible);
+      })
+      .catch(() => {
+        // Offline search over the public set is the floor, not a failure.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, sessionToken]);
+
+  // Focus management: remember the opener, move focus in, restore on close.
+  useEffect(() => {
+    if (!open) return undefined;
+    returnFocusRef.current = document.activeElement as HTMLElement | null;
+    const timer = window.setTimeout(() => searchRef.current?.focus(), 0);
+    return () => {
+      window.clearTimeout(timer);
+      returnFocusRef.current?.focus?.();
+    };
+  }, [open]);
 
   useEffect(() => {
-    if (!open) return;
-    returnFocusRef.current = document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-    prevTopConfirmRef.current = null;
-    layerReturnFocusRef.current = {};
-    const focusTarget = dialogRef.current?.querySelector<HTMLElement>("#help-search-input");
-    focusTarget?.focus();
-    const onKey = (event: KeyboardEvent) => {
+    if (!open) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        const top = topConfirmRef.current;
-        if (top === "assistant") {
-          setAssistant({ status: "idle" });
-          setConfirmStack((stack) => stack.filter((kind) => kind !== "assistant"));
-        } else if (top === "semantic") {
-          setSemantic({ status: "idle" });
-          setConfirmStack((stack) => stack.filter((kind) => kind !== "semantic"));
-        } else {
-          onCloseRef.current();
-        }
+        onClose();
         return;
       }
       if (event.key !== "Tab") return;
-
-      const trapRoot = topConfirmRef.current ? confirmDialogRef.current : dialogRef.current;
-      const focusable = focusableIn(trapRoot);
+      const focusable = focusableIn(dialogRef.current);
       if (focusable.length === 0) return;
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
+      const active = document.activeElement as HTMLElement | null;
+      if (event.shiftKey && (active === first || !dialogRef.current?.contains(active))) {
         event.preventDefault();
         last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
+      } else if (!event.shiftKey && active === last) {
         event.preventDefault();
         first.focus();
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      returnFocusRef.current?.focus();
-      returnFocusRef.current = null;
-    };
-  }, [open]);
-
-  useLayoutEffect(() => {
-    if (!open) {
-      prevTopConfirmRef.current = null;
-      return;
-    }
-    const previous = prevTopConfirmRef.current;
-    prevTopConfirmRef.current = topConfirm;
-    if (topConfirm) {
-      const focusTarget = confirmDialogRef.current?.querySelector<HTMLElement>(
-        "button.primary, button:not([disabled])",
-      );
-      focusTarget?.focus();
-      return;
-    }
-    if (previous) {
-      layerReturnFocusRef.current[previous]?.focus();
-    }
-  }, [open, topConfirm]);
-
-  useEffect(() => {
-    if (!open || !dialogRef.current) return;
-    const shell = dialogRef.current.parentElement;
-    if (!shell) return;
-    const siblings = Array.from(shell.children).filter(
-      (child): child is HTMLElement =>
-        child !== dialogRef.current &&
-        child instanceof HTMLElement &&
-        child.dataset.modalLayer !== "consent",
-    );
-    const previous = siblings.map((element) => ({
-      element,
-      ariaHidden: element.getAttribute("aria-hidden"),
-      inert: element.hasAttribute("inert"),
-    }));
-    siblings.forEach((element) => {
-      element.setAttribute("inert", "");
-      element.setAttribute("aria-hidden", "true");
-    });
-    return () => {
-      previous.forEach(({ element, ariaHidden, inert }) => {
-        if (inert) element.setAttribute("inert", "");
-        else element.removeAttribute("inert");
-        if (ariaHidden === null) element.removeAttribute("aria-hidden");
-        else element.setAttribute("aria-hidden", ariaHidden);
-      });
-    };
-  }, [open]);
-
-  useEffect(() => {
-    if (selected && !results.some((result) => result.article.id === selectedId)) {
-      setSelectedId(selected.id);
-    }
-  }, [results, selected, selectedId]);
-
-  useEffect(() => {
-    setAssistant({ status: "idle" });
-    setConfirmStack((stack) => stack.filter((kind) => kind !== "assistant"));
-  }, [selectedId, query]);
-
-  useEffect(() => {
-    setSemantic({ status: "idle" });
-    setConfirmStack((stack) => stack.filter((kind) => kind !== "semantic"));
-  }, [query, topic]);
-
-  const beginAssistantRequest = (opener: HTMLElement | null = null) => {
-    if (!selected || !onAskAssistant) return;
-    pushConfirm(
-      "assistant",
-      opener ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null),
-    );
-    setAssistant({
-      status: "confirm",
-      request: buildHelpAssistantRequest(selected, query || selected.title, retrievalMode),
-    });
-  };
-
-  const confirmAssistantRequest = async () => {
-    if (assistant.status !== "confirm" || !onAskAssistant) return;
-    setConfirmStack((stack) => stack.filter((kind) => kind !== "assistant"));
-    setAssistant({ status: "loading" });
-    try {
-      const answer = await onAskAssistant(assistant.request);
-      const validation = validateHelpAssistantAnswer(
-        answer,
-        assistant.request.sources.map((source) => source.id),
-      );
-      if (!validation.accepted) {
-        setAssistant({ status: "error", message: `Assistant answer rejected: ${validation.reason}.` });
-        return;
-      }
-      setAssistant({ status: "answer", answer });
-    } catch {
-      setAssistant({ status: "error", message: "Assistant unavailable; cited offline guidance remains authoritative." });
-    }
-  };
-
-  const beginSemanticRequest = (opener: HTMLElement | null = null) => {
-    const trimmed = query.trim();
-    if (!trimmed || !onSearchSemantic) return;
-    pushConfirm(
-      "semantic",
-      opener ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null),
-    );
-    setSemantic({
-      status: "confirm",
-      request: buildHelpSemanticRequest(
-        trimmed,
-        HELP_ARTICLES.filter((article) => topic === "all" || article.topic === topic),
-      ),
-    });
-  };
-
-  const confirmSemanticRequest = async () => {
-    if (semantic.status !== "confirm" || !onSearchSemantic) return;
-    setConfirmStack((stack) => stack.filter((kind) => kind !== "semantic"));
-    setSemantic({ status: "loading" });
-    try {
-      const answer = await onSearchSemantic(semantic.request);
-      const validation = validateHelpSemanticAnswer(
-        answer,
-        semantic.request.candidates.map((candidate) => candidate.articleId),
-      );
-      if (!validation.accepted) {
-        setSemantic({ status: "error", message: `Semantic ranking rejected: ${validation.reason}.` });
-        return;
-      }
-      const byId = new Map(HELP_ARTICLES.map((article) => [article.id, article]));
-      const ranked = answer.results
-        .slice()
-        .sort((a, b) => b.score - a.score)
-        .map((result) => {
-          const article = byId.get(result.articleId);
-          if (!article) return null;
-          return {
-            article,
-            score: result.score,
-            confidence: result.score,
-            matchedTerms: [],
-            retrievalMode: "provider-semantic" as const,
-          };
-        })
-        .filter((result): result is NonNullable<typeof result> => result !== null);
-      setSemantic({ status: "results", results: ranked, uncertainty: answer.uncertainty });
-    } catch {
-      setSemantic({ status: "error", message: "Semantic search unavailable; offline lexical guidance remains available." });
-    }
-  };
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => document.removeEventListener("keydown", onKeyDown, true);
+  }, [open, onClose]);
 
   if (!open) return null;
 
-  return (
-    <div
-      ref={dialogRef}
-      className="help-center"
-      data-modal-layer="help"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="help-center-title"
-      aria-describedby="help-center-subtitle"
-    >
-      <div
-        className="help-surface"
-        ref={surfaceRef}
-        aria-hidden={topConfirm ? true : undefined}
-        {...(topConfirm ? { inert: "" } : {})}
-      >
-      <header className="help-header">
-        <div>
-          <p className="help-eyebrow">GrokPtah guidance</p>
-          <h2 id="help-center-title">Help Center</h2>
-          <p className="help-subtitle" id="help-center-subtitle">
-            Search trustworthy product guidance without sending data to a model.
-          </p>
-        </div>
-        <button type="button" onClick={onClose} aria-label="Close Help Center">
-          Close <span aria-hidden>Esc</span>
-        </button>
-      </header>
+  const statusMessage = (() => {
+    if (query.trim() && outcome.kind === "abstained") {
+      return "No Help article matches that closely enough to show. Try different words, or browse by topic.";
+    }
+    if (query.trim()) {
+      return `${results.length} Help ${results.length === 1 ? "article" : "articles"} match.`;
+    }
+    return `Browsing ${browseArticles.length} Help ${browseArticles.length === 1 ? "article" : "articles"}.`;
+  })();
 
-      <div className="help-layout">
-        <aside className="help-nav" aria-label="Help articles">
-          <form
-            className="help-search"
-            onSubmit={(event) => event.preventDefault()}
-          >
-            <label htmlFor="help-search-input">Search help</label>
-            <input
-              id="help-search-input"
-              aria-label="Search help"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Try “quota”, “stale frame”, or “find a build”"
-            />
-          </form>
-          <label className="help-topic-label" htmlFor="help-topic-filter">
-            Topic
-          </label>
+  return (
+    <div className="modal-backdrop help-center-backdrop" onClick={onClose}>
+      <div
+        className="modal help-center"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        ref={dialogRef}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <header className="help-center-header">
+          <h2 id={titleId}>Help Center</h2>
+          <button type="button" onClick={onClose} aria-label="Close Help Center">
+            Close
+          </button>
+        </header>
+
+        <div className="help-center-search">
+          <label htmlFor="help-search-input">Search Help</label>
+          <input
+            id="help-search-input"
+            ref={searchRef}
+            type="search"
+            value={query}
+            placeholder="How do I recover an interrupted run?"
+            aria-describedby={statusId}
+            aria-controls={resultsId}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+          <label htmlFor="help-topic-select">Topic</label>
           <select
-            id="help-topic-filter"
-            className="help-topic"
-            aria-label="Topic"
+            id="help-topic-select"
             value={topic}
             onChange={(event) => setTopic(event.target.value as HelpTopic | "all")}
           >
-            {TOPICS.map((item) => (
-              <option value={item.value} key={item.value}>
-                {item.label}
+            {TOPICS.map((entry) => (
+              <option key={entry.value} value={entry.value}>
+                {entry.label}
               </option>
             ))}
           </select>
+        </div>
 
-          <p className="help-result-count" aria-live="polite">
-            {results.length} {results.length === 1 ? "article" : "articles"}
-          </p>
-          <p className="help-retrieval-mode" aria-label="Help retrieval mode">
-            {retrievalMode === "provider-semantic"
-              ? "Provider semantic ranking · corpus IDs preserved"
-              : "Offline lexical index · citations preserved"}
-          </p>
-            {onSearchSemantic && (semantic.status === "idle" || semantic.status === "confirm") && (
+        <p className="help-center-offline-note">
+          Search runs on this device against the Help content shipped with the app. Nothing
+          leaves your computer unless you ask for a written answer.
+        </p>
+
+        <p id={statusId} role="status" aria-live="polite" className="help-center-status">
+          {statusMessage}
+        </p>
+
+        <div className="help-center-body">
+          <nav aria-label="Help articles" className="help-center-list">
+            <ul id={resultsId}>
+              {visibleArticles.map((article) => (
+                <li key={article.id}>
+                  <button
+                    type="button"
+                    aria-current={article.id === selected?.id ? "true" : undefined}
+                    onClick={() => setSelectedId(article.id)}
+                  >
+                    <span className="help-article-title">{article.title}</span>
+                    <span className="help-article-summary">{article.summary}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+            {visibleArticles.length === 0 && (
+              <p className="help-center-empty">Nothing to show for this search.</p>
+            )}
+          </nav>
+
+          <article className="help-center-detail" aria-label="Help article">
+            {selected ? (
+              <>
+                <h3>{selected.title}</h3>
+                <p className="help-article-summary">{selected.summary}</p>
+                <p>{selected.body}</p>
+                <h4>Sources</h4>
+                <ul className="help-article-sources">
+                  {selected.source_ids.map((sourceId) => {
+                    const source = findSourceIn(corpus, sourceId);
+                    if (!source) return null;
+                    return (
+                      <li key={sourceId}>
+                        <code>{source.path}</code> — {source.heading}
+                      </li>
+                    );
+                  })}
+                </ul>
+              </>
+            ) : (
+              <p>Select an article to read it.</p>
+            )}
+          </article>
+        </div>
+
+        <section className="help-center-answer" aria-label="Written answer">
+          <div className="help-center-answer-controls">
             <button
               type="button"
-              className="help-semantic-search"
-              onClick={(event) => beginSemanticRequest(event.currentTarget)}
-              disabled={!query.trim()}
+              onClick={askForAnswer}
+              disabled={!query.trim() || answer.status === "asking"}
             >
-              Prepare meaning search
+              Ask for a written answer
             </button>
-          )}
-          {semantic.status === "loading" && <p className="help-retrieval-status" role="status">Ranking help by meaning…</p>}
-          {semantic.status === "error" && <p className="help-retrieval-status" role="alert">{semantic.message}</p>}
-          <ul className="help-list" role="listbox" aria-label="Help article results">
-            {results.map(({ article, matchedTerms, confidence }) => (
-              <li key={article.id}>
-                <button
-                  type="button"
-                  role="option"
-                  className={`help-list-item ${article.id === selected?.id ? "is-selected" : ""}`}
-                  aria-selected={article.id === selected?.id}
-                  onClick={() => setSelectedId(article.id)}
-                >
-                  <span className="help-list-topic">{article.topic.replace("-", " ")}</span>
-                  <strong>{article.title}</strong>
-                  <span>{article.summary}</span>
-                  {matchedTerms.length > 0 && (
-                    <small>
-                      Matches: {matchedTerms.slice(0, 3).join(", ")} · heuristic {Math.round(confidence * 100)}%
-                    </small>
-                  )}
-                </button>
-              </li>
-            ))}
-          </ul>
-        </aside>
-
-        <p className="sr-only" role="status" aria-live="polite">
-          {selected ? `Selected article: ${selected.title}` : "No matching guidance"}
-        </p>
-        <article className="help-article">
-          {selected ? (
-            <>
-              <span className="help-article-topic">{selected.topic.replace("-", " ")}</span>
-              <h3>{selected.title}</h3>
-              <p className="help-article-summary">{selected.summary}</p>
-              <p className="help-article-body">{selected.body}</p>
-              <div className="help-source-card">
-                <strong>Source-backed offline guidance</strong>
-                <span>
-                  Product corpus v1 · {selected.id} · retrieval: {retrievalMode === "provider-semantic" ? "provider semantic" : "offline lexical"} · exact-match priority
-                </span>
-                {query.trim() && selectedResult && (
-                  <span>
-                    {retrievalMode === "provider-semantic" ? "Provider ranking score" : "Heuristic match confidence"}: {Math.round(selectedResult.confidence * 100)}%
-                    <span className="help-confidence-note"> · ranking signal only, not certification</span>
-                  </span>
-                )}
-                <ul aria-label="Article sources">
-                  {selected.sources.map((source) => (
-                    <li key={source.id}>
-                      <code>{source.path}</code> · {source.heading}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-              <p className="help-index-note">
-                {retrievalMode === "provider-semantic"
-                  ? `This ranking came from the configured provider and was constrained to the versioned article metadata. ${semantic.status === "results" ? semantic.uncertainty : "Uncertainty was not supplied."} The cited offline article remains the authority.`
-                  : "This answer came from the deterministic offline index; no model or network was used. A future semantic retriever must preserve these article IDs, retrieval labels, and citation boundaries."}
-              </p>
-              <p className="help-assistant-note" role="status">
-                {onAskAssistant
-                  ? "Optional assistant: provider response is always confirmation-gated and citation-validated."
-                  : "Optional assistant: not connected in this build. Cited offline guidance remains available without a provider."}
-              </p>
-              {onAskAssistant && (
-                <section className="help-assistant-card" aria-label="Optional help assistant">
-                  <strong>Ask the optional assistant</strong>
-                  <p>
-                    Only this article’s cited context will be offered to the
-                    configured provider. No workspace, session, credential, or
-                    clipboard data is included.
-                  </p>
-                  {(assistant.status === "idle" || assistant.status === "confirm") && (
-                    <button type="button" onClick={(event) => beginAssistantRequest(event.currentTarget)}>
-                      Prepare cited question
-                    </button>
-                  )}
-                  {assistant.status === "loading" && <p role="status">Waiting for the configured provider…</p>}
-                  {assistant.status === "answer" && (
-                    <div className="help-assistant-answer" role="status">
-                      <strong>Draft answer — not product truth until reviewed</strong>
-                      <p>{assistant.answer.text}</p>
-                      <small>Citations: {assistant.answer.citations.join(", ")}</small>
-                      <small>Uncertainty: {assistant.answer.uncertainty}</small>
-                    </div>
-                  )}
-                  {assistant.status === "error" && <p role="alert">{assistant.message}</p>}
-                </section>
-              )}
-            </>
-          ) : (
-            <div className="help-empty" role="status">
-              <h3>No matching guidance</h3>
-              <p>Try a broader phrase, or clear the topic filter.</p>
-            </div>
-          )}
-        </article>
-      </div>
-      </div>
-
-      {topConfirm === "semantic" && semantic.status === "confirm" && (
-        <div className="help-confirm-layer">
-          <div
-            ref={confirmDialogRef}
-            className="help-semantic-confirm"
-            role="alertdialog"
-            aria-modal="true"
-            aria-labelledby="help-semantic-confirm-title"
-            aria-describedby="help-semantic-confirm-copy"
-          >
-            <p>
-              <strong id="help-semantic-confirm-title">Confirm meaning search</strong>
-            </p>
-            <p id="help-semantic-confirm-copy">
-              Send this query and article metadata to {assistantProviderLabel ?? "the selected provider"} for meaning-based ranking? No article body or workspace data will be sent.
-            </p>
-            <button type="button" className="primary" onClick={() => void confirmSemanticRequest()}>
-              Search by meaning
-            </button>
-            <button type="button" onClick={() => dismissConfirm("semantic")}>
-              Cancel
-            </button>
+            {answer.status === "asking" && (
+              <button type="button" onClick={cancelAnswer}>
+                Stop
+              </button>
+            )}
           </div>
-        </div>
-      )}
-      {topConfirm === "assistant" && assistant.status === "confirm" && (
-        <div className="help-confirm-layer">
-          <div
-            ref={confirmDialogRef}
-            className="help-assistant-confirm"
-            role="alertdialog"
-            aria-modal="true"
-            aria-labelledby="help-assistant-confirm-title"
-            aria-describedby="help-assistant-confirm-copy"
-          >
-            <p>
-              <strong id="help-assistant-confirm-title">Confirm assistant request</strong>
-            </p>
-            <p id="help-assistant-confirm-copy">
-              Ready to send the cited article bundle ({assistant.request.sources.length} source{assistant.request.sources.length === 1 ? "" : "s"}) via {assistantProviderLabel ?? "the selected provider"}?
-            </p>
-            <button type="button" className="primary" onClick={() => void confirmAssistantRequest()}>
-              Send cited context
-            </button>
-            <button type="button" onClick={() => dismissConfirm("assistant")}>
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
+
+          <p role="status" aria-live="polite" className="help-center-answer-status">
+            {answer.status === "idle" &&
+              "A written answer is a separate step. It is checked against the Help content before it is shown."}
+            {answer.status === "asking" && "Working on a written answer. You can keep reading."}
+            {answer.status === "abstained" &&
+              "Help could not support an answer from the shipped content, so it did not write one. The search results above are unaffected."}
+            {answer.status === "unavailable" && answer.message}
+            {answer.status === "answered" &&
+              `${answer.projection.claims.length} checked ${answer.projection.claims.length === 1 ? "statement" : "statements"}.`}
+          </p>
+
+          {answer.status === "answered" && (
+            <ol className="help-center-claims">
+              {answer.projection.claims.map((claim) => (
+                <li key={claim.ordinal}>
+                  <p>{claim.text}</p>
+                  <ul className="help-center-citations" aria-label="Sources for this statement">
+                    {claim.citations.map((citation, index) => (
+                      <li key={`${citation.source_id}-${index}`}>
+                        <code>{citation.path}</code> — {citation.heading}
+                        <blockquote>{citation.quote}</blockquote>
+                      </li>
+                    ))}
+                  </ul>
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
+      </div>
     </div>
   );
 }
