@@ -3061,7 +3061,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(body["error"]["data"]["code"], "unsupported");
+        // The internal Unsupported category intentionally maps to the
+        // share-safe SDK InvalidRequest taxonomy; the HTTP status remains
+        // METHOD_NOT_ALLOWED.
+        assert_eq!(body["error"]["data"]["code"], "invalid_request");
 
         fixture.srv.stop();
         set_grokptah_home_override(None);
