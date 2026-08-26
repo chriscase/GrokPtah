@@ -51,3 +51,5 @@ mod dto_tests;
 mod executor_tests;
 #[cfg(test)]
 mod parity_tests;
+#[cfg(test)]
+mod receipt_fixture_tests;

@@ -268,5 +268,106 @@ if (publicApi.HELP_INDEX_PROVENANCE.corpusDigest !== publicApi.HELP_CORPUS_DIGES
   throw new Error("published index provenance is not bound to the published corpus");
 }
 
+// ---- packaged accessibility ------------------------------------------------
+//
+// Rendered from the *bundle*, not the source. A component whose accessibility
+// is asserted only against `src/` is asserted against something no consumer
+// installs: a bundler that drops an attribute, a minifier that mangles a
+// generated id, or an entry that exports a different component all leave the
+// source tests green.
+//
+// Effect-driven behaviour (background inerting, focus restoration) needs a DOM
+// and is covered by `helpRoute.test.tsx`; what is checked here is the markup
+// every consumer receives.
+{
+  const { JSDOM } = await import("jsdom");
+  const dom = new JSDOM("<!doctype html><html><body><div id=\"app\"></div></body></html>", {
+    pretendToBeVisual: true,
+  });
+  // `navigator` is a getter-only global on modern Node, so install these with
+  // property descriptors rather than assignment, and restore the exact
+  // descriptors afterwards.
+  const installed = ["window", "document", "HTMLElement", "Node", "Element", "getComputedStyle", "navigator"];
+  const priorDescriptors = new Map();
+  for (const key of installed) {
+    priorDescriptors.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+    Object.defineProperty(globalThis, key, {
+      value: key === "window" ? dom.window : dom.window[key],
+      configurable: true,
+      writable: true,
+    });
+  }
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+
+  try {
+    const React = await import("react");
+    const { createRoot } = await import("react-dom/client");
+    const { act } = React;
+
+    const container = dom.window.document.getElementById("app");
+    const beside = dom.window.document.createElement("div");
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        React.createElement(
+          React.Fragment,
+          null,
+          React.createElement("nav", { "data-testid": "chrome" }, "app chrome"),
+          React.createElement(helpReactApi.HelpRoute, { open: true, onClose: () => {} }),
+        ),
+      );
+    });
+    beside.remove();
+
+    const dialog = dom.window.document.querySelector('[role="dialog"]');
+    if (!dialog) throw new Error("packaged Help route rendered no dialog");
+    if (dialog.getAttribute("aria-modal") !== "true") {
+      throw new Error("packaged Help dialog is not modal to assistive technology");
+    }
+    const labelledBy = dialog.getAttribute("aria-labelledby");
+    if (!labelledBy || !dom.window.document.getElementById(labelledBy)) {
+      throw new Error("packaged Help dialog has no resolvable accessible name");
+    }
+    if (!dom.window.document.querySelector('[aria-live="polite"]')) {
+      throw new Error("packaged Help route has no polite live region for status");
+    }
+    const search = dom.window.document.querySelector("input");
+    if (!search) throw new Error("packaged Help route rendered no search input");
+    // A real `<label for>` is the preferred accessible name, so accept it
+    // alongside the ARIA forms rather than demanding one particular mechanism.
+    const named =
+      search.getAttribute("aria-label") ||
+      (search.getAttribute("aria-labelledby") &&
+        dom.window.document.getElementById(search.getAttribute("aria-labelledby"))) ||
+      (search.id && dom.window.document.querySelector(`label[for="${search.id}"]`));
+    if (!named) throw new Error("packaged Help search input has no accessible name");
+    // The palette must not inert itself: the route renders inside the app
+    // container, so an ancestor carrying `inert` would take the dialog with it.
+    for (let node = dialog.parentElement; node; node = node.parentElement) {
+      if (node.hasAttribute("inert")) {
+        throw new Error("packaged Help dialog is inside an inert ancestor");
+      }
+    }
+    const chrome = dom.window.document.querySelector('[data-testid="chrome"]');
+    if (!chrome?.hasAttribute("inert")) {
+      throw new Error("packaged Help route did not make the background inert");
+    }
+    // Provider and corpus text is plain text, everywhere in the packaged tree.
+    if (dom.window.document.body.querySelector("script")) {
+      throw new Error("packaged Help route rendered a script element");
+    }
+
+    await act(async () => root.unmount());
+    console.log("packaged accessibility verified: modal dialog, named, live region, inert background");
+  } finally {
+    for (const [key, descriptor] of priorDescriptors) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+      else delete globalThis[key];
+    }
+    delete globalThis.IS_REACT_ACT_ENVIRONMENT;
+    dom.window.close();
+  }
+}
+
 console.log(`public bundle verified: ${requiredExports.join(", ")}`);
 console.log("help-react entry verified: React externalized, primitives exported");

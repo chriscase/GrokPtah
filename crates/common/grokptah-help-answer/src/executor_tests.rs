@@ -757,3 +757,67 @@ fn the_receipt_digest_follows_the_outcome() {
     });
     assert_eq!(answered.receipt_digest, shuffled.receipt_digest);
 }
+
+#[test]
+fn drift_between_admission_and_dispatch_is_refused() {
+    // An admission is verified against what is being served at *dispatch*, not
+    // at mint time. A corpus, index, or manifest rebuilt in between invalidates
+    // it — which is the whole reason the admission carries all three.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let exec = executor(
+        Arc::new(Answering::new(Arc::clone(&calls), echoed())),
+        Arc::new(Accepting),
+        fast(),
+    );
+    let core = core("durable run recovery");
+    let admission = admission_for(&core);
+
+    for drift in [
+        (|e: &mut AdmissionExpectation| e.corpus_digest = "sha256:rebuilt".into())
+            as fn(&mut AdmissionExpectation),
+        |e: &mut AdmissionExpectation| e.index_digest = "sha256:rebuilt".into(),
+        |e: &mut AdmissionExpectation| e.manifest_digest = "sha256:rebuilt".into(),
+        |e: &mut AdmissionExpectation| e.current_revision = 8,
+        |e: &mut AdmissionExpectation| e.policy_revision = "policy-2".into(),
+    ] {
+        let mut served = expectation();
+        drift(&mut served);
+        let receipt = exec
+            .submit(core.clone(), admission.clone(), &served)
+            .unwrap_or_else(|refusal| panic!("{refusal}"))
+            .join();
+        assert_eq!(receipt.outcome, ExecutionOutcome::Denied);
+        assert_eq!(receipt.failure, Some(FailureReason::AdmissionRefused));
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no drifted request may reach a provider"
+    );
+    exec.shutdown(Duration::from_secs(2));
+}
+
+#[test]
+fn an_admission_that_expired_while_queued_is_refused() {
+    // The window is short by construction, and it is checked at dispatch. A
+    // request that waited out its admission does not get to use it.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let exec = executor(
+        Arc::new(Answering::new(Arc::clone(&calls), echoed())),
+        Arc::new(Accepting),
+        fast(),
+    );
+    let core = core("durable run recovery");
+    let admission = admission_for(&core);
+    let mut later = expectation();
+    later.now_ms = admission.expires_at_ms + 1;
+
+    let receipt = exec
+        .submit(core, admission, &later)
+        .unwrap_or_else(|refusal| panic!("{refusal}"))
+        .join();
+    assert_eq!(receipt.outcome, ExecutionOutcome::Denied);
+    assert_eq!(receipt.failure, Some(FailureReason::AdmissionRefused));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    exec.shutdown(Duration::from_secs(2));
+}

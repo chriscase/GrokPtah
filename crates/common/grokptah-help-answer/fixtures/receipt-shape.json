@@ -1,0 +1,56 @@
+[
+  {
+    "schema": "grokptah.help-answer-receipt.v1",
+    "admissionId": "sha256:admission",
+    "requestDigest": "sha256:request",
+    "corpusDigest": "sha256:corpus",
+    "indexDigest": "sha256:index",
+    "manifestDigest": "sha256:manifest",
+    "grantRevision": 7,
+    "outcome": "answered",
+    "outcomeDigest": "sha256:outcome",
+    "citedSourceIds": [
+      "durable.lifecycle"
+    ],
+    "claimCount": 2,
+    "queuedMs": 1,
+    "ranMs": 12,
+    "receiptDigest": "sha256:2b75732596e4c12d7a4b1f006295c28f5323b7db424b27c8f4aa39132f111fdb"
+  },
+  {
+    "schema": "grokptah.help-answer-receipt.v1",
+    "admissionId": "sha256:admission",
+    "requestDigest": "sha256:request",
+    "corpusDigest": "sha256:corpus",
+    "indexDigest": "sha256:index",
+    "manifestDigest": "sha256:manifest",
+    "grantRevision": 7,
+    "outcome": "denied",
+    "failure": "admission_refused",
+    "citedSourceIds": [
+      "durable.lifecycle"
+    ],
+    "claimCount": 2,
+    "queuedMs": 1,
+    "ranMs": 12,
+    "receiptDigest": "sha256:d16562964f2abd08a9c3bef28f430f1f80a4906a67646f8175c09a64fd61c19e"
+  },
+  {
+    "schema": "grokptah.help-answer-receipt.v1",
+    "admissionId": "sha256:admission",
+    "requestDigest": "sha256:request",
+    "corpusDigest": "sha256:corpus",
+    "indexDigest": "sha256:index",
+    "manifestDigest": "sha256:manifest",
+    "grantRevision": 7,
+    "outcome": "abandoned",
+    "failure": "caller_cancelled",
+    "citedSourceIds": [
+      "durable.lifecycle"
+    ],
+    "claimCount": 2,
+    "queuedMs": 1,
+    "ranMs": 12,
+    "receiptDigest": "sha256:d0696219263b0852b0514df1631002d61a99f0262d88f0571a1cbdc67d175dfc"
+  }
+]

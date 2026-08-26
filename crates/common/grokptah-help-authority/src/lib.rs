@@ -591,4 +591,6 @@ mod grant_tests;
 #[cfg(test)]
 mod manifest_tests;
 #[cfg(test)]
+mod omission_tests;
+#[cfg(test)]
 mod tests;
