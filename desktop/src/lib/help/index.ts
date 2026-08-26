@@ -62,6 +62,7 @@ export {
   HELP_REDACTION_PLACEHOLDER,
   containsHelpSecret,
   redactHelpText,
+  scanHelpForSecrets,
   type HelpRedaction,
   type HelpRedactionResult,
 } from "./retrieval/redact";
@@ -85,10 +86,8 @@ export {
   HELP_ANSWER_LIMITS,
   HELP_ANSWER_REQUEST_SCHEMA,
   HELP_ANSWER_RESPONSE_SCHEMA,
+  askHelp,
   buildHelpAnswerRequest,
-  createHelpAnswerRoute,
-  isHelpAnswerRouteIntact,
-  requestHelpAnswer,
   validateHelpAnswerRequest,
   validateHelpAnswerResponse,
   type HelpAnswerCitation,
@@ -99,10 +98,45 @@ export {
   type HelpAnswerRejection,
   type HelpAnswerRequest,
   type HelpAnswerResponse,
-  type HelpAnswerRoute,
-  type HelpAnswerTransport,
   type HelpAnswerValidation,
 } from "./answer/contract";
+
+// ---- the authority seam ---------------------------------------------------
+// Types only. This lane declares the port and stops; the implementation is the
+// reviewed authority spine's, and `docs/HELP_ANSWER_AUTHORITY_SEAM.md` is the
+// handoff.
+export {
+  HELP_NO_AUTHORITY,
+  type HelpAnswerAuthority,
+  type HelpAnswerAuthorityResult,
+  type HelpAnswerExecution,
+  type HelpAnswerRefusal,
+} from "./answer/seam";
+
+// ---- claim-bound coverage -------------------------------------------------
+export {
+  HELP_CLAIM_MIN_TOKENS_FOR_RELEVANCE,
+  HELP_CLAIM_SUPPORT_FRACTION,
+  HELP_MAX_CLAIMS,
+  checkHelpClaimCoverage,
+  segmentHelpClaims,
+  type HelpAnswerClaim,
+  type HelpCoverageFailure,
+  type HelpCoverageResult,
+} from "./answer/claims";
+
+// ---- claim spans ----------------------------------------------------------
+export {
+  HELP_MAX_QUOTE_CODE_POINTS,
+  buildHelpClaimSpan,
+  helpSpansOverlap,
+  mapSanitizedRangeToSource,
+  sanitizeWithOffsetMap,
+  verifyHelpClaimSpan,
+  type HelpClaimSpan,
+  type HelpSpanFailure,
+  type HelpSpanVerification,
+} from "./retrieval/spans";
 
 // ---- headless consumer ----------------------------------------------------
 export {

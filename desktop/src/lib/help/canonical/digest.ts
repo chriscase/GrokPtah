@@ -137,4 +137,6 @@ export const HELP_DIGEST_DOMAINS = Object.freeze({
   chunk: "grokptah.help.chunk.v1",
   sourceSet: "grokptah.help.source-set.v1",
   corpus: "grokptah.help.corpus.v1",
+  answerRequest: "grokptah.help.answer-request.v1",
+  answer: "grokptah.help.answer.v1",
 });
