@@ -10,6 +10,7 @@ import {
   type HelpAuthorityRequest,
   type HelpAuthorityResponse,
 } from "./index";
+import { HelpAuthorityBrokerClient } from "./broker";
 import { HELP_CORPUS } from "../canonical/corpus";
 import { sha256Hex } from "../canonical/digest";
 import { searchHelpCorpus } from "../retrieval/hybrid";
@@ -128,6 +129,34 @@ describe("Help authority access and identity", () => {
 });
 
 describe("Help authority strict citations", () => {
+  it("keeps forbidden Chat/session/tool/workspace artifacts out of the request", () => {
+    const value = request();
+    const serialized = JSON.stringify(value);
+    for (const key of [
+      "chat",
+      "session",
+      "sessionId",
+      "transcript",
+      "history",
+      "workspace",
+      "workspacePath",
+      "files",
+      "tools",
+      "toolCalls",
+      "messages",
+      "fallback",
+    ]) {
+      expect(serialized.includes(`"${key}"`), key).toBe(false);
+    }
+    expect(responseFor(value).cleanup.artifactCounts).toEqual({
+      chat: 0,
+      session: 0,
+      transcript: 0,
+      tool: 0,
+      workspace: 0,
+    });
+  });
+
   it("accepts a fully byte-ranged, bidirectionally mapped answer", () => {
     const value = request();
     const validation = validateHelpAuthorityResponse(responseFor(value), value);
@@ -163,6 +192,28 @@ describe("Help authority strict citations", () => {
 });
 
 describe("Help authority executor", () => {
+  it("uses authenticated broker cookies and CSRF, never a bearer token", async () => {
+    const value = request();
+    let seen: RequestInit | undefined;
+    const client = new HelpAuthorityBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      csrfToken: "csrf-token",
+      fetcher: async (_input, init) => {
+        seen = init;
+        return new Response(JSON.stringify(responseFor(value)), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+    await expect(client.answer(value)).resolves.toBeDefined();
+    const headers = new Headers(seen?.headers);
+    expect(headers.get("Authorization")).toBeNull();
+    expect(headers.get("X-CSRF-Token")).toBe("csrf-token");
+    expect(headers.get("Idempotency-Key")).toBe(value.requestId);
+    expect(seen?.credentials).toBe("include");
+  });
+
   it("aborts and awaits a transport that ignores AbortSignal", async () => {
     const controller = new AbortController();
     const transport = vi.fn(async (value: HelpAuthorityRequest) => {
