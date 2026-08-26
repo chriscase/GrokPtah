@@ -3,7 +3,7 @@ import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { RunStatusCard, type RunStatusSnapshot } from "./RunStatusCard";
 
-const themeSource = readFileSync(new URL("./theme.css", import.meta.url), "utf8");
+const themeSource = readFileSync("src/theme.css", "utf8");
 
 describe("RunStatusCard", () => {
   it("exposes an accessible name, description, and native progress semantics", () => {
