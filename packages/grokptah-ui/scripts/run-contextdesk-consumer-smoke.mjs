@@ -185,6 +185,17 @@ try {
         name: "grokptah-ui-contextdesk-consumer",
         private: true,
         type: "module",
+        dependencies: {
+          "@grokptah/client": clientArchive,
+          "@grokptah/ui": uiArchive,
+          react: hostPackages[0],
+          "react-dom": hostPackages[1],
+        },
+        devDependencies: {
+          "@types/react": hostPackages[2],
+          "@types/react-dom": hostPackages[3],
+          typescript: hostPackages[4],
+        },
       },
       null,
       2,
