@@ -73,13 +73,33 @@ pub struct WorkspaceUiState {
     pub sessions: Vec<SessionSummary>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HostConfig {
     pub default_model: String,
     pub default_effort: EffortLevel,
     pub always_approve: bool,
     /// Cap model steps per user turn (live eval / tight budgets). None = default 24.
     pub max_agent_rounds: Option<u32>,
+    /// Launch gate consulted before a Build turn becomes a durable run.
+    ///
+    /// `None` installs the production gate, which re-resolves and refreshes
+    /// live local credentials and fails closed. Injecting one is a
+    /// construction-time seam for pinning admission policy in tests; it cannot
+    /// widen what a run may do, only decide whether one is admitted at all.
+    pub launch_gate: Option<Arc<dyn crate::launch_truth::LaunchGate>>,
+}
+
+impl std::fmt::Debug for HostConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostConfig")
+            .field("default_model", &self.default_model)
+            .field("default_effort", &self.default_effort)
+            .field("always_approve", &self.always_approve)
+            .field("max_agent_rounds", &self.max_agent_rounds)
+            .field("launch_gate", &self.launch_gate.is_some())
+            .finish()
+    }
 }
 
 impl Default for HostConfig {
@@ -91,6 +111,7 @@ impl Default for HostConfig {
             default_effort: EffortLevel::Medium,
             always_approve: false,
             max_agent_rounds: None,
+            launch_gate: None,
         }
     }
 }
@@ -479,6 +500,12 @@ pub struct AgentHostHandle {
     /// Wakes every embedded orchestration service after a global admission
     /// slot is actually released, after the completion event itself.
     orchestration_wakeup: Arc<Notify>,
+    /// Re-resolves and enforces launch truth immediately before a Build turn
+    /// becomes a durable run. Fixed at construction, and defaulted to the
+    /// production gate that reads live local credentials; a caller may inject
+    /// one through [`HostConfig::launch_gate`] to pin admission policy
+    /// deterministically.
+    launch_gate: Arc<dyn crate::launch_truth::LaunchGate>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
 }
@@ -638,8 +665,18 @@ impl AgentHost {
             live_shells: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             session_usage: HashMap::new(),
         };
+        let inner = Arc::new(Mutex::new(inner));
+        // The production gate reads the model selection fresh on every
+        // admission, so it holds the shared state rather than a host handle:
+        // no placeholder, and no reference back into the handle it lives on.
+        let launch_gate = config.launch_gate.unwrap_or_else(|| {
+            let state = inner.clone();
+            Arc::new(crate::launch_truth::HostLaunchGate::new(move || {
+                state.lock().model.clone()
+            }))
+        });
         AgentHostHandle {
-            inner: Arc::new(Mutex::new(inner)),
+            inner,
             event_rx_factory: Arc::new(Mutex::new(Some(event_rx))),
             orchestration_store: Arc::new(Mutex::new(None)),
             computer_store: Arc::new(Mutex::new(None)),
@@ -648,6 +685,7 @@ impl AgentHost {
             promotion_locks: Arc::new(Mutex::new(HashSet::new())),
             reviewed_runs: Arc::new(Mutex::new(HashSet::new())),
             orchestration_wakeup: Arc::new(Notify::new()),
+            launch_gate,
             _instance_lock: instance_lock,
         }
     }
@@ -1231,9 +1269,16 @@ impl AgentHostHandle {
                 entries: Vec::new(),
                 next_cursor: None,
                 cursor_expired: false,
+                writer_pending: false,
             });
         };
         let mut page = self.event_bus().read_after(after_seq, limit);
+        if page.cursor_expired {
+            return Ok(page);
+        }
+        if page.writer_pending && page.entries.is_empty() {
+            bail!("durable journal has not reached the requested watermark; retry");
+        }
         page.entries.retain(|entry| {
             session_id_of(&entry.update) == Some(session_id)
                 && entry.seq >= start_seq
@@ -1459,6 +1504,7 @@ impl AgentHostHandle {
     }
 
     #[allow(clippy::too_many_arguments)] // Keeps durable run identity inputs explicit.
+    #[allow(clippy::too_many_arguments)] // Keeps durable admission inputs explicit at this boundary.
     fn begin_desktop_run(
         &self,
         session_id: Uuid,
@@ -1470,6 +1516,7 @@ impl AgentHostHandle {
         execution: Option<RunExecution>,
         agent_id: Option<String>,
         parent_run_id: Option<String>,
+        admission: &crate::launch_truth::Admission,
     ) -> Option<(String, OrchStore)> {
         let store = match self.ensure_orchestration_store() {
             Ok(store) => store,
@@ -1512,6 +1559,8 @@ impl AgentHostHandle {
             progress: None,
             execution,
             approval: None,
+            launch_requirement: admission.requirement(),
+            attribution: admission.attribution(),
         };
         if let Some(agent_id) = agent_id.as_deref() {
             if let Err(error) = store.update_agent(agent_id, |agent| {
@@ -2407,13 +2456,31 @@ impl AgentHostHandle {
         if !p.is_dir() {
             bail!("not a directory: {}", p.display());
         }
+        // The isolation default follows the workspace. A session created
+        // before its folder was picked was defaulted against whatever project
+        // happened to be open, and leaving it pinned to isolation a new
+        // workspace cannot back would fail on its first turn. Probing Git
+        // touches the filesystem, so it happens before the lock.
+        let rebound_default = if run_promotion::isolation_readiness(&p).permits_default_isolation()
+        {
+            RunExecutionMode::IsolatedWorktree
+        } else {
+            RunExecutionMode::Shared
+        };
         let summary = {
             let mut g = self.inner.lock();
+            if g.turn_cancels.contains_key(&id) {
+                bail!("cannot rebind the workspace while a turn is running");
+            }
             let s = g
                 .sessions
                 .get_mut(&id)
                 .ok_or_else(|| anyhow!("unknown session"))?;
             s.cwd = p.clone();
+            // An operator's explicit choice is theirs and is never recomputed.
+            if s.kind == SessionKind::Build && !s.execution_mode_explicit {
+                s.execution_mode = rebound_default;
+            }
             s.updated_at = Utc::now();
             s.summary()
         };
@@ -2432,13 +2499,32 @@ impl AgentHostHandle {
     }
 
     /// Set the execution policy for future Build turns in one session.
-    /// Shared execution remains the default; changing policy during a turn is
-    /// refused so a running model can never change workspaces underneath it.
+    ///
+    /// Isolated execution is the default wherever the workspace can back one.
+    /// Shared execution is an explicit unsafe opt-in: it edits the operator's
+    /// checkout in place and carries
+    /// [`RollbackGuarantee::None`](crate::orchestration::RollbackGuarantee::None),
+    /// so selecting it on a workspace that *could* have been isolated requires
+    /// `acknowledge_unsafe`. Where isolation was never available, shared is the
+    /// only option and no acknowledgement is demanded.
+    ///
+    /// Changing policy during a turn is refused so a running model can never
+    /// change workspaces underneath it.
     pub fn session_set_execution_mode(
         &self,
         id: Uuid,
         mode: RunExecutionMode,
+        acknowledge_unsafe: bool,
     ) -> Result<SessionSummary> {
+        // Probing Git touches the filesystem, so it happens before the lock.
+        let workspace = {
+            let g = self.inner.lock();
+            g.sessions.get(&id).map(|session| session.cwd.clone())
+        };
+        let isolation_available = workspace
+            .as_deref()
+            .map(run_promotion::isolation_readiness)
+            .is_some_and(run_promotion::IsolationReadiness::permits_default_isolation);
         let summary = {
             let mut g = self.inner.lock();
             if g.turn_cancels.contains_key(&id) {
@@ -2451,7 +2537,17 @@ impl AgentHostHandle {
             if s.kind != SessionKind::Build && mode != RunExecutionMode::Shared {
                 bail!("isolated execution is available only for Build sessions");
             }
+            if s.kind == SessionKind::Build
+                && mode.requires_unsafe_acknowledgement()
+                && isolation_available
+                && !acknowledge_unsafe
+            {
+                bail!(
+                    "shared execution edits this workspace in place and cannot be rolled back                      by the host; re-send with acknowledge_unsafe to opt in, or keep the                      isolated worktree"
+                );
+            }
             s.execution_mode = mode;
+            s.execution_mode_explicit = true;
             s.updated_at = Utc::now();
             s.summary()
         };
@@ -2767,7 +2863,12 @@ impl AgentHostHandle {
             (s.cwd.clone(), leaving, g.model.clone())
         };
 
-        let quality = if std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
+        // Compaction spends a credential like any other turn, so it passes the
+        // same gate. A refusal is not fatal here: compaction has a
+        // deterministic local fallback, and degrading to it is better than
+        // failing the operator's compaction outright.
+        let gated = self.launch_gate.admit(None).await.is_ok();
+        let quality = if !gated || std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some() {
             None
         } else if let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
@@ -2925,6 +3026,23 @@ impl AgentHostHandle {
             .clone()
             .ok_or_else(|| anyhow!("no project open"))?;
         crate::memory::remember(&cwd, text, &[]).map_err(|e| anyhow!(e))
+    }
+
+    /// The launch gate this host admits durable Build work through.
+    ///
+    /// Shared rather than rebuilt so an embedded orchestration service and a
+    /// desktop turn can never be admitted under different policies.
+    pub fn launch_gate(&self) -> Arc<dyn crate::launch_truth::LaunchGate> {
+        self.launch_gate.clone()
+    }
+
+    /// The model selection future turns will resolve against.
+    ///
+    /// Read fresh on every launch decision rather than captured, so a model
+    /// switched between admitting a run and starting it is caught by the
+    /// admission requirement check instead of being silently honoured.
+    pub fn selected_model(&self) -> String {
+        self.inner.lock().model.clone()
     }
 
     pub fn set_model(&self, model: String) {
@@ -5280,6 +5398,38 @@ impl AgentHostHandle {
         } else {
             None
         };
+        // Re-resolve and refresh launch truth before this turn becomes durable
+        // and before any isolated worktree is prepared, so a refused launch
+        // leaves nothing behind on disk. The refusal is typed rather than a
+        // bare failure, and the user turn already appended to the transcript
+        // stays readable so the operator can see what was about to be sent.
+        // Every turn that can reach a provider is gated here, whatever started
+        // it: the desktop Send button, a Tauri command, a queued or steered
+        // prompt, a plan-mode resume, or a coordinator over MCP all funnel
+        // through this one function. A Chat turn spends a credential exactly
+        // like a Build turn does, so it is gated on the same terms.
+        //
+        // An externally-owned run was already admitted by the service that
+        // created it, so it re-enforces against the exact facts it was
+        // admitted on rather than deciding afresh.
+        let pinned = external_run.as_ref().and_then(|run| {
+            self.ensure_orchestration_store()
+                .ok()
+                .and_then(|store| store.load_run(&run.run_id).ok().flatten())
+                .and_then(|record| record.launch_requirement)
+        });
+        let admission = match self.launch_gate.admit(pinned.as_ref()).await {
+            Ok(admission) => Some(admission),
+            Err(reason) => {
+                let verdict = crate::launch_truth::refusal_verdict(reason);
+                bail!(
+                    "launch refused before admission: {} ({}/{})",
+                    reason.as_str(),
+                    verdict.terminal_result(),
+                    verdict.error_code_str()
+                );
+            }
+        };
         let requested_execution_mode = external_run
             .as_ref()
             .map(|run| run.execution_mode)
@@ -5346,6 +5496,9 @@ impl AgentHostHandle {
             .map(|execution| PathBuf::from(&execution.execution_workspace))
             .unwrap_or_else(|| cwd.clone());
         let desktop_run = if external_run.is_none() && kind == SessionKind::Build {
+            let admission = admission
+                .as_ref()
+                .expect("every gated turn resolves an admission above");
             self.begin_desktop_run(
                 session_id,
                 &cwd,
@@ -5356,6 +5509,7 @@ impl AgentHostHandle {
                 run_execution.clone(),
                 agent.as_ref().map(|agent| agent.agent_id.clone()),
                 resume.as_ref().map(|plan| plan.parent_run_id.clone()),
+                admission,
             )
         } else {
             None

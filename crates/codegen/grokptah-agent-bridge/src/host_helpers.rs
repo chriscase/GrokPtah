@@ -1768,6 +1768,9 @@ where
             if target.dialect == crate::gateway_config::ProviderDialect::XaiChatCompletions {
                 req = req.header("x-grok-effort", effort.as_str());
             }
+            if let Some(key) = crate::physical_send::provider_request_id() {
+                req = req.header("Idempotency-Key", key);
+            }
             let req = crate::auth_store::apply_auth_headers(req, c, &base);
             req.json(&body)
         };
@@ -1777,7 +1780,10 @@ where
             _ = cancel.cancelled() => bail!("cancelled"),
         };
         let mut resp = match resp_result {
-            Ok(r) => r,
+            Ok(r) => {
+                crate::physical_send::mark_sent();
+                r
+            }
             Err(e) => {
                 last_err = Some(
                     if target.dialect
@@ -1847,7 +1853,7 @@ where
             } else {
                 format!("HTTP {status}: {clipped}")
             });
-            if attempt < 3 {
+            if attempt < 3 && crate::physical_send::provider_request_id().is_none() {
                 tokio::time::sleep(std::time::Duration::from_millis(600 * (1 << attempt))).await;
                 continue;
             }
@@ -1864,6 +1870,7 @@ where
             if status.as_u16() == 400
                 && target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
                 && body.get("tool_choice").is_some()
+                && crate::physical_send::provider_request_id().is_none()
             {
                 if let Some(object) = body.as_object_mut() {
                     object.remove("tool_choice");
@@ -1875,6 +1882,7 @@ where
             if attempt < 2
                 && status.as_u16() == 400
                 && body.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
+                && crate::physical_send::provider_request_id().is_none()
             {
                 body["stream"] = serde_json::Value::Bool(false);
                 last_err = Some(format!(
@@ -1891,6 +1899,8 @@ where
                 text.chars().take(800).collect::<String>()
             );
         }
+
+        crate::physical_send::mark_responding();
 
         // Non-stream JSON body (fallback path). Some compatible gateways also
         // return this shape despite accepting `stream=true`.
@@ -2521,7 +2531,10 @@ pub(crate) async fn call_xai_chat(
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
     let send_once = |c: &crate::auth_store::WireCredentials| {
-        let req = client.post(&url).header("Content-Type", "application/json");
+        let mut req = client.post(&url).header("Content-Type", "application/json");
+        if let Some(key) = crate::physical_send::provider_request_id() {
+            req = req.header("Idempotency-Key", key);
+        }
         let req = crate::auth_store::apply_auth_headers(req, c, &base);
         req.json(&body)
     };

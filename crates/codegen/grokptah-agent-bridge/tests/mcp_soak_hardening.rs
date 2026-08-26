@@ -545,6 +545,8 @@ fn soak_restart_recovery_matrix() {
         progress: None,
         execution: None,
         approval: None,
+        launch_requirement: None,
+        attribution: None,
     };
     let fin_safe = safe_id_filename(&partial_id).unwrap();
     std::fs::write(

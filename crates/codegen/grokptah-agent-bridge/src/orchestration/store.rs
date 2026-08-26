@@ -10,6 +10,8 @@ use chrono::{Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
 
+use grokptah_agent_sdk::attempt::{ProviderAttempt, SendState};
+
 use super::types::{
     safe_id_filename, AgentRecord, AgentState, AuditEntry, ContinuationCheckpoint,
     IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunRecord, RunState,
@@ -93,6 +95,8 @@ impl OrchStore {
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
+        fs::create_dir_all(root.join("authority"))?;
+        fs::create_dir_all(root.join("attempts"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -140,6 +144,7 @@ impl OrchStore {
         };
         store.recover_finalization_intents()?;
         store.mark_unfinished_interrupted()?;
+        store.reconcile_interrupted_attempts()?;
         store.fail_orphaned_idempotency_claims()?;
         // Cleanup is best-effort at the record level, but directory access
         // failures still surface so a broken ledger cannot look healthy.
@@ -172,6 +177,57 @@ impl OrchStore {
             .root
             .join("finalization")
             .join(format!("{safe}.json")))
+    }
+
+    fn attempt_path(&self, attempt_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(attempt_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("attempts")
+            .join(format!("{safe}.json")))
+    }
+
+    fn authority_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(run_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("authority")
+            .join(format!("{safe}.json")))
+    }
+
+    /// Persist the secret-free public authority projection for one run.
+    pub fn save_authority_projection(
+        &self,
+        run_id: &str,
+        projection: &grokptah_agent_sdk::authority::PublicAuthorityProjection,
+    ) -> anyhow::Result<()> {
+        projection
+            .validate()
+            .map_err(|error| anyhow::anyhow!("refusing to persist a leaky projection: {error}"))?;
+        let _g = self.inner.lock.lock();
+        let path = self
+            .authority_path(run_id)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        atomic_write_json(&path, projection)
+    }
+
+    /// Load the public authority projection for one run.
+    pub fn load_authority_projection(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<grokptah_agent_sdk::authority::PublicAuthorityProjection>> {
+        let _g = self.inner.lock.lock();
+        let path = match self.authority_path(run_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let projection = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        Ok(Some(projection))
     }
 
     fn agent_path(&self, agent_id: &str) -> Result<PathBuf, OrchError> {
@@ -216,6 +272,12 @@ impl OrchStore {
     }
 
     /// Atomically read, mutate, and replace a run record.
+    ///
+    /// Credential attribution is write-once: it is decided at durable
+    /// admission from freshly re-resolved launch truth, and a later mutation
+    /// that changed it would silently re-point a recorded run at a different
+    /// account or credential route. Such an update is refused and the record
+    /// on disk is left untouched.
     pub fn update_run<F>(&self, run_id: &str, update: F) -> anyhow::Result<Option<RunRecord>>
     where
         F: FnOnce(&mut RunRecord) -> anyhow::Result<()>,
@@ -224,7 +286,13 @@ impl OrchStore {
         let Some(mut run) = self.load_run_unlocked(run_id)? else {
             return Ok(None);
         };
+        let admitted = (run.attribution.clone(), run.launch_requirement.clone());
         update(&mut run)?;
+        if (run.attribution.clone(), run.launch_requirement.clone()) != admitted {
+            anyhow::bail!(
+                "run attribution and launch requirement are fixed at admission and cannot be rewritten"
+            );
+        }
         let path = self
             .run_path(run_id)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -234,6 +302,140 @@ impl OrchStore {
         }
         *self.inner.last_run_error.lock() = None;
         Ok(Some(run))
+    }
+
+    /// Record a provider attempt that has provably not been sent yet.
+    ///
+    /// Opening is separate from advancing so the durable record always exists
+    /// *before* anything can reach a provider: a process that dies between
+    /// these two calls leaves a `known_not_sent` attempt, which is the only
+    /// state that is safe to retry.
+    pub fn open_attempt(&self, attempt: &ProviderAttempt) -> anyhow::Result<()> {
+        attempt
+            .validate()
+            .map_err(|error| anyhow::anyhow!("refusing to record an invalid attempt: {error}"))?;
+        if attempt.send_state != SendState::KnownNotSent {
+            anyhow::bail!("a newly opened attempt must be recorded as not yet sent");
+        }
+        let _g = self.inner.lock.lock();
+        let path = self
+            .attempt_path(attempt.attempt_id.as_str())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        if path.is_file() {
+            anyhow::bail!("attempt already exists");
+        }
+        atomic_write_json(&path, attempt)
+    }
+
+    pub fn load_attempt(&self, attempt_id: &str) -> anyhow::Result<Option<ProviderAttempt>> {
+        let _g = self.inner.lock.lock();
+        self.load_attempt_unlocked(attempt_id)
+    }
+
+    fn load_attempt_unlocked(&self, attempt_id: &str) -> anyhow::Result<Option<ProviderAttempt>> {
+        let path = match self.attempt_path(attempt_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_str(&fs::read_to_string(&path)?)?))
+    }
+
+    /// Atomically read, mutate, and replace a provider attempt.
+    ///
+    /// Everything that identifies *what* the attempt was — its run, ordinal,
+    /// subject, authority revisions, route, and intent — is write-once, and
+    /// the send state may only move forward through the legal lattice. A
+    /// rejected update leaves the record on disk exactly as it found it, so a
+    /// failed recovery cannot half-rewrite an unreconciled attempt.
+    pub fn update_attempt<F>(
+        &self,
+        attempt_id: &str,
+        update: F,
+    ) -> anyhow::Result<Option<ProviderAttempt>>
+    where
+        F: FnOnce(&mut ProviderAttempt) -> anyhow::Result<()>,
+    {
+        let _g = self.inner.lock.lock();
+        let Some(recorded) = self.load_attempt_unlocked(attempt_id)? else {
+            return Ok(None);
+        };
+        let mut attempt = recorded.clone();
+        update(&mut attempt)?;
+        if attempt.attempt_id != recorded.attempt_id
+            || attempt.run_id != recorded.run_id
+            || attempt.ordinal != recorded.ordinal
+            || attempt.subject != recorded.subject
+            || attempt.authority != recorded.authority
+            || attempt.route != recorded.route
+            || attempt.intent != recorded.intent
+        {
+            anyhow::bail!("a provider attempt's binding is fixed when it is opened");
+        }
+        if attempt.send_state != recorded.send_state
+            && !recorded
+                .send_state
+                .permits_transition_to(attempt.send_state)
+        {
+            anyhow::bail!("a provider attempt's send state cannot move backwards or skip a step");
+        }
+        attempt
+            .validate()
+            .map_err(|error| anyhow::anyhow!("refusing to record an invalid attempt: {error}"))?;
+        let path = self
+            .attempt_path(attempt_id)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        atomic_write_json(&path, &attempt)?;
+        Ok(Some(attempt))
+    }
+
+    /// Every attempt recorded for one run, in ordinal order.
+    pub fn list_attempts_for_run(&self, run_id: &str) -> anyhow::Result<Vec<ProviderAttempt>> {
+        let _g = self.inner.lock.lock();
+        let mut out = Vec::new();
+        let dir = self.inner.root.join("attempts");
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(text) = fs::read_to_string(entry.path()) {
+                if let Ok(attempt) = serde_json::from_str::<ProviderAttempt>(&text) {
+                    if attempt.run_id.as_str() == run_id {
+                        out.push(attempt);
+                    }
+                }
+            }
+        }
+        out.sort_by_key(|attempt| attempt.ordinal);
+        Ok(out)
+    }
+
+    /// Whether a *new* equivalent request may be issued for one run.
+    ///
+    /// False while any recorded attempt still needs provider-side
+    /// reconciliation. This is the durable form of the rule in
+    /// [`SendState::may_auto_retry`]: cancel and restart must reconcile the
+    /// exact attempt rather than opening a fresh one beside it.
+    pub fn run_permits_new_attempt(&self, run_id: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .list_attempts_for_run(run_id)?
+            .iter()
+            .all(ProviderAttempt::permits_equivalent_retry))
+    }
+
+    /// The attempts that still need provider-side reconciliation.
+    pub fn unreconciled_attempts(&self, run_id: &str) -> anyhow::Result<Vec<ProviderAttempt>> {
+        Ok(self
+            .list_attempts_for_run(run_id)?
+            .into_iter()
+            .filter(|attempt| attempt.send_state.requires_reconciliation())
+            .collect())
     }
 
     pub fn list_runs(&self) -> anyhow::Result<Vec<RunRecord>> {
@@ -777,6 +979,37 @@ impl OrchStore {
         self.inner.last_run_error.lock().clone()
     }
 
+    /// A process that died while an attempt was `Sending` cannot still be
+    /// sending. Move those records to `Uncertain` so restart never auto-retries.
+    pub fn reconcile_interrupted_attempts(&self) -> anyhow::Result<usize> {
+        let dir = self.inner.root.join("attempts");
+        if !dir.is_dir() {
+            return Ok(0);
+        }
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(text) = fs::read_to_string(entry.path()) {
+                if let Ok(attempt) = serde_json::from_str::<ProviderAttempt>(&text) {
+                    if attempt.send_state == SendState::Sending {
+                        ids.push(attempt.attempt_id.as_str().to_string());
+                    }
+                }
+            }
+        }
+        let mut n = 0;
+        for attempt_id in ids {
+            self.update_attempt(&attempt_id, |attempt| {
+                crate::attempt_binding::reconcile_interrupted(attempt).map_err(anyhow::Error::msg)
+            })?;
+            n += 1;
+        }
+        Ok(n)
+    }
+
     pub fn mark_unfinished_interrupted(&self) -> anyhow::Result<usize> {
         let mut n = 0;
         let mut interrupted_agents = Vec::new();
@@ -1010,6 +1243,8 @@ mod tests {
             progress: None,
             execution: None,
             approval: None,
+            launch_requirement: None,
+            attribution: None,
         }
     }
 
@@ -1060,6 +1295,8 @@ mod tests {
             progress: None,
             execution: None,
             approval: None,
+            launch_requirement: None,
+            attribution: None,
         };
         store.save_run(&run).unwrap();
         drop(store);
@@ -1184,6 +1421,8 @@ mod tests {
             progress: None,
             execution: None,
             approval: None,
+            launch_requirement: None,
+            attribution: None,
         };
         store.save_run(&run).unwrap();
         let clone = store.clone();
@@ -1412,6 +1651,8 @@ mod tests {
             progress: None,
             execution: None,
             approval: None,
+            launch_requirement: None,
+            attribution: None,
         };
         store.save_run(&run).unwrap();
         store
@@ -1510,5 +1751,148 @@ mod tests {
             RunState::Completed
         );
         assert!(!intent.exists());
+    }
+
+    /// Attribution and the pinned launch requirement are decided once, at
+    /// durable admission, from freshly re-resolved truth. A later mutation
+    /// that changed either would silently re-point a recorded run at a
+    /// different account, provider, or model.
+    #[test]
+    fn admission_facts_cannot_be_rewritten_after_a_run_is_recorded() {
+        use grokptah_agent_sdk::account::{
+            AccountReference, AccountReferenceSource, CredentialMethod, RunAttribution,
+        };
+        use grokptah_agent_sdk::launch::{
+            BaseCategory, LaunchRequirement, ModelReference, ProviderClass, RequestDialect,
+            RouteClass,
+        };
+
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+
+        let admitted = RunAttribution {
+            credential_method: CredentialMethod::GrokBuildOidc,
+            account_reference: AccountReference::new(
+                "usr-0a1b2c3d",
+                AccountReferenceSource::UserId,
+            ),
+        };
+        let pinned = LaunchRequirement {
+            provider: ProviderClass::Xai,
+            credential_method: CredentialMethod::GrokBuildOidc,
+            route: RouteClass::XaiFirstParty,
+            base: BaseCategory::XaiOfficial,
+            dialect: RequestDialect::XaiChatCompletions,
+            model: ModelReference::new("grok-4"),
+            account_reference: admitted.account_reference.clone(),
+        };
+        let mut run = terminal_run("attributed");
+        run.state = RunState::Running;
+        run.terminal_result = None;
+        run.attribution = Some(admitted.clone());
+        run.launch_requirement = Some(pinned.clone());
+        store.save_run(&run).unwrap();
+
+        // An ordinary lifecycle update that leaves admission alone succeeds.
+        store
+            .update_run("attributed", |run| {
+                run.state = RunState::Completed;
+                run.terminal_result = Some("completed".into());
+                Ok(())
+            })
+            .unwrap()
+            .expect("the run exists");
+
+        // Re-pointing the account is refused, and the record on disk is
+        // untouched — a rejected update must not half-apply.
+        let repointed = RunAttribution {
+            credential_method: CredentialMethod::ApiKey,
+            account_reference: AccountReference::new(
+                "usr-someone-else",
+                AccountReferenceSource::UserId,
+            ),
+        };
+        // Whatever the record already carries is the baseline a rejected
+        // update must leave exactly as it found it.
+        let untouched = store
+            .load_run("attributed")
+            .unwrap()
+            .unwrap()
+            .final_response;
+        for (name, mutate) in [
+            (
+                "attribution",
+                Box::new({
+                    let repointed = repointed.clone();
+                    move |run: &mut RunRecord| {
+                        run.attribution = Some(repointed.clone());
+                    }
+                }) as Box<dyn Fn(&mut RunRecord)>,
+            ),
+            (
+                "attribution cleared",
+                Box::new(|run: &mut RunRecord| {
+                    run.attribution = None;
+                }),
+            ),
+            (
+                "launch requirement",
+                Box::new({
+                    let mut drifted = pinned.clone();
+                    drifted.model = ModelReference::new("grok-3");
+                    move |run: &mut RunRecord| {
+                        run.launch_requirement = Some(drifted.clone());
+                    }
+                }),
+            ),
+            (
+                "launch requirement cleared",
+                Box::new(|run: &mut RunRecord| {
+                    run.launch_requirement = None;
+                }),
+            ),
+        ] {
+            let outcome = store.update_run("attributed", |run| {
+                mutate(run);
+                run.final_response = Some("this must not persist either".into());
+                Ok(())
+            });
+            assert!(outcome.is_err(), "{name} rewrite was accepted");
+            let reloaded = store.load_run("attributed").unwrap().unwrap();
+            assert_eq!(reloaded.attribution, Some(admitted.clone()), "{name}");
+            assert_eq!(reloaded.launch_requirement, Some(pinned.clone()), "{name}");
+            assert_eq!(reloaded.final_response, untouched, "{name} half-applied");
+        }
+    }
+
+    /// Receipts written before admission facts existed must still decode, and
+    /// must still re-serialize to exactly their original shape.
+    #[test]
+    fn a_receipt_written_before_admission_facts_existed_still_round_trips() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let mut legacy = serde_json::to_value(terminal_run("legacy")).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        assert!(
+            object.remove("attribution").is_none(),
+            "absent fields are skipped"
+        );
+        assert!(object.remove("launchRequirement").is_none());
+        let path = store.run_path("legacy").unwrap();
+        atomic_write_json(&path, &legacy).unwrap();
+
+        let decoded = store.load_run("legacy").unwrap().unwrap();
+        assert_eq!(decoded.attribution, None);
+        assert_eq!(decoded.launch_requirement, None);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+
+        // And a legacy run stays updatable: `None` is its admitted value.
+        store
+            .update_run("legacy", |run| {
+                run.final_response = Some("still writable".into());
+                Ok(())
+            })
+            .unwrap()
+            .expect("the legacy run exists");
     }
 }

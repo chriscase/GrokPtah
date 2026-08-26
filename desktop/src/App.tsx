@@ -91,6 +91,12 @@ import type {
   PromptQueueSnapshot,
 } from "./lib/promptQueue";
 import { useComposerQueue } from "./lib/useComposerQueue";
+import { GrokAccountBadge } from "./components/GrokAccountBadge";
+import {
+  canLaunchGrokBuild,
+  parseGrokAccountFacts,
+  type GrokAccountFacts,
+} from "./lib/grokAccountFacts";
 import { findTabOfKind, kindForTab } from "./lib/sessionTab";
 
 type WorkspaceMode = "build" | "chat";
@@ -261,6 +267,11 @@ function shortPath(path: string | null | undefined, max = 42): string {
 export default function App() {
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [auth, setAuth] = useState<AuthState>({ signed_in: false });
+  // `undefined` = not probed yet (never blocks); `null` = probed but
+  // off-contract (blocks, because we cannot vouch for it).
+  const [grokAccount, setGrokAccount] = useState<
+    GrokAccountFacts | null | undefined
+  >(undefined);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   /** Open concurrent workspaces (tabs). Multiple can be busy at once. */
   const [tabs, setTabs] = useState<SessionTab[]>([]);
@@ -558,6 +569,10 @@ export default function App() {
     );
   }, [activeSessionId]);
   const busy = activeTab?.busy ?? false;
+  // Only positive negative-evidence gates new work. An unprobed account
+  // (`undefined`) stays permissive so ignorance never locks the editor.
+  const grokLaunchBlocked =
+    grokAccount !== undefined && !canLaunchGrokBuild(grokAccount);
   const plan = activeTab?.plan ?? null;
   const anyBusy = tabs.some((t) => t.busy);
   const activity = activeTab?.activity ?? idleActivity();
@@ -841,12 +856,13 @@ export default function App() {
   const refreshChrome = useCallback(async () => {
     const request = chromeRefreshGuard.begin();
     try {
-      const [st, au, md, sess, info] = await Promise.all([
+      const [st, au, md, sess, info, account] = await Promise.all([
         api.agentStatus(),
         api.authState(),
         api.listModels(),
         api.sessionList(),
         api.productInfo(),
+        api.grokAccountFacts().catch(() => null),
       ]);
       if (!chromeRefreshGuard.isCurrent(request)) return;
       const refreshedStatus = preserveProjectCwd(
@@ -867,6 +883,7 @@ export default function App() {
       }
       setStatus(effectiveStatus);
       setAuth(au);
+      setGrokAccount(parseGrokAccountFacts(account));
       setModels(md);
       setSessions(sess);
       setProduct(info);
@@ -1674,6 +1691,10 @@ export default function App() {
   ) {
     const prompt = (text ?? composer).trim();
     if (!prompt) return;
+    // A positively expired or unusable credential blocks *new* work. Steering
+    // guides a turn that is already running, so it is not a new launch, and
+    // runs already recorded stay readable either way.
+    if (grokLaunchBlocked && !opts?.steer) return;
     const fromComposer = text === undefined;
     if (fromComposer) {
       clearComposerFor(activeSessionId);
@@ -3113,6 +3134,11 @@ export default function App() {
                 )}
               </div>
               <div className="composer-toolbar-right">
+                <GrokAccountBadge
+                  facts={grokAccount ?? null}
+                  placement="composer"
+                  onReauthenticate={() => setSettingsOpen(true)}
+                />
                 {busy && (
                   <button
                     type="button"
@@ -3148,11 +3174,13 @@ export default function App() {
                 <button
                   type="button"
                   className="composer-send"
-                  disabled={!composer.trim()}
+                  disabled={!composer.trim() || grokLaunchBlocked}
                   title={
-                    busy
-                      ? "Queue prompt (turn running) · use Steer now for guidance"
-                      : "Send (Enter) · newline with Shift+Enter"
+                    grokLaunchBlocked
+                      ? "Grok Build credential is expired or unusable — refresh sign-in to start new runs"
+                      : busy
+                        ? "Queue prompt (turn running) · use Steer now for guidance"
+                        : "Send (Enter) · newline with Shift+Enter"
                   }
                   onClick={() => void sendPrompt()}
                 >
@@ -3835,6 +3863,7 @@ export default function App() {
         models={models}
         auth={auth}
         onAuthChange={setAuth}
+        grokAccount={grokAccount}
         onChromeChange={() => void refreshChrome()}
       />
 

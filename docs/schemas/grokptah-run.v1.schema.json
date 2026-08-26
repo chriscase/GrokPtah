@@ -71,7 +71,48 @@
         "state": { "$ref": "#/$defs/runState" },
         "promptPreview": { "type": "string", "maxLength": 512 },
         "createdAt": { "type": "string", "minLength": 1 },
-        "updatedAt": { "type": "string", "minLength": 1 }
+        "updatedAt": { "type": "string", "minLength": 1 },
+        "attribution": {
+          "description": "Bounded credential attribution. Optional: receipts written before this field existed still validate.",
+          "oneOf": [{ "$ref": "#/$defs/runAttribution" }, { "type": "null" }]
+        }
+      }
+    },
+    "credentialMethod": {
+      "description": "Mirrors urn:grokptah:schema:account:v1#/$defs/credentialMethod so a run receipt validates standalone.",
+      "enum": [
+        "absent",
+        "api_key",
+        "token_command",
+        "provider_env",
+        "provider_keychain",
+        "grok_build_oidc",
+        "grok_build_api_key",
+        "unknown"
+      ]
+    },
+    "accountReferenceSource": {
+      "enum": ["user_id", "principal_id", "team_id"]
+    },
+    "accountReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "source"],
+      "properties": {
+        "value": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9._:-]+$" },
+        "source": { "$ref": "#/$defs/accountReferenceSource" }
+      }
+    },
+    "runAttribution": {
+      "description": "Records how a run authenticated and which account it billed against. Claims no balance, quota, entitlement, or live certification.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credentialMethod"],
+      "properties": {
+        "credentialMethod": { "$ref": "#/$defs/credentialMethod" },
+        "accountReference": {
+          "oneOf": [{ "$ref": "#/$defs/accountReference" }, { "type": "null" }]
+        }
       }
     },
     "event": {

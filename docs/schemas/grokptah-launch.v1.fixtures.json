@@ -1,0 +1,965 @@
+{
+  "$comment": "Shared golden fixtures for urn:grokptah:schema:launch:v1. Read by the Rust contract tests so the fail-closed matrix is pinned as data rather than only as code. Observation clock for every case is 2026-08-25T00:00:00Z (1787616000). `accepted` cases must decode, validate, round-trip byte-for-byte, and agree about launch gating; `rejected` cases must fail to decode or fail validation.",
+  "observedAtUnix": 1787616000,
+  "accepted": [
+    {
+      "name": "ready-oidc-session",
+      "note": "Signed-in session, future expiry, probed model on the first-party route.",
+      "permitsLaunch": true,
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "ready",
+        "reason": "resolved_with_future_expiry"
+      }
+    },
+    {
+      "name": "ready-api-key-without-expiry-claim",
+      "note": "An API-key route publishes no expiry, so it says so explicitly instead of inheriting 'unknown'. This is the one positive readiness that is not backed by a parsed expiry.",
+      "permitsLaunch": true,
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "api_key",
+        "refreshability": "not_refreshable",
+        "expiry": {
+          "status": "absent"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "ready",
+        "reason": "resolved_with_future_expiry"
+      }
+    },
+    {
+      "name": "blocked-session-without-expiry",
+      "note": "Only an API-key route may make no expiry claim. A session route with no expiry is a fact we failed to read, so it refuses.",
+      "permitsLaunch": false,
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "absent"
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "indeterminate",
+        "reason": "expiry_not_established"
+      }
+    },
+    {
+      "name": "blocked-expired-refreshable",
+      "note": "Refresh was available and the credential is still expired at the observation instant, so refresh has already failed.",
+      "permitsLaunch": false,
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "expired",
+          "expiresAt": "2026-08-24T23:59:59Z",
+          "secondsRemaining": -1
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "blocked",
+        "reason": "refresh_failed"
+      }
+    },
+    {
+      "name": "blocked-expired-not-refreshable",
+      "note": "No refresh path, so renewal needs a human.",
+      "permitsLaunch": false,
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "not_refreshable",
+        "expiry": {
+          "status": "expired",
+          "expiresAt": "2026-08-24T23:59:59Z",
+          "secondsRemaining": -1
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "blocked",
+        "reason": "reauthentication_required"
+      }
+    },
+    {
+      "name": "indeterminate-unparseable-expiry",
+      "note": "An unreadable expiry stamp refuses here, unlike the account contract where it was merely honest.",
+      "permitsLaunch": false,
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "unparseable"
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "indeterminate",
+        "reason": "expiry_unparseable"
+      }
+    },
+    {
+      "name": "indeterminate-unrecognized-credential-route",
+      "note": "An auth_mode the projection does not recognize collapses to `unknown` and refuses.",
+      "permitsLaunch": false,
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "unknown",
+        "refreshability": "unknown",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "indeterminate",
+        "reason": "credential_route_unrecognized"
+      }
+    },
+    {
+      "name": "indeterminate-unprobed-capabilities",
+      "note": "A model whose capabilities were never established asserts none of them, and refuses.",
+      "permitsLaunch": false,
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "unprobed",
+          "chat": false,
+          "tools": false,
+          "stream": false,
+          "parallelToolCalls": false,
+          "imageInput": false
+        },
+        "readiness": "indeterminate",
+        "reason": "capabilities_unprobed"
+      }
+    },
+    {
+      "name": "blocked-route-provider-mismatch",
+      "note": "An xAI credential must never be spent against a compatible-provider route.",
+      "permitsLaunch": false,
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "compatible_provider",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "blocked",
+        "reason": "route_provider_mismatch"
+      }
+    },
+    {
+      "name": "blocked-insecure-base",
+      "note": "A plaintext non-loopback endpoint refuses before a credential is ever sent to it.",
+      "permitsLaunch": false,
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "openai_compatible",
+        "credentialMethod": "provider_env",
+        "refreshability": "not_refreshable",
+        "expiry": {
+          "status": "absent"
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "compatible_provider",
+        "base": "insecure_transport",
+        "dialect": "openai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "blocked",
+        "reason": "base_endpoint_insecure"
+      }
+    },
+    {
+      "name": "blocked-model-not-selected",
+      "note": "No model selected, so there is nothing to launch against.",
+      "permitsLaunch": false,
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "unset",
+        "dialect": "unrecognized",
+        "model": {
+          "status": "not_selected"
+        },
+        "capabilities": {
+          "provenance": "unprobed",
+          "chat": false,
+          "tools": false,
+          "stream": false,
+          "parallelToolCalls": false,
+          "imageInput": false
+        },
+        "readiness": "blocked",
+        "reason": "model_not_selected"
+      }
+    },
+    {
+      "name": "blocked-model-route-mismatch",
+      "note": "The stored selection names a provider the credential does not belong to.",
+      "permitsLaunch": false,
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "unset",
+        "dialect": "unrecognized",
+        "model": {
+          "status": "route_mismatch"
+        },
+        "capabilities": {
+          "provenance": "unprobed",
+          "chat": false,
+          "tools": false,
+          "stream": false,
+          "parallelToolCalls": false,
+          "imageInput": false
+        },
+        "readiness": "blocked",
+        "reason": "model_route_mismatch"
+      }
+    },
+    {
+      "name": "blocked-chat-unsupported",
+      "note": "A measured model that cannot serve a chat completion refuses rather than failing at the first turn.",
+      "permitsLaunch": false,
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "measured",
+          "chat": false,
+          "tools": false,
+          "stream": false,
+          "parallelToolCalls": false,
+          "imageInput": false
+        },
+        "readiness": "blocked",
+        "reason": "chat_unsupported"
+      }
+    },
+    {
+      "name": "blocked-no-credential",
+      "note": "Nothing resolved on any route: the unresolved projection.",
+      "permitsLaunch": false,
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "unrecognized",
+        "credentialMethod": "absent",
+        "refreshability": "unknown",
+        "expiry": {
+          "status": "absent"
+        },
+        "route": "unrecognized",
+        "base": "unset",
+        "dialect": "unrecognized",
+        "model": {
+          "status": "not_selected"
+        },
+        "capabilities": {
+          "provenance": "unprobed",
+          "chat": false,
+          "tools": false,
+          "stream": false,
+          "parallelToolCalls": false,
+          "imageInput": false
+        },
+        "readiness": "blocked",
+        "reason": "sign_in_required"
+      }
+    },
+    {
+      "name": "ready-compatible-loopback-gateway",
+      "note": "A local OpenAI-compatible gateway on loopback is launchable over plaintext, matching the base-URL validator.",
+      "permitsLaunch": true,
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "openai_compatible",
+        "credentialMethod": "provider_keychain",
+        "refreshability": "not_refreshable",
+        "expiry": {
+          "status": "absent"
+        },
+        "route": "compatible_provider",
+        "base": "compatible_loopback",
+        "dialect": "openai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "local/mixtral-8x7b"
+          }
+        },
+        "capabilities": {
+          "provenance": "measured",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": false,
+          "imageInput": false
+        },
+        "readiness": "ready",
+        "reason": "resolved_api_key_no_expiry_claim"
+      }
+    }
+  ],
+  "rejected": [
+    {
+      "name": "unknown-field",
+      "note": "deny_unknown_fields: an added property is not a v1 projection.",
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "ready",
+        "reason": "resolved_with_future_expiry",
+        "balanceUsd": 42
+      }
+    },
+    {
+      "name": "ready-without-supporting-facts",
+      "note": "A hand-written 'ready' whose own facts do not support it must not validate.",
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "unprobed",
+          "chat": false,
+          "tools": false,
+          "stream": false,
+          "parallelToolCalls": false,
+          "imageInput": false
+        },
+        "readiness": "ready",
+        "reason": "resolved_with_future_expiry"
+      }
+    },
+    {
+      "name": "readiness-disagrees-with-reason",
+      "note": "readiness must follow from reason; a blocked reason cannot carry a ready verdict.",
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "ready",
+        "reason": "sign_in_required"
+      }
+    },
+    {
+      "name": "unprobed-asserting-a-capability",
+      "note": "Unprobed capabilities must assert nothing.",
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "unprobed",
+          "chat": true,
+          "tools": false,
+          "stream": false,
+          "parallelToolCalls": false,
+          "imageInput": false
+        },
+        "readiness": "indeterminate",
+        "reason": "capabilities_unprobed"
+      }
+    },
+    {
+      "name": "unselected-model-carrying-a-reference",
+      "note": "An unselected model must not smuggle an id through.",
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "not_selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "blocked",
+        "reason": "model_not_selected"
+      }
+    },
+    {
+      "name": "model-reference-out-of-charset",
+      "note": "A model id with markup or whitespace is not publishable verbatim.",
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4 <script>"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "ready",
+        "reason": "resolved_with_future_expiry"
+      }
+    },
+    {
+      "name": "account-reference-out-of-charset",
+      "note": "An account handle with a path fragment is not an opaque identifier.",
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "../../etc/passwd",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "ready",
+        "reason": "resolved_with_future_expiry"
+      }
+    },
+    {
+      "name": "expiry-without-evidence-carrying-a-timestamp",
+      "note": "An absent expiry must not attach a normalized instant.",
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "absent",
+          "expiresAt": "2026-08-25T12:30:00Z"
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "indeterminate",
+        "reason": "expiry_not_established"
+      }
+    },
+    {
+      "name": "wrong-contract-identifier",
+      "note": "A different contract id is not this revision.",
+      "truth": {
+        "contract": "grokptah.launch.v2",
+        "schemaVersion": 1,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "ready",
+        "reason": "resolved_with_future_expiry"
+      }
+    },
+    {
+      "name": "wrong-schema-version",
+      "note": "A different schema revision is not this revision.",
+      "truth": {
+        "contract": "grokptah.launch.v1",
+        "schemaVersion": 2,
+        "provider": "xai",
+        "credentialMethod": "grok_build_oidc",
+        "refreshability": "refreshable",
+        "expiry": {
+          "status": "valid",
+          "expiresAt": "2026-08-25T12:30:00Z",
+          "secondsRemaining": 45000
+        },
+        "accountReference": {
+          "value": "usr-0a1b2c3d",
+          "source": "user_id"
+        },
+        "route": "xai_first_party",
+        "base": "xai_official",
+        "dialect": "xai_chat_completions",
+        "model": {
+          "status": "selected",
+          "selected": {
+            "value": "grok-4"
+          }
+        },
+        "capabilities": {
+          "provenance": "declared",
+          "chat": true,
+          "tools": true,
+          "stream": true,
+          "parallelToolCalls": true,
+          "imageInput": false
+        },
+        "readiness": "ready",
+        "reason": "resolved_with_future_expiry"
+      }
+    }
+  ]
+}

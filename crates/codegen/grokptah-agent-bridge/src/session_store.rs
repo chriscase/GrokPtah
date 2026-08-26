@@ -119,6 +119,13 @@ pub struct SessionMeta {
     pub kind: crate::session::SessionKind,
     #[serde(default)]
     pub execution_mode: RunExecutionMode,
+    /// Whether the operator chose `execution_mode` themselves.
+    ///
+    /// Persisted so an explicit choice survives a restart: without it, a
+    /// deliberate opt-in to shared execution would be forgotten and silently
+    /// recomputed the next time the session's workspace was rebound.
+    #[serde(default)]
+    pub execution_mode_explicit: bool,
     #[serde(default)]
     pub completion_history: Vec<crate::session::SessionCompletion>,
 }
@@ -462,6 +469,7 @@ impl SessionMeta {
             archived_at: s.archived_at,
             kind: s.kind,
             execution_mode: s.execution_mode,
+            execution_mode_explicit: s.execution_mode_explicit,
             completion_history: s.completion_history.clone(),
         }
     }
@@ -490,6 +498,7 @@ impl SessionMeta {
             archived_at: self.archived_at,
             kind: self.kind,
             execution_mode: self.execution_mode,
+            execution_mode_explicit: self.execution_mode_explicit,
             completion_history: self.completion_history,
             transcript_loaded: false,
             // Until load_transcript, treat disk as authoritative length.

@@ -41,6 +41,79 @@ pub struct RunReview {
     pub fingerprint: String,
 }
 
+/// Whether a workspace can back an isolated, promotable run right now.
+///
+/// A closed vocabulary rather than a boolean: "not a Git repository" and
+/// "Git repository with uncommitted work" call for different operator
+/// actions, and neither is the same as "the Git tooling is unavailable".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationReadiness {
+    /// A Git workspace at a commit with no uncommitted or untracked changes.
+    /// Isolation can be prepared and later promoted through review.
+    CleanGit,
+    /// A Git workspace with uncommitted or untracked changes. Isolating now
+    /// would silently leave that work outside the run.
+    DirtyGit,
+    /// Not a Git workspace, so there is no base revision to isolate from.
+    NotGit,
+    /// Git could not be consulted at all (missing binary, unreadable path).
+    Unavailable,
+}
+
+impl IsolationReadiness {
+    /// The exact wire value used for logging and diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CleanGit => "clean_git",
+            Self::DirtyGit => "dirty_git",
+            Self::NotGit => "not_git",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    /// Whether a *new* session may default to an isolated worktree.
+    ///
+    /// Only a clean Git workspace qualifies: [`prepare`] refuses everything
+    /// else, so defaulting to isolation there would produce a session whose
+    /// first turn always fails.
+    pub const fn permits_default_isolation(self) -> bool {
+        matches!(self, Self::CleanGit)
+    }
+}
+
+/// Probe whether a workspace can back an isolated run, without touching it.
+///
+/// Read-only by construction: it runs `rev-parse` and `status`, and creates no
+/// directory, worktree, or file. [`prepare`] performs the same two checks
+/// before it mutates anything, so a `CleanGit` answer here and a successful
+/// `prepare` cannot disagree about what "clean" means.
+pub fn isolation_readiness(project: &Path) -> IsolationReadiness {
+    let Ok(source) = dunce::canonicalize(project) else {
+        return IsolationReadiness::Unavailable;
+    };
+    if !source.is_dir() {
+        return IsolationReadiness::Unavailable;
+    }
+    match git_command(&source, &["rev-parse", "--verify", "HEAD"], &[], None) {
+        // A repository with no commit yet has no base revision to isolate
+        // from, which `prepare` also refuses.
+        Ok(output) if !output.status.success() => return IsolationReadiness::NotGit,
+        Ok(_) => {}
+        Err(_) => return IsolationReadiness::Unavailable,
+    }
+    match git_command(
+        &source,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+        &[],
+        None,
+    ) {
+        Ok(output) if !output.status.success() => IsolationReadiness::NotGit,
+        Ok(output) if output.stdout.is_empty() => IsolationReadiness::CleanGit,
+        Ok(_) => IsolationReadiness::DirtyGit,
+        Err(_) => IsolationReadiness::Unavailable,
+    }
+}
+
 pub(crate) fn prepare(project: &Path, run_id: &str) -> Result<PreparedRunWorkspace> {
     let source = dunce::canonicalize(project).context("canonicalize isolated source workspace")?;
     if !source.is_dir() {
@@ -659,5 +732,115 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("outside the source workspace"), "{error}");
+    }
+
+    /// The probe and [`prepare`] must agree about what "clean" means: a
+    /// session that defaults to isolation on a workspace `prepare` will refuse
+    /// would fail on its very first turn.
+    #[test]
+    fn the_isolation_probe_agrees_with_what_prepare_will_accept() {
+        let clean = repository();
+        assert_eq!(
+            isolation_readiness(clean.path()),
+            IsolationReadiness::CleanGit
+        );
+        assert!(isolation_readiness(clean.path()).permits_default_isolation());
+        prepare(clean.path(), "probe-agrees").expect("a clean workspace prepares");
+
+        // An untracked file is uncommitted work that isolation would leave
+        // behind, so both the probe and `prepare` refuse it.
+        let dirty = repository();
+        fs::write(dirty.path().join("scratch.txt"), "uncommitted\n").unwrap();
+        assert_eq!(
+            isolation_readiness(dirty.path()),
+            IsolationReadiness::DirtyGit
+        );
+        assert!(!isolation_readiness(dirty.path()).permits_default_isolation());
+        assert!(prepare(dirty.path(), "probe-agrees").is_err());
+
+        // A tracked-but-modified file is the same answer.
+        let modified = repository();
+        fs::write(modified.path().join("README.md"), "changed\n").unwrap();
+        assert_eq!(
+            isolation_readiness(modified.path()),
+            IsolationReadiness::DirtyGit
+        );
+        assert!(prepare(modified.path(), "probe-agrees").is_err());
+    }
+
+    #[test]
+    fn a_workspace_without_a_base_revision_is_never_isolated_by_default() {
+        // Not a repository at all.
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(
+            isolation_readiness(plain.path()),
+            IsolationReadiness::NotGit
+        );
+        assert!(!isolation_readiness(plain.path()).permits_default_isolation());
+        assert!(prepare(plain.path(), "no-base").is_err());
+
+        // A repository with no commit has no HEAD to isolate from.
+        let empty = tempfile::tempdir().unwrap();
+        git(empty.path(), &["init", "-q"]);
+        assert_eq!(
+            isolation_readiness(empty.path()),
+            IsolationReadiness::NotGit
+        );
+        assert!(prepare(empty.path(), "no-base").is_err());
+
+        // A path that does not exist is a tooling answer, not a Git answer.
+        let missing = plain.path().join("does-not-exist");
+        assert_eq!(
+            isolation_readiness(&missing),
+            IsolationReadiness::Unavailable
+        );
+        assert!(!isolation_readiness(&missing).permits_default_isolation());
+    }
+
+    #[test]
+    fn the_probe_creates_nothing() {
+        let clean = repository();
+        let listing = |root: &Path| {
+            let mut names: Vec<_> = fs::read_dir(root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = listing(clean.path());
+        assert_eq!(
+            isolation_readiness(clean.path()),
+            IsolationReadiness::CleanGit
+        );
+        assert_eq!(
+            listing(clean.path()),
+            before,
+            "the probe wrote to the workspace"
+        );
+        // Specifically: no managed worktree root appeared.
+        assert!(!clean.path().join(".grokptah").exists());
+        // And the probe left the workspace clean, so it is still preparable.
+        assert_eq!(
+            isolation_readiness(clean.path()),
+            IsolationReadiness::CleanGit
+        );
+    }
+
+    #[test]
+    fn only_a_clean_git_workspace_permits_default_isolation() {
+        for readiness in [
+            IsolationReadiness::CleanGit,
+            IsolationReadiness::DirtyGit,
+            IsolationReadiness::NotGit,
+            IsolationReadiness::Unavailable,
+        ] {
+            assert_eq!(
+                readiness.permits_default_isolation(),
+                readiness == IsolationReadiness::CleanGit,
+                "{readiness:?}"
+            );
+            assert!(!readiness.as_str().is_empty());
+        }
     }
 }

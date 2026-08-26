@@ -367,21 +367,35 @@ async fn live_get_delivers_events_while_a_run_is_still_active() {
         .unwrap();
     assert_eq!(response.status(), 200);
     let mut chunks = response.bytes_stream();
-    let first = tokio::time::timeout(Duration::from_secs(3), chunks.next())
-        .await
-        .expect("active stream produced no first event")
-        .unwrap()
-        .unwrap();
-    let second = tokio::time::timeout(Duration::from_secs(3), chunks.next())
-        .await
-        .expect("active stream did not deliver a subsequent event")
-        .unwrap()
-        .unwrap();
-    let first = String::from_utf8(first.to_vec()).unwrap();
-    let second = String::from_utf8(second.to_vec()).unwrap();
-    assert!(first.contains("notifications/ptah_event"));
-    assert!(second.contains("notifications/ptah_event"));
-    assert_ne!(first, second, "live stream must deliver distinct updates");
+    let mut buf = String::new();
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    while events.len() < 2 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "active stream did not deliver two ptah_event frames; buf={buf:?} events={events:?}"
+        );
+        let chunk = tokio::time::timeout(remaining, chunks.next())
+            .await
+            .expect("active stream timed out")
+            .expect("active stream ended early")
+            .expect("active stream chunk");
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(idx) = buf.find("\n\n") {
+            let frame = buf[..idx].to_string();
+            buf.replace_range(..idx + 2, "");
+            if frame.contains("notifications/ptah_event") {
+                events.push(frame);
+            }
+        }
+    }
+    assert!(events[0].contains("notifications/ptah_event"));
+    assert!(events[1].contains("notifications/ptah_event"));
+    assert_ne!(
+        events[0], events[1],
+        "live stream must deliver distinct updates"
+    );
 
     let _ = wait_terminal(&mut client, owner.id, workspace.path(), &run_id).await;
     server.stop();

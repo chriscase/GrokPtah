@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +33,10 @@ try {
   await run(npm, ["pack", "--ignore-scripts", "--pack-destination", packDirectory], {
     cwd: fileURLToPath(packageSource),
   });
+  await copyFile(
+    fileURLToPath(new URL("../../docs/schemas/grokptah-account.v1.fixtures.json", import.meta.url)),
+    join(workspace, "account-fixtures.json"),
+  );
   const packed = (await readdir(packDirectory)).find((name) => name.endsWith(".tgz"));
   if (!packed) throw new Error("npm pack did not produce a package archive");
   await run(npm, [
@@ -70,7 +74,18 @@ try {
 import {
   HELP_ARTICLES as UI_CORE_HELP_ARTICLES,
   searchHelpArticles as uiCoreSearchHelpArticles,
+  canLaunchGrokBuild as uiCoreCanLaunchGrokBuild,
+  parseGrokAccountFacts as uiCoreParseGrokAccountFacts,
 } from "@grokptah/client/ui-core";
+import {
+  GROK_ACCOUNT_CONTRACT,
+  absentGrokAccountFacts,
+  canLaunchGrokBuild,
+  grokAccountNotice,
+  parseGrokAccountFacts,
+  parseRunAttribution,
+} from "@grokptah/client";
+import { readFileSync } from "node:fs";
 
 if (HELP_ARTICLES.length < 1) throw new Error("consumer could not read the Help Center corpus");
 if (!Object.isFrozen(HELP_ARTICLES) || !Object.isFrozen(HELP_ENTRIES)) {
@@ -172,7 +187,56 @@ const externalState = externalNotification
 if (externalState?.lastSeq !== 0 || externalState.recoveryRequired) {
   throw new Error("consumer external-worker monitor was not usable");
 }
+
+// ── Grok Build account readiness, read the way ContextDesk would ──
+if (GROK_ACCOUNT_CONTRACT !== "grokptah.account.v1") {
+  throw new Error("consumer account contract version was not usable");
+}
+const accountFixtures = JSON.parse(readFileSync("./account-fixtures.json", "utf8"));
+if (accountFixtures.accepted.length < 8 || accountFixtures.rejected.length < 8) {
+  throw new Error("consumer account fixture coverage shrank");
+}
+for (const testCase of accountFixtures.accepted) {
+  const parsed = parseGrokAccountFacts(testCase.facts);
+  if (parsed === null) {
+    throw new Error(\`consumer could not read readiness for \${testCase.name}\`);
+  }
+  if (canLaunchGrokBuild(parsed) !== testCase.permitsLaunch) {
+    throw new Error(\`consumer disagreed about launch gating for \${testCase.name}\`);
+  }
+  if (grokAccountNotice(parsed).blocksLaunch !== !testCase.permitsLaunch) {
+    throw new Error(\`consumer notice disagreed about gating for \${testCase.name}\`);
+  }
+  if (uiCoreParseGrokAccountFacts(testCase.facts) === null) {
+    throw new Error(\`ui-core subpath could not read readiness for \${testCase.name}\`);
+  }
+  // Nothing a consumer can render may carry credential material.
+  const rendered = JSON.stringify(parsed) + JSON.stringify(grokAccountNotice(parsed));
+  for (const needle of ["bearer", "Bearer", "refresh_token", "refreshToken", "auth_mode", "keychain:"]) {
+    if (rendered.includes(needle)) {
+      throw new Error(\`consumer readiness leaked \${needle} for \${testCase.name}\`);
+    }
+  }
+}
+for (const testCase of accountFixtures.rejected) {
+  if (parseGrokAccountFacts(testCase.facts) !== null) {
+    throw new Error(\`consumer accepted an off-contract projection: \${testCase.name}\`);
+  }
+  if (uiCoreCanLaunchGrokBuild(uiCoreParseGrokAccountFacts(testCase.facts)) !== false) {
+    throw new Error(\`ui-core consumer did not fail closed for \${testCase.name}\`);
+  }
+}
+if (canLaunchGrokBuild(absentGrokAccountFacts()) !== false) {
+  throw new Error("consumer launch gate did not block an absent credential");
+}
+if (parseRunAttribution({ credentialMethod: "grok_build_oidc" })?.credentialMethod !== "grok_build_oidc") {
+  throw new Error("consumer run attribution parser was not usable");
+}
+if (parseRunAttribution({ credentialMethod: "grok_build_oidc", balance: 100 }) !== null) {
+  throw new Error("consumer run attribution parser accepted a balance claim");
+}
 console.log("external consumer fixture passed");
+console.log("grok account readiness consumer fixture passed");
 `,
   );
 

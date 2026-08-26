@@ -1,0 +1,209 @@
+{
+  "$comment": "Shared golden fixtures for urn:grokptah:schema:account:v1. Loaded by the Rust contract tests, the desktop TypeScript tests, and the published-package consumer smoke so all three agree on exactly which projections are readable and which fail closed. Observation clock for every case is 2026-08-25T00:00:00Z (1787616000).",
+  "observedAtUnix": 1787616000,
+  "accepted": [
+    {
+      "name": "usable-oidc-session",
+      "note": "Signed-in Grok Build session with a future expiry.",
+      "permitsLaunch": true,
+      "facts": {
+        "contract": "grokptah.account.v1",
+        "schemaVersion": 1,
+        "credentialMethod": "grok_build_oidc",
+        "accountReference": { "value": "usr-0a1b2c3d", "source": "user_id" },
+        "expiry": { "status": "valid", "expiresAt": "2026-08-25T12:30:00Z", "secondsRemaining": 45000 },
+        "readiness": "usable",
+        "readinessReason": "expiry_in_future"
+      }
+    },
+    {
+      "name": "expired-oidc-session",
+      "note": "Positive expiry evidence blocks new launches.",
+      "permitsLaunch": false,
+      "facts": {
+        "contract": "grokptah.account.v1",
+        "schemaVersion": 1,
+        "credentialMethod": "grok_build_oidc",
+        "accountReference": { "value": "usr-0a1b2c3d", "source": "user_id" },
+        "expiry": { "status": "expired", "expiresAt": "2026-08-24T23:59:59Z", "secondsRemaining": -1 },
+        "readiness": "unusable",
+        "readinessReason": "credential_expired"
+      }
+    },
+    {
+      "name": "api-key-route-without-expiry",
+      "note": "No expiry evidence is unknown, not expired, and never blocks.",
+      "permitsLaunch": true,
+      "facts": {
+        "contract": "grokptah.account.v1",
+        "schemaVersion": 1,
+        "credentialMethod": "api_key",
+        "expiry": { "status": "absent" },
+        "readiness": "unknown",
+        "readinessReason": "expiry_not_provided"
+      }
+    },
+    {
+      "name": "unparseable-expiry-stays-honest",
+      "note": "An unreadable stamp is reported as unknown and never echoed.",
+      "permitsLaunch": true,
+      "facts": {
+        "contract": "grokptah.account.v1",
+        "schemaVersion": 1,
+        "credentialMethod": "grok_build_oidc",
+        "accountReference": { "value": "usr-0a1b2c3d", "source": "user_id" },
+        "expiry": { "status": "unparseable" },
+        "readiness": "unknown",
+        "readinessReason": "expiry_unparseable"
+      }
+    },
+    {
+      "name": "unrecognized-route-makes-no-claim",
+      "note": "A hostile or novel auth_mode collapses to unknown; it never earns usable and never blocks.",
+      "permitsLaunch": true,
+      "facts": {
+        "contract": "grokptah.account.v1",
+        "schemaVersion": 1,
+        "credentialMethod": "unknown",
+        "accountReference": { "value": "usr-0a1b2c3d", "source": "user_id" },
+        "expiry": { "status": "valid", "expiresAt": "2027-01-01T00:00:00Z", "secondsRemaining": 11145600 },
+        "readiness": "unknown",
+        "readinessReason": "method_unrecognized"
+      }
+    },
+    {
+      "name": "team-scoped-account-reference",
+      "note": "Falls back to a team identifier when no individual identity is present.",
+      "permitsLaunch": true,
+      "facts": {
+        "contract": "grokptah.account.v1",
+        "schemaVersion": 1,
+        "credentialMethod": "grok_build_api_key",
+        "accountReference": { "value": "team-9z8y", "source": "team_id" },
+        "expiry": { "status": "valid", "expiresAt": "2027-01-01T00:00:00Z", "secondsRemaining": 11145600 },
+        "readiness": "usable",
+        "readinessReason": "expiry_in_future"
+      }
+    },
+    {
+      "name": "account-identity-absent",
+      "note": "Missing durable identity drops the reference instead of inventing one.",
+      "permitsLaunch": true,
+      "facts": {
+        "contract": "grokptah.account.v1",
+        "schemaVersion": 1,
+        "credentialMethod": "grok_build_oidc",
+        "expiry": { "status": "valid", "expiresAt": "2027-01-01T00:00:00Z", "secondsRemaining": 11145600 },
+        "readiness": "usable",
+        "readinessReason": "expiry_in_future"
+      }
+    },
+    {
+      "name": "no-credential-at-all",
+      "note": "Nothing resolved on any route; blocks with a sign-in remedy.",
+      "permitsLaunch": false,
+      "facts": {
+        "contract": "grokptah.account.v1",
+        "schemaVersion": 1,
+        "credentialMethod": "absent",
+        "expiry": { "status": "absent" },
+        "readiness": "unusable",
+        "readinessReason": "no_credential"
+      }
+    }
+  ],
+  "rejected": [
+    {
+      "name": "bearer-smuggled-as-an-extra-key",
+      "facts": {
+        "contract": "grokptah.account.v1",
+        "schemaVersion": 1,
+        "credentialMethod": "grok_build_oidc",
+        "expiry": { "status": "absent" },
+        "readiness": "unknown",
+        "readinessReason": "expiry_not_provided",
+        "bearer": "xai-SENTINEL-BEARER-DO-NOT-LEAK"
+      }
+    },
+    {
+      "name": "free-form-auth-mode-smuggled-as-an-extra-key",
+      "facts": {
+        "contract": "grokptah.account.v1",
+        "schemaVersion": 1,
+        "credentialMethod": "grok_build_oidc",
+        "expiry": { "status": "absent" },
+        "readiness": "unknown",
+        "readinessReason": "expiry_not_provided",
+        "authMode": "oidc\"; DROP TABLE runs; --"
+      }
+    },
+    {
+      "name": "credential-reference-smuggled-as-an-extra-key",
+      "facts": {
+        "contract": "grokptah.account.v1",
+        "schemaVersion": 1,
+        "credentialMethod": "api_key",
+        "expiry": { "status": "absent" },
+        "readiness": "unknown",
+        "readinessReason": "expiry_not_provided",
+        "credentialRef": "keychain:provider/xai/api-key"
+      }
+    },
+    {
+      "name": "verdict-does-not-follow-from-expiry-evidence",
+      "facts": {
+        "contract": "grokptah.account.v1",
+        "schemaVersion": 1,
+        "credentialMethod": "grok_build_oidc",
+        "expiry": { "status": "expired", "expiresAt": "2026-08-24T23:59:59Z", "secondsRemaining": -1 },
+        "readiness": "usable",
+        "readinessReason": "expiry_in_future"
+      }
+    },
+    {
+      "name": "account-reference-is-not-opaque",
+      "facts": {
+        "contract": "grokptah.account.v1",
+        "schemaVersion": 1,
+        "credentialMethod": "grok_build_oidc",
+        "accountReference": { "value": "operator@example.test", "source": "user_id" },
+        "expiry": { "status": "absent" },
+        "readiness": "unknown",
+        "readinessReason": "expiry_not_provided"
+      }
+    },
+    {
+      "name": "unparseable-expiry-tries-to-echo-a-timestamp",
+      "facts": {
+        "contract": "grokptah.account.v1",
+        "schemaVersion": 1,
+        "credentialMethod": "grok_build_oidc",
+        "expiry": { "status": "unparseable", "expiresAt": "2026-08-25T12:30:00Z", "secondsRemaining": 45000 },
+        "readiness": "unknown",
+        "readinessReason": "expiry_unparseable"
+      }
+    },
+    {
+      "name": "wrong-contract-identifier",
+      "facts": {
+        "contract": "grokptah.account.v2",
+        "schemaVersion": 1,
+        "credentialMethod": "api_key",
+        "expiry": { "status": "absent" },
+        "readiness": "unknown",
+        "readinessReason": "expiry_not_provided"
+      }
+    },
+    {
+      "name": "out-of-vocabulary-credential-method",
+      "facts": {
+        "contract": "grokptah.account.v1",
+        "schemaVersion": 1,
+        "credentialMethod": "oidc",
+        "expiry": { "status": "absent" },
+        "readiness": "unknown",
+        "readinessReason": "expiry_not_provided"
+      }
+    }
+  ]
+}

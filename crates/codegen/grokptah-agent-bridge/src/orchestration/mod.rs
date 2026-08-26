@@ -2,11 +2,17 @@
 //!
 //! Pure policy + durable records live here; the MCP transport is a thin adapter.
 
+pub(crate) mod authority;
 mod authz;
 mod service;
 mod store;
 mod types;
 
+pub use authority::{
+    mint_provider_run_envelope, public_send_state, AuthorityKey, ClassifiedId, ExecutionBounds,
+    HostGrant, HostGrantClass, IdentityClass, ProviderRunMint, UnverifiedEnvelope,
+    VerifiedEnvelope,
+};
 pub use authz::{canonical_workspace, constant_time_eq, AuthContext, WorkspaceAllowlist};
 pub(crate) use service::apply_run_aggregate;
 pub use service::{OrchestrationConfig, OrchestrationService};
@@ -15,6 +21,7 @@ pub use types::{
     hash_payload, is_recognized_test_command, merge_bounds, prompt_preview, reject_control_prompt,
     safe_id_filename, AgentRecord, AgentResumePlan, AgentState, AuditEntry, ChangeRecord,
     ContinuationCheckpoint, ContinuationReason, IdempotencyReceipt, OrchError, OrchErrorCode,
-    PromotionState, RunAggregates, RunApproval, RunBounds, RunExecution, RunExecutionMode,
-    RunRecord, RunState, TestObservation, CONTROL_TOOLS, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
+    PromotionState, RollbackGuarantee, RunAggregates, RunApproval, RunBounds, RunExecution,
+    RunExecutionMode, RunRecord, RunState, TestObservation, CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    MAX_AGENT_CONTEXT_BYTES,
 };

@@ -10,8 +10,14 @@ use parking_lot::Mutex;
 use serde_json::json;
 use uuid::Uuid;
 
+use grokptah_agent_sdk::attempt::SendState;
+use grokptah_agent_sdk::launch::LaunchReason;
+use grokptah_agent_sdk::outcome::RunOutcomeClass;
+
+use crate::attempt_binding::{self, RunPrincipalContext};
 use crate::event_bus::{CursorExpiredError, EventBus, EventReceiver, JournalPage};
 use crate::host::AgentHostHandle;
+use crate::launch_truth::{self, LaunchGate};
 use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
 use crate::session::{SessionKind, WorkspaceStatus};
 
@@ -58,12 +64,18 @@ pub struct OrchestrationService {
     host: AgentHostHandle,
     bus: EventBus,
     store: OrchStore,
+    /// Re-resolves and enforces launch truth immediately before every durable
+    /// admission. Injectable so admission policy is testable without a
+    /// keychain, a network, or a wall clock.
+    launch_gate: Arc<dyn LaunchGate>,
     config: Mutex<OrchestrationConfig>,
     self_ref: Weak<OrchestrationService>,
     pending_admissions: Mutex<AdmissionQueueState>,
     scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Host HMAC key. Absence fail-closes provider-bound admission.
+    authority_key: Mutex<Option<std::sync::Arc<super::authority::AuthorityKey>>>,
 }
 
 /// Authorized bounds for a live run event stream.
@@ -176,12 +188,412 @@ impl Drop for IdempotencyLease {
     }
 }
 
+/// Open the first provider attempt for a freshly admitted run.
+///
+/// Nothing is recorded when the admission reached no provider: an offline
+/// host issues no request, and an attempt record would imply one that can
+/// never exist.
+impl OrchestrationService {
+    fn open_first_attempt(
+        &self,
+        run: &RunRecord,
+        prompt: &str,
+        admission: &crate::launch_truth::Admission,
+    ) -> Result<(), OrchError> {
+        // Derive the ordinal from what is already recorded rather than
+        // assuming this is the first: a resumed or replayed admission must
+        // not reuse an ordinal, because the provider idempotency key is
+        // derived from it.
+        let recorded = self
+            .store
+            .list_attempts_for_run(&run.run_id)
+            .unwrap_or_default();
+        if !attempt_binding::permits_new_request(&recorded) {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "an earlier provider attempt for this run is still unreconciled",
+            ));
+        }
+        let ordinal = attempt_binding::next_ordinal(&recorded);
+        let Some(attempt) = attempt_binding::bind_attempt(
+            &run.run_id,
+            ordinal,
+            &run.request_id,
+            prompt,
+            &RunPrincipalContext {
+                tenant: None,
+                project: None,
+                workspace: run.workspace.clone(),
+                session: run.session_id,
+                authority: attempt_binding::initial_authority(),
+            },
+            admission.facts(),
+        ) else {
+            return Ok(());
+        };
+        let attempt = attempt_binding::with_selection(
+            attempt,
+            admission.facts().map(|facts| facts.truth.provider.as_str()),
+            None,
+        );
+        self.seal_provider_attempt(&attempt, run)?;
+        self.store.open_attempt(&attempt).map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                format!("could not record the provider attempt: {error}"),
+            )
+        })
+    }
+
+    fn seal_provider_attempt(
+        &self,
+        attempt: &grokptah_agent_sdk::attempt::ProviderAttempt,
+        run: &RunRecord,
+    ) -> Result<(), OrchError> {
+        let key = self.authority_key.lock().clone().ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Unauthenticated,
+                "host authority key is absent",
+            )
+        })?;
+        let ids = vec![
+            super::ClassifiedId::new(
+                super::IdentityClass::Request,
+                attempt.intent.request_id.as_str(),
+            )
+            .map_err(|_| {
+                OrchError::new(OrchErrorCode::InvalidRequest, "request identity is invalid")
+            })?,
+            super::ClassifiedId::new(
+                super::IdentityClass::Work,
+                format!("work-{}", attempt.ordinal),
+            )
+            .map_err(|_| {
+                OrchError::new(OrchErrorCode::InvalidRequest, "work identity is invalid")
+            })?,
+            super::ClassifiedId::new(super::IdentityClass::Run, attempt.run_id.as_str()).map_err(
+                |_| OrchError::new(OrchErrorCode::InvalidRequest, "run identity is invalid"),
+            )?,
+            super::ClassifiedId::new(super::IdentityClass::Attempt, attempt.attempt_id.as_str())
+                .map_err(|_| {
+                    OrchError::new(OrchErrorCode::InvalidRequest, "attempt identity is invalid")
+                })?,
+            super::ClassifiedId::new(
+                super::IdentityClass::Lease,
+                format!("lease:{}", attempt.ordinal),
+            )
+            .map_err(|_| {
+                OrchError::new(OrchErrorCode::InvalidRequest, "lease identity is invalid")
+            })?,
+            super::ClassifiedId::new(
+                super::IdentityClass::ProviderRequest,
+                attempt.intent.provider_idempotency_key.as_str(),
+            )
+            .map_err(|_| {
+                OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "provider-request identity is invalid",
+                )
+            })?,
+        ];
+        let verified = super::mint_provider_run_envelope(
+            key.as_ref(),
+            super::ProviderRunMint {
+                principal: attempt
+                    .subject
+                    .principal
+                    .as_ref()
+                    .map(|id| id.as_str())
+                    .unwrap_or("principal-absent"),
+                tenant: attempt
+                    .subject
+                    .tenant
+                    .as_ref()
+                    .map(|id| id.as_str())
+                    .unwrap_or("tenant-absent"),
+                project: attempt
+                    .subject
+                    .project
+                    .as_ref()
+                    .map(|id| id.as_str())
+                    .unwrap_or("project-absent"),
+                workspace: attempt.subject.workspace.as_str(),
+                session: attempt.subject.session.as_str(),
+                agent: run.agent_id.as_deref(),
+                provider: attempt.route.provider.as_str(),
+                profile: attempt
+                    .route
+                    .profile
+                    .as_ref()
+                    .map(|id| id.as_str())
+                    .unwrap_or("profile-default"),
+                endpoint_fingerprint: "ep-fp-host",
+                model: attempt.route.model.value.as_str(),
+                effort: attempt.route.effort.as_ref().map(|id| id.as_str()),
+                identities: ids,
+                intent_digest: attempt.intent.digest.as_str(),
+                bounds: super::ExecutionBounds {
+                    max_duration_ms: run.bounds.max_duration_ms,
+                    max_rounds: run.bounds.max_rounds,
+                    max_tokens: 0,
+                    max_cost_cents: 0,
+                    max_tools: 0,
+                },
+            },
+        )
+        .map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Unauthenticated,
+                format!("authority envelope failed: {}", error.as_str()),
+            )
+        })?;
+        let _grant = verified.grant().map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                format!("grant derivation failed: {}", error.as_str()),
+            )
+        })?;
+        let projection = verified
+            .project_public(super::public_send_state(attempt.send_state))
+            .map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    format!("public authority projection failed: {}", error.as_str()),
+                )
+            })?;
+        self.store
+            .save_authority_projection(&run.run_id, &projection)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Move this run's open attempt to `sending`.
+///
+/// Called immediately before the model turn, so the durable record crosses the
+/// send boundary at the same moment the request does. A run with no recorded
+/// attempt (an offline host) has nothing to advance and succeeds trivially.
+fn begin_send(store: &OrchStore, run_id: &str) -> Result<(), String> {
+    let attempts = store
+        .list_attempts_for_run(run_id)
+        .map_err(|error| error.to_string())?;
+    if !attempt_binding::permits_new_request(&attempts) {
+        return Err(
+            "an earlier provider attempt for this run is still unreconciled; reconcile it against \
+             its idempotency key before issuing an equivalent request"
+                .into(),
+        );
+    }
+    let Some(open) = attempts
+        .iter()
+        .find(|attempt| attempt.send_state == SendState::KnownNotSent)
+    else {
+        return Ok(());
+    };
+    store
+        .update_attempt(open.attempt_id.as_str(), |attempt| {
+            attempt
+                .advance(SendState::Sending)
+                .map_err(anyhow::Error::msg)
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Record a refusal that happened at the send boundary itself.
+fn record_send_refusal(store: &OrchStore, run_id: &str, reason: &str) {
+    let _ = store.update_run(run_id, |run| {
+        if run.state.is_terminal() {
+            return Ok(());
+        }
+        run.state = RunState::Interrupted;
+        run.queue_position = None;
+        run.terminal_result = Some(RunOutcomeClass::Blocked.as_str().into());
+        run.error_code = Some(
+            grokptah_agent_sdk::outcome::RunFailureKind::LaunchBlocked
+                .as_str()
+                .into(),
+        );
+        run.final_response = Some(reason.to_string());
+        run.updated_at = Utc::now();
+        Ok(())
+    });
+}
+
+/// Move any in-flight attempt for this run to `uncertain`.
+///
+/// A cancelled or abandoned in-flight request is exactly ambiguous: it may
+/// have executed. Recording that is what stops a later restart from quietly
+/// duplicating it.
+fn reconcile_run_attempts(store: &OrchStore, run_id: &str) {
+    let Ok(attempts) = store.list_attempts_for_run(run_id) else {
+        return;
+    };
+    for attempt in attempts {
+        if attempt.send_state != SendState::Sending {
+            continue;
+        }
+        let _ = store.update_attempt(attempt.attempt_id.as_str(), |attempt| {
+            attempt_binding::reconcile_interrupted(attempt).map_err(anyhow::Error::msg)
+        });
+    }
+}
+
+/// Settle this run's in-flight attempt once the turn is over.
+///
+/// A parsed reply is an acknowledgement. The lattice is one step per durable
+/// write: `Sending` becomes `Sent` then `Settled` on success, or `Uncertain`
+/// when we never learned whether the request executed. `Sent`/`Responding`
+/// always finish as `Settled` — they already left the host and must not be
+/// auto-retried.
+fn settle_run_attempts(
+    store: &OrchStore,
+    run_id: &str,
+    result: &Result<String, String>,
+    candidate: &RunRecord,
+) {
+    let Ok(attempts) = store.list_attempts_for_run(run_id) else {
+        return;
+    };
+    let usage = attempt_binding::usage_receipt(
+        candidate.aggregates.usage.prompt_tokens,
+        candidate.aggregates.usage.completion_tokens,
+    );
+    for attempt in attempts {
+        let id = attempt.attempt_id.as_str().to_string();
+        match result {
+            Ok(_) => {
+                let _ = store.update_attempt(&id, |attempt| {
+                    attempt.receipts = attempt_binding::replied(usage);
+                    match attempt.send_state {
+                        SendState::Sending => {
+                            attempt.advance(SendState::Sent).map_err(anyhow::Error::msg)
+                        }
+                        SendState::Sent | SendState::Responding | SendState::Uncertain => attempt
+                            .advance(SendState::Settled)
+                            .map_err(anyhow::Error::msg),
+                        _ => Ok(()),
+                    }
+                });
+                let _ = store.update_attempt(&id, |attempt| {
+                    if attempt.send_state == SendState::Sent
+                        || attempt.send_state == SendState::Responding
+                    {
+                        attempt
+                            .advance(SendState::Settled)
+                            .map_err(anyhow::Error::msg)
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+            Err(_) => match attempt.send_state {
+                SendState::Sending => {
+                    let _ = store.update_attempt(&id, |attempt| {
+                        attempt
+                            .advance(SendState::Uncertain)
+                            .map_err(anyhow::Error::msg)
+                    });
+                }
+                SendState::Sent | SendState::Responding => {
+                    let _ = store.update_attempt(&id, |attempt| {
+                        attempt
+                            .advance(SendState::Settled)
+                            .map_err(anyhow::Error::msg)
+                    });
+                }
+                _ => {}
+            },
+        }
+    }
+}
+
+/// Translate a fail-closed launch refusal into a share-safe orchestration
+/// error.
+///
+/// The message carries only the closed [`LaunchReason`] wire value, which is a
+/// fixed vocabulary chosen so every entry names an operator action. No
+/// endpoint, account identity, or credential detail crosses this boundary.
+fn launch_refusal(reason: LaunchReason) -> OrchError {
+    let verdict = launch_truth::refusal_verdict(reason);
+    let code = match verdict.class {
+        RunOutcomeClass::Blocked => match verdict.kind.error_code() {
+            grokptah_agent_sdk::error::ErrorCode::Unauthenticated => OrchErrorCode::Unauthenticated,
+            _ => OrchErrorCode::ForbiddenScope,
+        },
+        RunOutcomeClass::Failed => OrchErrorCode::CapacityExhausted,
+        RunOutcomeClass::Indeterminate => OrchErrorCode::Internal,
+    };
+    OrchError::new(
+        code,
+        format!(
+            "launch refused before admission: {} ({})",
+            reason.as_str(),
+            verdict.terminal_result()
+        ),
+    )
+}
+
+/// Record a typed non-success terminal state for a run whose launch facts
+/// drifted between admission and start.
+///
+/// The state is taken from [`grokptah_agent_sdk::outcome`], which has no arm
+/// producing `Completed`, so this can never mark drifted work as successful.
+/// `final_response` is left untouched: whatever help the transcript already
+/// carries stays readable.
+fn record_launch_drift(store: &OrchStore, run_id: &str, reason: LaunchReason) {
+    let verdict = launch_truth::refusal_verdict(reason);
+    let state = match verdict.state {
+        grokptah_agent_sdk::run::DurableRunState::Failed => RunState::Failed,
+        grokptah_agent_sdk::run::DurableRunState::Cancelled => RunState::Cancelled,
+        grokptah_agent_sdk::run::DurableRunState::LimitReached => RunState::LimitReached,
+        // `Queued`, `Running`, and `Interrupted` all mean "not finished
+        // successfully"; only `Interrupted` is a terminal state that demands
+        // explicit recovery, which is exactly what a drifted launch needs.
+        _ => RunState::Interrupted,
+    };
+    debug_assert!(
+        state != RunState::Completed,
+        "a launch drift must never be recorded as a completed run"
+    );
+    let _ = store.update_run(run_id, |run| {
+        if run.state.is_terminal() {
+            return Ok(());
+        }
+        run.state = state;
+        run.queue_position = None;
+        run.terminal_result = Some(verdict.terminal_result().into());
+        run.error_code = Some(verdict.error_code_str().into());
+        run.updated_at = Utc::now();
+        Ok(())
+    });
+}
+
 impl OrchestrationService {
     pub fn new(
         host: AgentHostHandle,
         bus: EventBus,
         store: OrchStore,
+        config: OrchestrationConfig,
+    ) -> Arc<Self> {
+        // Reuse the host's own gate rather than building a second one, so a
+        // coordinator submission and a desktop turn can never be admitted
+        // under different policies.
+        let gate = host.launch_gate();
+        Self::with_launch_gate(host, bus, store, config, gate)
+    }
+
+    /// Construct a service with an explicit launch gate.
+    ///
+    /// Used by tests to pin admission policy deterministically. Production
+    /// goes through [`OrchestrationService::new`], which installs the gate
+    /// that reads live local credentials.
+    pub fn with_launch_gate(
+        host: AgentHostHandle,
+        bus: EventBus,
+        store: OrchStore,
         mut config: OrchestrationConfig,
+        launch_gate: Arc<dyn LaunchGate>,
     ) -> Arc<Self> {
         host.install_orchestration_store(store.clone());
         // The host owns the process-wide ledger. If desktop bootstrap opened
@@ -198,11 +610,19 @@ impl OrchestrationService {
             host,
             bus,
             store,
+            launch_gate,
             config: Mutex::new(config),
             self_ref: self_ref.clone(),
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
             scheduler_watcher: Mutex::new(None),
             join_handles: Mutex::new(Vec::new()),
+            authority_key: Mutex::new(
+                super::authority::AuthorityKey::load_or_provision(
+                    &crate::discover::grokptah_home().join("authority.key"),
+                )
+                .ok()
+                .map(std::sync::Arc::new),
+            ),
         });
         service.start_scheduler_watcher();
         service
@@ -717,7 +1137,7 @@ impl OrchestrationService {
     /// Resume one verified persistent agent through the service adapter. The
     /// host owns the idempotency receipt and checkpoint validation; this layer
     /// adds workspace/session authorization and transport bounds.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // Keeps the resume authorization fence explicit.
     pub async fn resume_persistent_agent(
         &self,
         _auth: &AuthContext,
@@ -878,8 +1298,25 @@ impl OrchestrationService {
 
     fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
-        serde_json::to_value(run)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
+        let mut value = serde_json::to_value(&run)
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        if let Ok(Some(authority)) = self.store.load_authority_projection(&run.run_id) {
+            value["authority"] = serde_json::to_value(authority)
+                .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        }
+        if let Ok(attempts) = self.store.list_attempts_for_run(&run.run_id) {
+            if let Some(latest) = attempts.last() {
+                value["sendState"] = serde_json::json!(latest.send_state.as_str());
+                value["attemptId"] = serde_json::json!(latest.attempt_id.as_str());
+                value["providerRequestId"] =
+                    serde_json::json!(latest.intent.provider_idempotency_key.as_str());
+                if latest.send_state.requires_reconciliation() {
+                    value["requiredOperatorAction"] =
+                        serde_json::json!("reconcile_uncertain_dispatch");
+                }
+            }
+        }
+        Ok(value)
     }
 
     pub fn get_progress(
@@ -1290,6 +1727,57 @@ impl OrchestrationService {
         // entirely of other sessions and advance the cursor past this run's
         // events. `read_range_all` is bounded by the journal retention policy
         // and preserves cursor-expiry failures instead of silently skipping.
+        if let Some(end) = run.end_seq {
+            let oldest = self.bus.oldest_seq();
+            if end > 0 && oldest > 1 && end < oldest.saturating_sub(1) {
+                return Err(OrchError::new(
+                    OrchErrorCode::CursorExpired,
+                    "event cursor expired; restart from seq 0 or latest",
+                ));
+            }
+        }
+        let mut entries = self.read_run_journal(&run, after_seq, limit)?;
+        if entries.is_empty() {
+            let probe = self.bus.read_after(after_seq, 1);
+            if probe.cursor_expired {
+                return Err(OrchError::new(
+                    OrchErrorCode::CursorExpired,
+                    "event cursor expired; restart from seq 0 or latest",
+                ));
+            }
+            if probe.writer_pending && probe.entries.is_empty() {
+                if self.bus.last_persistence_error().is_some() || !self.bus.durable_writer_alive() {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Internal,
+                        "durable journal writer failed before the requested watermark",
+                    ));
+                }
+                return Err(OrchError::new(
+                    OrchErrorCode::Timeout,
+                    "durable journal has not reached the requested watermark; retry",
+                ));
+            }
+            if !probe.entries.is_empty() {
+                // Writer caught up after the first range walk; never return
+                // the stale empty page as a durable catch-up.
+                entries = self.read_run_journal(&run, after_seq, limit)?;
+            }
+        }
+        let next_cursor = entries.last().map(|e| e.seq);
+        Ok(JournalPage {
+            entries,
+            next_cursor,
+            cursor_expired: false,
+            writer_pending: false,
+        })
+    }
+
+    fn read_run_journal(
+        &self,
+        run: &RunRecord,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<crate::event_bus::JournalEntry>, OrchError> {
         let mut entries = self
             .bus
             .read_range_all(after_seq, run.end_seq, Some(run.session_id))
@@ -1304,12 +1792,7 @@ impl OrchestrationService {
                 && run.end_seq.map(|s| e.seq <= s).unwrap_or(true)
         });
         entries.truncate(limit.clamp(1, 500));
-        let next_cursor = entries.last().map(|e| e.seq);
-        Ok(JournalPage {
-            entries,
-            next_cursor,
-            cursor_expired: false,
-        })
+        Ok(entries)
     }
 
     pub fn get_changes(
@@ -2285,7 +2768,7 @@ impl OrchestrationService {
                     session_id,
                     Path::new(&run.workspace),
                     error,
-                ))
+                ));
             }
         };
         let Some(execution) = run.execution.as_ref() else {
@@ -2417,7 +2900,7 @@ impl OrchestrationService {
                         session_id,
                         Path::new(&run.workspace),
                         OrchError::new(OrchErrorCode::Conflict, error.to_string()),
-                    ))
+                    ));
                 }
             };
         let response = serde_json::to_value(promoted)
@@ -2470,7 +2953,7 @@ impl OrchestrationService {
                     session_id,
                     Path::new(&run.workspace),
                     OrchError::new(OrchErrorCode::Conflict, error.to_string()),
-                ))
+                ));
             }
         };
         let response = serde_json::to_value(discarded)
@@ -2633,6 +3116,23 @@ impl OrchestrationService {
             IdempotencyStart::Perform(lease) => lease,
         };
 
+        // Re-resolve and refresh launch truth before anything durable exists.
+        // A run record is a promise about where tokens will be spent, so the
+        // facts behind that promise are established here, not inherited from
+        // whatever the UI believed when the operator pressed the button.
+        let admission = match self.launch_gate.admit(None).await {
+            Ok(facts) => facts,
+            Err(reason) => {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    None,
+                    session_id,
+                    &claimed,
+                    launch_refusal(reason),
+                ));
+            }
+        };
+
         // Give older queued work first claim on any newly available capacity.
         self.pump_pending();
         let run_id = Uuid::new_v4().to_string();
@@ -2684,6 +3184,8 @@ impl OrchestrationService {
             progress: None,
             execution: None,
             approval: None,
+            launch_requirement: admission.requirement(),
+            attribution: admission.attribution(),
         };
         if let Err(e) = self.store.save_run(&run) {
             if !queued {
@@ -2691,6 +3193,16 @@ impl OrchestrationService {
                 self.release_capacity(&run_id);
             }
             let e = OrchError::new(OrchErrorCode::Internal, e.to_string());
+            return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
+        }
+        // Record the provider attempt *before* anything can reach a provider.
+        // A process that dies between here and dispatch leaves an attempt in
+        // `known_not_sent`, which is the only state that is safe to retry.
+        if let Err(e) = self.open_first_attempt(&run, &prompt, &admission) {
+            if !queued {
+                self.host.release_turn_reservation(session_id, &run_id);
+                self.release_capacity(&run_id);
+            }
             return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
         }
 
@@ -2807,6 +3319,36 @@ impl OrchestrationService {
                 ),
             ));
         }
+        // An interrupted run whose request may already have reached the
+        // provider is not retryable: repeating it would duplicate whatever it
+        // did. The recorded idempotency key is how that attempt gets settled.
+        match self.store.unreconciled_attempts(source_run_id) {
+            Ok(unreconciled) if !unreconciled.is_empty() => {
+                let keys = unreconciled
+                    .iter()
+                    .map(|attempt| attempt.intent.provider_idempotency_key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(fail(
+                    self,
+                    OrchError::new(
+                        OrchErrorCode::Conflict,
+                        format!(
+                            "this run has {} provider attempt(s) whose outcome is unknown; \
+                             reconcile them against idempotency key(s) {keys} before retrying",
+                            unreconciled.len()
+                        ),
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(fail(
+                    self,
+                    OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                ));
+            }
+        }
 
         let previous_mode = source
             .execution
@@ -2901,10 +3443,15 @@ impl OrchestrationService {
         let store = self.store.clone();
         let bus = self.bus.clone();
         let service_ref = self.self_ref.clone();
+        let launch_gate = self.launch_gate.clone();
         let session_id = run.session_id;
         let rid = run.run_id.clone();
         let max_ms = run.bounds.max_duration_ms;
         let max_rounds = run.bounds.max_rounds;
+        // A queued run can wait arbitrarily long between admission and start,
+        // during which a credential can expire, be revoked, or be re-pointed
+        // at another provider. Re-check against the facts it was admitted on.
+        let pinned = run.launch_requirement.clone();
 
         // Dedicated aggregator task: must not share a biased select with the
         // duration deadline (chatty ShellOutput must not starve max_duration_ms).
@@ -2922,7 +3469,40 @@ impl OrchestrationService {
                 host: host.clone(),
                 run_id: rid.clone(),
             };
-            let prompt_fut = host.session_prompt_reserved_with_max_rounds_for_run(
+            // Re-resolve and refresh before spending anything. A drift here is
+            // recorded as a typed non-success terminal state; the transcript
+            // and any partial help the operator already has stay intact.
+            if let Err(reason) = launch_gate.admit(pinned.as_ref()).await {
+                agg_task.abort();
+                record_launch_drift(&store, &rid, reason);
+                reconcile_run_attempts(&store, &rid);
+                drop(admission_guard);
+                return;
+            }
+            // The send boundary. From here the request may reach a provider,
+            // so it stops being safe to repeat on its own.
+            if let Err(error) = begin_send(&store, &rid) {
+                agg_task.abort();
+                record_send_refusal(&store, &rid, &error);
+                drop(admission_guard);
+                return;
+            }
+            let send_binding = store.list_attempts_for_run(&rid).ok().and_then(|attempts| {
+                attempts.into_iter().rev().find_map(|attempt| {
+                    (attempt.send_state == SendState::Sending).then(|| {
+                        crate::physical_send::PhysicalSendBinding {
+                            store: store.clone(),
+                            attempt_id: attempt.attempt_id.as_str().to_string(),
+                            provider_request_id: attempt
+                                .intent
+                                .provider_idempotency_key
+                                .as_str()
+                                .to_string(),
+                        }
+                    })
+                })
+            });
+            let prompt_call = host.session_prompt_reserved_with_max_rounds_for_run(
                 session_id,
                 prompt,
                 Some(max_rounds.max(1)),
@@ -2930,6 +3510,7 @@ impl OrchestrationService {
                 &rid,
                 execution_mode,
             );
+            let prompt_fut = crate::physical_send::scope_optional(send_binding, prompt_call);
             tokio::pin!(prompt_fut);
             let deadline = tokio::time::sleep(Duration::from_millis(max_ms.max(1)));
             tokio::pin!(deadline);
@@ -3008,6 +3589,7 @@ impl OrchestrationService {
                     }
                 }
             }
+            settle_run_attempts(&store, &rid, &durable_result, &candidate);
             if candidate.aggregates.verification.is_none() {
                 let observations = crate::completion::observations_from_run(
                     candidate.aggregates.changes.len(),
@@ -3429,6 +4011,11 @@ impl OrchestrationService {
             current.terminal_result = Some("cancelled".into());
             Ok(())
         });
+        // Cancelling stops this host from waiting; it does not un-send a
+        // request that already left. Any in-flight attempt becomes
+        // `uncertain` so a later restart has to reconcile it rather than
+        // silently issuing an equivalent one.
+        reconcile_run_attempts(&self.store, rid);
         if !matches!(cancel_update, Ok(Some(_))) {
             let message = match cancel_update {
                 Ok(None) => "run record disappeared during cancel".into(),

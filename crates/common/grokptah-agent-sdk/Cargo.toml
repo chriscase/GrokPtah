@@ -9,5 +9,11 @@ license.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+# Test-only. The published contract and its JSON Schema must be strict peers,
+# and only a real Draft 2020-12 validator can prove that; a hand-rolled check
+# would only prove the schema agrees with our reading of it.
+[dev-dependencies]
+jsonschema = { workspace = true }
+
 [lints]
 workspace = true
