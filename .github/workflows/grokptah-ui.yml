@@ -1,0 +1,96 @@
+name: GrokPtah UI consumer matrix
+
+on:
+  pull_request:
+    paths:
+      - "packages/grokptah-ui/**"
+      - "desktop/**"
+      - ".github/workflows/grokptah-ui.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "packages/grokptah-ui/**"
+      - "desktop/**"
+      - ".github/workflows/grokptah-ui.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  ui-consumer:
+    name: React ${{ matrix.react-host }} consumer
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        react-host:
+          - "18"
+          - "19"
+    steps:
+      - name: Checkout exact head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          clean: true
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20.19.0"
+          cache: npm
+          cache-dependency-path: |
+            desktop/package-lock.json
+            packages/grokptah-ui/package-lock.json
+
+      - name: Fetch audited parent
+        run: git fetch --no-tags origin codex/external-worker-hardening-v1
+
+      - name: Install desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Install UI dependencies
+        working-directory: packages/grokptah-ui
+        run: npm ci
+
+      - name: Verify existing desktop public surface
+        working-directory: desktop
+        run: npm run verify:public
+
+      - name: Typecheck UI package
+        working-directory: packages/grokptah-ui
+        run: npm run typecheck
+
+      - name: Run focused UI tests
+        working-directory: packages/grokptah-ui
+        run: npm run test:focused
+
+      - name: Run full UI tests
+        working-directory: packages/grokptah-ui
+        run: npm test
+
+      - name: Build UI package
+        working-directory: packages/grokptah-ui
+        run: npm run build
+
+      - name: Check UI package inventory
+        working-directory: packages/grokptah-ui
+        run: npm run pack:dry-run
+
+      - name: Verify exact candidate
+        working-directory: packages/grokptah-ui
+        run: npm run verify -- --exact-candidate
+
+      - name: Run selected consumer smoke
+        working-directory: packages/grokptah-ui
+        run: npm run smoke:contextdesk -- --react-host=${{ matrix.react-host }}
+
+      - name: Check committed diff
+        run: git diff --check 8ad3be07eb27087acb67704fdf463ecb95b64505...HEAD
+
+      - name: Check clean tree
+        run: test -z "$(git status --porcelain --untracked-files=all)"

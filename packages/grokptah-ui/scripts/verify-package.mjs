@@ -25,6 +25,7 @@ const expectedSourceFiles = new Set([
   "scripts/verify-package.mjs",
   "scripts/run-contextdesk-consumer-smoke.mjs",
 ]);
+const workflowPath = ".github/workflows/grokptah-ui.yml";
 
 function fail(message) {
   throw new Error(`@grokptah/ui verification failed: ${message}`);
@@ -110,9 +111,12 @@ function verifyExactCandidate() {
     }
     records.push({ status: statusToken, path });
   }
-  const expectedPaths = [...expectedSourceFiles].map(
+  const expectedPaths = [
+    ...[...expectedSourceFiles].map(
     (relativePath) => `${packagePrefix}${relativePath}`,
-  );
+    ),
+    workflowPath,
+  ];
   const actualPaths = records.map(({ path }) => path);
   if (
     records.length !== expectedPaths.length ||
