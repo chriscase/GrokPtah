@@ -261,7 +261,9 @@ describe("App operator UX wiring", () => {
     expect(appSrc).toMatch(/acknowledgeOperatorPermission\(\(\)\s*=>\s*api\.permissionRespond/);
     expect(appSrc).toMatch(/if\s*\(\s*ack\s*!==\s*["']acknowledged["']\s*\)/);
     expect(appSrc).toMatch(/permissionQueueAfterAcknowledgement\(\s*q,\s*requestId,\s*ack\s*\)/);
-    expect(appSrc).toMatch(/presentDeniedPermissionRecord\(\s*permission,\s*sessionId/);
+    expect(appSrc).toMatch(/presentDeniedPermissionRecord\(\s*permission,\s*sessionId\s*\)/);
+    expect(appSrc).toMatch(/if\s*\(\s*record\s*\)/);
+    expect(appSrc).toMatch(/key=\{permission\.id\}/);
     expect(appSrc).toMatch(/Host acknowledged Deny/);
     expect(appSrc).not.toMatch(/Permission denied/);
     expect(appSrc).not.toMatch(/Continuing…/);
@@ -269,9 +271,15 @@ describe("App operator UX wiring", () => {
     expect(appSrc).not.toMatch(/["']owning-session["']/);
     expect(modalSrc).toMatch(/observeNonConsentInert/);
     expect(modalSrc).toMatch(/readConsentAcknowledgement/);
+    expect(modalSrc).toMatch(/reduceConsentLock/);
+    expect(modalSrc).toMatch(/owningSessionId/);
+    expect(modalSrc).not.toMatch(/sessionIdForPermission/);
     expect(modalSrc).not.toMatch(/acknowledgementTimeoutMs/);
     expect(modalSrc).not.toMatch(/settleOperatorConsentAcknowledgement/);
     expect(modalSrc).not.toMatch(/setTimeout\s*\(/);
+    expect(modalSrc).not.toMatch(
+      /useEffect\(\s*\(\)\s*=>\s*\{[\s\S]*submitGate\.current\s*=\s*null/,
+    );
     expect(cssSrc).toMatch(/\.modal\.permission-modal :focus-visible/);
     expect(cssSrc).toMatch(/forced-colors:\s*active/);
   });

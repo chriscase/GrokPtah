@@ -14,7 +14,7 @@ Do **not** treat this file as packaged qualification. Do **not** claim 100%.
 | Selected source | `codex/external-worker-hardening-v1` |
 | Required parent / fail-closed HEAD | `8ad3be07eb27087acb67704fdf463ecb95b64505` |
 | Isolated branch | `cursor/operator-consent-recovery-ux-772c` |
-| Prior draft head (review baseline) | `7a09464704b816cb452d677ec2159609b5eccb00` |
+| Prior draft head (review baseline) | `f39d4628c8a46569ec20cc33c5b646fd500f5460` |
 | Donor inspected, never merged | `b456178e2836916e9e646cc7cb262e1be794a01f` |
 | Donor parent | `8ad3be07eb27087acb67704fdf463ecb95b64505` (sibling, not ancestor of this work) |
 | Campaign | Disjoint from the authority-spine campaign |
@@ -44,6 +44,18 @@ Display-only. No backend authority change. No hosted or packaged acceptance clai
    cannot flip `lost`. PermissionModal does not start a timer and does not
    treat void or arbitrary resolution as acknowledgement. `submitGate` stays
    synchronous and at-most-once. Queue removal is ack-only.
+5. **Queue-head lock.** Request identity, phase, and the at-most-once gate bind
+   synchronously through `reduceConsentLock`. A mismatched request is not
+   projected as an unlocked idle head. No passive effect clears the gate or
+   unlocks pending/unconfirmed for the current request. Stale acknowledgement
+   for a previous id is ignored. App remounts the dialog with `key={permission.id}`.
+6. **Exact-path inert.** Only the mounted consent layer and its ancestor path
+   are excluded. Late mislabeled `data-modal-layer="consent"` portals and
+   SVG/foreign-element siblings are inerted. Prior `inert` / `aria-hidden`
+   values are restored exactly.
+7. **Owning session fail-closed.** Empty or missing `request.session_id` does
+   not persist the focused fallback and does not render as a known owner.
+   A claimed session that does not match the host owner is not persisted.
 
 ## Allowlist (exact)
 
@@ -140,10 +152,10 @@ Lint and Playwright are **not** claimed; neither exists in this desktop package.
 
 | Command | Result |
 | --- | --- |
-| `npm ci` | pass |
-| `npx tsc --noEmit` | pass (after annotating `parent` as `HTMLElement \| null` in the inert walk) |
-| focused Vitest (`operatorConsentPresentation`, `PermissionModal`, `App.operatorUx`) | 31/31 pass |
-| `npx vitest run` | 50 files / 310 tests pass |
+| `npm ci` | pending this successor (pass on `f39d4628`) |
+| `npx tsc --noEmit` | pending this successor |
+| focused Vitest (`operatorConsentPresentation`, `PermissionModal`, `App.operatorUx`) | pending this successor (31/31 on `f39d4628`) |
+| `npx vitest run` | pending this successor (50 files / 310 tests on `f39d4628`) |
 | `npx vite build` | pass (client production; chunk-size warning only) |
 | `npm run verify:public` | pass (regression only; public bundle + consumer fixture) |
 | `git diff --check` | clean |

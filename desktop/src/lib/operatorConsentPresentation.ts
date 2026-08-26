@@ -100,6 +100,70 @@ export function phaseAfterAcknowledgement(
   return ack === "acknowledged" ? "idle" : "unconfirmed";
 }
 
+export type ConsentLockState = {
+  requestId: string;
+  phase: ConsentPhase;
+};
+
+export type ConsentLockAction =
+  | { type: "bind"; requestId: string }
+  | { type: "submit"; requestId: string }
+  | {
+      type: "acknowledge";
+      requestId: string;
+      ack: ConsentAcknowledgement | null;
+    };
+
+/**
+ * Request-keyed consent lock. Identity changes bind to idle. Submit and
+ * acknowledgement for a different id are ignored so a stale update cannot
+ * unlock the current head.
+ */
+export function reduceConsentLock(
+  state: ConsentLockState,
+  action: ConsentLockAction,
+): ConsentLockState {
+  switch (action.type) {
+    case "bind":
+      if (state.requestId === action.requestId) return state;
+      return { requestId: action.requestId, phase: "idle" };
+    case "submit":
+      if (state.requestId !== action.requestId) {
+        return { requestId: action.requestId, phase: "pending" };
+      }
+      if (!canSubmitConsent(state.phase)) return state;
+      return { requestId: action.requestId, phase: "pending" };
+    case "acknowledge":
+      if (state.requestId !== action.requestId) return state;
+      return {
+        requestId: action.requestId,
+        phase: phaseAfterAcknowledgement(action.ack ?? "lost"),
+      };
+    default:
+      return state;
+  }
+}
+
+/** Host-authored owner only. Empty, missing, or whitespace is unknown. */
+export function owningSessionId(
+  request: Pick<PermissionRequest, "session_id"> | null | undefined,
+): string | null {
+  if (!request || typeof request !== "object") return null;
+  const raw = (request as { session_id?: unknown }).session_id;
+  if (typeof raw !== "string" || raw.trim().length === 0) return null;
+  return raw;
+}
+
+export function consentPhaseForRequest(
+  state: ConsentLockState,
+  requestId: string,
+  gateRequestId: string | null,
+): ConsentPhase {
+  if (state.requestId === requestId) return state.phase;
+  if (gateRequestId === requestId) return "pending";
+  return "idle";
+}
+
 export function permissionQueueAfterAcknowledgement(
   queue: PermissionRequest[],
   requestId: string,
@@ -191,7 +255,7 @@ export function presentOperatorConsent(input: {
       : {};
   const toolLabel = closedToolLabel(input.request.tool_name);
   const riskLabel = closedRiskLabel(detail.risk_tier);
-  const sessionFact = input.request.session_id || input.fallbackSessionId
+  const sessionFact = owningSessionId(input.request)
     ? CONSENT_COPY.sessionKnown
     : CONSENT_COPY.sessionMissing;
   const standingGrant = standingGrantFactsAtThisHead();
@@ -243,8 +307,17 @@ export function presentOperatorConsent(input: {
 
 export function presentDeniedPermissionRecord(
   request: PermissionRequest,
-  sessionId: string,
-): Omit<DenyHistoryEntry, "at"> {
+  claimedSessionId?: string | null,
+): Omit<DenyHistoryEntry, "at"> | null {
+  const owner = owningSessionId(request);
+  if (!owner) return null;
+  if (
+    typeof claimedSessionId === "string" &&
+    claimedSessionId.length > 0 &&
+    claimedSessionId !== owner
+  ) {
+    return null;
+  }
   const detail =
     typeof request.detail === "object" &&
     request.detail !== null &&
@@ -254,7 +327,7 @@ export function presentDeniedPermissionRecord(
   return {
     tool_name: ownToolKey(request.tool_name),
     summary: closedToolLabel(request.tool_name),
-    session_id: sessionId,
+    session_id: owner,
     risk_tier: ownRiskTier(
       typeof detail.risk_tier === "string" ? detail.risk_tier : undefined,
     ),
@@ -297,25 +370,45 @@ export function trapConsentTabKey(
 }
 
 type InertSnapshot = {
-  element: HTMLElement;
+  element: Element;
   ariaHidden: string | null;
   inert: boolean;
 };
 
-function isConsentLayer(element: Element): boolean {
-  return element instanceof HTMLElement && element.dataset.modalLayer === "consent";
+function parentElementOf(node: Element): Element | null {
+  const parent = node.parentElement;
+  if (parent) return parent;
+  const raw = node.parentNode;
+  return raw instanceof Element ? raw : null;
 }
 
-function ancestorSiblingTargets(layer: HTMLElement): HTMLElement[] {
-  const targets: HTMLElement[] = [];
-  let node: HTMLElement | null = layer;
+function mountedConsentPath(layer: HTMLElement): Set<Element> {
+  const path = new Set<Element>([layer]);
+  let node: Element | null = parentElementOf(layer);
   while (node && node !== document.documentElement) {
-    const parent: HTMLElement | null = node.parentElement;
+    path.add(node);
+    if (node === document.body) break;
+    node = parentElementOf(node);
+  }
+  return path;
+}
+
+/**
+ * Every sibling off the exact mounted consent layer's ancestor path.
+ * A `data-modal-layer="consent"` marker on any other node is not trusted.
+ */
+function ancestorSiblingTargets(layer: HTMLElement): Element[] {
+  const protectedPath = mountedConsentPath(layer);
+  const targets: Element[] = [];
+  let node: Element = layer;
+  while (node && node !== document.documentElement) {
+    const parent = parentElementOf(node);
     if (!parent) break;
     for (const child of Array.from(parent.children)) {
-      if (!(child instanceof HTMLElement)) continue;
+      if (!(child instanceof Element)) continue;
       if (child === node) continue;
-      if (isConsentLayer(child)) continue;
+      if (protectedPath.has(child)) continue;
+      if (child === layer) continue;
       if (child.tagName === "HEAD") continue;
       targets.push(child);
     }
@@ -326,8 +419,8 @@ function ancestorSiblingTargets(layer: HTMLElement): HTMLElement[] {
 }
 
 function applyInertSnapshot(
-  seen: Map<HTMLElement, InertSnapshot>,
-  element: HTMLElement,
+  seen: Map<Element, InertSnapshot>,
+  element: Element,
 ): void {
   if (seen.has(element)) return;
   seen.set(element, {
@@ -348,12 +441,13 @@ function restoreInertSnapshot(snapshot: InertSnapshot): void {
 }
 
 /**
- * Inert every non-consent ancestor sibling, including nodes added later and
- * body-level portals. Restores each element's exact prior inert/aria-hidden.
+ * Inert every non-path ancestor sibling, including late HTML portals,
+ * mislabeled consent markers, and SVG/foreign-element siblings. Restores
+ * each element's exact prior inert/aria-hidden.
  */
 export function observeNonConsentInert(layer: HTMLElement | null): () => void {
   if (!layer || !layer.isConnected) return () => {};
-  const seen = new Map<HTMLElement, InertSnapshot>();
+  const seen = new Map<Element, InertSnapshot>();
   const scan = () => {
     for (const target of ancestorSiblingTargets(layer)) {
       applyInertSnapshot(seen, target);

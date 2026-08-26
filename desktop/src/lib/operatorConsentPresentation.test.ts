@@ -9,14 +9,17 @@ import {
   closedRiskLabel,
   closedToolLabel,
   consentBlocksWorkspaceShortcuts,
+  consentPhaseForRequest,
   CONSENT_COPY,
   observeNonConsentInert,
+  owningSessionId,
   permissionQueueAfterAcknowledgement,
   phaseAfterAcknowledgement,
   presentDeniedPermissionRecord,
   presentOperatorConsent,
   presentationContainsForbiddenRaw,
   readConsentAcknowledgement,
+  reduceConsentLock,
   standingGrantFactsAtThisHead,
   trapConsentTabKey,
 } from "./operatorConsentPresentation";
@@ -149,27 +152,70 @@ describe("operatorConsentPresentation", () => {
   });
 
   it("keeps distinct owning session identities in deny records and never renders them", () => {
-    const alpha = presentDeniedPermissionRecord(req(), "session-alpha-1111");
+    const alpha = presentDeniedPermissionRecord(
+      req({ session_id: "session-alpha-1111" }),
+      "session-alpha-1111",
+    );
     const beta = presentDeniedPermissionRecord(
       req({ session_id: "session-beta-2222", tool_name: "write_file" }),
       "session-beta-2222",
     );
-    expect(alpha.session_id).toBe("session-alpha-1111");
-    expect(beta.session_id).toBe("session-beta-2222");
-    expect(alpha.session_id).not.toBe(beta.session_id);
-    expect(alpha.session_id).not.toBe("owning-session");
+    expect(alpha?.session_id).toBe("session-alpha-1111");
+    expect(beta?.session_id).toBe("session-beta-2222");
+    expect(alpha?.session_id).not.toBe(beta?.session_id);
+    expect(alpha?.session_id).not.toBe("owning-session");
     const presented = presentOperatorConsent({
       request: req(),
       phase: "idle",
       denyHistory: [
-        { at: 1, ...alpha },
-        { at: 2, ...beta },
+        { at: 1, ...alpha! },
+        { at: 2, ...beta! },
       ],
     });
     const haystack = haystackOf(presented);
     expect(haystack).not.toContain("session-alpha-1111");
     expect(haystack).not.toContain("session-beta-2222");
     expect(haystack).not.toContain("owning-session");
+  });
+
+  it("never persists a focused fallback or claimed mismatch when the host owner is missing", () => {
+    const focused = "session-focused-bbbb";
+    expect(owningSessionId(req({ session_id: "" }))).toBeNull();
+    expect(owningSessionId(req({ session_id: "   " }))).toBeNull();
+    expect(owningSessionId({ session_id: undefined as unknown as string })).toBeNull();
+    expect(presentDeniedPermissionRecord(req({ session_id: "" }), focused)).toBeNull();
+    expect(presentDeniedPermissionRecord(req({ session_id: "" }), "")).toBeNull();
+    expect(
+      presentDeniedPermissionRecord(req({ session_id: "session-alpha-1111" }), focused),
+    ).toBeNull();
+    const presented = presentOperatorConsent({
+      request: req({ session_id: "" }),
+      phase: "idle",
+      fallbackSessionId: focused,
+    });
+    expect(presented.sessionFact).toBe(CONSENT_COPY.sessionMissing);
+    expect(haystackOf(presented)).not.toContain(focused);
+    expect(haystackOf(presented)).not.toContain("owning-session");
+  });
+
+  it("binds request identity synchronously and ignores stale acknowledgement", () => {
+    const idle = { requestId: "a1", phase: "idle" as const };
+    const bound = reduceConsentLock(idle, { type: "bind", requestId: "b2" });
+    expect(bound).toEqual({ requestId: "b2", phase: "idle" });
+    expect(reduceConsentLock(idle, { type: "bind", requestId: "a1" })).toBe(idle);
+    const pending = reduceConsentLock(bound, { type: "submit", requestId: "b2" });
+    expect(pending).toEqual({ requestId: "b2", phase: "pending" });
+    expect(reduceConsentLock(pending, { type: "submit", requestId: "b2" })).toBe(pending);
+    expect(
+      reduceConsentLock(pending, { type: "acknowledge", requestId: "a1", ack: "acknowledged" }),
+    ).toBe(pending);
+    expect(
+      reduceConsentLock(pending, { type: "acknowledge", requestId: "b2", ack: "lost" }),
+    ).toEqual({ requestId: "b2", phase: "unconfirmed" });
+    expect(consentPhaseForRequest({ requestId: "a1", phase: "unconfirmed" }, "b2", "b2")).toBe(
+      "pending",
+    );
+    expect(consentPhaseForRequest({ requestId: "a1", phase: "idle" }, "b2", null)).toBe("idle");
   });
 
   it("explains pending and unconfirmed recovery without implying success or safe retry", () => {
@@ -232,16 +278,41 @@ describe("operatorConsentPresentation", () => {
     shell.append(late);
     await vi.waitFor(() => expect(late.hasAttribute("inert")).toBe(true));
 
+    const fake = document.createElement("div");
+    fake.dataset.modalLayer = "consent";
+    fake.dataset.testid = "mislabeled-consent";
+    document.body.append(fake);
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("data-testid", "svg-sibling");
+    const foreign = document.createElementNS("http://www.w3.org/2000/svg", "foreignObject");
+    const foreignButton = document.createElement("button");
+    foreignButton.type = "button";
+    foreignButton.textContent = "svg foreign";
+    foreign.append(foreignButton);
+    svg.append(foreign);
+    document.body.append(svg);
+
+    await vi.waitFor(() => {
+      expect(fake.hasAttribute("inert")).toBe(true);
+      expect(svg.hasAttribute("inert")).toBe(true);
+    });
+    expect(layer.hasAttribute("inert")).toBe(false);
+
     restore();
     expect(main.hasAttribute("inert")).toBe(false);
     expect(prior.hasAttribute("inert")).toBe(true);
     expect(prior.getAttribute("aria-hidden")).toBe("false");
     expect(portal.hasAttribute("inert")).toBe(false);
     expect(late.hasAttribute("inert")).toBe(false);
+    expect(fake.hasAttribute("inert")).toBe(false);
+    expect(svg.hasAttribute("inert")).toBe(false);
 
     prior.remove();
     shell.remove();
     portal.remove();
+    fake.remove();
+    svg.remove();
   });
 
   it("wraps Tab when focus is on the last control or has escaped the root", () => {

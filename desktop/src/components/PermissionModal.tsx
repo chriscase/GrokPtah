@@ -1,20 +1,20 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useReducer, useRef } from "react";
 import type { PermissionRequest } from "../lib/protocol";
-import {
-  sessionIdForPermission,
-  type PermissionDecision,
-} from "../lib/permissionQueue";
+import type { PermissionDecision } from "../lib/permissionQueue";
 import type { DenyHistoryEntry } from "../lib/denyHistory";
 import {
   applyConsentEscape,
   canSubmitConsent,
+  consentPhaseForRequest,
   observeNonConsentInert,
+  owningSessionId,
   presentOperatorConsent,
   readConsentAcknowledgement,
+  reduceConsentLock,
   trapConsentTabKey,
   type ConsentAcknowledgement,
   type ConsentDecision,
-  type ConsentPhase,
+  type ConsentLockState,
 } from "../lib/operatorConsentPresentation";
 
 export type PermissionModalProps = {
@@ -22,8 +22,8 @@ export type PermissionModalProps = {
   /** How many more requests wait behind this one (concurrent queue). */
   queuedBehind?: number;
   /**
-   * Called with the request id, decision, and the **owning** session id
-   * (request.session_id) — never invent the focused tab here (#141).
+   * Called with the request id, decision, and the **host-owned** session id.
+   * Empty or missing request.session_id is passed as "" — never the focused tab.
    * Must return an explicit closed acknowledgement. Void or arbitrary values
    * lock response unconfirmed and do not advance the queue.
    */
@@ -32,7 +32,7 @@ export type PermissionModalProps = {
     decision: PermissionDecision,
     sessionId: string,
   ) => ConsentAcknowledgement | Promise<ConsentAcknowledgement | unknown>;
-  /** Optional fallback only if request.session_id is empty. */
+  /** Optional fallback only if request.session_id is empty. Not owning provenance. */
   fallbackSessionId?: string | null;
   /** Recent denials for this project/session (#175). */
   denyHistory?: DenyHistoryEntry[];
@@ -43,6 +43,7 @@ export type PermissionModalProps = {
  *
  * Presentation-only. Acknowledgement timing belongs to App. This dialog never
  * starts a second timer and never treats void/arbitrary resolution as success.
+ * Request identity, phase, and the at-most-once gate bind synchronously.
  */
 export function PermissionModal({
   request,
@@ -51,12 +52,22 @@ export function PermissionModal({
   fallbackSessionId = null,
   denyHistory = [],
 }: PermissionModalProps) {
-  const sessionId = sessionIdForPermission(request, fallbackSessionId);
-  const [lock, setLock] = useState<{ id: string; phase: ConsentPhase }>({
-    id: request.id,
-    phase: "idle",
-  });
-  const phase: ConsentPhase = lock.id === request.id ? lock.phase : "idle";
+  const [lock, dispatch] = useReducer(
+    reduceConsentLock,
+    request.id,
+    (requestId): ConsentLockState => ({ requestId, phase: "idle" }),
+  );
+  const submitGate = useRef<string | null>(null);
+  if (lock.requestId !== request.id) {
+    if (submitGate.current === request.id) {
+      dispatch({ type: "submit", requestId: request.id });
+    } else {
+      submitGate.current = null;
+      dispatch({ type: "bind", requestId: request.id });
+    }
+  }
+  const phase = consentPhaseForRequest(lock, request.id, submitGate.current);
+  const owner = owningSessionId(request) ?? "";
   const presented = presentOperatorConsent({
     request,
     queuedBehind,
@@ -68,14 +79,6 @@ export function PermissionModal({
   const dialogRef = useRef<HTMLDivElement>(null);
   const denyRef = useRef<HTMLButtonElement>(null);
   const openerRef = useRef<HTMLElement | null>(null);
-  const submitGate = useRef<string | null>(null);
-
-  useEffect(() => {
-    if (lock.id !== request.id) {
-      setLock({ id: request.id, phase: "idle" });
-      submitGate.current = null;
-    }
-  }, [lock.id, request.id]);
 
   useLayoutEffect(() => {
     openerRef.current =
@@ -95,24 +98,21 @@ export function PermissionModal({
 
   const respond = useCallback(
     async (decision: ConsentDecision) => {
-      if (!canSubmitConsent(phase) || submitGate.current === request.id) return;
-      submitGate.current = request.id;
-      setLock({ id: request.id, phase: "pending" });
+      const requestId = request.id;
+      if (!canSubmitConsent(phase) || submitGate.current === requestId) return;
+      submitGate.current = requestId;
+      dispatch({ type: "submit", requestId });
       let raw: unknown;
       try {
-        raw = await Promise.resolve(onRespond(request.id, decision, sessionId));
+        raw = await Promise.resolve(onRespond(requestId, decision, owner));
       } catch {
-        setLock({ id: request.id, phase: "unconfirmed" });
+        dispatch({ type: "acknowledge", requestId, ack: "rejected" });
         return;
       }
       const ack = readConsentAcknowledgement(raw);
-      if (ack === "acknowledged") {
-        setLock({ id: request.id, phase: "idle" });
-        return;
-      }
-      setLock({ id: request.id, phase: "unconfirmed" });
+      dispatch({ type: "acknowledge", requestId, ack });
     },
-    [onRespond, phase, request.id, sessionId],
+    [onRespond, owner, phase, request.id],
   );
 
   useEffect(() => {

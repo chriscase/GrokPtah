@@ -3829,6 +3829,7 @@ export default function App() {
 
       {permission && (
         <PermissionModal
+          key={permission.id}
           request={permission}
           queuedBehind={Math.max(0, permissionQueue.length - 1)}
           fallbackSessionId={activeSessionId}
@@ -3841,15 +3842,10 @@ export default function App() {
               return ack;
             }
             if (decision === "deny") {
-              setDenyHistory((h) =>
-                appendDeny(
-                  h,
-                  presentDeniedPermissionRecord(
-                    permission,
-                    sessionId || permission.session_id || "",
-                  ),
-                ),
-              );
+              const record = presentDeniedPermissionRecord(permission, sessionId);
+              if (record) {
+                setDenyHistory((h) => appendDeny(h, record));
+              }
             }
             setPermissionQueue((q) =>
               permissionQueueAfterAcknowledgement(q, requestId, ack),

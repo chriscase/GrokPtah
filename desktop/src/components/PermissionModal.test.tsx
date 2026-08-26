@@ -1,6 +1,9 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { useState } from "react";
+import { StrictMode, useState } from "react";
+import { act } from "react";
+import { flushSync } from "react-dom";
+import { createRoot } from "react-dom/client";
 import { PermissionModal } from "./PermissionModal";
 import {
   dequeuePermission,
@@ -633,5 +636,208 @@ describe("PermissionModal (#141 + operator consent)", () => {
     expect(screen.getByTestId("permission-known-facts").textContent).toMatch(
       /Scope: unavailable/,
     );
+  });
+
+  it("does not send a focused fallback when the host session id is missing", async () => {
+    const answers: Array<{ requestId: string; sessionId: string }> = [];
+    const malformed = makeReq("mal-1", "", "write_file");
+    malformed.session_id = "";
+    render(
+      <PermissionHarness
+        initial={[malformed]}
+        focusedSessionId="session-focused-bbbb"
+        onAnswer={(requestId, _d, sessionId) => answers.push({ requestId, sessionId })}
+      />,
+    );
+    expect(screen.getByTestId("permission-session").textContent).toBe(
+      CONSENT_COPY.sessionMissing,
+    );
+    fireEvent.click(screen.getByTestId("permission-deny"));
+    await waitFor(() => expect(answers).toHaveLength(1));
+    expect(answers[0]?.sessionId).toBe("");
+    expect(answers[0]?.sessionId).not.toBe("session-focused-bbbb");
+    expect(
+      presentDeniedPermissionRecord(malformed, answers[0]?.sessionId ?? "session-focused-bbbb"),
+    ).toBeNull();
+  });
+
+  it("keeps a valid host owner distinct from the focused tab", async () => {
+    const answers: Array<{ sessionId: string }> = [];
+    render(
+      <PermissionHarness
+        initial={[makeReq("own-1", "session-alpha-1111")]}
+        focusedSessionId="session-focused-bbbb"
+        onAnswer={(_id, _d, sessionId) => answers.push({ sessionId })}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("permission-deny"));
+    await waitFor(() => expect(answers).toHaveLength(1));
+    expect(answers[0]?.sessionId).toBe("session-alpha-1111");
+    expect(answers[0]?.sessionId).not.toBe("session-focused-bbbb");
+    const record = presentDeniedPermissionRecord(
+      makeReq("own-1", "session-alpha-1111"),
+      answers[0]?.sessionId,
+    );
+    expect(record?.session_id).toBe("session-alpha-1111");
+    expect(
+      presentDeniedPermissionRecord(
+        makeReq("own-1", "session-alpha-1111"),
+        "session-focused-bbbb",
+      ),
+    ).toBeNull();
+  });
+
+  it("activates the next head at most once between commit and passive-effect flush", async () => {
+    const answers: string[] = [];
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    function RaceHost() {
+      const [head, setHead] = useState(makeReq("race-a", "sess-a"));
+      return (
+        <>
+          <button
+            type="button"
+            data-testid="replace-head"
+            onClick={() => setHead(makeReq("race-b", "sess-b", "write_file"))}
+          >
+            replace
+          </button>
+          <PermissionModal
+            request={head}
+            onRespond={async (requestId, decision) => {
+              answers.push(`${requestId}:${decision}`);
+              return "acknowledged";
+            }}
+          />
+        </>
+      );
+    }
+    flushSync(() => {
+      root.render(<RaceHost />);
+    });
+    flushSync(() => {
+      container.querySelector<HTMLButtonElement>('[data-testid="replace-head"]')?.click();
+    });
+    const allow = container.querySelector<HTMLButtonElement>('[data-testid="permission-allow"]');
+    expect(allow).toBeTruthy();
+    allow?.click();
+    allow?.click();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    allow?.click();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(answers.filter((row) => row.startsWith("race-b:"))).toEqual(["race-b:allow"]);
+    expect(answers.filter((row) => row.startsWith("race-a:"))).toEqual([]);
+    flushSync(() => {
+      root.unmount();
+    });
+    container.remove();
+  });
+
+  it("sends at most one answer per request under StrictMode, rapid replace, Escape, and late ack", async () => {
+    const answers: string[] = [];
+    render(
+      <StrictMode>
+        <PermissionHarness
+          initial={[makeReq("strict-1", "sess-1")]}
+          focusedSessionId="sess-1"
+          onAnswer={(requestId, decision) => answers.push(`${requestId}:${decision}`)}
+        />
+      </StrictMode>,
+    );
+    fireEvent.click(screen.getByTestId("permission-allow"));
+    fireEvent.click(screen.getByTestId("permission-allow"));
+    await waitFor(() => expect(answers).toEqual(["strict-1:allow"]));
+    cleanup();
+
+    function RapidHost() {
+      const [head, setHead] = useState(makeReq("rapid-1", "s1"));
+      return (
+        <div>
+          <button
+            type="button"
+            data-testid="rapid-2"
+            onClick={() => setHead(makeReq("rapid-2", "s2", "write_file"))}
+          >
+            two
+          </button>
+          <button
+            type="button"
+            data-testid="rapid-3"
+            onClick={() => setHead(makeReq("rapid-3", "s3", "read_file"))}
+          >
+            three
+          </button>
+          <PermissionModal
+            request={head}
+            onRespond={async (requestId, decision) => {
+              answers.push(`${requestId}:${decision}`);
+              return "acknowledged";
+            }}
+          />
+        </div>
+      );
+    }
+    answers.length = 0;
+    render(<RapidHost />);
+    fireEvent.click(screen.getByTestId("permission-allow"));
+    await waitFor(() => expect(answers).toContain("rapid-1:allow"));
+    fireEvent.click(screen.getByTestId("rapid-2"));
+    fireEvent.click(screen.getByTestId("permission-allow"));
+    fireEvent.click(screen.getByTestId("permission-allow"));
+    await waitFor(() => expect(answers.filter((row) => row.startsWith("rapid-2:"))).toHaveLength(1));
+    fireEvent.click(screen.getByTestId("rapid-3"));
+    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(answers.filter((row) => row.startsWith("rapid-3:"))).toEqual([
+      "rapid-3:deny",
+    ]));
+    expect(answers.filter((row) => row.startsWith("rapid-1:"))).toHaveLength(1);
+    cleanup();
+
+    let finishLate: ((value: unknown) => void) | undefined;
+    function LateHost() {
+      const [head, setHead] = useState(makeReq("late-a", "s1"));
+      return (
+        <div>
+          <button
+            type="button"
+            data-testid="late-to-b"
+            onClick={() => setHead(makeReq("late-b", "s2", "write_file"))}
+          >
+            to b
+          </button>
+          <PermissionModal
+            request={head}
+            onRespond={async (requestId, decision) => {
+              answers.push(`${requestId}:${decision}`);
+              if (requestId === "late-a") {
+                return await new Promise((resolve) => {
+                  finishLate = resolve;
+                });
+              }
+              return "acknowledged";
+            }}
+          />
+        </div>
+      );
+    }
+    answers.length = 0;
+    render(<LateHost />);
+    fireEvent.click(screen.getByTestId("permission-allow"));
+    await waitFor(() => expect(answers).toEqual(["late-a:allow"]));
+    fireEvent.click(screen.getByTestId("late-to-b"));
+    fireEvent.click(screen.getByTestId("permission-allow"));
+    fireEvent.click(screen.getByTestId("permission-allow"));
+    await waitFor(() => expect(answers.filter((row) => row.startsWith("late-b:"))).toEqual([
+      "late-b:allow",
+    ]));
+    finishLate?.("lost");
+    fireEvent.click(screen.getByTestId("permission-allow"));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(answers.filter((row) => row.startsWith("late-b:"))).toEqual(["late-b:allow"]);
+    expect(answers.filter((row) => row.startsWith("late-a:"))).toEqual(["late-a:allow"]);
   });
 });
