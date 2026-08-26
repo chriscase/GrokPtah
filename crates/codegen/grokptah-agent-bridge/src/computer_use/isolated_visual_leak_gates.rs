@@ -107,21 +107,37 @@ fn socket_identity(stream: &UnixStream) -> String {
         .to_string()
 }
 
+/// Identities for the four sockets one session uses.
+///
+/// Reading them needs `/proc`, so off Linux this is empty and the descriptor
+/// assertions below do not run. Driving the session itself does not need
+/// `/proc`, so that part still runs everywhere and is what the two
+/// all-platform tests below check.
+fn session_socket_identities(sockets: [&UnixStream; 4]) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        sockets
+            .iter()
+            .map(|socket| socket_identity(socket))
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = sockets;
+        Vec::new()
+    }
+}
+
 // ------------------------------------------------------------ descriptors and sockets
 
 /// Drives one complete session over real socket pairs, then drops everything.
-/// Returns the kernel identity of every socket it made, so the caller can
-/// prove none of them is still open.
-#[cfg(target_os = "linux")]
+/// Returns the kernel identity of every socket it made where the platform
+/// exposes that, so a caller can prove none of them is still open.
 fn drive_one_session_over_sockets() -> Vec<String> {
     let (control_host, control_peer) = UnixStream::pair().expect("control socket pair");
     let (frame_host, frame_peer) = UnixStream::pair().expect("frame socket pair");
-    let identities = vec![
-        socket_identity(&control_host),
-        socket_identity(&control_peer),
-        socket_identity(&frame_host),
-        socket_identity(&frame_peer),
-    ];
+    let identities =
+        session_socket_identities([&control_host, &control_peer, &frame_host, &frame_peer]);
 
     // The peer plays the helper and guest: it queues exactly the events and the
     // one frame this session consumes. It stays open for the whole session,
@@ -218,19 +234,14 @@ fn a_completed_session_leaves_no_orphan_descriptor_or_socket() {
     );
 }
 
-#[cfg(target_os = "linux")]
-#[test]
-fn an_abandoned_session_leaves_no_orphan_descriptor_or_socket() {
-    // The supervisor owns the descriptors, so dropping a session mid-flight —
-    // the crash and restart case — must still release every one of them.
+/// Builds a session and drops it mid-flight — the crash and restart case —
+/// without driving it. The supervisor owns the descriptors, so dropping it must
+/// still release every one of them.
+fn abandon_one_session() -> Vec<String> {
     let (control_host, control_peer) = UnixStream::pair().unwrap();
     let (frame_host, frame_peer) = UnixStream::pair().unwrap();
-    let identities = [
-        socket_identity(&control_host),
-        socket_identity(&control_peer),
-        socket_identity(&frame_host),
-        socket_identity(&frame_peer),
-    ];
+    let identities =
+        session_socket_identities([&control_host, &control_peer, &frame_host, &frame_peer]);
 
     let runtime = IsolatedVisualRuntimeSession::new(contract(), CHALLENGE).unwrap();
     let driver = IsolatedVisualRuntimeDriver::new(
@@ -240,7 +251,25 @@ fn an_abandoned_session_leaves_no_orphan_descriptor_or_socket() {
     );
     drop(driver);
     drop((control_peer, frame_peer));
+    identities
+}
 
+#[test]
+fn a_session_drives_to_completion_over_real_sockets() {
+    // Runs on every unix, so macOS covers the whole seam too. The driving
+    // function asserts the frame reassembles and the cleanup completes.
+    drive_one_session_over_sockets();
+}
+
+#[test]
+fn an_abandoned_session_can_be_dropped_mid_flight() {
+    abandon_one_session();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_abandoned_session_leaves_no_orphan_descriptor_or_socket() {
+    let identities = abandon_one_session();
     let live = open_descriptor_targets();
     for identity in &identities {
         assert!(
