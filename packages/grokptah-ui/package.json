@@ -29,8 +29,8 @@
     "smoke:contextdesk": "node scripts/run-contextdesk-consumer-smoke.mjs"
   },
   "peerDependencies": {
-    "react": ">=18.0.0",
-    "react-dom": ">=18.0.0"
+    "react": ">=18.3.1 <20.0.0",
+    "react-dom": ">=18.3.1 <20.0.0"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^7.0.1",

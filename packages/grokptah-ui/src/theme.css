@@ -135,7 +135,8 @@
 
 .gpt-ui-run-status-card__title,
 .gpt-ui-run-status-card__description,
-.gpt-ui-run-status-card__live {
+.gpt-ui-run-status-card__live,
+.gpt-ui-run-status-card__budget {
   margin: 0;
 }
 
@@ -165,7 +166,14 @@
   line-height: 1.5;
 }
 
-.gpt-ui-run-status-card__progress {
+.gpt-ui-run-status-card__budget {
+  margin-block-start: var(--gpt-ui-space-2);
+  font-weight: 600;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.gpt-ui-run-status-card__budget-meter {
   display: block;
   inline-size: 100%;
   max-inline-size: 100%;
@@ -175,7 +183,7 @@
   background: var(--gpt-ui-color-track);
 }
 
-.gpt-ui-run-status-card progress:focus-visible {
+.gpt-ui-run-status-card meter:focus-visible {
   outline: 0.15rem solid var(--gpt-ui-focus);
   outline-offset: 0.15rem;
 }

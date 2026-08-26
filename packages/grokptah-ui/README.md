@@ -28,9 +28,14 @@ adapted structurally, while fields outside this contract are ignored.
 
 The card has no action, callback, request content, result, error, event, path,
 URL, or identity surface. It renders fixed present-state copy, a labelled
-article, a polite atomic status announcement, and a native progress element.
-Progress values are bounded and malformed values are presented without
-inventing a terminal state.
+article, a polite atomic status announcement, and, for a valid round budget,
+text such as `Round 3 of 12 maximum` plus a native meter labelled
+`Round budget used`. A valid budget uses safe integers with
+`0 <= round <= maxRounds <= 100`; an absent, malformed, oversized, or
+inconsistent budget renders no budget surface and never changes the state.
+
+The package is tested with React and ReactDOM 18.3.1 and 19.2.8. Its peer
+range is limited to `>=18.3.1 <20.0.0`.
 
 ## Theme hosts
 

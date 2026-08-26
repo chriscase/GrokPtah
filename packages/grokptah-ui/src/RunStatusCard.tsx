@@ -6,7 +6,7 @@ import { useId } from "react";
  * The optional progress object intentionally contains no run identity,
  * request content, result, error, event, path, URL, callback, or action.
  * Producers with a wider structural projection may pass it directly; this
- * component reads only state and the two bounded progress numbers.
+ * component reads only state and the two bounded round-budget numbers.
  */
 export type RunStatusSnapshot = {
   readonly state:
@@ -86,7 +86,7 @@ const UNAVAILABLE_COPY: StatusCopy = {
   live: "Run status is unavailable.",
 };
 
-type NormalizedProgress = {
+type NormalizedRoundBudget = {
   readonly round: number;
   readonly maxRounds: number;
 };
@@ -98,24 +98,33 @@ function isRunStatusState(value: unknown): value is RunStatusState {
   );
 }
 
-function normalizeProgress(
+function normalizeRoundBudget(
   progress: RunStatusSnapshot["progress"] | undefined,
-): NormalizedProgress | null {
-  if (progress === undefined || progress === null) return null;
+): NormalizedRoundBudget | null {
+  if (
+    progress === undefined ||
+    progress === null ||
+    typeof progress !== "object" ||
+    Array.isArray(progress)
+  ) {
+    return null;
+  }
 
   const { round, maxRounds } = progress;
   if (
     !Number.isSafeInteger(round) ||
     !Number.isSafeInteger(maxRounds) ||
-    maxRounds < 1
+    round < 0 ||
+    maxRounds < 1 ||
+    round > maxRounds ||
+    maxRounds > MAX_ROUNDS
   ) {
     return null;
   }
 
-  const boundedMaxRounds = Math.min(maxRounds, MAX_ROUNDS);
   return {
-    round: Math.min(Math.max(round, 0), boundedMaxRounds),
-    maxRounds: boundedMaxRounds,
+    round,
+    maxRounds,
   };
 }
 
@@ -135,7 +144,7 @@ export function RunStatusCard({
       : undefined;
   const state = isRunStatusState(stateValue) ? stateValue : null;
   const copy = state === null ? UNAVAILABLE_COPY : STATUS_COPY[state];
-  const progress = normalizeProgress(
+  const roundBudget = normalizeRoundBudget(
     snapshot !== null &&
       typeof snapshot === "object" &&
       "progress" in snapshot
@@ -167,13 +176,20 @@ export function RunStatusCard({
       >
         {copy.live}
       </p>
-      <progress
-        className="gpt-ui-run-status-card__progress"
-        aria-label="Run progress"
-        {...(progress === null
-          ? {}
-          : { value: progress.round, max: progress.maxRounds })}
-      />
+      {roundBudget !== null && (
+        <>
+          <p className="gpt-ui-run-status-card__budget">
+            Round {roundBudget.round} of {roundBudget.maxRounds} maximum
+          </p>
+          <meter
+            className="gpt-ui-run-status-card__budget-meter"
+            aria-label="Round budget used"
+            min={0}
+            max={roundBudget.maxRounds}
+            value={roundBudget.round}
+          />
+        </>
+      )}
     </article>
   );
 }
