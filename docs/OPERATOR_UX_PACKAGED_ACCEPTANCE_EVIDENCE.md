@@ -15,6 +15,9 @@ Do **not** treat this file as packaged qualification. Do **not** claim 100%.
 | Required parent / fail-closed HEAD | `8ad3be07eb27087acb67704fdf463ecb95b64505` |
 | Isolated branch | `cursor/operator-consent-recovery-ux-772c` |
 | Prior draft head (review baseline) | `f39d4628c8a46569ec20cc33c5b646fd500f5460` |
+| Reviewed implementation source commit | `a68cd238f94a74b5785ab31d954a77041a57e853` |
+| Reviewed evidence head | `acf1a45673ea86a9db16a3acc28979909ccd4f75` |
+| Hosted Desktop run on reviewed evidence head | `32922755590` |
 | Donor inspected, never merged | `b456178e2836916e9e646cc7cb262e1be794a01f` |
 | Donor parent | `8ad3be07eb27087acb67704fdf463ecb95b64505` (sibling, not ancestor of this work) |
 | Campaign | Disjoint from the authority-spine campaign |
@@ -161,7 +164,7 @@ Lint and Playwright are **not** claimed; neither exists in this desktop package.
 | `npm audit --omit=dev` | pass (0 production vulnerabilities) |
 | `git diff --check` | clean |
 | privacy scan | no live credentials or private identity paths; tests use absence needles only (`/etc/passwd`, `/opt/x`, `src/main.rs`, `git status`, `tok_opaque_9f3a`, bidi/Cf controls, prototype keys, `/Users/secret`) |
-| GitHub `Desktop / desktop` on `f39d4628` | **fail (parent lock residual)** — `Typecheck + unit tests` passed; `Cargo tests (desktop)` failed `cargo test --locked` because `desktop/src-tauri/Cargo.lock` does not record path dep `grokptah-agent-sdk` already present in `grokptah-agent-bridge` at `8ad3be07`. This draft does not alter lockfiles. The unchanged parent lock mismatch remains an inherited hosted blocker. |
+| GitHub `Desktop / desktop` run `32922755590` on reviewed evidence head `acf1a456` | **fail (parent lock residual)** — `Typecheck + unit tests` passed with 50 files / 316 tests; `Cargo tests (desktop)` then failed `cargo test --locked` because `desktop/src-tauri/Cargo.lock` does not record path dep `grokptah-agent-sdk` already present in `grokptah-agent-bridge` at `8ad3be07`. This draft does not alter lockfiles. The unchanged parent lock mismatch remains an inherited hosted blocker; bridge/oracle gates after Cargo did not run. |
 
 JSDOM printed `HTMLCanvasElement.prototype.getContext` when `App.operatorUx.test.tsx` imported `App.tsx` (xterm). Tests still passed. That is not packaged AT.
 
