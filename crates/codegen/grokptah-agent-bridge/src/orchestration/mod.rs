@@ -3,11 +3,18 @@
 //! Pure policy + durable records live here; the MCP transport is a thin adapter.
 
 mod authz;
+mod provider_journal;
 mod service;
 mod store;
 mod types;
 
 pub use authz::{canonical_workspace, constant_time_eq, AuthContext, WorkspaceAllowlist};
+pub use provider_journal::{
+    ProviderAttemptOutcome, ProviderAttemptRecord, ProviderAttemptState,
+    ProviderJournalReopenReport, ProviderReconciliation, ProviderReconciliationAction,
+    ProviderRequestIdentity, ProviderSendCause, ProviderSendJournal, UnresolvedAttempt,
+    MAX_PROVIDER_ATTEMPTS_PER_RUN, PROVIDER_JOURNAL_SCHEMA,
+};
 pub(crate) use service::apply_run_aggregate;
 pub use service::{OrchestrationConfig, OrchestrationService};
 pub use store::{IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport};

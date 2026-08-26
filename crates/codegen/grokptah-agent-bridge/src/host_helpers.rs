@@ -1705,9 +1705,301 @@ fn ensure_stream_completed(saw_data: bool, stream_completed: bool) -> Result<()>
     Ok(())
 }
 
+// ── Provider-send journal binding (physical attempt identity) ────────────
+//
+// One logical model step can issue several *physical* provider requests:
+// a credential refresh after 401, a transport/429/5xx retry, a `tool_choice`
+// fallback, or a non-stream fallback. Each of those is its own attempt with
+// its own ordinal and digest, so no resend can silently reuse the identity of
+// a request whose outcome is unknown.
+
+/// Durable binding for the physical sends of one model step.
+#[derive(Clone)]
+pub(crate) struct ProviderSendContext {
+    journal: crate::orchestration::ProviderSendJournal,
+    run_id: String,
+    session_id: Uuid,
+    round: u32,
+}
+
+impl ProviderSendContext {
+    pub(crate) fn new(
+        journal: crate::orchestration::ProviderSendJournal,
+        run_id: impl Into<String>,
+        session_id: Uuid,
+        round: u32,
+    ) -> Self {
+        Self {
+            journal,
+            run_id: run_id.into(),
+            session_id,
+            round,
+        }
+    }
+
+    /// Same run and journal, bound to a different model-step round.
+    pub(crate) fn for_round(&self, round: u32) -> Self {
+        Self {
+            journal: self.journal.clone(),
+            run_id: self.run_id.clone(),
+            session_id: self.session_id,
+            round,
+        }
+    }
+}
+
+/// A single declared physical send. Every method is a durable transition; a
+/// journal write that fails aborts the send rather than proceeding unrecorded.
+pub(crate) struct ProviderAttemptHandle {
+    journal: Option<crate::orchestration::ProviderSendJournal>,
+    run_id: String,
+    ordinal: u64,
+}
+
+impl ProviderAttemptHandle {
+    fn unbound() -> Self {
+        Self {
+            journal: None,
+            run_id: String::new(),
+            ordinal: 0,
+        }
+    }
+
+    fn mark_sending(&self) -> Result<()> {
+        let Some(journal) = self.journal.as_ref() else {
+            return Ok(());
+        };
+        journal
+            .mark_sending(&self.run_id, self.ordinal)
+            .map(|_| ())
+            .map_err(|error| anyhow!("provider send journal: {}", error.message))
+    }
+
+    fn mark_sent(&self, provider_request_id: Option<&str>) -> Result<()> {
+        let Some(journal) = self.journal.as_ref() else {
+            return Ok(());
+        };
+        journal
+            .mark_sent(&self.run_id, self.ordinal, provider_request_id)
+            .map(|_| ())
+            .map_err(|error| anyhow!("provider send journal: {}", error.message))
+    }
+
+    fn mark_responding(&self, status: u16) -> Result<()> {
+        let Some(journal) = self.journal.as_ref() else {
+            return Ok(());
+        };
+        journal
+            .mark_responding(&self.run_id, self.ordinal, status)
+            .map(|_| ())
+            .map_err(|error| anyhow!("provider send journal: {}", error.message))
+    }
+
+    fn settle(
+        &self,
+        outcome: crate::orchestration::ProviderAttemptOutcome,
+        detail: impl AsRef<str>,
+    ) -> Result<()> {
+        let Some(journal) = self.journal.as_ref() else {
+            return Ok(());
+        };
+        journal
+            .settle(&self.run_id, self.ordinal, outcome, detail)
+            .map(|_| ())
+            .map_err(|error| anyhow!("provider send journal: {}", error.message))
+    }
+
+    fn settle_accepted(&self, detail: impl AsRef<str>) -> Result<()> {
+        self.settle(
+            crate::orchestration::ProviderAttemptOutcome::Accepted,
+            detail,
+        )
+    }
+
+    fn settle_rejected(&self, detail: impl AsRef<str>) -> Result<()> {
+        self.settle(
+            crate::orchestration::ProviderAttemptOutcome::ProviderRejected,
+            detail,
+        )
+    }
+
+    fn settle_not_sent(&self, detail: impl AsRef<str>) -> Result<()> {
+        self.settle(
+            crate::orchestration::ProviderAttemptOutcome::NotSent,
+            detail,
+        )
+    }
+
+    /// Any error after the physical-send boundary. The attempt keeps fencing
+    /// retry and capacity until a reconciliation proves the outcome.
+    fn mark_uncertain(&self, reason: impl AsRef<str>) -> Result<()> {
+        let Some(journal) = self.journal.as_ref() else {
+            return Ok(());
+        };
+        journal
+            .mark_uncertain(&self.run_id, self.ordinal, reason)
+            .map(|_| ())
+            .map_err(|error| anyhow!("provider send journal: {}", error.message))
+    }
+}
+
+/// Digest of the credential's identity, never its secret. A refreshed token
+/// yields a different revision, so a post-401 resend is provably a different
+/// physical request.
+pub(crate) fn credential_revision(creds: &crate::auth_store::WireCredentials) -> String {
+    use sha2::{Digest, Sha256};
+    let bearer_digest = {
+        let mut out = String::with_capacity(64);
+        for byte in Sha256::digest(creds.bearer.as_bytes()) {
+            use std::fmt::Write;
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    };
+    crate::orchestration::hash_payload(&serde_json::json!({
+        "providerId": creds.provider_id,
+        "method": creds.method,
+        "oidcTokenAuth": creds.oidc_token_auth,
+        "userId": creds.user_id,
+        "teamId": creds.team_id,
+        "authScope": creds.auth_scope,
+        "principalType": creds.principal_type,
+        "principalId": creds.principal_id,
+        "expiresAt": creds.expires_at,
+        "bearerDigest": bearer_digest,
+    }))
+}
+
+/// Public route template for a first-party route; an opaque, stable label for
+/// a private compatible gateway, so the journal binds the route without ever
+/// persisting a corporate endpoint.
+pub(crate) fn route_identity(
+    dialect: crate::gateway_config::ProviderDialect,
+    base_url: &str,
+) -> String {
+    match dialect {
+        crate::gateway_config::ProviderDialect::XaiChatCompletions => {
+            format!("{}/chat/completions", base_url.trim_end_matches('/'))
+        }
+        crate::gateway_config::ProviderDialect::OpenAiChatCompletions => {
+            let digest = crate::orchestration::hash_payload(&serde_json::json!({
+                "baseUrl": base_url.trim_end_matches('/'),
+            }));
+            format!("compatible:{}/chat/completions", &digest[..32])
+        }
+    }
+}
+
+pub(crate) fn dialect_label(dialect: crate::gateway_config::ProviderDialect) -> &'static str {
+    match dialect {
+        crate::gateway_config::ProviderDialect::XaiChatCompletions => "xai_chat_completions",
+        crate::gateway_config::ProviderDialect::OpenAiChatCompletions => "openai_chat_completions",
+    }
+}
+
+/// Bind the journal entry to the exact bytes this request will carry.
+pub(crate) fn provider_request_identity(
+    creds: &crate::auth_store::WireCredentials,
+    target: &ResolvedModelTarget,
+    body: &serde_json::Value,
+) -> crate::orchestration::ProviderRequestIdentity {
+    crate::orchestration::ProviderRequestIdentity {
+        route_identity: route_identity(target.dialect, &target.base_url),
+        provider_profile: creds.provider_id.clone(),
+        dialect: dialect_label(target.dialect).into(),
+        wire_model: target.wire_model.clone(),
+        credential_revision: credential_revision(creds),
+        body_digest: crate::orchestration::hash_payload(body),
+    }
+}
+
+/// Provider-assigned request identity, when the response advertises one.
+/// Header values are treated as untrusted: only a bounded, printable ASCII
+/// token is retained.
+fn provider_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    const CANDIDATES: [&str; 5] = [
+        "x-request-id",
+        "x-grok-request-id",
+        "request-id",
+        "openai-request-id",
+        "cf-ray",
+    ];
+    for name in CANDIDATES {
+        let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
+            continue;
+        };
+        let token: String = value
+            .trim()
+            .chars()
+            .take(128)
+            .filter(|c| c.is_ascii_graphic())
+            .collect();
+        if !token.is_empty() {
+            return Some(format!("{name}:{token}"));
+        }
+    }
+    None
+}
+
+/// Durably declare one physical send before any byte reaches the transport.
+fn declare_provider_send(
+    context: Option<&ProviderSendContext>,
+    cause: crate::orchestration::ProviderSendCause,
+    identity: &crate::orchestration::ProviderRequestIdentity,
+) -> Result<ProviderAttemptHandle> {
+    let Some(context) = context else {
+        return Ok(ProviderAttemptHandle::unbound());
+    };
+    let record = context
+        .journal
+        .declare(
+            &context.run_id,
+            context.session_id,
+            context.round,
+            cause,
+            identity,
+        )
+        .map_err(|error| anyhow!("provider send journal: {}", error.message))?;
+    Ok(ProviderAttemptHandle {
+        journal: Some(context.journal.clone()),
+        run_id: context.run_id.clone(),
+        ordinal: record.ordinal,
+    })
+}
+
+/// Redact a transport failure the same way the response paths do, so a
+/// private compatible endpoint never reaches a journal entry or an error.
+fn transport_error_message(
+    target: &ResolvedModelTarget,
+    error: &reqwest::Error,
+    refreshed: bool,
+) -> String {
+    if target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions {
+        if error.is_timeout() {
+            "configured provider request timed out".into()
+        } else if error.is_connect() {
+            "configured provider could not connect".into()
+        } else {
+            "configured provider request failed".into()
+        }
+    } else if refreshed {
+        format!("request error after refresh: {error}")
+    } else {
+        format!("request error: {error}")
+    }
+}
+
 /// Stream one chat/completions step (tools + tokens).
 /// Content → `on_delta`; reasoning_content → `on_thought` (#149).
 /// Cancel aborts the HTTP body read within ~one chunk.
+///
+/// Every *physical* request issued here is declared in the durable provider
+/// send journal before it reaches the transport and is left in exactly one of
+/// two terminal shapes: `settled`, when the outcome is durably known, or
+/// `uncertain`, when anything failed after the physical-send boundary. An
+/// uncertain attempt fences both the automatic resend below and the explicit
+/// retry path until a reconciliation proves what the provider did, so a
+/// duplicate physical request can never be issued on a guess.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_xai_agent_step<F, G>(
     creds: &crate::auth_store::WireCredentials,
@@ -1716,6 +2008,7 @@ pub(crate) async fn call_xai_agent_step<F, G>(
     messages: &[serde_json::Value],
     tools: &serde_json::Value,
     cancel: &CancellationToken,
+    journal: Option<&ProviderSendContext>,
     mut on_delta: F,
     mut on_thought: G,
 ) -> Result<AgentStep>
@@ -1756,7 +2049,10 @@ where
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
     let mut last_err = None::<String>;
-    for attempt in 0..4u32 {
+    // Why this physical send exists. Every resend below sets it explicitly, so
+    // the journal never records an authorized resend as a first send.
+    let mut cause = crate::orchestration::ProviderSendCause::InitialSend;
+    for attempt_index in 0..4u32 {
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
@@ -1772,46 +2068,89 @@ where
             req.json(&body)
         };
 
+        // Durable intent precedes the physical write: a crash observed in
+        // `known_not_sent` proves nothing left this process.
+        let mut attempt = declare_provider_send(
+            journal,
+            cause,
+            &provider_request_identity(&creds, &target, &body),
+        )?;
+        attempt.mark_sending()?;
+
         let resp_result = tokio::select! {
             r = send_once(&creds).send() => r,
-            _ = cancel.cancelled() => bail!("cancelled"),
+            _ = cancel.cancelled() => {
+                attempt.mark_uncertain(
+                    "turn cancelled while the physical send was in flight",
+                )?;
+                bail!("cancelled");
+            }
         };
         let mut resp = match resp_result {
             Ok(r) => r,
             Err(e) => {
-                last_err = Some(
-                    if target.dialect
-                        == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
-                    {
-                        if e.is_timeout() {
-                            "configured provider request timed out".into()
-                        } else if e.is_connect() {
-                            "configured provider could not connect".into()
-                        } else {
-                            "configured provider request failed".into()
-                        }
-                    } else {
-                        format!("request error: {e}")
-                    },
-                );
-                if attempt < 3 {
-                    tokio::time::sleep(std::time::Duration::from_millis(400 * (1 << attempt)))
-                        .await;
+                let message = transport_error_message(&target, &e, false);
+                // Only a connect-phase failure proves the request never
+                // reached the provider. Anything else may already have been
+                // executed remotely, so it fences retry instead of looping.
+                if !e.is_connect() {
+                    attempt.mark_uncertain(&message)?;
+                    bail!("{message}");
+                }
+                attempt.settle_not_sent(&message)?;
+                last_err = Some(message);
+                if attempt_index < 3 {
+                    cause = crate::orchestration::ProviderSendCause::TransportRetry;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        400 * (1 << attempt_index),
+                    ))
+                    .await;
                     continue;
                 }
                 bail!("{}", last_err.unwrap());
             }
         };
+        attempt.mark_sent(provider_request_id(resp.headers()).as_deref())?;
+        attempt.mark_responding(resp.status().as_u16())?;
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
+            // The 401 itself is a definitive outcome for that attempt.
+            attempt.settle_rejected("HTTP 401 before credential refresh")?;
             match crate::auth_store::force_refresh(&creds).await {
                 Ok(fresh) => {
                     creds = fresh;
-                    resp = tokio::select! {
-                        r = send_once(&creds).send() => r
-                            .map_err(|e| anyhow!("request error after refresh: {e}"))?,
-                        _ = cancel.cancelled() => bail!("cancelled"),
+                    // A refreshed credential is a different credential
+                    // revision, so this resend is a new ordinal and a new
+                    // request digest — never a reuse of the 401 attempt.
+                    attempt = declare_provider_send(
+                        journal,
+                        crate::orchestration::ProviderSendCause::AuthRefresh,
+                        &provider_request_identity(&creds, &target, &body),
+                    )?;
+                    attempt.mark_sending()?;
+                    let refreshed = tokio::select! {
+                        r = send_once(&creds).send() => r,
+                        _ = cancel.cancelled() => {
+                            attempt.mark_uncertain(
+                                "turn cancelled while the refreshed send was in flight",
+                            )?;
+                            bail!("cancelled");
+                        }
                     };
+                    resp = match refreshed {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let message = transport_error_message(&target, &e, true);
+                            if e.is_connect() {
+                                attempt.settle_not_sent(&message)?;
+                            } else {
+                                attempt.mark_uncertain(&message)?;
+                            }
+                            bail!("{message}");
+                        }
+                    };
+                    attempt.mark_sent(provider_request_id(resp.headers()).as_deref())?;
+                    attempt.mark_responding(resp.status().as_u16())?;
                 }
                 Err(e) => {
                     let text = read_bounded_response_body(resp, cancel)
@@ -1830,6 +2169,7 @@ where
             || status.is_server_error()
             || status == reqwest::StatusCode::REQUEST_TIMEOUT
         {
+            attempt.settle_rejected(format!("HTTP {status}"))?;
             let text = read_bounded_response_body(resp, cancel)
                 .await
                 .unwrap_or_default();
@@ -1847,14 +2187,21 @@ where
             } else {
                 format!("HTTP {status}: {clipped}")
             });
-            if attempt < 3 {
-                tokio::time::sleep(std::time::Duration::from_millis(600 * (1 << attempt))).await;
+            if attempt_index < 3 {
+                cause = if status.as_u16() == 429 {
+                    crate::orchestration::ProviderSendCause::RateLimitRetry
+                } else {
+                    crate::orchestration::ProviderSendCause::ServerErrorRetry
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(600 * (1 << attempt_index)))
+                    .await;
                 continue;
             }
             bail!("{}", last_err.unwrap());
         }
 
         if !status.is_success() {
+            attempt.settle_rejected(format!("HTTP {status}"))?;
             let text = read_bounded_response_body(resp, cancel)
                 .await
                 .unwrap_or_default();
@@ -1869,10 +2216,11 @@ where
                     object.remove("tool_choice");
                 }
                 last_err = Some("HTTP 400 (will retry without tool_choice)".into());
+                cause = crate::orchestration::ProviderSendCause::ToolChoiceFallback;
                 continue;
             }
             // Some proxies reject stream+tools — fall back to non-stream once.
-            if attempt < 2
+            if attempt_index < 2
                 && status.as_u16() == 400
                 && body.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
             {
@@ -1881,6 +2229,7 @@ where
                     "HTTP {status} (will retry non-stream): {}",
                     text.chars().take(200).collect::<String>()
                 ));
+                cause = crate::orchestration::ProviderSendCause::StreamFallback;
                 continue;
             }
             if target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions {
@@ -1900,29 +2249,41 @@ where
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_ascii_lowercase();
-        if body.get("stream").and_then(|s| s.as_bool()) == Some(false) {
-            let raw = read_bounded_response_body(resp, cancel).await?;
-            let v: serde_json::Value =
-                serde_json::from_str(&raw).map_err(|e| anyhow!("provider JSON: {e}"))?;
+        let non_stream_body = body.get("stream").and_then(|s| s.as_bool()) == Some(false);
+        if non_stream_body || content_type.contains("application/json") {
+            let raw = match read_bounded_response_body(resp, cancel).await {
+                Ok(raw) => raw,
+                Err(error) => {
+                    // The transfer never completed, so the provider outcome is
+                    // unknown even though it accepted the request.
+                    attempt.mark_uncertain(format!("provider response body: {error}"))?;
+                    return Err(error);
+                }
+            };
             // Note: session usage is accumulated in the turn loop when available.
-            let _ = v.get("usage"); // kept for future wire-through of session_id
-            return parse_agent_step_from_message(
-                &v["choices"][0]["message"],
-                false,
-                &mut on_delta,
-                &mut on_thought,
-            );
-        }
-        if content_type.contains("application/json") {
-            let raw = read_bounded_response_body(resp, cancel).await?;
-            let value: serde_json::Value =
-                serde_json::from_str(&raw).map_err(|e| anyhow!("provider JSON: {e}"))?;
-            return parse_agent_step_from_message(
+            let value: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(value) => value,
+                Err(error) => {
+                    attempt.settle_rejected("provider returned a malformed JSON body")?;
+                    bail!("provider JSON: {error}");
+                }
+            };
+            let _ = value.get("usage"); // kept for future wire-through of session_id
+            return match parse_agent_step_from_message(
                 &value["choices"][0]["message"],
                 false,
                 &mut on_delta,
                 &mut on_thought,
-            );
+            ) {
+                Ok(step) => {
+                    attempt.settle_accepted("complete non-stream response")?;
+                    Ok(step)
+                }
+                Err(error) => {
+                    attempt.settle_rejected("provider returned an unusable JSON message")?;
+                    Err(error)
+                }
+            };
         }
 
         // SSE stream path — cancel kills the body read promptly.
@@ -1937,20 +2298,48 @@ where
                 c = stream.next() => c,
                 _ = cancel.cancelled() => {
                     drop(stream);
+                    attempt.mark_uncertain(
+                        "turn cancelled while the provider response was streaming",
+                    )?;
                     bail!("cancelled");
                 }
             };
             let Some(chunk) = chunk else {
                 break;
             };
-            let bytes = chunk.map_err(|e| anyhow!("stream: {e}"))?;
+            // Every failure below happens after the physical-send boundary and
+            // before a completion marker, so the provider outcome is unknown.
+            let bytes = match chunk {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    attempt.mark_uncertain(format!("stream: {error}"))?;
+                    bail!("stream: {error}");
+                }
+            };
             if !acc.saw_data {
-                full_body.push(&bytes)?;
+                if let Err(error) = full_body.push(&bytes) {
+                    attempt.mark_uncertain(format!("provider response body: {error}"))?;
+                    return Err(error);
+                }
             }
-            for line in decoder.push(&bytes)? {
-                if apply_agent_sse_line(&line, &mut acc, &mut on_delta, &mut on_thought)? {
-                    done = true;
-                    break;
+            let lines = match decoder.push(&bytes) {
+                Ok(lines) => lines,
+                Err(error) => {
+                    attempt.mark_uncertain(format!("provider stream framing: {error}"))?;
+                    return Err(error);
+                }
+            };
+            for line in lines {
+                match apply_agent_sse_line(&line, &mut acc, &mut on_delta, &mut on_thought) {
+                    Ok(true) => {
+                        done = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        attempt.mark_uncertain(format!("provider stream: {error}"))?;
+                        return Err(error);
+                    }
                 }
             }
             if done {
@@ -1959,25 +2348,69 @@ where
         }
 
         if !done {
-            if let Some(trailing) = decoder.finish()? {
-                done = apply_agent_sse_line(&trailing, &mut acc, &mut on_delta, &mut on_thought)?;
+            match decoder.finish() {
+                Ok(Some(trailing)) => {
+                    match apply_agent_sse_line(&trailing, &mut acc, &mut on_delta, &mut on_thought)
+                    {
+                        Ok(value) => done = value,
+                        Err(error) => {
+                            attempt.mark_uncertain(format!("provider stream: {error}"))?;
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    attempt.mark_uncertain(format!("provider stream framing: {error}"))?;
+                    return Err(error);
+                }
             }
         }
         if !acc.saw_data {
-            let raw = full_body.finish()?;
-            let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|error| {
-                anyhow!("provider returned neither SSE nor valid JSON: {error}")
-            })?;
-            return parse_agent_step_from_message(
+            let raw = match full_body.finish() {
+                Ok(raw) => raw,
+                Err(error) => {
+                    attempt.mark_uncertain(format!("provider response body: {error}"))?;
+                    return Err(error);
+                }
+            };
+            let value: serde_json::Value = match serde_json::from_str(raw.trim()) {
+                Ok(value) => value,
+                Err(error) => {
+                    attempt.settle_rejected("provider returned neither SSE nor valid JSON")?;
+                    bail!("provider returned neither SSE nor valid JSON: {error}");
+                }
+            };
+            return match parse_agent_step_from_message(
                 &value["choices"][0]["message"],
                 false,
                 &mut on_delta,
                 &mut on_thought,
-            );
+            ) {
+                Ok(step) => {
+                    attempt.settle_accepted("complete non-SSE response")?;
+                    Ok(step)
+                }
+                Err(error) => {
+                    attempt.settle_rejected("provider returned an unusable JSON message")?;
+                    Err(error)
+                }
+            };
         }
 
-        ensure_stream_completed(acc.saw_data, done)?;
-        let tool_calls = finish_streamed_tool_calls(acc.tool_calls, done)?;
+        // A stream that stops before its completion marker leaves the provider
+        // outcome unknown; only an observed marker settles the attempt.
+        if let Err(error) = ensure_stream_completed(acc.saw_data, done) {
+            attempt.mark_uncertain(error.to_string())?;
+            return Err(error);
+        }
+        let tool_calls = match finish_streamed_tool_calls(acc.tool_calls, done) {
+            Ok(tool_calls) => tool_calls,
+            Err(error) => {
+                attempt.settle_rejected("provider completed with an unusable tool call")?;
+                return Err(error);
+            }
+        };
 
         let reasoning_opt = if acc.reasoning.trim().is_empty() {
             None
@@ -1991,6 +2424,7 @@ where
             } else {
                 Some(acc.content)
             };
+            attempt.settle_accepted("complete streamed tool call response")?;
             return Ok(AgentStep::ToolCalls {
                 content: content_opt,
                 tool_calls,
@@ -2000,6 +2434,7 @@ where
         }
 
         if !acc.content.trim().is_empty() {
+            attempt.settle_accepted("complete streamed final response")?;
             return Ok(AgentStep::Final {
                 text: acc.content,
                 streamed: acc.streamed_any,
@@ -2008,15 +2443,20 @@ where
         }
         if let Some(r) = reasoning_opt {
             // Reasoning-only: already streamed via on_thought; no assistant text.
+            attempt.settle_accepted("complete streamed reasoning-only response")?;
             return Ok(AgentStep::Final {
                 text: String::new(),
                 streamed: true,
                 reasoning: Some(r),
             });
         }
+        // A completed but empty stream is a definitive outcome; the non-stream
+        // fallback below is an authorized resend with its own ordinal.
+        attempt.settle_accepted("complete but empty streamed response")?;
         last_err = Some("empty stream response".into());
-        if attempt < 3 {
+        if attempt_index < 3 {
             body["stream"] = serde_json::Value::Bool(false);
+            cause = crate::orchestration::ProviderSendCause::StreamFallback;
             continue;
         }
         bail!("{}", last_err.unwrap());
@@ -2040,7 +2480,7 @@ mod compatible_stream_tests {
 
     use super::*;
 
-    fn compatible_credentials(provider_id: &str) -> crate::auth_store::WireCredentials {
+    pub(super) fn compatible_credentials(provider_id: &str) -> crate::auth_store::WireCredentials {
         crate::auth_store::WireCredentials {
             provider_id: provider_id.into(),
             bearer: "synthetic-test-key".into(),
@@ -2059,7 +2499,7 @@ mod compatible_stream_tests {
         }
     }
 
-    fn install_compatible_profile(home: &std::path::Path, base_url: &str) -> String {
+    pub(super) fn install_compatible_profile(home: &std::path::Path, base_url: &str) -> String {
         crate::discover::set_grokptah_home_override(Some(home.to_path_buf()));
         let mut config = crate::gateway_config::GatewayConfig::default();
         let mut profile = crate::gateway_config::ProviderProfile::openai_compatible(
@@ -2203,6 +2643,7 @@ mod compatible_stream_tests {
                         &[serde_json::json!({"role": "user", "content": "synthetic"})],
                         &serde_json::json!([]),
                         &cancel,
+                        None,
                         move |_| cancel_after_delta.cancel(),
                         |_| {},
                     ),
@@ -2250,6 +2691,527 @@ mod compatible_stream_tests {
                 assert!(!error.contains(&address.to_string()));
             });
         crate::discover::set_grokptah_home_override(None);
+    }
+}
+
+/// The physical-send journal seen from the real send path: every scripted
+/// provider outcome is driven through `call_xai_agent_step` against a loopback
+/// stub. No live provider, credential, or outbound network is involved.
+#[cfg(test)]
+mod provider_send_journal_tests {
+    use std::collections::VecDeque;
+    use std::convert::Infallible;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use axum::body::{Body, Bytes};
+    use axum::http::{header, Response, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+
+    use super::compatible_stream_tests::{compatible_credentials, install_compatible_profile};
+    use super::*;
+    use crate::orchestration::{
+        ProviderAttemptOutcome, ProviderAttemptRecord, ProviderAttemptState, ProviderSendCause,
+        ProviderSendJournal,
+    };
+
+    const SSE_OK: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    const SSE_TRUNCATED: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+    const JSON_OK: &str = r#"{"choices":[{"message":{"content":"done"}}]}"#;
+
+    #[derive(Clone)]
+    enum Stub {
+        Status(u16),
+        Sse(&'static str),
+        Json(&'static str),
+    }
+
+    struct Harness {
+        server: tokio::task::JoinHandle<()>,
+        requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        model: String,
+        journal: ProviderSendJournal,
+        _home: tempfile::TempDir,
+    }
+
+    impl Harness {
+        fn attempts(&self, run_id: &str) -> Vec<ProviderAttemptRecord> {
+            self.journal.list_run(run_id).unwrap()
+        }
+
+        fn unresolved(&self, run_id: &str) -> usize {
+            self.journal.unresolved_for_run(run_id).unwrap().len()
+        }
+
+        fn requests(&self) -> Vec<serde_json::Value> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    /// Bind a loopback stub that answers the scripted sequence in order and
+    /// records every request body it was sent.
+    async fn scripted(script: Vec<Stub>) -> Harness {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let queue = Arc::new(Mutex::new(VecDeque::from(script)));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let handler_queue = queue.clone();
+        let handler_requests = requests.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: Bytes| {
+                let queue = handler_queue.clone();
+                let requests = handler_requests.clone();
+                async move {
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) {
+                        requests.lock().unwrap().push(value);
+                    }
+                    let next = queue
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or(Stub::Status(500));
+                    match next {
+                        Stub::Status(status) => Response::builder()
+                            .status(StatusCode::from_u16(status).unwrap())
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(r#"{"error":"scripted"}"#))
+                            .unwrap(),
+                        Stub::Sse(payload) => Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "text/event-stream")
+                            .body(Body::from(payload))
+                            .unwrap(),
+                        Stub::Json(payload) => Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(payload))
+                            .unwrap(),
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let home = tempfile::tempdir().unwrap();
+        let model = install_compatible_profile(home.path(), &format!("http://{address}/v1"));
+        let journal =
+            ProviderSendJournal::open(home.path().join("journal")).expect("open send journal");
+        Harness {
+            server,
+            requests,
+            model,
+            journal,
+            _home: home,
+        }
+    }
+
+    async fn step(
+        harness: &Harness,
+        run_id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<AgentStep> {
+        let context = ProviderSendContext::new(
+            harness.journal.clone(),
+            run_id,
+            Uuid::from_u128(0xfeed_0001),
+            3,
+        );
+        call_xai_agent_step(
+            &compatible_credentials("cancel-test"),
+            &harness.model,
+            EffortLevel::None,
+            &[serde_json::json!({"role": "user", "content": "synthetic"})],
+            &serde_json::json!([]),
+            cancel,
+            Some(&context),
+            |_| {},
+            |_| {},
+        )
+        .await
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn causes(attempts: &[ProviderAttemptRecord]) -> Vec<ProviderSendCause> {
+        attempts.iter().map(|attempt| attempt.cause).collect()
+    }
+
+    fn digests(attempts: &[ProviderAttemptRecord]) -> std::collections::BTreeSet<String> {
+        attempts
+            .iter()
+            .map(|attempt| attempt.request_digest.clone())
+            .collect()
+    }
+
+    /// 429 and 5xx are definitive provider outcomes: each settles its own
+    /// attempt, and the automatic retry is a new ordinal with a new digest.
+    #[test]
+    fn rate_limit_and_server_error_settle_then_resend_under_new_ordinals() {
+        let _lock = crate::discover::home_override_serial();
+        runtime().block_on(async {
+            let harness = scripted(vec![
+                Stub::Status(429),
+                Stub::Status(503),
+                Stub::Sse(SSE_OK),
+            ])
+            .await;
+            let cancel = CancellationToken::new();
+            if step(&harness, "run-retry", &cancel).await.is_err() {
+                panic!("scripted retry must succeed");
+            }
+
+            let attempts = harness.attempts("run-retry");
+            assert_eq!(attempts.len(), 3);
+            assert_eq!(
+                attempts.iter().map(|a| a.ordinal).collect::<Vec<_>>(),
+                vec![1, 2, 3]
+            );
+            assert_eq!(
+                causes(&attempts),
+                vec![
+                    ProviderSendCause::InitialSend,
+                    ProviderSendCause::RateLimitRetry,
+                    ProviderSendCause::ServerErrorRetry,
+                ]
+            );
+            assert_eq!(
+                attempts
+                    .iter()
+                    .map(|a| a.outcome.unwrap())
+                    .collect::<Vec<_>>(),
+                vec![
+                    ProviderAttemptOutcome::ProviderRejected,
+                    ProviderAttemptOutcome::ProviderRejected,
+                    ProviderAttemptOutcome::Accepted,
+                ]
+            );
+            assert_eq!(
+                attempts
+                    .iter()
+                    .map(|a| a.response_status.unwrap())
+                    .collect::<Vec<_>>(),
+                vec![429, 503, 200]
+            );
+            // Every attempt is bound to the exact run, round, route and model.
+            assert!(attempts.iter().all(|a| a.run_id == "run-retry"
+                && a.round == 3
+                && a.wire_model == "test-model"
+                && a.dialect == "openai_chat_completions"
+                && a.provider_profile == "cancel-test"
+                && a.route_identity.starts_with("compatible:")));
+            assert_eq!(digests(&attempts).len(), 3);
+            assert_eq!(harness.unresolved("run-retry"), 0);
+            harness.server.abort();
+        });
+        crate::discover::set_grokptah_home_override(None);
+    }
+
+    /// A gateway that rejects `tool_choice` and then rejects streaming drives
+    /// two authorized fallbacks. Each resend changes the request body, so its
+    /// body digest — not just its ordinal — is different.
+    #[test]
+    fn tool_choice_and_stream_fallbacks_resend_with_new_body_digests() {
+        let _lock = crate::discover::home_override_serial();
+        runtime().block_on(async {
+            let harness = scripted(vec![
+                Stub::Status(400),
+                Stub::Status(400),
+                Stub::Json(JSON_OK),
+            ])
+            .await;
+            let cancel = CancellationToken::new();
+            if step(&harness, "run-fallback", &cancel).await.is_err() {
+                panic!("scripted fallbacks must succeed");
+            }
+
+            let attempts = harness.attempts("run-fallback");
+            assert_eq!(attempts.len(), 3);
+            assert_eq!(
+                causes(&attempts),
+                vec![
+                    ProviderSendCause::InitialSend,
+                    ProviderSendCause::ToolChoiceFallback,
+                    ProviderSendCause::StreamFallback,
+                ]
+            );
+            let bodies: std::collections::BTreeSet<_> = attempts
+                .iter()
+                .map(|attempt| attempt.body_digest.clone())
+                .collect();
+            assert_eq!(bodies.len(), 3, "each fallback changes the request body");
+            assert_eq!(digests(&attempts).len(), 3);
+
+            // The journal's body binding matches what actually went on the wire.
+            let sent = harness.requests();
+            assert_eq!(sent.len(), 3);
+            assert!(sent[0].get("tool_choice").is_some());
+            assert!(sent[1].get("tool_choice").is_none());
+            assert_eq!(sent[2]["stream"], serde_json::Value::Bool(false));
+            assert_eq!(harness.unresolved("run-fallback"), 0);
+            harness.server.abort();
+        });
+        crate::discover::set_grokptah_home_override(None);
+    }
+
+    /// A 401 is a definitive answer, not an unknown. It settles its attempt
+    /// and leaves nothing fencing the run.
+    #[test]
+    fn unauthorized_settles_the_attempt_without_uncertainty() {
+        let _lock = crate::discover::home_override_serial();
+        runtime().block_on(async {
+            let harness = scripted(vec![Stub::Status(401)]).await;
+            let cancel = CancellationToken::new();
+            let error = match step(&harness, "run-401", &cancel).await {
+                Ok(_) => panic!("401 unexpectedly produced a step"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("401"), "{error}");
+
+            let attempts = harness.attempts("run-401");
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].state, ProviderAttemptState::Settled);
+            assert_eq!(
+                attempts[0].outcome,
+                Some(ProviderAttemptOutcome::ProviderRejected)
+            );
+            assert_eq!(attempts[0].response_status, Some(401));
+            assert_eq!(harness.unresolved("run-401"), 0);
+            harness.server.abort();
+        });
+        crate::discover::set_grokptah_home_override(None);
+    }
+
+    /// A stream that stops before its completion marker leaves the provider
+    /// outcome unknown. The attempt is uncertain and keeps fencing the run.
+    #[test]
+    fn truncated_stream_is_uncertain_and_fences_the_run() {
+        let _lock = crate::discover::home_override_serial();
+        runtime().block_on(async {
+            let harness = scripted(vec![Stub::Sse(SSE_TRUNCATED)]).await;
+            let cancel = CancellationToken::new();
+            if step(&harness, "run-truncated", &cancel).await.is_ok() {
+                panic!("a truncated stream must not be accepted");
+            }
+
+            let attempts = harness.attempts("run-truncated");
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].state, ProviderAttemptState::Uncertain);
+            assert!(attempts[0].outcome.is_none());
+            assert_eq!(harness.unresolved("run-truncated"), 1);
+
+            // The crash cut agrees with the live cut: still uncertain.
+            harness.journal.reopen().unwrap();
+            harness.journal.reopen().unwrap();
+            assert_eq!(harness.unresolved("run-truncated"), 1);
+            harness.server.abort();
+        });
+        crate::discover::set_grokptah_home_override(None);
+    }
+
+    /// Cancelling a turn mid-stream cannot claim the provider stopped too.
+    /// The attempt is left uncertain so capacity and retry stay fenced.
+    #[test]
+    fn cancel_mid_stream_leaves_the_attempt_uncertain() {
+        let _lock = crate::discover::home_override_serial();
+        runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/v1/chat/completions",
+                post(|| async {
+                    let first = futures::stream::once(async {
+                        Ok::<_, Infallible>(Bytes::from_static(
+                            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                        ))
+                    });
+                    let stalled =
+                        futures::stream::pending::<std::result::Result<Bytes, Infallible>>();
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(first.chain(stalled)))
+                        .unwrap()
+                }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let home = tempfile::tempdir().unwrap();
+            let model = install_compatible_profile(home.path(), &format!("http://{address}/v1"));
+            let journal = ProviderSendJournal::open(home.path().join("journal")).unwrap();
+            let context = ProviderSendContext::new(
+                journal.clone(),
+                "run-cancelled",
+                Uuid::from_u128(0xfeed_0002),
+                1,
+            );
+            let cancel = CancellationToken::new();
+            let cancel_after_delta = cancel.clone();
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                call_xai_agent_step(
+                    &compatible_credentials("cancel-test"),
+                    &model,
+                    EffortLevel::None,
+                    &[serde_json::json!({"role": "user", "content": "synthetic"})],
+                    &serde_json::json!([]),
+                    &cancel,
+                    Some(&context),
+                    move |_| cancel_after_delta.cancel(),
+                    |_| {},
+                ),
+            )
+            .await
+            .expect("cancellation must stop a stalled response");
+            let error = match result {
+                Ok(_) => panic!("cancelled stalled response unexpectedly succeeded"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("cancelled"), "{error}");
+
+            let attempts = journal.list_run("run-cancelled").unwrap();
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].state, ProviderAttemptState::Uncertain);
+            assert!(attempts[0]
+                .uncertain_reason
+                .as_deref()
+                .unwrap()
+                .contains("cancelled"));
+            assert_eq!(
+                journal.unresolved_for_run("run-cancelled").unwrap().len(),
+                1
+            );
+            server.abort();
+        });
+        crate::discover::set_grokptah_home_override(None);
+    }
+
+    /// A connect-phase failure is the one transport error that proves nothing
+    /// reached the provider, so it settles rather than fencing — and each
+    /// retry is still its own ordinal.
+    #[test]
+    fn connect_failure_is_provably_not_sent() {
+        let _lock = crate::discover::home_override_serial();
+        runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(listener);
+            let home = tempfile::tempdir().unwrap();
+            let model = install_compatible_profile(home.path(), &format!("http://{address}/v1"));
+            let journal = ProviderSendJournal::open(home.path().join("journal")).unwrap();
+            let context = ProviderSendContext::new(
+                journal.clone(),
+                "run-connect",
+                Uuid::from_u128(0xfeed_0003),
+                2,
+            );
+            let cancel = CancellationToken::new();
+            let error = match call_xai_agent_step(
+                &compatible_credentials("cancel-test"),
+                &model,
+                EffortLevel::None,
+                &[serde_json::json!({"role": "user", "content": "synthetic"})],
+                &serde_json::json!([]),
+                &cancel,
+                Some(&context),
+                |_| {},
+                |_| {},
+            )
+            .await
+            {
+                Ok(_) => panic!("closed endpoint unexpectedly responded"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("configured provider"));
+            assert!(!error.contains(&address.to_string()));
+
+            let attempts = journal.list_run("run-connect").unwrap();
+            assert_eq!(attempts.len(), 4);
+            assert!(attempts
+                .iter()
+                .all(|attempt| attempt.outcome == Some(ProviderAttemptOutcome::NotSent)));
+            assert_eq!(
+                causes(&attempts),
+                vec![
+                    ProviderSendCause::InitialSend,
+                    ProviderSendCause::TransportRetry,
+                    ProviderSendCause::TransportRetry,
+                    ProviderSendCause::TransportRetry,
+                ]
+            );
+            assert_eq!(journal.unresolved_for_run("run-connect").unwrap().len(), 0);
+        });
+        crate::discover::set_grokptah_home_override(None);
+    }
+
+    /// The credential revision is what makes a post-401 resend a provably
+    /// different physical request. It moves when the token does, and it never
+    /// carries the token itself.
+    #[test]
+    fn credential_revision_tracks_refresh_without_carrying_the_secret() {
+        let base = compatible_credentials("cancel-test");
+        let same = credential_revision(&base);
+        assert_eq!(same, credential_revision(&base.clone()));
+
+        let mut refreshed = base.clone();
+        refreshed.bearer = "refreshed-test-key".into();
+        assert_ne!(same, credential_revision(&refreshed));
+
+        let mut rotated_scope = base.clone();
+        rotated_scope.auth_scope = Some("other-scope".into());
+        assert_ne!(same, credential_revision(&rotated_scope));
+
+        let mut re_expiring = base.clone();
+        re_expiring.expires_at = Some(chrono::Utc::now());
+        assert_ne!(same, credential_revision(&re_expiring));
+
+        assert_eq!(same.len(), 64);
+        assert!(!same.contains("synthetic-test-key"));
+    }
+
+    /// A private compatible gateway must never be persisted in the clear,
+    /// while a first-party route stays legible.
+    #[test]
+    fn route_identity_hides_a_private_gateway_and_still_binds_it() {
+        let private = route_identity(
+            crate::gateway_config::ProviderDialect::OpenAiChatCompletions,
+            "https://gateway.internal.example/v1",
+        );
+        assert!(private.starts_with("compatible:"));
+        assert!(!private.contains("gateway.internal.example"));
+        assert_eq!(
+            private,
+            route_identity(
+                crate::gateway_config::ProviderDialect::OpenAiChatCompletions,
+                "https://gateway.internal.example/v1/",
+            )
+        );
+        assert_ne!(
+            private,
+            route_identity(
+                crate::gateway_config::ProviderDialect::OpenAiChatCompletions,
+                "https://other.internal.example/v1",
+            )
+        );
+
+        assert_eq!(
+            route_identity(
+                crate::gateway_config::ProviderDialect::XaiChatCompletions,
+                "https://cli-chat-proxy.grok.com/v1",
+            ),
+            "https://cli-chat-proxy.grok.com/v1/chat/completions"
+        );
     }
 }
 

@@ -10,6 +10,7 @@ use chrono::{Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
 
+use super::provider_journal::{ProviderJournalReopenReport, ProviderSendJournal};
 use super::types::{
     safe_id_filename, AgentRecord, AgentState, AuditEntry, ContinuationCheckpoint,
     IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunRecord, RunState,
@@ -22,6 +23,8 @@ pub struct OrchStore {
 
 struct OrchStoreInner {
     root: PathBuf,
+    /// Durable physical provider-send records recovered by the same open.
+    provider_journal: ProviderSendJournal,
     _store_lock: fs::File,
     lock: Mutex<()>,
     last_run_error: Mutex<Option<String>>,
@@ -67,6 +70,9 @@ pub struct RetentionReport {
     pub idempotency_files_removed: usize,
     pub protected_runs: usize,
     pub skipped_files: usize,
+    /// Provider-send journal directories removed with their expired run.
+    /// A directory with anything unresolved is never removed.
+    pub provider_journal_dirs_removed: usize,
 }
 
 struct AuditWriter {
@@ -93,6 +99,7 @@ impl OrchStore {
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
+        fs::create_dir_all(root.join("provider_attempts"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -124,9 +131,11 @@ impl OrchStore {
                     }
                 }
             })?;
+        let provider_journal = ProviderSendJournal::open(root.join("provider_attempts"))?;
         let store = Self {
             inner: Arc::new(OrchStoreInner {
                 root,
+                provider_journal,
                 _store_lock: store_lock,
                 lock: Mutex::new(()),
                 last_run_error: Mutex::new(None),
@@ -139,6 +148,10 @@ impl OrchStore {
             }),
         };
         store.recover_finalization_intents()?;
+        // The provider-send crash cut runs before runs are marked interrupted,
+        // so an interrupted run is never observable without the uncertainty
+        // that belongs to it.
+        store.reopen_provider_journal()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
         // Cleanup is best-effort at the record level, but directory access
@@ -149,6 +162,17 @@ impl OrchStore {
 
     pub fn root(&self) -> &Path {
         &self.inner.root
+    }
+
+    /// Durable journal of physical provider sends for runs in this store.
+    pub fn provider_journal(&self) -> ProviderSendJournal {
+        self.inner.provider_journal.clone()
+    }
+
+    /// Apply the provider-send crash cut. Idempotent: every reopen preserves
+    /// uncertainty that a previous reopen recorded.
+    pub fn reopen_provider_journal(&self) -> anyhow::Result<ProviderJournalReopenReport> {
+        self.inner.provider_journal.reopen()
     }
 
     fn run_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
@@ -433,6 +457,13 @@ impl OrchStore {
                 report.protected_runs += 1;
                 continue;
             }
+            // A run whose physical provider sends are unresolved keeps its
+            // record: dropping it would erase the evidence a reconciliation
+            // needs while the journal is still fencing that run.
+            if !self.provider_sends_resolved(&run.run_id) {
+                report.protected_runs += 1;
+                continue;
+            }
             eligible_runs.push((path.as_path(), run));
         }
         eligible_runs.sort_by(|(_, a), (_, b)| b.updated_at.cmp(&a.updated_at));
@@ -448,6 +479,8 @@ impl OrchStore {
                 Err(_) => report.skipped_files += 1,
             }
         }
+
+        self.prune_provider_journal_unlocked(&mut report)?;
 
         let mut receipts = Vec::new();
         let dir = self.inner.root.join("idempotency");
@@ -502,6 +535,63 @@ impl OrchStore {
             }
         }
         Ok(report)
+    }
+
+    /// True only when this reader can positively account for every physical
+    /// provider send recorded for the run. An unreadable journal answers
+    /// `false`, so retention keeps the run rather than guessing.
+    fn provider_sends_resolved(&self, run_id: &str) -> bool {
+        self.inner
+            .provider_journal
+            .unresolved_for_run(run_id)
+            .map(|attempts| attempts.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Drop journal directories whose run record no longer exists, so the
+    /// journal cannot outgrow the ledger it belongs to. A directory holding
+    /// anything unresolved — including an entry this reader cannot parse —
+    /// is left alone.
+    fn prune_provider_journal_unlocked(&self, report: &mut RetentionReport) -> anyhow::Result<()> {
+        let mut live = std::collections::HashSet::new();
+        for entry in fs::read_dir(self.inner.root.join("runs"))? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+                live.insert(stem.to_string());
+            }
+        }
+        let journal_root = self.inner.root.join("provider_attempts");
+        let entries = match fs::read_dir(&journal_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                report.skipped_files += 1;
+                continue;
+            };
+            if live.contains(name) {
+                continue;
+            }
+            if !directory_is_fully_settled(&path) {
+                report.skipped_files += 1;
+                continue;
+            }
+            match fs::remove_dir_all(&path) {
+                Ok(()) => report.provider_journal_dirs_removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => report.skipped_files += 1,
+            }
+        }
+        Ok(())
     }
 
     fn read_run_entries_unlocked(
@@ -884,6 +974,35 @@ fn safe_to_expire_run(run: &RunRecord) -> bool {
         .unwrap_or(true)
 }
 
+/// Every entry under this journal directory parses, validates, and is
+/// settled. Anything else fails closed and keeps the directory.
+fn directory_is_fully_settled(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            return false;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            return false;
+        };
+        let Ok(record) =
+            serde_json::from_str::<super::provider_journal::ProviderAttemptRecord>(&text)
+        else {
+            return false;
+        };
+        if record.validate().is_err() || record.is_unresolved() {
+            return false;
+        }
+    }
+    true
+}
+
 fn merge_run_observations(target: &mut RunRecord, current: &RunRecord) {
     for change in &current.aggregates.changes {
         if !target
@@ -945,7 +1064,7 @@ pub enum IdempotencyClaim {
     Replay(Result<serde_json::Value, OrchError>),
 }
 
-fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+pub(super) fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -962,7 +1081,10 @@ fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Res
     Ok(())
 }
 
-fn write_json_exclusive<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+pub(super) fn write_json_exclusive<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1305,6 +1427,82 @@ mod tests {
         assert!(store.load_run("active").unwrap().is_some());
         assert!(store.load_run("isolated-live").unwrap().is_some());
         assert!(store.load_idempotency("old-receipt").unwrap().is_none());
+    }
+
+    /// The provider-send journal is retained with the ledger it belongs to:
+    /// a settled run's directory is collected with its record, while a run
+    /// with anything unresolved keeps both. A journal cannot outgrow the
+    /// ledger, and retention cannot erase the evidence a reconciliation needs.
+    #[test]
+    fn retention_collects_settled_journals_and_protects_unresolved_ones() {
+        use crate::orchestration::provider_journal::{
+            ProviderAttemptOutcome, ProviderRequestIdentity, ProviderSendCause,
+        };
+        use crate::orchestration::types::hash_payload;
+
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let journal = store.provider_journal();
+        let identity = ProviderRequestIdentity {
+            route_identity: "compatible:abc/chat/completions".into(),
+            provider_profile: "test-profile".into(),
+            dialect: "openai_chat_completions".into(),
+            wire_model: "test-model".into(),
+            credential_revision: hash_payload(&serde_json::json!({ "revision": "rev-1" })),
+            body_digest: hash_payload(&serde_json::json!({ "body": "prompt" })),
+        };
+        let session = Uuid::new_v4();
+
+        for run_id in ["settled-run", "unresolved-run"] {
+            let mut run = terminal_run(run_id);
+            run.updated_at = Utc::now() - Duration::days(10);
+            store.save_run(&run).unwrap();
+            let record = journal
+                .declare(
+                    run_id,
+                    session,
+                    1,
+                    ProviderSendCause::InitialSend,
+                    &identity,
+                )
+                .unwrap();
+            journal.mark_sending(run_id, record.ordinal).unwrap();
+            if run_id == "settled-run" {
+                journal
+                    .mark_sent(run_id, record.ordinal, Some("x-request-id:a"))
+                    .unwrap();
+                journal
+                    .mark_responding(run_id, record.ordinal, 200)
+                    .unwrap();
+                journal
+                    .settle(
+                        run_id,
+                        record.ordinal,
+                        ProviderAttemptOutcome::Accepted,
+                        "complete",
+                    )
+                    .unwrap();
+            }
+        }
+
+        let report = store
+            .prune_retention(RetentionPolicy {
+                max_terminal_runs: 100,
+                max_idempotency_receipts: 100,
+                terminal_run_age: Duration::days(1),
+                idempotency_receipt_age: Duration::days(1),
+            })
+            .unwrap();
+        assert_eq!(report.run_files_removed, 1);
+        assert_eq!(report.provider_journal_dirs_removed, 1);
+        assert!(store.load_run("settled-run").unwrap().is_none());
+        assert!(journal.list_run("settled-run").unwrap().is_empty());
+        // The unresolved run keeps its record and its journal.
+        assert!(store.load_run("unresolved-run").unwrap().is_some());
+        assert_eq!(
+            journal.unresolved_for_run("unresolved-run").unwrap().len(),
+            1
+        );
     }
 
     #[test]

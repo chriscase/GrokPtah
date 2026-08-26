@@ -204,6 +204,10 @@ pub(crate) struct Inner {
     prompt_queue_revisions: HashMap<Uuid, u64>,
     /// Per-turn model-step budget override (orchestration `RunBounds.max_rounds`).
     turn_max_rounds: HashMap<Uuid, u32>,
+    /// Durable run identity that owns the physical provider sends of the
+    /// turn currently running on this session. Absent for turns with no
+    /// durable run: there is then nothing for the send journal to fence.
+    turn_provider_bindings: HashMap<Uuid, crate::host_helpers::ProviderSendContext>,
     event_tx: crate::event_bus::EventBus,
     /// Paths the agent wrote/edited this process (for diff review).
     edited_files: Vec<String>,
@@ -355,6 +359,13 @@ struct ComputerAgentBusyGuard {
 
 impl Drop for TurnBusyGuard {
     fn drop(&mut self) {
+        // Runs on both exits: the normal path disarms the guard, but the
+        // provider-send binding must never outlive its turn either way.
+        self.host
+            .inner
+            .lock()
+            .turn_provider_bindings
+            .remove(&self.session_id);
         if !self.armed {
             return;
         }
@@ -632,6 +643,7 @@ impl AgentHost {
             prompt_queues,
             prompt_queue_revisions: HashMap::new(),
             turn_max_rounds: HashMap::new(),
+            turn_provider_bindings: HashMap::new(),
             event_tx,
             edited_files: Vec::new(),
             edit_snapshots: HashMap::new(), // session_id → path → original
@@ -5360,6 +5372,32 @@ impl AgentHostHandle {
         } else {
             None
         };
+        // Bind every physical provider send of this turn to the durable run
+        // that owns it. A turn without a durable run has nothing to fence, so
+        // the binding is absent rather than invented; a coordinator-owned run
+        // whose journal cannot be opened fails closed instead of sending
+        // unrecorded.
+        let provider_binding = match (desktop_run.as_ref(), external_run.as_ref()) {
+            (Some((run_id, store)), _) => Some(crate::host_helpers::ProviderSendContext::new(
+                store.provider_journal(),
+                run_id.clone(),
+                session_id,
+                0,
+            )),
+            (None, Some(external)) => Some(crate::host_helpers::ProviderSendContext::new(
+                self.ensure_orchestration_store()?.provider_journal(),
+                external.run_id.clone(),
+                session_id,
+                0,
+            )),
+            (None, None) => None,
+        };
+        if let Some(binding) = provider_binding {
+            self.inner
+                .lock()
+                .turn_provider_bindings
+                .insert(session_id, binding);
+        }
         let mut desktop_aggregator = desktop_run.as_ref().map(|(run_id, store)| {
             self.start_desktop_run_aggregator(run_id, session_id, store.clone())
         });
@@ -5547,6 +5585,19 @@ impl AgentHostHandle {
         }
         busy_guard.armed = false;
         final_result
+    }
+
+    /// Durable provider-send binding for the turn currently running on
+    /// `session_id`, if that turn is owned by a durable run.
+    pub(crate) fn provider_send_context(
+        &self,
+        session_id: Uuid,
+    ) -> Option<crate::host_helpers::ProviderSendContext> {
+        self.inner
+            .lock()
+            .turn_provider_bindings
+            .get(&session_id)
+            .cloned()
     }
 
     fn ensure_build_workspace_ready(&self, session_id: Uuid) -> Result<()> {
@@ -6450,6 +6501,8 @@ impl AgentHostHandle {
                 g.max_agent_rounds,
             )
         };
+        // Durable run identity for this turn's physical provider sends.
+        let provider_binding = self.provider_send_context(session_id);
         // Auto-compact when wire window is large (non-destructive local history).
         {
             let need = {
@@ -6663,6 +6716,11 @@ impl AgentHostHandle {
                 detail: format!("Model step {round}/{visible_max_rounds}"),
             });
 
+            // Each model step is one round; every physical send it issues
+            // (refresh, retry, tool or stream fallback) is journaled under it.
+            let round_binding = provider_binding
+                .as_ref()
+                .map(|binding| binding.for_round(round as u32));
             let step = match call_xai_agent_step(
                 creds,
                 model,
@@ -6670,6 +6728,7 @@ impl AgentHostHandle {
                 &messages,
                 &tools_this_round,
                 cancel,
+                round_binding.as_ref(),
                 |delta| {
                     emit_message(event_tx, session_id, delta);
                 },
@@ -8255,6 +8314,9 @@ impl AgentHostHandle {
                 &messages,
                 &tools,
                 &cancel,
+                // Subagent sends outlive the parent turn's binding, so they
+                // are deliberately not journaled under the parent run.
+                None,
                 |_d| {},
                 |_t| {},
             )

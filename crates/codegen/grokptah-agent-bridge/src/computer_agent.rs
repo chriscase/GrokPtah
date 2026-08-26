@@ -144,6 +144,9 @@ pub(crate) async fn qualify_semantic_model(
             &first_messages,
             &qualification_tools(),
             cancel,
+            // Computer cockpit qualification/proposal calls are not durable
+            // orchestration runs; they have no run/round identity to bind.
+            None,
             |_| {},
             |_| {},
         )
@@ -191,6 +194,9 @@ pub(crate) async fn qualify_semantic_model(
             &recovery_messages,
             &qualification_tools(),
             cancel,
+            // Computer cockpit qualification/proposal calls are not durable
+            // orchestration runs; they have no run/round identity to bind.
+            None,
             |_| {},
             |_| {},
         )
@@ -233,6 +239,9 @@ pub(crate) async fn propose_semantic_action(
             &messages,
             &proposal_tools(),
             cancel,
+            // Computer cockpit qualification/proposal calls are not durable
+            // orchestration runs; they have no run/round identity to bind.
+            None,
             |_| {},
             |_| {},
         )

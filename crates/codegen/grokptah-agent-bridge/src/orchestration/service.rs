@@ -1,6 +1,6 @@
 //! Orchestration service: reads + bounded mutations over AgentHostHandle (#196).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -16,6 +16,9 @@ use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
 use crate::session::{SessionKind, WorkspaceStatus};
 
 use super::authz::{canonical_workspace, require_workspace_match, AuthContext, WorkspaceAllowlist};
+use super::provider_journal::{
+    ProviderAttemptRecord, ProviderReconciliationAction, UnresolvedAttempt,
+};
 use super::store::{IdempotencyClaim, OrchStore};
 use super::types::*;
 
@@ -64,6 +67,11 @@ pub struct OrchestrationService {
     scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Runs whose admission slot is deliberately still held because their
+    /// physical provider sends are unresolved. Reconciliation is what
+    /// releases them; a restart clears the in-process hold while the durable
+    /// journal keeps fencing retry.
+    unresolved_capacity_holds: Mutex<HashSet<String>>,
 }
 
 /// Authorized bounds for a live run event stream.
@@ -90,16 +98,37 @@ impl Drop for OrchestrationService {
         for run_id in pending {
             self.host.release_orchestration_queue_slot(&run_id);
         }
+        let held = self
+            .unresolved_capacity_holds
+            .get_mut()
+            .drain()
+            .collect::<Vec<_>>();
+        for run_id in held {
+            self.host.release_orchestration_turn(&run_id);
+        }
     }
 }
 
 struct AdmissionGuard {
     host: AgentHostHandle,
     run_id: String,
+    /// Keep the admission slot after the turn ends. Set only when the run's
+    /// physical provider sends are unresolved: releasing capacity there would
+    /// let a replacement run overlap work the provider may still be doing.
+    hold: bool,
+}
+
+impl AdmissionGuard {
+    fn hold(&mut self) {
+        self.hold = true;
+    }
 }
 
 impl Drop for AdmissionGuard {
     fn drop(&mut self) {
+        if self.hold {
+            return;
+        }
         self.host.release_orchestration_turn(&self.run_id);
     }
 }
@@ -201,6 +230,7 @@ impl OrchestrationService {
             config: Mutex::new(config),
             self_ref: self_ref.clone(),
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
+            unresolved_capacity_holds: Mutex::new(HashSet::new()),
             scheduler_watcher: Mutex::new(None),
             join_handles: Mutex::new(Vec::new()),
         });
@@ -358,6 +388,71 @@ impl OrchestrationService {
     fn release_capacity(&self, run_id: &str) {
         self.host.release_orchestration_turn(run_id);
         self.pump_pending();
+    }
+
+    /// Physical provider sends that still fence this run. A journal this
+    /// process cannot read is reported as unresolved: absence of evidence is
+    /// never treated as evidence of resolution.
+    fn unresolved_provider_sends(&self, run_id: &str) -> Vec<UnresolvedAttempt> {
+        match self.store.provider_journal().unresolved_for_run(run_id) {
+            Ok(attempts) => attempts,
+            Err(error) => vec![UnresolvedAttempt {
+                run_id: run_id.to_string(),
+                ordinal: None,
+                state: None,
+                reason: format!("provider send journal is unreadable: {}", error.message),
+            }],
+        }
+    }
+
+    /// Keep this run's admission slot while remote work may be unresolved.
+    fn register_unresolved_hold(&self, run_id: &str) {
+        self.unresolved_capacity_holds
+            .lock()
+            .insert(run_id.to_string());
+    }
+
+    /// Give the slot back once nothing is outstanding for the run. Safe to
+    /// call when no hold exists.
+    fn release_unresolved_hold(&self, run_id: &str) {
+        let held = self.unresolved_capacity_holds.lock().remove(run_id);
+        if held {
+            self.release_capacity(run_id);
+        }
+    }
+
+    fn unresolved_json(attempts: &[UnresolvedAttempt]) -> serde_json::Value {
+        json!(attempts
+            .iter()
+            .map(|attempt| json!({
+                "ordinal": attempt.ordinal,
+                "state": attempt.state.map(|state| state.as_str()),
+                "reason": attempt.reason,
+            }))
+            .collect::<Vec<_>>())
+    }
+
+    fn provider_attempt_json(record: &ProviderAttemptRecord) -> serde_json::Value {
+        json!({
+            "runId": record.run_id,
+            "round": record.round,
+            "ordinal": record.ordinal,
+            "cause": record.cause.as_str(),
+            "state": record.state.as_str(),
+            "outcome": record.outcome.map(|outcome| outcome.as_str()),
+            "routeIdentity": record.route_identity,
+            "providerProfile": record.provider_profile,
+            "dialect": record.dialect,
+            "wireModel": record.wire_model,
+            "credentialRevision": record.credential_revision,
+            "bodyDigest": record.body_digest,
+            "requestDigest": record.request_digest,
+            "responseStatus": record.response_status,
+            "providerRequestId": record.provider_request_id,
+            "uncertainReason": record.uncertain_reason,
+            "declaredAt": record.declared_at,
+            "updatedAt": record.updated_at,
+        })
     }
 
     /// Keep the durable records aligned with the host-global scheduler. The
@@ -2191,6 +2286,105 @@ impl OrchestrationService {
         Ok((run, review))
     }
 
+    /// Read projection: physical provider sends that still fence this run.
+    /// Authority is the existing run scope check; this adds no new authority.
+    pub fn list_provider_attempts(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let _ = auth;
+        self.authorize_run_request(session_id, workspace, run_id)?;
+        let attempts = self.store.provider_journal().list_run(run_id)?;
+        let unresolved = self.unresolved_provider_sends(run_id);
+        Ok(json!({
+            "runId": run_id,
+            "attempts": attempts
+                .iter()
+                .map(Self::provider_attempt_json)
+                .collect::<Vec<_>>(),
+            "unresolvedProviderAttempts": Self::unresolved_json(&unresolved),
+            "retryFenced": !unresolved.is_empty(),
+        }))
+    }
+
+    /// The only exit from provider-send uncertainty.
+    ///
+    /// The caller must re-present the exact request digest and the credential
+    /// revision the attempt was issued under, so a proof that belongs to a
+    /// different request or a rotated credential is refused, and an attempt
+    /// that is already settled cannot be reconciled a second time. Clearing
+    /// the last outstanding attempt is also what returns the run's held
+    /// admission slot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconcile_provider_attempt(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        ordinal: u64,
+        action: ProviderReconciliationAction,
+        request_digest: &str,
+        credential_revision: &str,
+        evidence: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let _ = auth;
+        let tool = "ptah_reconcile_provider_attempt";
+        let run = self
+            .authorize_run_request(session_id, workspace, run_id)
+            .inspect_err(|error| {
+                self.audit_err(
+                    tool,
+                    None,
+                    Some(session_id),
+                    Some(&workspace.display().to_string()),
+                    error,
+                )
+            })?;
+        let record = self
+            .store
+            .provider_journal()
+            .reconcile(
+                run_id,
+                ordinal,
+                action,
+                request_digest,
+                credential_revision,
+                evidence,
+            )
+            .inspect_err(|error| {
+                self.audit_err(tool, None, Some(session_id), Some(&run.workspace), error)
+            })?;
+        let unresolved = self.unresolved_provider_sends(run_id);
+        if unresolved.is_empty() {
+            self.release_unresolved_hold(run_id);
+        }
+        self.audit(
+            tool,
+            None,
+            Some(session_id),
+            Some(&run.workspace),
+            "accepted",
+            None,
+            &format!(
+                "provider attempt {ordinal} reconciled as {}",
+                record
+                    .outcome
+                    .map(|outcome| outcome.as_str())
+                    .unwrap_or("unknown")
+            ),
+        );
+        Ok(json!({
+            "runId": run_id,
+            "attempt": Self::provider_attempt_json(&record),
+            "unresolvedProviderAttempts": Self::unresolved_json(&unresolved),
+            "retryFenced": !unresolved.is_empty(),
+        }))
+    }
+
     pub fn review_run(
         &self,
         _auth: &AuthContext,
@@ -2806,6 +3000,21 @@ impl OrchestrationService {
                 ),
             ));
         }
+        // An interrupted run whose physical provider sends are unresolved may
+        // still have work executing remotely. Replacing it now would overlap
+        // that work, so the explicit retry is refused until a reconciliation
+        // proves each outstanding attempt's outcome.
+        let unresolved = self.unresolved_provider_sends(source_run_id);
+        if !unresolved.is_empty() {
+            return Err(fail(
+                self,
+                OrchError::with_data(
+                    OrchErrorCode::Conflict,
+                    "run has unresolved provider sends; reconcile them before retrying",
+                    json!({ "unresolvedProviderAttempts": Self::unresolved_json(&unresolved) }),
+                ),
+            ));
+        }
 
         let previous_mode = source
             .execution
@@ -2917,9 +3126,10 @@ impl OrchestrationService {
         });
 
         let join = tokio::spawn(async move {
-            let admission_guard = AdmissionGuard {
+            let mut admission_guard = AdmissionGuard {
                 host: host.clone(),
                 run_id: rid.clone(),
+                hold: false,
             };
             let prompt_fut = host.session_prompt_reserved_with_max_rounds_for_run(
                 session_id,
@@ -3089,6 +3299,36 @@ impl OrchestrationService {
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
 
+            // Cancellation, timeout, and failure all land here. Capacity is
+            // released only when nothing the provider might still be executing
+            // is outstanding; otherwise the slot is deliberately held so a
+            // replacement run cannot overlap unresolved remote work.
+            let unresolved = match store.provider_journal().unresolved_for_run(&rid) {
+                Ok(attempts) => attempts.len(),
+                // Fail closed: an unreadable journal is not proof of
+                // resolution.
+                Err(_) => 1,
+            };
+            // Hold only when the hold is durably owned by a live service:
+            // a slot nobody can ever release would leak host-global capacity.
+            if unresolved > 0 {
+                if let Some(service) = service_ref.upgrade() {
+                    service.register_unresolved_hold(&rid);
+                    admission_guard.hold();
+                }
+                let _ = store.enqueue_audit(AuditEntry {
+                    ts: Utc::now(),
+                    tool: "provider_send_fence".into(),
+                    request_id: None,
+                    session_id: Some(session_id),
+                    workspace: Some(candidate.workspace.clone()),
+                    outcome: "capacity_held".into(),
+                    error_code: Some("provider_sends_unresolved".into()),
+                    detail: format!(
+                        "{unresolved} unresolved physical provider send(s) for run {rid}"
+                    ),
+                });
+            }
             // Release capacity before waking the scheduler, so a queued task
             // can be promoted immediately and fairly.
             drop(admission_guard);
