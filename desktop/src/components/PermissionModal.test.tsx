@@ -12,10 +12,25 @@ import type { DenyHistoryEntry } from "../lib/denyHistory";
 import {
   CONSENT_COPY,
   permissionQueueAfterAcknowledgement,
+  presentDeniedPermissionRecord,
   type ConsentAcknowledgement,
 } from "../lib/operatorConsentPresentation";
 
 afterEach(cleanup);
+
+const ADVERSARIAL = [
+  "/etc/passwd",
+  "/opt/x",
+  "src/main.rs",
+  "git status",
+  "tok_opaque_9f3a",
+  "\u202e",
+  "\u2066",
+  "\u200b",
+  "__proto__",
+  "constructor",
+  "toString",
+];
 
 function makeReq(
   id: string,
@@ -43,7 +58,7 @@ function PermissionHarness({
   focusedSessionId: string;
   onAnswer: (requestId: string, decision: string, sessionId: string) => void;
   denyHistory?: DenyHistoryEntry[];
-  respondImpl?: () => Promise<void | ConsentAcknowledgement>;
+  respondImpl?: () => Promise<unknown>;
 }) {
   const [queue, setQueue] = useState(initial);
   const head = headPermission(queue);
@@ -59,38 +74,25 @@ function PermissionHarness({
         queuedBehind={Math.max(0, queue.length - 1)}
         fallbackSessionId={focusedSessionId}
         denyHistory={denyHistory}
-        acknowledgementTimeoutMs={40}
         onRespond={async (requestId, decision, sessionId) => {
           onAnswer(requestId, decision, sessionId);
-          if (respondImpl) {
-            const result = await respondImpl();
-            if (result === undefined) {
-              setQueue((q) =>
-                permissionQueueAfterAcknowledgement(q, requestId, "acknowledged"),
-              );
-            }
-            return result;
+          const result = respondImpl ? await respondImpl() : "acknowledged";
+          if (result === "acknowledged") {
+            setQueue((q) =>
+              permissionQueueAfterAcknowledgement(q, requestId, "acknowledged"),
+            );
           }
-          setQueue((q) =>
-            permissionQueueAfterAcknowledgement(q, requestId, "acknowledged"),
-          );
+          return result;
         }}
       />
     </div>
   );
 }
 
-function rawNeedles(request: PermissionRequest): string[] {
-  return [
-    request.id,
-    request.session_id,
-    request.tool_name,
-    "Authorization: Bearer",
-    "/Users/secret",
-    "rm -rf",
-    "{",
-    "}",
-  ];
+function surfaceHaystack(root: HTMLElement): string {
+  const liveAlert = screen.queryByTestId("permission-announcement")?.textContent ?? "";
+  const liveStatus = screen.queryByTestId("permission-live-status")?.textContent ?? "";
+  return `${root.textContent ?? ""}\n${liveAlert}\n${liveStatus}\n${root.outerHTML}`;
 }
 
 describe("PermissionModal (#141 + operator consent)", () => {
@@ -166,12 +168,12 @@ describe("PermissionModal (#141 + operator consent)", () => {
     ]);
   });
 
-  it("shows closed risk and deny-history labels without raw summaries (#175)", () => {
+  it("shows only closed risk and deny-history labels without raw summaries", () => {
     const history: DenyHistoryEntry[] = [
       {
         at: Date.now(),
         tool_name: "run_terminal_cmd",
-        summary: "Allow shell: rm -rf /Users/secret",
+        summary: "Allow shell: rm -rf /Users/secret nested shell invocation",
         session_id: "sess-1",
         risk: "high-risk shell pattern",
         risk_tier: "deny",
@@ -190,14 +192,49 @@ describe("PermissionModal (#141 + operator consent)", () => {
         denyHistory={history}
       />,
     );
-    expect(screen.getByTestId("permission-risk").textContent).toMatch(/Ask first/);
-    expect(screen.getByTestId("permission-risk").textContent).toMatch(
-      /nested shell invocation/,
-    );
+    const risk = screen.getByTestId("permission-risk").textContent ?? "";
+    expect(risk).toMatch(/Ask first/);
+    expect(risk).toMatch(/Untrusted risk prose is hidden/);
+    expect(risk).not.toMatch(/nested shell invocation/);
+    expect(screen.getByTestId("permission-summary").textContent).toBe(CONSENT_COPY.waiting);
     expect(screen.getByTestId("permission-deny-history")).toBeTruthy();
     const item = screen.getByTestId("permission-deny-history-item").textContent ?? "";
     expect(item).toMatch(/Terminal command/);
-    expect(item).not.toMatch(/run_terminal_cmd|rm -rf|\/Users\/secret/);
+    expect(item).toMatch(CONSENT_COPY.priorDenial);
+    expect(item).not.toMatch(/run_terminal_cmd|rm -rf|\/Users\/secret|nested shell/);
+  });
+
+  it("keeps distinct persisted session identities and never renders them", () => {
+    const alpha = presentDeniedPermissionRecord(
+      makeReq("d-alpha", "session-alpha-1111"),
+      "session-alpha-1111",
+    );
+    const beta = presentDeniedPermissionRecord(
+      makeReq("d-beta", "session-beta-2222", "write_file"),
+      "session-beta-2222",
+    );
+    expect(alpha.session_id).toBe("session-alpha-1111");
+    expect(beta.session_id).toBe("session-beta-2222");
+    expect(alpha.session_id).not.toBe(beta.session_id);
+    expect(alpha.session_id).not.toBe("owning-session");
+    expect(beta.session_id).not.toBe("owning-session");
+
+    render(
+      <PermissionHarness
+        initial={[makeReq("d-now", "session-now-3333")]}
+        focusedSessionId="session-focused-bbbb"
+        onAnswer={() => {}}
+        denyHistory={[
+          { at: 1, ...alpha },
+          { at: 2, ...beta },
+        ]}
+      />,
+    );
+    const hay = surfaceHaystack(screen.getByTestId("permission-modal"));
+    expect(hay).not.toContain("session-alpha-1111");
+    expect(hay).not.toContain("session-beta-2222");
+    expect(hay).not.toContain("session-now-3333");
+    expect(hay).not.toContain("owning-session");
   });
 
   it("focuses Deny first, traps Tab, restores the opener, and inerts non-consent siblings", async () => {
@@ -246,6 +283,61 @@ describe("PermissionModal (#141 + operator consent)", () => {
     opener.remove();
   });
 
+  it("inerts late overlays and body portals, restores prior state, and traps escaped focus", async () => {
+    const prior = document.createElement("aside");
+    prior.setAttribute("inert", "");
+    prior.setAttribute("aria-hidden", "false");
+    prior.dataset.testid = "prior-overlay";
+    document.body.append(prior);
+
+    const { unmount } = render(
+      <PermissionHarness
+        initial={[makeReq("inert-late", "sess-1")]}
+        focusedSessionId="sess-1"
+        onAnswer={() => {}}
+      />,
+    );
+
+    const shell = screen.getByTestId("operator-shell");
+    const late = document.createElement("div");
+    late.dataset.testid = "late-overlay";
+    const lateButton = document.createElement("button");
+    lateButton.type = "button";
+    lateButton.textContent = "late overlay";
+    late.append(lateButton);
+    shell.append(late);
+
+    const portal = document.createElement("div");
+    portal.dataset.testid = "body-portal";
+    const portalButton = document.createElement("button");
+    portalButton.type = "button";
+    portalButton.textContent = "body portal";
+    portal.append(portalButton);
+    document.body.append(portal);
+
+    await waitFor(() => {
+      expect(late).toHaveAttribute("inert");
+      expect(portal).toHaveAttribute("inert");
+      expect(prior).toHaveAttribute("inert");
+      expect(prior).toHaveAttribute("aria-hidden", "true");
+    });
+    expect(screen.getByTestId("permission-modal-backdrop")).not.toHaveAttribute("inert");
+
+    const first = screen.getByTestId("permission-deny");
+    portalButton.focus();
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(document.activeElement).toBe(first);
+
+    unmount();
+    expect(prior.hasAttribute("inert")).toBe(true);
+    expect(prior.getAttribute("aria-hidden")).toBe("false");
+    expect(late.hasAttribute("inert")).toBe(false);
+    expect(portal.hasAttribute("inert")).toBe(false);
+    prior.remove();
+    late.remove();
+    portal.remove();
+  });
+
   it("sends Deny on Escape only before submission", async () => {
     const answers: string[] = [];
     render(
@@ -260,8 +352,8 @@ describe("PermissionModal (#141 + operator consent)", () => {
   });
 
   it("submits at most once and suppresses Escape while pending or unconfirmed", async () => {
-    let release: (() => void) | undefined;
-    const pending = new Promise<void>((resolve) => {
+    let release: ((value: ConsentAcknowledgement) => void) | undefined;
+    const pending = new Promise<ConsentAcknowledgement>((resolve) => {
       release = resolve;
     });
     const answers: string[] = [];
@@ -283,8 +375,44 @@ describe("PermissionModal (#141 + operator consent)", () => {
     ));
     expect(answers).toEqual(["allow"]);
     expect(screen.getByTestId("permission-recovery").textContent).toBe(CONSENT_COPY.pending);
-    release?.();
+    release?.("acknowledged");
     await waitFor(() => expect(screen.queryByTestId("permission-modal")).toBeNull());
+  });
+
+  it("stays pending until onRespond returns and never invents a timeout acknowledgement", async () => {
+    let finish: ((value: unknown) => void) | undefined;
+    const hung = new Promise<unknown>((resolve) => {
+      finish = resolve;
+    });
+    render(
+      <PermissionHarness
+        initial={[makeReq("hang-1", "sess-1"), makeReq("hang-2", "sess-2", "write_file")]}
+        focusedSessionId="sess-1"
+        onAnswer={() => {}}
+        respondImpl={() => hung}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("permission-allow"));
+    await waitFor(() =>
+      expect(screen.getByTestId("permission-modal")).toHaveAttribute(
+        "data-consent-phase",
+        "pending",
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(screen.getByTestId("permission-modal")).toHaveAttribute(
+      "data-consent-phase",
+      "pending",
+    );
+    expect(screen.getByTestId("permission-tool").textContent).toBe("Terminal command");
+    finish?.("lost");
+    await waitFor(() =>
+      expect(screen.getByTestId("permission-modal")).toHaveAttribute(
+        "data-consent-phase",
+        "unconfirmed",
+      ),
+    );
+    expect(screen.getByTestId("permission-tool").textContent).toBe("Terminal command");
   });
 
   it("locks response unconfirmed on lost acknowledgement without retry or queue advance", async () => {
@@ -298,11 +426,10 @@ describe("PermissionModal (#141 + operator consent)", () => {
         <PermissionModal
           request={head}
           queuedBehind={Math.max(0, queue.length - 1)}
-          acknowledgementTimeoutMs={20}
           onRespond={async (requestId, decision) => {
             answers.push(`${requestId}:${decision}`);
             setQueue((q) => permissionQueueAfterAcknowledgement(q, requestId, "lost"));
-            return new Promise(() => {});
+            return "lost";
           }}
         />
       );
@@ -334,14 +461,13 @@ describe("PermissionModal (#141 + operator consent)", () => {
       <PermissionModal
         request={queue[0]}
         queuedBehind={1}
-        acknowledgementTimeoutMs={30}
         onRespond={async (requestId, decision) => {
           expect(permissionQueueAfterAcknowledgement(queue, requestId, "rejected")).toEqual(
             queue,
           );
           expect(dequeuePermission).not.toBeUndefined();
           send(requestId, decision);
-          throw new Error("transport reset");
+          return "rejected";
         }}
       />,
     );
@@ -355,6 +481,40 @@ describe("PermissionModal (#141 + operator consent)", () => {
     fireEvent.click(screen.getByTestId("permission-deny"));
     expect(send).toHaveBeenCalledOnce();
     expect(screen.getByTestId("permission-tool").textContent).toBe("Terminal command");
+  });
+
+  it("treats void and arbitrary onRespond resolution as unconfirmed and keeps the queue head", async () => {
+    const cases: unknown[] = [undefined, "ok", { ok: true }, 42];
+    for (const raw of cases) {
+      cleanup();
+      function ArbitraryHarness() {
+        const [queue] = useState([
+          makeReq("arb-1", "sess-1"),
+          makeReq("arb-2", "sess-2", "write_file"),
+        ]);
+        const head = headPermission(queue);
+        if (!head) return <div data-testid="no-permission">none</div>;
+        return (
+          <PermissionModal
+            request={head}
+            queuedBehind={queue.length - 1}
+            onRespond={async () => raw}
+          />
+        );
+      }
+      render(<ArbitraryHarness />);
+      fireEvent.click(screen.getByTestId("permission-allow"));
+      await waitFor(() =>
+        expect(screen.getByTestId("permission-modal")).toHaveAttribute(
+          "data-consent-phase",
+          "unconfirmed",
+        ),
+      );
+      fireEvent.click(screen.getByTestId("permission-allow"));
+      fireEvent.keyDown(window, { key: "Escape" });
+      expect(screen.getByTestId("permission-tool").textContent).toBe("Terminal command");
+      expect(screen.queryByTestId("no-permission")).toBeNull();
+    }
   });
 
   it("keeps an unconfirmed lock across stale field updates for the same request", async () => {
@@ -380,7 +540,6 @@ describe("PermissionModal (#141 + operator consent)", () => {
           </button>
           <PermissionModal
             request={request}
-            acknowledgementTimeoutMs={20}
             onRespond={async () => {
               throw new Error("lost host");
             }}
@@ -407,30 +566,64 @@ describe("PermissionModal (#141 + operator consent)", () => {
     );
   });
 
-  it("redacts secrets, paths, commands, and identifiers from every visible and live surface", () => {
+  it("never renders secrets, paths, commands, ids, tokens, or formatting controls on any surface", () => {
     const request = makeReq(
       "req-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
       "session-background-aaaa",
-      "run_terminal_cmd",
+      "__proto__",
       {
-        risk: "Authorization: Bearer sk-test-not-a-real-key in /Users/secret",
-        risk_tier: "deny",
-        command: "rm -rf /Users/secret",
+        risk: "Authorization: Bearer tok_opaque_9f3a nested shell /etc/passwd /opt/x src/main.rs git status \u202e\u2066\u200b",
+        risk_tier: "constructor",
+        command: "git status",
+        path: "/etc/passwd",
+        url: "https://example.invalid/opt/x",
+        token: "tok_opaque_9f3a",
       },
     );
+    request.summary =
+      "Allow toString on /etc/passwd via git status tok_opaque_9f3a \u202e";
+    const history: DenyHistoryEntry[] = [
+      {
+        at: 1,
+        tool_name: "toString",
+        summary: "src/main.rs git status /opt/x",
+        session_id: "session-background-aaaa",
+        risk: "/etc/passwd",
+        risk_tier: "deny",
+      },
+    ];
     render(
-      <PermissionModal request={request} queuedBehind={1} onRespond={async () => {}} />,
+      <PermissionModal
+        request={request}
+        queuedBehind={1}
+        denyHistory={history}
+        onRespond={async () => "acknowledged"}
+      />,
     );
     const root = screen.getByTestId("permission-modal");
-    const text = `${root.textContent ?? ""}${root.outerHTML}`;
-    for (const needle of rawNeedles(request)) {
-      if (needle === "{" || needle === "}") continue;
+    const text = surfaceHaystack(root);
+    const needles = [
+      ...ADVERSARIAL,
+      request.id,
+      request.session_id,
+      "Authorization: Bearer",
+      "nested shell",
+      "https://example.invalid",
+      "run_terminal_cmd",
+    ];
+    for (const needle of needles) {
       expect(text).not.toContain(needle);
     }
     expect(root.querySelector("pre")).toBeNull();
     expect(screen.queryByTestId("permission-always")).toBeNull();
+    expect(screen.getByTestId("permission-summary").textContent).toBe(CONSENT_COPY.waiting);
+    expect(screen.getByTestId("permission-tool").textContent).toBe(CONSENT_COPY.toolUnknown);
+    expect(screen.getByTestId("permission-risk").textContent).toMatch(CONSENT_COPY.riskUnknown);
     expect(screen.getByTestId("permission-announcement").textContent).not.toMatch(
-      /session-background|req-aaaaaaaa|Bearer|\/Users/,
+      /session-background|req-aaaaaaaa|Bearer|\/etc\/passwd|git status/,
+    );
+    expect(screen.getByTestId("permission-live-status").textContent).not.toMatch(
+      /\/opt\/x|src\/main\.rs|tok_opaque/,
     );
     expect(screen.getByTestId("permission-standing-grant").textContent).toMatch(
       /Always Allow is unavailable/,

@@ -1,9 +1,9 @@
 /**
  * Operator-consent presentation helpers.
  *
- * Display-only. Every request/error field is untrusted input. Closed labels and
- * bounded values never become host authority, standing grants, or a backend
- * outcome. Client redaction is defense-in-depth.
+ * Display-only. This module never becomes host authority. At this head the
+ * renderer projects a closed set of own-key labels and fixed copy. Untrusted
+ * request, detail, and deny-history strings are not rendered.
  */
 import type { DenyHistoryEntry } from "./denyHistory";
 import { dequeuePermission } from "./permissionQueue";
@@ -36,6 +36,9 @@ export const CONSENT_COPY = {
   riskUnknown: "Unknown risk class",
   riskAsk: "Ask first",
   riskDeny: "Must deny",
+  riskNote: "Tool safety gate only. Untrusted risk prose is hidden.",
+  waiting: "A mapped tool class is waiting.",
+  priorDenial: "A previous denial is on record.",
   unsafeRetry:
     "Do not retry from an indeterminate state. A later retry is only safe after a new host-authored prompt and a confirmed stopped run.",
 } as const;
@@ -47,30 +50,28 @@ export const STANDING_GRANT_FACTS = {
   revision: "unavailable",
 } as const;
 
-const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/g;
-const PRIVILEGED_TEXT =
-  /(?:\/(?:users|private|var|tmp|home|volumes)\/|(?:[a-z]:\\users\\|\\\\)|https?:\/\/|(?:^|[\s=:])(authorization|bearer|api[_ -]?key|xai_api_key|grokptah_home|clipboard|private[_ -]?key|password|cookie|session[_ -]?token|secret(?:[_ -]?key)?)(?:[\s=:]|$))/i;
-const PATH_OR_COMMAND =
-  /(?:\.\.|~\/|\$[A-Z_]+|[;&|`$<>]|-rf\b|\bsudo\b|\bcurl\b|\bwget\b|\bchmod\b)/i;
-const IDENTIFIER =
-  /\b(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[a-z]{0,12}[-_][a-z0-9][-_a-z0-9]{6,}|sess(?:ion)?[-_][a-z0-9-]+|req[-_][a-z0-9-]+)\b/i;
-const RAW_TOOL_TOKEN =
-  /\b(?:run_terminal_cmd|write_files?|read_file|grep_search|glob_search|[a-z]+_[a-z0-9_]+)\b/;
+const CLOSED_TOOL_LABELS: Record<string, string> = Object.assign(
+  Object.create(null) as Record<string, string>,
+  {
+    run_terminal_cmd: "Terminal command",
+    write_file: "Write a file",
+    write_files: "Write files",
+    read_file: "Read a file",
+    grep_search: "Search files",
+    glob_search: "Find files",
+  },
+);
 
-const CLOSED_TOOL_LABELS: Record<string, string> = {
-  run_terminal_cmd: "Terminal command",
-  write_file: "Write a file",
-  write_files: "Write files",
-  read_file: "Read a file",
-  grep_search: "Search files",
-  glob_search: "Find files",
-};
+const CLOSED_RISK_LABELS: Record<string, string> = Object.assign(
+  Object.create(null) as Record<string, string>,
+  {
+    deny: CONSENT_COPY.riskDeny,
+    ask: CONSENT_COPY.riskAsk,
+  },
+);
 
 const FOCUSABLE_SELECTOR =
   'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], summary, [tabindex]:not([tabindex="-1"])';
-
-const DEFAULT_ACK_TIMEOUT_MS = 8_000;
-const DISPLAY_BOUND = 96;
 
 export function standingGrantFactsAtThisHead(): typeof STANDING_GRANT_FACTS & {
   explanation: string;
@@ -108,61 +109,46 @@ export function permissionQueueAfterAcknowledgement(
   return dequeuePermission(queue, requestId);
 }
 
-export async function settleOperatorConsentAcknowledgement(
-  send: () => Promise<unknown>,
-  timeoutMs: number = DEFAULT_ACK_TIMEOUT_MS,
-): Promise<ConsentAcknowledgement> {
-  let timedOut = false;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const sent = Promise.resolve()
-      .then(send)
-      .then((value): ConsentAcknowledgement => {
-        if (value === "rejected" || value === "lost") return value;
-        return "acknowledged";
-      });
-    const timeout = new Promise<ConsentAcknowledgement>((resolve) => {
-      timer = setTimeout(() => {
-        timedOut = true;
-        resolve("lost");
-      }, timeoutMs);
-    });
-    const winner = await Promise.race([sent, timeout]);
-    if (timedOut) return "lost";
-    return winner;
-  } catch {
-    return timedOut ? "lost" : "rejected";
-  } finally {
-    if (timer) clearTimeout(timer);
+/** Closed ack tokens only. Void, objects, and arbitrary strings are not acknowledgements. */
+export function readConsentAcknowledgement(
+  value: unknown,
+): ConsentAcknowledgement | null {
+  if (value === "acknowledged" || value === "rejected" || value === "lost") {
+    return value;
   }
+  return null;
+}
+
+function ownMappedLabel(
+  table: Record<string, string>,
+  key: unknown,
+  fallback: string,
+): string {
+  if (typeof key !== "string") return fallback;
+  if (!Object.prototype.hasOwnProperty.call(table, key)) return fallback;
+  const mapped = table[key];
+  return typeof mapped === "string" && mapped.length > 0 ? mapped : fallback;
 }
 
 export function closedToolLabel(toolName: unknown): string {
-  if (typeof toolName !== "string") return CONSENT_COPY.toolUnknown;
-  const mapped = CLOSED_TOOL_LABELS[toolName];
-  if (mapped) return mapped;
-  return CONSENT_COPY.toolUnknown;
+  return ownMappedLabel(CLOSED_TOOL_LABELS, toolName, CONSENT_COPY.toolUnknown);
 }
 
 export function closedRiskLabel(tier: unknown): string {
-  if (tier === "deny") return CONSENT_COPY.riskDeny;
-  if (tier === "ask") return CONSENT_COPY.riskAsk;
-  return CONSENT_COPY.riskUnknown;
+  return ownMappedLabel(CLOSED_RISK_LABELS, tier, CONSENT_COPY.riskUnknown);
 }
 
-export function redactUntrustedDisplay(value: unknown, bound = DISPLAY_BOUND): string {
-  if (typeof value !== "string") return "";
-  const stripped = value.replace(CONTROL_CHARS, "").trim();
-  if (!stripped) return "";
-  if (
-    PRIVILEGED_TEXT.test(stripped) ||
-    PATH_OR_COMMAND.test(stripped) ||
-    IDENTIFIER.test(stripped) ||
-    RAW_TOOL_TOKEN.test(stripped)
-  ) {
-    return "";
+function ownToolKey(toolName: unknown): string {
+  if (typeof toolName !== "string") return "unknown_tool";
+  if (!Object.prototype.hasOwnProperty.call(CLOSED_TOOL_LABELS, toolName)) {
+    return "unknown_tool";
   }
-  return stripped.length > bound ? `${stripped.slice(0, bound)}…` : stripped;
+  return toolName;
+}
+
+function ownRiskTier(tier: unknown): "deny" | "ask" | undefined {
+  if (tier === "deny" || tier === "ask") return tier;
+  return undefined;
 }
 
 export type PresentedDenyHistoryItem = {
@@ -189,12 +175,6 @@ export type OperatorConsentPresentation = {
   offerStandingGrant: false;
 };
 
-function detailRecord(detail: unknown): Record<string, unknown> {
-  return typeof detail === "object" && detail !== null && !Array.isArray(detail)
-    ? (detail as Record<string, unknown>)
-    : {};
-}
-
 export function presentOperatorConsent(input: {
   request: PermissionRequest;
   queuedBehind?: number;
@@ -203,25 +183,20 @@ export function presentOperatorConsent(input: {
   fallbackSessionId?: string | null;
 }): OperatorConsentPresentation {
   const queuedBehind = input.queuedBehind ?? 0;
-  const detail = detailRecord(input.request.detail);
+  const detail =
+    typeof input.request.detail === "object" &&
+    input.request.detail !== null &&
+    !Array.isArray(input.request.detail)
+      ? (input.request.detail as Record<string, unknown>)
+      : {};
   const toolLabel = closedToolLabel(input.request.tool_name);
   const riskLabel = closedRiskLabel(detail.risk_tier);
-  const boundedRisk = redactUntrustedDisplay(detail.risk);
-  const boundedSummary = redactUntrustedDisplay(input.request.summary);
-  const sessionFact = input.request.session_id
+  const sessionFact = input.request.session_id || input.fallbackSessionId
     ? CONSENT_COPY.sessionKnown
-    : input.fallbackSessionId
-      ? CONSENT_COPY.sessionKnown
-      : CONSENT_COPY.sessionMissing;
+    : CONSENT_COPY.sessionMissing;
   const standingGrant = standingGrantFactsAtThisHead();
   const queueCopy = queuedBehind > 0 ? CONSENT_COPY.queued : null;
   const recovery =
-    input.phase === "pending"
-      ? CONSENT_COPY.pending
-      : input.phase === "unconfirmed"
-        ? CONSENT_COPY.unconfirmed
-        : CONSENT_COPY.idleNext;
-  const liveStatus =
     input.phase === "pending"
       ? CONSENT_COPY.pending
       : input.phase === "unconfirmed"
@@ -240,10 +215,8 @@ export function presentOperatorConsent(input: {
     title: CONSENT_COPY.title,
     toolLabel,
     riskLabel,
-    riskNote: boundedRisk || "No host risk prose was provided.",
-    summary:
-      boundedSummary ||
-      `${toolLabel} is waiting. Untrusted summary text is hidden.`,
+    riskNote: CONSENT_COPY.riskNote,
+    summary: CONSENT_COPY.waiting,
     sessionFact,
     queueCopy,
     standingGrant,
@@ -251,9 +224,7 @@ export function presentOperatorConsent(input: {
     denyHistory: (input.denyHistory ?? []).slice(0, 8).map((entry) => ({
       toolLabel: closedToolLabel(entry.tool_name),
       riskLabel: closedRiskLabel(entry.risk_tier),
-      summary:
-        redactUntrustedDisplay(entry.summary) ||
-        "A previous denial is on record. Untrusted detail is hidden.",
+      summary: CONSENT_COPY.priorDenial,
     })),
     liveAlert: [
       CONSENT_COPY.blockedAlert,
@@ -263,14 +234,9 @@ export function presentOperatorConsent(input: {
     ]
       .filter(Boolean)
       .join(" "),
-    liveStatus,
+    liveStatus: recovery,
     recovery,
-    nextAction:
-      input.phase === "idle"
-        ? CONSENT_COPY.idleNext
-        : input.phase === "pending"
-          ? CONSENT_COPY.pending
-          : CONSENT_COPY.unconfirmed,
+    nextAction: recovery,
     offerStandingGrant: false,
   };
 }
@@ -279,19 +245,19 @@ export function presentDeniedPermissionRecord(
   request: PermissionRequest,
   sessionId: string,
 ): Omit<DenyHistoryEntry, "at"> {
-  const detail = detailRecord(request.detail);
+  const detail =
+    typeof request.detail === "object" &&
+    request.detail !== null &&
+    !Array.isArray(request.detail)
+      ? (request.detail as Record<string, unknown>)
+      : {};
   return {
-    tool_name:
-      typeof request.tool_name === "string" && CLOSED_TOOL_LABELS[request.tool_name]
-        ? request.tool_name
-        : "unknown_tool",
-    summary: redactUntrustedDisplay(request.summary) || closedToolLabel(request.tool_name),
-    session_id: sessionId ? "owning-session" : "",
-    risk: redactUntrustedDisplay(detail.risk) || undefined,
-    risk_tier:
-      detail.risk_tier === "deny" || detail.risk_tier === "ask"
-        ? detail.risk_tier
-        : undefined,
+    tool_name: ownToolKey(request.tool_name),
+    summary: closedToolLabel(request.tool_name),
+    session_id: sessionId,
+    risk_tier: ownRiskTier(
+      typeof detail.risk_tier === "string" ? detail.risk_tier : undefined,
+    ),
   };
 }
 
@@ -330,31 +296,83 @@ export function trapConsentTabKey(
   }
 }
 
-export function inertNonConsentSiblings(layer: HTMLElement | null): () => void {
-  const shell = layer?.parentElement;
-  if (!layer || !shell) return () => {};
-  const siblings = Array.from(shell.children).filter(
-    (child): child is HTMLElement =>
-      child !== layer &&
-      child instanceof HTMLElement &&
-      child.dataset.modalLayer !== "consent",
-  );
-  const previous = siblings.map((element) => ({
+type InertSnapshot = {
+  element: HTMLElement;
+  ariaHidden: string | null;
+  inert: boolean;
+};
+
+function isConsentLayer(element: Element): boolean {
+  return element instanceof HTMLElement && element.dataset.modalLayer === "consent";
+}
+
+function ancestorSiblingTargets(layer: HTMLElement): HTMLElement[] {
+  const targets: HTMLElement[] = [];
+  let node: HTMLElement | null = layer;
+  while (node && node !== document.documentElement) {
+    const parent = node.parentElement;
+    if (!parent) break;
+    for (const child of Array.from(parent.children)) {
+      if (!(child instanceof HTMLElement)) continue;
+      if (child === node) continue;
+      if (isConsentLayer(child)) continue;
+      if (child.tagName === "HEAD") continue;
+      targets.push(child);
+    }
+    if (parent === document.body) break;
+    node = parent;
+  }
+  return targets;
+}
+
+function applyInertSnapshot(
+  seen: Map<HTMLElement, InertSnapshot>,
+  element: HTMLElement,
+): void {
+  if (seen.has(element)) return;
+  seen.set(element, {
     element,
     ariaHidden: element.getAttribute("aria-hidden"),
     inert: element.hasAttribute("inert"),
-  }));
-  siblings.forEach((element) => {
-    element.setAttribute("inert", "");
-    element.setAttribute("aria-hidden", "true");
   });
+  element.setAttribute("inert", "");
+  element.setAttribute("aria-hidden", "true");
+}
+
+function restoreInertSnapshot(snapshot: InertSnapshot): void {
+  const { element, ariaHidden, inert } = snapshot;
+  if (inert) element.setAttribute("inert", "");
+  else element.removeAttribute("inert");
+  if (ariaHidden === null) element.removeAttribute("aria-hidden");
+  else element.setAttribute("aria-hidden", ariaHidden);
+}
+
+/**
+ * Inert every non-consent ancestor sibling, including nodes added later and
+ * body-level portals. Restores each element's exact prior inert/aria-hidden.
+ */
+export function observeNonConsentInert(layer: HTMLElement | null): () => void {
+  if (!layer || !layer.isConnected) return () => {};
+  const seen = new Map<HTMLElement, InertSnapshot>();
+  const scan = () => {
+    for (const target of ancestorSiblingTargets(layer)) {
+      applyInertSnapshot(seen, target);
+    }
+  };
+  scan();
+  const root = document.body ?? layer.ownerDocument?.body;
+  if (!root || typeof MutationObserver !== "function") {
+    return () => {
+      Array.from(seen.values()).forEach(restoreInertSnapshot);
+      seen.clear();
+    };
+  }
+  const observer = new MutationObserver(scan);
+  observer.observe(root, { childList: true, subtree: true });
   return () => {
-    previous.forEach(({ element, ariaHidden, inert }) => {
-      if (inert) element.setAttribute("inert", "");
-      else element.removeAttribute("inert");
-      if (ariaHidden === null) element.removeAttribute("aria-hidden");
-      else element.setAttribute("aria-hidden", ariaHidden);
-    });
+    observer.disconnect();
+    Array.from(seen.values()).forEach(restoreInertSnapshot);
+    seen.clear();
   };
 }
 

@@ -61,7 +61,6 @@ import {
   consentBlocksWorkspaceShortcuts,
   permissionQueueAfterAcknowledgement,
   presentDeniedPermissionRecord,
-  settleOperatorConsentAcknowledgement,
   type ConsentAcknowledgement,
 } from "./lib/operatorConsentPresentation";
 import {
@@ -254,12 +253,37 @@ export function shouldHandleWorkspaceShortcut(consentOpen: boolean): boolean {
   return !consentBlocksWorkspaceShortcuts(consentOpen);
 }
 
-/** Renderer acknowledgement only — never retries or invents a deny. */
+const CONSENT_ACK_TIMEOUT_MS = 8_000;
+
+/**
+ * Single acknowledgement owner. Awaits the Tauri permissionRespond Result
+ * once. Resolved invoke → acknowledged. Rejected invoke → rejected.
+ * Timeout → lost. A late resolve after timeout cannot change the result.
+ */
 export async function acknowledgeOperatorPermission(
   send: () => Promise<unknown>,
-  timeoutMs?: number,
+  timeoutMs: number = CONSENT_ACK_TIMEOUT_MS,
 ): Promise<ConsentAcknowledgement> {
-  return settleOperatorConsentAcknowledgement(send, timeoutMs);
+  let decided: ConsentAcknowledgement | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const decide = (ack: ConsentAcknowledgement): ConsentAcknowledgement => {
+    if (decided) return decided;
+    decided = ack;
+    return ack;
+  };
+  try {
+    return await Promise.race([
+      Promise.resolve()
+        .then(send)
+        .then(() => decide("acknowledged"))
+        .catch(() => decide("rejected")),
+      new Promise<ConsentAcknowledgement>((resolve) => {
+        timer = setTimeout(() => resolve(decide("lost")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export {

@@ -14,9 +14,36 @@ Do **not** treat this file as packaged qualification. Do **not** claim 100%.
 | Selected source | `codex/external-worker-hardening-v1` |
 | Required parent / fail-closed HEAD | `8ad3be07eb27087acb67704fdf463ecb95b64505` |
 | Isolated branch | `cursor/operator-consent-recovery-ux-772c` |
+| Prior draft head (review baseline) | `7a09464704b816cb452d677ec2159609b5eccb00` |
 | Donor inspected, never merged | `b456178e2836916e9e646cc7cb262e1be794a01f` |
 | Donor parent | `8ad3be07eb27087acb67704fdf463ecb95b64505` (sibling, not ancestor of this work) |
 | Campaign | Disjoint from the authority-spine campaign |
+
+## Independent review corrections (this successor)
+
+Display-only. No backend authority change. No hosted or packaged acceptance claim.
+
+1. **Closed display projection.** The renderer no longer blacklists fragments
+   from `request.summary`, `detail.risk`, deny-history summaries, paths,
+   commands, URLs, credential-like prose, ids, or Unicode formatting controls.
+   Visible copy is fixed `CONSENT_COPY` plus own-key mapped tool and risk
+   classes. Tool/risk tables are null-prototype maps; lookup uses
+   `Object.prototype.hasOwnProperty.call` so `__proto__`, `constructor`,
+   `toString`, and other inherited keys always return a string and cannot
+   crash consent.
+2. **Deny-history identity.** Persisted records keep the true owning
+   `session_id`. Presentation never renders that id and never substitutes the
+   literal `owning-session`. Two sessions keep distinct provenance.
+3. **Inert containment.** `observeNonConsentInert` applies observer-backed
+   ancestor-sibling inert from the consent layer through `document.body`,
+   including late siblings and body portals. Pre-existing `inert` /
+   `aria-hidden` values are snapshotted and restored exactly.
+4. **Single acknowledgement owner.** `acknowledgeOperatorPermission` in App
+   awaits `api.permissionRespond` once and returns one closed
+   `acknowledged` / `rejected` / `lost` result. A late resolve after timeout
+   cannot flip `lost`. PermissionModal does not start a timer and does not
+   treat void or arbitrary resolution as acknowledgement. `submitGate` stays
+   synchronous and at-most-once. Queue removal is ack-only.
 
 ## Allowlist (exact)
 
@@ -113,14 +140,14 @@ Lint and Playwright are **not** claimed; neither exists in this desktop package.
 
 | Command | Result |
 | --- | --- |
-| `npx tsc --noEmit` | pass (after wrapping `onRespond` in `Promise.resolve`) |
-| focused Vitest (`operatorConsentPresentation`, `PermissionModal`, `App.operatorUx`) | 25/25 pass |
-| `npx vitest run` | 50 files / 304 tests pass |
-| `npx vite build` | pass (client production; chunk-size warning only) |
-| `npm run verify:public` | pass (regression only; public bundle + consumer fixture) |
-| `git diff --check` | clean |
-| privacy scan | no live credentials or private identity paths; tests use absence needles only (`sk-test-not-a-real-key`, `/Users/secret`) |
-| GitHub `Desktop / desktop` on `297050a1` | **fail (parent lock residual)** — `Typecheck + unit tests` passed; `Cargo tests (desktop)` failed `cargo test --locked` because `desktop/src-tauri/Cargo.lock` does not record path dep `grokptah-agent-sdk` already present in `grokptah-agent-bridge` at `8ad3be07`. This draft does not alter lockfiles. |
+| `npx tsc --noEmit` | pending this successor (pass on `297050a1`) |
+| focused Vitest (`operatorConsentPresentation`, `PermissionModal`, `App.operatorUx`) | pending this successor (25/25 on prior head) |
+| `npx vitest run` | pending this successor (50 files / 304 tests on prior head) |
+| `npx vite build` | pending this successor |
+| `npm run verify:public` | pending this successor |
+| `git diff --check` | pending this successor |
+| privacy scan | absence needles only (`/etc/passwd`, `/opt/x`, `src/main.rs`, `git status`, `tok_opaque_9f3a`, bidi/Cf controls, prototype keys). No live credentials. |
+| GitHub `Desktop / desktop` on `297050a1` / `7a094647` | **fail (parent lock residual)** — `Typecheck + unit tests` passed; `Cargo tests (desktop)` failed `cargo test --locked` because `desktop/src-tauri/Cargo.lock` does not record path dep `grokptah-agent-sdk` already present in `grokptah-agent-bridge` at `8ad3be07`. This draft does not alter lockfiles. The unchanged parent lock mismatch remains an inherited hosted blocker. |
 
 JSDOM printed `HTMLCanvasElement.prototype.getContext` when `App.operatorUx.test.tsx` imported `App.tsx` (xterm). Tests still passed. That is not packaged AT.
 

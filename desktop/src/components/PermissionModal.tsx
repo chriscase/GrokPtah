@@ -8,9 +8,9 @@ import type { DenyHistoryEntry } from "../lib/denyHistory";
 import {
   applyConsentEscape,
   canSubmitConsent,
-  inertNonConsentSiblings,
+  observeNonConsentInert,
   presentOperatorConsent,
-  settleOperatorConsentAcknowledgement,
+  readConsentAcknowledgement,
   trapConsentTabKey,
   type ConsentAcknowledgement,
   type ConsentDecision,
@@ -24,26 +24,25 @@ export type PermissionModalProps = {
   /**
    * Called with the request id, decision, and the **owning** session id
    * (request.session_id) — never invent the focused tab here (#141).
-   * Advance the host queue only when the returned acknowledgement is resolved.
+   * Must return an explicit closed acknowledgement. Void or arbitrary values
+   * lock response unconfirmed and do not advance the queue.
    */
   onRespond: (
     requestId: string,
     decision: PermissionDecision,
     sessionId: string,
-  ) => void | Promise<void | ConsentAcknowledgement>;
+  ) => ConsentAcknowledgement | Promise<ConsentAcknowledgement | unknown>;
   /** Optional fallback only if request.session_id is empty. */
   fallbackSessionId?: string | null;
   /** Recent denials for this project/session (#175). */
   denyHistory?: DenyHistoryEntry[];
-  /** Test override for lost-acknowledgement timing. */
-  acknowledgementTimeoutMs?: number;
 };
 
 /**
  * Safety-boundary modal for tool permission prompts.
  *
- * Presentation-only: focus, trapping, redaction, and acknowledgement lockout
- * do not change host authority. Always Allow is not offered at this head.
+ * Presentation-only. Acknowledgement timing belongs to App. This dialog never
+ * starts a second timer and never treats void/arbitrary resolution as success.
  */
 export function PermissionModal({
   request,
@@ -51,7 +50,6 @@ export function PermissionModal({
   onRespond,
   fallbackSessionId = null,
   denyHistory = [],
-  acknowledgementTimeoutMs,
 }: PermissionModalProps) {
   const sessionId = sessionIdForPermission(request, fallbackSessionId);
   const [lock, setLock] = useState<{ id: string; phase: ConsentPhase }>({
@@ -82,7 +80,7 @@ export function PermissionModal({
   useLayoutEffect(() => {
     openerRef.current =
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const restore = inertNonConsentSiblings(backdropRef.current);
+    const restore = observeNonConsentInert(backdropRef.current);
     return () => {
       restore();
       const opener = openerRef.current;
@@ -100,17 +98,21 @@ export function PermissionModal({
       if (!canSubmitConsent(phase) || submitGate.current === request.id) return;
       submitGate.current = request.id;
       setLock({ id: request.id, phase: "pending" });
-      const ack = await settleOperatorConsentAcknowledgement(
-        () => Promise.resolve(onRespond(request.id, decision, sessionId)),
-        acknowledgementTimeoutMs,
-      );
+      let raw: unknown;
+      try {
+        raw = await Promise.resolve(onRespond(request.id, decision, sessionId));
+      } catch {
+        setLock({ id: request.id, phase: "unconfirmed" });
+        return;
+      }
+      const ack = readConsentAcknowledgement(raw);
       if (ack === "acknowledged") {
         setLock({ id: request.id, phase: "idle" });
         return;
       }
       setLock({ id: request.id, phase: "unconfirmed" });
     },
-    [acknowledgementTimeoutMs, onRespond, phase, request.id, sessionId],
+    [onRespond, phase, request.id, sessionId],
   );
 
   useEffect(() => {
