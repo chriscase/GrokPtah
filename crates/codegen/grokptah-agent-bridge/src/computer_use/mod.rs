@@ -31,6 +31,8 @@ mod isolated_visual_helper;
 mod isolated_visual_helper_control;
 mod isolated_visual_input;
 mod isolated_visual_input_wire;
+#[cfg(all(test, unix))]
+mod isolated_visual_leak_gates;
 #[cfg(test)]
 mod isolated_visual_package;
 mod isolated_visual_protocol;
