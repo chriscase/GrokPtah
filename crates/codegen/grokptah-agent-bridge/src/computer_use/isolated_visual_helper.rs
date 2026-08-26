@@ -54,6 +54,28 @@ impl IsolatedVisualHelperFailure {
             _ => return None,
         })
     }
+
+    /// Whether this failure, on its own, proves no guest is left running.
+    ///
+    /// True only for failures raised before any guest could have been started
+    /// and for the helper's own report that the guest stopped. A failure that
+    /// can leave a live guest behind is deliberately excluded so terminal
+    /// cleanup can never claim more than the host actually observed.
+    pub fn proves_guest_not_running(self) -> bool {
+        match self {
+            Self::InvalidInvocation
+            | Self::InvalidDescriptor
+            | Self::InvalidConfiguration
+            | Self::StartNotAuthorized
+            | Self::VirtualizationUnavailable
+            | Self::ConfigurationRejected
+            | Self::GuestStopped => true,
+            // The guest's fate is unknown after these: a start that failed
+            // partway, a lost control channel, a stop the helper could not
+            // complete, or a guest that violated the protocol.
+            Self::StartFailed | Self::ControlLost | Self::StopFailed | Self::GuestProtocol => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +135,31 @@ pub enum IsolatedVisualHelperSupervisorState {
     StopSent,
     Stopped,
     Failed(IsolatedVisualHelperFailure),
+}
+
+impl IsolatedVisualHelperSupervisorState {
+    /// Whether the host *observed* enough to prove the guest is not running.
+    ///
+    /// This is the driver-derived half of the cleanup proof. It is deliberately
+    /// a proof rather than an inference: only states carrying a terminal helper
+    /// report — a clean stop, a guest that stopped underneath the host, or a
+    /// failure raised before any guest could exist — return true. A control
+    /// byte that was written but never acknowledged (`StartSent`, `StopSent`)
+    /// and a live guest (`Running`, `BindingSent`, `Bound`) both return false,
+    /// so a caller cannot assert a stop the driver never saw.
+    pub fn proves_guest_not_running(self) -> bool {
+        match self {
+            // No START was ever authorized, so no guest can exist yet.
+            Self::AwaitingPrepared | Self::Prepared => true,
+            // The helper reported the guest stopped.
+            Self::Stopped => true,
+            Self::Failed(failure) => failure.proves_guest_not_running(),
+            // Written but unacknowledged, or a guest still live.
+            Self::StartSent | Self::Running | Self::BindingSent | Self::Bound | Self::StopSent => {
+                false
+            }
+        }
+    }
 }
 
 /// Host-side state machine for the fixed helper ABI. This does not spawn a

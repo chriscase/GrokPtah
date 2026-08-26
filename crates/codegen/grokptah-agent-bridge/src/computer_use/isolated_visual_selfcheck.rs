@@ -531,12 +531,20 @@ fn check_one_agent_lease() -> ComputerResult<()> {
     // Evidence refuses to exist unless every check passed, so a coordinator
     // cannot even hold a half-satisfied cleanup receipt.
     require(
-        IsolatedVisualCleanupEvidence::verified(contract.surface.clone(), true, true, true, false)
-            .is_err(),
+        IsolatedVisualCleanupEvidence::verified(
+            contract.surface.clone(),
+            true,
+            true,
+            true,
+            true,
+            false,
+        )
+        .is_err(),
         "isolated cleanup evidence was minted with a surviving frame cache",
     )?;
     guest.complete_cleanup(&IsolatedVisualCleanupEvidence::verified(
         contract.surface.clone(),
+        true,
         true,
         true,
         true,
@@ -1129,12 +1137,20 @@ fn check_driven_failure() -> ComputerResult<()> {
         "a failed isolated session still accepted a stop control",
     )?;
     require(
-        IsolatedVisualCleanupEvidence::verified(contract.surface.clone(), false, true, true, true)
-            .is_err(),
+        IsolatedVisualCleanupEvidence::verified(
+            contract.surface.clone(),
+            true,
+            false,
+            true,
+            true,
+            true,
+        )
+        .is_err(),
         "isolated cleanup evidence was minted with a surviving helper process",
     )?;
     driver.complete_cleanup(&IsolatedVisualCleanupEvidence::verified(
         contract.surface.clone(),
+        true,
         true,
         true,
         true,
