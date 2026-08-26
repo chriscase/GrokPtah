@@ -7,3 +7,8 @@
  */
 export * from "./uiCore";
 export * from "./grokptahBrokerClient";
+export {
+  HelpAuthorityBrokerClient,
+  HelpAuthorityBrokerError,
+  type HelpAuthorityBrokerOptions,
+} from "./help/authority/broker";

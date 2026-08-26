@@ -88,6 +88,14 @@ try {
   buildHelpAnswerRequest,
   validateHelpAnswerResponse,
   verifyHelpModelChecksum,
+  HELP_AUTHORITY_SCHEMA,
+  HELP_SOURCE_BYTE_DIGEST,
+  buildHelpAuthorityRequest,
+  createHelpAuthorization,
+  parseHelpAuthorityRequest,
+  validateHelpAuthorityRequest,
+  validateHelpAuthorityResponse,
+  HelpAuthorityBrokerClient,
 } from "@grokptah/client";
 import {
   HELP_ARTICLES as UI_CORE_HELP_ARTICLES,
@@ -233,6 +241,44 @@ if (helpRequest.toolsDisabled !== true || helpRequest.conversationDisabled !== t
 }
 if (validateHelpAnswerResponse({ schema: "grokptah.help-answer-response.v1", answer: "x", citations: [], uncertainty: "y", corpusDigest: helpRequest.corpusDigest, routeDigest: helpRoute.routeDigest }, helpRequest).accepted) {
   throw new Error("consumer Help answer validation accepted an uncited reply");
+}
+const authorityRequest = buildHelpAuthorityRequest({
+  requestId: "consumer-authority-request",
+  query: "durable run recovery",
+  results: helpOutcome.results,
+  provider: {
+    profile: "consumer-profile",
+    tenant: "consumer-tenant",
+    model: "consumer-model",
+    routeRevision: "route-1",
+    dialect: "broker_native",
+  },
+  authorizedCapabilities: [],
+});
+if (
+  authorityRequest.schema !== HELP_AUTHORITY_SCHEMA ||
+  !HELP_SOURCE_BYTE_DIGEST.startsWith("sha256:") ||
+  createHelpAuthorization().mode !== "public" ||
+  !parseHelpAuthorityRequest(authorityRequest) ||
+  !validateHelpAuthorityRequest(authorityRequest).accepted
+) {
+  throw new Error("consumer one-shot Help authority request was not usable");
+}
+if (
+  validateHelpAuthorityResponse(
+    { ...authorityRequest, kind: "response" },
+    authorityRequest,
+  ).accepted
+) {
+  throw new Error("consumer one-shot Help authority accepted an invalid response");
+}
+const helpBroker = new HelpAuthorityBrokerClient({
+  baseUrl: "https://contextdesk.example",
+  csrfToken: "consumer-csrf",
+  fetcher: async () => new Response(null, { status: 204 }),
+});
+if (!(helpBroker instanceof HelpAuthorityBrokerClient)) {
+  throw new Error("consumer one-shot Help broker could not be constructed");
 }
 
 const helpReact = await import("@grokptah/client/help-react");

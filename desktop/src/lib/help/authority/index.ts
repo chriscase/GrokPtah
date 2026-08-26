@@ -46,8 +46,3 @@ export {
   type HelpAuthorityExecutorOptions,
   type HelpAuthorityTransport,
 } from "./executor";
-export {
-  HelpAuthorityBrokerClient,
-  HelpAuthorityBrokerError,
-  type HelpAuthorityBrokerOptions,
-} from "./broker";

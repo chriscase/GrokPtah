@@ -89,6 +89,15 @@ const requiredExports = [
   "redactHelpText",
   "sanitizeHelpText",
   "verifyHelpModelChecksum",
+  // Dedicated one-shot Help authority.
+  "HELP_AUTHORITY_SCHEMA",
+  "HELP_SOURCE_BYTE_DIGEST",
+  "buildHelpAuthorityRequest",
+  "createHelpAuthorization",
+  "parseHelpAuthorityRequest",
+  "validateHelpAuthorityRequest",
+  "validateHelpAuthorityResponse",
+  "HelpAuthorityBrokerClient",
 ];
 const missing = requiredExports.filter((name) => !(name in publicApi));
 if (missing.length > 0) {
@@ -106,8 +115,8 @@ for (const name of [
 ]) {
   if (!(name in uiCoreApi)) throw new Error(`ui-core bundle is missing required export: ${name}`);
 }
-if ("GrokPtahBrokerClient" in uiCoreApi) {
-  throw new Error("ui-core bundle must not expose the browser broker client");
+if ("GrokPtahBrokerClient" in uiCoreApi || "HelpAuthorityBrokerClient" in uiCoreApi) {
+  throw new Error("ui-core bundle must not expose browser broker clients");
 }
 if (!Object.isFrozen(publicApi.HELP_ARTICLES) || !Object.isFrozen(uiCoreApi.HELP_ARTICLES)) {
   throw new Error("published Help corpus must be immutable");

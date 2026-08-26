@@ -4,3 +4,8 @@
  */
 export * from "./help/index";
 export * from "./help/react/index";
+export {
+  HelpAuthorityBrokerClient,
+  HelpAuthorityBrokerError,
+  type HelpAuthorityBrokerOptions,
+} from "./help/authority/broker";
