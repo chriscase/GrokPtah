@@ -11,9 +11,122 @@
     "worker": { "$ref": "#/$defs/worker" },
     "run": { "$ref": "#/$defs/run" },
     "events": { "type": "array", "items": { "$ref": "#/$defs/event" } },
-    "artifacts": { "type": "array", "items": { "$ref": "#/$defs/artifact" } }
+    "artifacts": { "type": "array", "items": { "$ref": "#/$defs/artifact" } },
+    "admission": { "$ref": "#/$defs/admission" },
+    "receipt": { "$ref": "#/$defs/receipt" },
+    "capabilityStatus": { "type": "array", "items": { "$ref": "#/$defs/capabilityStatus" } }
   },
   "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "alias": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "comment": "A workspace or principal alias. Never an absolute path, a drive-qualified path, a UNC path, or a traversal.",
+      "pattern": "^(?![/\\\\])(?![A-Za-z]:[\\\\/])(?!.*\\\\)(?!(?:.*/)?\\.\\.(?:/|$))[^\\u0000-\\u001f\\r\\n]+$"
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "comment": "Bounded redacted operator text. Never provider output, a URL, a credential, or a host path.",
+      "pattern": "^[^\\u0000-\\u001f\\r\\n]+$"
+    },
+    "mutation": { "enum": ["launch", "follow_up", "cancel"] },
+    "receiptState": { "enum": ["claimed", "accepted", "rejected", "uncertain"] },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["principalId", "sessionId", "workspace", "runId"],
+      "properties": {
+        "principalId": { "$ref": "#/$defs/identity" },
+        "sessionId": { "$ref": "#/$defs/identity" },
+        "workspace": { "$ref": "#/$defs/alias" },
+        "runId": { "$ref": "#/$defs/identity" }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["externalAgentId"],
+      "properties": {
+        "externalAgentId": { "$ref": "#/$defs/identity" },
+        "externalRunId": { "$ref": "#/$defs/identity" }
+      }
+    },
+    "admission": {
+      "type": "object",
+      "additionalProperties": false,
+      "comment": "A host-minted, single-use, scope-bound ticket. It is not a bearer credential: the host revalidates every field against its own mint ledger.",
+      "required": [
+        "contract", "admissionId", "nonce", "requestId", "scope", "mutation", "provider",
+        "capabilityRevision", "issuedAtMs", "expiresAtMs", "payloadDigest"
+      ],
+      "properties": {
+        "contract": { "const": "grokptah.external-workers.v1" },
+        "admissionId": { "$ref": "#/$defs/identity" },
+        "nonce": { "$ref": "#/$defs/identity" },
+        "requestId": { "$ref": "#/$defs/identity" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "mutation": { "$ref": "#/$defs/mutation" },
+        "provider": { "$ref": "#/$defs/provider" },
+        "providerId": { "$ref": "#/$defs/identity" },
+        "capabilityRevision": { "type": "integer", "minimum": 0 },
+        "issuedAtMs": { "type": "integer", "minimum": 0 },
+        "expiresAtMs": { "type": "integer", "minimum": 0 },
+        "payloadDigest": { "$ref": "#/$defs/digest" },
+        "target": { "$ref": "#/$defs/target" }
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "comment": "Durable redacted evidence of one mutation attempt. Carries opaque identities and a payload digest only.",
+      "required": [
+        "contract", "requestId", "admissionId", "mutation", "scope", "provider",
+        "providerRequestId", "attempt", "state", "payloadDigest", "reason",
+        "createdAtMs", "updatedAtMs"
+      ],
+      "properties": {
+        "contract": { "const": "grokptah.external-workers.v1" },
+        "requestId": { "$ref": "#/$defs/identity" },
+        "admissionId": { "$ref": "#/$defs/identity" },
+        "mutation": { "$ref": "#/$defs/mutation" },
+        "scope": { "$ref": "#/$defs/scope" },
+        "provider": { "$ref": "#/$defs/provider" },
+        "providerId": { "$ref": "#/$defs/identity" },
+        "providerRequestId": { "$ref": "#/$defs/identity" },
+        "attempt": { "type": "integer", "minimum": 1 },
+        "state": { "$ref": "#/$defs/receiptState" },
+        "target": { "$ref": "#/$defs/target" },
+        "payloadDigest": { "$ref": "#/$defs/digest" },
+        "reason": { "$ref": "#/$defs/reason" },
+        "createdAtMs": { "type": "integer", "minimum": 0 },
+        "updatedAtMs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "capabilityStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "comment": "All four gates must hold before a host advertises an external-worker capability.",
+      "required": [
+        "provider", "registered", "reachable", "versionCompatible", "policyAllowed",
+        "capabilityRevision"
+      ],
+      "properties": {
+        "provider": { "$ref": "#/$defs/provider" },
+        "providerId": { "$ref": "#/$defs/identity" },
+        "registered": { "type": "boolean" },
+        "reachable": { "type": "boolean" },
+        "versionCompatible": { "type": "boolean" },
+        "policyAllowed": { "type": "boolean" },
+        "capabilityRevision": { "type": "integer", "minimum": 0 },
+        "reason": { "$ref": "#/$defs/reason" }
+      }
+    },
     "provider": {
       "enum": ["cursor_cloud", "claude_code_cloud", "local_worker", "custom"]
     },

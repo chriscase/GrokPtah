@@ -363,3 +363,279 @@ export function applyExternalWorkerNotification(
   const events = [...state.events, event].slice(-MAX_EVENTS);
   return { lastSeq: event.seq, events, recoveryRequired: false };
 }
+
+// ---------------------------------------------------------------------------
+// Production authority projections.
+//
+// A browser consumer never mints authority: it receives a host-minted
+// admission and echoes it back on the matching mutation. These parsers exist
+// so a malformed, stale, or over-scoped ticket is refused before it is used,
+// and so a receipt that somehow carries privileged text never renders.
+// ---------------------------------------------------------------------------
+
+export type ExternalWorkerMutation = "launch" | "follow_up" | "cancel";
+
+export type ExternalWorkerReceiptState = "claimed" | "accepted" | "rejected" | "uncertain";
+
+export type ExternalWorkerScope = {
+  principalId: string;
+  sessionId: string;
+  workspace: string;
+  runId: string;
+};
+
+export type ExternalWorkerTarget = {
+  externalAgentId: string;
+  externalRunId?: string;
+};
+
+export type ExternalWorkerAdmission = {
+  contract: typeof EXTERNAL_WORKER_CONTRACT;
+  admissionId: string;
+  nonce: string;
+  requestId: string;
+  scope: ExternalWorkerScope;
+  mutation: ExternalWorkerMutation;
+  provider: ExternalWorkerProvider;
+  providerId?: string;
+  capabilityRevision: number;
+  issuedAtMs: number;
+  expiresAtMs: number;
+  payloadDigest: string;
+  target?: ExternalWorkerTarget;
+};
+
+export type ExternalWorkerReceipt = {
+  contract: typeof EXTERNAL_WORKER_CONTRACT;
+  requestId: string;
+  admissionId: string;
+  mutation: ExternalWorkerMutation;
+  scope: ExternalWorkerScope;
+  provider: ExternalWorkerProvider;
+  providerId?: string;
+  providerRequestId: string;
+  attempt: number;
+  state: ExternalWorkerReceiptState;
+  target?: ExternalWorkerTarget;
+  payloadDigest: string;
+  reason: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+};
+
+export type ExternalWorkerCapabilityStatus = {
+  provider: ExternalWorkerProvider;
+  providerId?: string;
+  registered: boolean;
+  reachable: boolean;
+  versionCompatible: boolean;
+  policyAllowed: boolean;
+  capabilityRevision: number;
+  reason?: string;
+};
+
+/** Host ceiling on a minted admission lifetime, mirroring the Rust contract. */
+export const MAX_EXTERNAL_WORKER_ADMISSION_TTL_MS = 15 * 60 * 1_000;
+const MAX_REASON_BYTES = 512;
+const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/;
+const MUTATIONS = new Set<ExternalWorkerMutation>(["launch", "follow_up", "cancel"]);
+const RECEIPT_STATES = new Set<ExternalWorkerReceiptState>([
+  "claimed",
+  "accepted",
+  "rejected",
+  "uncertain",
+]);
+// A workspace alias is an identity, never a place on the host filesystem.
+const HOST_PATH = /^(?:\/|\\\\|[a-z]:[\\/])|\\|(?:^|\/)\.\.(?:\/|$)/i;
+
+function nonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function parseScope(value: unknown): ExternalWorkerScope | null {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, new Set(["principalId", "sessionId", "workspace", "runId"]))
+  ) return null;
+  if (
+    !identity(value.principalId) ||
+    !identity(value.sessionId) ||
+    !identity(value.runId) ||
+    !identity(value.workspace) ||
+    HOST_PATH.test(value.workspace)
+  ) return null;
+  return value as ExternalWorkerScope;
+}
+
+function parseTarget(value: unknown): ExternalWorkerTarget | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set(["externalAgentId", "externalRunId"]))) return null;
+  if (
+    !identity(value.externalAgentId) ||
+    (value.externalRunId !== undefined && !identity(value.externalRunId))
+  ) return null;
+  return value as ExternalWorkerTarget;
+}
+
+function redactedReason(value: unknown): value is string {
+  return (
+    boundedString(value, MAX_REASON_BYTES, true) &&
+    !/[\u0000-\u001f\u007f]/.test(value)
+  );
+}
+
+function targetMatchesMutation(
+  mutation: ExternalWorkerMutation,
+  target: ExternalWorkerTarget | undefined,
+): boolean {
+  if (mutation === "launch") return target === undefined;
+  if (target === undefined) return false;
+  return mutation === "cancel" ? target.externalRunId !== undefined : target.externalRunId === undefined;
+}
+
+/**
+ * Parse a host-minted admission.
+ *
+ * Shape validity is not authority: the server revalidates every field against
+ * its own mint ledger. This only stops an obviously unusable ticket from being
+ * echoed back and from rendering as if it granted something.
+ */
+export function parseExternalWorkerAdmission(value: unknown): ExternalWorkerAdmission | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set([
+    "contract", "admissionId", "nonce", "requestId", "scope", "mutation", "provider", "providerId",
+    "capabilityRevision", "issuedAtMs", "expiresAtMs", "payloadDigest", "target",
+  ]))) return null;
+  const scope = parseScope(value.scope);
+  const target = value.target === undefined ? undefined : parseTarget(value.target);
+  if (
+    value.contract !== EXTERNAL_WORKER_CONTRACT ||
+    !identity(value.admissionId) ||
+    !identity(value.nonce) ||
+    !identity(value.requestId) ||
+    scope === null ||
+    typeof value.mutation !== "string" ||
+    !MUTATIONS.has(value.mutation as ExternalWorkerMutation) ||
+    typeof value.provider !== "string" ||
+    !PROVIDERS.has(value.provider as ExternalWorkerProvider) ||
+    (value.providerId !== undefined && !identity(value.providerId)) ||
+    (value.provider === "custom" && value.providerId === undefined) ||
+    !nonNegativeInteger(value.capabilityRevision) ||
+    !nonNegativeInteger(value.issuedAtMs) ||
+    !nonNegativeInteger(value.expiresAtMs) ||
+    value.expiresAtMs <= value.issuedAtMs ||
+    value.expiresAtMs - value.issuedAtMs > MAX_EXTERNAL_WORKER_ADMISSION_TTL_MS ||
+    typeof value.payloadDigest !== "string" ||
+    !SHA256_DIGEST.test(value.payloadDigest) ||
+    (value.target !== undefined && target === null) ||
+    !targetMatchesMutation(value.mutation as ExternalWorkerMutation, target ?? undefined)
+  ) return null;
+  return value as ExternalWorkerAdmission;
+}
+
+/** Whether an admission is still inside its minted lifetime at `nowMs`. */
+export function isExternalWorkerAdmissionLive(
+  admission: ExternalWorkerAdmission,
+  nowMs: number,
+): boolean {
+  return nowMs >= admission.issuedAtMs && nowMs < admission.expiresAtMs;
+}
+
+/** Parse a redacted durable mutation receipt. */
+export function parseExternalWorkerReceipt(value: unknown): ExternalWorkerReceipt | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set([
+    "contract", "requestId", "admissionId", "mutation", "scope", "provider", "providerId",
+    "providerRequestId", "attempt", "state", "target", "payloadDigest", "reason",
+    "createdAtMs", "updatedAtMs",
+  ]))) return null;
+  const scope = parseScope(value.scope);
+  const target = value.target === undefined ? undefined : parseTarget(value.target);
+  if (
+    value.contract !== EXTERNAL_WORKER_CONTRACT ||
+    !identity(value.requestId) ||
+    !identity(value.admissionId) ||
+    !identity(value.providerRequestId) ||
+    typeof value.mutation !== "string" ||
+    !MUTATIONS.has(value.mutation as ExternalWorkerMutation) ||
+    scope === null ||
+    typeof value.provider !== "string" ||
+    !PROVIDERS.has(value.provider as ExternalWorkerProvider) ||
+    (value.providerId !== undefined && !identity(value.providerId)) ||
+    (value.provider === "custom" && value.providerId === undefined) ||
+    typeof value.attempt !== "number" ||
+    !Number.isInteger(value.attempt) ||
+    value.attempt < 1 ||
+    typeof value.state !== "string" ||
+    !RECEIPT_STATES.has(value.state as ExternalWorkerReceiptState) ||
+    (value.target !== undefined && target === null) ||
+    (value.state === "accepted" && target === undefined) ||
+    typeof value.payloadDigest !== "string" ||
+    !SHA256_DIGEST.test(value.payloadDigest) ||
+    !redactedReason(value.reason) ||
+    !nonNegativeInteger(value.createdAtMs) ||
+    !nonNegativeInteger(value.updatedAtMs) ||
+    value.updatedAtMs < value.createdAtMs
+  ) return null;
+  return value as ExternalWorkerReceipt;
+}
+
+/** Whether a receipt state forbids another attempt on the same request. */
+export function externalWorkerReceiptBlocksRetry(state: ExternalWorkerReceiptState): boolean {
+  return state !== "rejected";
+}
+
+/** Whether every advertisement gate holds for one provider identity. */
+export function externalWorkerCapabilityAvailable(
+  status: ExternalWorkerCapabilityStatus,
+): boolean {
+  return status.registered && status.reachable && status.versionCompatible && status.policyAllowed;
+}
+
+/** Parse one advertised external-worker capability status. */
+export function parseExternalWorkerCapabilityStatus(
+  value: unknown,
+): ExternalWorkerCapabilityStatus | null {
+  if (!isRecord(value) || !hasOnlyKeys(value, new Set([
+    "provider", "providerId", "registered", "reachable", "versionCompatible", "policyAllowed",
+    "capabilityRevision", "reason",
+  ]))) return null;
+  if (
+    typeof value.provider !== "string" ||
+    !PROVIDERS.has(value.provider as ExternalWorkerProvider) ||
+    (value.providerId !== undefined && !identity(value.providerId)) ||
+    (value.provider === "custom" && value.providerId === undefined) ||
+    typeof value.registered !== "boolean" ||
+    typeof value.reachable !== "boolean" ||
+    typeof value.versionCompatible !== "boolean" ||
+    typeof value.policyAllowed !== "boolean" ||
+    !nonNegativeInteger(value.capabilityRevision) ||
+    (value.reason !== undefined && !redactedReason(value.reason))
+  ) return null;
+  const status = value as ExternalWorkerCapabilityStatus;
+  if (!externalWorkerCapabilityAvailable(status) && status.reason === undefined) return null;
+  return status;
+}
+
+/**
+ * Whether an admission may be presented for this exact mutation.
+ *
+ * The browser check is deliberately narrow and local: it stops a ticket from
+ * being sent against the wrong scope, mutation, or target. Expiry, single use,
+ * capability revision, and payload binding are the server's to enforce.
+ */
+export function externalWorkerAdmissionCovers(
+  admission: ExternalWorkerAdmission,
+  mutation: ExternalWorkerMutation,
+  scope: ExternalWorkerScope,
+  requestId: string,
+  target?: ExternalWorkerTarget,
+): boolean {
+  return (
+    admission.mutation === mutation &&
+    admission.requestId === requestId &&
+    admission.scope.principalId === scope.principalId &&
+    admission.scope.sessionId === scope.sessionId &&
+    admission.scope.workspace === scope.workspace &&
+    admission.scope.runId === scope.runId &&
+    admission.target?.externalAgentId === target?.externalAgentId &&
+    admission.target?.externalRunId === target?.externalRunId
+  );
+}

@@ -1,8 +1,11 @@
 # Cursor Cloud agents from GrokPtah
 
-**Status:** provider-neutral external-worker contract and a trusted native
-Cursor Cloud v1 lifecycle adapter are now staged in `grokptah-agent-sdk` and
-`grokptah-agent-bridge`; the adapter is not live-qualified yet.
+**Status:** provider-neutral external-worker contract, a trusted native
+Cursor Cloud v1 lifecycle adapter, and a host-minted production-authority gate
+in front of every mutation are staged in `grokptah-agent-sdk` and
+`grokptah-agent-bridge`. All evidence to date is synthetic and in-tree; the
+adapter is **not** live-qualified and no live provider account, credential, or
+network has been exercised.
 
 GrokPtah can manage Cursor's Cloud Agents as an external execution provider.
 This is separate from controlling a local Cursor desktop window. Cursor's
@@ -53,6 +56,47 @@ projections. It deliberately has no provider credentials or network client, so
 another product can import the same contracts from a desktop adapter, service,
 or browser-safe broker without importing GrokPtah's authority implementation.
 
+## Production authority gate
+
+An adapter is a transport, not an authority. `ExternalWorkerAuthority`
+(`grokptah-agent-bridge::external_worker_authority`) is the gate in front of
+launch, follow-up, and cancel, and `ExternalWorkerStore`
+(`external_worker_store`) is its durable ledger. In order, a mutation needs:
+
+1. **Advertised capability.** A qualified adapter is registered, answered a
+   bounded reachability probe, speaks `grokptah.external-workers.v1`, and host
+   policy allows the principal, workspace, and provider identity. Registration
+   is single-shot: installing a second adapter for the same
+   `(provider, providerId)` fails closed with `ProviderAlreadyRegistered`
+   rather than replacing the first, and each successful install bumps a
+   capability revision.
+2. **A host-minted admission.** `ExternalWorkerAdmission` binds principal,
+   session, workspace, run, one mutation kind, provider identity, capability
+   revision, payload digest, provider target, idempotency key, a single-use
+   nonce, and a TTL clamped to 15 minutes. The public projection carries no
+   prompt, credential, provider URL, or host path. It is not a bearer
+   credential: the host revalidates every field against its own durable mint
+   ledger, so a perfectly well-formed ticket this host did not mint is
+   rejected on lookup. Expiry, single use, and capability revision are checked
+   at send time, not at mint time.
+3. **A clean durable ledger.** A receipt or an acceptance tombstone for the
+   same idempotency key refuses the send.
+
+After the send there are exactly three dispositions. Accepted writes a
+permanent `MutationTombstone`; rejected records no provider effect; anything
+else — a transport failure, a 5xx/408/409/425/429, or a response this host
+could not verify — is `Uncertain`. Uncertain is sticky and blocks automatic
+*and* explicit retry until `reconcile` records an explicit accepted/rejected
+decision. A process that stops mid-flight reopens its claimed receipt as
+`Uncertain` on the next open, never as retryable. Receipts are pruned by
+capacity and age; tombstones never are, so a duplicate is still recognized as
+already-effective long after its receipt has aged out.
+
+`providerRequestId` is derived deterministically from the admitted intent
+(contract, mutation, scope, idempotency key, payload digest), so every attempt
+presents the provider with the same request identity while the receipt
+`attempt` counter advances.
+
 The native bridge now exposes `CursorCloudAdapter` behind the
 `ExternalWorkerAdapter` trait. It targets Cursor Cloud Agents API v1, keeps the
 API key in the trusted process, requires an explicit repository allowlist, sends
@@ -76,7 +120,9 @@ path is qualified.
 1. Keep the Cursor API key in the native/server credential boundary. It must
    never reach the browser, Tauri webview, prompt transcript, or public broker.
 2. Require an explicit repository allowlist, exact starting ref, execution
-   mode, model/profile, prompt bounds, and an idempotency key before creation.
+   mode, model/profile, prompt bounds, an idempotency key, and a live
+   host-minted scope-bound admission before creation. A mutation without a
+   revalidated admission is never sent.
 3. Default to isolated cloud work and `autoCreatePR: false`; creating a PR,
    promoting changes, or merging remains a separate human-approved action.
 4. Store provider, agent ID, run ID, repo/ref, model, status, timestamps,
@@ -99,9 +145,19 @@ path is qualified.
    isolated create, explicit allowlist and response-safety checks, exact source
    projection, status polling, busy/unknown follow-up rejection, redacted
    terminal text, terminal cancellation, and run-attributed digest-bearing
-   artifacts without network credentials. Provider list/archive, stream
-   reconnect/expiry, durable idempotent retry, and a real artifact download/hash
-   path remain to be added.
+   artifacts without network credentials. Synthetic authority tests additionally
+   prove admission minting and revalidation, scope and expiry binding,
+   duplicate launch/follow-up/cancel refusal, restart reconciliation,
+   tombstone survival across receipt pruning, uncertain-after-send blocking,
+   adapter reachability and version gates, registration collision, redaction,
+   and projection-schema agreement. Provider list/archive, stream
+   reconnect/expiry, and a real artifact download/hash path remain to be added.
+
+   The fixture also caught a real defect: the adapter's response DTO derived
+   `autoCreatePr` from `rename_all = "camelCase"` while Cursor's payloads spell
+   the field `autoCreatePR`, so the PR-safety proof could never be satisfied
+   and every provider response failed closed. The DTO now accepts both
+   spellings and still requires an explicit `false`.
 2. **Read-only live probe:** list models/repositories and read an existing
    disposable agent; record API version, limits, retention, and redaction.
 3. **Disposable create:** create one agent from an exact public test ref with
@@ -110,8 +166,10 @@ path is qualified.
 4. **Manager integration:** expose Cursor as a provider-neutral lane in the
    desktop and browser-safe broker, with explicit user-visible provider and
    cost/usage labels. The staged browser client now has typed launch, status,
-   artifact, and cancellation calls; the trusted native lifecycle adapter is
-   staged, while server routes and live qualification remain to be completed.
+   artifact, and cancellation calls, and every mutation carries a host-minted
+   admission and returns a redacted receipt. The trusted native lifecycle
+   adapter and its authority gate are staged, while broker server routes and
+   live qualification remain to be completed.
 5. **Release gate:** independently review the adapter, run a retry/restart
    soak, and prove that approval, promotion, and Computer Use remain separate.
 

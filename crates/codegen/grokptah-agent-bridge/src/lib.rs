@@ -16,6 +16,8 @@ pub mod event_bus;
 mod events;
 mod exec_risk;
 pub mod external_worker;
+pub mod external_worker_authority;
+pub mod external_worker_store;
 mod gateway_config;
 mod hooks;
 mod host;
@@ -115,8 +117,16 @@ pub use discover::{
 pub use event_bus::{EventBus, EventReceiver, JournalEntry, JournalPage};
 pub use events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 pub use external_worker::{
-    CursorCloudAdapter, ExternalWorkerAdapter, ExternalWorkerAdapterError, ExternalWorkerRegistry,
-    CURSOR_CLOUD_API_BASE,
+    CursorCloudAdapter, ExternalWorkerAdapter, ExternalWorkerAdapterError, ExternalWorkerProbe,
+    ExternalWorkerProviderKey, ExternalWorkerRegistry, CURSOR_CLOUD_API_BASE,
+};
+pub use external_worker_authority::{
+    post_send_disposition, provider_request_id, AdmissionRequest, AdmittedMutation,
+    ExternalWorkerAuthority, ExternalWorkerClock, ExternalWorkerPolicy, MutationPayload,
+    SystemClock, DEFAULT_ADMISSION_TTL_MS,
+};
+pub use external_worker_store::{
+    AdmissionRecord, AdmissionState, ExternalWorkerStore, MutationClaim, MutationTombstone,
 };
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use mcp_control::{

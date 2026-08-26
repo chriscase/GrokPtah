@@ -227,7 +227,12 @@ pub struct RunEventPage {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum RunNotification {
     /// A scoped event journal update.
-    Event { scope: RunScope, event: RunEvent },
+    Event {
+        /// Exact run identity the event belongs to.
+        scope: RunScope,
+        /// Bounded, share-safe event projection.
+        event: RunEvent,
+    },
     /// The client must poll before reconnecting.
     Recovery {
         /// Exact run identity that needs recovery.
@@ -351,29 +356,35 @@ mod tests {
 
     #[test]
     fn public_contract_validators_reject_unbounded_values() {
-        assert!(Bounds {
-            max_rounds: Some(25),
-            ..Bounds::default()
-        }
-        .validate()
-        .is_err());
-        assert!(RunEvent {
-            seq: 1,
-            ts: "2026-01-01T00:00:00Z".into(),
-            update: serde_json::json!({"text": "x"}),
-        }
-        .validate()
-        .is_ok());
-        assert!(ReviewReceipt {
-            changed_files: vec![ChangedFile {
-                path: "../secret".into(),
-                summary: "x".into()
-            }],
-            diff: String::new(),
-            diff_truncated: false,
-            fingerprint: "fp".into(),
-        }
-        .validate()
-        .is_err());
+        assert!(
+            Bounds {
+                max_rounds: Some(25),
+                ..Bounds::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RunEvent {
+                seq: 1,
+                ts: "2026-01-01T00:00:00Z".into(),
+                update: serde_json::json!({"text": "x"}),
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ReviewReceipt {
+                changed_files: vec![ChangedFile {
+                    path: "../secret".into(),
+                    summary: "x".into()
+                }],
+                diff: String::new(),
+                diff_truncated: false,
+                fingerprint: "fp".into(),
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

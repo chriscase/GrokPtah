@@ -7,18 +7,27 @@
  */
 
 import {
+  externalWorkerAdmissionCovers,
+  isExternalWorkerAdmissionLive,
+  parseExternalWorkerAdmission,
   parseExternalWorkerArtifact,
   parseExternalWorkerFollowUpRequest,
   parseExternalWorkerLaunchRequest,
   parseExternalWorkerLaunchResult,
+  parseExternalWorkerReceipt,
   parseExternalWorkerRecord,
   parseExternalWorkerRunRecord,
+  type ExternalWorkerAdmission,
   type ExternalWorkerArtifact,
   type ExternalWorkerFollowUpRequest,
   type ExternalWorkerLaunchRequest,
   type ExternalWorkerLaunchResult,
+  type ExternalWorkerMutation,
+  type ExternalWorkerReceipt,
   type ExternalWorkerRecord,
   type ExternalWorkerRunRecord,
+  type ExternalWorkerScope,
+  type ExternalWorkerTarget,
 } from "./externalWorker";
 
 export type GrokPtahBrokerCapability = {
@@ -573,23 +582,33 @@ export class GrokPtahBrokerClient {
     return run;
   }
 
-  /** Launch an isolated external coding worker through the trusted broker. */
+  /**
+   * Launch an isolated external coding worker through the trusted broker.
+   *
+   * The host-minted `admission` is mandatory. The client checks only that the
+   * ticket is well formed, live, and scoped to this exact intent; the broker
+   * revalidates it against its own mint ledger and is the sole authority.
+   */
   async launchExternalWorker(
     bindingId: string,
     request: ExternalWorkerLaunchRequest,
+    admission: ExternalWorkerAdmission,
+    scope: ExternalWorkerScope,
     idempotencyKey: string,
-  ): Promise<ExternalWorkerLaunchResult> {
+  ): Promise<ExternalWorkerAdmittedResult<ExternalWorkerLaunchResult>> {
     if (parseExternalWorkerLaunchRequest(request) === null) {
       throw new GrokPtahBrokerError(0, "invalid_request", "External worker launch request is invalid");
     }
     if (request.requestId !== idempotencyKey) {
       throw new GrokPtahBrokerError(0, "invalid_request", "External worker requestId must match Idempotency-Key");
     }
-    const result = await this.requestValidated(
+    requireAdmission(admission, "launch", scope, idempotencyKey);
+    const envelope = await this.requestValidated(
       `/bindings/${segment(bindingId)}/external-workers`,
-      parseExternalWorkerLaunchResult,
-      { method: "POST", idempotencyKey, body: request },
+      admittedParser(parseExternalWorkerLaunchResult),
+      { method: "POST", idempotencyKey, body: { admission, request } },
     );
+    const result = envelope.value;
     if (
       result.worker.externalAgentId !== result.run.externalAgentId ||
       result.worker.repository !== request.repository ||
@@ -597,7 +616,8 @@ export class GrokPtahBrokerClient {
     ) {
       throw new GrokPtahBrokerError(0, "invalid_response", "External worker launch does not match the request");
     }
-    return result;
+    requireReceipt(envelope.receipt, admission, "launch");
+    return envelope;
   }
 
   /** Queue a bounded follow-up run on an existing external worker. */
@@ -605,23 +625,28 @@ export class GrokPtahBrokerClient {
     bindingId: string,
     externalAgentId: string,
     request: ExternalWorkerFollowUpRequest,
+    admission: ExternalWorkerAdmission,
+    scope: ExternalWorkerScope,
     idempotencyKey: string,
-  ): Promise<ExternalWorkerRunRecord> {
+  ): Promise<ExternalWorkerAdmittedResult<ExternalWorkerRunRecord>> {
     if (parseExternalWorkerFollowUpRequest(request) === null) {
       throw new GrokPtahBrokerError(0, "invalid_request", "External worker follow-up request is invalid");
     }
     if (request.requestId !== idempotencyKey) {
       throw new GrokPtahBrokerError(0, "invalid_request", "External worker requestId must match Idempotency-Key");
     }
+    requireAdmission(admission, "follow_up", scope, idempotencyKey, { externalAgentId });
     const worker = await this.getExternalWorker(bindingId, externalAgentId);
     if (["unknown", "failed", "cancelled", "archived"].includes(worker.state)) {
       throw new GrokPtahBrokerError(0, "invalid_request", "External worker is not eligible for follow-up");
     }
-    return this.requestValidated(
+    const envelope = await this.requestValidated(
       `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/runs`,
-      parseExternalWorkerRunRecord,
-      { method: "POST", idempotencyKey, body: request },
+      admittedParser(parseExternalWorkerRunRecord),
+      { method: "POST", idempotencyKey, body: { admission, request } },
     );
+    requireReceipt(envelope.receipt, admission, "follow_up");
+    return envelope;
   }
 
   /** Read a redacted external-worker identity from the broker. */
@@ -670,17 +695,36 @@ export class GrokPtahBrokerClient {
     bindingId: string,
     externalAgentId: string,
     externalRunId: string,
+    admission: ExternalWorkerAdmission,
+    scope: ExternalWorkerScope,
     idempotencyKey: string,
-  ): Promise<ExternalWorkerRunRecord> {
-    const result = await this.requestValidated(
+  ): Promise<ExternalWorkerAdmittedResult<ExternalWorkerRunRecord>> {
+    requireAdmission(admission, "cancel", scope, idempotencyKey, {
+      externalAgentId,
+      externalRunId,
+    });
+    const envelope = await this.requestValidated(
       `/bindings/${segment(bindingId)}/external-workers/${segment(externalAgentId)}/runs/${segment(externalRunId)}/cancel`,
-      parseExternalWorkerRunRecord,
-      { method: "POST", idempotencyKey },
+      admittedParser(parseExternalWorkerRunRecord),
+      { method: "POST", idempotencyKey, body: { admission } },
     );
-    if (result.state !== "cancelled") {
+    if (envelope.value.state !== "cancelled") {
       throw new GrokPtahBrokerError(0, "invalid_response", "External worker cancellation was not terminal");
     }
-    return result;
+    requireReceipt(envelope.receipt, admission, "cancel");
+    return envelope;
+  }
+
+  /** Read the durable redacted receipt for one external-worker mutation. */
+  async getExternalWorkerReceipt(
+    bindingId: string,
+    requestId: string,
+  ): Promise<ExternalWorkerReceipt> {
+    return this.requestValidated(
+      `/bindings/${segment(bindingId)}/external-worker-receipts/${segment(requestId)}`,
+      parseExternalWorkerReceipt,
+      {},
+    );
   }
 
   async getRun<T = unknown>(bindingId: string, brokerRunId: string): Promise<T> {
@@ -981,6 +1025,75 @@ export class GrokPtahBrokerClient {
       throw new GrokPtahBrokerError(0, "invalid_response", "Broker response shape is invalid");
     }
     return parsed;
+  }
+}
+
+/** A provider projection plus the durable receipt that authorized it. */
+export type ExternalWorkerAdmittedResult<T> = {
+  value: T;
+  receipt: ExternalWorkerReceipt;
+};
+
+function admittedParser<T>(
+  parser: (value: unknown) => T | null,
+): (value: unknown) => ExternalWorkerAdmittedResult<T> | null {
+  return (value: unknown) => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    if (Object.keys(record).some((key) => key !== "value" && key !== "receipt")) return null;
+    const parsed = parser(record.value);
+    const receipt = parseExternalWorkerReceipt(record.receipt);
+    if (parsed === null || receipt === null) return null;
+    return { value: parsed, receipt };
+  };
+}
+
+/**
+ * Refuse to send a mutation whose ticket does not cover it.
+ *
+ * This is a client-side guard against sending a stale or mis-scoped ticket at
+ * all; the broker still revalidates every field and remains the authority.
+ */
+function requireAdmission(
+  admission: ExternalWorkerAdmission,
+  mutation: ExternalWorkerMutation,
+  scope: ExternalWorkerScope,
+  requestId: string,
+  target?: ExternalWorkerTarget,
+): void {
+  if (parseExternalWorkerAdmission(admission) === null) {
+    throw new GrokPtahBrokerError(0, "invalid_request", "External worker admission is invalid");
+  }
+  if (!isExternalWorkerAdmissionLive(admission, Date.now())) {
+    throw new GrokPtahBrokerError(0, "invalid_request", "External worker admission is expired");
+  }
+  if (!externalWorkerAdmissionCovers(admission, mutation, scope, requestId, target)) {
+    throw new GrokPtahBrokerError(
+      0,
+      "invalid_request",
+      "External worker admission does not cover this mutation",
+    );
+  }
+}
+
+/** Refuse a response whose receipt does not describe the admitted mutation. */
+function requireReceipt(
+  receipt: ExternalWorkerReceipt,
+  admission: ExternalWorkerAdmission,
+  mutation: ExternalWorkerMutation,
+): void {
+  if (
+    receipt.mutation !== mutation ||
+    receipt.requestId !== admission.requestId ||
+    receipt.admissionId !== admission.admissionId ||
+    receipt.payloadDigest !== admission.payloadDigest ||
+    receipt.state !== "accepted"
+  ) {
+    throw new GrokPtahBrokerError(
+      0,
+      "invalid_response",
+      "External worker receipt does not prove the admitted mutation",
+    );
   }
 }
 

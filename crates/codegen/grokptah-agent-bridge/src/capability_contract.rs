@@ -6,6 +6,7 @@
 
 pub use grokptah_agent_sdk::{
     CapabilityAvailability, CapabilityDescriptor, CapabilitySet, CapabilityTier,
+    ExternalWorkerCapabilityStatus,
 };
 
 /// Version of the capability-discovery payload.
@@ -20,6 +21,27 @@ use crate::orchestration::CONTROL_TOOLS;
 /// Availability remains separate from authorization; promotion and Computer
 /// Use control are still advertised as gated.
 pub fn advertised_capabilities() -> CapabilitySet {
+    advertised_capabilities_with_external_workers(&[])
+}
+
+/// Stable identifier for redacted external-worker observation.
+pub const EXTERNAL_WORKER_OBSERVE_CAPABILITY: &str = "worker.external.observe";
+/// Stable identifier for admitted external-worker mutations.
+pub const EXTERNAL_WORKER_EXECUTE_CAPABILITY: &str = "worker.external.execute";
+
+/// Build the advertised set, including external workers when they are real.
+///
+/// The external-worker rows are derived from observed adapter truth rather
+/// than from configuration intent: `report` comes from the authority, which
+/// computes registration, reachability, contract compatibility, and policy for
+/// each installed provider identity. If no installed identity satisfies all
+/// four, neither row is advertised at all — a consumer is never told that an
+/// external-worker mutation exists when no adapter could actually perform one.
+/// The mutating row is additionally `Gated`: advertising it is not authority,
+/// and a host-minted admission is still required per mutation.
+pub fn advertised_capabilities_with_external_workers(
+    report: &[ExternalWorkerCapabilityStatus],
+) -> CapabilitySet {
     let has = |tool: &str| CONTROL_TOOLS.contains(&tool);
     let mut capabilities = Vec::new();
 
@@ -135,6 +157,31 @@ pub fn advertised_capabilities() -> CapabilitySet {
         });
     }
 
+    if report
+        .iter()
+        .any(ExternalWorkerCapabilityStatus::is_available)
+    {
+        capabilities.push(CapabilityDescriptor {
+            id: EXTERNAL_WORKER_OBSERVE_CAPABILITY.into(),
+            tier: CapabilityTier::Observe,
+            mutating: false,
+            human_gate: false,
+            availability: CapabilityAvailability::Available,
+            description: "Read redacted external cloud worker, run, and receipt projections."
+                .into(),
+        });
+        capabilities.push(CapabilityDescriptor {
+            id: EXTERNAL_WORKER_EXECUTE_CAPABILITY.into(),
+            tier: CapabilityTier::Execute,
+            mutating: true,
+            human_gate: true,
+            availability: CapabilityAvailability::Gated,
+            description: "Launch, follow up, or cancel an isolated external worker under a \
+                 host-minted scope-bound admission."
+                .into(),
+        });
+    }
+
     CapabilitySet {
         contract: CAPABILITY_CONTRACT_VERSION.into(),
         capabilities,
@@ -162,6 +209,45 @@ mod tests {
         );
     }
 
+    fn status(available: bool) -> ExternalWorkerCapabilityStatus {
+        ExternalWorkerCapabilityStatus {
+            provider: grokptah_agent_sdk::ExternalWorkerProvider::CursorCloud,
+            provider_id: None,
+            registered: true,
+            reachable: available,
+            version_compatible: true,
+            policy_allowed: true,
+            capability_revision: 1,
+            reason: (!available).then(|| "adapter did not answer a probe".to_string()),
+        }
+    }
+
+    #[test]
+    fn external_worker_rows_appear_only_when_an_adapter_is_truly_available() {
+        let without = advertised_capabilities();
+        assert!(without.get(EXTERNAL_WORKER_OBSERVE_CAPABILITY).is_none());
+        assert!(without.get(EXTERNAL_WORKER_EXECUTE_CAPABILITY).is_none());
+        assert!(without.is_current());
+
+        let unavailable = advertised_capabilities_with_external_workers(&[status(false)]);
+        assert!(unavailable
+            .get(EXTERNAL_WORKER_EXECUTE_CAPABILITY)
+            .is_none());
+
+        let available =
+            advertised_capabilities_with_external_workers(&[status(false), status(true)]);
+        let execute = available
+            .get(EXTERNAL_WORKER_EXECUTE_CAPABILITY)
+            .expect("an available adapter advertises the mutating row");
+        assert!(execute.mutating);
+        assert!(execute.human_gate);
+        assert_eq!(execute.availability, CapabilityAvailability::Gated);
+        let observe = available
+            .get(EXTERNAL_WORKER_OBSERVE_CAPABILITY)
+            .expect("observation is advertised alongside it");
+        assert!(!observe.mutating);
+        assert!(available.is_current(), "the set stays well formed");
+    }
     #[test]
     fn capability_payload_is_json_round_trippable() {
         let set = advertised_capabilities();

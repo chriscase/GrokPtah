@@ -49,45 +49,157 @@ describe("GrokPtahBrokerClient", () => {
     expect(fetcher.mock.calls[0][1]?.headers).not.toHaveProperty("Authorization");
   });
 
-  it("launches an isolated external worker through the broker without credentials", async () => {
-    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({
-      worker: {
+  const DIGEST = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  const scope = {
+    principalId: "principal-1",
+    sessionId: "session-1",
+    workspace: "grokptah-main",
+    runId: "run-1",
+  };
+
+  function admission(overrides: Record<string, unknown> = {}) {
+    const now = Date.now();
+    return {
+      contract: "grokptah.external-workers.v1",
+      admissionId: "adm-1",
+      nonce: "nonce-1",
+      requestId: "request-1",
+      scope,
+      mutation: "launch",
+      provider: "cursor_cloud",
+      capabilityRevision: 1,
+      issuedAtMs: now - 1_000,
+      expiresAtMs: now + 60_000,
+      payloadDigest: DIGEST,
+      ...overrides,
+    } as never;
+  }
+
+  function launchBody() {
+    return {
+      requestId: "request-1",
+      provider: "cursor_cloud" as const,
+      repository: "org/repo",
+      startingRef: "main",
+      prompt: "Review the exact candidate",
+      executionMode: "isolated" as const,
+      autoCreatePr: false,
+    };
+  }
+
+  function admittedLaunchResponse(receiptOverrides: Record<string, unknown> = {}) {
+    return jsonResponse({
+      value: {
+        worker: {
+          provider: "cursor_cloud",
+          externalAgentId: "agent-1",
+          repository: "org/repo",
+          startingRef: "main",
+          state: "running",
+          createdAt: "2026-08-24T00:00:00Z",
+          updatedAt: "2026-08-24T00:00:00Z",
+        },
+        run: {
+          externalAgentId: "agent-1",
+          externalRunId: "run-1",
+          state: "running",
+          lastSeq: 0,
+          createdAt: "2026-08-24T00:00:00Z",
+          updatedAt: "2026-08-24T00:00:00Z",
+        },
+      },
+      receipt: {
+        contract: "grokptah.external-workers.v1",
+        requestId: "request-1",
+        admissionId: "adm-1",
+        mutation: "launch",
+        scope,
         provider: "cursor_cloud",
-        externalAgentId: "agent-1",
-        repository: "org/repo",
-        startingRef: "main",
-        state: "running",
-        createdAt: "2026-08-24T00:00:00Z",
-        updatedAt: "2026-08-24T00:00:00Z",
+        providerRequestId: "ewp-stable",
+        attempt: 1,
+        state: "accepted",
+        target: { externalAgentId: "agent-1", externalRunId: "run-1" },
+        payloadDigest: DIGEST,
+        reason: "provider accepted the admitted mutation",
+        createdAtMs: 1_000,
+        updatedAtMs: 2_000,
+        ...receiptOverrides,
       },
-      run: {
-        externalAgentId: "agent-1",
-        externalRunId: "run-1",
-        state: "running",
-        lastSeq: 0,
-        createdAt: "2026-08-24T00:00:00Z",
-        updatedAt: "2026-08-24T00:00:00Z",
-      },
-    }));
+    });
+  }
+
+  it("launches an isolated external worker under a host-minted admission", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(admittedLaunchResponse());
     const client = new GrokPtahBrokerClient({
       baseUrl: "https://contextdesk.example",
       fetcher,
       csrfToken: "csrf-1",
     });
-    const result = await client.launchExternalWorker("binding-1", {
-      requestId: "request-1",
-      provider: "cursor_cloud",
-      repository: "org/repo",
-      startingRef: "main",
-      prompt: "Review the exact candidate",
-      executionMode: "isolated",
-      autoCreatePr: false,
-    }, "request-1");
-    expect(result.run.externalRunId).toBe("run-1");
+    const result = await client.launchExternalWorker(
+      "binding-1",
+      launchBody(),
+      admission(),
+      scope,
+      "request-1",
+    );
+    expect(result.value.run.externalRunId).toBe("run-1");
+    expect(result.receipt.state).toBe("accepted");
     expect(String(fetcher.mock.calls[0][0])).toBe(
       "https://contextdesk.example/api/grokptah/v1/bindings/binding-1/external-workers",
     );
+    expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body))).toMatchObject({
+      admission: { nonce: "nonce-1", mutation: "launch" },
+    });
     expect(fetcher.mock.calls[0][1]?.headers).not.toHaveProperty("Authorization");
+  });
+
+  it("never sends a mutation whose admission is missing, stale, or mis-scoped", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(admittedLaunchResponse());
+    const client = new GrokPtahBrokerClient({
+      baseUrl: "https://contextdesk.example",
+      fetcher,
+      csrfToken: "csrf-1",
+    });
+    const now = Date.now();
+    const rejected: Array<[string, unknown]> = [
+      ["malformed", admission({ payloadDigest: "not-a-digest" })],
+      ["expired", admission({ issuedAtMs: now - 120_000, expiresAtMs: now - 1 })],
+      ["wrong mutation", admission({ mutation: "cancel" })],
+      ["wrong principal", admission({ scope: { ...scope, principalId: "principal-2" } })],
+      ["wrong workspace", admission({ scope: { ...scope, workspace: "grokptah-other" } })],
+      ["wrong run", admission({ scope: { ...scope, runId: "run-2" } })],
+      ["wrong request id", admission({ requestId: "request-2" })],
+      ["over-scoped target", admission({ target: { externalAgentId: "agent-1" } })],
+    ];
+    for (const [label, ticket] of rejected) {
+      await expect(
+        client.launchExternalWorker("binding-1", launchBody(), ticket as never, scope, "request-1"),
+        `${label} must fail closed`,
+      ).rejects.toThrow();
+    }
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("rejects an admitted response whose receipt does not prove the mutation", async () => {
+    for (const override of [
+      { state: "uncertain" },
+      { mutation: "cancel" },
+      { payloadDigest: "sha256:" + "f".repeat(64) },
+      { admissionId: "adm-other" },
+      { reason: "wrote /Users/dev/out.json" },
+    ]) {
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(admittedLaunchResponse(override));
+      const client = new GrokPtahBrokerClient({
+        baseUrl: "https://contextdesk.example",
+        fetcher,
+        csrfToken: "csrf-1",
+      });
+      await expect(
+        client.launchExternalWorker("binding-1", launchBody(), admission(), scope, "request-1"),
+      ).rejects.toThrow();
+    }
   });
 
   it("fails closed when a typed binding or run envelope is malformed", async () => {
