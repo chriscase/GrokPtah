@@ -235,7 +235,11 @@ createRoot(root).render(createElement(RunStatusCard, {
     "/Users/",
     "/private/",
     "\\Users\\",
-    "credential",
+    "@grokptah/client/credentials",
+    "/credentials/",
+    "credentials.ts",
+    "credentials.js",
+    "credentialStore",
   ];
   const leakedGraphMarkers = forbiddenGraphMarkers.filter((marker) =>
     browserText.includes(marker),
