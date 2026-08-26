@@ -74,6 +74,8 @@ pub struct OrchestrationService {
     scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Join handles for in-flight runs (prevents forget + unbounded leaks).
     join_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Host HMAC key. Absence fail-closes provider-bound admission.
+    authority_key: Mutex<Option<std::sync::Arc<super::authority::AuthorityKey>>>,
 }
 
 /// Authorized bounds for a live run event stream.
@@ -234,12 +236,135 @@ impl OrchestrationService {
             admission.facts().map(|facts| facts.truth.provider.as_str()),
             None,
         );
+        self.seal_provider_attempt(&attempt, run)?;
         self.store.open_attempt(&attempt).map_err(|error| {
             OrchError::new(
                 OrchErrorCode::Internal,
                 format!("could not record the provider attempt: {error}"),
             )
         })
+    }
+
+    fn seal_provider_attempt(
+        &self,
+        attempt: &grokptah_agent_sdk::attempt::ProviderAttempt,
+        run: &RunRecord,
+    ) -> Result<(), OrchError> {
+        let key = self.authority_key.lock().clone().ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Unauthenticated,
+                "host authority key is absent",
+            )
+        })?;
+        let ids = vec![
+            super::ClassifiedId::new(
+                super::IdentityClass::Request,
+                attempt.intent.request_id.as_str(),
+            )
+            .map_err(|_| {
+                OrchError::new(OrchErrorCode::InvalidRequest, "request identity is invalid")
+            })?,
+            super::ClassifiedId::new(
+                super::IdentityClass::Work,
+                format!("work-{}", attempt.ordinal),
+            )
+            .map_err(|_| {
+                OrchError::new(OrchErrorCode::InvalidRequest, "work identity is invalid")
+            })?,
+            super::ClassifiedId::new(super::IdentityClass::Run, attempt.run_id.as_str()).map_err(
+                |_| OrchError::new(OrchErrorCode::InvalidRequest, "run identity is invalid"),
+            )?,
+            super::ClassifiedId::new(super::IdentityClass::Attempt, attempt.attempt_id.as_str())
+                .map_err(|_| {
+                    OrchError::new(OrchErrorCode::InvalidRequest, "attempt identity is invalid")
+                })?,
+            super::ClassifiedId::new(
+                super::IdentityClass::Lease,
+                format!("lease:{}", attempt.ordinal),
+            )
+            .map_err(|_| {
+                OrchError::new(OrchErrorCode::InvalidRequest, "lease identity is invalid")
+            })?,
+            super::ClassifiedId::new(
+                super::IdentityClass::ProviderRequest,
+                attempt.intent.provider_idempotency_key.as_str(),
+            )
+            .map_err(|_| {
+                OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "provider-request identity is invalid",
+                )
+            })?,
+        ];
+        let verified = super::mint_provider_run_envelope(
+            key.as_ref(),
+            super::ProviderRunMint {
+                principal: attempt
+                    .subject
+                    .principal
+                    .as_ref()
+                    .map(|id| id.as_str())
+                    .unwrap_or("principal-absent"),
+                tenant: attempt
+                    .subject
+                    .tenant
+                    .as_ref()
+                    .map(|id| id.as_str())
+                    .unwrap_or("tenant-absent"),
+                project: attempt
+                    .subject
+                    .project
+                    .as_ref()
+                    .map(|id| id.as_str())
+                    .unwrap_or("project-absent"),
+                workspace: attempt.subject.workspace.as_str(),
+                session: attempt.subject.session.as_str(),
+                agent: run.agent_id.as_deref(),
+                provider: attempt.route.provider.as_str(),
+                profile: attempt
+                    .route
+                    .profile
+                    .as_ref()
+                    .map(|id| id.as_str())
+                    .unwrap_or("profile-default"),
+                endpoint_fingerprint: "ep-fp-host",
+                model: attempt.route.model.value.as_str(),
+                effort: attempt.route.effort.as_ref().map(|id| id.as_str()),
+                identities: ids,
+                intent_digest: attempt.intent.digest.as_str(),
+                bounds: super::ExecutionBounds {
+                    max_duration_ms: run.bounds.max_duration_ms,
+                    max_rounds: run.bounds.max_rounds,
+                    max_tokens: 0,
+                    max_cost_cents: 0,
+                    max_tools: 0,
+                },
+            },
+        )
+        .map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Unauthenticated,
+                format!("authority envelope failed: {}", error.as_str()),
+            )
+        })?;
+        let _grant = verified.grant().map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                format!("grant derivation failed: {}", error.as_str()),
+            )
+        })?;
+        let projection = verified
+            .project_public(super::public_send_state(attempt.send_state))
+            .map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    format!("public authority projection failed: {}", error.as_str()),
+                )
+            })?;
+        self.store
+            .save_authority_projection(&run.run_id, &projection)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(())
     }
 }
 
@@ -457,6 +582,13 @@ impl OrchestrationService {
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
             scheduler_watcher: Mutex::new(None),
             join_handles: Mutex::new(Vec::new()),
+            authority_key: Mutex::new(
+                super::authority::AuthorityKey::load_or_provision(
+                    &crate::discover::grokptah_home().join("authority.key"),
+                )
+                .ok()
+                .map(std::sync::Arc::new),
+            ),
         });
         service.start_scheduler_watcher();
         service
@@ -1132,8 +1264,25 @@ impl OrchestrationService {
 
     fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
-        serde_json::to_value(run)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
+        let mut value = serde_json::to_value(&run)
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        if let Ok(Some(authority)) = self.store.load_authority_projection(&run.run_id) {
+            value["authority"] = serde_json::to_value(authority)
+                .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        }
+        if let Ok(attempts) = self.store.list_attempts_for_run(&run.run_id) {
+            if let Some(latest) = attempts.last() {
+                value["sendState"] = serde_json::json!(latest.send_state.as_str());
+                value["attemptId"] = serde_json::json!(latest.attempt_id.as_str());
+                value["providerRequestId"] =
+                    serde_json::json!(latest.intent.provider_idempotency_key.as_str());
+                if latest.send_state.requires_reconciliation() {
+                    value["requiredOperatorAction"] =
+                        serde_json::json!("reconcile_uncertain_dispatch");
+                }
+            }
+        }
+        Ok(value)
     }
 
     pub fn get_progress(

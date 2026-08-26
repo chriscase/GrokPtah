@@ -111,9 +111,51 @@ impl AuthorityKey {
         Err(SpineError::KeyAbsent)
     }
 
+    /// Load an existing host key, or provision one at `path` (mode 0600).
+    pub fn load_or_provision(path: &Path) -> Result<Self, SpineError> {
+        if let Ok(env_path) = std::env::var("GROKPTAH_AUTHORITY_KEY_FILE") {
+            return load_key_file(Path::new(&env_path));
+        }
+        if path.is_file() {
+            return load_key_file(path);
+        }
+        let mut bytes = [0u8; 32];
+        fill_random_bytes(&mut bytes)?;
+        let key = Self::provision("host-default", 1, &bytes)?;
+        write_key_file(path, &key)?;
+        Ok(key)
+    }
+
     fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
+}
+
+fn fill_random_bytes(out: &mut [u8]) -> Result<(), SpineError> {
+    use std::io::Read;
+    let mut file = std::fs::File::open("/dev/urandom").map_err(|_| SpineError::KeyAbsent)?;
+    file.read_exact(out).map_err(|_| SpineError::KeyAbsent)
+}
+
+fn write_key_file(path: &Path, key: &AuthorityKey) -> Result<(), SpineError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| SpineError::KeyAbsent)?;
+    }
+    let body = format!(
+        "id={}\nversion={}\nhex={}\n",
+        key.id(),
+        key.version(),
+        hex_encode(key.as_bytes())
+    );
+    let tmp = path.with_extension("key.tmp");
+    std::fs::write(&tmp, body).map_err(|_| SpineError::KeyAbsent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perm = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&tmp, perm).map_err(|_| SpineError::KeyAbsent)?;
+    }
+    std::fs::rename(&tmp, path).map_err(|_| SpineError::KeyAbsent)
 }
 
 fn load_key_file(path: &Path) -> Result<AuthorityKey, SpineError> {
@@ -587,6 +629,70 @@ impl VerifiedEnvelope {
             .validate()
             .map_err(|_| SpineError::InvalidIdentity)?;
         Ok(projection)
+    }
+}
+
+pub struct ProviderRunMint<'a> {
+    pub principal: &'a str,
+    pub tenant: &'a str,
+    pub project: &'a str,
+    pub workspace: &'a str,
+    pub session: &'a str,
+    pub agent: Option<&'a str>,
+    pub provider: &'a str,
+    pub profile: &'a str,
+    pub endpoint_fingerprint: &'a str,
+    pub model: &'a str,
+    pub effort: Option<&'a str>,
+    pub identities: Vec<ClassifiedId>,
+    pub intent_digest: &'a str,
+    pub bounds: ExecutionBounds,
+}
+
+pub fn mint_provider_run_envelope(
+    key: &AuthorityKey,
+    mint: ProviderRunMint<'_>,
+) -> Result<VerifiedEnvelope, SpineError> {
+    UnverifiedEnvelope {
+        principal: mint.principal.into(),
+        tenant: mint.tenant.into(),
+        project: mint.project.into(),
+        workspace: mint.workspace.into(),
+        session: mint.session.into(),
+        agent: mint.agent.map(str::to_string),
+        provider: mint.provider.into(),
+        profile: mint.profile.into(),
+        endpoint_fingerprint: mint.endpoint_fingerprint.into(),
+        model: mint.model.into(),
+        effort: mint.effort.map(str::to_string),
+        auth_revision: 1,
+        policy_revision: 1,
+        capability_revision: 1,
+        credential_revision: 1,
+        source_revision: 1,
+        bounds: mint.bounds,
+        identities: mint.identities,
+        grant_class: HostGrantClass::ProviderRun,
+        intent_digest: mint.intent_digest.into(),
+        expires_unix: chrono::Utc::now().timestamp().saturating_add(86_400),
+        key_id: String::new(),
+        key_version: 0,
+        envelope_mac_hex: String::new(),
+    }
+    .seal(key)
+}
+
+pub fn public_send_state(
+    state: grokptah_agent_sdk::attempt::SendState,
+) -> grokptah_agent_sdk::authority::PublicSendState {
+    use grokptah_agent_sdk::attempt::SendState;
+    match state {
+        SendState::KnownNotSent => grokptah_agent_sdk::authority::PublicSendState::KnownNotSent,
+        SendState::Sending => grokptah_agent_sdk::authority::PublicSendState::Sending,
+        SendState::Sent => grokptah_agent_sdk::authority::PublicSendState::Sent,
+        SendState::Uncertain => grokptah_agent_sdk::authority::PublicSendState::Uncertain,
+        SendState::Responding => grokptah_agent_sdk::authority::PublicSendState::Responding,
+        SendState::Settled => grokptah_agent_sdk::authority::PublicSendState::Settled,
     }
 }
 

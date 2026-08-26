@@ -9,8 +9,9 @@ mod store;
 mod types;
 
 pub use authority::{
-    AuthorityKey, ClassifiedId, ExecutionBounds, HostGrant, HostGrantClass, IdentityClass,
-    UnverifiedEnvelope, VerifiedEnvelope,
+    mint_provider_run_envelope, public_send_state, AuthorityKey, ClassifiedId, ExecutionBounds,
+    HostGrant, HostGrantClass, IdentityClass, ProviderRunMint, UnverifiedEnvelope,
+    VerifiedEnvelope,
 };
 pub use authz::{canonical_workspace, constant_time_eq, AuthContext, WorkspaceAllowlist};
 pub(crate) use service::apply_run_aggregate;

@@ -95,6 +95,7 @@ impl OrchStore {
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
+        fs::create_dir_all(root.join("authority"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -183,6 +184,48 @@ impl OrchStore {
             .root
             .join("attempts")
             .join(format!("{safe}.json")))
+    }
+
+    fn authority_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(run_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("authority")
+            .join(format!("{safe}.json")))
+    }
+
+    /// Persist the secret-free public authority projection for one run.
+    pub fn save_authority_projection(
+        &self,
+        run_id: &str,
+        projection: &grokptah_agent_sdk::authority::PublicAuthorityProjection,
+    ) -> anyhow::Result<()> {
+        projection
+            .validate()
+            .map_err(|error| anyhow::anyhow!("refusing to persist a leaky projection: {error}"))?;
+        let _g = self.inner.lock.lock();
+        let path = self
+            .authority_path(run_id)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        atomic_write_json(&path, projection)
+    }
+
+    /// Load the public authority projection for one run.
+    pub fn load_authority_projection(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Option<grokptah_agent_sdk::authority::PublicAuthorityProjection>> {
+        let _g = self.inner.lock.lock();
+        let path = match self.authority_path(run_id) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let projection = serde_json::from_str(&fs::read_to_string(&path)?)?;
+        Ok(Some(projection))
     }
 
     fn agent_path(&self, agent_id: &str) -> Result<PathBuf, OrchError> {

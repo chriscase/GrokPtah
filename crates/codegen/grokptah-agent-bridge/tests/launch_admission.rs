@@ -271,6 +271,26 @@ async fn an_admitted_run_records_the_exact_facts_it_was_admitted_on() {
     for needle in ["bearer", "Bearer", "refresh_token", "apiKey", "@"] {
         assert!(!encoded.contains(needle), "run record leaked {needle:?}");
     }
+
+    let public = orch
+        .get_run_scoped(&auth, session_id, workspace.path(), &run_id)
+        .expect("public run projection");
+    assert_eq!(public["authority"]["grantClass"], "provider_run");
+    assert_eq!(public["sendState"], "known_not_sent");
+    assert!(public["providerRequestId"].as_str().is_some());
+    let public_encoded = serde_json::to_string(&public).unwrap();
+    for needle in [
+        "hmac",
+        "mac_key",
+        "GROKPTAH_AUTHORITY_KEY",
+        "/Users/",
+        "hex=",
+    ] {
+        assert!(
+            !public_encoded.contains(needle),
+            "public run leaked {needle:?}: {public_encoded}"
+        );
+    }
     host.stop().unwrap();
 }
 
