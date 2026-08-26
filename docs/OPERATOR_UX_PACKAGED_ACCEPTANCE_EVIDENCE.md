@@ -140,13 +140,14 @@ Lint and Playwright are **not** claimed; neither exists in this desktop package.
 
 | Command | Result |
 | --- | --- |
-| `npx tsc --noEmit` | pending this successor (pass on `297050a1`) |
-| focused Vitest (`operatorConsentPresentation`, `PermissionModal`, `App.operatorUx`) | pending this successor (25/25 on prior head) |
-| `npx vitest run` | pending this successor (50 files / 304 tests on prior head) |
-| `npx vite build` | pending this successor |
-| `npm run verify:public` | pending this successor |
-| `git diff --check` | pending this successor |
-| privacy scan | absence needles only (`/etc/passwd`, `/opt/x`, `src/main.rs`, `git status`, `tok_opaque_9f3a`, bidi/Cf controls, prototype keys). No live credentials. |
+| `npm ci` | pass |
+| `npx tsc --noEmit` | pass (after annotating `parent` as `HTMLElement \| null` in the inert walk) |
+| focused Vitest (`operatorConsentPresentation`, `PermissionModal`, `App.operatorUx`) | 31/31 pass |
+| `npx vitest run` | 50 files / 310 tests pass |
+| `npx vite build` | pass (client production; chunk-size warning only) |
+| `npm run verify:public` | pass (regression only; public bundle + consumer fixture) |
+| `git diff --check` | clean |
+| privacy scan | no live credentials or private identity paths; tests use absence needles only (`/etc/passwd`, `/opt/x`, `src/main.rs`, `git status`, `tok_opaque_9f3a`, bidi/Cf controls, prototype keys, `/Users/secret`) |
 | GitHub `Desktop / desktop` on `297050a1` / `7a094647` | **fail (parent lock residual)** — `Typecheck + unit tests` passed; `Cargo tests (desktop)` failed `cargo test --locked` because `desktop/src-tauri/Cargo.lock` does not record path dep `grokptah-agent-sdk` already present in `grokptah-agent-bridge` at `8ad3be07`. This draft does not alter lockfiles. The unchanged parent lock mismatch remains an inherited hosted blocker. |
 
 JSDOM printed `HTMLCanvasElement.prototype.getContext` when `App.operatorUx.test.tsx` imported `App.tsx` (xterm). Tests still passed. That is not packaged AT.

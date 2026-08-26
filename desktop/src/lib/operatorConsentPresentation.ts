@@ -310,7 +310,7 @@ function ancestorSiblingTargets(layer: HTMLElement): HTMLElement[] {
   const targets: HTMLElement[] = [];
   let node: HTMLElement | null = layer;
   while (node && node !== document.documentElement) {
-    const parent = node.parentElement;
+    const parent: HTMLElement | null = node.parentElement;
     if (!parent) break;
     for (const child of Array.from(parent.children)) {
       if (!(child instanceof HTMLElement)) continue;

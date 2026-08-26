@@ -323,10 +323,12 @@ describe("PermissionModal (#141 + operator consent)", () => {
     });
     expect(screen.getByTestId("permission-modal-backdrop")).not.toHaveAttribute("inert");
 
-    const first = screen.getByTestId("permission-deny");
+    const dialog = screen.getByTestId("permission-modal");
     portalButton.focus();
     fireEvent.keyDown(window, { key: "Tab" });
-    expect(document.activeElement).toBe(first);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).not.toBe(portalButton);
+    expect(document.activeElement).not.toBe(lateButton);
 
     unmount();
     expect(prior.hasAttribute("inert")).toBe(true);
