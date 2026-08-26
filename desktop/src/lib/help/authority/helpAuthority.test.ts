@@ -190,4 +190,28 @@ describe("Help authority executor", () => {
     expect(transport).toHaveBeenCalledOnce();
     expect(executor.activeCount).toBe(0);
   });
+
+  it("caps an overlong absolute deadline at maxDurationMs", async () => {
+    const value = buildHelpAuthorityRequest({
+      requestId: "help-deadline-cap",
+      query: "durable run recovery",
+      results: searchHelpCorpus("durable run recovery", { limit: 1 }).results,
+      provider: PROVIDER,
+      maxDurationMs: 5,
+      deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const transport = vi.fn(
+      (_request: HelpAuthorityRequest, signal: AbortSignal) =>
+        new Promise<unknown>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        }),
+    );
+    const result = await createHelpAuthorityExecutor(transport).execute(value);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.failure).toBe("deadline");
+      expect(result.cleanup.providerTask).toBe("joined");
+      expect(result.cleanup.queueSlot).toBe("released");
+    }
+  });
 });
