@@ -18,6 +18,8 @@ pub enum ErrorCode {
     StaleOrRecovery,
     /// Bounded admission is full.
     Capacity,
+    /// The requested operation is deliberately unavailable on this host.
+    Unsupported,
     /// The desktop authority is asleep, locked, or unavailable.
     AuthorityUnavailable,
     /// Unexpected failure with no privileged detail.
@@ -84,5 +86,18 @@ mod tests {
         let decoded: ErrorEnvelope =
             serde_json::from_value(recovered_value).expect("recovery round-trips");
         assert_eq!(decoded.event_range, recovered.event_range);
+
+        let unsupported = serde_json::to_value(ErrorEnvelope {
+            code: ErrorCode::Unsupported,
+            message: "The operation is unsupported.".into(),
+            request_id: None,
+            reason_code: Some("unsupported".into()),
+            event_range: None,
+        })
+        .expect("unsupported error serializes");
+        assert_eq!(unsupported["code"], "unsupported");
+        let decoded: ErrorEnvelope =
+            serde_json::from_value(unsupported).expect("unsupported error round-trips");
+        assert_eq!(decoded.code, ErrorCode::Unsupported);
     }
 }

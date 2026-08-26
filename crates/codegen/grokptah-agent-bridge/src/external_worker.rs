@@ -539,7 +539,7 @@ struct CursorAgent {
     status: String,
     #[serde(default)]
     repos: Vec<CursorRepo>,
-    #[serde(default)]
+    #[serde(default, rename = "autoCreatePR")]
     auto_create_pr: Option<bool>,
     #[serde(default)]
     work_on_current_branch: Option<bool>,
@@ -994,6 +994,17 @@ mod tests {
         assert_eq!(
             safe_terminal_result("wrote C:\\Users\\alice\\project"),
             None
+        );
+    }
+
+    #[test]
+    fn fake_agent_projection_proves_isolated_write_safety() {
+        let agent: CursorAgent = serde_json::from_value(fake_agent()).unwrap();
+        assert_eq!(agent.auto_create_pr, Some(false));
+        assert_eq!(agent.work_on_current_branch, Some(false));
+        assert_eq!(
+            agent.env.as_ref().map(|env| env.kind.as_str()),
+            Some("cloud")
         );
     }
 
