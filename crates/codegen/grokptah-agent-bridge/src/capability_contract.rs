@@ -11,7 +11,42 @@ pub use grokptah_agent_sdk::{
 /// Version of the capability-discovery payload.
 pub const CAPABILITY_CONTRACT_VERSION: &str = grokptah_agent_sdk::CONTRACT_VERSION;
 
+use sha2::{Digest, Sha256};
+
 use crate::orchestration::CONTROL_TOOLS;
+
+/// Stable digest of the *authorization-relevant* shape of a capability set.
+///
+/// Human approval receipts bind this value, so a receipt issued while
+/// `computer.control` was advertised one way cannot be redeemed after the
+/// advertised authority model changes — a tool appearing or disappearing, a
+/// tier or `mutating` flag moving, or a gate being dropped all invalidate
+/// outstanding receipts.
+///
+/// `description` is deliberately excluded: prose churn is not an authority
+/// change and must not invalidate a human's decision.
+pub fn capability_revision_of(set: &CapabilitySet) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"grokptah.capability.revision.v1\x00");
+    hasher.update(set.contract.as_bytes());
+    for capability in &set.capabilities {
+        hasher.update(b"\x00");
+        hasher.update(capability.id.as_bytes());
+        hasher.update(b"\x00");
+        hasher.update(format!("{:?}", capability.tier).as_bytes());
+        hasher.update(b"\x00");
+        hasher.update([u8::from(capability.mutating)]);
+        hasher.update([u8::from(capability.human_gate)]);
+        hasher.update(b"\x00");
+        hasher.update(format!("{:?}", capability.availability).as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Digest of the set this host currently advertises.
+pub fn capability_revision() -> String {
+    capability_revision_of(&advertised_capabilities())
+}
 
 /// Build the advertised set from the bridge's allowlisted control tools.
 ///
@@ -120,7 +155,12 @@ pub fn advertised_capabilities() -> CapabilitySet {
                 .into(),
         });
     }
-    if has("ptah_authorize_computer_run")
+    // `computer.control` is advertised only when the *whole* gated sequence is
+    // reachable. Advertising control without the approval request/read pair
+    // would describe a human gate a consumer has no way to satisfy.
+    if has("ptah_request_computer_approval")
+        && has("ptah_get_computer_approval")
+        && has("ptah_authorize_computer_run")
         && has("ptah_pause_computer_run")
         && has("ptah_take_over_computer_run")
         && has("ptah_cancel_computer_run")
@@ -131,7 +171,9 @@ pub fn advertised_capabilities() -> CapabilitySet {
             mutating: true,
             human_gate: true,
             availability: CapabilityAvailability::Gated,
-            description: "Use lease- and revision-fenced semantic Computer Use controls.".into(),
+            description: "Spend a host-issued human approval receipt to take lease- and \
+                revision-fenced semantic Computer Use control."
+                .into(),
         });
     }
 
@@ -160,6 +202,43 @@ mod tests {
                 .map(|capability| capability.human_gate),
             Some(true)
         );
+    }
+
+    #[test]
+    fn capability_revision_tracks_authority_not_prose() {
+        let baseline = capability_revision();
+        assert_eq!(baseline.len(), 64);
+        assert!(baseline.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(baseline, capability_revision_of(&advertised_capabilities()));
+
+        let mut reworded = advertised_capabilities();
+        for capability in &mut reworded.capabilities {
+            capability.description = "reworded".into();
+        }
+        assert_eq!(
+            capability_revision_of(&reworded),
+            baseline,
+            "prose churn must not invalidate outstanding human approvals"
+        );
+
+        let mut ungated = advertised_capabilities();
+        for capability in &mut ungated.capabilities {
+            if capability.id == "computer.control" {
+                capability.human_gate = false;
+                capability.availability = CapabilityAvailability::Available;
+            }
+        }
+        assert_ne!(
+            capability_revision_of(&ungated),
+            baseline,
+            "dropping the computer.control human gate must change the revision"
+        );
+
+        let mut narrowed = advertised_capabilities();
+        narrowed
+            .capabilities
+            .retain(|capability| capability.id != "computer.control");
+        assert_ne!(capability_revision_of(&narrowed), baseline);
     }
 
     #[test]

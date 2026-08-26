@@ -58,6 +58,8 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
 ];
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
 const COMPUTER_MUTATION_TOOLS: &[&str] = &[
+    "ptah_request_computer_approval",
+    "ptah_get_computer_approval",
     "ptah_authorize_computer_run",
     "ptah_pause_computer_run",
     "ptah_take_over_computer_run",
@@ -823,6 +825,34 @@ struct ComputerGrantArgs {
     uses_remaining: Option<u32>,
 }
 
+/// Arguments for spending a host-issued approval receipt.
+///
+/// The receipt fields are required by the schema itself, so a client that
+/// omits them is rejected at parse time rather than reaching any code that
+/// could grant control.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComputerAuthorizeArgs {
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    run_id: String,
+    expected_version: u64,
+    action_classes: BTreeSet<crate::computer_use::ActionClass>,
+    ttl_ms: u64,
+    uses_remaining: u32,
+    approval_id: String,
+    approval_nonce: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComputerApprovalReadArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    approval_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ComputerControlArgs {
@@ -1522,13 +1552,14 @@ fn tool_input_schema(name: &str) -> Value {
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500}
             }
         }),
-        "ptah_authorize_computer_run" => json!({
+        "ptah_request_computer_approval" => json!({
             "type": "object",
             "required": [
                 "request_id", "session_id", "workspace", "run_id",
-                "expected_version", "action_classes", "ttl_ms"
+                "expected_version", "action_classes", "ttl_ms", "uses_remaining"
             ],
             "additionalProperties": false,
+            "description": "Ask a human at the trusted host to approve one exact Computer Use control intent. This grants nothing on its own: it returns a pending approval id plus a one-time nonce, and control requires ptah_authorize_computer_run to spend the receipt after a human decides.",
             "properties": {
                 "request_id": req_id,
                 "session_id": session,
@@ -1542,7 +1573,54 @@ fn tool_input_schema(name: &str) -> Value {
                     "items": {"type": "string", "enum": ["semantic", "text_entry"]}
                 },
                 "ttl_ms": {"type": "integer", "minimum": 1, "maximum": 3600000},
-                "uses_remaining": {"type": "integer", "minimum": 1}
+                "uses_remaining": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Finite action budget. A human approves a bounded number of actions; there is no unbounded form."
+                }
+            }
+        }),
+        "ptah_get_computer_approval" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "approval_id"],
+            "additionalProperties": false,
+            "description": "Poll the lifecycle of an approval this same principal and MCP session requested. The one-time nonce is served only by ptah_request_computer_approval and is never re-served here.",
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "approval_id": run_id
+            }
+        }),
+        "ptah_authorize_computer_run" => json!({
+            "type": "object",
+            "required": [
+                "request_id", "session_id", "workspace", "run_id",
+                "expected_version", "action_classes", "ttl_ms", "uses_remaining",
+                "approval_id", "approval_nonce"
+            ],
+            "additionalProperties": false,
+            "description": "Spend a host-issued human approval receipt to take Computer Use control. The receipt is consumed exactly once and every binding is revalidated; requested action classes and bounds may narrow the approved set but never widen it.",
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "run_id": run_id,
+                "expected_version": {"type": "integer", "minimum": 0},
+                "action_classes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": true,
+                    "items": {"type": "string", "enum": ["semantic", "text_entry"]}
+                },
+                "ttl_ms": {"type": "integer", "minimum": 1, "maximum": 3600000},
+                "uses_remaining": {"type": "integer", "minimum": 1},
+                "approval_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "approval_nonce": {
+                    "type": "string",
+                    "minLength": 64,
+                    "maxLength": 64,
+                    "description": "One-time secret returned by ptah_request_computer_approval."
+                }
             }
         }),
         "ptah_pause_computer_run" | "ptah_take_over_computer_run" | "ptah_cancel_computer_run" => {
@@ -1822,6 +1900,21 @@ async fn tools_call(
     }))
 }
 
+/// An initialized MCP session is a *precondition* for every Computer Run
+/// mutation, never a substitute for the `computer.control` human gate: the
+/// approval receipt consumed inside `ptah_authorize_computer_run` is what
+/// actually authorizes control.
+fn require_computer_client(
+    client: Option<&ComputerClientIdentity>,
+) -> Result<&ComputerClientIdentity, OrchError> {
+    client.ok_or_else(|| {
+        OrchError::new(
+            OrchErrorCode::ForbiddenScope,
+            "Computer Run mutations require an initialized MCP client session",
+        )
+    })
+}
+
 async fn dispatch_tool(
     orch: &Arc<OrchestrationService>,
     auth: &crate::orchestration::AuthContext,
@@ -1926,17 +2019,12 @@ async fn dispatch_tool(
             let args: ComputerScopeArgs = parse_value(args)?;
             orch.get_computer_capacity_scoped(auth, args.session_id, &args.workspace)
         }
-        "ptah_authorize_computer_run" => {
+        "ptah_request_computer_approval" => {
             let args: ComputerGrantArgs = parse_value(args)?;
             require_nonempty(&args.request_id, "request_id")?;
             require_nonempty(&args.run_id, "run_id")?;
-            let client = client.ok_or_else(|| {
-                OrchError::new(
-                    OrchErrorCode::ForbiddenScope,
-                    "Computer Run mutations require an initialized MCP client session",
-                )
-            })?;
-            orch.authorize_computer_run_scoped(
+            let client = require_computer_client(client)?;
+            orch.request_computer_approval_scoped(
                 auth,
                 client,
                 &args.request_id,
@@ -1952,16 +2040,51 @@ async fn dispatch_tool(
             )
             .await
         }
+        "ptah_get_computer_approval" => {
+            let args: ComputerApprovalReadArgs = parse_value(args)?;
+            require_nonempty(&args.approval_id, "approval_id")?;
+            let client = require_computer_client(client)?;
+            orch.get_computer_approval_scoped(
+                auth,
+                client,
+                args.session_id,
+                &args.workspace,
+                &args.approval_id,
+            )
+            .await
+        }
+        "ptah_authorize_computer_run" => {
+            let args: ComputerAuthorizeArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.run_id, "run_id")?;
+            require_nonempty(&args.approval_id, "approval_id")?;
+            require_nonempty(&args.approval_nonce, "approval_nonce")?;
+            let client = require_computer_client(client)?;
+            orch.authorize_computer_run_scoped(
+                auth,
+                client,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                &args.run_id,
+                args.expected_version,
+                crate::computer_use::ComputerGrantRequest {
+                    action_classes: args.action_classes,
+                    ttl_ms: args.ttl_ms,
+                    uses_remaining: Some(args.uses_remaining),
+                },
+                &crate::computer_use::ApprovalPresentation {
+                    approval_id: args.approval_id,
+                    nonce: args.approval_nonce,
+                },
+            )
+            .await
+        }
         "ptah_pause_computer_run" => {
             let args: ComputerControlArgs = parse_value(args)?;
             require_nonempty(&args.request_id, "request_id")?;
             require_nonempty(&args.run_id, "run_id")?;
-            let client = client.ok_or_else(|| {
-                OrchError::new(
-                    OrchErrorCode::ForbiddenScope,
-                    "Computer Run mutations require an initialized MCP client session",
-                )
-            })?;
+            let client = require_computer_client(client)?;
             orch.pause_computer_run_scoped(
                 auth,
                 client,
@@ -1977,12 +2100,7 @@ async fn dispatch_tool(
             let args: ComputerControlArgs = parse_value(args)?;
             require_nonempty(&args.request_id, "request_id")?;
             require_nonempty(&args.run_id, "run_id")?;
-            let client = client.ok_or_else(|| {
-                OrchError::new(
-                    OrchErrorCode::ForbiddenScope,
-                    "Computer Run mutations require an initialized MCP client session",
-                )
-            })?;
+            let client = require_computer_client(client)?;
             orch.take_over_computer_run_scoped(
                 auth,
                 client,
@@ -1998,12 +2116,7 @@ async fn dispatch_tool(
             let args: ComputerControlArgs = parse_value(args)?;
             require_nonempty(&args.request_id, "request_id")?;
             require_nonempty(&args.run_id, "run_id")?;
-            let client = client.ok_or_else(|| {
-                OrchError::new(
-                    OrchErrorCode::ForbiddenScope,
-                    "Computer Run mutations require an initialized MCP client session",
-                )
-            })?;
+            let client = require_computer_client(client)?;
             orch.cancel_computer_run_scoped(
                 auth,
                 client,
@@ -2585,35 +2698,43 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .collect();
-        for name in [
+        const DISCOVERABLE_COMPUTER_TOOLS: &[&str] = &[
             "ptah_list_computer_runs",
             "ptah_get_computer_run",
             "ptah_get_computer_run_events",
             "ptah_get_computer_capacity",
+            "ptah_request_computer_approval",
+            "ptah_get_computer_approval",
             "ptah_authorize_computer_run",
             "ptah_pause_computer_run",
             "ptah_take_over_computer_run",
             "ptah_cancel_computer_run",
-        ] {
-            assert!(names.contains(&name), "{name} must be discoverable");
+        ];
+        for name in DISCOVERABLE_COMPUTER_TOOLS {
+            assert!(names.contains(name), "{name} must be discoverable");
         }
         assert!(
-            !names.iter().any(|name| {
-                name.contains("computer")
-                    && ![
-                        "ptah_list_computer_runs",
-                        "ptah_get_computer_run",
-                        "ptah_get_computer_run_events",
-                        "ptah_get_computer_capacity",
-                        "ptah_authorize_computer_run",
-                        "ptah_pause_computer_run",
-                        "ptah_take_over_computer_run",
-                        "ptah_cancel_computer_run",
-                    ]
-                    .contains(name)
-            }),
+            !names.iter().any(
+                |name| name.contains("computer") && !DISCOVERABLE_COMPUTER_TOOLS.contains(name)
+            ),
             "no unapproved computer mutation may be discoverable"
         );
+        // Reachability is not authority: `ptah_request_computer_approval` is
+        // discoverable precisely so a coordinator can *ask*. Control still
+        // requires a receipt spent inside `ptah_authorize_computer_run`.
+        let authorize_schema = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "ptah_authorize_computer_run")
+            .expect("authorize tool is listed")["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(authorize_schema.contains(&"approval_id"));
+        assert!(authorize_schema.contains(&"approval_nonce"));
 
         // Listing is scoped to the session AND the durable workspace binding:
         // the unbound run is invisible even to its own session.

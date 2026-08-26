@@ -445,49 +445,98 @@ export class GrokPtahOperations {
     return this.invoke<T>("ptah_get_computer_capacity", scopeArgs(scope));
   }
 
+  /**
+   * Ask a human at the trusted host to approve one exact control intent.
+   *
+   * This grants nothing. It returns a pending approval id plus the one-time
+   * nonce that identifies this caller as the requester; the host serves that
+   * nonce exactly once, here.
+   */
+  async requestComputerApproval<T = unknown>(
+    scope: GrokPtahRunScope,
+    requestId: string,
+    expectedVersion: number,
+    lease: GrokPtahComputerLease,
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAdvertised("computer.control");
+    return this.invoke<T>("ptah_request_computer_approval", {
+      request_id: nonEmpty(requestId, "requestId"),
+      ...scopeArgs(scope),
+      expected_version: expectedVersion,
+      ...validateComputerLease(lease),
+    });
+  }
+
+  /** Poll the lifecycle of an approval this same caller requested. */
+  async getComputerApproval<T = unknown>(
+    scope: GrokPtahScope,
+    approvalId: string,
+  ): Promise<GrokPtahOperationResult<T>> {
+    this.requireAdvertised("computer.control");
+    return this.invoke<T>("ptah_get_computer_approval", {
+      ...scopeArgs(scope),
+      approval_id: nonEmpty(approvalId, "approvalId"),
+    });
+  }
+
+  /**
+   * Take Computer Use control by spending a host-issued approval receipt.
+   *
+   * The receipt is a required argument, not an optional assurance. There is
+   * deliberately no Boolean here: a caller asserting "the gate is satisfied"
+   * is not evidence of anything, and the authority decision belongs to the
+   * host, which re-validates every binding and consumes the receipt exactly
+   * once. The requested lease may narrow what the human approved; it can
+   * never widen it.
+   */
   async authorizeComputerRun<T = unknown>(
     scope: GrokPtahRunScope,
     requestId: string,
     expectedVersion: number,
-    actionClasses: Array<"semantic" | "text_entry">,
-    ttlMs: number,
-    gateSatisfied = false,
+    lease: GrokPtahComputerLease,
+    receipt: GrokPtahApprovalReceipt,
   ): Promise<GrokPtahOperationResult<T>> {
-    this.requireGated("computer.control", gateSatisfied);
+    this.requireAdvertised("computer.control");
     return this.invoke<T>("ptah_authorize_computer_run", {
       request_id: nonEmpty(requestId, "requestId"),
       ...scopeArgs(scope),
       expected_version: expectedVersion,
-      action_classes: actionClasses,
-      ttl_ms: ttlMs,
+      ...validateComputerLease(lease),
+      approval_id: nonEmpty(receipt.approvalId, "receipt.approvalId"),
+      approval_nonce: nonEmpty(receipt.nonce, "receipt.nonce"),
     });
   }
 
+  /**
+   * De-escalating safety controls.
+   *
+   * These take no receipt by design. They only ever reduce agent authority,
+   * and making it harder to stop a running agent than to start one would be a
+   * safety regression. The host still applies the lease, revision, and
+   * stale-observation fences, and revokes any outstanding receipt for the run.
+   */
   async pauseComputerRun<T = unknown>(
     scope: GrokPtahRunScope,
     requestId: string,
     expectedVersion: number,
-    gateSatisfied = false,
   ): Promise<GrokPtahOperationResult<T>> {
-    return this.computerControl<T>("ptah_pause_computer_run", scope, requestId, expectedVersion, gateSatisfied);
+    return this.computerControl<T>("ptah_pause_computer_run", scope, requestId, expectedVersion);
   }
 
   async takeOverComputerRun<T = unknown>(
     scope: GrokPtahRunScope,
     requestId: string,
     expectedVersion: number,
-    gateSatisfied = false,
   ): Promise<GrokPtahOperationResult<T>> {
-    return this.computerControl<T>("ptah_take_over_computer_run", scope, requestId, expectedVersion, gateSatisfied);
+    return this.computerControl<T>("ptah_take_over_computer_run", scope, requestId, expectedVersion);
   }
 
   async cancelComputerRun<T = unknown>(
     scope: GrokPtahRunScope,
     requestId: string,
     expectedVersion: number,
-    gateSatisfied = false,
   ): Promise<GrokPtahOperationResult<T>> {
-    return this.computerControl<T>("ptah_cancel_computer_run", scope, requestId, expectedVersion, gateSatisfied);
+    return this.computerControl<T>("ptah_cancel_computer_run", scope, requestId, expectedVersion);
   }
 
   private async computerControl<T>(
@@ -495,9 +544,8 @@ export class GrokPtahOperations {
     scope: GrokPtahRunScope,
     requestId: string,
     expectedVersion: number,
-    gateSatisfied: boolean,
   ): Promise<GrokPtahOperationResult<T>> {
-    this.requireGated("computer.control", gateSatisfied);
+    this.requireAdvertised("computer.control");
     return this.invoke<T>(tool, {
       request_id: nonEmpty(requestId, "requestId"),
       ...scopeArgs(scope),
@@ -536,6 +584,51 @@ export class GrokPtahOperations {
     if (state === "ready") return;
     throw new GrokPtahCapabilityError(id, state === "requires_gate" ? "requires_gate" : "unavailable");
   }
+
+  /**
+   * Assert only that the host advertises the capability.
+   *
+   * Used by the Computer Use control path, where the human gate is proven to
+   * the *server* by a host-issued receipt. A client-side Boolean would add
+   * nothing an attacker could not also set, so there is none: this check
+   * exists to give a clear local error when a host does not expose the
+   * capability at all, never to decide authority.
+   */
+  private requireAdvertised(id: string): void {
+    const capability = findCapability(this.client.capabilities, id);
+    if (capability && capability.availability !== "unavailable") return;
+    throw new GrokPtahCapabilityError(id, "unavailable");
+  }
+}
+
+/** Bounded action lease a human is asked to approve, or a caller narrows to. */
+export type GrokPtahComputerLease = {
+  actionClasses: Array<"semantic" | "text_entry">;
+  ttlMs: number;
+  /** Finite action budget. A human approves a bounded number of actions. */
+  usesRemaining: number;
+};
+
+/** Host-issued receipt material, returned once by requestComputerApproval. */
+export type GrokPtahApprovalReceipt = {
+  approvalId: string;
+  nonce: string;
+};
+
+function validateComputerLease(lease: GrokPtahComputerLease): Record<string, unknown> {
+  if (!Array.isArray(lease.actionClasses) || lease.actionClasses.length === 0) {
+    throw new Error("GrokPtah actionClasses must name at least one class");
+  }
+  for (const value of [lease.ttlMs, lease.usesRemaining]) {
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      throw new Error("GrokPtah computer lease bounds must be positive safe integers");
+    }
+  }
+  return {
+    action_classes: lease.actionClasses,
+    ttl_ms: lease.ttlMs,
+    uses_remaining: lease.usesRemaining,
+  };
 }
 
 function scopeArgs(scope: GrokPtahScope | GrokPtahRunScope): Record<string, unknown> {

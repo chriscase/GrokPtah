@@ -82,6 +82,8 @@ pub fn run() {
             commands::computer_use_cockpit_stage_action,
             commands::computer_use_cockpit_approve,
             commands::computer_use_cockpit_discard_approval,
+            commands::computer_use_pending_control_approvals,
+            commands::computer_use_decide_control_approval,
             commands::computer_use_cockpit_pause,
             commands::computer_use_cockpit_take_over,
             commands::computer_use_cockpit_stop,

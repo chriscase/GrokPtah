@@ -124,8 +124,14 @@ export function findCapability(
 }
 
 /**
- * Return the UI action state. A gated capability is renderable but cannot be
- * invoked until the caller has obtained the required human/lease approval.
+ * Return the UI action state.
+ *
+ * This is a **rendering** decision, not an authorization one. `gateSatisfied`
+ * says whether this surface believes the operator has already answered the
+ * gate, so a button can show "requires approval" instead of failing at
+ * transport. The authority decision belongs to the host: for
+ * `computer.control` it is a host-issued approval receipt the server
+ * re-validates and consumes, and no value passed here can substitute for one.
  */
 export function capabilityActionState(
   capability: CapabilityDescriptor | undefined,

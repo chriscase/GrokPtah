@@ -360,6 +360,12 @@ fn mcp_surface_exposes_only_the_scoped_computer_tools() {
             "ptah_get_computer_run",
             "ptah_get_computer_run_events",
             "ptah_get_computer_capacity",
+            // Deliberate widening: a coordinator must be able to *ask* for the
+            // `computer.control` human gate and watch its lifecycle. Neither
+            // tool grants anything — control still requires a host-issued
+            // receipt spent inside `ptah_authorize_computer_run`.
+            "ptah_request_computer_approval",
+            "ptah_get_computer_approval",
             "ptah_authorize_computer_run",
             "ptah_pause_computer_run",
             "ptah_take_over_computer_run",
@@ -376,6 +382,13 @@ fn mcp_surface_exposes_only_the_scoped_computer_tools() {
         "computer_observe",
         "computer_input",
         "computer_shell",
+        // Deciding an approval is the *human* half of the gate. It lives on
+        // the trusted desktop surface only; no control-plane tool may ever
+        // let a coordinator answer its own request.
+        "decide_computer",
+        "computer_decide",
+        "approve_computer",
+        "grant_computer",
     ] {
         assert!(
             !CONTROL_TOOLS

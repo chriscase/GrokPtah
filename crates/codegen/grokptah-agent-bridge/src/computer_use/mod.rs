@@ -12,6 +12,7 @@
 //! Which runs each surface may list is a separate gate: the cockpit is
 //! session-scoped; coordinator reads take [`ComputerReadBinding`].
 
+mod approval;
 mod control;
 mod macos_observation;
 mod platform;
@@ -23,9 +24,15 @@ mod simulator;
 mod store;
 mod types;
 
+pub use approval::{
+    ApprovalBinding, ApprovalBounds, ApprovalPresentation, ApprovalPrincipal, ApprovalProjection,
+    ApprovalRecord, ApprovalScope, ApprovalState, ApprovalStatus, IssuedApprovalRequest,
+    APPROVAL_CONTRACT_VERSION, APPROVAL_RECEIPT_TTL, APPROVAL_REQUEST_TTL,
+    COMPUTER_CONTROL_CAPABILITY,
+};
 pub use control::{
     ComputerAgentObservation, ComputerClientIdentity, ComputerGrantRequest,
-    ComputerRunAgentController, ComputerRunController,
+    ComputerRunAgentController, ComputerRunController, IssuedApproval,
 };
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{

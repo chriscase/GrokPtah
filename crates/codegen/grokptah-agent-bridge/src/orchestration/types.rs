@@ -785,6 +785,8 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_get_computer_run",
     "ptah_get_computer_run_events",
     "ptah_get_computer_capacity",
+    "ptah_request_computer_approval",
+    "ptah_get_computer_approval",
     "ptah_authorize_computer_run",
     "ptah_pause_computer_run",
     "ptah_take_over_computer_run",

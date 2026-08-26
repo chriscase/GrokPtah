@@ -9,12 +9,15 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use super::approval::{ApprovalRecord, ApprovalState, APPROVAL_CONTRACT_VERSION};
 use super::types::{
     validate_id, validate_workspace, ComputerControlDisposition, ComputerError, ComputerErrorCode,
     ComputerResult, ComputerRun, ComputerRunState,
 };
 
 const MAX_RECEIPTS: usize = 2_048;
+const MAX_APPROVALS: usize = 512;
+const TERMINAL_APPROVAL_AGE: Duration = Duration::days(7);
 const MAX_RECORD_BYTES: u64 = 32 * 1024 * 1024;
 const TERMINAL_RUN_AGE: Duration = Duration::days(30);
 const TERMINAL_RECEIPT_AGE: Duration = Duration::days(7);
@@ -69,6 +72,7 @@ impl ComputerStore {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("runs"))?;
         fs::create_dir_all(root.join("receipts"))?;
+        fs::create_dir_all(root.join("approvals"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -92,6 +96,7 @@ impl ComputerStore {
         };
         store.recover_interrupted()?;
         store.recover_receipts()?;
+        store.recover_approvals()?;
         store.prune_retention()?;
         Ok(store)
     }
@@ -231,6 +236,170 @@ impl ComputerStore {
         atomic_write_json(&path, &receipt).map_err(internal_error)
     }
 
+    // ── Human-approval receipt ledger (`computer.control` gate) ──────────
+    //
+    // This ledger is deliberately separate from the mutation-idempotency
+    // `receipts/` directory above. Those receipts answer "did this request
+    // already run?"; these answer "did a human authorize this exact control
+    // request?" Conflating them would let a retry of an unapproved call
+    // replay into authority.
+
+    /// Persist a freshly created `Pending` request.
+    ///
+    /// Exclusive create: an approval id is never rewritten, so a second
+    /// request can neither overwrite a pending decision nor resurrect a
+    /// consumed receipt.
+    pub(crate) fn create_approval(&self, record: &ApprovalRecord) -> ComputerResult<()> {
+        let _guard = self.inner.lock.lock();
+        validate_approval(record)?;
+        if record.state != ApprovalState::Pending {
+            return Err(invalid_record());
+        }
+        if count_json_files(&self.inner.root.join("approvals")).map_err(internal_error)?
+            >= MAX_APPROVALS
+        {
+            return Err(ComputerError::new(
+                ComputerErrorCode::LimitReached,
+                "computer-use approval ledger is full",
+            ));
+        }
+        let path = self.approval_path(&record.approval_id)?;
+        write_json_exclusive(&path, record).map_err(internal_error)
+    }
+
+    pub(crate) fn load_approval(
+        &self,
+        approval_id: &str,
+    ) -> ComputerResult<Option<ApprovalRecord>> {
+        let _guard = self.inner.lock.lock();
+        self.load_approval_unlocked(approval_id)
+    }
+
+    pub(crate) fn list_approvals(&self) -> ComputerResult<Vec<ApprovalRecord>> {
+        let _guard = self.inner.lock.lock();
+        let mut records = Vec::new();
+        for path in json_paths(&self.inner.root.join("approvals")).map_err(internal_error)? {
+            records.push(self.read_approval_path(&path)?);
+        }
+        records.sort_by(|a, b| b.requested_at.cmp(&a.requested_at));
+        Ok(records)
+    }
+
+    /// Apply a host-owned decision (approve / deny / revoke) under the ledger
+    /// lock and fsync it before returning.
+    pub(crate) fn update_approval<F>(
+        &self,
+        approval_id: &str,
+        update: F,
+    ) -> ComputerResult<ApprovalRecord>
+    where
+        F: FnOnce(&mut ApprovalRecord) -> ComputerResult<()>,
+    {
+        let _guard = self.inner.lock.lock();
+        let mut record = self
+            .load_approval_unlocked(approval_id)?
+            .ok_or_else(super::approval::not_available)?;
+        update(&mut record)?;
+        validate_approval(&record)?;
+        atomic_write_json(&self.approval_path(approval_id)?, &record).map_err(internal_error)?;
+        Ok(record)
+    }
+
+    /// Atomically verify and spend a receipt.
+    ///
+    /// The whole check-and-set runs under the store mutex and the durable
+    /// write is fsynced *before* this returns, so a caller can never act on a
+    /// receipt whose consumption has not already landed. Two concurrent
+    /// consumers of the same receipt therefore serialize: exactly one sees
+    /// `Approved` and wins; the other observes `Consumed` and is refused as a
+    /// replay.
+    pub(crate) fn consume_approval<F>(
+        &self,
+        approval_id: &str,
+        request_id: &str,
+        now: DateTime<Utc>,
+        check: F,
+    ) -> ComputerResult<ApprovalRecord>
+    where
+        F: FnOnce(&ApprovalRecord) -> ComputerResult<()>,
+    {
+        let _guard = self.inner.lock.lock();
+        let mut record = self
+            .load_approval_unlocked(approval_id)?
+            .ok_or_else(super::approval::not_available)?;
+        check(&record)?;
+        record.mark_consumed(request_id, now);
+        validate_approval(&record)?;
+        atomic_write_json(&self.approval_path(approval_id)?, &record).map_err(internal_error)?;
+        Ok(record)
+    }
+
+    fn approval_path(&self, approval_id: &str) -> ComputerResult<PathBuf> {
+        let safe = safe_file_id(approval_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("approvals")
+            .join(format!("{safe}.json")))
+    }
+
+    fn load_approval_unlocked(&self, approval_id: &str) -> ComputerResult<Option<ApprovalRecord>> {
+        let path = self.approval_path(approval_id)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        self.read_approval_path(&path).map(Some)
+    }
+
+    fn read_approval_path(&self, path: &Path) -> ComputerResult<ApprovalRecord> {
+        let record: ApprovalRecord = read_json(path).map_err(internal_error)?;
+        validate_approval(&record)?;
+        if self.approval_path(&record.approval_id)? != path {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Internal,
+                "computer-use approval identity does not match its durable path",
+            ));
+        }
+        Ok(record)
+    }
+
+    /// Restart invalidates live approval authority but preserves the durable
+    /// record of what was already spent.
+    ///
+    /// `recover_interrupted` already clears every run grant on restart, so a
+    /// surviving `Pending`/`Approved` receipt could only ever be redeemed
+    /// against a run the human never saw. Consumed and denied records are
+    /// untouched: their terminal state is exactly the anti-replay fact that
+    /// must survive a restart.
+    fn recover_approvals(&self) -> ComputerResult<()> {
+        let _guard = self.inner.lock.lock();
+        for path in json_paths(&self.inner.root.join("approvals")).map_err(internal_error)? {
+            let mut record = self.read_approval_path(&path)?;
+            if record.revoke() {
+                atomic_write_json(&path, &record).map_err(internal_error)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn prune_approvals(&self, now: DateTime<Utc>) -> ComputerResult<()> {
+        let mut records = Vec::new();
+        for path in json_paths(&self.inner.root.join("approvals")).map_err(internal_error)? {
+            let record = self.read_approval_path(&path)?;
+            records.push((path, record));
+        }
+        records.sort_by(|a, b| b.1.requested_at.cmp(&a.1.requested_at));
+        for (index, (path, record)) in records.into_iter().enumerate() {
+            let terminal = record.state.is_terminal();
+            let expired =
+                terminal && now.signed_duration_since(record.requested_at) > TERMINAL_APPROVAL_AGE;
+            if terminal && (index >= MAX_APPROVALS || expired) {
+                fs::remove_file(path).map_err(internal_error)?;
+            }
+        }
+        Ok(())
+    }
+
     fn run_path(&self, run_id: &str) -> ComputerResult<PathBuf> {
         let safe = safe_file_id(run_id)?;
         Ok(self.inner.root.join("runs").join(format!("{safe}.json")))
@@ -349,6 +518,8 @@ impl ComputerStore {
                 fs::remove_file(path).map_err(internal_error)?;
             }
         }
+
+        self.prune_approvals(now)?;
         Ok(())
     }
 
@@ -463,6 +634,69 @@ fn validate_run_record(run: &ComputerRun) -> ComputerResult<()> {
                     .as_ref()
                     .is_some_and(|id| id.len() > super::types::MAX_ID_BYTES)
         })
+    {
+        return Err(invalid_record());
+    }
+    Ok(())
+}
+
+fn validate_approval(record: &ApprovalRecord) -> ComputerResult<()> {
+    if record.contract != APPROVAL_CONTRACT_VERSION {
+        return Err(invalid_record());
+    }
+    validate_id("approval_id", &record.approval_id)?;
+    validate_id("request_id", &record.request_id)?;
+    if record.nonce_hash.len() != 64
+        || !record
+            .nonce_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || record.request_expires_at <= record.requested_at
+    {
+        return Err(invalid_record());
+    }
+    let shape_is_valid = match record.state {
+        ApprovalState::Pending => {
+            record.issued_at.is_none()
+                && record.expires_at.is_none()
+                && record.consumed_at.is_none()
+        }
+        ApprovalState::Approved => {
+            record.issued_at.is_some()
+                && record
+                    .expires_at
+                    .is_some_and(|expires| record.issued_at.is_some_and(|issued| expires > issued))
+                && record.consumed_at.is_none()
+        }
+        ApprovalState::Denied | ApprovalState::Revoked => record.consumed_at.is_none(),
+        ApprovalState::Consumed => {
+            record.issued_at.is_some()
+                && record.expires_at.is_some()
+                && record.consumed_at.is_some()
+                && record.consumed_by_request_id.is_some()
+        }
+    };
+    if !shape_is_valid {
+        return Err(invalid_record());
+    }
+    if let Some(consumed_by) = &record.consumed_by_request_id {
+        validate_id("consumed_by_request_id", consumed_by)?;
+    }
+    // The binding is re-validated against the record's own limits ceiling at
+    // consumption; here only the shape that the ledger itself depends on is
+    // enforced, so a durable record can never carry an unusable identity.
+    record.binding.principal.validate()?;
+    record.binding.scope.validate()?;
+    if record.binding.capability_id != super::approval::COMPUTER_CONTROL_CAPABILITY
+        || record.binding.capability_revision.len() != 64
+        || !record
+            .binding
+            .capability_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || record.binding.bounds.action_classes.is_empty()
+        || record.binding.bounds.max_uses == 0
+        || record.binding.bounds.max_ttl_ms == 0
     {
         return Err(invalid_record());
     }

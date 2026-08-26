@@ -7,6 +7,11 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::approval::{
+    ApprovalBinding, ApprovalBounds, ApprovalPresentation, ApprovalPrincipal, ApprovalProjection,
+    ApprovalRecord, ApprovalScope, ApprovalStatus, IssuedApprovalRequest,
+    COMPUTER_CONTROL_CAPABILITY,
+};
 use super::policy::ComputerPolicy;
 use super::projection::{
     not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
@@ -236,71 +241,313 @@ impl ComputerUseService {
         result
     }
 
-    /// Authorize a bounded MCP client grant with a stable mutation payload.
+    // ── `computer.control` human-approval gate ───────────────────────────
+    //
+    // There is deliberately **no** un-receipted MCP authorization entry
+    // point. `authorize` above is the local-operator path, reached only from
+    // the trusted host's own cockpit where the operator *is* the human. Every
+    // MCP caller goes through the request → human decision → consume sequence
+    // below: an authenticated transport and an initialized MCP session are
+    // proof of *reachability*, never of approval.
+
+    /// Stage a `Pending` approval request for one exact control intent.
     ///
-    /// The durable receipt must be claimed before server-generated grant
-    /// timestamps and ids are created. Otherwise a retry with the same
-    /// request id would hash differently and be rejected instead of replaying
-    /// the original result.
-    pub fn authorize_mcp_client(
+    /// This grants nothing. The returned nonce is the only copy that ever
+    /// leaves the host; the ledger keeps a digest.
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_control_approval(
         &self,
         request_id: &str,
+        owner_session_id: Uuid,
+        workspace: &str,
         run_id: &str,
         expected_version: u64,
-        client_id: String,
+        principal: ApprovalPrincipal,
+        capability_revision: &str,
+        grant_request: &ComputerGrantRequest,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<IssuedApprovalRequest> {
+        validate_id("run_id", run_id)?;
+        let run = self.scoped_run(owner_session_id, workspace, run_id)?;
+        // The human must be shown a decision about the run as it is now, not a
+        // revision the agent remembers.
+        ensure_version(&run, expected_version)?;
+        grant_request.validate(run.limits)?;
+        let binding = ApprovalBinding {
+            capability_id: COMPUTER_CONTROL_CAPABILITY.into(),
+            capability_revision: capability_revision.to_owned(),
+            principal,
+            scope: ApprovalScope {
+                owner_session_id,
+                workspace: workspace.to_owned(),
+                run_id: run_id.to_owned(),
+                run_version: run.version,
+            },
+            bounds: ApprovalBounds {
+                action_classes: grant_request.action_classes.clone(),
+                max_uses: grant_request.uses_remaining.ok_or_else(|| {
+                    ComputerError::new(
+                        ComputerErrorCode::InvalidRequest,
+                        "a human approval request must name a finite action budget",
+                    )
+                })?,
+                max_ttl_ms: grant_request.ttl_ms,
+            },
+        };
+        let issued = ApprovalRecord::request(request_id, binding, run.limits, now)?;
+        self.store.create_approval(&issued.record)?;
+        let _ = self.store.update_run(run_id, |run| {
+            run.record_audit("request_approval", "pending", None, None, None);
+            Ok(())
+        });
+        Ok(issued)
+    }
+
+    /// Bound read of one approval record.
+    ///
+    /// The caller must present the same principal and scope the record was
+    /// minted for; anything else is indistinguishable from "unknown".
+    pub fn read_control_approval(
+        &self,
+        approval_id: &str,
+        principal: &ApprovalPrincipal,
+        owner_session_id: Uuid,
+        workspace: &str,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<ApprovalProjection> {
+        let record = self
+            .store
+            .load_approval(approval_id)?
+            .filter(|record| {
+                record.binding.principal == *principal
+                    && record.binding.scope.owner_session_id == owner_session_id
+                    && record.binding.scope.workspace == workspace
+            })
+            .ok_or_else(super::approval::not_available)?;
+        Ok(record.project_at(now))
+    }
+
+    /// Local-operator view of the approvals awaiting a decision for one
+    /// session. This is the cockpit gate; it is never served to MCP.
+    pub fn pending_control_approvals(
+        &self,
+        owner_session_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<Vec<ApprovalProjection>> {
+        Ok(self
+            .store
+            .list_approvals()?
+            .into_iter()
+            .filter(|record| {
+                record.binding.scope.owner_session_id == owner_session_id
+                    && record.status_at(now) == ApprovalStatus::Pending
+            })
+            .map(|record| record.project_at(now))
+            .collect())
+    }
+
+    /// Record the trusted host's human decision.
+    ///
+    /// `capability_revision` is re-read here, at decision time, so the
+    /// receipt binds the contract the human actually saw.
+    pub fn decide_control_approval(
+        &self,
+        approval_id: &str,
+        owner_session_id: Uuid,
+        approve: bool,
+        capability_revision: &str,
+        now: DateTime<Utc>,
+    ) -> ComputerResult<ApprovalProjection> {
+        let record = self
+            .store
+            .load_approval(approval_id)?
+            .filter(|record| record.binding.scope.owner_session_id == owner_session_id)
+            .ok_or_else(super::approval::not_available)?;
+        // A decision is only meaningful against the run the human is looking
+        // at; a run that moved since the request must be re-requested.
+        let run = self.store.load_run(&record.binding.scope.run_id)?;
+        if run.is_none_or(|run| run.version != record.binding.scope.run_version) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::StaleObservation,
+                "computer run moved since this approval was requested",
+            ));
+        }
+        let updated = self.store.update_approval(approval_id, |record| {
+            if approve {
+                record.approve(capability_revision, now)
+            } else {
+                record.deny(now)
+            }
+        })?;
+        let _ = self.store.update_run(&updated.binding.scope.run_id, |run| {
+            run.record_audit(
+                "decide_approval",
+                if approve { "approved" } else { "denied" },
+                None,
+                None,
+                None,
+            );
+            Ok(())
+        });
+        Ok(updated.project_at(now))
+    }
+
+    /// Invalidate every un-consumed approval bound to one run.
+    ///
+    /// Pause, takeover, and cancel de-escalate authority, so any receipt a
+    /// human issued against the previous disposition must stop being
+    /// redeemable. Consumed records are untouched.
+    pub fn revoke_control_approvals_for_run(&self, run_id: &str) -> ComputerResult<u32> {
+        let mut revoked = 0;
+        for record in self.store.list_approvals()? {
+            if record.binding.scope.run_id != run_id {
+                continue;
+            }
+            if matches!(
+                record.state,
+                super::approval::ApprovalState::Pending | super::approval::ApprovalState::Approved
+            ) {
+                self.store.update_approval(&record.approval_id, |record| {
+                    record.revoke();
+                    Ok(())
+                })?;
+                revoked += 1;
+            }
+        }
+        Ok(revoked)
+    }
+
+    /// Attach MCP control authority to a run **only** by spending a
+    /// host-issued human approval receipt.
+    ///
+    /// Order matters and is load-bearing:
+    ///
+    /// 1. shape and scope validation, then the idempotency claim;
+    /// 2. the receipt is verified and atomically consumed, fsynced to the
+    ///    ledger *before* this function can return;
+    /// 3. only then is the grant written to the run.
+    ///
+    /// A failure after step 2 burns the receipt without granting anything.
+    /// That is the intended direction: the human re-approves rather than the
+    /// server retrying an approval it cannot prove is still wanted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_with_receipt(
+        &self,
+        request_id: &str,
+        owner_session_id: Uuid,
+        workspace: &str,
+        run_id: &str,
+        expected_version: u64,
+        principal: ApprovalPrincipal,
+        capability_revision: &str,
         grant_request: ComputerGrantRequest,
+        presentation: &ApprovalPresentation,
+        now: DateTime<Utc>,
     ) -> ComputerResult<ComputerRun> {
         validate_id("run_id", run_id)?;
-        validate_id("client_id", &client_id)?;
-        let run = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
+        validate_id("client_id", &principal.client_actor_id)?;
+        presentation.validate()?;
+        let run = self.scoped_run(owner_session_id, workspace, run_id)?;
         grant_request.validate(run.limits)?;
         let payload = json!({
             "runId": run_id,
             "expectedVersion": expected_version,
-            "clientId": client_id,
+            "clientId": principal.client_actor_id,
             "grantRequest": grant_request,
+            "approvalId": presentation.approval_id,
         });
         if let Some(replayed) = self.begin_mutation(request_id, "authorize", &payload)? {
             return replayed;
         }
-        let now = Utc::now();
-        let result = self
-            .store
-            .update_run(run_id, |run| {
-                ensure_version(run, expected_version)?;
-                if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
-                    return Err(ComputerError::new(
-                        ComputerErrorCode::InvalidState,
-                        "operator takeover is absorbing; create a new computer run",
-                    ));
-                }
-                let grant = ActionGrant {
-                    grant_id: format!("mcp-{}", Uuid::new_v4()),
-                    run_id: run.run_id.clone(),
-                    target: run.target.clone(),
-                    action_classes: grant_request.action_classes.clone(),
-                    issued_by: GrantIssuer::McpClient {
-                        client_id: client_id.clone(),
-                    },
-                    issued_at: now,
-                    expires_at: now + Duration::milliseconds(grant_request.ttl_ms as i64),
-                    uses_remaining: grant_request.uses_remaining,
-                    revoked_at: None,
-                };
-                self.policy.authorize_grant(run, &grant, now)?;
-                run.grant = Some(grant);
-                run.last_error = None;
-                run.transition(ComputerRunState::Ready)?;
-                run.set_control_disposition(ComputerControlDisposition::AgentOwned);
-                run.record_audit("authorize", "granted", None, None, None);
-                Ok(())
-            })
-            .and_then(|run| run.ok_or_else(unknown_run));
+
+        let live = ApprovalBinding {
+            capability_id: COMPUTER_CONTROL_CAPABILITY.into(),
+            capability_revision: capability_revision.to_owned(),
+            principal: principal.clone(),
+            scope: ApprovalScope {
+                owner_session_id,
+                workspace: workspace.to_owned(),
+                run_id: run_id.to_owned(),
+                run_version: expected_version,
+            },
+            bounds: ApprovalBounds {
+                action_classes: grant_request.action_classes.clone(),
+                max_uses: grant_request.uses_remaining.unwrap_or(u32::MAX),
+                max_ttl_ms: grant_request.ttl_ms,
+            },
+        };
+
+        let result = (|| {
+            // Fence the run first so a stale caller cannot burn a receipt
+            // that is still good, then spend the receipt before any state
+            // that could authorize input is written.
+            ensure_version(&run, expected_version)?;
+            if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::InvalidState,
+                    "operator takeover is absorbing; create a new computer run",
+                ));
+            }
+            let consumed = self.store.consume_approval(
+                &presentation.approval_id,
+                request_id,
+                now,
+                |record| {
+                    record.check_consumable(presentation, &live, &grant_request, run.version, now)
+                },
+            )?;
+            self.store
+                .update_run(run_id, |run| {
+                    ensure_version(run, expected_version)?;
+                    let grant = ActionGrant {
+                        grant_id: format!("mcp-{}", Uuid::new_v4()),
+                        run_id: run.run_id.clone(),
+                        target: run.target.clone(),
+                        action_classes: grant_request.action_classes.clone(),
+                        issued_by: GrantIssuer::McpClient {
+                            client_id: principal.client_actor_id.clone(),
+                        },
+                        issued_at: now,
+                        expires_at: now + Duration::milliseconds(grant_request.ttl_ms as i64),
+                        uses_remaining: grant_request.uses_remaining,
+                        revoked_at: None,
+                    };
+                    self.policy.authorize_grant(run, &grant, now)?;
+                    run.grant = Some(grant);
+                    run.last_error = None;
+                    run.transition(ComputerRunState::Ready)?;
+                    run.set_control_disposition(ComputerControlDisposition::AgentOwned);
+                    run.record_audit("consume_approval", &consumed.approval_id, None, None, None);
+                    run.record_audit("authorize", "granted", None, None, None);
+                    Ok(())
+                })
+                .and_then(|run| run.ok_or_else(unknown_run))
+        })();
         if let Err(error) = &result {
             self.record_denial(run_id, "authorize", None, error);
         }
         self.finish_mutation(request_id, &result)?;
         result
+    }
+
+    /// Session + workspace binding shared by every approval-gated operation.
+    ///
+    /// Unknown run, cross-session run, and cross-workspace run collapse into
+    /// the same error so the ledger cannot be probed for run existence.
+    fn scoped_run(
+        &self,
+        owner_session_id: Uuid,
+        workspace: &str,
+        run_id: &str,
+    ) -> ComputerResult<ComputerRun> {
+        validate_id("run_id", run_id)?;
+        self.store
+            .load_run(run_id)?
+            .filter(|run| {
+                run.owner_session_id == owner_session_id
+                    && run.workspace.as_deref() == Some(workspace)
+            })
+            .ok_or_else(not_available)
     }
 
     pub async fn observe(

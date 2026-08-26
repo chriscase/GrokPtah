@@ -5,13 +5,15 @@ use async_trait::async_trait;
 use base64::Engine;
 use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
-    canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
+    canonical_workspace_string, capability_revision, ActionClass, ActionGrant, AgentHostHandle,
+    ApprovalPresentation, ApprovalPrincipal, ApprovalProjection, ComputerAction,
     ComputerAgentObservation, ComputerAgentProposal, ComputerCapabilities, ComputerClientIdentity,
     ComputerError, ComputerErrorCode, ComputerGrantRequest, ComputerObservation,
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerRun, ComputerRunAgentController, ComputerRunController,
     ComputerRunProjection, ComputerRunState, ComputerTargetCandidate, ComputerUseLimits,
-    ComputerUseService, GrantIssuer, MacOsObservationPlatform, SemanticAction, SimulatorBackend,
+    ComputerUseService, GrantIssuer, IssuedApproval, MacOsObservationPlatform, SemanticAction,
+    SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -651,6 +653,46 @@ impl DesktopComputerUse {
         self.cockpit_snapshot(owner_session_id)
     }
 
+    // ── Local-operator side of the `computer.control` human gate ─────────
+    //
+    // These are the only ways an approval leaves `Pending`. They are reached
+    // from the trusted desktop surface, where the operator *is* the human; no
+    // MCP tool maps to them, so a coordinator can never decide its own
+    // request.
+
+    /// Approvals this session's operator still has to answer.
+    pub fn pending_control_approvals(
+        &self,
+        owner_session_id: Uuid,
+    ) -> Result<Vec<ApprovalProjection>, String> {
+        let service = self.simulator()?;
+        service
+            .pending_control_approvals(owner_session_id, Utc::now())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Record the operator's decision on one pending approval.
+    ///
+    /// The capability revision is read here, at decision time, so the receipt
+    /// binds the contract the operator was actually shown.
+    pub fn decide_control_approval(
+        &self,
+        owner_session_id: Uuid,
+        approval_id: &str,
+        approve: bool,
+    ) -> Result<ApprovalProjection, String> {
+        let service = self.simulator()?;
+        service
+            .decide_control_approval(
+                approval_id,
+                owner_session_id,
+                approve,
+                &capability_revision(),
+                Utc::now(),
+            )
+            .map_err(|error| error.to_string())
+    }
+
     pub async fn pause_simulator(
         &self,
         owner_session_id: Uuid,
@@ -659,6 +701,9 @@ impl DesktopComputerUse {
     ) -> Result<ComputerCockpitSnapshot, String> {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
+        service
+            .revoke_control_approvals_for_run(run_id)
+            .map_err(|error| error.to_string())?;
         service
             .pause(&Uuid::new_v4().to_string(), run_id, expected_version)
             .await
@@ -675,6 +720,9 @@ impl DesktopComputerUse {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
         service
+            .revoke_control_approvals_for_run(run_id)
+            .map_err(|error| error.to_string())?;
+        service
             .take_over(&Uuid::new_v4().to_string(), run_id, expected_version)
             .await
             .map_err(|error| error.to_string())?;
@@ -688,6 +736,9 @@ impl DesktopComputerUse {
     ) -> Result<ComputerCockpitSnapshot, String> {
         self.clear_pending_for_owner(owner_session_id)?;
         let (service, _) = self.owned_service(owner_session_id, run_id)?;
+        service
+            .revoke_control_approvals_for_run(run_id)
+            .map_err(|error| error.to_string())?;
         service
             .cancel(&Uuid::new_v4().to_string(), run_id)
             .await
@@ -774,25 +825,85 @@ impl DesktopComputerUse {
 
 #[async_trait]
 impl ComputerRunController for DesktopComputerUse {
-    async fn authorize(
+    async fn request_approval(
         &self,
-        client: &ComputerClientIdentity,
+        principal: &ApprovalPrincipal,
         request_id: &str,
         owner_session_id: Uuid,
         workspace: &str,
         run_id: &str,
         expected_version: u64,
+        capability_revision: &str,
         grant_request: ComputerGrantRequest,
+    ) -> Result<IssuedApproval, ComputerError> {
+        let _guard = self.simulator_operation.lock().await;
+        let (service, run) = self.controller_run(owner_session_id, workspace, run_id)?;
+        grant_request.validate(run.limits)?;
+        let now = Utc::now();
+        let issued = service.request_control_approval(
+            request_id,
+            owner_session_id,
+            workspace,
+            run_id,
+            expected_version,
+            principal.clone(),
+            capability_revision,
+            &grant_request,
+            now,
+        )?;
+        Ok(IssuedApproval {
+            approval: issued.record.project_at(now),
+            nonce: issued.nonce,
+        })
+    }
+
+    async fn read_approval(
+        &self,
+        principal: &ApprovalPrincipal,
+        owner_session_id: Uuid,
+        workspace: &str,
+        approval_id: &str,
+    ) -> Result<ApprovalProjection, ComputerError> {
+        let _guard = self.simulator_operation.lock().await;
+        let service = self
+            .simulator()
+            .map_err(|error| ComputerError::new(ComputerErrorCode::BackendUnavailable, error))?;
+        service.read_control_approval(
+            approval_id,
+            principal,
+            owner_session_id,
+            workspace,
+            Utc::now(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn authorize(
+        &self,
+        principal: &ApprovalPrincipal,
+        request_id: &str,
+        owner_session_id: Uuid,
+        workspace: &str,
+        run_id: &str,
+        expected_version: u64,
+        capability_revision: &str,
+        grant_request: ComputerGrantRequest,
+        presentation: &ApprovalPresentation,
     ) -> Result<ComputerRun, ComputerError> {
         let _guard = self.simulator_operation.lock().await;
         let (service, run) = self.controller_run(owner_session_id, workspace, run_id)?;
         grant_request.validate(run.limits)?;
-        service.authorize_mcp_client(
+        service.authorize_with_receipt(
             request_id,
+            owner_session_id,
+            workspace,
             run_id,
             expected_version,
-            client.actor_id(),
+            principal.clone(),
+            capability_revision,
             grant_request,
+            presentation,
+            Utc::now(),
         )
     }
 
@@ -809,6 +920,10 @@ impl ComputerRunController for DesktopComputerUse {
         self.clear_pending_for_owner(owner_session_id)
             .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error))?;
         let (service, _run) = self.controller_run(owner_session_id, workspace, run_id)?;
+        // De-escalation invalidates any receipt a human issued against the
+        // previous disposition: an approval to *act* must not survive the
+        // operator asking the agent to stop.
+        service.revoke_control_approvals_for_run(run_id)?;
         service.pause(request_id, run_id, expected_version).await
     }
 
@@ -825,6 +940,7 @@ impl ComputerRunController for DesktopComputerUse {
         self.clear_pending_for_owner(owner_session_id)
             .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error))?;
         let (service, _run) = self.controller_run(owner_session_id, workspace, run_id)?;
+        service.revoke_control_approvals_for_run(run_id)?;
         service
             .take_over(request_id, run_id, expected_version)
             .await
@@ -843,6 +959,7 @@ impl ComputerRunController for DesktopComputerUse {
         self.clear_pending_for_owner(owner_session_id)
             .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error))?;
         let (service, _run) = self.controller_run(owner_session_id, workspace, run_id)?;
+        service.revoke_control_approvals_for_run(run_id)?;
         service.cancel(request_id, run_id).await
     }
 }

@@ -1142,10 +1142,16 @@ impl OrchestrationService {
         })
     }
 
+    /// Stage a `computer.control` human-approval request.
+    ///
+    /// Reachability is not authority: this call succeeds for any properly
+    /// scoped caller and still grants nothing. The one-time nonce it returns
+    /// is only useful once a human has separately approved the request at the
+    /// trusted host.
     #[allow(clippy::too_many_arguments)]
-    pub async fn authorize_computer_run_scoped(
+    pub async fn request_computer_approval_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         client: &crate::computer_use::ComputerClientIdentity,
         request_id: &str,
         session_id: Uuid,
@@ -1156,15 +1162,84 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         let claimed = self.authorize_computer_scope(session_id, workspace)?;
         let controller = self.computer_controller()?;
-        controller
-            .authorize(
-                client,
+        let principal = approval_principal(auth, client);
+        let issued = controller
+            .request_approval(
+                &principal,
                 request_id,
                 session_id,
                 &claimed,
                 run_id,
                 expected_version,
+                &crate::capability_contract::capability_revision(),
                 grant,
+            )
+            .await
+            .map_err(computer_mutation_error)?;
+        let mut value = serde_json::to_value(&issued.approval)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        // The nonce rides the *creation* response only. `read_approval` never
+        // re-serves it, so a later read of the same record cannot be replayed
+        // into possession of the secret.
+        if let Some(object) = value.as_object_mut() {
+            object.insert("nonce".into(), serde_json::Value::String(issued.nonce));
+        }
+        Ok(value)
+    }
+
+    /// Read one approval the calling principal itself requested.
+    pub async fn get_computer_approval_scoped(
+        &self,
+        auth: &AuthContext,
+        client: &crate::computer_use::ComputerClientIdentity,
+        session_id: Uuid,
+        workspace: &Path,
+        approval_id: &str,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_computer_scope(session_id, workspace)?;
+        let controller = self.computer_controller()?;
+        let principal = approval_principal(auth, client);
+        let projection = controller
+            .read_approval(&principal, session_id, &claimed, approval_id)
+            .await
+            .map_err(computer_mutation_error)?;
+        serde_json::to_value(projection)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    /// Attach Computer Use control authority by spending a host-issued
+    /// human-approval receipt.
+    ///
+    /// The receipt is mandatory. Transport authentication and an initialized
+    /// MCP session get a caller as far as *requesting* approval and no
+    /// further.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn authorize_computer_run_scoped(
+        &self,
+        auth: &AuthContext,
+        client: &crate::computer_use::ComputerClientIdentity,
+        request_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        expected_version: u64,
+        grant: crate::computer_use::ComputerGrantRequest,
+        presentation: &crate::computer_use::ApprovalPresentation,
+    ) -> Result<serde_json::Value, OrchError> {
+        let claimed = self.authorize_computer_scope(session_id, workspace)?;
+        let controller = self.computer_controller()?;
+        let principal = approval_principal(auth, client);
+        controller
+            .authorize(
+                &principal,
+                request_id,
+                session_id,
+                &claimed,
+                run_id,
+                expected_version,
+                &crate::capability_contract::capability_revision(),
+                grant,
+                presentation,
             )
             .await
             .map_err(computer_mutation_error)?;
@@ -3488,6 +3563,19 @@ impl OrchestrationService {
 /// `Unauthorized` covers unknown, cross-session, cross-workspace, unbound, and
 /// traversal-shaped reads with one shared message, so this mapping must stay
 /// single-valued to preserve that indistinguishability on the wire.
+/// Bind the control-plane principal to the MCP transport identity.
+///
+/// Both halves ride into every human-approval receipt: the bearer-token
+/// fingerprint so token rotation invalidates outstanding receipts, and the
+/// transport session so a second client on the same token cannot redeem
+/// another client's approval.
+fn approval_principal(
+    auth: &AuthContext,
+    client: &crate::computer_use::ComputerClientIdentity,
+) -> crate::computer_use::ApprovalPrincipal {
+    client.approval_principal(&auth.token_id, &auth.token_fingerprint)
+}
+
 fn computer_scope_denied() -> OrchError {
     OrchError::new(
         OrchErrorCode::ForbiddenScope,

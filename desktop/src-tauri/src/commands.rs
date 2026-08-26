@@ -339,6 +339,40 @@ pub fn computer_use_cockpit_discard_approval(
         .discard_simulator_approval(computer_owner(&state, &session_id)?)
 }
 
+/// Approvals an MCP coordinator has requested and this operator must answer.
+///
+/// The projection is redaction-safe: it carries the bounds a human is being
+/// asked to grant, never the one-time nonce, the bearer-token fingerprint, or
+/// the requesting transport session.
+#[tauri::command]
+pub fn computer_use_pending_control_approvals(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<grokptah_agent_bridge::ApprovalProjection>, String> {
+    state
+        .computer_use
+        .pending_control_approvals(computer_owner(&state, &session_id)?)
+}
+
+/// Record this operator's decision on one pending `computer.control` request.
+///
+/// This is the human half of the gate. It exists only on the trusted desktop
+/// surface: no MCP tool reaches it, so a coordinator can never approve its own
+/// request.
+#[tauri::command]
+pub fn computer_use_decide_control_approval(
+    state: State<'_, AppState>,
+    session_id: String,
+    approval_id: String,
+    approve: bool,
+) -> Result<grokptah_agent_bridge::ApprovalProjection, String> {
+    state.computer_use.decide_control_approval(
+        computer_owner(&state, &session_id)?,
+        &approval_id,
+        approve,
+    )
+}
+
 #[tauri::command]
 pub async fn computer_use_cockpit_pause(
     state: State<'_, AppState>,

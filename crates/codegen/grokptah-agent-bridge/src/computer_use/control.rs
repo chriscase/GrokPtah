@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::approval::{ApprovalPresentation, ApprovalPrincipal, ApprovalProjection};
 use super::types::{
     ActionClass, ComputerAction, ComputerObservation, ComputerResult, ComputerRun,
     ComputerUseLimits,
@@ -33,6 +34,26 @@ impl ComputerClientIdentity {
             "{}@{}#{}",
             self.client_name, self.client_version, self.transport_session_id
         )
+    }
+
+    /// Combine transport identity with the control-plane principal so a
+    /// human approval receipt is bound to *both*.
+    ///
+    /// Neither half is sufficient on its own: the bearer token says which
+    /// control plane is calling, the transport session says which client
+    /// instance is calling, and only the pair identifies the caller a human
+    /// actually approved.
+    pub fn approval_principal(
+        &self,
+        principal_id: &str,
+        token_fingerprint: &str,
+    ) -> ApprovalPrincipal {
+        ApprovalPrincipal {
+            principal_id: principal_id.to_owned(),
+            token_fingerprint: token_fingerprint.to_owned(),
+            mcp_session_id: self.transport_session_id.clone(),
+            client_actor_id: self.actor_id(),
+        }
     }
 }
 
@@ -68,6 +89,19 @@ impl ComputerGrantRequest {
     }
 }
 
+/// A staged approval request plus the one-time nonce handed to the requester.
+///
+/// The projection is share-safe; the nonce is not. Keep them separate at
+/// every boundary so a redacted read path can never accidentally serve the
+/// secret.
+#[derive(Debug, Clone)]
+pub struct IssuedApproval {
+    /// Redaction-safe record view.
+    pub approval: ApprovalProjection,
+    /// One-time secret. Returned to the requester exactly once.
+    pub nonce: String,
+}
+
 /// A fresh observation plus the durable run fence that must accompany any
 /// proposal derived from it.
 #[derive(Debug, Clone)]
@@ -84,18 +118,60 @@ pub struct ComputerAgentObservation {
 /// fence.
 #[async_trait]
 pub trait ComputerRunController: Send + Sync {
+    /// Stage a human-approval request for one exact control intent.
+    ///
+    /// This is the *only* way an MCP caller reaches the `computer.control`
+    /// gate, and it grants nothing on its own. The returned nonce is the
+    /// caller's one-time proof that it is the same requester; it is issued
+    /// once and never re-served.
     #[allow(clippy::too_many_arguments)]
-    async fn authorize(
+    async fn request_approval(
         &self,
-        client: &ComputerClientIdentity,
+        principal: &ApprovalPrincipal,
         request_id: &str,
         owner_session_id: Uuid,
         workspace: &str,
         run_id: &str,
         expected_version: u64,
+        capability_revision: &str,
         grant: ComputerGrantRequest,
+    ) -> ComputerResult<IssuedApproval>;
+
+    /// Read one approval record the caller itself requested.
+    async fn read_approval(
+        &self,
+        principal: &ApprovalPrincipal,
+        owner_session_id: Uuid,
+        workspace: &str,
+        approval_id: &str,
+    ) -> ComputerResult<ApprovalProjection>;
+
+    /// Attach control authority by spending a host-issued approval receipt.
+    ///
+    /// The receipt is required. A caller-supplied Boolean, an authenticated
+    /// bearer token, and an initialized MCP session are each insufficient,
+    /// individually and together.
+    #[allow(clippy::too_many_arguments)]
+    async fn authorize(
+        &self,
+        principal: &ApprovalPrincipal,
+        request_id: &str,
+        owner_session_id: Uuid,
+        workspace: &str,
+        run_id: &str,
+        expected_version: u64,
+        capability_revision: &str,
+        grant: ComputerGrantRequest,
+        presentation: &ApprovalPresentation,
     ) -> ComputerResult<ComputerRun>;
 
+    /// De-escalating safety controls.
+    ///
+    /// `pause`, `take_over`, and `cancel` deliberately do **not** take an
+    /// approval receipt. They only ever reduce agent authority, and requiring
+    /// a fresh human decision to stop a running agent would be a safety
+    /// regression, not a hardening. They keep the plain transport identity and
+    /// the existing lease / stale-observation fences.
     async fn pause(
         &self,
         client: &ComputerClientIdentity,

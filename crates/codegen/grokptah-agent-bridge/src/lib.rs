@@ -53,8 +53,8 @@ pub use agents_personas::{
     discover_agents, discover_personas, resolve_agent, resolve_persona, AgentDef, PersonaDef,
 };
 pub use capability_contract::{
-    advertised_capabilities, CapabilityAvailability, CapabilityDescriptor, CapabilitySet,
-    CapabilityTier, CAPABILITY_CONTRACT_VERSION,
+    advertised_capabilities, capability_revision, capability_revision_of, CapabilityAvailability,
+    CapabilityDescriptor, CapabilitySet, CapabilityTier, CAPABILITY_CONTRACT_VERSION,
 };
 pub use exec_risk::{assess_shell_risk, peel_transparent_prefixes, RiskReport, RiskTier};
 pub use gateway_config::{
@@ -96,17 +96,21 @@ pub use completion::{
 pub use computer_agent::{ComputerAgentEligibility, ComputerAgentProposal};
 pub use computer_use::{
     canonical_workspace_string, project_run_at, ActionClass, ActionGrant, ActionGrantSummary,
-    ActionOutcome, ActionOutcomeSummary, ComputerAction, ComputerAgentObservation,
-    ComputerAuditEntry, ComputerBackend, ComputerCapabilities, ComputerClientIdentity,
-    ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerErrorSummary,
-    ComputerGrantRequest, ComputerObservation, ComputerObservationPlatform, ComputerPermission,
-    ComputerPermissionStatus, ComputerPlatformStatus, ComputerPolicy, ComputerReadBinding,
-    ComputerRun, ComputerRunAgentController, ComputerRunCapacity, ComputerRunController,
-    ComputerRunEventPage, ComputerRunEventRange, ComputerRunProgress, ComputerRunProjection,
-    ComputerRunReads, ComputerRunState, ComputerScopeCapacity, ComputerStore, ComputerTarget,
+    ActionOutcome, ActionOutcomeSummary, ApprovalBinding, ApprovalBounds, ApprovalPresentation,
+    ApprovalPrincipal, ApprovalProjection, ApprovalRecord, ApprovalScope, ApprovalState,
+    ApprovalStatus, ComputerAction, ComputerAgentObservation, ComputerAuditEntry, ComputerBackend,
+    ComputerCapabilities, ComputerClientIdentity, ComputerControlDisposition, ComputerError,
+    ComputerErrorCode, ComputerErrorSummary, ComputerGrantRequest, ComputerObservation,
+    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus, ComputerPolicy, ComputerReadBinding, ComputerRun,
+    ComputerRunAgentController, ComputerRunCapacity, ComputerRunController, ComputerRunEventPage,
+    ComputerRunEventRange, ComputerRunProgress, ComputerRunProjection, ComputerRunReads,
+    ComputerRunState, ComputerScopeCapacity, ComputerStore, ComputerTarget,
     ComputerTargetCandidate, ComputerTargetSummary, ComputerUseLimits, ComputerUseService,
-    GrantIssuer, MacOsObservationPlatform, ObservationSummary, SemanticAction, SimulatorBackend,
-    DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
+    GrantIssuer, IssuedApproval, IssuedApprovalRequest, MacOsObservationPlatform,
+    ObservationSummary, SemanticAction, SimulatorBackend, APPROVAL_CONTRACT_VERSION,
+    APPROVAL_RECEIPT_TTL, APPROVAL_REQUEST_TTL, COMPUTER_CONTROL_CAPABILITY, DEFAULT_EVENT_PAGE,
+    MAX_EVENT_PAGE,
 };
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,

@@ -138,8 +138,11 @@ async function main() {
   const initialized = await rpc(null, "notifications/initialized", {}, { session: sid });
   check("initialized notification is accepted", initialized.status === 202);
 
-  // Discovery: the four reads plus the explicitly bounded control slice;
-  // observation, action, evidence, and raw-input tools remain absent.
+  // Discovery: the four reads, the human-approval request/read pair, and the
+  // explicitly bounded control slice; observation, action, evidence, and
+  // raw-input tools remain absent. Requesting an approval is reachable and
+  // grants nothing: control still requires a host-issued receipt spent inside
+  // ptah_authorize_computer_run.
   const list = await rpc(2, "tools/list", {}, { session: sid });
   const names = (list.body?.result?.tools ?? []).map((t) => t.name);
   const allowedComputerTools = [
@@ -147,6 +150,8 @@ async function main() {
     "ptah_get_computer_run",
     "ptah_get_computer_run_events",
     "ptah_get_computer_capacity",
+    "ptah_request_computer_approval",
+    "ptah_get_computer_approval",
     "ptah_authorize_computer_run",
     "ptah_pause_computer_run",
     "ptah_take_over_computer_run",
@@ -159,6 +164,16 @@ async function main() {
     "discovery has no unapproved computer tool",
     !names.some((n) => n.includes("computer") && !allowedComputerTools.includes(n)),
     names.join(","),
+  );
+  // The human gate is enforced by the schema itself: control cannot even be
+  // requested without receipt material.
+  const authorizeRequired =
+    (list.body?.result?.tools ?? []).find((t) => t.name === "ptah_authorize_computer_run")
+      ?.inputSchema?.required ?? [];
+  check(
+    "authorize requires host-issued receipt material",
+    authorizeRequired.includes("approval_id") && authorizeRequired.includes("approval_nonce"),
+    authorizeRequired.join(","),
   );
 
   // Scoped listing: both bound runs of this session, never another session's.

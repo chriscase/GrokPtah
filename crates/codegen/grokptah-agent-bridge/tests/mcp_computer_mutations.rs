@@ -13,9 +13,11 @@ use grokptah_agent_bridge::orchestration::{
     OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
-    home_override_serial, set_grokptah_home_override, start_control_server, ActionClass, AgentHost,
+    capability_revision, home_override_serial, set_grokptah_home_override, start_control_server,
+    ActionClass, AgentHost, ApprovalPresentation, ApprovalPrincipal, ApprovalProjection,
     ComputerClientIdentity, ComputerError, ComputerErrorCode, ComputerGrantRequest, ComputerRun,
-    ComputerRunController, ComputerUseLimits, ComputerUseService, HostConfig, SimulatorBackend,
+    ComputerRunController, ComputerUseLimits, ComputerUseService, HostConfig, IssuedApproval,
+    SimulatorBackend,
 };
 use serde_json::{json, Value};
 use tempfile::tempdir;
@@ -50,29 +52,94 @@ impl FixtureController {
     fn record_actor(&self, client: &ComputerClientIdentity) {
         self.actors.lock().unwrap().push(client.actor_id());
     }
+
+    fn record_principal(&self, principal: &ApprovalPrincipal) {
+        self.actors
+            .lock()
+            .unwrap()
+            .push(principal.client_actor_id.clone());
+    }
 }
 
 #[async_trait]
 impl ComputerRunController for FixtureController {
-    async fn authorize(
+    #[allow(clippy::too_many_arguments)]
+    async fn request_approval(
         &self,
-        client: &ComputerClientIdentity,
+        principal: &ApprovalPrincipal,
         request_id: &str,
         owner_session_id: Uuid,
         workspace: &str,
         run_id: &str,
         expected_version: u64,
+        capability_revision: &str,
         grant_request: ComputerGrantRequest,
-    ) -> Result<ComputerRun, ComputerError> {
-        self.record_actor(client);
+    ) -> Result<IssuedApproval, ComputerError> {
+        self.record_principal(principal);
         let run = self.scoped_run(owner_session_id, workspace, run_id)?;
         grant_request.validate(run.limits)?;
-        self.service.authorize_mcp_client(
+        let now = chrono::Utc::now();
+        let issued = self.service.request_control_approval(
             request_id,
+            owner_session_id,
+            workspace,
             run_id,
             expected_version,
-            client.actor_id(),
+            principal.clone(),
+            capability_revision,
+            &grant_request,
+            now,
+        )?;
+        Ok(IssuedApproval {
+            approval: issued.record.project_at(now),
+            nonce: issued.nonce,
+        })
+    }
+
+    async fn read_approval(
+        &self,
+        principal: &ApprovalPrincipal,
+        owner_session_id: Uuid,
+        workspace: &str,
+        approval_id: &str,
+    ) -> Result<ApprovalProjection, ComputerError> {
+        self.record_principal(principal);
+        self.service.read_control_approval(
+            approval_id,
+            principal,
+            owner_session_id,
+            workspace,
+            chrono::Utc::now(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn authorize(
+        &self,
+        principal: &ApprovalPrincipal,
+        request_id: &str,
+        owner_session_id: Uuid,
+        workspace: &str,
+        run_id: &str,
+        expected_version: u64,
+        capability_revision: &str,
+        grant_request: ComputerGrantRequest,
+        presentation: &ApprovalPresentation,
+    ) -> Result<ComputerRun, ComputerError> {
+        self.record_principal(principal);
+        let run = self.scoped_run(owner_session_id, workspace, run_id)?;
+        grant_request.validate(run.limits)?;
+        self.service.authorize_with_receipt(
+            request_id,
+            owner_session_id,
+            workspace,
+            run_id,
+            expected_version,
+            principal.clone(),
+            capability_revision,
             grant_request,
+            presentation,
+            chrono::Utc::now(),
         )
     }
 
@@ -243,7 +310,7 @@ async fn computer_mutations_bind_client_identity_and_preserve_fences() {
         3,
         "tools/call",
         json!({
-            "name":"ptah_authorize_computer_run",
+            "name":"ptah_request_computer_approval",
             "arguments":{
                 "request_id":"no-transport-session",
                 "session_id":session.id,
@@ -251,7 +318,8 @@ async fn computer_mutations_bind_client_identity_and_preserve_fences() {
                 "run_id":run.run_id,
                 "expected_version":run.version,
                 "action_classes":["semantic"],
-                "ttl_ms":60000
+                "ttl_ms":60000,
+                "uses_remaining":1
             }
         }),
     )
@@ -260,6 +328,85 @@ async fn computer_mutations_bind_client_identity_and_preserve_fences() {
         unauthorized_without_session.status(),
         reqwest::StatusCode::FORBIDDEN
     );
+
+    // Requesting approval is reachable for any properly scoped caller and
+    // grants nothing on its own.
+    let requested = rpc(
+        &client,
+        &url,
+        Some(&transport_session),
+        30,
+        "tools/call",
+        json!({
+            "name":"ptah_request_computer_approval",
+            "arguments":{
+                "request_id":"mcp-approval-request-1",
+                "session_id":session.id,
+                "workspace":workspace.path(),
+                "run_id":run.run_id,
+                "expected_version":run.version,
+                "action_classes":["semantic"],
+                "ttl_ms":60000,
+                "uses_remaining":1
+            }
+        }),
+    )
+    .await;
+    assert_eq!(requested.status(), reqwest::StatusCode::OK);
+    let requested_body: Value = requested.json().await.unwrap();
+    let approval = &requested_body["result"]["structuredContent"];
+    assert_eq!(approval["status"], "pending");
+    let approval_id = approval["approvalId"].as_str().unwrap().to_owned();
+    let approval_nonce = approval["nonce"].as_str().unwrap().to_owned();
+
+    // The pending request is not authority: control is still refused.
+    let premature = rpc(
+        &client,
+        &url,
+        Some(&transport_session),
+        31,
+        "tools/call",
+        json!({
+            "name":"ptah_authorize_computer_run",
+            "arguments":{
+                "request_id":"mcp-authorize-premature",
+                "session_id":session.id,
+                "workspace":workspace.path(),
+                "run_id":run.run_id,
+                "expected_version":run.version,
+                "action_classes":["semantic"],
+                "ttl_ms":60000,
+                "uses_remaining":1,
+                "approval_id":approval_id,
+                "approval_nonce":approval_nonce
+            }
+        }),
+    )
+    .await;
+    assert_ne!(
+        premature.status(),
+        reqwest::StatusCode::OK,
+        "an un-decided approval must not grant control"
+    );
+    assert!(controller
+        .service
+        .get_run(&run.run_id)
+        .unwrap()
+        .unwrap()
+        .grant
+        .is_none());
+
+    // The human decides at the trusted host. No MCP tool reaches this.
+    controller
+        .service
+        .decide_control_approval(
+            &approval_id,
+            session.id,
+            true,
+            &capability_revision(),
+            chrono::Utc::now(),
+        )
+        .unwrap();
 
     let authorized = rpc(
         &client,
@@ -277,7 +424,9 @@ async fn computer_mutations_bind_client_identity_and_preserve_fences() {
                 "expected_version":run.version,
                 "action_classes":["semantic"],
                 "ttl_ms":60000,
-                "uses_remaining":1
+                "uses_remaining":1,
+                "approval_id":approval_id,
+                "approval_nonce":approval_nonce
             }
         }),
     )
@@ -308,7 +457,9 @@ async fn computer_mutations_bind_client_identity_and_preserve_fences() {
                 "expected_version":run.version,
                 "action_classes":["semantic"],
                 "ttl_ms":60000,
-                "uses_remaining":1
+                "uses_remaining":1,
+                "approval_id":approval_id,
+                "approval_nonce":approval_nonce
             }
         }),
     )
@@ -327,6 +478,37 @@ async fn computer_mutations_bind_client_identity_and_preserve_fences() {
     assert_eq!(
         replayed_body["result"]["structuredContent"]["grant"]["grantId"],
         projection["grant"]["grantId"]
+    );
+
+    // A *different* mutation presenting the same spent receipt is a replay,
+    // not an idempotent retry, and is refused.
+    let second_use = rpc(
+        &client,
+        &url,
+        Some(&transport_session),
+        42,
+        "tools/call",
+        json!({
+            "name":"ptah_authorize_computer_run",
+            "arguments":{
+                "request_id":"mcp-authorize-second-use",
+                "session_id":session.id,
+                "workspace":workspace.path(),
+                "run_id":run.run_id,
+                "expected_version":run.version,
+                "action_classes":["semantic"],
+                "ttl_ms":60000,
+                "uses_remaining":1,
+                "approval_id":approval_id,
+                "approval_nonce":approval_nonce
+            }
+        }),
+    )
+    .await;
+    assert_ne!(
+        second_use.status(),
+        reqwest::StatusCode::OK,
+        "a consumed receipt must not authorize a second control grant"
     );
 
     let ready_version = projection["version"].as_u64().unwrap();
@@ -401,7 +583,12 @@ async fn computer_mutations_bind_client_identity_and_preserve_fences() {
     );
 
     let actors = controller.actors.lock().unwrap().clone();
-    assert_eq!(actors.len(), 5);
+    assert_eq!(
+        actors.len(),
+        8,
+        "request, premature authorize, authorize, second-use, pause, stale takeover, takeover \
+         all bind one server-derived identity"
+    );
     assert!(actors.iter().all(|actor| actor == &actors[0]));
 
     server.stop();

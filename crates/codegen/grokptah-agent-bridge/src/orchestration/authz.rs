@@ -2,11 +2,19 @@
 
 use std::path::{Path, PathBuf};
 
+use sha2::Digest;
+
 use super::types::{OrchError, OrchErrorCode};
 
 #[derive(Debug, Clone)]
 pub struct AuthContext {
     pub token_id: String,
+    /// Lowercase hex SHA-256 of the presented bearer token.
+    ///
+    /// Computer Use human-approval receipts bind this, so rotating the
+    /// control token invalidates every outstanding receipt without the
+    /// approval ledger ever storing the secret itself.
+    pub token_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -99,6 +107,7 @@ pub fn require_bearer(header: Option<&str>, expected: &str) -> Result<AuthContex
     }
     Ok(AuthContext {
         token_id: "primary".into(),
+        token_fingerprint: format!("{:x}", sha2::Sha256::digest(token.as_bytes())),
     })
 }
 
@@ -141,6 +150,25 @@ mod tests {
         assert!(require_bearer(Some("tok"), "tok").is_err());
         assert!(require_bearer(Some("Bearer wrong"), "tok").is_err());
         assert!(require_bearer(Some("Bearer tok"), "tok").is_ok());
+    }
+
+    #[test]
+    fn bearer_context_carries_a_rotating_token_fingerprint() {
+        let first = require_bearer(Some("Bearer tok"), "tok").expect("token accepted");
+        let rotated = require_bearer(Some("Bearer tok2"), "tok2").expect("token accepted");
+        assert_eq!(first.token_fingerprint.len(), 64);
+        assert!(first
+            .token_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(
+            first.token_fingerprint, rotated.token_fingerprint,
+            "rotating the control token must invalidate outstanding receipts"
+        );
+        assert_ne!(
+            first.token_fingerprint, "tok",
+            "the raw token must never be the fingerprint"
+        );
     }
 
     #[test]
