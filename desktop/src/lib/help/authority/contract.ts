@@ -274,7 +274,12 @@ function digest(value: string): string {
 }
 
 function validBoundedString(value: unknown, maxBytes: number): value is string {
-  return typeof value === "string" && value.trim().length > 0 && utf8Bytes(value) <= maxBytes;
+  return (
+    typeof value === "string" &&
+    value.trim().length > 0 &&
+    utf8Bytes(value) <= maxBytes &&
+    !/[\u0000-\u001f\u007f]/u.test(value)
+  );
 }
 
 function validSafeString(value: unknown, maxBytes: number): value is string {

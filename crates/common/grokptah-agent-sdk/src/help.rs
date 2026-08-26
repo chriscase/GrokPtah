@@ -239,7 +239,7 @@ fn error(reason: &'static str) -> HelpParseError {
 }
 
 fn safe_text(value: &str, max_bytes: usize) -> bool {
-    if value.trim().is_empty() || value.len() > max_bytes {
+    if value.trim().is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
         return false;
     }
     let lower = value.to_ascii_lowercase();
