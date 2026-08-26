@@ -4,6 +4,7 @@
  * Shared by the vitest regression gate and the CLI reporter so a number quoted
  * in a report and a number enforced in CI cannot disagree.
  */
+import { HELP_CORPUS } from "../canonical/corpus";
 import { searchHelpCorpus, type HelpRetrievalOptions } from "../retrieval/hybrid";
 import { HELP_GOLD_SET, type HelpGoldCategory, type HelpGoldQuery } from "./goldset";
 
@@ -61,9 +62,17 @@ export function evaluateHelpQuery(
   entry: HelpGoldQuery,
   options: HelpRetrievalOptions = {},
 ): HelpEvalOutcome {
-  // Restricted content must be reachable for evaluation; access filtering is
-  // a separate, independently tested concern.
-  const outcome = searchHelpCorpus(entry.query, { limit: 5, ...options });
+  // The gold set evaluates ranking over the complete shipped corpus. This is
+  // explicit test authority, not an implicit production widening; callers can
+  // still pass a narrower capability set to evaluate a scoped surface.
+  const evaluationCapabilities = [
+    ...new Set(HELP_CORPUS.articles.flatMap((article) => article.capabilityIds)),
+  ];
+  const outcome = searchHelpCorpus(entry.query, {
+    limit: 5,
+    authorizedCapabilities: evaluationCapabilities,
+    ...options,
+  });
   const relevant = relevantSet(entry);
   const results = outcome.results;
   const topArticleId = results[0]?.articleId ?? null;

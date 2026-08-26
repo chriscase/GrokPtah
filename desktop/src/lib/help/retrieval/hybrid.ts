@@ -84,6 +84,11 @@ export type HelpRetrievalOptions = {
   readonly topic?: HelpTopic | "all";
   readonly audience?: HelpAudience;
   readonly access?: readonly HelpAccess[];
+  /**
+   * Explicit authority for non-public Help. Missing or empty means public-only,
+   * even when `access` asks for gated/operator articles.
+   */
+  readonly authorizedCapabilities?: readonly string[];
   /** Restrict the signals used. Default `hybrid`. */
   readonly mode?: HelpRetrievalMode;
   /** Fail closed unless the corpus digest matches this value exactly. */
@@ -279,6 +284,18 @@ function describe(components: HelpScoreComponents, matchedTerms: readonly string
   return `${parts.join("; ")} — fused ${components.fused.toFixed(3)}`;
 }
 
+function isAuthorizedArticle(articleId: string, authorizedCapabilities: readonly string[] | undefined): boolean {
+  const article = getHelpArticle(articleId);
+  if (!article) return false;
+  if (article.access === "public") return true;
+  if (!authorizedCapabilities || authorizedCapabilities.length === 0) return false;
+  const capabilities = new Set(authorizedCapabilities);
+  return (
+    article.capabilityIds.length > 0 &&
+    article.capabilityIds.every((capability) => capabilities.has(capability))
+  );
+}
+
 type Candidate = {
   articleId: string;
   bestChunkId: string | null;
@@ -444,6 +461,7 @@ export function searchHelpCorpus(
     if (options.topic && options.topic !== "all" && article.topic !== options.topic) continue;
     if (options.audience && !article.audience.includes(options.audience)) continue;
     if (allowedAccess && !allowedAccess.has(article.access)) continue;
+    if (!isAuthorizedArticle(article.id, options.authorizedCapabilities)) continue;
     // Coordination: how much of the query this article actually accounts for.
     // Without it a single rare term carries an otherwise unrelated query —
     // "convert 40 celsius to fahrenheit" matched an article containing

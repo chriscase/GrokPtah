@@ -33,11 +33,25 @@ import type {
   SteeringReceipt,
 } from "./promptQueue";
 import type { CapabilitySet } from "./capabilities";
+import type {
+  HelpAuthorityCleanupReceipt,
+  HelpAuthorityRequest,
+  HelpAuthorityResponse,
+} from "./help/authority";
+
+export type HelpAuthorityTauriExecution = {
+  response: HelpAuthorityResponse | null;
+  failure: string | null;
+  cleanup: HelpAuthorityCleanupReceipt;
+};
 
 export const api = {
   agentStart: () => invoke<void>("agent_start"),
   agentStop: () => invoke<void>("agent_stop"),
   agentStatus: () => invoke<AgentStatus>("agent_status"),
+  /** Dedicated one-shot Help path; it never creates a Chat/session artifact. */
+  helpExecuteOneShot: (request: HelpAuthorityRequest) =>
+    invoke<HelpAuthorityTauriExecution>("help_execute_one_shot", { request }),
   capabilityContract: () => invoke<CapabilitySet>("capability_contract"),
   persistentAgentList: () =>
     invoke<PersistentAgent[]>("persistent_agent_list"),

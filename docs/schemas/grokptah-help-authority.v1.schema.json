@@ -1,0 +1,529 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokptah:schema:help-authority:v1",
+  "title": "GrokPtah one-shot Help authority contract v1",
+  "description": "Strict, source-bound, secret-free Help request, response, and finalization receipts.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/request"
+    },
+    {
+      "$ref": "#/$defs/response"
+    },
+    {
+      "$ref": "#/$defs/cleanupReceipt"
+    }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "minLength": 71,
+      "maxLength": 71
+    },
+    "boundedId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "capabilityId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9_]*)+$"
+    },
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "authorizedCapabilities"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "public",
+            "authorized"
+          ]
+        },
+        "authorizedCapabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/capabilityId"
+          }
+        }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "corpusDigest",
+        "sourceDigest",
+        "modelDigest",
+        "modelId",
+        "modelVersion"
+      ],
+      "properties": {
+        "corpusDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "sourceDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "modelDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "modelId": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "modelVersion": {
+          "$ref": "#/$defs/boundedId"
+        }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "tenant",
+        "model",
+        "routeRevision",
+        "dialect"
+      ],
+      "properties": {
+        "profile": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "tenant": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "model": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "routeRevision": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "dialect": {
+          "enum": [
+            "openai_chat",
+            "openai_responses",
+            "anthropic_messages",
+            "broker_native"
+          ]
+        }
+      }
+    },
+    "deadline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deadlineAt",
+        "maxDurationMs"
+      ],
+      "properties": {
+        "deadlineAt": {
+          "type": "string",
+          "format": "date-time",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "maxDurationMs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20000
+        }
+      }
+    },
+    "sourceBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceId",
+        "sourceSectionDigest",
+        "sourceByteLength"
+      ],
+      "properties": {
+        "sourceId": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "sourceSectionDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "sourceByteLength": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        }
+      }
+    },
+    "contextChunk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chunkId",
+        "articleId",
+        "access",
+        "requiredCapabilities",
+        "text",
+        "textDigest",
+        "spanStart",
+        "spanEnd",
+        "sourceBindings"
+      ],
+      "properties": {
+        "chunkId": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "articleId": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "access": {
+          "enum": [
+            "public",
+            "gated",
+            "operator"
+          ]
+        },
+        "requiredCapabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/capabilityId"
+          }
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "textDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "spanStart": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4096
+        },
+        "spanEnd": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "sourceBindings": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/sourceBinding"
+          }
+        }
+      }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "kind",
+        "requestId",
+        "authorization",
+        "identity",
+        "provider",
+        "deadline",
+        "query",
+        "context",
+        "toolsDisabled",
+        "conversationDisabled"
+      ],
+      "properties": {
+        "schema": {
+          "const": "grokptah.help-authority.v1"
+        },
+        "kind": {
+          "const": "request"
+        },
+        "requestId": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "authorization": {
+          "$ref": "#/$defs/authorization"
+        },
+        "identity": {
+          "$ref": "#/$defs/identity"
+        },
+        "provider": {
+          "$ref": "#/$defs/provider"
+        },
+        "deadline": {
+          "$ref": "#/$defs/deadline"
+        },
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "context": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/contextChunk"
+          }
+        },
+        "toolsDisabled": {
+          "const": true
+        },
+        "conversationDisabled": {
+          "const": true
+        }
+      }
+    },
+    "claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "claimId",
+        "text",
+        "spanStart",
+        "spanEnd",
+        "citationIds"
+      ],
+      "properties": {
+        "claimId": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "spanStart": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8192
+        },
+        "spanEnd": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8192
+        },
+        "citationIds": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/boundedId"
+          }
+        }
+      }
+    },
+    "citation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "citationId",
+        "chunkId",
+        "articleId",
+        "spanStart",
+        "spanEnd",
+        "quotedText",
+        "quotedTextHash",
+        "sourceId",
+        "sourceSectionDigest",
+        "claimIds"
+      ],
+      "properties": {
+        "citationId": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "chunkId": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "articleId": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "spanStart": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4096
+        },
+        "spanEnd": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "quotedText": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "quotedTextHash": {
+          "$ref": "#/$defs/digest"
+        },
+        "sourceId": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "sourceSectionDigest": {
+          "$ref": "#/$defs/digest"
+        },
+        "claimIds": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/boundedId"
+          }
+        }
+      }
+    },
+    "artifactCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chat",
+        "session",
+        "transcript",
+        "tool",
+        "workspace"
+      ],
+      "properties": {
+        "chat": {
+          "const": 0
+        },
+        "session": {
+          "const": 0
+        },
+        "transcript": {
+          "const": 0
+        },
+        "tool": {
+          "const": 0
+        },
+        "workspace": {
+          "const": 0
+        }
+      }
+    },
+    "cleanupReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "kind",
+        "requestId",
+        "status",
+        "providerTask",
+        "abortRequested",
+        "queueSlot",
+        "artifactCounts"
+      ],
+      "properties": {
+        "schema": {
+          "const": "grokptah.help-authority.v1"
+        },
+        "kind": {
+          "const": "cleanup"
+        },
+        "requestId": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "status": {
+          "enum": [
+            "finalized",
+            "uncertain"
+          ]
+        },
+        "providerTask": {
+          "enum": [
+            "joined",
+            "not_joined"
+          ]
+        },
+        "abortRequested": {
+          "type": "boolean"
+        },
+        "queueSlot": {
+          "enum": [
+            "released",
+            "not_released"
+          ]
+        },
+        "artifactCounts": {
+          "$ref": "#/$defs/artifactCounts"
+        }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "kind",
+        "requestId",
+        "identity",
+        "provider",
+        "deadline",
+        "answer",
+        "claims",
+        "citations",
+        "uncertainty",
+        "cleanup"
+      ],
+      "properties": {
+        "schema": {
+          "const": "grokptah.help-authority.v1"
+        },
+        "kind": {
+          "const": "response"
+        },
+        "requestId": {
+          "$ref": "#/$defs/boundedId"
+        },
+        "identity": {
+          "$ref": "#/$defs/identity"
+        },
+        "provider": {
+          "$ref": "#/$defs/provider"
+        },
+        "deadline": {
+          "$ref": "#/$defs/deadline"
+        },
+        "answer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "claims": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/claim"
+          }
+        },
+        "citations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/citation"
+          }
+        },
+        "uncertainty": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "cleanup": {
+          "$ref": "#/$defs/cleanupReceipt"
+        }
+      }
+    }
+  }
+}

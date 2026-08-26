@@ -17,6 +17,7 @@ mod events;
 mod exec_risk;
 pub mod external_worker;
 mod gateway_config;
+pub mod help_executor;
 mod hooks;
 mod host;
 mod host_helpers;
@@ -119,6 +120,12 @@ pub use external_worker::{
     CURSOR_CLOUD_API_BASE,
 };
 pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
+pub use help_executor::{
+    HelpExecution, HelpExecutionFailure, HelpExecutor, HelpProvider, HelpProviderFuture,
+};
+pub use grokptah_agent_sdk::{
+    HelpAuthorityRequest, HelpAuthorityResponse, HelpCleanupReceipt,
+};
 pub use mcp_control::{
     discovered_tool_names, start_control_from_env, start_control_server, start_control_server_with,
     ControlServerHandle, ControlServerLimits,

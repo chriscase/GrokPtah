@@ -111,3 +111,7 @@ export {
   type HelpSearchController,
   type HelpSearchState,
 } from "./consumer";
+
+// Production one-shot authority boundary. This is intentionally separate from
+// the legacy Help/Chat projections above.
+export * from "./authority/index";

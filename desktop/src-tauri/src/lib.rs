@@ -3,6 +3,7 @@
 mod commands;
 mod computer_use;
 mod event_forward;
+mod help_executor;
 mod pty_host;
 
 use std::sync::Mutex;
@@ -16,6 +17,7 @@ pub struct AppState {
     /// Loopback MCP control plane (#196); optional when token not configured.
     pub control: Mutex<Option<ControlServerHandle>>,
     pub computer_use: std::sync::Arc<computer_use::DesktopComputerUse>,
+    pub help: std::sync::Arc<help_executor::TauriHelpService>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -33,6 +35,7 @@ pub fn run() {
             pty: pty_host::PtyHub::new(),
             control: Mutex::new(None),
             computer_use: std::sync::Arc::new(computer_use::DesktopComputerUse::new(&host)),
+            help: std::sync::Arc::new(help_executor::TauriHelpService::new()),
         })
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -85,6 +88,7 @@ pub fn run() {
             commands::computer_use_cockpit_pause,
             commands::computer_use_cockpit_take_over,
             commands::computer_use_cockpit_stop,
+            help_executor::help_execute_one_shot,
             commands::set_project_cwd,
             commands::pick_project_folder,
             commands::session_new,

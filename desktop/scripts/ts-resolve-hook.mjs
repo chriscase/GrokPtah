@@ -9,6 +9,8 @@
  * run the real modules.
  */
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { stripTypeScriptTypes } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 export async function resolve(specifier, context, nextResolve) {
@@ -23,4 +25,22 @@ export async function resolve(specifier, context, nextResolve) {
     }
   }
   return nextResolve(specifier, context);
+}
+
+/**
+ * Node 22.14 does not infer a load format for an explicitly resolved `.ts`
+ * URL. Tell the built-in type-stripper to treat these source files as ESM.
+ * Keeping this in the shared hook makes the corpus/model/eval scripts execute
+ * exactly the modules that Vite and TypeScript ship.
+ */
+export async function load(url, context, nextLoad) {
+  if (url.endsWith(".ts") || url.endsWith(".tsx")) {
+    const source = await readFile(new URL(url), "utf8");
+    return {
+      format: "module",
+      shortCircuit: true,
+      source: stripTypeScriptTypes(source, { mode: "strip" }),
+    };
+  }
+  return nextLoad(url, context);
 }
