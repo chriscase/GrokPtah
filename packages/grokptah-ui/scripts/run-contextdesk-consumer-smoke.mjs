@@ -66,39 +66,6 @@ function run(command, args, options = {}) {
   });
 }
 
-function runJson(command, args, options = {}) {
-  return new Promise((resolveRun, reject) => {
-    const child = spawn(command, args, {
-      ...options,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code !== 0) {
-        reject(
-          new Error(
-            `${command} ${args.join(" ")} exited ${code}:\n${stdout}\n${stderr}`,
-          ),
-        );
-      } else {
-        try {
-          resolveRun(JSON.parse(stdout));
-        } catch (error) {
-          reject(new Error(`could not parse ${command} JSON output: ${error.message}`));
-        }
-      }
-    });
-  });
-}
-
 async function collectTextFiles(directory) {
   const files = [];
   async function visit(currentDirectory) {
@@ -221,24 +188,40 @@ try {
     { cwd: consumerRoot },
   );
 
-  const dependencyTree = await runJson(
-    npm,
-    ["ls", "--json", "--all", "--silent", "--prefix", consumerRoot],
-    { cwd: consumerRoot },
-  );
-  function dependencyVersions(tree, packageName, path = [], found = []) {
-    for (const [name, dependency] of Object.entries(tree.dependencies ?? {})) {
-      if (name === packageName && dependency.version) {
-        found.push({ version: dependency.version, path: [...path, name].join(" > ") });
+  async function installedPackagePaths(nodeModulesRoot, packageName) {
+    const packageParts = packageName.split("/");
+    const installations = [];
+    async function visit(nodeModulesDirectory) {
+      const packagePath = join(nodeModulesDirectory, ...packageParts);
+      if (existsSync(join(packagePath, "package.json"))) {
+        installations.push(packagePath);
       }
-      dependencyVersions(dependency, packageName, [...path, name], found);
+      for (const entry of await readdir(nodeModulesDirectory, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const nestedNodeModules = join(nodeModulesDirectory, entry.name, "node_modules");
+        if (existsSync(nestedNodeModules)) await visit(nestedNodeModules);
+      }
     }
-    return found;
+    await visit(nodeModulesRoot);
+    return installations;
   }
+
   for (const packageName of ["react", "react-dom"]) {
-    const versions = dependencyVersions(dependencyTree, packageName);
+    const installations = await installedPackagePaths(
+      join(consumerRoot, "node_modules"),
+      packageName,
+    );
+    const versions = [];
+    for (const installation of installations) {
+      versions.push({
+        version: JSON.parse(
+          await readFile(join(installation, "package.json"), "utf8"),
+        ).version,
+        path: installation,
+      });
+    }
     if (
-      versions.length !== 1 ||
+      installations.length !== 1 ||
       versions[0]?.version !== hostConfiguration.expected[packageName]
     ) {
       throw new Error(
