@@ -9,6 +9,7 @@
 
 use serde::Serialize;
 
+use super::isolated_visual_harness::run_real_measured_launch;
 use super::isolated_visual_selfcheck::run_isolated_visual_selfcheck;
 
 /// One reason isolated visual Computer Use is not dispatchable.
@@ -42,6 +43,10 @@ pub struct ComputerIsolatedVisualStatus {
     pub dispatch_enabled: bool,
     /// Whether the substrate's own contract rehearsal held in this build.
     pub contract_self_check_passed: bool,
+    /// The furthest stage a measured launch has been observed to reach on
+    /// this host. `not_attempted` means no guest, helper, or package has
+    /// been touched at all.
+    pub measured_launch_stage: &'static str,
     /// Every reason dispatch is unavailable, in a stable order.
     pub blockers: Vec<ComputerIsolatedVisualBlocker>,
 }
@@ -51,6 +56,9 @@ pub struct ComputerIsolatedVisualStatus {
 /// constant `false` rather than a computed value a caller could flip.
 pub fn computer_isolated_visual_status() -> ComputerIsolatedVisualStatus {
     let contract_self_check_passed = run_isolated_visual_selfcheck().is_ok();
+    // Reported without an operator opt-in, so this observes the harness
+    // refusing rather than attempting anything.
+    let measured_launch = run_real_measured_launch(None);
 
     let mut blockers = vec![ComputerIsolatedVisualBlocker::DispatchDisabled];
     if !cfg!(target_os = "macos") {
@@ -67,12 +75,14 @@ pub fn computer_isolated_visual_status() -> ComputerIsolatedVisualStatus {
     ComputerIsolatedVisualStatus {
         dispatch_enabled: false,
         contract_self_check_passed,
+        measured_launch_stage: measured_launch.launch_attempted.as_str(),
         blockers,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::isolated_visual_harness::LaunchStage;
     use super::*;
 
     #[test]
@@ -92,6 +102,11 @@ mod tests {
         assert!(status
             .blockers
             .contains(&ComputerIsolatedVisualBlocker::MeasuredHardwareGatesUnmet));
+        assert_eq!(
+            status.measured_launch_stage,
+            LaunchStage::NotAttempted.as_str(),
+            "status must not report a launch stage it did not reach"
+        );
     }
 
     #[test]

@@ -44,6 +44,9 @@ use super::isolated_visual_artifacts::{
 use super::isolated_visual_channel::IsolatedVisualChannelBinding;
 use super::isolated_visual_driver::IsolatedVisualRuntimeDriver;
 use super::isolated_visual_frames::IsolatedVisualFrameCarrier;
+use super::isolated_visual_harness::{
+    run_measured_launch, LaunchOutcome, LaunchStage, ScriptedMeasuredLaunch,
+};
 use super::isolated_visual_helper::{
     IsolatedVisualHelperEvent, IsolatedVisualHelperEventCode, IsolatedVisualHelperSupervisor,
     IsolatedVisualHelperSupervisorState, ISOLATED_VISUAL_HELPER_CONTROL_BIND,
@@ -142,6 +145,7 @@ pub(crate) fn run_isolated_visual_selfcheck() -> ComputerResult<()> {
     check_driven_session()?;
     check_driven_failure()?;
     check_artifact_receipts()?;
+    check_measured_launch_policy()?;
     #[cfg(unix)]
     bind_deadline_entrypoints();
     Ok(())
@@ -820,6 +824,100 @@ fn check_driven_session() -> ComputerResult<()> {
         runtime.terminal_check().is_err(),
         "restart interruption left the isolated input gate live",
     )
+}
+
+/// The measured launch policy: stages are ordered, an uncertain step is never
+/// retried, and an acknowledgement without a visible change proves nothing.
+fn check_measured_launch_policy() -> ComputerResult<()> {
+    let mut healthy = ScriptedMeasuredLaunch::healthy();
+    let report = run_measured_launch(&mut healthy);
+    require(
+        report.outcome == LaunchOutcome::Completed
+            && report.launch_attempted == LaunchStage::StoppedAndReaped
+            && report.proves_hardware_launch(),
+        "a fully measured scripted launch did not reach stop and reap",
+    )?;
+
+    for code in [
+        ComputerErrorCode::UncertainOutcome,
+        ComputerErrorCode::Interrupted,
+    ] {
+        let mut uncertain = ScriptedMeasuredLaunch::with_uncertain_spawn(code);
+        let report = run_measured_launch(&mut uncertain);
+        require(
+            report.outcome == LaunchOutcome::Uncertain
+                && report.launch_attempted == LaunchStage::PackageMeasured
+                && !report.proves_hardware_launch(),
+            "an uncertain step did not end the measured launch",
+        )?;
+        require(
+            uncertain.calls() == ["measure", "spawn"],
+            "an uncertain step was retried or a later stage still ran",
+        )?;
+    }
+
+    let mut uncertain_input = ScriptedMeasuredLaunch::with_uncertain_keyboard();
+    let report = run_measured_launch(&mut uncertain_input);
+    require(
+        report.outcome == LaunchOutcome::Uncertain
+            && report.launch_attempted == LaunchStage::PointerAcknowledged
+            && report.acknowledged_inputs == 1,
+        "an uncertain input did not stop the run at the last measured stage",
+    )?;
+    require(
+        !uncertain_input.calls().contains(&"unicode") && !uncertain_input.calls().contains(&"stop"),
+        "a later stage ran after an uncertain input",
+    )?;
+
+    // Stages are ordered, so a report can never name a stage it did not reach.
+    let ordered = [
+        LaunchStage::NotAttempted,
+        LaunchStage::PlatformRejected,
+        LaunchStage::PackageUnverified,
+        LaunchStage::PackageMeasured,
+        LaunchStage::HelperSpawned,
+        LaunchStage::GuestBooted,
+        LaunchStage::FrameAuthenticated,
+        LaunchStage::PointerAcknowledged,
+        LaunchStage::KeyboardAcknowledged,
+        LaunchStage::UnicodeAcknowledged,
+        LaunchStage::StoppedAndReaped,
+    ];
+    for pair in ordered.windows(2) {
+        require(pair[0] < pair[1], "measured launch stages are not ordered")?;
+        require(
+            !pair[0].as_str().is_empty(),
+            "a measured launch stage has no stable name",
+        )?;
+    }
+
+    let mut invisible = ScriptedMeasuredLaunch::with_invisible_pointer_effect();
+    let report = run_measured_launch(&mut invisible);
+    require(
+        !report.proves_hardware_launch() && report.acknowledged_inputs == 0,
+        "an acknowledged input with no visible change counted as a proof",
+    )?;
+
+    let mut stale = ScriptedMeasuredLaunch::with_stale_frame_after_input();
+    let report = run_measured_launch(&mut stale);
+    require(
+        report.outcome == LaunchOutcome::Failed(ComputerErrorCode::StaleObservation),
+        "a stale frame after an input was accepted",
+    )?;
+
+    // Nothing here attempted a real launch.
+    require(
+        !super::isolated_visual_harness::run_real_measured_launch(None).proves_hardware_launch(),
+        "the real harness claimed a hardware launch without one",
+    )?;
+    #[cfg(target_os = "macos")]
+    {
+        // The operator opt-in is the only way to request a real attempt. Bind
+        // it without granting one.
+        let _: fn() -> super::isolated_visual_harness::MeasuredLaunchOptIn =
+            super::isolated_visual_harness::MeasuredLaunchOptIn::granted_by_operator;
+    }
+    Ok(())
 }
 
 /// A packaged receipt only validates against the manifest it was measured for,
