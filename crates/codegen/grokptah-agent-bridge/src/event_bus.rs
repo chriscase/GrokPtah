@@ -516,7 +516,7 @@ impl EventBus {
     /// acked entries or marks `writer_pending`.
     pub fn read_after(&self, after_seq: u64, limit: usize) -> JournalPage {
         let limit = limit.clamp(1, 500);
-        self.wait_for_durable(after_seq, limit);
+        self.wait_for_durable(after_seq);
         let g = self.inner.lock();
         let gap = *self.journal_gap.lock();
         let expired = JournalPage {
@@ -572,7 +572,7 @@ impl EventBus {
 
     /// Wait until the durable writer has acked enough of the requested range
     /// or the bounded backpressure timeout elapses.
-    fn wait_for_durable(&self, after_seq: u64, limit: usize) {
+    fn wait_for_durable(&self, after_seq: u64) {
         if !self.persist_configured.load(Ordering::Acquire) {
             return;
         }
@@ -581,15 +581,12 @@ impl EventBus {
         };
         let deadline = Instant::now() + WRITER_SEND_TIMEOUT;
         loop {
-            if self.last_persistence_error().is_some() {
-                return;
-            }
             if let Some((start, end)) = *self.journal_gap.lock() {
                 if after_seq >= start.saturating_sub(1) && after_seq < end {
                     return;
                 }
             }
-            if self.durable_caught_up(after_seq, limit) {
+            if self.durable_through.load(Ordering::Acquire) >= self.current_seq() {
                 return;
             }
             let now = Instant::now();
@@ -597,7 +594,7 @@ impl EventBus {
                 return;
             }
             let mut guard = handle.space.mu.lock();
-            if self.durable_caught_up(after_seq, limit) {
+            if self.durable_through.load(Ordering::Acquire) >= self.current_seq() {
                 return;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -606,23 +603,6 @@ impl EventBus {
             }
             handle.space.cv.wait_for(&mut guard, remaining);
         }
-    }
-
-    fn durable_caught_up(&self, after_seq: u64, limit: usize) -> bool {
-        let last = self.current_seq();
-        let durable = self.durable_through.load(Ordering::Acquire);
-        if durable >= last {
-            return true;
-        }
-        let oldest = self.oldest_seq();
-        // A watermark in the evicted prefix cannot satisfy this cursor.
-        // Leave the wait so read_after can mark writer_pending / expire.
-        if oldest > 1 && durable + 1 < oldest {
-            return false;
-        }
-        let retained_start = oldest.max(after_seq.saturating_add(1));
-        durable.saturating_add(1) > retained_start
-            && durable.saturating_sub(after_seq) >= limit as u64
     }
 
     /// Page through entire run range (honors cursor expiry; no silent 500 cutoff).
