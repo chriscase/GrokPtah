@@ -7,17 +7,36 @@
   "$defs": {
     "RunState": {
       "type": "string",
-      "enum": ["queued", "running", "completed", "failed", "cancelled", "interrupted", "limit_reached"]
+      "enum": [
+        "queued",
+        "starting",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "limit_reached"
+      ],
+      "description": "`starting` is the interval between an attempt taking this run's lease and its worker acknowledging. It is a real state, not a transient: a crash inside it leaves a lease held and work that may have begun."
     },
     "AttemptProjectionState": {
       "type": "string",
       "description": "Public form of an attempt lease's state. `expired` is distinct from `held` because it is the state a reconciler acts on.",
-      "enum": ["held", "released", "expired"]
+      "enum": [
+        "held",
+        "released",
+        "expired"
+      ]
     },
     "ProviderSendProjectionState": {
       "type": "string",
       "description": "What is durably known about whether the work reached the provider. `known_not_sent` and `uncertain` must never be merged: only the first is safe to attempt again.",
-      "enum": ["known_not_sent", "sending", "uncertain", "sent"]
+      "enum": [
+        "known_not_sent",
+        "sending",
+        "uncertain",
+        "sent"
+      ]
     },
     "AdmissionProjection": {
       "type": "object",
@@ -30,7 +49,11 @@
         "state",
         "promptPreview",
         "createdAt",
-        "updatedAt"
+        "updatedAt",
+        "teardownUncertain",
+        "retryEligible",
+        "capacityFenced",
+        "maxRounds"
       ],
       "properties": {
         "projectionVersion": {
@@ -38,40 +61,149 @@
           "minimum": 1,
           "description": "Contract version, bumped whenever a field is added, removed, or changes meaning."
         },
-        "runId": { "type": "string", "minLength": 1, "maxLength": 256 },
-        "sessionId": { "type": "string", "format": "uuid" },
-        "workspace": { "type": "string", "minLength": 1, "maxLength": 4096 },
-        "state": { "$ref": "#/$defs/RunState" },
+        "runId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "sessionId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "workspace": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "state": {
+          "$ref": "#/$defs/RunState"
+        },
         "specKey": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "pattern": "^[0-9a-f]{64}$",
           "description": "Immutable execution specification key. Safe to publish: it is a digest, and it distinguishes identical work from merely similar work."
         },
         "queuePosition": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 1,
           "description": "One-based position in the bounded admission queue, while queued."
         },
         "attempt": {
-          "type": ["integer", "null"],
+          "type": [
+            "integer",
+            "null"
+          ],
           "minimum": 1,
           "description": "Monotonic attempt number. Never reused, never decreases."
         },
         "attemptState": {
-          "oneOf": [{ "$ref": "#/$defs/AttemptProjectionState" }, { "type": "null" }]
+          "oneOf": [
+            {
+              "$ref": "#/$defs/AttemptProjectionState"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "providerSendState": {
-          "oneOf": [{ "$ref": "#/$defs/ProviderSendProjectionState" }, { "type": "null" }]
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ProviderSendProjectionState"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "promptPreview": {
           "type": "string",
           "maxLength": 500,
           "description": "Bounded, redacted preview. Never the execution input."
         },
-        "terminalResult": { "type": ["string", "null"], "maxLength": 100 },
-        "errorCode": { "type": ["string", "null"], "maxLength": 100 },
-        "createdAt": { "type": "string", "format": "date-time" },
-        "updatedAt": { "type": "string", "format": "date-time" }
+        "terminalResult": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 100
+        },
+        "errorCode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 100
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "heartbeatAgeSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Seconds since the holding attempt last heartbeat its lease. Distinguishes a working turn from a holder that stopped reporting."
+        },
+        "leaseExpiresInSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Seconds until the attempt lease expires; negative once it has."
+        },
+        "routeRevision": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Fingerprint of the concrete provider, model, endpoint, and credential this work is bound to. A fingerprint, so a route change is visible without any endpoint or credential being published."
+        },
+        "teardownUncertain": {
+          "type": "boolean",
+          "description": "A previous teardown could not be established. The run's lease and capacity are fenced and no new attempt is authorized."
+        },
+        "teardownDetail": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 500,
+          "description": "Bounded, redacted explanation of the uncertainty."
+        },
+        "retryEligible": {
+          "type": "boolean",
+          "description": "Whether a new attempt is currently permitted. False whenever the outcome of previous work is unknown \u2014 the case where retrying risks doing it twice."
+        },
+        "capacityFenced": {
+          "type": "boolean",
+          "description": "Whether this run currently occupies an admission slot."
+        },
+        "remainingDurationMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Remaining wall-clock budget from the sealed bounds."
+        },
+        "maxRounds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Round budget from the sealed bounds."
+        }
       }
     }
   },

@@ -1384,7 +1384,10 @@ async fn wait_run_terminal(
     loop {
         let v = orch.get_run(auth, run_id).unwrap();
         let state: RunState = serde_json::from_value(v["state"].clone()).unwrap();
-        if !matches!(state, RunState::Running | RunState::Queued) {
+        // `is_terminal` is the authoritative predicate; enumerating the
+        // non-terminal states by hand silently mistakes any new one for an
+        // outcome.
+        if state.is_terminal() {
             return state;
         }
         if start.elapsed() > timeout {

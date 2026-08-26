@@ -69,7 +69,7 @@ fn seed_run(
                 RunState::Failed => "failed".into(),
                 RunState::Cancelled => "cancelled".into(),
                 RunState::LimitReached => "limit_reached".into(),
-                RunState::Queued | RunState::Running => "incomplete".into(),
+                RunState::Queued | RunState::Starting | RunState::Running => "incomplete".into(),
             }),
             final_response: None,
             error_code: (state == RunState::Interrupted).then(|| "interrupted".into()),

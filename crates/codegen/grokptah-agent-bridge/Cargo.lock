@@ -506,6 +506,7 @@ dependencies = [
  "tower",
  "uuid",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

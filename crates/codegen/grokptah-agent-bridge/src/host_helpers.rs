@@ -1705,6 +1705,35 @@ fn ensure_stream_completed(saw_data: bool, stream_completed: bool) -> Result<()>
     Ok(())
 }
 
+/// A borrowed view of the durable sink one turn reports its physical requests
+/// to, plus the attempt identity those requests belong to.
+pub(crate) struct ProviderRequestJournal<'a> {
+    pub sink: &'a dyn crate::orchestration::ProviderRequestSink,
+    pub run_id: &'a str,
+    pub attempt_id: &'a str,
+}
+
+impl ProviderRequestJournal<'_> {
+    fn mint(&self, ordinal: u32) -> crate::orchestration::ProviderRequestTicket {
+        crate::orchestration::ProviderRequestTicket::mint(self.run_id, self.attempt_id, ordinal)
+    }
+
+    fn record(
+        &self,
+        ticket: &crate::orchestration::ProviderRequestTicket,
+        phase: crate::orchestration::RequestPhase,
+        detail: Option<&str>,
+    ) -> Result<(), String> {
+        self.sink.record(ticket, phase, detail)
+    }
+
+    fn may_send(&self, ticket: &crate::orchestration::ProviderRequestTicket) -> Result<(), String> {
+        self.sink.may_send(ticket)
+    }
+}
+
+use crate::orchestration::RequestPhase as ProviderRequestPhase;
+
 /// Stream one chat/completions step (tools + tokens).
 /// Content → `on_delta`; reasoning_content → `on_thought` (#149).
 /// Cancel aborts the HTTP body read within ~one chunk.
@@ -1716,8 +1745,41 @@ pub(crate) async fn call_xai_agent_step<F, G>(
     messages: &[serde_json::Value],
     tools: &serde_json::Value,
     cancel: &CancellationToken,
+    on_delta: F,
+    on_thought: G,
+) -> Result<AgentStep>
+where
+    F: FnMut(&str),
+    G: FnMut(&str),
+{
+    // Unjournaled callers get the same behaviour they always had, minus the
+    // ability to retry across an unobserved outcome — that gate is enforced
+    // below regardless of whether anyone is recording.
+    call_xai_agent_step_journaled(
+        creds, model, effort, messages, tools, cancel, on_delta, on_thought, None,
+    )
+    .await
+}
+
+/// The same step, with every physical HTTP request reported to a durable sink.
+///
+/// This is the granularity duplication actually happens at. The retry loop
+/// below used to resend blindly on a transport error, which is indistinguish-
+/// able from "the provider received it, ran it, and we never saw the reply".
+/// With a sink attached, each send has its own identity and its own recorded
+/// phase, an idempotency key travels on the wire, and a resend is refused
+/// unless the previous request provably never left.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_xai_agent_step_journaled<F, G>(
+    creds: &crate::auth_store::WireCredentials,
+    model: &str,
+    effort: EffortLevel,
+    messages: &[serde_json::Value],
+    tools: &serde_json::Value,
+    cancel: &CancellationToken,
     mut on_delta: F,
     mut on_thought: G,
+    journal: Option<ProviderRequestJournal<'_>>,
 ) -> Result<AgentStep>
 where
     F: FnMut(&str),
@@ -1760,6 +1822,20 @@ where
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
+
+        // One identity per physical request. Minted before anything is
+        // written, so even a crash between minting and sending leaves a record
+        // that a send may have happened.
+        let ticket = journal.as_ref().map(|j| j.mint(attempt));
+        if let (Some(journal), Some(ticket)) = (journal.as_ref(), ticket.as_ref()) {
+            // Refused here rather than after the fact: a retry across an
+            // unobserved outcome must not be attempted at all.
+            journal.may_send(ticket).map_err(|reason| anyhow!(reason))?;
+            journal
+                .record(ticket, ProviderRequestPhase::KnownNotSent, None)
+                .map_err(|reason| anyhow!(reason))?;
+        }
+
         let send_once = |c: &crate::auth_store::WireCredentials| {
             let mut req = client
                 .post(&url)
@@ -1768,17 +1844,59 @@ where
             if target.dialect == crate::gateway_config::ProviderDialect::XaiChatCompletions {
                 req = req.header("x-grok-effort", effort.as_str());
             }
+            if let Some(ticket) = ticket.as_ref() {
+                // On the wire, so a provider that honours idempotency can
+                // collapse a duplicate we could not prevent.
+                req = req
+                    .header("Idempotency-Key", ticket.idempotency_key.as_str())
+                    .header("X-Request-Id", ticket.request_id.as_str());
+            }
             let req = crate::auth_store::apply_auth_headers(req, c, &base);
             req.json(&body)
         };
 
+        if let (Some(journal), Some(ticket)) = (journal.as_ref(), ticket.as_ref()) {
+            journal
+                .record(ticket, ProviderRequestPhase::Sending, None)
+                .map_err(|reason| anyhow!(reason))?;
+        }
+
         let resp_result = tokio::select! {
             r = send_once(&creds).send() => r,
-            _ = cancel.cancelled() => bail!("cancelled"),
+            _ = cancel.cancelled() => {
+                // Cancelled with a request in flight: whether the provider saw
+                // it is unknown, and must be recorded as unknown.
+                if let (Some(journal), Some(ticket)) = (journal.as_ref(), ticket.as_ref()) {
+                    let _ = journal.record(
+                        ticket,
+                        ProviderRequestPhase::Uncertain,
+                        Some("cancelled while the request was in flight"),
+                    );
+                }
+                bail!("cancelled");
+            }
         };
         let mut resp = match resp_result {
-            Ok(r) => r,
+            Ok(r) => {
+                if let (Some(journal), Some(ticket)) = (journal.as_ref(), ticket.as_ref()) {
+                    // Headers observed: the provider definitely received it.
+                    journal
+                        .record(ticket, ProviderRequestPhase::Sent, None)
+                        .map_err(|reason| anyhow!(reason))?;
+                }
+                r
+            }
             Err(e) => {
+                if let (Some(journal), Some(ticket)) = (journal.as_ref(), ticket.as_ref()) {
+                    // A connect failure provably never reached the provider;
+                    // anything else may have. Only the first is resendable.
+                    let phase = if e.is_connect() || e.is_builder() {
+                        ProviderRequestPhase::KnownNotSent
+                    } else {
+                        ProviderRequestPhase::Uncertain
+                    };
+                    let _ = journal.record(ticket, phase, Some("transport error"));
+                }
                 last_err = Some(
                     if target.dialect
                         == crate::gateway_config::ProviderDialect::OpenAiChatCompletions
@@ -3045,5 +3163,352 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
         assert!(stationarity.contains("true no-op tool calls"));
         assert!(!is_round_limit_stop_message(&stationarity));
         assert!(round_limit_stop_message(4).contains("tool rounds without a final answer"));
+    }
+}
+
+#[cfg(test)]
+mod provider_request_journal_tests {
+    use super::*;
+    use crate::orchestration::{ProviderRequestSink, ProviderRequestTicket, RequestPhase};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// A sink that records every phase transition in order, and can be asked
+    /// to refuse a resend the way the durable one does.
+    #[derive(Default)]
+    struct RecordingSink {
+        phases: Mutex<Vec<(u32, RequestPhase)>>,
+        refuse_resend: Mutex<Option<String>>,
+    }
+
+    impl RecordingSink {
+        fn phases(&self) -> Vec<(u32, RequestPhase)> {
+            self.phases.lock().unwrap().clone()
+        }
+
+        fn last_phase_for(&self, ordinal: u32) -> Option<RequestPhase> {
+            self.phases
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(o, _)| *o == ordinal)
+                .map(|(_, phase)| *phase)
+        }
+    }
+
+    impl ProviderRequestSink for RecordingSink {
+        fn record(
+            &self,
+            ticket: &ProviderRequestTicket,
+            phase: RequestPhase,
+            _detail: Option<&str>,
+        ) -> Result<(), String> {
+            self.phases
+                .lock()
+                .unwrap()
+                .push((ticket.request_ordinal, phase));
+            Ok(())
+        }
+
+        fn may_send(&self, ticket: &ProviderRequestTicket) -> Result<(), String> {
+            if ticket.request_ordinal == 0 {
+                return Ok(());
+            }
+            match self.refuse_resend.lock().unwrap().clone() {
+                Some(reason) => Err(reason),
+                None => Ok(()),
+            }
+        }
+    }
+
+    struct FakeProvider {
+        addr: std::net::SocketAddr,
+        seen_idempotency_keys: Arc<Mutex<Vec<String>>>,
+        request_count: Arc<AtomicU32>,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    /// How the fake provider treats each request it receives.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FakeBehavior {
+        /// Answer with a complete, well-formed streaming response.
+        Succeed,
+        /// Accept the request, then drop the connection without responding —
+        /// the crash cut where the provider may well have run the work.
+        AcceptThenCrash,
+    }
+
+    async fn start_fake_provider(behavior: FakeBehavior) -> FakeProvider {
+        use axum::extract::State;
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+
+        #[derive(Clone)]
+        struct Shared {
+            keys: Arc<Mutex<Vec<String>>>,
+            count: Arc<AtomicU32>,
+            behavior: FakeBehavior,
+        }
+
+        async fn handle(
+            State(shared): State<Shared>,
+            headers: HeaderMap,
+            _body: axum::body::Bytes,
+        ) -> axum::response::Response {
+            shared.count.fetch_add(1, Ordering::SeqCst);
+            if let Some(key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
+                shared.keys.lock().unwrap().push(key.to_string());
+            }
+            match shared.behavior {
+                FakeBehavior::Succeed => {
+                    let sse = concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n"
+                    );
+                    axum::response::Response::builder()
+                        .status(200)
+                        .header("Content-Type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                }
+                FakeBehavior::AcceptThenCrash => {
+                    // Received and (as far as the client can tell) possibly
+                    // acted on, then the stream fails mid-body with no
+                    // terminator: the client never observes an outcome.
+                    let chunks = futures::stream::iter(vec![
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                            b"data: {\"choices\":[]}\n\n",
+                        )),
+                        Err(std::io::Error::other("provider connection lost")),
+                    ]);
+                    axum::response::Response::builder()
+                        .status(200)
+                        .header("Content-Type", "text/event-stream")
+                        .body(axum::body::Body::from_stream(chunks))
+                        .unwrap()
+                }
+            }
+        }
+
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let count = Arc::new(AtomicU32::new(0));
+        let shared = Shared {
+            keys: keys.clone(),
+            count: count.clone(),
+            behavior,
+        };
+        let app = axum::Router::new()
+            .route("/chat/completions", post(handle))
+            .with_state(shared);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown, rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        FakeProvider {
+            addr,
+            seen_idempotency_keys: keys,
+            request_count: count,
+            shutdown,
+            handle,
+        }
+    }
+
+    impl FakeProvider {
+        async fn stop(self) {
+            let _ = self.shutdown.send(());
+            let _ = self.handle.await;
+        }
+    }
+
+    /// Every physical request carries a stable idempotency key on the wire, and
+    /// the phase machine walks it from minted through settled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_successful_request_is_keyed_on_the_wire_and_walks_its_phases() {
+        let provider = start_fake_provider(FakeBehavior::Succeed).await;
+        let sink = Arc::new(RecordingSink::default());
+        let ticket = ProviderRequestTicket::mint("run-1", "attempt-1", 0);
+
+        // Drive the real send shape: the same headers `send_once` attaches.
+        let client = reqwest::Client::new();
+        sink.record(&ticket, RequestPhase::KnownNotSent, None)
+            .unwrap();
+        sink.record(&ticket, RequestPhase::Sending, None).unwrap();
+        let response = client
+            .post(format!("http://{}/chat/completions", provider.addr))
+            .header("Content-Type", "application/json")
+            .header("Idempotency-Key", ticket.idempotency_key.as_str())
+            .header("X-Request-Id", ticket.request_id.as_str())
+            .json(&serde_json::json!({"model": "m", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        sink.record(&ticket, RequestPhase::Sent, None).unwrap();
+        let _ = response.bytes().await.unwrap();
+        sink.record(&ticket, RequestPhase::Responding, None)
+            .unwrap();
+        sink.record(&ticket, RequestPhase::Settled, None).unwrap();
+
+        let seen = provider.seen_idempotency_keys.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![ticket.idempotency_key.clone()],
+            "the idempotency key must reach the provider"
+        );
+        assert_eq!(
+            sink.phases(),
+            vec![
+                (0, RequestPhase::KnownNotSent),
+                (0, RequestPhase::Sending),
+                (0, RequestPhase::Sent),
+                (0, RequestPhase::Responding),
+                (0, RequestPhase::Settled),
+            ]
+        );
+        assert!(sink.last_phase_for(0).unwrap().is_settled());
+        provider.stop().await;
+    }
+
+    /// The crash cut that matters: the provider accepted the request and then
+    /// died without answering. That is `Uncertain`, and a resend is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_accepted_then_crashed_request_is_uncertain_and_blocks_resend() {
+        let provider = start_fake_provider(FakeBehavior::AcceptThenCrash).await;
+        let sink = Arc::new(RecordingSink::default());
+        let first = ProviderRequestTicket::mint("run-2", "attempt-1", 0);
+
+        let client = reqwest::Client::new();
+        sink.record(&first, RequestPhase::KnownNotSent, None)
+            .unwrap();
+        sink.record(&first, RequestPhase::Sending, None).unwrap();
+        let outcome = client
+            .post(format!("http://{}/chat/completions", provider.addr))
+            .header("Idempotency-Key", first.idempotency_key.as_str())
+            .json(&serde_json::json!({"model": "m", "messages": []}))
+            .send()
+            .await;
+
+        // The provider received the request — it counted it — and then the
+        // response died. From the client's side this is a transport error that
+        // is *not* a connect failure, which is precisely the classification
+        // production uses to choose `Uncertain` over `KnownNotSent`.
+        let error = outcome.expect_err("the crash cut must not yield a response");
+        assert!(
+            !error.is_connect() && !error.is_builder(),
+            "a mid-stream failure must not look like a connect failure: {error}"
+        );
+        let classified = if error.is_connect() || error.is_builder() {
+            RequestPhase::KnownNotSent
+        } else {
+            RequestPhase::Uncertain
+        };
+        assert_eq!(classified, RequestPhase::Uncertain);
+        sink.record(&first, classified, Some("transport error"))
+            .unwrap();
+
+        assert_eq!(sink.last_phase_for(0), Some(RequestPhase::Uncertain));
+        assert!(
+            !RequestPhase::Uncertain.permits_resend(),
+            "unobserved is not the same as not-sent"
+        );
+
+        // A second physical request is refused, not attempted.
+        *sink.refuse_resend.lock().unwrap() = Some(
+            "request 0 for this run has an unobserved outcome; resending would risk duplicate \
+             provider work"
+                .into(),
+        );
+        let second = ProviderRequestTicket::mint("run-2", "attempt-1", 1);
+        let refusal = sink.may_send(&second).unwrap_err();
+        assert!(refusal.contains("unobserved"), "{refusal}");
+        assert_eq!(
+            provider.request_count.load(Ordering::SeqCst),
+            1,
+            "the provider must not have received a duplicate"
+        );
+        provider.stop().await;
+    }
+
+    /// A request that never reached the socket is safe to replace, and its
+    /// successor gets a *different* key so a provider can tell them apart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connect_failure_is_known_not_sent_and_may_be_replaced() {
+        let sink = Arc::new(RecordingSink::default());
+        let first = ProviderRequestTicket::mint("run-3", "attempt-1", 0);
+        sink.record(&first, RequestPhase::KnownNotSent, None)
+            .unwrap();
+        sink.record(&first, RequestPhase::Sending, None).unwrap();
+
+        // Nothing is listening: the request provably never left.
+        let client = reqwest::Client::new();
+        let error = client
+            .post("http://127.0.0.1:1/chat/completions")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_connect(), "expected a connect failure: {error}");
+        sink.record(&first, RequestPhase::KnownNotSent, Some("connect refused"))
+            .unwrap();
+
+        assert!(RequestPhase::KnownNotSent.permits_resend());
+        let second = ProviderRequestTicket::mint("run-3", "attempt-1", 1);
+        assert!(sink.may_send(&second).is_ok());
+        assert_ne!(
+            first.idempotency_key, second.idempotency_key,
+            "each physical request needs its own key"
+        );
+        assert_ne!(first.request_id, second.request_id);
+    }
+
+    /// Request identity is stable for one physical request and derived from the
+    /// attempt, so it survives a process restart unchanged.
+    #[test]
+    fn request_identity_is_stable_and_attempt_scoped() {
+        let a = ProviderRequestTicket::mint("run-4", "attempt-1", 2);
+        let b = ProviderRequestTicket::mint("run-4", "attempt-1", 2);
+        assert_eq!(
+            a, b,
+            "the same physical request must mint the same identity"
+        );
+
+        let other_attempt = ProviderRequestTicket::mint("run-4", "attempt-2", 2);
+        assert_ne!(a.request_id, other_attempt.request_id);
+        let other_run = ProviderRequestTicket::mint("run-5", "attempt-1", 2);
+        assert_ne!(a.request_id, other_run.request_id);
+        assert!(a.idempotency_key.starts_with("grokptah-"));
+    }
+
+    /// After a restart, anything that was in flight is unknown — never
+    /// "not sent", which would license a resend of work that may have run.
+    #[test]
+    fn a_restart_reinterprets_in_flight_requests_as_uncertain() {
+        assert_eq!(
+            RequestPhase::Sending.after_restart(),
+            RequestPhase::Uncertain
+        );
+        assert_eq!(RequestPhase::Sent.after_restart(), RequestPhase::Uncertain);
+        assert_eq!(
+            RequestPhase::Responding.after_restart(),
+            RequestPhase::Uncertain
+        );
+        // Settled work stays settled; provably-unsent work stays resendable.
+        assert_eq!(RequestPhase::Settled.after_restart(), RequestPhase::Settled);
+        assert_eq!(
+            RequestPhase::KnownNotSent.after_restart(),
+            RequestPhase::KnownNotSent
+        );
+        assert!(!RequestPhase::Uncertain.permits_resend());
+        assert!(!RequestPhase::Sent.permits_resend());
+        assert!(!RequestPhase::Responding.permits_resend());
     }
 }

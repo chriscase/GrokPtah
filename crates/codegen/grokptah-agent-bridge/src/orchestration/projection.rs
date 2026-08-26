@@ -18,12 +18,14 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::admission::{AttemptLease, AttemptLeaseState, ProviderSendRecord, ProviderSendState};
+use super::admission::{
+    AttemptLease, AttemptLeaseState, ProviderSendRecord, ProviderSendState, TeardownUncertain,
+};
 use super::types::{RunRecord, RunState};
 
 /// Contract version of every projection in this module. Bumped whenever a
 /// field is added, removed, or changes meaning.
-pub const PROJECTION_VERSION: u32 = 1;
+pub const PROJECTION_VERSION: u32 = 2;
 
 /// What one admitted unit of work looks like to anything outside the bridge.
 ///
@@ -49,6 +51,32 @@ pub struct AdmissionProjection {
     pub attempt_state: Option<AttemptProjectionState>,
     /// What is durably known about whether the work reached the provider.
     pub provider_send_state: Option<ProviderSendProjectionState>,
+    /// Seconds since this attempt's lease was last heartbeat, when it holds
+    /// one. A consumer watching a long turn needs to distinguish "working" from
+    /// "the holder stopped reporting".
+    pub heartbeat_age_seconds: Option<i64>,
+    /// Seconds until this attempt's lease expires, negative once it has.
+    pub lease_expires_in_seconds: Option<i64>,
+    /// The concrete provider route this work is bound to, as a fingerprint.
+    /// Publishing the fingerprint lets a consumer notice a route change
+    /// without ever seeing an endpoint or a credential.
+    pub route_revision: Option<String>,
+    /// True when a previous teardown could not be established. The run's
+    /// capacity and lease are fenced, and no new attempt is authorized.
+    pub teardown_uncertain: bool,
+    /// Bounded, redacted explanation of that uncertainty, when it applies.
+    pub teardown_detail: Option<String>,
+    /// Whether a new attempt for this work is currently permitted.
+    ///
+    /// False whenever the outcome of previous work is unknown — the case where
+    /// retrying risks doing it twice.
+    pub retry_eligible: bool,
+    /// Whether this run currently occupies an admission slot.
+    pub capacity_fenced: bool,
+    /// Remaining wall-clock budget in milliseconds, from the sealed bounds.
+    pub remaining_duration_ms: Option<u64>,
+    /// Round budget from the sealed bounds.
+    pub max_rounds: u32,
     /// Bounded, redacted preview. Never the execution input.
     pub prompt_preview: String,
     pub terminal_result: Option<String>,
@@ -96,12 +124,37 @@ pub fn project_admission(
     run: &RunRecord,
     lease: Option<&AttemptLease>,
     send: Option<&ProviderSendRecord>,
+    uncertainty: Option<&TeardownUncertain>,
+    route_revision: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> AdmissionProjection {
     let attempt_state = lease.map(|lease| match lease.state {
         AttemptLeaseState::Released => AttemptProjectionState::Released,
         AttemptLeaseState::Held if lease.is_expired(now) => AttemptProjectionState::Expired,
         AttemptLeaseState::Held => AttemptProjectionState::Held,
+    });
+    let heartbeat_age_seconds =
+        lease.map(|lease| now.signed_duration_since(lease.heartbeat_at).num_seconds());
+    let lease_expires_in_seconds = lease.map(|lease| {
+        let deadline = lease.heartbeat_at
+            + chrono::Duration::milliseconds(lease.lease_ttl_ms.min(i64::MAX as u64) as i64);
+        deadline.signed_duration_since(now).num_seconds()
+    });
+    // Retry is permitted only when nothing about previous work is unknown.
+    // Two independent things can make it unknown: an unresolved teardown, and
+    // a provider send whose outcome was never observed.
+    let retry_eligible = uncertainty.is_none()
+        && send
+            .map(|send| send.state.permits_new_attempt() || send.state.permits_completion())
+            .unwrap_or(true)
+        && !matches!(run.state, RunState::Starting | RunState::Running);
+    let remaining_duration_ms = run.state.is_terminal().then_some(0).or_else(|| {
+        let elapsed = now.signed_duration_since(run.updated_at).num_milliseconds();
+        Some(
+            run.bounds
+                .max_duration_ms
+                .saturating_sub(elapsed.max(0) as u64),
+        )
     });
     AdmissionProjection {
         projection_version: PROJECTION_VERSION,
@@ -114,6 +167,15 @@ pub fn project_admission(
         attempt: lease.map(|lease| lease.attempt),
         attempt_state,
         provider_send_state: send.map(|send| send.state.into()),
+        heartbeat_age_seconds,
+        lease_expires_in_seconds,
+        route_revision: route_revision.map(str::to_string),
+        teardown_uncertain: uncertainty.is_some(),
+        teardown_detail: uncertainty.map(|record| record.reason.clone()),
+        retry_eligible,
+        capacity_fenced: run.state.is_dispatched() || uncertainty.is_some(),
+        remaining_duration_ms,
+        max_rounds: run.bounds.max_rounds,
         prompt_preview: run.prompt_preview.clone(),
         terminal_result: run.terminal_result.clone(),
         error_code: run.error_code.clone(),
@@ -133,7 +195,11 @@ mod tests {
     }
 
     fn sample() -> AdmissionProjection {
-        let run = RunRecord {
+        project_admission(&sample_run(), None, None, None, None, chrono::Utc::now())
+    }
+
+    fn sample_run() -> RunRecord {
+        RunRecord {
             run_id: "run-1".into(),
             session_id: Uuid::nil(),
             workspace: "/tmp/project".into(),
@@ -158,8 +224,7 @@ mod tests {
             progress: None,
             execution: None,
             approval: None,
-        };
-        project_admission(&run, None, None, chrono::Utc::now())
+        }
     }
 
     /// The Rust type, the JSON Schema, and the TypeScript declaration must
@@ -209,7 +274,13 @@ mod tests {
             .lines()
             .filter_map(|line| {
                 let line = line.trim();
-                if line.is_empty() || line.starts_with("//") || line.starts_with('*') {
+                // Skip blank lines and every form of comment, including the
+                // single-line `/** ... */` doc comments the declarations use.
+                if line.is_empty()
+                    || line.starts_with("//")
+                    || line.starts_with('*')
+                    || line.starts_with("/*")
+                {
                     return None;
                 }
                 let name = line.split(':').next()?.trim().trim_end_matches('?');
@@ -236,7 +307,6 @@ mod tests {
             "\"bearer",
             "\"principalrevision\"",
             "\"policyrevision\"",
-            "\"routerevision\"",
             "\"ownerid\"",
             "\"sendid\"",
             "\"attemptid\"",
@@ -249,6 +319,28 @@ mod tests {
         // The bounded preview is the one prompt-derived field, and it is
         // published under a name that says so.
         assert!(encoded.contains("\"promptpreview\""));
+
+        // `routeRevision` *is* published, deliberately, so a consumer can see
+        // that the provider route changed. It must be a fingerprint and never
+        // the route itself: no endpoint, no host, no credential.
+        let with_route = project_admission(
+            &sample_run(),
+            None,
+            None,
+            None,
+            Some(&"a".repeat(64)),
+            chrono::Utc::now(),
+        );
+        let route = with_route.route_revision.clone().unwrap();
+        assert_eq!(route.len(), 64);
+        assert!(route.chars().all(|c| c.is_ascii_hexdigit()));
+        let encoded = serde_json::to_string(&with_route).unwrap();
+        for leak in ["http://", "https://", "bearer", "api-key", "sk-"] {
+            assert!(
+                !encoded.to_lowercase().contains(leak),
+                "the route fingerprint must not carry {leak}"
+            );
+        }
     }
 
     /// Every provider-send state survives the projection distinctly. Merging

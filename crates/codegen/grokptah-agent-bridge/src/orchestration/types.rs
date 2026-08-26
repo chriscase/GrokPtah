@@ -10,6 +10,17 @@ use crate::completion::{CompletionEvidence, CompletionUsage};
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
     Queued,
+    /// An attempt holds this run's lease and is being dispatched, but no
+    /// worker has acknowledged yet.
+    ///
+    /// This state exists because `queued -> running` hides a real interval:
+    /// the lease is taken, tasks are created, handles are registered, and only
+    /// then does a worker begin. A crash anywhere in that window used to look
+    /// like "still queued", which is a claim the ledger could not support —
+    /// the lease was already gone. `Starting` is the honest name for it, and
+    /// recovery treats it as an attempt that must be reconciled, not as work
+    /// that never began.
+    Starting,
     Running,
     Completed,
     Failed,
@@ -19,6 +30,14 @@ pub enum RunState {
 }
 
 impl RunState {
+    /// Whether an attempt for this run has been authorized and may have begun.
+    ///
+    /// `Starting` counts: its lease is held and its tasks may be moments from
+    /// executing, so nothing may treat it as un-dispatched.
+    pub fn is_dispatched(self) -> bool {
+        matches!(self, Self::Starting | Self::Running)
+    }
+
     pub fn is_terminal(self) -> bool {
         matches!(
             self,

@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use grokptah_agent_bridge::orchestration::{
     hash_payload, AcceptanceIntent, AttemptLeaseState, AuthContext, OrchStore, OrchestrationConfig,
-    OrchestrationService, ProviderSendState, RunBounds, SealedBounds, WorkspaceAllowlist,
-    ACCEPTANCE_INTENT_VERSION,
+    OrchestrationService, ProviderSendState, RunBounds, SealStamp, SealedBounds,
+    WorkspaceAllowlist, ACCEPTANCE_INTENT_VERSION,
 };
 use grokptah_agent_bridge::{
     safe_id_filename, set_grokptah_home_override, AgentHost, AgentHostHandle, HostConfig,
@@ -264,11 +264,6 @@ async fn wait_all_terminal(rig: &Rig, run_ids: &[String], timeout: Duration) {
 fn run_state(rig: &Rig, run_id: &str) -> RunState {
     let value = rig.orch.get_run(&rig.auth(), run_id).unwrap();
     serde_json::from_value(value["state"].clone()).unwrap()
-}
-
-fn error_code(rig: &Rig, run_id: &str) -> Option<String> {
-    let value = rig.orch.get_run(&rig.auth(), run_id).unwrap();
-    value["errorCode"].as_str().map(str::to_string)
 }
 
 fn intent_file(store_root: &Path, run_id: &str) -> std::path::PathBuf {
@@ -685,6 +680,7 @@ async fn recovery_never_synthesizes_a_run_from_orphaned_input() {
         agent_id: None,
         agent_revision: 0,
         spec_revision: "grokptah-agent-bridge/orchestration/1".into(),
+        principal_token_id: "primary".into(),
         principal_revision: hash_payload(&json!({"principal": "test"})),
         policy_revision: hash_payload(&json!({"policy": "test"})),
         route_revision: hash_payload(&json!({"route": "test"})),
@@ -700,8 +696,10 @@ async fn recovery_never_synthesizes_a_run_from_orphaned_input() {
         parent_run_id: None,
         created_at: chrono::Utc::now(),
         digest: String::new(),
+        seal: SealStamp::unsealed(),
     }
-    .seal();
+    .seal_with(rig.orch.store().seal_authority())
+    .unwrap();
     rig.orch.store().save_acceptance_intent(&intent).unwrap();
     assert!(intent_file(&store_root, &orphan_run).is_file());
 
@@ -782,7 +780,7 @@ async fn crash_after_lease_before_spawn_still_runs_exactly_once() {
     assert_eq!(held.state, AttemptLeaseState::Held);
 
     let rig = rig.restart().await;
-    wait_all_terminal(&rig, &[run_id.clone()], Duration::from_secs(90)).await;
+    wait_all_terminal(&rig, std::slice::from_ref(&run_id), Duration::from_secs(90)).await;
 
     assert_eq!(
         rig.markers()
@@ -817,7 +815,7 @@ async fn input_left_behind_after_terminalization_never_reruns() {
         .await
         .unwrap();
     let run_id = response["runId"].as_str().unwrap().to_string();
-    wait_all_terminal(&rig, &[run_id.clone()], Duration::from_secs(60)).await;
+    wait_all_terminal(&rig, std::slice::from_ref(&run_id), Duration::from_secs(60)).await;
     assert_eq!(rig.markers().get("cleanup-marker").copied(), Some(1));
 
     // Re-plant the input, as a crash between "terminal" and "input removed"
@@ -835,6 +833,7 @@ async fn input_left_behind_after_terminalization_never_reruns() {
         agent_id: None,
         agent_revision: 0,
         spec_revision: "grokptah-agent-bridge/orchestration/1".into(),
+        principal_token_id: "primary".into(),
         principal_revision: hash_payload(&json!({"principal": "test"})),
         policy_revision: hash_payload(&json!({"policy": "test"})),
         route_revision: hash_payload(&json!({"route": "test"})),
@@ -850,8 +849,10 @@ async fn input_left_behind_after_terminalization_never_reruns() {
         parent_run_id: None,
         created_at: chrono::Utc::now(),
         digest: String::new(),
+        seal: SealStamp::unsealed(),
     }
-    .seal();
+    .seal_with(rig.orch.store().seal_authority())
+    .unwrap();
     rig.orch.store().save_acceptance_intent(&replanted).unwrap();
 
     let rig = rig.restart().await;
@@ -986,6 +987,9 @@ async fn durable_input_is_private_and_symlink_resistant() {
         .unwrap();
     let run_id = response["runId"].as_str().unwrap().to_string();
     let store_root = rig.store_path();
+    // Only the Unix authority assertions below read this; on Windows the
+    // equivalent check is the DACL verdict, unit-tested in `ledger_io`.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let path = intent_file(&store_root, &run_id);
 
     #[cfg(unix)]
@@ -1165,7 +1169,12 @@ async fn capacity_is_not_reused_until_the_worker_future_is_gone() {
         "capacity was reported free while the worker future could still run"
     );
 
-    wait_all_terminal(&rig, &[queued_id.clone()], Duration::from_secs(60)).await;
+    wait_all_terminal(
+        &rig,
+        std::slice::from_ref(&queued_id),
+        Duration::from_secs(60),
+    )
+    .await;
     assert_eq!(
         rig.orch.worker_future_finished(&long_id),
         Some(true),
@@ -1204,8 +1213,17 @@ async fn shutdown_terminalizes_every_live_run() {
         .await
         .unwrap();
     let run_id = long["runId"].as_str().unwrap().to_string();
-    wait_for("dispatch", Duration::from_secs(10), || {
-        rig.orch.live_run_ids().contains(&run_id)
+    // Wait for the worker to actually be *running*, not merely published.
+    //
+    // Publication now happens before the start gate opens, so `the future has
+    // not finished` is also true of a worker parked behind a closed gate,
+    // which is a different state: teardown there is certain, not uncertain.
+    // `Running` is written by the worker itself as its first durable act, so
+    // pairing it with an unfinished future is the unambiguous statement that
+    // work is in flight.
+    wait_for("the worker to start", Duration::from_secs(20), || {
+        rig.orch.worker_future_finished(&run_id) == Some(false)
+            && run_state(&rig, &run_id) == RunState::Running
     })
     .await;
 
@@ -1228,15 +1246,50 @@ async fn shutdown_terminalizes_every_live_run() {
         "shutdown must name why the run ended, saw {:?}",
         record.error_code
     );
-    assert!(
-        !intent_file(&store_root, &run_id).is_file(),
-        "a terminalized run must not keep executable input"
-    );
-    let lease = reopened.load_attempt_lease(&run_id).unwrap();
-    assert!(
-        lease.is_none() || lease.unwrap().state == AttemptLeaseState::Released,
-        "a terminalized run must not keep a held attempt lease"
-    );
+    // Shutdown reaches one of exactly two states, and which one it reaches is
+    // a genuine race with the abort: if the worker's future is dropped before
+    // the synchronous path looks, quiescence really was proved and there is
+    // nothing to fence; if it is not, the outcome is unknown and must be
+    // recorded. Asserting only one of those would be asserting who won a
+    // race, so what is asserted here is that the three durable consequences
+    // never disagree — which is the actual bug class. The fenced branch is
+    // driven deterministically, across a real process boundary, by
+    // `orchestration_durability_p2::a_fenced_attempt_survives_the_death_of_the_coordinator_that_fenced_it`.
+    let fence = reopened.load_teardown_uncertain(&run_id).unwrap();
+    let lease = reopened
+        .load_attempt_lease(&run_id)
+        .unwrap()
+        .expect("a dispatched attempt always leaves a lease record");
+    let input_retained = intent_file(&store_root, &run_id).is_file();
+    match &fence {
+        Some(fence) => {
+            assert_eq!(fence.run_id, run_id);
+            assert!(
+                !fence.reason.is_empty(),
+                "the fence must say why the outcome is unknown"
+            );
+            assert_eq!(
+                lease.state,
+                AttemptLeaseState::Held,
+                "a fenced run's lease must not be released, by shutdown or by a restart"
+            );
+            assert!(
+                input_retained,
+                "a fenced run keeps its durable input until the fence is lifted"
+            );
+        }
+        None => {
+            assert_eq!(
+                lease.state,
+                AttemptLeaseState::Released,
+                "an unfenced terminal run must not still hold its lease"
+            );
+            assert!(
+                !input_retained,
+                "an unfenced terminal run must not keep executable input"
+            );
+        }
+    }
     drop(reopened);
     drop(home);
     drop(ws);
@@ -1282,7 +1335,7 @@ async fn public_surfaces_never_expose_the_private_prompt() {
     assert!(!encoded.contains(secret), "receipt leaked the prompt");
     assert!(!encoded.contains(TOKEN), "receipt leaked the control token");
 
-    wait_all_terminal(&rig, &[run_id.clone()], Duration::from_secs(60)).await;
+    wait_all_terminal(&rig, std::slice::from_ref(&run_id), Duration::from_secs(60)).await;
 
     let store_root = rig.store_path();
     // The admission surfaces summarize the work; they never carry the input.
@@ -1363,7 +1416,7 @@ async fn a_completed_run_carries_sent_provider_evidence() {
         .await
         .unwrap();
     let run_id = response["runId"].as_str().unwrap().to_string();
-    wait_all_terminal(&rig, &[run_id.clone()], Duration::from_secs(60)).await;
+    wait_all_terminal(&rig, std::slice::from_ref(&run_id), Duration::from_secs(60)).await;
 
     let run = rig.orch.store().load_run(&run_id).unwrap().expect("run");
     let send = rig

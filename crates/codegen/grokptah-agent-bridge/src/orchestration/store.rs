@@ -9,12 +9,15 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 
 use super::admission::{
-    AcceptanceIntent, AttemptLease, AttemptLeaseState, ProviderSendFailure, ProviderSendRecord,
-    ProviderSendState, ATTEMPT_LEASE_VERSION, PROVIDER_SEND_VERSION,
+    AcceptanceIntent, AttemptLease, AttemptLeaseState, ProviderRequestTicket, ProviderSendFailure,
+    ProviderSendRecord, ProviderSendState, RequestPhase, SealedTombstone, TeardownUncertain,
+    ATTEMPT_LEASE_VERSION, PROVIDER_SEND_VERSION, TEARDOWN_UNCERTAIN_VERSION, TOMBSTONE_VERSION,
 };
 use super::ledger_io::LedgerDir;
+use super::seal::SealAuthority;
 use super::types::{
     safe_id_filename, AgentRecord, AgentState, AuditEntry, ContinuationCheckpoint,
     IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunRecord, RunState,
@@ -34,6 +37,15 @@ struct OrchStoreInner {
     leases: LedgerDir,
     sends: LedgerDir,
     tombstones: LedgerDir,
+    /// Positive statements that an attempt's outcome is unknown. Their
+    /// presence fences a run's conflict domain.
+    uncertainty: LedgerDir,
+    /// One record per *physical* provider request, keyed by request identity.
+    requests: LedgerDir,
+    /// The keyed authority every sealed record is verified against. Held by
+    /// the store so no caller can accidentally verify against a key of its
+    /// own choosing.
+    authority: SealAuthority,
     _store_lock: fs::File,
     lock: Mutex<()>,
     last_run_error: Mutex<Option<String>>,
@@ -114,6 +126,8 @@ impl OrchStore {
         create_private_dir(&root.join("leases"))?;
         create_private_dir(&root.join("sends"))?;
         create_private_dir(&root.join("tombstones"))?;
+        create_private_dir(&root.join("uncertainty"))?;
+        create_private_dir(&root.join("requests"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -152,6 +166,12 @@ impl OrchStore {
         let leases = open_ledger(&root, "leases")?;
         let sends = open_ledger(&root, "sends")?;
         let tombstones = open_ledger(&root, "tombstones")?;
+        let uncertainty = open_ledger(&root, "uncertainty")?;
+        let requests = open_ledger(&root, "requests")?;
+        // Fail closed: a store whose sealing authority cannot be opened is a
+        // store we cannot authenticate, so it does not open at all.
+        let authority = SealAuthority::open(&root)
+            .map_err(|error| anyhow::anyhow!("sealing authority unavailable: {}", error.message))?;
         let store = Self {
             inner: Arc::new(OrchStoreInner {
                 root,
@@ -159,6 +179,9 @@ impl OrchStore {
                 leases,
                 sends,
                 tombstones,
+                uncertainty,
+                requests,
+                authority,
                 _store_lock: store_lock,
                 lock: Mutex::new(()),
                 last_run_error: Mutex::new(None),
@@ -171,17 +194,152 @@ impl OrchStore {
             }),
         };
         store.recover_finalization_intents()?;
-        // Opening the ledger takes an exclusive advisory lock, so reaching
-        // this point proves no other process owns these runs. Every attempt
-        // lease on disk therefore belongs to an instance that is gone, and is
-        // released so recovery does not have to wait out its TTL.
-        store.release_orphaned_attempt_leases()?;
+        // A request that was in flight when this process's predecessor died
+        // has an unknown outcome, and must be recorded as unknown before
+        // anything consults it.
+        store.reinterpret_in_flight_requests()?;
+        // Terminalize first, then release leases. The disposition of a run is
+        // what decides whether its lease may be released at all, so it has to
+        // be settled before that decision is made.
         store.mark_unfinished_interrupted()?;
+        store.drop_inputs_for_terminal_runs()?;
+        store.release_orphaned_attempt_leases()?;
         store.fail_orphaned_idempotency_claims()?;
         // Cleanup is best-effort at the record level, but directory access
         // failures still surface so a broken ledger cannot look healthy.
         store.prune_retention(RetentionPolicy::default())?;
         Ok(store)
+    }
+
+    /// The keyed authority this store verifies every sealed record against.
+    ///
+    /// Exposed so the service can seal records it is about to hand back, and
+    /// so operators can inspect key protection and rotation state — never so a
+    /// caller can substitute an authority of its own.
+    pub fn seal_authority(&self) -> &SealAuthority {
+        &self.inner.authority
+    }
+
+    /// Rewrite every sealed holder under the current key, all or nothing.
+    ///
+    /// Rotation alone leaves a ledger sealed under a mix of keys, and a mixed
+    /// ledger is one where a forgery sealed under a retired key is
+    /// indistinguishable from an honest record that has not been rewritten
+    /// yet. This closes that window: every input, lease, send, and tombstone
+    /// is re-verified under whichever key sealed it and re-sealed under the
+    /// current one, and if any single record cannot be carried across, nothing
+    /// is committed.
+    ///
+    /// Returns how many records were resealed.
+    pub fn reseal_all_holders(&self) -> Result<ResealReport, OrchError> {
+        let authority = self.inner.authority.clone();
+        let _guard = self.inner.lock.lock();
+
+        // Phase 1: read and re-seal everything in memory. A single failure
+        // here aborts before any file is rewritten.
+        let mut staged: Vec<(&LedgerDir, String, Vec<u8>)> = Vec::new();
+        let mut report = ResealReport::default();
+
+        for name in self.inner.inputs.list("json")? {
+            let Some(text) = self.inner.inputs.read_private(&name)? else {
+                continue;
+            };
+            let intent: AcceptanceIntent = serde_json::from_str(&text).map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    format!("acceptance intent {name} is unreadable: {error}"),
+                )
+            })?;
+            intent.validate(&authority)?;
+            report.inputs_scanned += 1;
+            if authority.is_current(&intent.seal) {
+                continue;
+            }
+            let resealed = intent.seal_with(&authority)?;
+            staged.push((
+                &self.inner.inputs,
+                name,
+                serde_json::to_vec_pretty(&resealed).map_err(json_error)?,
+            ));
+        }
+
+        for name in self.inner.leases.list("json")? {
+            let Some(text) = self.inner.leases.read_private(&name)? else {
+                continue;
+            };
+            let lease: AttemptLease = serde_json::from_str(&text).map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    format!("attempt lease {name} is unreadable: {error}"),
+                )
+            })?;
+            lease.validate(&authority)?;
+            report.leases_scanned += 1;
+            if authority.is_current(&lease.seal) {
+                continue;
+            }
+            let resealed = lease.seal_with(&authority)?;
+            staged.push((
+                &self.inner.leases,
+                name,
+                serde_json::to_vec_pretty(&resealed).map_err(json_error)?,
+            ));
+        }
+
+        for name in self.inner.sends.list("json")? {
+            let Some(text) = self.inner.sends.read_private(&name)? else {
+                continue;
+            };
+            let send: ProviderSendRecord = serde_json::from_str(&text).map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    format!("provider send {name} is unreadable: {error}"),
+                )
+            })?;
+            send.validate(&authority)?;
+            report.sends_scanned += 1;
+            if authority.is_current(&send.seal) {
+                continue;
+            }
+            let resealed = send.seal_with(&authority)?;
+            staged.push((
+                &self.inner.sends,
+                name,
+                serde_json::to_vec_pretty(&resealed).map_err(json_error)?,
+            ));
+        }
+
+        for name in self.inner.tombstones.list("json")? {
+            let Some(text) = self.inner.tombstones.read_private(&name)? else {
+                continue;
+            };
+            let tombstone: SealedTombstone = serde_json::from_str(&text).map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    format!("idempotency tombstone {name} is unreadable: {error}"),
+                )
+            })?;
+            tombstone.validate(&authority)?;
+            report.tombstones_scanned += 1;
+            if authority.is_current(&tombstone.seal) {
+                continue;
+            }
+            let resealed = tombstone.seal_with(&authority)?;
+            staged.push((
+                &self.inner.tombstones,
+                name,
+                serde_json::to_vec_pretty(&resealed).map_err(json_error)?,
+            ));
+        }
+
+        // Phase 2: commit. Every record has already been proved carryable, so
+        // the only failures left here are I/O, and each is surfaced rather
+        // than leaving a half-resealed ledger unreported.
+        for (ledger, name, bytes) in &staged {
+            ledger.write_private(name, bytes)?;
+        }
+        report.resealed = staged.len();
+        Ok(report)
     }
 
     pub fn root(&self) -> &Path {
@@ -628,7 +786,7 @@ impl OrchStore {
     /// completed: a receipt that says "accepted" always has a durable input
     /// behind it.
     pub fn save_acceptance_intent(&self, intent: &AcceptanceIntent) -> Result<(), OrchError> {
-        intent.validate()?;
+        intent.validate(&self.inner.authority)?;
         let name = Self::record_name(&intent.run_id)?;
         let bytes = serde_json::to_vec_pretty(intent)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
@@ -661,7 +819,7 @@ impl OrchStore {
                 format!("acceptance intent is unreadable: {error}"),
             )
         })?;
-        intent.validate()?;
+        intent.validate(&self.inner.authority)?;
         if intent.run_id != run_id {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -690,7 +848,7 @@ impl OrchStore {
                 .ok()
                 .flatten()
                 .and_then(|text| serde_json::from_str::<AcceptanceIntent>(&text).ok())
-                .filter(|intent| intent.validate().is_ok())
+                .filter(|intent| intent.validate(&self.inner.authority).is_ok())
                 .map(|intent| intent.run_id);
             out.push((name, run_id));
         }
@@ -735,7 +893,7 @@ impl OrchStore {
                 format!("attempt lease is unreadable: {error}"),
             )
         })?;
-        lease.validate()?;
+        lease.validate(&self.inner.authority)?;
         if lease.run_id != run_id {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -804,9 +962,10 @@ impl OrchStore {
             lease_ttl_ms: ttl_ms.max(1),
             state: AttemptLeaseState::Held,
             digest: String::new(),
+            seal: super::seal::SealStamp::unsealed(),
         }
-        .seal();
-        lease.validate()?;
+        .seal_with(&self.inner.authority)?;
+        lease.validate(&self.inner.authority)?;
         self.write_attempt_lease_unlocked(&name, &lease)?;
         Ok(lease)
     }
@@ -853,9 +1012,10 @@ impl OrchStore {
         let renewed = AttemptLease {
             heartbeat_at: Utc::now(),
             digest: String::new(),
+            seal: super::seal::SealStamp::unsealed(),
             ..current
         }
-        .seal();
+        .seal_with(&self.inner.authority)?;
         self.write_attempt_lease_unlocked(&name, &renewed)?;
         Ok(renewed)
     }
@@ -886,9 +1046,10 @@ impl OrchStore {
             state: AttemptLeaseState::Released,
             heartbeat_at: Utc::now(),
             digest: String::new(),
+            seal: super::seal::SealStamp::unsealed(),
             ..current
         }
-        .seal();
+        .seal_with(&self.inner.authority)?;
         self.write_attempt_lease_unlocked(&name, &released)?;
         Ok(true)
     }
@@ -914,9 +1075,10 @@ impl OrchStore {
             state: AttemptLeaseState::Released,
             heartbeat_at: Utc::now(),
             digest: String::new(),
+            seal: super::seal::SealStamp::unsealed(),
             ..current
         }
-        .seal();
+        .seal_with(&self.inner.authority)?;
         self.write_attempt_lease_unlocked(&name, &reclaimed)?;
         Ok(Some(reclaimed))
     }
@@ -935,7 +1097,7 @@ impl OrchStore {
                 .ok()
                 .flatten()
                 .and_then(|text| serde_json::from_str::<AttemptLease>(&text).ok())
-                .filter(|lease| lease.validate().is_ok());
+                .filter(|lease| lease.validate(&self.inner.authority).is_ok());
             out.push((name, lease));
         }
         Ok(out)
@@ -976,9 +1138,10 @@ impl OrchStore {
             created_at: now,
             updated_at: now,
             digest: String::new(),
+            seal: super::seal::SealStamp::unsealed(),
         }
-        .seal();
-        record.validate()?;
+        .seal_with(&self.inner.authority)?;
+        record.validate(&self.inner.authority)?;
         self.write_provider_send_unlocked(&name, &record)?;
         Ok(record)
     }
@@ -1006,7 +1169,7 @@ impl OrchStore {
                 format!("provider send record is unreadable: {error}"),
             )
         })?;
-        record.validate()?;
+        record.validate(&self.inner.authority)?;
         if record.run_id != run_id {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -1073,10 +1236,11 @@ impl OrchStore {
             detail,
             updated_at: Utc::now(),
             digest: String::new(),
+            seal: super::seal::SealStamp::unsealed(),
             ..current
         }
-        .seal();
-        updated.validate()?;
+        .seal_with(&self.inner.authority)?;
+        updated.validate(&self.inner.authority)?;
         self.write_provider_send_unlocked(&name, &updated)?;
         Ok(updated)
     }
@@ -1085,6 +1249,218 @@ impl OrchStore {
         let name = Self::record_name(run_id)?;
         let _guard = self.inner.lock.lock();
         self.inner.sends.remove(&name)
+    }
+
+    // ── physical provider requests ─────────────────────────────────────
+
+    /// Record the phase of one physical HTTP request.
+    ///
+    /// Phases only ever move forward, and never back into a resendable state
+    /// from one that may already have reached the provider.
+    pub fn record_provider_request(
+        &self,
+        run_id: &str,
+        ticket: &ProviderRequestTicket,
+        phase: RequestPhase,
+        detail: Option<&str>,
+    ) -> Result<(), OrchError> {
+        let name = Self::record_name(&ticket.request_id)?;
+        let _guard = self.inner.lock.lock();
+        let previous = self.load_request_unlocked(&name)?;
+        if let Some(previous) = previous.as_ref() {
+            let current = previous.phase;
+            if current == phase {
+                return Ok(());
+            }
+            if !request_phase_may_advance(current, phase) {
+                return Err(OrchError::with_data(
+                    OrchErrorCode::Conflict,
+                    "provider request phase cannot move backwards",
+                    serde_json::json!({ "from": current.as_str(), "to": phase.as_str() }),
+                ));
+            }
+        }
+        let record = ProviderRequestRecord {
+            request_id: ticket.request_id.clone(),
+            idempotency_key: ticket.idempotency_key.clone(),
+            request_ordinal: ticket.request_ordinal,
+            run_id: run_id.to_string(),
+            phase,
+            detail: detail.map(|value| value.chars().take(300).collect()),
+            updated_at: Utc::now(),
+        };
+        let bytes = serde_json::to_vec_pretty(&record).map_err(json_error)?;
+        self.inner.requests.write_private(&name, &bytes)
+    }
+
+    pub fn load_provider_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ProviderRequestRecord>, OrchError> {
+        let name = Self::record_name(request_id)?;
+        let _guard = self.inner.lock.lock();
+        self.load_request_unlocked(&name)
+    }
+
+    fn load_request_unlocked(
+        &self,
+        name: &str,
+    ) -> Result<Option<ProviderRequestRecord>, OrchError> {
+        let Some(text) = self.inner.requests.read_private(name)? else {
+            return Ok(None);
+        };
+        serde_json::from_str(&text).map(Some).map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("provider request record is unreadable: {error}"),
+            )
+        })
+    }
+
+    /// Every physical request recorded for one run, in send order.
+    pub fn list_provider_requests(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<ProviderRequestRecord>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut out = Vec::new();
+        for name in self.inner.requests.list("json")? {
+            let Some(record) = self.load_request_unlocked(&name)? else {
+                continue;
+            };
+            if record.run_id == run_id {
+                out.push(record);
+            }
+        }
+        out.sort_by_key(|record| record.request_ordinal);
+        Ok(out)
+    }
+
+    /// Reinterpret in-flight requests after a restart.
+    ///
+    /// A process that died mid-send left no observer. Anything from `Sending`
+    /// through `Responding` therefore becomes `Uncertain`: the provider may
+    /// have received the work, run it, and billed for it, and nobody saw the
+    /// answer. Calling that `KnownNotSent` would license a resend of work that
+    /// already happened.
+    pub fn reinterpret_in_flight_requests(&self) -> anyhow::Result<usize> {
+        let names = self
+            .inner
+            .requests
+            .list("json")
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let mut changed = 0;
+        for name in names {
+            let _guard = self.inner.lock.lock();
+            let Some(mut record) = self
+                .load_request_unlocked(&name)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            else {
+                continue;
+            };
+            let next = record.phase.after_restart();
+            if next == record.phase {
+                continue;
+            }
+            record.phase = next;
+            record.detail = Some(
+                "process ended while this request was in flight; the outcome was never observed"
+                    .into(),
+            );
+            record.updated_at = Utc::now();
+            let bytes = serde_json::to_vec_pretty(&record)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            self.inner
+                .requests
+                .write_private(&name, &bytes)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            changed += 1;
+        }
+        Ok(changed)
+    }
+
+    // ── teardown uncertainty ───────────────────────────────────────────
+
+    /// Record that one attempt's outcome could not be established.
+    ///
+    /// Callable from a synchronous `Drop`, because writing a small sealed file
+    /// is the *only* honest thing such a path can do: it cannot await, so it
+    /// cannot prove anything, so it says so instead of guessing.
+    pub fn record_teardown_uncertain(
+        &self,
+        run_id: &str,
+        attempt_id: &str,
+        owner_id: &str,
+        reason: &str,
+    ) -> Result<(), OrchError> {
+        let name = Self::record_name(run_id)?;
+        let record = TeardownUncertain {
+            record_version: TEARDOWN_UNCERTAIN_VERSION,
+            run_id: run_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            owner_id: owner_id.to_string(),
+            reason: reason.chars().take(500).collect(),
+            recorded_at: Utc::now(),
+            digest: String::new(),
+            seal: super::seal::SealStamp::unsealed(),
+        }
+        .seal_with(&self.inner.authority)?;
+        let bytes = serde_json::to_vec_pretty(&record).map_err(json_error)?;
+        let _guard = self.inner.lock.lock();
+        self.inner.uncertainty.write_private(&name, &bytes)
+    }
+
+    /// Whether this run's conflict domain is fenced by an unresolved teardown.
+    pub fn load_teardown_uncertain(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<TeardownUncertain>, OrchError> {
+        let name = Self::record_name(run_id)?;
+        let _guard = self.inner.lock.lock();
+        let Some(text) = self.inner.uncertainty.read_private(&name)? else {
+            return Ok(None);
+        };
+        let record: TeardownUncertain = serde_json::from_str(&text).map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("teardown uncertainty record is unreadable: {error}"),
+            )
+        })?;
+        record.validate(&self.inner.authority)?;
+        if record.run_id != run_id {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "teardown uncertainty record does not belong to this run",
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    /// Every run currently fenced by an unresolved teardown.
+    pub fn list_teardown_uncertain(&self) -> Result<Vec<TeardownUncertain>, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let names = self.inner.uncertainty.list("json")?;
+        let mut out = Vec::new();
+        for name in names {
+            let Some(text) = self.inner.uncertainty.read_private(&name)? else {
+                continue;
+            };
+            if let Ok(record) = serde_json::from_str::<TeardownUncertain>(&text) {
+                if record.validate(&self.inner.authority).is_ok() {
+                    out.push(record);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+        Ok(out)
+    }
+
+    /// Lift the fence, after an operator or a reconciler established what
+    /// actually happened. Never called implicitly.
+    pub fn clear_teardown_uncertain(&self, run_id: &str) -> Result<bool, OrchError> {
+        let name = Self::record_name(run_id)?;
+        let _guard = self.inner.lock.lock();
+        self.inner.uncertainty.remove(&name)
     }
 
     // ── idempotency tombstones ─────────────────────────────────────────
@@ -1096,7 +1472,9 @@ impl OrchStore {
     /// pruning a failed receipt would silently reopen the request for a fresh
     /// attempt — a failed submission would become executable simply by waiting
     /// out the retention horizon. The tombstone is tiny by design so keeping
-    /// it far longer than the receipt costs almost nothing.
+    /// it far longer than the receipt costs almost nothing, and it carries the
+    /// same keyed authority seal, because a forgeable tombstone would be worth
+    /// exactly as much to an attacker as a forgeable receipt.
     pub fn write_idempotency_tombstone(
         &self,
         request_id: &str,
@@ -1104,66 +1482,82 @@ impl OrchStore {
         payload_hash: &str,
         outcome: &str,
         run_id: Option<&str>,
+        spec_key: Option<&str>,
     ) -> Result<(), OrchError> {
-        let name = Self::record_name(request_id)?;
+        let (name, bytes) = self.seal_idempotency_tombstone(
+            request_id,
+            tool,
+            payload_hash,
+            outcome,
+            run_id,
+            spec_key,
+        )?;
         let _guard = self.inner.lock.lock();
-        let record = serde_json::json!({
-            "tombstoneVersion": 1,
-            "requestId": request_id,
-            "tool": tool,
-            "payloadHash": payload_hash,
-            "outcome": outcome,
-            "runId": run_id,
-            "recordedAt": Utc::now().to_rfc3339(),
-        });
-        let bytes = serde_json::to_vec_pretty(&record)
-            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         self.inner.tombstones.write_private(&name, &bytes)
     }
 
+    /// Seal a tombstone without touching the store lock.
+    ///
+    /// Sealing is the expensive, fallible half (it can fail closed on a
+    /// retired or unavailable key); doing it outside the lock is what lets
+    /// [`OrchStore::finish_idempotency`] hold a *single* guard across the
+    /// tombstone and the receipt write instead of releasing it between them.
+    fn seal_idempotency_tombstone(
+        &self,
+        request_id: &str,
+        tool: &str,
+        payload_hash: &str,
+        outcome: &str,
+        run_id: Option<&str>,
+        spec_key: Option<&str>,
+    ) -> Result<(String, Vec<u8>), OrchError> {
+        let name = Self::record_name(request_id)?;
+        let record = SealedTombstone {
+            tombstone_version: TOMBSTONE_VERSION,
+            request_id: request_id.to_string(),
+            tool: tool.to_string(),
+            payload_hash: payload_hash.to_string(),
+            outcome: outcome.to_string(),
+            run_id: run_id.map(str::to_string),
+            spec_key: spec_key.map(str::to_string),
+            recorded_at: Utc::now(),
+            digest: String::new(),
+            seal: super::seal::SealStamp::unsealed(),
+        }
+        .seal_with(&self.inner.authority)?;
+        record.validate(&self.inner.authority)?;
+        let bytes = serde_json::to_vec_pretty(&record).map_err(json_error)?;
+        Ok((name, bytes))
+    }
+
     /// The recorded decision for a request identity, if any.
+    ///
+    /// A tombstone that does not authenticate is an error, not an absence: a
+    /// caller must never conclude "no decision was recorded" from a record it
+    /// could not verify.
     pub fn load_idempotency_tombstone(
         &self,
         request_id: &str,
-    ) -> Result<Option<IdempotencyTombstone>, OrchError> {
+    ) -> Result<Option<SealedTombstone>, OrchError> {
         let name = Self::record_name(request_id)?;
         let _guard = self.inner.lock.lock();
         let Some(text) = self.inner.tombstones.read_private(&name)? else {
             return Ok(None);
         };
-        let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+        let record: SealedTombstone = serde_json::from_str(&text).map_err(|error| {
             OrchError::new(
                 OrchErrorCode::Conflict,
                 format!("idempotency tombstone is unreadable: {error}"),
             )
         })?;
-        let field = |key: &str| -> Option<String> {
-            value.get(key).and_then(|v| v.as_str()).map(str::to_string)
-        };
-        let (Some(recorded_request), Some(tool), Some(payload_hash), Some(outcome)) = (
-            field("requestId"),
-            field("tool"),
-            field("payloadHash"),
-            field("outcome"),
-        ) else {
-            return Err(OrchError::new(
-                OrchErrorCode::Conflict,
-                "idempotency tombstone is missing required fields",
-            ));
-        };
-        if recorded_request != request_id {
+        record.validate(&self.inner.authority)?;
+        if record.request_id != request_id {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
                 "idempotency tombstone does not belong to this request",
             ));
         }
-        Ok(Some(IdempotencyTombstone {
-            request_id: recorded_request,
-            tool,
-            payload_hash,
-            outcome,
-            run_id: field("runId"),
-        }))
+        Ok(Some(record))
     }
 
     pub fn list_idempotency_tombstones(&self) -> Result<Vec<String>, OrchError> {
@@ -1345,6 +1739,35 @@ impl OrchStore {
         status: &str,
     ) -> Result<(), OrchError> {
         let path = self.idemp_path(request_id)?;
+        // Seal first, outside the lock.
+        //
+        // Sealing is the fallible half: it fails closed when the authority key
+        // is unavailable or has been retired. Doing it before the transaction
+        // opens means an unusable key aborts the finish with *nothing*
+        // written, rather than half-written state.
+        let (tombstone_name, tombstone_bytes) = self.seal_idempotency_tombstone(
+            request_id,
+            tool,
+            payload_hash,
+            status,
+            run_id.as_deref(),
+            spec_key.as_deref(),
+        )?;
+        let receipt = IdempotencyReceipt {
+            request_id: request_id.into(),
+            payload_hash: payload_hash.into(),
+            run_id,
+            spec_key,
+            tool: tool.into(),
+            response,
+            error,
+            created_at: Utc::now(),
+            status: status.into(),
+        };
+
+        // One guard spans the whole transaction: precondition, tombstone,
+        // receipt. No other writer can observe or interleave with the window
+        // between the two records.
         let _g = self.inner.lock.lock();
         if !path.is_file() {
             return Err(OrchError::new(
@@ -1371,31 +1794,18 @@ impl OrchStore {
                 format!("idempotency claim is already {}", previous.status),
             ));
         }
-        let run_id_for_tombstone = run_id.clone();
-        let receipt = IdempotencyReceipt {
-            request_id: request_id.into(),
-            payload_hash: payload_hash.into(),
-            run_id,
-            spec_key,
-            tool: tool.into(),
-            response,
-            error,
-            created_at: Utc::now(),
-            status: status.into(),
-        };
+        // Conservative order within the transaction.
+        //
+        // The tombstone is written *first* and the receipt second. A crash
+        // between them leaves a tombstone with no finished receipt, which
+        // refuses the request — the safe direction. The reverse order would
+        // leave a receipt whose decision disappears at the retention horizon,
+        // which is how a refused submission becomes executable by waiting.
+        self.inner
+            .tombstones
+            .write_private(&tombstone_name, &tombstone_bytes)?;
         atomic_write_json(&path, &receipt)
-            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
-        // The tombstone outlives the receipt. Retention prunes receipts; if
-        // the decision went with them, waiting out the horizon would turn a
-        // refused request back into an executable one.
-        drop(_g);
-        self.write_idempotency_tombstone(
-            request_id,
-            tool,
-            payload_hash,
-            status,
-            run_id_for_tombstone.as_deref(),
-        )
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
     }
 
     pub fn append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
@@ -1453,10 +1863,29 @@ impl OrchStore {
         let mut n = 0;
         let mut interrupted_agents = Vec::new();
         for mut run in self.list_runs()? {
+            // A run fenced by an unresolved teardown is left exactly as it
+            // is — not recovered, not tombstoned, still holding its lease —
+            // whatever state it is in.
+            //
+            // Terminalizing it would be a claim that the previous attempt is
+            // over, and the fence exists precisely because nothing observed
+            // that. Writing `interrupted` here also frees the lease on the
+            // next pass, which is how a worker nobody proved stopped ends up
+            // sharing its run with a successor.
+            if matches!(self.load_teardown_uncertain(&run.run_id), Ok(Some(_))) {
+                continue;
+            }
             let tombstone_code = match run.state {
+                // A `Starting` attempt held this run's lease and may have
+                // begun. It is never resumed implicitly, for the same reason
+                // `Running` is not: what it did is unknown.
+                RunState::Starting => Some("interrupted_starting"),
                 RunState::Running => Some("interrupted"),
                 RunState::Queued => match self.queued_admission_disposition(&run) {
                     QueuedAdmission::Recoverable => None,
+                    // Fenced runs are left exactly as they are: not recovered,
+                    // not tombstoned, and holding their lease.
+                    QueuedAdmission::Fenced => continue,
                     QueuedAdmission::Lost => Some("admission_lost"),
                     QueuedAdmission::Tampered => Some("admission_tampered"),
                 },
@@ -1517,6 +1946,11 @@ impl OrchStore {
     /// accept cut are durably present: the sealed input **and** the completed
     /// receipt that promised the caller it would run.
     fn queued_admission_disposition(&self, run: &RunRecord) -> QueuedAdmission {
+        // A fence outlives the process that set it. Until it is lifted the run
+        // is neither recoverable nor safely tombstoned.
+        if matches!(self.load_teardown_uncertain(&run.run_id), Ok(Some(_))) {
+            return QueuedAdmission::Fenced;
+        }
         let intent = match self.load_acceptance_intent(&run.run_id) {
             Ok(Some(intent)) => intent,
             Ok(None) => return QueuedAdmission::Lost,
@@ -1580,10 +2014,32 @@ impl OrchStore {
     /// lease that cannot be parsed or verified is removed outright — a
     /// tampered lease must not be able to block a run forever, and it cannot
     /// authorize one either, since dispatch always mints a fresh lease.
+    /// Release the attempt leases a departed coordinator can no longer hold.
+    ///
+    /// Exclusive ledger ownership proves the previous *coordinator process* is
+    /// gone. It does not prove the worker that coordinator spawned is gone: a
+    /// process killed outright never gets to fence anything, and the children
+    /// it spawned outlive it. So the advisory lock alone is never sufficient
+    /// grounds to release; what the run's own durable cut says is.
+    ///
+    /// A lease is released only when something durable establishes that no
+    /// work can be behind it:
+    ///
+    /// * the lease does not verify — it authorizes nothing, so it is removed;
+    /// * the run is terminal, or has no record at all — nothing is running;
+    /// * the run is still `Queued`, which is the honest cut meaning the start
+    ///   gate never opened, so no worker began;
+    /// * the lease has outlived its own TTL, which is the bounded statement
+    ///   "nobody has heartbeat this for longer than the budget allows".
+    ///
+    /// Anything else — a fenced run, or a non-terminal run past `Queued` still
+    /// inside an unexpired lease — keeps its lease, and gains a positive
+    /// record that this process never observed it stop.
     fn release_orphaned_attempt_leases(&self) -> anyhow::Result<usize> {
         let leases = self
             .list_attempt_leases()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let now = Utc::now();
         let mut released = 0;
         for (name, lease) in leases {
             let Some(lease) = lease else {
@@ -1596,18 +2052,81 @@ impl OrchStore {
             if lease.state == AttemptLeaseState::Released {
                 continue;
             }
+            // A run fenced by an unresolved teardown keeps its lease.
+            if matches!(self.load_teardown_uncertain(&lease.run_id), Ok(Some(_))) {
+                continue;
+            }
+            let run = self.load_run(&lease.run_id)?;
+            let nothing_can_be_running = match &run {
+                None => true,
+                Some(run) => run.state.is_terminal() || run.state == RunState::Queued,
+            };
+            if !nothing_can_be_running && !lease.is_expired(now) {
+                // We do not know what happened to this attempt, and saying so
+                // is the whole point of the fence: releasing here would hand
+                // the run to a second attempt on the strength of the first
+                // one's silence.
+                let _ = self.record_teardown_uncertain(
+                    &lease.run_id,
+                    &lease.attempt_id,
+                    &lease.owner_id,
+                    "coordinator exited without proving this attempt stopped",
+                );
+                continue;
+            }
             let released_lease = AttemptLease {
                 state: AttemptLeaseState::Released,
                 heartbeat_at: Utc::now(),
                 digest: String::new(),
+                seal: super::seal::SealStamp::unsealed(),
                 ..lease
             }
-            .seal();
+            .seal_with(&self.inner.authority)?;
             self.write_attempt_lease_unlocked(&name, &released_lease)
                 .map_err(|error| anyhow::anyhow!(error.to_string()))?;
             released += 1;
         }
         Ok(released)
+    }
+
+    /// A terminal run never keeps executable input.
+    ///
+    /// Several paths install a terminal record without clearing the sealed
+    /// acceptance intent behind it — an outer supervisor staging `interrupted`
+    /// on its way out is one. The leftover input cannot be dispatched, because
+    /// nothing re-admits a terminal run, but it *is* the private prompt, and
+    /// keeping it past the work it belongs to is a retention leak rather than
+    /// a safety margin.
+    ///
+    /// A fenced run is the deliberate exception. Its outcome is unknown, so
+    /// its input is still needed to reconcile it, and it keeps everything
+    /// until the fence is lifted.
+    fn drop_inputs_for_terminal_runs(&self) -> anyhow::Result<usize> {
+        let mut dropped = 0;
+        // The listing is `(file name, run id from the verified intent)`; an
+        // intent that does not verify has no run id and is not this pass's to
+        // judge.
+        for (_, run_id) in self.list_acceptance_intent_run_ids()? {
+            let Some(run_id) = run_id else {
+                continue;
+            };
+            let Some(run) = self.load_run(&run_id)? else {
+                // No run record at all: this is an orphan input, handled by
+                // the admission path rather than here. Recovery never
+                // synthesizes a run from one, so it is left exactly as found.
+                continue;
+            };
+            if !run.state.is_terminal() {
+                continue;
+            }
+            if matches!(self.load_teardown_uncertain(&run_id), Ok(Some(_))) {
+                continue;
+            }
+            if self.remove_acceptance_intent(&run_id).unwrap_or(false) {
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
     }
 
     fn fail_orphaned_idempotency_claims(&self) -> anyhow::Result<usize> {
@@ -1710,22 +2229,64 @@ fn append_audit_entry(root: &Path, entry: &AuditEntry) -> anyhow::Result<()> {
 enum QueuedAdmission {
     /// Sealed input and a completed receipt naming this exact run both exist.
     Recoverable,
+    /// A previous teardown could not be established, so the run's conflict
+    /// domain stays fenced until something lifts it explicitly.
+    Fenced,
     /// The admission never completed, so it must never execute.
     Lost,
     /// Durable evidence exists but is not what was accepted.
     Tampered,
 }
 
-/// A durable record that one request identity has already been decided.
-/// Survives receipt retention, so a pruned failure cannot become a success.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdempotencyTombstone {
+/// The durable record of one physical provider request.
+///
+/// Deliberately not sealed: it is written from inside the HTTP hot path, many
+/// times per turn, and it authorizes nothing on its own — it is evidence about
+/// what happened, consulted alongside the sealed attempt records that do carry
+/// authority. Its integrity requirement is that it cannot be *forged into
+/// permission*, and permission comes from the lease and the intent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderRequestRecord {
     pub request_id: String,
-    pub tool: String,
-    pub payload_hash: String,
-    /// `complete` or `failed` — the decision that was reached.
-    pub outcome: String,
-    pub run_id: Option<String>,
+    /// The key that travelled on the wire.
+    pub idempotency_key: String,
+    pub request_ordinal: u32,
+    pub run_id: String,
+    pub phase: RequestPhase,
+    pub detail: Option<String>,
+    pub updated_at: chrono::DateTime<Utc>,
+}
+
+/// Phases move forward only, and never re-enter a resendable state.
+fn request_phase_may_advance(from: RequestPhase, to: RequestPhase) -> bool {
+    use RequestPhase::*;
+    match (from, to) {
+        (KnownNotSent, Sending) => true,
+        (Sending, Sent) | (Sending, Uncertain) | (Sending, KnownNotSent) => {
+            // `Sending -> KnownNotSent` is legal only for a transport failure
+            // that provably never reached the socket; the caller establishes
+            // that, and nothing downstream may infer it.
+            true
+        }
+        (Sent, Responding) | (Sent, Uncertain) => true,
+        (Responding, Settled) | (Responding, Uncertain) => true,
+        _ => false,
+    }
+}
+
+/// What one coordinated reseal transaction covered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResealReport {
+    pub inputs_scanned: usize,
+    pub leases_scanned: usize,
+    pub sends_scanned: usize,
+    pub tombstones_scanned: usize,
+    pub resealed: usize,
+}
+
+fn json_error(error: serde_json::Error) -> OrchError {
+    OrchError::new(OrchErrorCode::Internal, error.to_string())
 }
 
 pub enum IdempotencyClaim {
@@ -1783,6 +2344,11 @@ fn write_json_exclusive<T: serde::Serialize>(path: &Path, value: &T) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Payload hashes are sha-256 digests by contract; the sealed tombstone
+    /// enforces that, so fixtures use a real one.
+    const TEST_PAYLOAD_HASH: &str =
+        "0000000000000000000000000000000000000000000000000000000000000000";
     use crate::orchestration::types::{
         AgentRecord, ContinuationCheckpoint, ContinuationReason, RunBounds,
     };
@@ -2006,14 +2572,27 @@ mod tests {
     fn idempotency_claim_exclusive() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        match store.claim_idempotency("t", "req", "h").unwrap() {
+        match store
+            .claim_idempotency("t", "req", TEST_PAYLOAD_HASH)
+            .unwrap()
+        {
             IdempotencyClaim::Perform => {}
             _ => panic!("first claim should perform"),
         }
         store
-            .complete_idempotency("t", "req", "h", None, None, serde_json::json!({"ok": true}))
+            .complete_idempotency(
+                "t",
+                "req",
+                TEST_PAYLOAD_HASH,
+                None,
+                None,
+                serde_json::json!({"ok": true}),
+            )
             .unwrap();
-        match store.claim_idempotency("t", "req", "h").unwrap() {
+        match store
+            .claim_idempotency("t", "req", TEST_PAYLOAD_HASH)
+            .unwrap()
+        {
             IdempotencyClaim::Replay(Ok(v)) => assert_eq!(v["ok"], true),
             _ => panic!("replay"),
         }
@@ -2025,24 +2604,29 @@ mod tests {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         assert!(matches!(
-            store.claim_idempotency("t", "failed", "h").unwrap(),
+            store
+                .claim_idempotency("t", "failed", TEST_PAYLOAD_HASH)
+                .unwrap(),
             IdempotencyClaim::Perform
         ));
         let error = OrchError::new(OrchErrorCode::Internal, "failed once");
         store
-            .fail_idempotency("t", "failed", "h", None, error.clone())
+            .fail_idempotency("t", "failed", TEST_PAYLOAD_HASH, None, error.clone())
             .unwrap();
         assert!(store
             .complete_idempotency(
                 "t",
                 "failed",
-                "h",
+                TEST_PAYLOAD_HASH,
                 None,
                 None,
                 serde_json::json!({"ok": true})
             )
             .is_err());
-        match store.claim_idempotency("t", "failed", "h").unwrap() {
+        match store
+            .claim_idempotency("t", "failed", TEST_PAYLOAD_HASH)
+            .unwrap()
+        {
             IdempotencyClaim::Replay(Err(replayed)) => {
                 assert_eq!(replayed.code.as_str(), error.code.as_str());
                 assert_eq!(replayed.message, error.message);
@@ -2186,13 +2770,18 @@ mod tests {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         assert!(matches!(
-            store.claim_idempotency("t", "orphan", "h").unwrap(),
+            store
+                .claim_idempotency("t", "orphan", TEST_PAYLOAD_HASH)
+                .unwrap(),
             IdempotencyClaim::Perform
         ));
         drop(store);
 
         let reopened = OrchStore::open(d.path()).unwrap();
-        match reopened.claim_idempotency("t", "orphan", "h").unwrap() {
+        match reopened
+            .claim_idempotency("t", "orphan", TEST_PAYLOAD_HASH)
+            .unwrap()
+        {
             IdempotencyClaim::Replay(Err(e)) => {
                 assert!(e.message.contains("interrupted"));
             }
@@ -2248,7 +2837,9 @@ mod tests {
     fn traversal_id_rejected() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        assert!(store.claim_idempotency("t", "../x", "h").is_err());
+        assert!(store
+            .claim_idempotency("t", "../x", TEST_PAYLOAD_HASH)
+            .is_err());
     }
 
     #[test]

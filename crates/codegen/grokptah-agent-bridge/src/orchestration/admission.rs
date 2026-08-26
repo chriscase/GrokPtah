@@ -48,13 +48,14 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::seal::{SealAuthority, SealStamp};
 use super::types::{
     hash_payload, safe_id_filename, OrchError, OrchErrorCode, RunBounds, RunExecutionMode,
 };
 
 /// Version of the [`AcceptanceIntent`] seal. A record produced by a different
 /// version is rejected rather than reinterpreted.
-pub const ACCEPTANCE_INTENT_VERSION: u32 = 2;
+pub const ACCEPTANCE_INTENT_VERSION: u32 = 3;
 
 /// Version of the [`AttemptLease`] seal.
 pub const ATTEMPT_LEASE_VERSION: u32 = 1;
@@ -143,8 +144,14 @@ pub struct AcceptanceIntent {
     pub agent_revision: u64,
     /// Execution spec revision (bridge contract the input was accepted under).
     pub spec_revision: String,
-    /// Fingerprint of the authenticated principal and the capabilities it
-    /// held at acceptance. Never the credential itself.
+    /// The authenticated principal this work runs as.
+    ///
+    /// A non-secret label for the caller that admitted it, sealed so a queued
+    /// task dispatched minutes later still executes as the principal that was
+    /// authorized — not as whoever happens to be configured then.
+    pub principal_token_id: String,
+    /// Fingerprint of that principal and the capabilities it held at
+    /// acceptance. Never the credential itself.
     pub principal_revision: String,
     /// Fingerprint of the authorization policy in force at acceptance: the
     /// workspace allowlist and the server bounds ceiling.
@@ -161,17 +168,30 @@ pub struct AcceptanceIntent {
     pub retry_of: Option<String>,
     pub parent_run_id: Option<String>,
     pub created_at: DateTime<Utc>,
-    /// Versioned integrity digest over every field above.
+    /// Content identity of this specification: a plain digest over every
+    /// field above.
+    ///
+    /// This is an **identifier, not an authenticator**. It says *which* work
+    /// this is, and anyone can compute it for content they choose — which is
+    /// precisely why it cannot be what integrity rests on. Its job is to let
+    /// the run, the receipt, the lease, the send, and the worker agree on one
+    /// specification.
     pub digest: String,
+    /// The keyed authority seal over the same fields.
+    ///
+    /// This is what makes the record *authentic*. Producing it requires the
+    /// sealing key, so an attacker who can rewrite the ledger still cannot
+    /// mint a record this authority will accept.
+    pub seal: SealStamp,
 }
 
 impl AcceptanceIntent {
-    /// Compute the seal over every execution-relevant field.
+    /// The canonical payload every seal is computed over.
     ///
-    /// The prompt enters by content hash and byte length so the digest input
-    /// stays bounded while still covering the prompt exactly.
-    pub fn digest_for(&self) -> String {
-        hash_payload(&serde_json::json!({
+    /// The prompt enters by content hash and byte length so the input stays
+    /// bounded while still covering the prompt exactly.
+    pub fn canonical_payload(&self) -> serde_json::Value {
+        serde_json::json!({
             "intentVersion": self.intent_version,
             "runId": self.run_id,
             "requestId": self.request_id,
@@ -184,6 +204,7 @@ impl AcceptanceIntent {
             "agentId": self.agent_id,
             "agentRevision": self.agent_revision,
             "specRevision": self.spec_revision,
+            "principalTokenId": self.principal_token_id,
             "principalRevision": self.principal_revision,
             "policyRevision": self.policy_revision,
             "routeRevision": self.route_revision,
@@ -199,17 +220,41 @@ impl AcceptanceIntent {
             "retryOf": self.retry_of,
             "parentRunId": self.parent_run_id,
             "createdAt": self.created_at.to_rfc3339(),
-        }))
+        })
     }
 
-    /// Stamp the seal. Call exactly once, at acceptance.
-    pub fn seal(mut self) -> Self {
+    /// Content identity over the canonical payload.
+    pub fn digest_for(&self) -> String {
+        hash_payload(&self.canonical_payload())
+    }
+
+    /// Stamp both the content identity and the keyed authority seal. Call
+    /// exactly once, at acceptance.
+    pub fn seal_with(mut self, authority: &SealAuthority) -> Result<Self, OrchError> {
         self.digest = self.digest_for();
-        self
+        self.seal = SealStamp::unsealed();
+        // The seal covers the identity too, so a forger cannot keep a valid
+        // seal while swapping which specification the record claims to be.
+        self.seal = authority.seal(&self.sealed_payload())?;
+        Ok(self)
+    }
+
+    /// The payload the authority seal covers: the canonical fields plus the
+    /// content identity derived from them.
+    fn sealed_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "record": "acceptance_intent",
+            "payload": self.canonical_payload(),
+            "digest": self.digest,
+        })
     }
 
     /// Fail closed on anything that is not exactly what was accepted.
-    pub fn validate(&self) -> Result<(), OrchError> {
+    ///
+    /// Both halves are required: the content identity must match the fields,
+    /// *and* the keyed seal must authenticate them. A record that satisfies
+    /// only the first is a forgery that recomputed a digest.
+    pub fn validate(&self, authority: &SealAuthority) -> Result<(), OrchError> {
         if self.intent_version != ACCEPTANCE_INTENT_VERSION {
             return Err(OrchError::new(
                 OrchErrorCode::Unsupported,
@@ -236,6 +281,7 @@ impl AcceptanceIntent {
         validate_bounded_allow_empty(&self.session_revision, "session_revision")?;
         validate_bounded_allow_empty(&self.workspace_revision, "workspace_revision")?;
         validate_bounded(&self.spec_revision, "spec_revision")?;
+        validate_bounded(&self.principal_token_id, "principal_token_id")?;
         validate_hex_digest(&self.principal_revision, "principal_revision")?;
         validate_hex_digest(&self.policy_revision, "policy_revision")?;
         validate_hex_digest(&self.route_revision, "route_revision")?;
@@ -262,10 +308,10 @@ impl AcceptanceIntent {
         if self.digest != self.digest_for() {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
-                "acceptance intent digest does not match its sealed fields",
+                "acceptance intent identity does not match its fields",
             ));
         }
-        Ok(())
+        authority.verify(&self.sealed_payload(), &self.seal)
     }
 
     /// The bounds this input executes under, as a run record carries them.
@@ -436,11 +482,13 @@ impl<'a> SpecBinding<'a> {
     pub fn verify(
         &self,
         spec: &AcceptanceIntent,
+        authority: &SealAuthority,
         required: &[SpecHolder],
     ) -> Result<(), OrchError> {
-        // The specification must verify on its own terms first; otherwise the
-        // key everything is compared against is itself untrustworthy.
-        spec.validate()?;
+        // The specification must authenticate on its own terms first;
+        // otherwise the key everything is compared against is itself
+        // untrustworthy.
+        spec.validate(authority)?;
         let key = spec.spec_key();
         for holder in [
             SpecHolder::Run,
@@ -508,12 +556,16 @@ pub struct AttemptLease {
     pub heartbeat_at: DateTime<Utc>,
     pub lease_ttl_ms: u64,
     pub state: AttemptLeaseState,
+    /// Content identity. Identifier, not authenticator — see
+    /// [`AcceptanceIntent::digest`].
     pub digest: String,
+    /// Keyed authority seal over the same fields.
+    pub seal: SealStamp,
 }
 
 impl AttemptLease {
-    pub fn digest_for(&self) -> String {
-        hash_payload(&serde_json::json!({
+    pub fn canonical_payload(&self) -> serde_json::Value {
+        serde_json::json!({
             "leaseVersion": self.lease_version,
             "runId": self.run_id,
             "attempt": self.attempt,
@@ -525,15 +577,29 @@ impl AttemptLease {
             "heartbeatAt": self.heartbeat_at.to_rfc3339(),
             "leaseTtlMs": self.lease_ttl_ms,
             "state": self.state,
-        }))
+        })
     }
 
-    pub fn seal(mut self) -> Self {
+    pub fn digest_for(&self) -> String {
+        hash_payload(&self.canonical_payload())
+    }
+
+    fn sealed_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "record": "attempt_lease",
+            "payload": self.canonical_payload(),
+            "digest": self.digest,
+        })
+    }
+
+    pub fn seal_with(mut self, authority: &SealAuthority) -> Result<Self, OrchError> {
         self.digest = self.digest_for();
-        self
+        self.seal = SealStamp::unsealed();
+        self.seal = authority.seal(&self.sealed_payload())?;
+        Ok(self)
     }
 
-    pub fn validate(&self) -> Result<(), OrchError> {
+    pub fn validate(&self, authority: &SealAuthority) -> Result<(), OrchError> {
         if self.lease_version != ATTEMPT_LEASE_VERSION {
             return Err(OrchError::new(
                 OrchErrorCode::Unsupported,
@@ -557,10 +623,10 @@ impl AttemptLease {
         if self.digest != self.digest_for() {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
-                "attempt lease digest does not match its sealed fields",
+                "attempt lease identity does not match its fields",
             ));
         }
-        Ok(())
+        authority.verify(&self.sealed_payload(), &self.seal)
     }
 
     /// A held lease whose holder stopped heartbeating is reapable. Expiry is
@@ -741,12 +807,15 @@ pub struct ProviderSendRecord {
     pub detail: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Content identity. Identifier, not authenticator.
     pub digest: String,
+    /// Keyed authority seal over the same fields.
+    pub seal: SealStamp,
 }
 
 impl ProviderSendRecord {
-    pub fn digest_for(&self) -> String {
-        hash_payload(&serde_json::json!({
+    pub fn canonical_payload(&self) -> serde_json::Value {
+        serde_json::json!({
             "sendVersion": self.send_version,
             "sendId": self.send_id,
             "runId": self.run_id,
@@ -757,15 +826,29 @@ impl ProviderSendRecord {
             "detail": self.detail,
             "createdAt": self.created_at.to_rfc3339(),
             "updatedAt": self.updated_at.to_rfc3339(),
-        }))
+        })
     }
 
-    pub fn seal(mut self) -> Self {
+    pub fn digest_for(&self) -> String {
+        hash_payload(&self.canonical_payload())
+    }
+
+    fn sealed_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "record": "provider_send",
+            "payload": self.canonical_payload(),
+            "digest": self.digest,
+        })
+    }
+
+    pub fn seal_with(mut self, authority: &SealAuthority) -> Result<Self, OrchError> {
         self.digest = self.digest_for();
-        self
+        self.seal = SealStamp::unsealed();
+        self.seal = authority.seal(&self.sealed_payload())?;
+        Ok(self)
     }
 
-    pub fn validate(&self) -> Result<(), OrchError> {
+    pub fn validate(&self, authority: &SealAuthority) -> Result<(), OrchError> {
         if self.send_version != PROVIDER_SEND_VERSION {
             return Err(OrchError::new(
                 OrchErrorCode::Unsupported,
@@ -796,10 +879,10 @@ impl ProviderSendRecord {
         if self.digest != self.digest_for() {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
-                "provider send digest does not match its sealed fields",
+                "provider send identity does not match its fields",
             ));
         }
-        Ok(())
+        authority.verify(&self.sealed_payload(), &self.seal)
     }
 
     /// Legal forward transitions. The state machine never moves backwards, so
@@ -817,16 +900,332 @@ impl ProviderSendRecord {
     }
 }
 
+/// Version of the idempotency tombstone seal.
+pub const TOMBSTONE_VERSION: u32 = 1;
+
+/// A durable, keyed record that one request identity has already been decided.
+///
+/// Receipts are pruned by retention; tombstones outlive them, so this is the
+/// record that stops a refused request becoming executable by waiting out the
+/// horizon. That makes it exactly as attractive to forge as a receipt, and it
+/// carries the same keyed authority seal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SealedTombstone {
+    pub tombstone_version: u32,
+    pub request_id: String,
+    pub tool: String,
+    pub payload_hash: String,
+    /// `complete` or `failed` — the decision that was reached.
+    pub outcome: String,
+    pub run_id: Option<String>,
+    /// The execution specification this decision admitted, when it admitted
+    /// one.
+    pub spec_key: Option<String>,
+    pub recorded_at: DateTime<Utc>,
+    pub digest: String,
+    pub seal: SealStamp,
+}
+
+impl SealedTombstone {
+    pub fn canonical_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tombstoneVersion": self.tombstone_version,
+            "requestId": self.request_id,
+            "tool": self.tool,
+            "payloadHash": self.payload_hash,
+            "outcome": self.outcome,
+            "runId": self.run_id,
+            "specKey": self.spec_key,
+            "recordedAt": self.recorded_at.to_rfc3339(),
+        })
+    }
+
+    pub fn digest_for(&self) -> String {
+        hash_payload(&self.canonical_payload())
+    }
+
+    fn sealed_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "record": "idempotency_tombstone",
+            "payload": self.canonical_payload(),
+            "digest": self.digest,
+        })
+    }
+
+    pub fn seal_with(mut self, authority: &SealAuthority) -> Result<Self, OrchError> {
+        self.digest = self.digest_for();
+        self.seal = SealStamp::unsealed();
+        self.seal = authority.seal(&self.sealed_payload())?;
+        Ok(self)
+    }
+
+    pub fn validate(&self, authority: &SealAuthority) -> Result<(), OrchError> {
+        if self.tombstone_version != TOMBSTONE_VERSION {
+            return Err(OrchError::new(
+                OrchErrorCode::Unsupported,
+                format!(
+                    "idempotency tombstone version {} is not supported",
+                    self.tombstone_version
+                ),
+            ));
+        }
+        validate_identity(&self.request_id, "request_id")?;
+        validate_identity(&self.tool, "tool")?;
+        validate_hex_digest(&self.payload_hash, "payload_hash")?;
+        if !matches!(self.outcome.as_str(), "complete" | "failed") {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "idempotency tombstone outcome is not a decision",
+            ));
+        }
+        if let Some(run_id) = self.run_id.as_deref() {
+            validate_identity(run_id, "run_id")?;
+        }
+        if let Some(spec_key) = self.spec_key.as_deref() {
+            validate_hex_digest(spec_key, "spec_key")?;
+        }
+        validate_hex_digest(&self.digest, "digest")?;
+        if self.digest != self.digest_for() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "idempotency tombstone identity does not match its fields",
+            ));
+        }
+        authority.verify(&self.sealed_payload(), &self.seal)
+    }
+}
+
+/// Where one *physical* HTTP request to a provider currently stands.
+///
+/// The coarse per-attempt states describe a turn; these describe a single
+/// request on the wire, which is the granularity at which duplication actually
+/// happens. A turn that "retried" is a turn that sent the same work twice, and
+/// only a per-request record can tell the difference between the second send
+/// being safe and it being a duplicate charge and a duplicate side effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestPhase {
+    /// Minted, not yet written to the socket. Provably safe to abandon.
+    KnownNotSent,
+    /// Handed to the transport. From here the provider may have seen it.
+    Sending,
+    /// Response headers observed: the provider definitely received it.
+    Sent,
+    /// The response body is streaming.
+    Responding,
+    /// The response completed and its effects are durably acknowledged.
+    Settled,
+    /// The outcome was never observed. Never implicitly resent.
+    Uncertain,
+}
+
+impl RequestPhase {
+    /// Whether a *new* physical request carrying the same work may be sent.
+    ///
+    /// Only from a request that provably never reached the socket. Everything
+    /// from `Sending` onward may already have been received, and re-sending it
+    /// is how one turn becomes two.
+    pub fn permits_resend(self) -> bool {
+        matches!(self, Self::KnownNotSent)
+    }
+
+    /// Whether this request's work is durably finished.
+    pub fn is_settled(self) -> bool {
+        matches!(self, Self::Settled)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::KnownNotSent => "known_not_sent",
+            Self::Sending => "sending",
+            Self::Sent => "sent",
+            Self::Responding => "responding",
+            Self::Settled => "settled",
+            Self::Uncertain => "uncertain",
+        }
+    }
+
+    /// How a `Sending` request is reinterpreted after a restart.
+    ///
+    /// A process that died mid-send left no observer, so the honest answer is
+    /// `Uncertain` — never `KnownNotSent`, which would license a resend of
+    /// work the provider may have already run.
+    pub fn after_restart(self) -> Self {
+        match self {
+            Self::Sending | Self::Sent | Self::Responding => Self::Uncertain,
+            other => other,
+        }
+    }
+}
+
+/// The durable identity of one physical HTTP request.
+///
+/// `idempotency_key` is what goes **on the wire**, so a provider that honours
+/// idempotency can collapse a duplicate itself. It is derived from the
+/// attempt and the request ordinal, so it is stable for one physical request
+/// and different for the next.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderRequestTicket {
+    pub request_ordinal: u32,
+    pub request_id: String,
+    pub idempotency_key: String,
+}
+
+impl ProviderRequestTicket {
+    /// Mint the identity for request `ordinal` of one attempt.
+    pub fn mint(run_id: &str, attempt_id: &str, ordinal: u32) -> Self {
+        let request_id = hash_payload(&serde_json::json!({
+            "runId": run_id,
+            "attemptId": attempt_id,
+            "ordinal": ordinal,
+        }));
+        Self {
+            request_ordinal: ordinal,
+            idempotency_key: format!("grokptah-{}", &request_id[..32]),
+            request_id,
+        }
+    }
+}
+
+/// The sink a provider client reports each physical request to.
+///
+/// Kept as a trait so the HTTP layer does not depend on the orchestration
+/// store, and so a test can supply a sink that records phases without a ledger.
+pub trait ProviderRequestSink: Send + Sync {
+    /// Record that a request has reached `phase`. Returning `Err` means the
+    /// evidence could not be made durable, which the caller must treat as a
+    /// reason not to proceed rather than as a warning.
+    fn record(
+        &self,
+        ticket: &ProviderRequestTicket,
+        phase: RequestPhase,
+        detail: Option<&str>,
+    ) -> Result<(), String>;
+
+    /// Whether a new physical request may be sent right now.
+    ///
+    /// Consulted *before* every send, including retries, so a retry after an
+    /// unobserved outcome is refused rather than attempted.
+    fn may_send(&self, ticket: &ProviderRequestTicket) -> Result<(), String>;
+}
+
+/// Version of the teardown-uncertainty record.
+pub const TEARDOWN_UNCERTAIN_VERSION: u32 = 1;
+
+/// A durable statement that one attempt's outcome could not be established.
+///
+/// Written when teardown ran out of budget, or when a synchronous path had no
+/// way to prove anything. Its presence fences the run's conflict domain: the
+/// lease is not released, the capacity is not handed back, and no new attempt
+/// is authorized, because the previous worker may still be executing.
+///
+/// This is deliberately a *positive* record. The alternative — inferring
+/// uncertainty from the absence of a terminal record — cannot distinguish
+/// "we do not know" from "we have not looked yet", and the two demand
+/// opposite behaviour.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TeardownUncertain {
+    pub record_version: u32,
+    pub run_id: String,
+    pub attempt_id: String,
+    /// The process instance that failed to establish the outcome.
+    pub owner_id: String,
+    /// Bounded, redacted explanation for an operator.
+    pub reason: String,
+    pub recorded_at: DateTime<Utc>,
+    pub digest: String,
+    pub seal: SealStamp,
+}
+
+impl TeardownUncertain {
+    pub fn canonical_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "recordVersion": self.record_version,
+            "runId": self.run_id,
+            "attemptId": self.attempt_id,
+            "ownerId": self.owner_id,
+            "reason": self.reason,
+            "recordedAt": self.recorded_at.to_rfc3339(),
+        })
+    }
+
+    pub fn digest_for(&self) -> String {
+        hash_payload(&self.canonical_payload())
+    }
+
+    fn sealed_payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "record": "teardown_uncertain",
+            "payload": self.canonical_payload(),
+            "digest": self.digest,
+        })
+    }
+
+    pub fn seal_with(mut self, authority: &SealAuthority) -> Result<Self, OrchError> {
+        self.digest = self.digest_for();
+        self.seal = SealStamp::unsealed();
+        self.seal = authority.seal(&self.sealed_payload())?;
+        Ok(self)
+    }
+
+    pub fn validate(&self, authority: &SealAuthority) -> Result<(), OrchError> {
+        if self.record_version != TEARDOWN_UNCERTAIN_VERSION {
+            return Err(OrchError::new(
+                OrchErrorCode::Unsupported,
+                format!(
+                    "teardown uncertainty version {} is not supported",
+                    self.record_version
+                ),
+            ));
+        }
+        validate_identity(&self.run_id, "run_id")?;
+        validate_identity(&self.attempt_id, "attempt_id")?;
+        validate_identity(&self.owner_id, "owner_id")?;
+        validate_bounded_allow_empty(&self.reason, "reason")?;
+        validate_hex_digest(&self.digest, "digest")?;
+        if self.digest != self.digest_for() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "teardown uncertainty identity does not match its fields",
+            ));
+        }
+        authority.verify(&self.sealed_payload(), &self.seal)
+    }
+}
+
 /// A gate that holds every task of one attempt at its first instruction until
 /// all of that attempt's handles are registered.
 ///
 /// Without it, registration races the work: a task can run, complete, and try
 /// to settle before the registry knows it exists, so teardown has nothing to
-/// abort and capacity accounting sees a run that never started. The gate makes
-/// registration and startability a single ordered step.
+/// abort and capacity accounting sees a run that never started.
+///
+/// The gate has two terminal outcomes, and the distinction is the whole point.
+/// It can **open**, releasing every waiter to run, or it can be **abandoned**,
+/// releasing every waiter to exit without running. A gate that is merely
+/// closed is neither: work behind it has not started and *may still start*, so
+/// nothing may conclude the attempt is quiescent while that is true.
 #[derive(Clone)]
 pub struct StartGate {
-    open: CancellationToken,
+    state: Arc<GateState>,
+}
+
+struct GateState {
+    released: CancellationToken,
+    abandoned: AtomicBool,
+    opened: AtomicBool,
+}
+
+/// What a waiter saw when the gate released it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateOutcome {
+    /// Proceed: registration completed and this attempt is authorized to run.
+    Opened,
+    /// Exit without running: the attempt was cancelled before it started.
+    Abandoned,
 }
 
 impl Default for StartGate {
@@ -839,22 +1238,64 @@ impl StartGate {
     /// A gate that starts closed.
     pub fn new() -> Self {
         Self {
-            open: CancellationToken::new(),
+            state: Arc::new(GateState {
+                released: CancellationToken::new(),
+                abandoned: AtomicBool::new(false),
+                opened: AtomicBool::new(false),
+            }),
         }
     }
 
-    /// Park until the gate opens. Returns immediately once it has.
-    pub async fn wait(&self) {
-        self.open.cancelled().await;
+    /// Park until the gate is released, then say why.
+    pub async fn wait(&self) -> GateOutcome {
+        self.state.released.cancelled().await;
+        self.outcome()
     }
 
-    /// Release every waiter. Idempotent.
-    pub fn open(&self) {
-        self.open.cancel();
+    fn outcome(&self) -> GateOutcome {
+        if self.state.abandoned.load(Ordering::Acquire) {
+            GateOutcome::Abandoned
+        } else {
+            GateOutcome::Opened
+        }
+    }
+
+    /// Release every waiter to run. Idempotent, and refused after abandonment
+    /// so a cancelled attempt cannot be un-cancelled by a late registration.
+    pub fn open(&self) -> bool {
+        if self.state.abandoned.load(Ordering::Acquire) {
+            return false;
+        }
+        self.state.opened.store(true, Ordering::Release);
+        self.state.released.cancel();
+        true
+    }
+
+    /// Release every waiter to exit without running.
+    ///
+    /// This is what makes cancellation safe during the registration gap: an
+    /// attempt abandoned before its gate opened can never start, so it is
+    /// genuinely quiescent even though no worker ever ran.
+    pub fn abandon(&self) {
+        self.state.abandoned.store(true, Ordering::Release);
+        self.state.released.cancel();
     }
 
     pub fn is_open(&self) -> bool {
-        self.open.is_cancelled()
+        self.state.opened.load(Ordering::Acquire)
+    }
+
+    pub fn is_abandoned(&self) -> bool {
+        self.state.abandoned.load(Ordering::Acquire)
+    }
+
+    /// True while work behind this gate could still begin.
+    ///
+    /// The safety question is not "has it started?" but "can it start?".
+    /// Anything that concludes quiescence must consult this, because a closed
+    /// gate that has not been abandoned is a future about to run.
+    pub fn may_still_start(&self) -> bool {
+        !self.state.abandoned.load(Ordering::Acquire) && !self.state.released.is_cancelled()
     }
 }
 
@@ -868,6 +1309,13 @@ impl StartGate {
 pub struct WorkerLiveness {
     started: AtomicBool,
     finished: AtomicBool,
+    /// True once it is established that this worker can never begin.
+    ///
+    /// `!started` alone is *not* quiescence: a worker parked behind a closed
+    /// gate has not started and is about to. Only an abandoned gate — or a
+    /// task cancelled before its first poll, which can no longer be scheduled
+    /// — turns "never started" into "never will".
+    unstartable: AtomicBool,
 }
 
 impl WorkerLiveness {
@@ -883,14 +1331,30 @@ impl WorkerLiveness {
         self.started.store(true, Ordering::Release);
     }
 
+    /// Mark that this worker can never begin.
+    ///
+    /// Called when the attempt's start gate is abandoned, or when the task is
+    /// confirmed cancelled before its first poll.
+    pub fn mark_unstartable(&self) {
+        self.unstartable.store(true, Ordering::Release);
+    }
+
+    pub fn is_unstartable(&self) -> bool {
+        self.unstartable.load(Ordering::Acquire)
+    }
+
     /// The worker future can no longer execute.
     ///
     /// True either because the future ended — its guard dropped, which covers
-    /// completion, cancellation, and abort mid-await — or because it was
-    /// cancelled before it was ever polled, so its body never ran and never
-    /// will. Both are safe; a future that has started and not finished is not.
+    /// completion, cancellation, and abort mid-await — or because it has been
+    /// *established* that it can never begin.
+    ///
+    /// Deliberately not "it hasn't started yet". A worker waiting on a closed
+    /// gate has not started and is one `open()` away from running; treating
+    /// that as quiescent is how capacity gets handed to a second attempt while
+    /// the first is still about to execute.
     pub fn quiescent(&self) -> bool {
-        self.finished() || !self.started()
+        self.finished() || (!self.started() && self.is_unstartable())
     }
 }
 
@@ -928,6 +1392,8 @@ pub struct LiveWorker {
     worker_abort: parking_lot::Mutex<Option<AbortHandle>>,
     aggregator_abort: parking_lot::Mutex<Option<AbortHandle>>,
     supervisor: parking_lot::Mutex<Option<JoinHandle<()>>>,
+    /// The gate this attempt's tasks are parked behind, once one exists.
+    gate: parking_lot::Mutex<Option<StartGate>>,
     /// Registration is complete and the gate has been opened.
     registered: AtomicBool,
     /// No further work may begin; the cancel token is signalled and the nested
@@ -985,6 +1451,7 @@ impl LiveWorker {
             worker_abort: parking_lot::Mutex::new(None),
             aggregator_abort: parking_lot::Mutex::new(None),
             supervisor: parking_lot::Mutex::new(None),
+            gate: parking_lot::Mutex::new(None),
             registered: AtomicBool::new(false),
             fenced: AtomicBool::new(false),
             finalized: AtomicBool::new(false),
@@ -1042,8 +1509,33 @@ impl LiveWorker {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
         self.cancel.cancel();
+        // Abandon the gate *before* aborting: a worker still parked behind an
+        // un-abandoned gate could otherwise be released to run by a
+        // registration that is still in flight.
+        if let Some(gate) = self.gate.lock().as_ref() {
+            gate.abandon();
+        }
+        if !self.liveness.started() {
+            // The gate can never open now, so a worker that never began never
+            // will. That is what makes it safe to call this attempt quiescent.
+            self.liveness.mark_unstartable();
+        }
         self.abort_nested();
         first
+    }
+
+    /// Attach the gate this attempt's tasks are parked behind.
+    pub fn attach_gate(&self, gate: StartGate) {
+        *self.gate.lock() = Some(gate);
+    }
+
+    /// True while any of this attempt's work could still begin.
+    pub fn may_still_start(&self) -> bool {
+        self.gate
+            .lock()
+            .as_ref()
+            .map(|gate| gate.may_still_start())
+            .unwrap_or(false)
     }
 
     pub fn is_fenced(&self) -> bool {
@@ -1085,11 +1577,6 @@ impl LiveWorker {
 
     pub fn has_escaped(&self) -> bool {
         self.escaped.load(Ordering::Acquire)
-    }
-
-    /// Backwards-compatible alias for the finalization latch.
-    pub fn settle_once(&self) -> bool {
-        self.claim_finalization()
     }
 
     pub fn is_settled(&self) -> bool {
@@ -1167,7 +1654,15 @@ async fn await_worker_finished(liveness: &Arc<WorkerLiveness>, budget: Duration)
 mod tests {
     use super::*;
 
+    fn test_authority() -> SealAuthority {
+        SealAuthority::with_key(vec![0x5au8; 32]).unwrap()
+    }
+
     fn intent() -> AcceptanceIntent {
+        intent_sealed(&test_authority())
+    }
+
+    fn intent_sealed(authority: &SealAuthority) -> AcceptanceIntent {
         AcceptanceIntent {
             intent_version: ACCEPTANCE_INTENT_VERSION,
             run_id: "run-1".into(),
@@ -1181,6 +1676,7 @@ mod tests {
             agent_id: None,
             agent_revision: 0,
             spec_revision: "bridge/1".into(),
+            principal_token_id: "primary".into(),
             principal_revision: hash_payload(&serde_json::json!({"principal": "a"})),
             policy_revision: hash_payload(&serde_json::json!({"policy": "a"})),
             route_revision: hash_payload(&serde_json::json!({"route": "a"})),
@@ -1198,18 +1694,52 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
             digest: String::new(),
+            seal: SealStamp::unsealed(),
         }
-        .seal()
+        .seal_with(authority)
+        .unwrap()
     }
 
     #[test]
     fn sealed_intent_round_trips_and_validates() {
-        let sealed = intent();
-        assert!(sealed.validate().is_ok());
+        let authority = test_authority();
+        let sealed = intent_sealed(&authority);
+        assert!(sealed.validate(&authority).is_ok());
         let encoded = serde_json::to_vec(&sealed).unwrap();
         let decoded: AcceptanceIntent = serde_json::from_slice(&encoded).unwrap();
-        assert!(decoded.validate().is_ok());
+        assert!(decoded.validate(&authority).is_ok());
         assert_eq!(decoded, sealed);
+    }
+
+    /// A forger who rewrites a record and recomputes its *digest* still cannot
+    /// produce its *seal*. This is the difference the keyed authority buys.
+    #[test]
+    fn a_recomputed_digest_is_not_an_authority_seal() {
+        let authority = test_authority();
+        let honest = intent_sealed(&authority);
+        let mut forged = honest.clone();
+        forged.prompt = "rm -rf /".into();
+        // The forger does everything an attacker with ledger write access can:
+        // rewrite the content and recompute the public identity.
+        forged.digest = forged.digest_for();
+        let encoded = serde_json::to_vec(&forged).unwrap();
+        let decoded: AcceptanceIntent = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            decoded.digest,
+            decoded.digest_for(),
+            "identity is consistent"
+        );
+        assert!(
+            decoded.validate(&authority).is_err(),
+            "a recomputed digest must not pass the keyed seal"
+        );
+
+        // And a seal minted under a different key is refused, not accepted as
+        // some other authority's word.
+        let forger = SealAuthority::with_key(vec![0x11u8; 32]).unwrap();
+        let resealed = forged.seal_with(&forger).unwrap();
+        assert!(resealed.validate(&forger).is_ok());
+        assert!(resealed.validate(&authority).is_err());
     }
 
     /// One named, individually parseable edit to a sealed record.
@@ -1277,6 +1807,10 @@ mod tests {
                 Box::new(|i: &mut AcceptanceIntent| i.spec_revision = "bridge/2".into()),
             ),
             (
+                "principal_token_id",
+                Box::new(|i: &mut AcceptanceIntent| i.principal_token_id = "someone-else".into()),
+            ),
+            (
                 "principal_revision",
                 Box::new(|i: &mut AcceptanceIntent| {
                     i.principal_revision = hash_payload(&serde_json::json!({"principal": "b"}))
@@ -1340,7 +1874,7 @@ mod tests {
             let encoded = serde_json::to_vec(&tampered).unwrap();
             let decoded: AcceptanceIntent = serde_json::from_slice(&encoded).unwrap();
             assert!(
-                decoded.validate().is_err(),
+                decoded.validate(&test_authority()).is_err(),
                 "tampering with {field} must fail closed"
             );
         }
@@ -1370,12 +1904,13 @@ mod tests {
 
     #[test]
     fn prompt_must_stay_within_its_sealed_bound() {
-        let mut over = intent();
+        let authority = test_authority();
+        let mut over = intent_sealed(&authority);
         over.prompt = "x".repeat(over.bounds.max_prompt_bytes + 1);
-        let over = over.seal();
+        let over = over.seal_with(&authority).unwrap();
         // The seal itself is valid; the bound is what rejects it.
         assert_eq!(over.digest, over.digest_for());
-        assert!(over.validate().is_err());
+        assert!(over.validate(&authority).is_err());
     }
 
     fn lease(now: DateTime<Utc>) -> AttemptLease {
@@ -1392,15 +1927,17 @@ mod tests {
             lease_ttl_ms: 1_000,
             state: AttemptLeaseState::Held,
             digest: String::new(),
+            seal: SealStamp::unsealed(),
         }
-        .seal()
+        .seal_with(&test_authority())
+        .unwrap()
     }
 
     #[test]
     fn lease_expiry_is_evaluated_against_the_durable_heartbeat() {
         let now = Utc::now();
         let held = lease(now);
-        assert!(held.validate().is_ok());
+        assert!(held.validate(&test_authority()).is_ok());
         assert!(held.is_active(now));
         assert!(!held.is_expired(now));
         assert!(held.is_expired(now + chrono::Duration::milliseconds(1_001)));
@@ -1409,7 +1946,8 @@ mod tests {
             state: AttemptLeaseState::Released,
             ..held.clone()
         }
-        .seal();
+        .seal_with(&test_authority())
+        .unwrap();
         assert!(released.is_expired(now));
         assert!(!released.is_active(now));
     }
@@ -1431,7 +1969,7 @@ mod tests {
         ] {
             let mut tampered = base.clone();
             mutate(&mut tampered);
-            assert!(tampered.validate().is_err());
+            assert!(tampered.validate(&test_authority()).is_err());
         }
     }
 
@@ -1449,7 +1987,7 @@ mod tests {
             let handles: Vec<_> = (0..16)
                 .map(|_| {
                     let worker = worker.clone();
-                    scope.spawn(move || usize::from(worker.settle_once()))
+                    scope.spawn(move || usize::from(worker.claim_finalization()))
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).sum()

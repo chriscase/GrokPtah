@@ -80,10 +80,10 @@ async fn wait_terminal(
         let v = orch.get_run(auth, run_id).unwrap();
         let state: grokptah_agent_bridge::RunState =
             serde_json::from_value(v["state"].clone()).unwrap();
-        if !matches!(
-            state,
-            grokptah_agent_bridge::RunState::Running | grokptah_agent_bridge::RunState::Queued
-        ) {
+        // `is_terminal` is the authoritative predicate; enumerating the
+        // non-terminal states by hand silently mistakes any new one for an
+        // outcome.
+        if state.is_terminal() {
             return state;
         }
         if start.elapsed() > Duration::from_secs(20) {

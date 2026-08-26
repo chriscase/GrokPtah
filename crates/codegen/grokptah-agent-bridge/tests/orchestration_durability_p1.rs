@@ -19,7 +19,7 @@ use std::time::Duration;
 use grokptah_agent_bridge::orchestration::{
     hash_payload, project_admission, AcceptanceIntent, AttemptLeaseState, AuthContext, OrchStore,
     OrchestrationConfig, OrchestrationService, ProviderSendFailure, ProviderSendState, RunBounds,
-    SealedBounds, SpecBinding, SpecHolder, WorkspaceAllowlist, ACCEPTANCE_INTENT_VERSION,
+    SealAuthority, SpecBinding, SpecHolder, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     safe_id_filename, set_grokptah_home_override, AgentHost, AgentHostHandle, HostConfig,
@@ -87,6 +87,21 @@ impl Rig {
             }
         }
         counts
+    }
+
+    /// Tear down without bringing anything back, releasing the store lock.
+    fn shutdown_only(self) -> (TempDir, TempDir, ProcessEnvGuard) {
+        let Rig {
+            home,
+            ws,
+            _env,
+            host,
+            orch,
+            ..
+        } = self;
+        drop(orch);
+        drop(host);
+        (home, ws, _env)
     }
 
     async fn restart(self) -> Self {
@@ -302,6 +317,7 @@ async fn all_six_holders_agree_on_one_specification_key() {
     }
     .verify(
         &intent,
+        store.seal_authority(),
         &[
             SpecHolder::Run,
             SpecHolder::Receipt,
@@ -338,14 +354,16 @@ async fn all_six_holders_agree_on_one_specification_key() {
         },
     ] {
         assert!(
-            dissent.verify(&intent, &[]).is_err(),
+            dissent
+                .verify(&intent, store.seal_authority(), &[])
+                .is_err(),
             "a holder bound to a different key must be refused"
         );
     }
 
     // A required holder that is bound to nothing is also a refusal.
     assert!(SpecBinding::default()
-        .verify(&intent, &[SpecHolder::Run])
+        .verify(&intent, store.seal_authority(), &[SpecHolder::Run])
         .is_err());
     set_grokptah_home_override(None);
 }
@@ -397,17 +415,24 @@ async fn a_resealed_forgery_is_a_different_specification_and_never_runs() {
 
     // Swap the prompt and *reseal*, so the record verifies on its own terms.
     // Only the binding to the run and the receipt exposes it.
-    let forged = AcceptanceIntent {
+    // The forger has ledger write access but not the sealing key, so the best
+    // it can do is rewrite the content and recompute the *public* identity.
+    let mut forged = AcceptanceIntent {
         prompt: marker_prompt("forged-marker"),
         digest: String::new(),
         ..original.clone()
-    }
-    .seal();
-    assert!(
-        forged.validate().is_ok(),
-        "the forgery is internally consistent, which is the point"
-    );
+    };
+    forged.digest = forged.digest_for();
     assert_ne!(forged.spec_key(), original.spec_key());
+    // Sealing it under a key of the attacker's own choosing produces a record
+    // that is internally perfect and that this store will never accept.
+    let attacker_authority = SealAuthority::with_key(vec![0x7eu8; 32]).unwrap();
+    let forged = forged.seal_with(&attacker_authority).unwrap();
+    assert!(forged.validate(&attacker_authority).is_ok());
+    assert!(
+        forged.validate(rig.orch.store().seal_authority()).is_err(),
+        "a seal minted under a foreign key must never authenticate here"
+    );
 
     let run = rig.orch.store().load_run(&run_id).unwrap().unwrap();
     let binding = SpecBinding {
@@ -415,11 +440,18 @@ async fn a_resealed_forgery_is_a_different_specification_and_never_runs() {
         ..Default::default()
     };
     assert!(
-        binding.verify(&forged, &[SpecHolder::Run]).is_err(),
+        binding
+            .verify(
+                &forged,
+                rig.orch.store().seal_authority(),
+                &[SpecHolder::Run]
+            )
+            .is_err(),
         "a resealed forgery must not satisfy the run's binding"
     );
 
     // Install it on disk anyway; the run's own key is what refuses it.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let path = intent_file(&store_root, &run_id);
     #[cfg(unix)]
     {
@@ -572,7 +604,12 @@ async fn teardown_releases_capacity_only_after_proved_quiescence() {
         .unwrap();
     assert_eq!(cancelled["teardownComplete"], true);
 
-    wait_all_terminal(&rig, &[queued_id.clone()], Duration::from_secs(60)).await;
+    wait_all_terminal(
+        &rig,
+        std::slice::from_ref(&queued_id),
+        Duration::from_secs(60),
+    )
+    .await;
     assert_eq!(
         rig.orch.worker_future_finished(&long_id),
         Some(true),
@@ -711,7 +748,12 @@ async fn the_queue_reconciler_recovers_work_from_the_ledger_alone() {
     for _ in 0..5 {
         rig.orch.reconcile_durable_queued();
     }
-    wait_all_terminal(&rig, &[queued_id.clone()], Duration::from_secs(60)).await;
+    wait_all_terminal(
+        &rig,
+        std::slice::from_ref(&queued_id),
+        Duration::from_secs(60),
+    )
+    .await;
     assert_eq!(
         rig.markers().get("recon-marker").copied(),
         Some(1),
@@ -838,7 +880,7 @@ async fn a_run_without_sent_evidence_is_never_reported_completed() {
         .await
         .unwrap();
     let run_id = response["runId"].as_str().unwrap().to_string();
-    wait_all_terminal(&rig, &[run_id.clone()], Duration::from_secs(60)).await;
+    wait_all_terminal(&rig, std::slice::from_ref(&run_id), Duration::from_secs(60)).await;
 
     let run = rig.orch.store().load_run(&run_id).unwrap().unwrap();
     let send = rig.orch.store().load_provider_send(&run_id).unwrap();
@@ -904,7 +946,12 @@ async fn policy_drift_between_acceptance_and_action_refuses_the_run() {
         other.path().to_path_buf(),
     ]));
 
-    wait_all_terminal(&rig, &[queued_id.clone()], Duration::from_secs(60)).await;
+    wait_all_terminal(
+        &rig,
+        std::slice::from_ref(&queued_id),
+        Duration::from_secs(60),
+    )
+    .await;
     let run = rig.orch.store().load_run(&queued_id).unwrap().unwrap();
     assert_ne!(
         run.state,
@@ -913,7 +960,7 @@ async fn policy_drift_between_acceptance_and_action_refuses_the_run() {
     );
     assert_eq!(run.error_code.as_deref(), Some("authorization_drift"));
     assert!(
-        rig.markers().get("drift-marker").is_none(),
+        !rig.markers().contains_key("drift-marker"),
         "the drifted run executed: {:?}",
         rig.markers()
     );
@@ -990,7 +1037,7 @@ async fn a_decision_survives_receipt_retention() {
     );
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
-        rig.markers().get("horizon-marker").is_none(),
+        !rig.markers().contains_key("horizon-marker"),
         "a decided-failed request executed after its receipt was retired"
     );
     set_grokptah_home_override(None);
@@ -1023,12 +1070,20 @@ async fn the_public_projection_never_carries_execution_material() {
         .await
         .unwrap();
     let run_id = response["runId"].as_str().unwrap().to_string();
-    wait_all_terminal(&rig, &[run_id.clone()], Duration::from_secs(60)).await;
+    wait_all_terminal(&rig, std::slice::from_ref(&run_id), Duration::from_secs(60)).await;
 
     let run = rig.orch.store().load_run(&run_id).unwrap().unwrap();
     let lease = rig.orch.store().load_attempt_lease(&run_id).unwrap();
     let send = rig.orch.store().load_provider_send(&run_id).unwrap();
-    let projection = project_admission(&run, lease.as_ref(), send.as_ref(), chrono::Utc::now());
+    let uncertainty = rig.orch.store().load_teardown_uncertain(&run_id).unwrap();
+    let projection = project_admission(
+        &run,
+        lease.as_ref(),
+        send.as_ref(),
+        uncertainty.as_ref(),
+        Some(&"b".repeat(64)),
+        chrono::Utc::now(),
+    );
     let encoded = serde_json::to_string(&projection).unwrap();
 
     assert!(!encoded.contains(secret), "projection leaked the prompt");
@@ -1045,6 +1100,13 @@ async fn the_public_projection_never_carries_execution_material() {
     }
     assert_eq!(projection.run_id, run_id);
     assert_eq!(projection.spec_key, run.spec_key);
+    // The new operator-facing truth is present and safe.
+    assert!(!projection.teardown_uncertain);
+    assert!(projection.max_rounds >= 1);
+    assert_eq!(
+        projection.route_revision.as_deref(),
+        Some("b".repeat(64).as_str())
+    );
     set_grokptah_home_override(None);
 }
 
@@ -1225,11 +1287,48 @@ async fn shutdown_fences_and_stages_without_releasing_capacity_synchronously() {
         record.state
     );
     assert_eq!(record.state, RunState::Interrupted);
-    let lease = reopened.load_attempt_lease(&run_id).unwrap();
-    assert!(
-        lease.is_none() || lease.unwrap().state == AttemptLeaseState::Released,
-        "restart must not leave a held lease behind"
-    );
+
+    // The synchronous path never *releases*. Either it proved the worker had
+    // already stopped — in which case the supervisor settled the attempt and
+    // there is nothing left uncertain — or it could not, in which case the
+    // conflict domain is fenced and both the lease and the input survive the
+    // restart. Which of the two happens is a race with the abort, so what is
+    // asserted is that the fence, the lease, and the input never disagree.
+    let fence = reopened.load_teardown_uncertain(&run_id).unwrap();
+    let lease = reopened
+        .load_attempt_lease(&run_id)
+        .unwrap()
+        .expect("a dispatched attempt always leaves a lease record");
+    let input_retained = intent_file(&store_root, &run_id).is_file();
+    match &fence {
+        Some(fence) => {
+            assert_eq!(fence.run_id, run_id);
+            assert_eq!(
+                lease.state,
+                AttemptLeaseState::Held,
+                "a fenced run keeps its lease across a restart"
+            );
+            assert!(
+                input_retained,
+                "a fenced run keeps its durable input across a restart"
+            );
+            // And the fence is what stops a second attempt: lifting it is
+            // explicit, never a side effect of recovery.
+            assert!(reopened.clear_teardown_uncertain(&run_id).unwrap());
+            assert!(reopened.load_teardown_uncertain(&run_id).unwrap().is_none());
+        }
+        None => {
+            assert_eq!(
+                lease.state,
+                AttemptLeaseState::Released,
+                "an unfenced terminal run must not still hold its lease"
+            );
+            assert!(
+                !input_retained,
+                "an unfenced terminal run must not keep executable input"
+            );
+        }
+    }
     drop(reopened);
     drop(home);
     drop(ws);
@@ -1274,7 +1373,11 @@ async fn every_private_ledger_is_owner_only_and_no_follow() {
         )
         .await
         .unwrap();
+    // Both are read only by the Unix authority assertions below; the
+    // Windows equivalent is the DACL verdict, unit-tested in `ledger_io`.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let queued_id = queued["runId"].as_str().unwrap().to_string();
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let store_root = rig.store_path();
 
     // Every private ledger directory is owner-only.
@@ -1339,5 +1442,144 @@ async fn ledger_names_cannot_be_steered_by_caller_identity() {
         // Only store-generated digests name input files.
         assert!(store.remove_acceptance_intent_file(hostile).is_err());
     }
+    set_grokptah_home_override(None);
+}
+
+// ── registration gap ───────────────────────────────────────────────────
+
+/// A run published but not yet started is *provably* quiescent, and must not
+/// be recorded as uncertain.
+///
+/// This is the distinction the cancel-aware gate exists for. A worker parked
+/// behind a gate that has been abandoned can never begin, so there is nothing
+/// to be uncertain about — but the same worker behind a gate that is merely
+/// closed is one `open()` away from running, and treating *that* as quiescent
+/// is how capacity gets handed to a second attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
+async fn a_run_cancelled_in_the_registration_gap_is_certain_not_uncertain() {
+    let rig = Rig::new(1).await;
+    let auth = rig.auth();
+
+    let submitted = rig
+        .orch
+        .submit_task(
+            &auth,
+            "gap-run",
+            rig.session,
+            rig.ws.path(),
+            "run sleep 30".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let run_id = submitted["runId"].as_str().unwrap().to_string();
+
+    // Publication happens before the gate opens, so this observes the run in
+    // the registration gap itself.
+    wait_for("publication", Duration::from_secs(10), || {
+        rig.orch.live_run_ids().contains(&run_id)
+    })
+    .await;
+
+    let status = rig
+        .orch
+        .attempt_status(&run_id)
+        .expect("a published attempt reports its status");
+    assert!(status.registered, "publication implies full registration");
+    assert!(!status.capacity_released);
+
+    let cancelled = rig
+        .orch
+        .cancel(
+            &auth,
+            "gap-cancel",
+            rig.session,
+            rig.ws.path(),
+            Some(&run_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled["teardownComplete"], true);
+
+    // Whether the worker had begun or not, teardown is *proved* either way:
+    // it either finished, or its gate was abandoned before it could start.
+    assert_eq!(rig.orch.worker_future_finished(&run_id), Some(true));
+
+    let store_root = rig.store_path();
+    let (home, ws, env) = rig.shutdown_only();
+    let reopened = open_store(&store_root).await;
+
+    // Proved quiescence means no fence: uncertainty is recorded only when it
+    // is real, so an operator who sees one knows it means something.
+    assert!(
+        reopened.load_teardown_uncertain(&run_id).unwrap().is_none(),
+        "a provably-stopped attempt must not be recorded as uncertain"
+    );
+    let record = reopened.load_run(&run_id).unwrap().expect("run record");
+    assert!(record.state.is_terminal());
+    drop(reopened);
+    drop(home);
+    drop(ws);
+    drop(env);
+    set_grokptah_home_override(None);
+}
+
+/// The explicit async shutdown proves quiescence and releases; it never leaves
+/// a fence behind for work it could establish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
+async fn explicit_async_shutdown_releases_against_proved_quiescence() {
+    let rig = Rig::new(1).await;
+    let auth = rig.auth();
+
+    let submitted = rig
+        .orch
+        .submit_task(
+            &auth,
+            "async-shutdown",
+            rig.session,
+            rig.ws.path(),
+            // Long enough to still be live at shutdown, short enough that a
+            // cooperative teardown completes well inside the budget.
+            "run sleep 8".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let run_id = submitted["runId"].as_str().unwrap().to_string();
+    wait_for("the worker to start", Duration::from_secs(10), || {
+        rig.orch.worker_future_finished(&run_id) == Some(false)
+    })
+    .await;
+
+    // The async path can await, so it establishes what the synchronous one
+    // cannot, and releases on that basis rather than on a guess.
+    let uncertain = rig.orch.shutdown().await;
+    assert!(
+        uncertain.is_empty(),
+        "a cooperative worker must be provably stopped, not left uncertain: {uncertain:?}"
+    );
+    assert_eq!(
+        rig.orch.worker_future_finished(&run_id),
+        Some(true),
+        "shutdown releases only against a proved stop"
+    );
+    assert!(
+        !rig.orch.live_run_ids().contains(&run_id),
+        "a released attempt is deregistered"
+    );
+
+    let store_root = rig.store_path();
+    let (home, ws, env) = rig.shutdown_only();
+    let reopened = open_store(&store_root).await;
+    assert!(
+        reopened.load_teardown_uncertain(&run_id).unwrap().is_none(),
+        "an established outcome must not leave a fence"
+    );
+    drop(reopened);
+    drop(home);
+    drop(ws);
+    drop(env);
     set_grokptah_home_override(None);
 }

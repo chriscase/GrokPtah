@@ -17,8 +17,9 @@ use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
 use crate::session::{SessionKind, WorkspaceStatus};
 
 use super::admission::{
-    AcceptanceIntent, AttemptLease, AuthorizationSnapshot, LiveWorker, ProviderSendFailure,
-    ProviderSendState, SealedBounds, SpecBinding, SpecHolder, StartGate, WorkerLiveness,
+    AcceptanceIntent, AttemptLease, AuthorizationSnapshot, GateOutcome, LiveWorker,
+    ProviderRequestSink, ProviderRequestTicket, ProviderSendFailure, ProviderSendState,
+    RequestPhase, SealedBounds, SpecBinding, SpecHolder, StartGate, WorkerLiveness,
     WorkerLivenessGuard, ACCEPTANCE_INTENT_VERSION, DEFAULT_ATTEMPT_LEASE_TTL_MS,
     DEFAULT_TEARDOWN_BUDGET,
 };
@@ -98,6 +99,10 @@ pub struct OrchestrationService {
     /// capacity, promote another attempt, or report the run terminal while its
     /// entry is still live.
     live_workers: Mutex<HashMap<String, Arc<LiveWorker>>>,
+    /// Run ids claimed for dispatch but not yet published. A reservation
+    /// blocks a second attempt without exposing an entry whose handles are
+    /// still being attached.
+    dispatch_reservations: Mutex<std::collections::HashSet<String>>,
     /// Bounded post-mortem liveness of recent attempts, so callers can ask
     /// whether the *worker future itself* is gone rather than trusting the
     /// ledger.
@@ -166,6 +171,12 @@ pub struct AttemptStatus {
     pub escaped: bool,
     /// The worker future itself can no longer execute.
     pub worker_quiescent: bool,
+    /// Work behind this attempt's start gate could still begin.
+    ///
+    /// Reported separately from `worker_quiescent` because the two answer
+    /// different questions: one is "has it stopped?", the other is "can it
+    /// start?", and an attempt in the registration gap is neither.
+    pub may_still_start: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -188,30 +199,57 @@ impl Drop for OrchestrationService {
         if let Some(watcher) = self.scheduler_watcher.get_mut().take() {
             watcher.abort();
         }
-        // Shutdown is an outer-supervisor exit like any other: every live
-        // attempt must end with a durable terminal record or a bounded
-        // recoverable finalization intent, never with a run left `Running`
-        // and no evidence of why.
+        if let Some(task) = self.teardown_task.get_mut().take() {
+            task.abort();
+        }
+        for task in self.reconcilers.get_mut().drain(..) {
+            task.abort();
+        }
+
+        // `Drop` is synchronous, so it cannot await anything, which means it
+        // can never prove a worker stopped. It therefore does exactly two
+        // things: it **fences** every live attempt, and it **records that the
+        // outcome is unknown**.
+        //
+        // What it must not do is release. Dropping a lease, dropping durable
+        // input, or handing back capacity would each authorize a second
+        // attempt on the strength of an abort *request*, and an abort request
+        // is not evidence. Callers that can await should use
+        // `shutdown().await`, which proves quiescence first; this is the last
+        // resort for when nobody did.
         let live: Vec<Arc<LiveWorker>> = self
             .live_workers
             .get_mut()
             .drain()
-            .map(|(_, e)| e)
+            .map(|(_, entry)| entry)
             .collect();
         for entry in live {
-            entry.cancel.cancel();
-            entry.abort_nested();
-            if entry.settle_once() {
+            entry.fence();
+            if entry.claim_finalization() {
                 stage_supervisor_exit(&self.store, &entry.run_id, "shutdown");
-                release_settled_attempt(
-                    &self.store,
-                    &self.host,
-                    &entry.run_id,
-                    &entry.attempt_id,
-                    &self.owner_id,
+            }
+            if entry.liveness.quiescent() {
+                // Provably gone: the gate was abandoned before it opened, or
+                // the worker had already finished. Nothing is uncertain, so
+                // the conflict domain does not need fencing past this point.
+                continue;
+            }
+            // Otherwise the run keeps its lease and its capacity until
+            // something that can await reconciles it, and the ledger says so
+            // out loud rather than leaving the gap to be inferred.
+            if let Err(error) = self.store.record_teardown_uncertain(
+                &entry.run_id,
+                &entry.attempt_id,
+                &self.owner_id,
+                "process shut down while the attempt was live",
+            ) {
+                eprintln!(
+                    "[grokptah] run {} teardown uncertainty could not be recorded: {}",
+                    entry.run_id, error.message
                 );
             }
         }
+
         let pending = self
             .pending_admissions
             .get_mut()
@@ -220,30 +258,11 @@ impl Drop for OrchestrationService {
             .map(|run| run.run_id.clone())
             .collect::<Vec<_>>();
         for run_id in pending {
+            // A queued run never started, so releasing its *queue* slot claims
+            // nothing about whether a worker ran.
             self.host.release_orchestration_queue_slot(&run_id);
         }
     }
-}
-
-/// Release everything one settled attempt still owns.
-///
-/// Called exactly once per attempt, by whichever exit path won
-/// [`LiveWorker::settle_once`]. Ordering is deliberate: the durable lease and
-/// the durable input go first, because both are only safe to drop once the run
-/// is terminal; host capacity goes last, because releasing it is what allows
-/// another attempt to start.
-fn release_settled_attempt(
-    store: &OrchStore,
-    host: &AgentHostHandle,
-    run_id: &str,
-    attempt_id: &str,
-    owner_id: &str,
-) {
-    let _ = store.release_attempt_lease(run_id, attempt_id, owner_id);
-    // Safe only now: the run is terminal, so no recovery pass can ever need
-    // this input again.
-    let _ = store.remove_acceptance_intent(run_id);
-    host.release_orchestration_turn(run_id);
 }
 
 /// Record that one outer supervisor exited without installing a terminal
@@ -275,6 +294,78 @@ fn stage_supervisor_exit(store: &OrchStore, run_id: &str, reason: &str) {
     }
 }
 
+/// The durable sink one attempt's physical provider requests report to.
+///
+/// Holds the store and the run identity, so the HTTP layer can report phases
+/// without knowing anything about the ledger. `may_send` is the enforcement
+/// point: it is consulted before *every* send, including retries, so a retry
+/// across an unobserved outcome is refused rather than attempted and regretted.
+pub struct LedgerRequestSink {
+    store: OrchStore,
+    run_id: String,
+}
+
+impl LedgerRequestSink {
+    pub fn new(store: OrchStore, run_id: String) -> Self {
+        Self { store, run_id }
+    }
+}
+
+impl ProviderRequestSink for LedgerRequestSink {
+    fn record(
+        &self,
+        ticket: &ProviderRequestTicket,
+        phase: RequestPhase,
+        detail: Option<&str>,
+    ) -> Result<(), String> {
+        self.store
+            .record_provider_request(&self.run_id, ticket, phase, detail)
+            .map_err(|error| error.message)
+    }
+
+    fn may_send(&self, ticket: &ProviderRequestTicket) -> Result<(), String> {
+        // Every earlier physical request for this run must have reached a
+        // state that makes another send safe. `Uncertain` never does: the
+        // provider may already have run the work, and no local retry can
+        // establish otherwise.
+        let history = self
+            .store
+            .list_provider_requests(&self.run_id)
+            .map_err(|error| error.message)?;
+        for previous in history {
+            if previous.request_ordinal >= ticket.request_ordinal {
+                continue;
+            }
+            match previous.phase {
+                RequestPhase::KnownNotSent | RequestPhase::Settled => {}
+                RequestPhase::Uncertain => {
+                    return Err(format!(
+                        "request {} for this run has an unobserved outcome; \
+                         resending would risk duplicate provider work. \
+                         Reconcile it or record an explicit operator disposition first.",
+                        previous.request_ordinal
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "request {} for this run is still {}; a second send is not authorized",
+                        previous.request_ordinal,
+                        other.as_str()
+                    ));
+                }
+            }
+        }
+        // A run fenced by an unresolved teardown never sends at all.
+        if matches!(
+            self.store.load_teardown_uncertain(&self.run_id),
+            Ok(Some(_))
+        ) {
+            return Err("run is fenced by an unresolved teardown".into());
+        }
+        Ok(())
+    }
+}
+
 /// Why a worker future did not return a turn result.
 ///
 /// The classification is durable evidence, not a log line: `send_failure`
@@ -289,6 +380,16 @@ pub(crate) struct WorkerOutcome {
 }
 
 impl WorkerOutcome {
+    /// The attempt was cancelled during the registration gap, before its gate
+    /// opened. Nothing was transmitted because nothing ever ran.
+    fn abandoned() -> Self {
+        Self {
+            message: "attempt was cancelled before it started".into(),
+            error_code: "cancelled_before_start",
+            send_failure: Some(ProviderSendFailure::PreflightRejected),
+        }
+    }
+
     /// Refused before the turn began; nothing was transmitted.
     fn refused(error: OrchError) -> Self {
         Self {
@@ -535,6 +636,7 @@ impl OrchestrationService {
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
             scheduler_watcher: Mutex::new(None),
             live_workers: Mutex::new(HashMap::new()),
+            dispatch_reservations: Mutex::new(std::collections::HashSet::new()),
             remembered_liveness: Mutex::new(VecDeque::new()),
             owner_id: Uuid::new_v4().to_string(),
             teardown_tx,
@@ -548,6 +650,52 @@ impl OrchestrationService {
         // before any new submission can take its capacity.
         service.recover_admissions();
         service
+    }
+
+    /// Shut down every live attempt, proving quiescence before releasing.
+    ///
+    /// This is the path a caller that can await should always use. It fences
+    /// each attempt, waits within a bound for its worker to actually stop, and
+    /// only then releases the lease, the durable input, and the capacity.
+    /// Anything that cannot be proved is recorded as teardown-uncertain and
+    /// keeps its conflict domain fenced rather than being assumed finished.
+    ///
+    /// Returns the run ids whose outcome could not be established.
+    pub async fn shutdown(&self) -> Vec<String> {
+        let live: Vec<Arc<LiveWorker>> = self.live_workers.lock().values().cloned().collect();
+        let mut uncertain = Vec::new();
+        for entry in live {
+            let outcome = entry.terminate(DEFAULT_TEARDOWN_BUDGET).await;
+            if !outcome.may_release_capacity() {
+                // Not provably stopped. Fence the conflict domain and say so.
+                let _ = self.store.record_teardown_uncertain(
+                    &entry.run_id,
+                    &entry.attempt_id,
+                    &self.owner_id,
+                    &format!("bounded teardown ended as {outcome:?}"),
+                );
+                uncertain.push(entry.run_id.clone());
+                continue;
+            }
+            // Quiescence is proved. Winning the release latch means this call
+            // performs the release; losing it means the teardown owner already
+            // did, which is the same success reached by another path — not a
+            // reason to fence anything.
+            if entry.claim_capacity_release() {
+                let _ = self.store.release_attempt_lease(
+                    &entry.run_id,
+                    &entry.attempt_id,
+                    &self.owner_id,
+                );
+                let _ = self.store.remove_acceptance_intent(&entry.run_id);
+                self.host.release_orchestration_turn(&entry.run_id);
+            }
+            self.live_workers.lock().remove(&entry.run_id);
+        }
+        if let Some(task) = self.teardown_task.lock().take() {
+            task.abort();
+        }
+        uncertain
     }
 
     /// Start the single async owner of teardown.
@@ -692,6 +840,7 @@ impl OrchestrationService {
     /// ever being stored.
     pub(crate) fn authorization_snapshot(
         &self,
+        principal_token_id: &str,
         session: &crate::session::SessionSummary,
         agent_id: Option<&str>,
     ) -> AuthorizationSnapshot {
@@ -703,12 +852,18 @@ impl OrchestrationService {
                 config.bearer_token.clone(),
             )
         };
-        // The principal is identified by a digest of its credential and the
-        // capability set that credential carries, never by the credential.
+        // The principal is the *authenticated caller*, not whatever credential
+        // the config happens to hold. Binding the config alone would let work
+        // admitted by one caller be dispatched under another's authority as
+        // soon as the config was reloaded, which is the drift this exists to
+        // catch. `token_id` identifies the presented credential; the config
+        // digest is included as well so rotating the accepted secret is also
+        // drift.
         let principal_revision = hash_payload(&json!({
-            "credential": hash_payload(&json!(token)),
+            "tokenId": principal_token_id,
+            "acceptedCredential": hash_payload(&json!(token)),
             "capabilities": CONTROL_TOOLS,
-            "authenticated": !token.is_empty(),
+            "authenticated": !principal_token_id.is_empty(),
         }));
         let policy_revision = hash_payload(&json!({
             "allowlist": allowlist.fingerprint(),
@@ -721,14 +876,7 @@ impl OrchestrationService {
         }));
         // Provider, model, route, and credential material as one fingerprint.
         // Offline execution is a route in its own right, not an absence of one.
-        let offline = std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some();
-        let route_revision = hash_payload(&json!({
-            "offline": offline,
-            "provider": if offline { "offline" } else { "wire" },
-            "route": session.kind,
-            "executionMode": session.execution_mode,
-            "credentialsPresent": offline || provider_credentials_present(session),
-        }));
+        let route_revision = provider_route_revision(session);
         // The continuation revision of a persistent agent, when the work
         // belongs to one. Work with no agent has no continuation lineage, and
         // must not borrow the session's message count as a stand-in: that
@@ -762,6 +910,12 @@ impl OrchestrationService {
     /// recomputed and compared against what the specification sealed, and any
     /// drift refuses the dispatch rather than executing under authority that
     /// no longer exists.
+    /// Re-answer "may this run?" at the moment of action.
+    ///
+    /// The principal is taken from the specification, not from whoever is
+    /// configured now: a queued task must execute as the principal that was
+    /// authorized to submit it, and if that principal's capabilities or
+    /// credential have changed since, the recomputed fingerprint says so.
     pub(crate) fn reauthorize_for_action(&self, spec: &AcceptanceIntent) -> Result<(), OrchError> {
         // Session, project, and capability must still resolve at all.
         let session = self.require_build_session(spec.session_id)?;
@@ -794,7 +948,7 @@ impl OrchestrationService {
                 ));
             }
         }
-        self.authorization_snapshot(&session, spec.agent_id.as_deref())
+        self.authorization_snapshot(&spec.principal_token_id, &session, spec.agent_id.as_deref())
             .reauthorize(spec)
     }
 
@@ -1009,6 +1163,12 @@ impl OrchestrationService {
     /// execute: its durable input is destroyed in the same step, so no
     /// recovery pass can find anything to run.
     fn tombstone_admission(&self, run_id: &str, error_code: &str) {
+        // A fenced run keeps its lease and its input: the fence exists
+        // precisely because we do not know whether a worker is still using
+        // them. Tombstoning it would release both on a guess.
+        if matches!(self.store.load_teardown_uncertain(run_id), Ok(Some(_))) {
+            return;
+        }
         let _ = self.store.update_run(run_id, |run| {
             if run.state.is_terminal() {
                 return Ok(());
@@ -1303,6 +1463,7 @@ impl OrchestrationService {
             capacity_released: entry.capacity_released(),
             escaped: entry.has_escaped(),
             worker_quiescent: entry.liveness.quiescent(),
+            may_still_start: entry.may_still_start(),
         })
     }
 
@@ -1452,6 +1613,25 @@ impl OrchestrationService {
                 }
             };
 
+            // Reauthorize *before* promotion, not only before the gate opens.
+            // A task that sat in the queue while a scope was revoked must not
+            // consume a capacity slot or take a lease it is no longer entitled
+            // to; refusing here keeps the slot for work that is still allowed.
+            if let Err(error) = self.reauthorize_for_action(&intent) {
+                self.release_turn_if_not_live(&pending.run_id);
+                self.audit(
+                    "run_promotion",
+                    Some(&current.request_id),
+                    Some(current.session_id),
+                    Some(&current.workspace),
+                    "rejected",
+                    Some(error.code.as_str()),
+                    &error.message,
+                );
+                self.tombstone_admission(&pending.run_id, "authorization_drift");
+                continue;
+            }
+
             // Mandatory attempt lease. A run whose previous attempt is still
             // live in this process is never promoted a second time.
             let lease = match self.acquire_dispatch_lease(&current, &intent) {
@@ -1499,6 +1679,21 @@ impl OrchestrationService {
     ///
     /// Every path that turns durable input into execution goes through here.
     fn load_bound_intent(&self, run: &RunRecord) -> Result<AcceptanceIntent, OrchError> {
+        // A run whose previous teardown could not be established is fenced.
+        // Its worker may still be executing somewhere, so authorizing another
+        // attempt would be authorizing an overlap. Only an explicit
+        // reconciliation or operator disposition lifts this.
+        if let Some(uncertain) = self.store.load_teardown_uncertain(&run.run_id)? {
+            return Err(OrchError::with_data(
+                OrchErrorCode::Conflict,
+                "run is fenced by an unresolved teardown and cannot be dispatched",
+                json!({
+                    "runId": run.run_id,
+                    "attemptId": uncertain.attempt_id,
+                    "reason": uncertain.reason,
+                }),
+            ));
+        }
         let intent = self
             .store
             .load_acceptance_intent(&run.run_id)?
@@ -1520,7 +1715,7 @@ impl OrchestrationService {
             lease: lease.as_ref().map(|lease| lease.intent_digest.as_str()),
             ..SpecBinding::default()
         }
-        .verify(&intent, &[SpecHolder::Run])?;
+        .verify(&intent, self.store.seal_authority(), &[SpecHolder::Run])?;
         Ok(intent)
     }
 
@@ -3599,7 +3794,6 @@ impl OrchestrationService {
         retry_of: Option<&str>,
         idempotency_tool: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let _ = auth;
         let tool = idempotency_tool;
         let payload = json!({
             "sessionId": session_id,
@@ -3688,7 +3882,8 @@ impl OrchestrationService {
         // The authorization that admits this work, captured as fingerprints
         // and sealed into the specification, so action time can re-answer the
         // same question instead of trusting this moment forever.
-        let authorization = self.authorization_snapshot(&session, session.agent_id.as_deref());
+        let authorization =
+            self.authorization_snapshot(&auth.token_id, &session, session.agent_id.as_deref());
 
         // ── crash-safe cut C2: private bounded input, sealed ───────────
         //
@@ -3709,6 +3904,7 @@ impl OrchestrationService {
             agent_id: session.agent_id.clone(),
             agent_revision: authorization.agent_revision,
             spec_revision: EXECUTION_SPEC_REVISION.into(),
+            principal_token_id: auth.token_id.clone(),
             principal_revision: authorization.principal_revision.clone(),
             policy_revision: authorization.policy_revision.clone(),
             route_revision: authorization.route_revision.clone(),
@@ -3720,8 +3916,9 @@ impl OrchestrationService {
             parent_run_id: None,
             created_at: Utc::now(),
             digest: String::new(),
+            seal: super::seal::SealStamp::unsealed(),
         }
-        .seal();
+        .seal_with(self.store.seal_authority())?;
         if let Err(e) = self.store.save_acceptance_intent(&intent) {
             if !queued {
                 self.host.release_turn_reservation(session_id, &run_id);
@@ -3840,7 +4037,13 @@ impl OrchestrationService {
             Some(&claimed.display().to_string()),
             "accepted",
             None,
-            if queued { "run queued" } else { "run started" },
+            // Never "started": at receipt time no lease is held and no worker
+            // exists. Dispatch audits itself separately, after both are true.
+            if queued {
+                "run queued"
+            } else {
+                "run accepted for immediate dispatch"
+            },
         );
 
         if queued {
@@ -4076,24 +4279,23 @@ impl OrchestrationService {
         ));
 
         // ── one active attempt ─────────────────────────────────────────
-        // Reserve the registry slot before anything is spawned, so a second
-        // dispatch for the same run cannot interleave with this one.
-        {
-            let mut live = self.live_workers.lock();
-            if live.contains_key(&rid) {
-                drop(live);
-                eprintln!("[grokptah] refusing a second live attempt for run {rid}");
-                let _ = self
-                    .store
-                    .release_attempt_lease(&rid, &lease.attempt_id, &owner_id);
-                return;
-            }
-            live.insert(rid.clone(), entry.clone());
+        //
+        // Reserving is not publishing. A *reservation* claims the run id so a
+        // second dispatch cannot interleave; the entry itself is published
+        // only once every handle exists, because a published entry with
+        // missing handles is one that teardown cannot fully abort.
+        if !self.reserve_dispatch(&rid) {
+            eprintln!("[grokptah] refusing a second live attempt for run {rid}");
+            let _ = self
+                .store
+                .release_attempt_lease(&rid, &lease.attempt_id, &owner_id);
+            return;
         }
         self.remember_liveness(&rid, liveness.clone());
 
-        // ── the closed start gate ──────────────────────────────────────
+        // ── the closed, cancel-aware start gate ────────────────────────
         let gate = StartGate::new();
+        entry.attach_gate(gate.clone());
 
         // ── nested aggregator ──────────────────────────────────────────
         let mut agg_rx = bus.subscribe();
@@ -4101,7 +4303,9 @@ impl OrchestrationService {
         let rid_agg = rid.clone();
         let gate_agg = gate.clone();
         let agg_task = tokio::spawn(async move {
-            gate_agg.wait().await;
+            if gate_agg.wait().await == GateOutcome::Abandoned {
+                return;
+            }
             while let Some(update) = agg_rx.recv().await {
                 apply_run_aggregate(&store_agg, &rid_agg, session_id, &update);
             }
@@ -4121,7 +4325,13 @@ impl OrchestrationService {
         let attempt_id_worker = lease.attempt_id.clone();
         let spec_worker = intent.clone();
         let worker = tokio::spawn(async move {
-            gate_worker.wait().await;
+            if gate_worker.wait().await == GateOutcome::Abandoned {
+                // Cancelled during the registration gap: this worker never
+                // begins, and says so, so teardown can prove quiescence
+                // without waiting for work that will never run.
+                liveness_worker.mark_unstartable();
+                return Err(WorkerOutcome::abandoned());
+            }
             let _live = WorkerLivenessGuard::new(liveness_worker);
 
             // Action-time reauthorization. The worker re-checks for itself
@@ -4143,8 +4353,8 @@ impl OrchestrationService {
             // honestly says queued, because nothing has started.
             let start_seq = bus_next_seq_for(&service_worker);
             let acknowledged = store_worker.update_run(&rid_worker, |current| {
-                if current.state != RunState::Queued {
-                    anyhow::bail!("run is no longer queued");
+                if current.state != RunState::Starting {
+                    anyhow::bail!("run is not awaiting worker acknowledgement");
                 }
                 current.state = RunState::Running;
                 current.queue_position = None;
@@ -4155,7 +4365,7 @@ impl OrchestrationService {
             if !matches!(acknowledged, Ok(Some(_))) {
                 return Err(WorkerOutcome::refused(OrchError::new(
                     OrchErrorCode::Conflict,
-                    "run was no longer queued at worker acknowledgement",
+                    "run was not awaiting acknowledgement when its worker started",
                 )));
             }
 
@@ -4227,12 +4437,27 @@ impl OrchestrationService {
         let worker_abort = worker.abort_handle();
 
         // ── outer supervisor ───────────────────────────────────────────
+        let rid_publish = rid.clone();
         let entry_sup = entry.clone();
         let lease_sup = lease.clone();
         let gate_sup = gate.clone();
         let spec_sup = intent.clone();
         let supervisor = tokio::spawn(async move {
-            gate_sup.wait().await;
+            if gate_sup.wait().await == GateOutcome::Abandoned {
+                // The attempt was cancelled before it started. Terminalize it
+                // honestly rather than leaving a `Starting` record behind.
+                let mut exit = SupervisorExitGuard {
+                    store: store.clone(),
+                    service: service_ref.clone(),
+                    entry: entry_sup.clone(),
+                    run_id: rid.clone(),
+                    candidate: None,
+                    reason: TeardownReason::Cancelled,
+                };
+                exit.candidate = None;
+                drop(exit);
+                return;
+            }
             // Armed for every exit: normal return, `?`, panic unwind, abort.
             let mut exit = SupervisorExitGuard {
                 store: store.clone(),
@@ -4506,6 +4731,7 @@ impl OrchestrationService {
             };
             if let Err(error) = binding.verify(
                 &spec_sup,
+                store.seal_authority(),
                 &[SpecHolder::Run, SpecHolder::Lease, SpecHolder::Worker],
             ) {
                 candidate.state = RunState::Failed;
@@ -4530,12 +4756,87 @@ impl OrchestrationService {
             drop(exit);
         });
 
-        // ── atomic registration, then open the gate ────────────────────
+        // ── publish, record the dispatch intent, then open ─────────────
+        //
+        // Order matters three times over. Handles are attached before the
+        // entry is published, so nothing can observe a half-registered
+        // attempt. The `Starting` cut is written before the gate opens, so the
+        // ledger admits the attempt exists before any of it can run. And the
+        // gate opens last, so no task begins until both are true.
         entry.attach_aggregator(agg_task_abort);
         entry.attach_worker(worker_abort);
         entry.attach_supervisor(supervisor);
+        self.publish_dispatch(&rid_publish, entry.clone());
         entry.mark_registered();
+
+        if let Err(error) = self.record_dispatch_intent(&rid_publish, &lease) {
+            // The ledger could not admit that this attempt exists, so the
+            // attempt does not happen: abandon the gate and let the supervisor
+            // terminalize it. Opening the gate here would start work the
+            // ledger has no record of.
+            eprintln!(
+                "[grokptah] run {rid_publish} could not record its dispatch intent: {}",
+                error.message
+            );
+            gate.abandon();
+            return;
+        }
+
         gate.open();
+        self.audit(
+            "run_dispatch",
+            None,
+            Some(session_id),
+            None,
+            "accepted",
+            None,
+            &format!("run {rid_publish} dispatched as attempt {}", lease.attempt),
+        );
+    }
+
+    /// Claim the right to dispatch one run, without publishing anything.
+    ///
+    /// Returns false when another attempt already holds the claim or is
+    /// already published.
+    fn reserve_dispatch(&self, run_id: &str) -> bool {
+        let mut reserved = self.dispatch_reservations.lock();
+        if self.live_workers.lock().contains_key(run_id) {
+            return false;
+        }
+        reserved.insert(run_id.to_string())
+    }
+
+    /// Publish a fully-registered attempt and release its reservation.
+    fn publish_dispatch(&self, run_id: &str, entry: Arc<LiveWorker>) {
+        let mut live = self.live_workers.lock();
+        live.insert(run_id.to_string(), entry);
+        drop(live);
+        self.dispatch_reservations.lock().remove(run_id);
+    }
+
+    /// Persist the honest `Starting` cut: an attempt holds this run's lease
+    /// and is about to begin, but nothing has acknowledged yet.
+    fn record_dispatch_intent(&self, run_id: &str, lease: &AttemptLease) -> Result<(), OrchError> {
+        let attempt = lease.attempt;
+        match self.store.update_run(run_id, |run| {
+            if run.state != RunState::Queued {
+                anyhow::bail!("run is no longer queued");
+            }
+            run.state = RunState::Starting;
+            run.queue_position = None;
+            run.updated_at = Utc::now();
+            Ok(())
+        }) {
+            Ok(Some(_)) => {
+                let _ = attempt;
+                Ok(())
+            }
+            Ok(None) => Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "run record disappeared before dispatch",
+            )),
+            Err(error) => Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        }
     }
 
     pub async fn queue_prompt(
@@ -4951,13 +5252,42 @@ impl OrchestrationService {
 /// Only presence is reported, never the material. Credentials being revoked
 /// between admission and action is a route change, and must refuse the
 /// dispatch rather than fail deep inside a turn.
-fn provider_credentials_present(session: &crate::session::SessionSummary) -> bool {
-    let _ = session;
+fn provider_route_revision(session: &crate::session::SessionSummary) -> String {
+    let offline = std::env::var_os("GROKPTAH_AGENT_OFFLINE").is_some();
     let model = crate::models_catalog::resolve_default_model();
-    crate::auth_store::resolve_wire_credentials_for_model(&model)
-        .ok()
-        .flatten()
-        .is_some()
+    // Resolve the concrete route the work would take: provider, wire model,
+    // and endpoint. A credential rotation, a re-pointed base URL, or a model
+    // swap each change this, and each is a different execution than the one
+    // that was authorized.
+    let (provider_id, wire_model, endpoint, credential) =
+        match crate::auth_store::resolve_wire_credentials_for_model(&model) {
+            Ok(Some(creds)) => {
+                let target = crate::host_helpers::resolve_model_target(&creds, &model).ok();
+                (
+                    creds.provider_id.clone(),
+                    target
+                        .as_ref()
+                        .map(|t| t.wire_model.clone())
+                        .unwrap_or_default(),
+                    target.map(|t| t.base_url).unwrap_or_default(),
+                    // The credential enters by digest: presence and identity
+                    // are what matter, and the material must never be sealed
+                    // into a record.
+                    hash_payload(&json!(creds.bearer)),
+                )
+            }
+            _ => (String::new(), String::new(), String::new(), String::new()),
+        };
+    hash_payload(&json!({
+        "offline": offline,
+        "providerId": provider_id,
+        "model": model,
+        "wireModel": wire_model,
+        "endpoint": endpoint,
+        "credential": credential,
+        "sessionKind": session.kind,
+        "executionMode": session.execution_mode,
+    }))
 }
 
 /// Session revision sealed into an acceptance intent.
