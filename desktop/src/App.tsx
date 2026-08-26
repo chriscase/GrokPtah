@@ -59,6 +59,13 @@ import {
   headPermission,
 } from "./lib/permissionQueue";
 import {
+  consentBlocksWorkspaceShortcuts,
+  permissionQueueAfterAcknowledgement,
+  presentDeniedPermissionRecord,
+  settleOperatorConsentAcknowledgement,
+  type ConsentAcknowledgement,
+} from "./lib/operatorConsentPresentation";
+import {
   clampDocks,
   SPLIT_MIN_WIDTH,
   useLayoutDensity,
@@ -242,6 +249,24 @@ function collapseAdjacentDuplicateAssistants(
   }
   return out;
 }
+
+/** Same gate the workspace capture-phase handler uses while consent exists. */
+export function shouldHandleWorkspaceShortcut(consentOpen: boolean): boolean {
+  return !consentBlocksWorkspaceShortcuts(consentOpen);
+}
+
+/** Renderer acknowledgement only — never retries or invents a deny. */
+export async function acknowledgeOperatorPermission(
+  send: () => Promise<unknown>,
+  timeoutMs?: number,
+): Promise<ConsentAcknowledgement> {
+  return settleOperatorConsentAcknowledgement(send, timeoutMs);
+}
+
+export {
+  consentBlocksWorkspaceShortcuts,
+  permissionQueueAfterAcknowledgement,
+};
 
 /** Shorten a filesystem path for chrome (prefer last two segments). */
 function shortPath(path: string | null | undefined, max = 42): string {
@@ -1272,6 +1297,7 @@ export default function App() {
   // Keyboard: multi-zone + chrome (capture so composer/webview don't eat them)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (!shouldHandleWorkspaceShortcut(Boolean(permission))) return;
       const meta = e.metaKey || e.ctrlKey;
       if (!meta) return;
 
@@ -1331,7 +1357,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [docks, activeSessionId, maxDocks, openBeside]);
+  }, [docks, activeSessionId, maxDocks, openBeside, permission]);
 
   async function ensureSession(): Promise<string> {
     // Prefer the active tab only when its kind matches Builds/Chats mode.
@@ -3785,26 +3811,28 @@ export default function App() {
           fallbackSessionId={activeSessionId}
           denyHistory={denyHistory}
           onRespond={async (requestId, decision, sessionId) => {
+            const ack = await acknowledgeOperatorPermission(() =>
+              api.permissionRespond(requestId, decision),
+            );
+            if (ack !== "acknowledged") {
+              return ack;
+            }
             if (decision === "deny") {
-              const d =
-                typeof permission.detail === "object" &&
-                permission.detail !== null
-                  ? (permission.detail as Record<string, unknown>)
-                  : {};
               setDenyHistory((h) =>
-                appendDeny(h, {
-                  tool_name: permission.tool_name,
-                  summary: permission.summary,
-                  session_id: sessionId || permission.session_id || "",
-                  risk: typeof d.risk === "string" ? d.risk : undefined,
-                  risk_tier:
-                    typeof d.risk_tier === "string" ? d.risk_tier : undefined,
-                }),
+                appendDeny(
+                  h,
+                  presentDeniedPermissionRecord(
+                    permission,
+                    sessionId || permission.session_id || "",
+                  ),
+                ),
               );
             }
-            await api.permissionRespond(requestId, decision);
-            setPermissionQueue((q) => dequeuePermission(q, requestId));
+            setPermissionQueue((q) =>
+              permissionQueueAfterAcknowledgement(q, requestId, ack),
+            );
             // Patch the *owning* session, not whichever tab is focused (#141).
+            // Copy reports only that the host acknowledged the renderer answer.
             if (sessionId) {
               patchTab(sessionId, (t) => ({
                 ...t,
@@ -3814,7 +3842,9 @@ export default function App() {
                   phase: "tool",
                   label: "Working",
                   detail:
-                    decision === "deny" ? "Permission denied" : "Continuing…",
+                    decision === "deny"
+                      ? "Host acknowledged Deny"
+                      : "Host acknowledged Allow",
                   live: true,
                   lastEventAt: Date.now(),
                 },
@@ -3823,6 +3853,7 @@ export default function App() {
             if (decision === "always_allow") {
               await refreshChrome();
             }
+            return ack;
           }}
         />
       )}
