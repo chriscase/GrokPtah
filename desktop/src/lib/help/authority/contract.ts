@@ -21,6 +21,7 @@ export const HELP_AUTHORITY_LIMITS = Object.freeze({
   maxRequestBytes: 32_768,
   maxResponseBytes: 32_768,
   maxCleanupBytes: 8_192,
+  cleanupGraceMs: 1_000,
   maxRequestIdBytes: 256,
   maxQueryBytes: 512,
   maxContextChunks: 8,

@@ -176,7 +176,7 @@ impl HelpExecutor {
         }
         let parsed_deadline = DateTime::parse_from_rfc3339(&request.deadline.deadline_at)
             .map(|value| value.with_timezone(&Utc));
-        let Ok(deadline) = parsed_deadline else {
+        let Ok(request_deadline) = parsed_deadline else {
             return HelpExecution {
                 response: None,
                 failure: Some(HelpExecutionFailure::Rejected),
@@ -202,6 +202,9 @@ impl HelpExecutor {
                 ),
             };
         }
+        let deadline = request_deadline.min(
+            Utc::now() + chrono::Duration::milliseconds(request.deadline.max_duration_ms as i64),
+        );
         let permit = match self.acquire(deadline).await {
             Ok(permit) => permit,
             Err(failure) => {
@@ -383,7 +386,8 @@ mod tests {
                 required_capabilities: vec![],
                 text: "Help answers cite source bytes.".into(),
                 text_digest:
-                    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
+                    "sha256:a202decb78b381e5e0ccf96123deb430452f49f086ae58a54c98c37756e161bb"
+                        .into(),
                 span_start: 0,
                 span_end: "Help answers cite source bytes.".len(),
                 source_bindings: vec![HelpSourceBinding {

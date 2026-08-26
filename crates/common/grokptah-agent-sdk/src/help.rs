@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as ShaDigest, Sha256};
 
 pub const HELP_AUTHORITY_SCHEMA: &str = "grokptah.help-authority.v1";
 pub const HELP_AUTHORITY_MAX_REQUEST_BYTES: usize = 32_768;
@@ -266,8 +267,31 @@ fn valid_digest(value: &str) -> bool {
         && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn sha256_digest(value: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(value.as_bytes()))
+}
+
 fn valid_id(value: &str, max_bytes: usize) -> bool {
     safe_text(value, max_bytes)
+}
+
+fn valid_capability_id(value: &str) -> bool {
+    let mut segments = value.split('.');
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    !first.is_empty()
+        && first.as_bytes()[0].is_ascii_lowercase()
+        && first
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && segments.all(|segment| {
+            !segment.is_empty()
+                && segment.as_bytes()[0].is_ascii_lowercase()
+                && segment.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                })
+        })
 }
 
 fn validate_identity(identity: &HelpIdentity) -> Result<(), HelpParseError> {
@@ -288,7 +312,7 @@ fn validate_authorization(authorization: &HelpAuthorization) -> Result<(), HelpP
     }
     let mut ids = HashSet::new();
     for capability in &authorization.authorized_capabilities {
-        if !valid_id(capability, 128) || !capability.contains('.') || !ids.insert(capability) {
+        if !valid_id(capability, 128) || !valid_capability_id(capability) || !ids.insert(capability) {
             return Err(error("invalid Help capability set"));
         }
     }
@@ -338,6 +362,7 @@ fn validate_context(
             || !chunk_ids.insert(&chunk.chunk_id)
             || !safe_text(&chunk.text, 512)
             || !valid_digest(&chunk.text_digest)
+            || chunk.text_digest != sha256_digest(&chunk.text)
             || chunk.span_start != 0
             || chunk.span_end != chunk.text.len()
             || chunk.span_end == 0
@@ -361,6 +386,13 @@ fn validate_context(
         }
         if chunk.required_capabilities.len() > 16 {
             return Err(error("too many Help context capabilities"));
+        }
+        if chunk
+            .required_capabilities
+            .iter()
+            .any(|capability| !valid_id(capability, 128) || !valid_capability_id(capability))
+        {
+            return Err(error("invalid Help context capability"));
         }
         let mut source_ids = HashSet::new();
         if chunk.source_bindings.is_empty()
@@ -483,6 +515,7 @@ fn validate_response_fields(
                 != Some(citation.quoted_text.as_str())
             || !safe_text(&citation.quoted_text, 512)
             || !valid_digest(&citation.quoted_text_hash)
+            || citation.quoted_text_hash != sha256_digest(&citation.quoted_text)
             || !valid_id(&citation.source_id, 256)
             || !valid_digest(&citation.source_section_digest)
             || citation.claim_ids.is_empty()
@@ -649,7 +682,8 @@ mod tests {
                 required_capabilities: vec![],
                 text: "Help answers cite source bytes.".into(),
                 text_digest:
-                    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
+                    "sha256:a202decb78b381e5e0ccf96123deb430452f49f086ae58a54c98c37756e161bb"
+                        .into(),
                 span_start: 0,
                 span_end: "Help answers cite source bytes.".len(),
                 source_bindings: vec![HelpSourceBinding {

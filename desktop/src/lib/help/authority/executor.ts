@@ -86,14 +86,14 @@ export class HelpAuthorityExecutor {
     }
   }
 
-  private async acquire(deadlineAt: string): Promise<"acquired" | "capacity" | "deadline"> {
-    if (Date.parse(deadlineAt) <= Date.now()) return "deadline";
+  private async acquire(deadlineAtMs: number): Promise<"acquired" | "capacity" | "deadline"> {
+    if (deadlineAtMs <= Date.now()) return "deadline";
     if (this.active < this.maxConcurrent) {
       this.active += 1;
       return "acquired";
     }
     if (this.waiters.length >= this.maxQueued) return "capacity";
-    const remaining = Date.parse(deadlineAt) - Date.now();
+    const remaining = deadlineAtMs - Date.now();
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
         const index = this.waiters.findIndex((waiter) => waiter.timer === timer);
@@ -150,7 +150,11 @@ export class HelpAuthorityExecutor {
       };
     }
 
-    const admission = await this.acquire(request.deadline.deadlineAt);
+    const absoluteDeadlineMs = Math.min(
+      Date.parse(request.deadline.deadlineAt),
+      Date.now() + request.deadline.maxDurationMs,
+    );
+    const admission = await this.acquire(absoluteDeadlineMs);
     if (admission !== "acquired") {
       return {
         ok: false,
@@ -171,6 +175,7 @@ export class HelpAuthorityExecutor {
     signal?.addEventListener("abort", abortFromCaller, { once: true });
     let abortRequested = Boolean(signal?.aborted);
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
     let deadlineReached = false;
     let providerTaskJoined = false;
     let raw: unknown;
@@ -180,7 +185,7 @@ export class HelpAuthorityExecutor {
     // Start exactly one provider task. There is no session, transcript, tool,
     // workspace, fallback, or inherited host authority in this closure.
     const providerTask = Promise.resolve().then(() => this.transport(request, controller.signal));
-    const remaining = Math.max(1, Date.parse(request.deadline.deadlineAt) - Date.now());
+    const remaining = Math.max(1, absoluteDeadlineMs - Date.now());
     const deadline = new Promise<"deadline">((resolve) => {
       timer = setTimeout(() => {
         deadlineReached = true;
@@ -218,15 +223,28 @@ export class HelpAuthorityExecutor {
         controller.abort();
       }
       // Promise.race above can settle before a cancellation-ignoring
-      // transport. Await the provider promise itself before cleanup; this is
-      // the crucial no-leaked-task guarantee.
-      try {
-        raw = await providerTask;
-      } catch (error) {
-        transportError = error;
-      } finally {
-        providerTaskJoined = true;
-      }
+      // transport. Give it a bounded cleanup grace period and wait for the
+      // promise when it settles; otherwise publish uncertainty and fail
+      // closed rather than allowing an unbounded browser task to hold a slot.
+      providerTaskJoined = await Promise.race([
+        providerTask.then(
+          (value) => {
+            raw = value;
+            return true;
+          },
+          (error: unknown) => {
+            transportError = error;
+            return true;
+          },
+        ),
+        new Promise<boolean>((resolve) => {
+          cleanupTimer = setTimeout(
+            () => resolve(false),
+            HELP_AUTHORITY_LIMITS.cleanupGraceMs,
+          );
+        }),
+      ]);
+      if (cleanupTimer !== undefined) clearTimeout(cleanupTimer);
       if (timer !== undefined) clearTimeout(timer);
       signal?.removeEventListener("abort", abortFromCaller);
       this.release();
