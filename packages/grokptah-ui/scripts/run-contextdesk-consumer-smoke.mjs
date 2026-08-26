@@ -208,7 +208,6 @@ createRoot(root).render(createElement(RunStatusCard, {
     [
       resolve(packageRoot, "node_modules/vite/bin/vite.js"),
       "build",
-      "--root",
       consumerRoot,
       "--outDir",
       browserOutput,
