@@ -5,6 +5,10 @@ import {
   type HelpAuthorityRequest,
   type HelpAuthorityResponse,
 } from "./contract";
+import {
+  createHelpAuthorityExecutor,
+  type HelpAuthorityExecutor,
+} from "./executor";
 
 export type HelpAuthorityBrokerOptions = {
   /** ContextDesk or another trusted broker origin; never a provider origin. */
@@ -91,6 +95,7 @@ export class HelpAuthorityBrokerClient {
   private readonly fetcher: typeof fetch;
   private readonly credentials: RequestCredentials;
   private readonly csrfToken: string | undefined;
+  private readonly executor: HelpAuthorityExecutor;
 
   constructor(options: HelpAuthorityBrokerOptions) {
     const baseUrl = options.baseUrl.replace(/\/$/, "");
@@ -104,6 +109,9 @@ export class HelpAuthorityBrokerClient {
       throw new HelpAuthorityBrokerError(0, "invalid_request", "CSRF token is oversized");
     }
     this.csrfToken = csrfToken || undefined;
+    this.executor = createHelpAuthorityExecutor((request, signal) =>
+      this.fetchAnswer(request, signal),
+    );
   }
 
   async answer(
@@ -125,13 +133,28 @@ export class HelpAuthorityBrokerClient {
         "broker CSRF token is required for Help execution",
       );
     }
+    const result = await this.executor.execute(request, signal);
+    if (!result.ok) {
+      throw new HelpAuthorityBrokerError(
+        0,
+        result.failure === "rejected" ? "invalid_response" : "transport",
+        `Help broker Help execution failed: ${result.failure}`,
+      );
+    }
+    return result.response;
+  }
+
+  private async fetchAnswer(
+    request: HelpAuthorityRequest,
+    signal: AbortSignal,
+  ): Promise<HelpAuthorityResponse> {
     const response = await this.fetcher(this.url, {
       method: "POST",
       headers: {
         Accept: "application/json",
         "Content-Type": "application/json",
         "Idempotency-Key": request.requestId,
-        "X-CSRF-Token": this.csrfToken,
+        "X-CSRF-Token": this.csrfToken!,
       },
       credentials: this.credentials,
       body: JSON.stringify(request),
