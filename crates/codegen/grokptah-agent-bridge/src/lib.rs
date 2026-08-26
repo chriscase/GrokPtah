@@ -119,13 +119,11 @@ pub use external_worker::{
     CursorCloudAdapter, ExternalWorkerAdapter, ExternalWorkerAdapterError, ExternalWorkerRegistry,
     CURSOR_CLOUD_API_BASE,
 };
-pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
+pub use grokptah_agent_sdk::{HelpAuthorityRequest, HelpAuthorityResponse, HelpCleanupReceipt};
 pub use help_executor::{
     HelpExecution, HelpExecutionFailure, HelpExecutor, HelpProvider, HelpProviderFuture,
 };
-pub use grokptah_agent_sdk::{
-    HelpAuthorityRequest, HelpAuthorityResponse, HelpCleanupReceipt,
-};
+pub use host::{AgentHost, AgentHostHandle, AgentStatus, HostConfig, WorkspaceUiState};
 pub use mcp_control::{
     discovered_tool_names, start_control_from_env, start_control_server, start_control_server_with,
     ControlServerHandle, ControlServerLimits,

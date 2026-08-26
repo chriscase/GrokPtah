@@ -25,8 +25,7 @@ use grokptah_agent_sdk::{
 };
 
 /// Provider future used by the one-shot Help executor.
-pub type HelpProviderFuture =
-    Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'static>>;
+pub type HelpProviderFuture = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'static>>;
 
 /// A provider callback with no access to host/session state.
 pub trait HelpProvider: Send + Sync + 'static {
@@ -237,9 +236,8 @@ impl HelpExecutor {
         let provider_cancel = CancellationToken::new();
         let task_cancel = provider_cancel.clone();
         let task_request = request.clone();
-        let mut provider_task = tokio::spawn(async move {
-            provider.execute(task_request, task_cancel).await
-        });
+        let mut provider_task =
+            tokio::spawn(async move { provider.execute(task_request, task_cancel).await });
         let remaining = (deadline - Utc::now())
             .to_std()
             .unwrap_or_else(|_| Duration::from_millis(1));
@@ -343,8 +341,8 @@ impl Default for HelpExecutor {
 mod tests {
     use super::*;
     use grokptah_agent_sdk::{
-        HelpAccess, HelpAccessMode, HelpAuthorization, HelpContextChunk, HelpDeadline,
-        HelpDialect, HelpIdentity, HelpProvider, HelpSourceBinding,
+        HelpAccess, HelpAccessMode, HelpAuthorization, HelpContextChunk, HelpDeadline, HelpDialect,
+        HelpIdentity, HelpProvider, HelpSourceBinding,
     };
 
     fn request() -> HelpAuthorityRequest {
@@ -357,9 +355,12 @@ mod tests {
                 authorized_capabilities: vec![],
             },
             identity: HelpIdentity {
-                corpus_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-                source_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-                model_digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+                corpus_digest:
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                source_digest:
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                model_digest:
+                    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
                 model_id: "offline-help".into(),
                 model_version: "1".into(),
             },
@@ -381,12 +382,15 @@ mod tests {
                 access: HelpAccess::Public,
                 required_capabilities: vec![],
                 text: "Help answers cite source bytes.".into(),
-                text_digest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
+                text_digest:
+                    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
                 span_start: 0,
                 span_end: "Help answers cite source bytes.".len(),
                 source_bindings: vec![HelpSourceBinding {
                     source_id: "source".into(),
-                    source_section_digest: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
+                    source_section_digest:
+                        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                            .into(),
                     source_byte_length: 10,
                 }],
             }],
@@ -433,7 +437,11 @@ mod tests {
         let first = tokio::spawn({
             let executor = executor.clone();
             let provider = provider.clone();
-            async move { executor.execute(request(), provider, CancellationToken::new()).await }
+            async move {
+                executor
+                    .execute(request(), provider, CancellationToken::new())
+                    .await
+            }
         });
         tokio::task::yield_now().await;
         let second = executor

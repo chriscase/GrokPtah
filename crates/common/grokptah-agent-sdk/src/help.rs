@@ -288,10 +288,7 @@ fn validate_authorization(authorization: &HelpAuthorization) -> Result<(), HelpP
     }
     let mut ids = HashSet::new();
     for capability in &authorization.authorized_capabilities {
-        if !valid_id(capability, 128)
-            || !capability.contains('.')
-            || !ids.insert(capability)
-        {
+        if !valid_id(capability, 128) || !capability.contains('.') || !ids.insert(capability) {
             return Err(error("invalid Help capability set"));
         }
     }
@@ -354,9 +351,10 @@ fn validate_context(
         } else {
             if !matches!(authorization.mode, HelpAccessMode::Authorized)
                 || chunk.required_capabilities.is_empty()
-                || chunk.required_capabilities.iter().any(|capability| {
-                    !authorization.authorized_capabilities.contains(capability)
-                })
+                || chunk
+                    .required_capabilities
+                    .iter()
+                    .any(|capability| !authorization.authorized_capabilities.contains(capability))
             {
                 return Err(error("Help context is not authorized"));
             }
@@ -396,7 +394,8 @@ pub fn validate_help_request(request: &HelpAuthorityRequest) -> Result<(), HelpP
     validate_provider(&request.provider)?;
     validate_deadline(&request.deadline)?;
     validate_context(&request.context, &request.authorization)?;
-    let bytes = serde_json::to_vec(request).map_err(|_| error("Help request is not serializable"))?;
+    let bytes =
+        serde_json::to_vec(request).map_err(|_| error("Help request is not serializable"))?;
     if bytes.len() > HELP_AUTHORITY_MAX_REQUEST_BYTES {
         return Err(error("Help request exceeds byte limit"));
     }
@@ -422,7 +421,8 @@ fn validate_cleanup(
     {
         return Err(error("Help cleanup is uncertain"));
     }
-    let bytes = serde_json::to_vec(cleanup).map_err(|_| error("Help cleanup is not serializable"))?;
+    let bytes =
+        serde_json::to_vec(cleanup).map_err(|_| error("Help cleanup is not serializable"))?;
     if bytes.len() > HELP_AUTHORITY_MAX_CLEANUP_BYTES {
         return Err(error("Help cleanup exceeds byte limit"));
     }
@@ -502,16 +502,22 @@ fn validate_response_fields(
             || !claim_ids.insert(&claim.claim_id)
             || claim.span_start >= claim.span_end
             || claim.span_end > response.answer.len()
-            || response.answer.get(claim.span_start..claim.span_end)
-                != Some(claim.text.as_str())
+            || response.answer.get(claim.span_start..claim.span_end) != Some(claim.text.as_str())
             || !safe_text(&claim.text, 1_024)
             || claim.citation_ids.is_empty()
             || claim.citation_ids.len() > HELP_AUTHORITY_MAX_CITATIONS
-            || claim.citation_ids.iter().any(|id| !citation_ids.contains(id))
+            || claim
+                .citation_ids
+                .iter()
+                .any(|id| !citation_ids.contains(id))
         {
             return Err(error("unsupported Help claim"));
         }
-        if response.answer.get(cursor..claim.span_start).is_some_and(|gap| !gap.trim().is_empty()) {
+        if response
+            .answer
+            .get(cursor..claim.span_start)
+            .is_some_and(|gap| !gap.trim().is_empty())
+        {
             return Err(error("Help answer has uncited text"));
         }
         if !claim_supported(claim, &response.citations) {
@@ -556,7 +562,8 @@ pub fn validate_help_response(
 ) -> Result<(), HelpParseError> {
     validate_help_request(request)?;
     validate_response_fields(response, request)?;
-    let bytes = serde_json::to_vec(response).map_err(|_| error("Help response is not serializable"))?;
+    let bytes =
+        serde_json::to_vec(response).map_err(|_| error("Help response is not serializable"))?;
     if bytes.len() > HELP_AUTHORITY_MAX_RESPONSE_BYTES {
         return Err(error("Help response exceeds byte limit"));
     }
@@ -571,7 +578,8 @@ pub fn parse_help_request(bytes: &[u8]) -> Result<HelpAuthorityRequest, HelpPars
     if bytes.len() > HELP_AUTHORITY_MAX_REQUEST_BYTES {
         return Err(error("Help request exceeds byte limit"));
     }
-    let request = serde_json::from_slice(bytes).map_err(|_| error("Help request JSON is invalid"))?;
+    let request =
+        serde_json::from_slice(bytes).map_err(|_| error("Help request JSON is invalid"))?;
     validate_help_request(&request)?;
     Ok(request)
 }
@@ -583,7 +591,8 @@ pub fn parse_help_response(
     if bytes.len() > HELP_AUTHORITY_MAX_RESPONSE_BYTES {
         return Err(error("Help response exceeds byte limit"));
     }
-    let response = serde_json::from_slice(bytes).map_err(|_| error("Help response JSON is invalid"))?;
+    let response =
+        serde_json::from_slice(bytes).map_err(|_| error("Help response JSON is invalid"))?;
     validate_help_response(&response, request)?;
     Ok(response)
 }
@@ -592,7 +601,8 @@ pub fn parse_help_cleanup(bytes: &[u8]) -> Result<HelpCleanupReceipt, HelpParseE
     if bytes.len() > HELP_AUTHORITY_MAX_CLEANUP_BYTES {
         return Err(error("Help cleanup exceeds byte limit"));
     }
-    let cleanup = serde_json::from_slice(bytes).map_err(|_| error("Help cleanup JSON is invalid"))?;
+    let cleanup =
+        serde_json::from_slice(bytes).map_err(|_| error("Help cleanup JSON is invalid"))?;
     validate_help_cleanup(&cleanup)?;
     Ok(cleanup)
 }
@@ -611,9 +621,12 @@ mod tests {
                 authorized_capabilities: vec![],
             },
             identity: HelpIdentity {
-                corpus_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-                source_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-                model_digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+                corpus_digest:
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                source_digest:
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                model_digest:
+                    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
                 model_id: "offline-help".into(),
                 model_version: "1".into(),
             },
@@ -635,12 +648,15 @@ mod tests {
                 access: HelpAccess::Public,
                 required_capabilities: vec![],
                 text: "Help answers cite source bytes.".into(),
-                text_digest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
+                text_digest:
+                    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
                 span_start: 0,
                 span_end: "Help answers cite source bytes.".len(),
                 source_bindings: vec![HelpSourceBinding {
                     source_id: "source".into(),
-                    source_section_digest: "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into(),
+                    source_section_digest:
+                        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                            .into(),
                     source_byte_length: 10,
                 }],
             }],
