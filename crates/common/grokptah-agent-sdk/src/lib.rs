@@ -40,10 +40,11 @@ pub use help::{
     HELP_AUTHORITY_MAX_CONTEXT_CHUNKS, HELP_AUTHORITY_MAX_DURATION_MS,
     HELP_AUTHORITY_MAX_REQUEST_BYTES, HELP_AUTHORITY_MAX_RESPONSE_BYTES, HELP_AUTHORITY_SCHEMA,
     HelpAccess, HelpAccessMode, HelpArtifactCounts, HelpAuthorityRequest, HelpAuthorityResponse,
-    HelpCitation, HelpClaim, HelpCleanupReceipt, HelpCleanupStatus, HelpContextChunk, HelpDeadline,
-    HelpDialect, HelpIdentity, HelpMessageKind, HelpParseError, HelpProvider, HelpProviderTask,
-    HelpQueueSlot, HelpSourceBinding, parse_help_cleanup, parse_help_request, parse_help_response,
-    validate_help_cleanup, validate_help_request, validate_help_response,
+    HelpAuthorization, HelpCitation, HelpClaim, HelpCleanupReceipt, HelpCleanupStatus,
+    HelpContextChunk, HelpDeadline, HelpDialect, HelpIdentity, HelpMessageKind, HelpParseError,
+    HelpProvider, HelpProviderTask, HelpQueueSlot, HelpSourceBinding, parse_help_cleanup,
+    parse_help_request, parse_help_response, validate_help_cleanup, validate_help_request,
+    validate_help_response,
 };
 pub use run::{
     Bounds, ChangedFile, DurableRun, DurableRunState, ExecutionMode, IdempotencyKey, ReviewReceipt,

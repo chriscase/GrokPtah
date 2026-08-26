@@ -342,7 +342,7 @@ mod tests {
     use super::*;
     use grokptah_agent_sdk::{
         HelpAccess, HelpAccessMode, HelpAuthorization, HelpContextChunk, HelpDeadline, HelpDialect,
-        HelpIdentity, HelpProvider, HelpSourceBinding,
+        HelpIdentity, HelpSourceBinding,
     };
 
     fn request() -> HelpAuthorityRequest {
