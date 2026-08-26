@@ -18,6 +18,7 @@ All are runnable from a clean clone with caches disabled
 | Agent bridge | `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked -- --test-threads=1` | `crates/codegen/grokptah-agent-bridge` |
 | Offline oracles | `cargo test --locked eval_oracle -- --nocapture` | `crates/codegen/grokptah-agent-bridge` |
 | Focused upstream support | `cargo fmt -p xai-grok-env -p xai-grok-shell-base -- --check && cargo clippy -p xai-grok-env -p xai-grok-shell-base --all-targets --all-features --locked -- -D warnings && cargo test -p xai-grok-shell-base --all-features --locked` | repository root |
+| Release evidence gate | `cargo fmt -p grokptah-release-evidence -- --check && cargo clippy -p grokptah-release-evidence --all-targets -- -D warnings && cargo test -p grokptah-release-evidence` | repository root |
 
 The deterministic reliability campaign is also a supported focused check:
 
@@ -28,6 +29,11 @@ cargo test --locked --test reliability_eval -- --test-threads=1
 
 For the report-producing operator command and scenario matrix, see
 [RELIABILITY_EVALS.md](RELIABILITY_EVALS.md).
+
+The release evidence gate verifies a completed soak's qualification report and
+binds a release record to the exact qualified head. It reads evidence and never
+produces it; see
+[RELEASE_EVIDENCE_QUALIFICATION.md](RELEASE_EVIDENCE_QUALIFICATION.md).
 
 ## Unsigned release build
 

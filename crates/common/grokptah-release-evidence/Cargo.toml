@@ -1,0 +1,17 @@
+[package]
+name = "grokptah-release-evidence"
+description = "Fail-closed verifier for GrokPtah post-soak qualification evidence and release identity"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
