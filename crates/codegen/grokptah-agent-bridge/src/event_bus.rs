@@ -502,10 +502,16 @@ impl EventBus {
             }
         }
         let next_cursor = entries.last().map(|e| e.seq);
-        let cursor_expired = entries.is_empty()
-            && after_seq > 0
-            && after_seq < g.oldest_seq
-            && !g.journal.is_empty();
+        let gap_prefix_was_evicted = gap.is_some_and(|(start, _)| {
+            after_seq < start.saturating_sub(1)
+                && entries.is_empty()
+                && g.journal.iter().any(|entry| entry.seq >= start)
+        });
+        let cursor_expired = gap_prefix_was_evicted
+            || (entries.is_empty()
+                && after_seq > 0
+                && after_seq < g.oldest_seq
+                && !g.journal.is_empty());
         JournalPage {
             entries: if cursor_expired { Vec::new() } else { entries },
             next_cursor,
@@ -1599,6 +1605,24 @@ mod tests {
 
         let reopened = EventBus::new(8).with_persist_dir(dir.path());
         assert!(reopened.read_after(6, 8).cursor_expired);
+    }
+
+    #[test]
+    fn gap_with_no_retained_prefix_expires_restart_cursor() {
+        let bus = EventBus::new(2);
+        let sid = Uuid::new_v4();
+        for index in 0..5 {
+            bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: sid,
+                text: format!("message-{index}"),
+            });
+        }
+        record_journal_gap(&bus.journal_gap, 3);
+
+        let page = bus.read_after(0, 8);
+        assert!(page.entries.is_empty());
+        assert!(page.cursor_expired);
+        assert!(page.next_cursor.is_none());
     }
 
     #[test]

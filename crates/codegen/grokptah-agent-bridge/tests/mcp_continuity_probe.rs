@@ -94,6 +94,27 @@ async fn wait_for_file(path: &Path) {
     );
 }
 
+async fn wait_for_durable_seq(path: &Path, expected: u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        let durable_seq = std::fs::read_to_string(path).ok().and_then(|text| {
+            text.lines().next_back().and_then(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|value| value["seq"].as_u64())
+            })
+        });
+        if durable_seq.is_some_and(|seq| seq >= expected) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "event journal did not durably reach sequence {expected}: {}",
+        path.display()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::await_holding_lock)]
 async fn continuity_probe_is_evidence_first_and_recoverable() {
@@ -188,20 +209,23 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
     // The harness has opened the run-scoped GET and intentionally holds its
     // body unread. Flooding the bounded broadcast subscriber now forces the
     // server to emit the explicit recovery notification when the client
-    // resumes reading.
+    // resumes reading. Drain the separate persistence queue after each batch
+    // so the test exercises subscriber lag, not a second unrelated durable-
+    // writer overload. A fixed sleep made that distinction host-speed
+    // dependent and allowed the durable prefix to disappear in hosted CI.
     wait_for_file(&ready_file).await;
+    let journal_path = home
+        .path()
+        .join(".grokptah/orchestration/event_journal.jsonl");
     for index in 0..6_000 {
         host.event_bus().publish(SessionUpdate::AgentMessageChunk {
             session_id: gap_session.id,
             text: format!("continuity-gap-{index}"),
         });
         if index % 100 == 99 {
-            // Keep the persistence writer ahead of its small queue while the
-            // unread HTTP body still forces the broadcast receiver to lag.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            wait_for_durable_seq(&journal_path, host.event_bus().current_seq()).await;
         }
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
     std::fs::write(&release_file, "release").unwrap();
 
     let output = tokio::time::timeout(Duration::from_secs(90), child.wait_with_output())
