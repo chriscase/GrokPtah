@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -18,6 +19,9 @@ const MAX_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EVENT_BYTES: usize = 256 * 1024;
 const MAX_JOURNAL_LINE_BYTES: usize = MAX_EVENT_BYTES + 4096;
 const SEQUENCE_RESERVATION_SIZE: u64 = 1_000_000;
+/// Bounded wait when the durable writer is behind. Queue-full is backpressure,
+/// not a missing durable range.
+const WRITER_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,15 +68,34 @@ pub struct EventBus {
     journal_gap: Arc<Mutex<Option<(u64, u64)>>>,
 }
 
+#[derive(Clone)]
+struct JournalSpace {
+    mu: Arc<Mutex<()>>,
+    cv: Arc<Condvar>,
+}
+
 struct PersistenceHandle {
     tx: Mutex<Option<SyncSender<JournalEntry>>>,
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
     gap_path: PathBuf,
+    /// Serializes durable enqueue so seq order is preserved after `inner` is released.
+    order: Mutex<()>,
+    space: JournalSpace,
+}
+
+struct JournalWriterCtx {
+    path: PathBuf,
+    gap_path: PathBuf,
+    capacity: usize,
+    persistence_error: Arc<Mutex<Option<String>>>,
+    journal_gap: Arc<Mutex<Option<(u64, u64)>>>,
+    space: JournalSpace,
 }
 
 impl Drop for PersistenceHandle {
     fn drop(&mut self) {
         self.tx.lock().take();
+        self.space.cv.notify_all();
         if let Some(join) = self.join.lock().take() {
             let _ = join.join();
         }
@@ -344,18 +367,22 @@ impl EventBus {
                 let writer_path = path.clone();
                 let writer_gap_path = gap_path.clone();
                 let capacity = g.capacity;
+                let space = JournalSpace {
+                    mu: Arc::new(Mutex::new(())),
+                    cv: Arc::new(Condvar::new()),
+                };
+                let writer_ctx = JournalWriterCtx {
+                    path: writer_path,
+                    gap_path: writer_gap_path,
+                    capacity,
+                    persistence_error,
+                    journal_gap,
+                    space: space.clone(),
+                };
                 let join = std::thread::Builder::new()
                     .name("grokptah-event-journal".into())
                     .spawn(move || {
-                        run_journal_writer(
-                            &writer_path,
-                            capacity,
-                            durable_tail,
-                            rx,
-                            &persistence_error,
-                            &writer_gap_path,
-                            &journal_gap,
-                        );
+                        run_journal_writer(writer_ctx, durable_tail, rx);
                     });
                 match join {
                     Ok(join) => {
@@ -363,6 +390,8 @@ impl EventBus {
                             tx: Mutex::new(Some(tx)),
                             join: Mutex::new(Some(join)),
                             gap_path: gap_path.clone(),
+                            order: Mutex::new(()),
+                            space,
                         }));
                     }
                     Err(error) => {
@@ -429,27 +458,6 @@ impl EventBus {
                 g.oldest_seq = old.seq.saturating_add(1);
             }
         }
-        if let Some(persistence) = &g.persistence {
-            let failure = match persistence.tx.lock().as_ref() {
-                Some(tx) => match tx.try_send(entry.clone()) {
-                    Ok(()) => None,
-                    Err(TrySendError::Full(_)) => Some(("journal writer queue is full", false)),
-                    Err(TrySendError::Disconnected(_)) => Some(("journal writer stopped", true)),
-                },
-                None => Some(("journal writer stopped", true)),
-            };
-            if let Some((detail, disconnected)) = failure {
-                *self.persistence_error.lock() = Some(detail.into());
-                record_journal_gap(&self.journal_gap, seq);
-                if disconnected {
-                    if let Err(error) =
-                        persist_current_gap(&persistence.gap_path, &self.journal_gap)
-                    {
-                        *self.persistence_error.lock() = Some(error.to_string());
-                    }
-                }
-            }
-        }
         if is_critical_update(&redacted) {
             let _ = g.critical_tx.send(SequencedUpdate {
                 seq,
@@ -460,6 +468,24 @@ impl EventBus {
                 seq,
                 update: redacted,
             });
+        }
+        if let Some(handle) = g.persistence.clone() {
+            let persist_order = handle.order.lock();
+            drop(g);
+            let sender = handle.tx.lock().clone();
+            let failure = match sender.as_ref() {
+                Some(tx) => enqueue_journal_entry(tx, &entry, &handle.space),
+                None => Some(("journal writer stopped", true)),
+            };
+            drop(persist_order);
+            if let Some((detail, _)) = failure {
+                *self.persistence_error.lock() = Some(detail.into());
+                record_journal_gap(&self.journal_gap, seq);
+                if let Err(error) = persist_current_gap(&handle.gap_path, &self.journal_gap) {
+                    *self.persistence_error.lock() = Some(error.to_string());
+                }
+                self.inner.lock().persistence.take();
+            }
         }
     }
 
@@ -473,43 +499,42 @@ impl EventBus {
         let limit = limit.clamp(1, 500);
         let g = self.inner.lock();
         let gap = *self.journal_gap.lock();
+        let expired = JournalPage {
+            entries: Vec::new(),
+            next_cursor: None,
+            cursor_expired: true,
+        };
         if let Some((start, end)) = gap {
             if after_seq >= start.saturating_sub(1) && after_seq < end {
-                return JournalPage {
-                    entries: Vec::new(),
-                    next_cursor: None,
-                    cursor_expired: true,
-                };
+                return expired;
             }
         }
-        if after_seq > 0 && after_seq + 1 < g.oldest_seq && !g.journal.is_empty() {
-            return JournalPage {
-                entries: Vec::new(),
-                next_cursor: None,
-                cursor_expired: true,
-            };
+        if after_seq > 0 && after_seq < g.oldest_seq.saturating_sub(1) && !g.journal.is_empty() {
+            return expired;
         }
         let mut entries: Vec<JournalEntry> = g
             .journal
             .iter()
             .filter(|e| e.seq > after_seq)
-            .take(limit)
             .cloned()
             .collect();
         if let Some((start, _)) = gap {
             if after_seq < start.saturating_sub(1) {
                 entries.retain(|entry| entry.seq < start);
+                if entries.is_empty() && !g.journal.is_empty() && g.oldest_seq >= start {
+                    // Prefix was evicted and the persist gap is still ahead:
+                    // fail closed rather than skip the hole or return an empty
+                    // success page.
+                    return expired;
+                }
             }
         }
+        entries.truncate(limit);
         let next_cursor = entries.last().map(|e| e.seq);
-        let cursor_expired = entries.is_empty()
-            && after_seq > 0
-            && after_seq < g.oldest_seq
-            && !g.journal.is_empty();
         JournalPage {
-            entries: if cursor_expired { Vec::new() } else { entries },
+            entries,
             next_cursor,
-            cursor_expired,
+            cursor_expired: false,
         }
     }
 
@@ -644,56 +669,116 @@ pub(crate) fn session_id_of(u: &SessionUpdate) -> Option<uuid::Uuid> {
 }
 
 fn run_journal_writer(
-    path: &Path,
-    capacity: usize,
+    ctx: JournalWriterCtx,
     mut tail: VecDeque<JournalEntry>,
     rx: std::sync::mpsc::Receiver<JournalEntry>,
-    persistence_error: &Mutex<Option<String>>,
-    gap_path: &Path,
-    journal_gap: &Mutex<Option<(u64, u64)>>,
 ) {
     use std::sync::mpsc::RecvTimeoutError;
 
     let mut tail_bytes: usize = tail.iter().map(journal_entry_size).sum();
-    let mut file_bytes = std::fs::metadata(path)
+    let mut file_bytes = std::fs::metadata(&ctx.path)
         .map(|metadata| metadata.len() as usize)
         .unwrap_or(0);
-    let mut persisted_gap = load_journal_gap(gap_path).ok();
+    let mut persisted_gap = load_journal_gap(&ctx.gap_path).ok();
     loop {
         let entry = match rx.recv_timeout(std::time::Duration::from_millis(25)) {
-            Ok(entry) => Some(entry),
+            Ok(entry) => {
+                let _guard = ctx.space.mu.lock();
+                ctx.space.cv.notify_one();
+                Some(entry)
+            }
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => {
-                flush_journal_gap(gap_path, journal_gap, &mut persisted_gap, persistence_error);
+                let _guard = ctx.space.mu.lock();
+                ctx.space.cv.notify_all();
+                flush_journal_gap(
+                    &ctx.gap_path,
+                    &ctx.journal_gap,
+                    &mut persisted_gap,
+                    &ctx.persistence_error,
+                );
                 break;
             }
         };
         let Some(entry) = entry else {
-            flush_journal_gap(gap_path, journal_gap, &mut persisted_gap, persistence_error);
+            flush_journal_gap(
+                &ctx.gap_path,
+                &ctx.journal_gap,
+                &mut persisted_gap,
+                &ctx.persistence_error,
+            );
             continue;
         };
         let entry_bytes = journal_entry_size(&entry);
         tail_bytes = tail_bytes.saturating_add(entry_bytes);
         tail.push_back(entry.clone());
-        while tail.len() > capacity || tail_bytes > MAX_JOURNAL_BYTES {
+        while tail.len() > ctx.capacity || tail_bytes > MAX_JOURNAL_BYTES {
             if let Some(old) = tail.pop_front() {
                 tail_bytes = tail_bytes.saturating_sub(journal_entry_size(&old));
             }
         }
         let result = if file_bytes.saturating_add(entry_bytes) > MAX_JOURNAL_BYTES {
-            rewrite_journal_file(path, &tail).map(|_| {
+            rewrite_journal_file(&ctx.path, &tail).map(|_| {
                 file_bytes = tail_bytes;
             })
         } else {
-            append_journal_line(path, &entry).map(|_| {
+            append_journal_line(&ctx.path, &entry).map(|_| {
                 file_bytes = file_bytes.saturating_add(entry_bytes);
             })
         };
         if let Err(error) = result {
-            *persistence_error.lock() = Some(error.to_string());
-            record_journal_gap(journal_gap, entry.seq);
+            *ctx.persistence_error.lock() = Some(error.to_string());
+            record_journal_gap(&ctx.journal_gap, entry.seq);
         }
-        flush_journal_gap(gap_path, journal_gap, &mut persisted_gap, persistence_error);
+        flush_journal_gap(
+            &ctx.gap_path,
+            &ctx.journal_gap,
+            &mut persisted_gap,
+            &ctx.persistence_error,
+        );
+    }
+}
+
+fn enqueue_journal_entry(
+    tx: &SyncSender<JournalEntry>,
+    entry: &JournalEntry,
+    space: &JournalSpace,
+) -> Option<(&'static str, bool)> {
+    let deadline = Instant::now() + WRITER_SEND_TIMEOUT;
+    loop {
+        match tx.try_send(entry.clone()) {
+            Ok(()) => return None,
+            Err(TrySendError::Disconnected(_)) => {
+                return Some(("journal writer stopped", true));
+            }
+            Err(TrySendError::Full(_)) => {
+                let mut guard = space.mu.lock();
+                match tx.try_send(entry.clone()) {
+                    Ok(()) => return None,
+                    Err(TrySendError::Disconnected(_)) => {
+                        return Some(("journal writer stopped", true));
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Some(("journal writer backpressure timeout", false));
+                        }
+                        let remaining = deadline.saturating_duration_since(now);
+                        if space.cv.wait_for(&mut guard, remaining).timed_out() {
+                            match tx.try_send(entry.clone()) {
+                                Ok(()) => return None,
+                                Err(TrySendError::Disconnected(_)) => {
+                                    return Some(("journal writer stopped", true));
+                                }
+                                Err(TrySendError::Full(_)) => {
+                                    return Some(("journal writer backpressure timeout", false));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1694,5 +1779,246 @@ mod tests {
         let page = bus.read_after(0, 8);
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].seq, 42);
+    }
+
+    #[tokio::test]
+    async fn hosted_shape_flood_wrap_then_durable_read_from_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new(DEFAULT_JOURNAL_CAPACITY).with_persist_dir(dir.path());
+        let mut rx = bus.subscribe();
+        let sid = Uuid::new_v4();
+        for i in 0..6_000 {
+            bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: sid,
+                text: format!("flood-{i}"),
+            });
+        }
+        let notice = rx.recv().await.expect("gap notice");
+        assert!(matches!(
+            notice,
+            SessionUpdate::Error { ref message, .. } if message.contains("resynchronize")
+        ));
+        let page = bus.read_after(0, 500);
+        assert!(!page.cursor_expired, "{page:?}");
+        assert!(!page.entries.is_empty());
+        assert!(page.entries.len() <= 500);
+        assert!(bus.journal_gap.lock().is_none());
+        assert_eq!(bus.last_persistence_error(), None);
+    }
+
+    #[test]
+    fn cursor_after_known_gap_end_reads_the_retained_tail() {
+        let bus = EventBus::new(32);
+        let sid = Uuid::new_v4();
+        for i in 0..8 {
+            bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: sid,
+                text: format!("g-{i}"),
+            });
+        }
+        record_journal_gap(&bus.journal_gap, 3);
+        let page = bus.read_after(3, 8);
+        assert!(!page.cursor_expired, "{page:?}");
+        assert_eq!(page.entries[0].seq, 4);
+    }
+
+    #[tokio::test]
+    async fn lag_notice_then_durable_read_returns_retained_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new(64).with_persist_dir(dir.path());
+        let mut rx = bus.subscribe();
+        let sid = Uuid::new_v4();
+        for i in 0..512 {
+            bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: sid,
+                text: format!("flood-{i}"),
+            });
+        }
+        let notice = rx.recv().await.expect("gap notice");
+        assert!(matches!(
+            notice,
+            SessionUpdate::Error { ref message, .. } if message.contains("resynchronize")
+        ));
+        let page = bus.read_after(0, 500);
+        assert!(!page.cursor_expired, "{page:?}");
+        assert!(!page.entries.is_empty());
+        assert!(page.entries.len() <= 500);
+        assert_eq!(bus.last_persistence_error(), None);
+    }
+
+    #[test]
+    fn writer_backpressure_does_not_invent_a_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new(32).with_persist_dir(dir.path());
+        let sid = Uuid::new_v4();
+        for i in 0..400 {
+            bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: sid,
+                text: format!("bp-{i}"),
+            });
+        }
+        assert!(bus.journal_gap.lock().is_none());
+        let page = bus.read_after(0, 500);
+        assert!(!page.cursor_expired);
+        assert_eq!(page.entries.len(), 32);
+        assert!(bus.inner.lock().persistence.is_some());
+    }
+
+    #[test]
+    fn persist_gap_after_wrap_fails_closed_instead_of_empty_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new(8).with_persist_dir(dir.path());
+        let sid = Uuid::new_v4();
+        for i in 0..16 {
+            bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: sid,
+                text: format!("wrap-{i}"),
+            });
+        }
+        record_journal_gap(&bus.journal_gap, 3);
+        let page = bus.read_after(0, 500);
+        assert!(page.cursor_expired);
+        assert!(page.entries.is_empty());
+    }
+
+    #[test]
+    fn restart_without_a_gap_replays_retained_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let sid = Uuid::new_v4();
+        let bus1 = EventBus::new(16).with_persist_dir(dir.path());
+        for i in 0..4 {
+            bus1.publish(SessionUpdate::AgentMessageChunk {
+                session_id: sid,
+                text: format!("ok-{i}"),
+            });
+        }
+        drop(bus1);
+        let bus2 = EventBus::new(16).with_persist_dir(dir.path());
+        let page = bus2.read_after(0, 500);
+        assert!(!page.cursor_expired);
+        assert_eq!(page.entries.len(), 4);
+        assert!(bus2.journal_gap.lock().is_none());
+    }
+
+    #[test]
+    fn five_hundred_entry_pages_do_not_skip_the_run() {
+        let bus = EventBus::new(2_000);
+        let keep = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        for i in 0..600 {
+            bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: if i % 2 == 0 { keep } else { other },
+                text: format!("{i}"),
+            });
+        }
+        let first = bus.read_after(0, 500);
+        assert_eq!(first.entries.len(), 500);
+        assert!(!first.cursor_expired);
+        let rest = bus.read_after(first.next_cursor.unwrap(), 500);
+        assert_eq!(rest.entries.len(), 100);
+        let mut seen = std::collections::BTreeSet::new();
+        for e in first.entries.iter().chain(rest.entries.iter()) {
+            assert!(seen.insert(e.seq));
+        }
+        assert_eq!(seen.len(), 600);
+    }
+
+    #[test]
+    fn session_filter_does_not_advance_past_own_events() {
+        let bus = EventBus::new(64);
+        let keep = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        for i in 0..40 {
+            bus.publish(SessionUpdate::AgentMessageChunk {
+                session_id: other,
+                text: format!("other-{i}"),
+            });
+        }
+        bus.publish(SessionUpdate::AgentMessageChunk {
+            session_id: keep,
+            text: "mine".into(),
+        });
+        let page = bus
+            .read_range_all(0, None, Some(keep))
+            .expect("own events must remain reachable");
+        assert_eq!(page.len(), 1);
+        assert!(
+            matches!(page[0].update, SessionUpdate::AgentMessageChunk { ref text, .. } if text == "mine")
+        );
+    }
+
+    #[test]
+    fn restart_after_gap_preserves_monotonic_seq_and_gap_truth() {
+        let dir = tempfile::tempdir().unwrap();
+        let sid = Uuid::new_v4();
+        let bus1 = EventBus::new(16).with_persist_dir(dir.path());
+        for i in 0..4 {
+            bus1.publish(SessionUpdate::AgentMessageChunk {
+                session_id: sid,
+                text: format!("pre-{i}"),
+            });
+        }
+        record_journal_gap(&bus1.journal_gap, 2);
+        persist_current_gap(
+            &dir.path().join("event_journal.gap.json"),
+            &bus1.journal_gap,
+        )
+        .unwrap();
+        let seq_before = bus1.current_seq();
+        drop(bus1);
+
+        let bus2 = EventBus::new(16).with_persist_dir(dir.path());
+        assert!(bus2.read_after(1, 8).cursor_expired);
+        bus2.publish(SessionUpdate::TurnComplete {
+            session_id: sid,
+            cancelled: false,
+        });
+        assert!(bus2.current_seq() > seq_before);
+        let terminal = bus2
+            .read_range_all(seq_before, None, Some(sid))
+            .expect("post-gap terminal events remain readable");
+        assert!(terminal
+            .iter()
+            .any(|e| matches!(e.update, SessionUpdate::TurnComplete { .. })));
+        assert!(bus2.read_after(1, 8).cursor_expired);
+    }
+
+    #[test]
+    fn concurrent_persisted_publish_has_no_duplicate_or_silent_loss() {
+        use std::sync::Arc;
+        use std::thread;
+        let dir = tempfile::tempdir().unwrap();
+        let bus = Arc::new(EventBus::new(2_000).with_persist_dir(dir.path()));
+        let sid = Uuid::new_v4();
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let bus = bus.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..40 {
+                    bus.publish(SessionUpdate::AgentMessageChunk {
+                        session_id: sid,
+                        text: format!("{t}-{i}"),
+                    });
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        drop(bus);
+        let reopened = EventBus::new(2_000).with_persist_dir(dir.path());
+        let page = reopened
+            .read_range_all(0, None, None)
+            .expect("persisted concurrent run must remain replayable");
+        assert_eq!(page.len(), 160);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut last = 0u64;
+        for e in &page {
+            assert!(e.seq > last, "seq not monotonic: {} then {}", last, e.seq);
+            last = e.seq;
+            assert!(seen.insert(e.seq));
+        }
+        assert!(reopened.journal_gap.lock().is_none());
+        assert_eq!(reopened.last_persistence_error(), None);
     }
 }

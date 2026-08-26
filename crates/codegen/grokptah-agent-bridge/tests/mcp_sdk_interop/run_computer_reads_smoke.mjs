@@ -232,7 +232,9 @@ async function main() {
   const stale = await tool(61, "ptah_get_computer_run_events", callArgs({ run_id: runC, after_seq: 0 }), { session: sid });
   check(
     "cursor below retention is 410 cursor_expired",
-    stale.status === 410 && stale.body?.error?.data?.code === "cursor_expired",
+    stale.status === 410 &&
+      stale.body?.error?.data?.code === "stale_or_recovery" &&
+      stale.body?.error?.data?.reasonCode === "cursor_expired",
     JSON.stringify(stale.body?.error ?? null),
   );
   const startSeq = stale.body?.error?.data?.eventRange?.startSeq;
