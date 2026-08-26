@@ -351,6 +351,11 @@ const GENERATED_HEADER = [
   "",
 ].join("\n");
 
+// Provenance is part of the checked-in artifact. Recording the builder's
+// machine version here would make every verification rebuild dirty solely
+// because CI and a developer use different Node patch releases.
+const MODEL_REPRODUCED_UNDER = "node v22.22.2";
+
 await writeFile(
   join(modelDir, "helpEmbeddingModel.v1.ts"),
   `${GENERATED_HEADER}export const HELP_EMBEDDING_MODEL = ${JSON.stringify(artifact)} as const;\n`,
@@ -387,7 +392,7 @@ const provenance = {
     svd: "cyclic one-sided Jacobi, fixed sweep order, epsilon 1e-12, ties broken by source index",
     buildOps: "Math.log used only for IDF/PPMI weighting; values baked into the artifact",
     runtimeOps: "add, subtract, multiply, divide, sqrt only — all correctly rounded under IEEE-754",
-    reproducedUnder: `node ${process.version}`,
+    reproducedUnder: MODEL_REPRODUCED_UNDER,
   },
 };
 await writeFile(
