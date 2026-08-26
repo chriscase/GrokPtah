@@ -357,11 +357,15 @@ fn validate_ref(value: &str, field: &str) -> Result<(), &'static str> {
             _ => "worker ref must not be empty",
         });
     }
+    if value
+        .chars()
+        .any(|character| matches!(character, '\n' | '\r' | '\0'))
+    {
+        return Err("worker identity contains a control character");
+    }
     if value.len() > MAX_EXTERNAL_WORKER_REF_BYTES
         || value.starts_with('/')
-        || value
-            .chars()
-            .any(|character| matches!(character, '\\' | '\n' | '\r' | '\0'))
+        || value.contains('\\')
         || value.split('/').any(|segment| segment == "..")
     {
         return Err("worker ref must be bounded and non-absolute");
