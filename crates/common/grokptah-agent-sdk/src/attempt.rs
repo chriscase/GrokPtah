@@ -339,6 +339,10 @@ pub enum SendState {
     /// The outcome is unknown: the connection broke, the process died, or the
     /// reply could not be parsed. The request may or may not have run.
     Uncertain,
+    /// The provider acknowledged the request and a response is being consumed.
+    Responding,
+    /// Terminal for this identity. Capacity may be released only after this.
+    Settled,
 }
 
 impl SendState {
@@ -349,15 +353,19 @@ impl SendState {
             Self::Sending => "sending",
             Self::Sent => "sent",
             Self::Uncertain => "uncertain",
+            Self::Responding => "responding",
+            Self::Settled => "settled",
         }
     }
 
     /// Every state in declaration order, for schema and parity pinning.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::KnownNotSent,
         Self::Sending,
         Self::Sent,
         Self::Uncertain,
+        Self::Responding,
+        Self::Settled,
     ];
 
     /// Whether the host may re-send this attempt without asking anyone.
@@ -371,13 +379,13 @@ impl SendState {
 
     /// Whether this attempt is finished, successfully or not.
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Sent | Self::Uncertain)
+        matches!(self, Self::Settled)
     }
 
     /// Whether this attempt must be reconciled against the provider before
     /// any equivalent request is issued again.
     pub const fn requires_reconciliation(self) -> bool {
-        matches!(self, Self::Sending | Self::Uncertain)
+        matches!(self, Self::Sending | Self::Uncertain | Self::Responding)
     }
 
     /// Whether `next` is a legal successor of `self`.
@@ -389,6 +397,9 @@ impl SendState {
         match (self, next) {
             (Self::KnownNotSent, Self::Sending) => true,
             (Self::Sending, Self::Sent | Self::Uncertain) => true,
+            (Self::Sent, Self::Responding | Self::Settled) => true,
+            (Self::Uncertain, Self::Responding | Self::Settled) => true,
+            (Self::Responding, Self::Settled) => true,
             // A prepared request that is abandoned before dispatch is still
             // provably unsent, so this is the one non-advancing legal case.
             (Self::KnownNotSent, Self::KnownNotSent) => true,
@@ -526,7 +537,7 @@ impl ProviderAttempt {
         // A failure that was caught before dispatch must not claim otherwise.
         if let Some(failure) = self.failure
             && failure.class() == crate::outcome::RunOutcomeClass::Blocked
-            && self.send_state.is_terminal()
+            && self.send_state != SendState::KnownNotSent
         {
             return Err("a blocked attempt never reached the provider and cannot be terminal");
         }
@@ -646,6 +657,11 @@ mod tests {
             (KnownNotSent, Sending),
             (Sending, Sent),
             (Sending, Uncertain),
+            (Sent, Responding),
+            (Sent, Settled),
+            (Uncertain, Responding),
+            (Uncertain, Settled),
+            (Responding, Settled),
         ];
         for from in SendState::ALL {
             for to in SendState::ALL {
@@ -657,17 +673,15 @@ mod tests {
                 );
             }
         }
-        // A terminal attempt is finished; nothing reopens it.
-        for terminal in [Sent, Uncertain] {
-            for to in SendState::ALL {
-                assert!(
-                    !terminal.permits_transition_to(to),
-                    "{terminal:?} -> {to:?} reopened a finished attempt"
-                );
-            }
+        // A settled attempt is finished; nothing reopens it.
+        for to in SendState::ALL {
+            assert!(
+                !Settled.permits_transition_to(to),
+                "Settled -> {to:?} reopened a finished attempt"
+            );
         }
         // And nothing ever returns to the retryable state.
-        for from in [Sending, Sent, Uncertain] {
+        for from in [Sending, Sent, Uncertain, Responding, Settled] {
             assert!(
                 !from.permits_transition_to(KnownNotSent),
                 "{from:?} was rewound into an auto-retryable state"

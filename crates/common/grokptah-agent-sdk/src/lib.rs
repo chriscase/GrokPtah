@@ -11,6 +11,8 @@
 pub mod account;
 /// One provider attempt: what it was bound to, and whether it was sent.
 pub mod attempt;
+/// Strict public projection of host authority. No keys, MACs, or grants.
+pub mod authority;
 /// Versioned capability discovery types.
 pub mod capability;
 /// Lease- and revision-fenced Computer Use types.
@@ -39,6 +41,10 @@ pub use attempt::{
     AttemptIntent, AttemptRoute, AttemptSubject, AuthorityRevisions, BoundedId,
     GROK_ATTEMPT_CONTRACT_VERSION, GROK_ATTEMPT_SCHEMA_VERSION, MAX_ATTEMPT_IDENTIFIER_BYTES,
     ProviderAttempt, ProviderReceipts, Revision, SendState, UsageReceipt,
+};
+pub use authority::{
+    PUBLIC_AUTHORITY_CONTRACT_VERSION, PUBLIC_AUTHORITY_SCHEMA_VERSION, PublicAuthorityProjection,
+    PublicGrantClass, PublicIdentity, PublicIdentityClass, PublicRevisionSet, PublicSendState,
 };
 pub use capability::{CapabilityAvailability, CapabilityDescriptor, CapabilitySet, CapabilityTier};
 pub use computer::{

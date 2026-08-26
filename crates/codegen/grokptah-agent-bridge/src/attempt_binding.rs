@@ -203,9 +203,13 @@ pub(crate) fn next_ordinal(attempts: &[ProviderAttempt]) -> u32 {
 pub fn reconcile_interrupted(attempt: &mut ProviderAttempt) -> Result<(), &'static str> {
     match attempt.send_state {
         SendState::Sending => attempt.advance(SendState::Uncertain),
-        // A request that never left is still provably unsent, and a finished
-        // one is finished; neither needs reconciling.
-        SendState::KnownNotSent | SendState::Sent | SendState::Uncertain => Ok(()),
+        // A request that never left is still provably unsent. Sent/responding/
+        // settled/uncertain records are not rewound.
+        SendState::KnownNotSent
+        | SendState::Sent
+        | SendState::Uncertain
+        | SendState::Responding
+        | SendState::Settled => Ok(()),
     }
 }
 

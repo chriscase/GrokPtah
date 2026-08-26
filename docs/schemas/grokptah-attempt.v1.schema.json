@@ -150,9 +150,9 @@
       }
     },
     "sendState": {
-      "description": "Only `known_not_sent` may be retried automatically. `sending` and `uncertain` must be reconciled against the provider using `intent.providerIdempotencyKey`; `sent` is finished.",
+      "description": "Only `known_not_sent` may be retried automatically. `sending` and `uncertain` must be reconciled against the provider using `intent.providerIdempotencyKey`. `responding` consumes an acknowledged reply. `settled` is finished.",
       "type": "string",
-      "enum": ["known_not_sent", "sending", "sent", "uncertain"]
+      "enum": ["known_not_sent", "sending", "sent", "uncertain", "responding", "settled"]
     },
     "receipts": {
       "type": "object",

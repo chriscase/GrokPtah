@@ -2,11 +2,16 @@
 //!
 //! Pure policy + durable records live here; the MCP transport is a thin adapter.
 
+pub(crate) mod authority;
 mod authz;
 mod service;
 mod store;
 mod types;
 
+pub use authority::{
+    AuthorityKey, ClassifiedId, ExecutionBounds, HostGrant, HostGrantClass, IdentityClass,
+    UnverifiedEnvelope, VerifiedEnvelope,
+};
 pub use authz::{canonical_workspace, constant_time_eq, AuthContext, WorkspaceAllowlist};
 pub(crate) use service::apply_run_aggregate;
 pub use service::{OrchestrationConfig, OrchestrationService};
