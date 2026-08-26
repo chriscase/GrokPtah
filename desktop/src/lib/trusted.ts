@@ -5,4 +5,4 @@
 export * from "./capabilities";
 export * from "./grokptahClient";
 export * from "./grokptahOperations";
-export * from "./help";
+export * from "./help/publicSurface";

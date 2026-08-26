@@ -8,31 +8,10 @@
  */
 export * from "./capabilities";
 export * from "./externalWorker";
-export * from "./help";
-// The source-cited Help Center corpus is exported under explicit names so the
-// original bounded `searchHelp` contract remains backward compatible while
-// consumers can opt into semantic-ranking and assistant request validation.
-export {
-  HELP_ARTICLES,
-  HELP_CORPUS_VERSION,
-  buildHelpAssistantRequest,
-  buildHelpSemanticRequest,
-  parseHelpAssistantAnswer,
-  parseHelpSemanticAnswer,
-  searchHelp as searchHelpArticles,
-  validateHelpAssistantAnswer,
-  validateHelpSemanticAnswer,
-} from "./helpCenter";
-export type {
-  HelpArticle,
-  HelpAssistantAnswer,
-  HelpAssistantRequest,
-  HelpAssistantValidation,
-  HelpSemanticAnswer,
-  HelpSemanticRequest,
-  HelpSemanticValidation,
-  HelpSearchResult as HelpArticleSearchResult,
-  HelpTopic,
-} from "./helpCenter";
+// Semantic Help ships its offline half only: the public corpus, retrieval,
+// and the checks a consumer can re-run. Authority constructors, route
+// selection, transport, and the executor are not exported here and are not
+// importable from the published package — see `help/publicSurface.ts`.
+export * from "./help/publicSurface";
 export * from "./promptQueue";
 export * from "./streamApply";

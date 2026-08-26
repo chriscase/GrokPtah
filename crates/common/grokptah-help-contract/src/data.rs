@@ -368,8 +368,13 @@ pub const ARTICLES: &[ArticleSeed] = &[
             "screen access",
             "safe automation",
             "mouse and keyboard",
+            "can the agent click for me",
+            "is it safe to let it click",
         ],
         keywords: &[
+            "agent",
+            "click",
+            "safety",
             "computer",
             "consent",
             "observation",

@@ -3,6 +3,7 @@
 mod commands;
 mod computer_use;
 mod event_forward;
+mod help;
 mod pty_host;
 
 use std::sync::Mutex;
@@ -34,6 +35,7 @@ pub fn run() {
             control: Mutex::new(None),
             computer_use: std::sync::Arc::new(computer_use::DesktopComputerUse::new(&host)),
         })
+        .manage(help::HelpState::new())
         .setup(move |app| {
             let handle = app.handle().clone();
             app.state::<AppState>().pty.set_app(handle.clone());
@@ -59,6 +61,12 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            help::help_ask,
+            help::help_follow,
+            help::help_cancel,
+            help::help_bounds,
+            help::help_visible_corpus,
+            help::help_session,
             commands::agent_start,
             commands::agent_stop,
             commands::agent_status,

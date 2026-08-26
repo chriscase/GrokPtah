@@ -33,6 +33,11 @@ pub const CORPUS_ARTIFACT_PATH: &str = "desktop/src/lib/help/canonical/help-corp
 pub const TYPESCRIPT_ARTIFACT_PATH: &str = "desktop/src/lib/help/generated/contract.ts";
 /// Repository-relative path of the generated JSON Schema.
 pub const SCHEMA_ARTIFACT_PATH: &str = "docs/schemas/grokptah-help.v1.schema.json";
+/// Repository-relative path of the Rust-emitted digest parity vectors.
+pub const PARITY_ARTIFACT_PATH: &str = "desktop/src/lib/help/generated/digest-parity.json";
+/// Repository-relative path of the public-only bundle the package ships.
+pub const PUBLIC_CORPUS_ARTIFACT_PATH: &str =
+    "desktop/src/lib/help/canonical/help-corpus-public.v1.json";
 
 /// The exact bytes of the committed corpus artifact, embedded at compile time.
 ///

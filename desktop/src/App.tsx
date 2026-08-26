@@ -26,12 +26,7 @@ import { ComputerCockpit } from "./components/ComputerCockpit";
 import { FleetStrip } from "./components/FleetStrip";
 import { SearchPanel } from "./components/SearchPanel";
 import { HelpCenter } from "./components/HelpCenter";
-import {
-  parseHelpAssistantAnswer,
-  parseHelpSemanticAnswer,
-  type HelpAssistantRequest,
-  type HelpSemanticRequest,
-} from "./lib/helpCenter";
+import { helpSession } from "./lib/help/host";
 import { SessionBrowser } from "./components/SessionBrowser";
 import { SessionPane } from "./components/SessionPane";
 import { SettingsPanel } from "./components/SettingsPanel";
@@ -350,6 +345,17 @@ export default function App() {
   const [sessionBrowserOpen, setSessionBrowserOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  // Opaque token the host issues. It names a row in the host's session table
+  // and carries no principal, tenant, or capability of its own.
+  const [helpSessionToken, setHelpSessionToken] = useState("");
+  useEffect(() => {
+    // Fetched once. A failure leaves the token empty, which the host reads as
+    // an unknown session, so Help degrades to offline search rather than
+    // falling back to some other identity.
+    void helpSession()
+      .then(setHelpSessionToken)
+      .catch(() => setHelpSessionToken(""));
+  }, []);
   /**
    * Ordered dock slots (session ids visible as columns). Phase 14.1 multi-zone.
    * Empty or single-element = classic single-pane; up to maxDocks columns.
@@ -578,52 +584,6 @@ export default function App() {
     .filter((value): value is string => Boolean(value))
     .filter((value, index, values) => values.indexOf(value) === index)
     .join(" · ") || "selected provider";
-  const askHelpAssistant = useCallback(
-    async (request: HelpAssistantRequest) => {
-      const session = await api.sessionNewKind("chat");
-      const prompt = [
-        "You are the optional GrokPtah product-help assistant.",
-        request.instruction,
-        `Selected provider/model: ${assistantProviderLabel}`,
-        `Retrieval mode: ${request.retrievalMode}`,
-        `Corpus version: ${request.corpusVersion}`,
-        "Do not switch provider, tenant, model, or retrieval scope.",
-        "Return JSON only with exactly these keys: text (string), citations (array of exact source IDs), uncertainty (string).",
-        `Question: ${request.query}`,
-        `Cited context:\n${request.citedContext}`,
-      ].join("\n\n");
-      try {
-        const reply = await api.sessionPrompt(session.id, prompt);
-        return parseHelpAssistantAnswer(reply);
-      } finally {
-        await api.sessionDelete(session.id).catch(() => undefined);
-      }
-    },
-    [assistantProviderLabel],
-  );
-  const searchHelpSemantically = useCallback(
-    async (request: HelpSemanticRequest) => {
-      const session = await api.sessionNewKind("chat");
-      const prompt = [
-        "You are the optional GrokPtah Help Center semantic retriever.",
-        request.instruction,
-        `Selected provider/model: ${assistantProviderLabel}`,
-        `Retrieval mode: ${request.retrievalMode}`,
-        `Corpus version: ${request.corpusVersion}`,
-        "Do not switch provider, tenant, model, or retrieval scope.",
-        "Return JSON only with exactly these keys: results (array of objects with articleId, score, rationale), uncertainty (string).",
-        `Query: ${request.query}`,
-        `Candidate article metadata:\n${JSON.stringify(request.candidates)}`,
-      ].join("\n\n");
-      try {
-        const reply = await api.sessionPrompt(session.id, prompt);
-        return parseHelpSemanticAnswer(reply);
-      } finally {
-        await api.sessionDelete(session.id).catch(() => undefined);
-      }
-    },
-    [assistantProviderLabel],
-  );
   const activeTabKind = kindForTab(activeTab, sessions, workspaceMode);
   const activeIsBuild = activeTabKind === "build";
   const activeCwd = activeSummary?.cwd || activeTab?.cwd;
@@ -3870,9 +3830,7 @@ export default function App() {
       <HelpCenter
         open={helpOpen}
         onClose={() => setHelpOpen(false)}
-        onAskAssistant={askHelpAssistant}
-        onSearchSemantic={searchHelpSemantically}
-        assistantProviderLabel={assistantProviderLabel}
+        sessionToken={helpSessionToken}
       />
 
       {aboutOpen && (

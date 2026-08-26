@@ -4,7 +4,7 @@ import {
   emptyPromptQueueState,
   promptQueueReducer,
   queueKind,
-  searchHelpArticles,
+  searchHelpCorpus,
 } from "./uiCore";
 
 describe("headless UI integration barrel", () => {
@@ -31,9 +31,18 @@ describe("headless UI integration barrel", () => {
     expect(state.entries["session-1"]?.[0]?.text).toBe("review");
   });
 
-  it("exposes the source-cited Help Center corpus to other products", () => {
-    const hits = searchHelpArticles("restricted company gateway");
-    expect(hits[0]?.article.id).toBe("providers.restricted-gateway-review");
-    expect(hits[0]?.retrievalMode).toBe("offline-lexical");
+  it("exposes offline Help retrieval over the public corpus", () => {
+    const outcome = searchHelpCorpus("recover an interrupted run");
+    expect(outcome.kind).toBe("results");
+    if (outcome.kind !== "results") return;
+    expect(outcome.results[0]?.articleId).toBe("operations.durable-recovery");
+    expect(outcome.mode).toBe("offline-hybrid");
+  });
+
+  it("abstains rather than guessing when the corpus cannot answer", () => {
+    // The barrel ships the abstention behaviour, not just the ranking: a
+    // consumer must be able to tell "no answer" from "a weak answer".
+    const outcome = searchHelpCorpus("what is the capital of Portugal");
+    expect(outcome.kind).toBe("abstained");
   });
 });

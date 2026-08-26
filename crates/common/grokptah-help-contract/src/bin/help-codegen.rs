@@ -14,9 +14,10 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use grokptah_help_contract::corpus::Visibility;
 use grokptah_help_contract::{
-    CORPUS_ARTIFACT_PATH, SCHEMA_ARTIFACT_PATH, TYPESCRIPT_ARTIFACT_PATH, build_corpus, codegen,
-    render_corpus_artifact,
+    CORPUS_ARTIFACT_PATH, PARITY_ARTIFACT_PATH, PUBLIC_CORPUS_ARTIFACT_PATH, SCHEMA_ARTIFACT_PATH,
+    TYPESCRIPT_ARTIFACT_PATH, build_corpus, codegen, render_corpus_artifact,
 };
 
 /// Walk up from the crate directory to the repository root.
@@ -42,6 +43,13 @@ fn artifacts() -> Vec<Artifact> {
             path: CORPUS_ARTIFACT_PATH,
             contents: render_corpus_artifact(&corpus),
         },
+        // The published bundle is filtered here, by the same code that built
+        // the corpus, rather than by a packaging script that could be run with
+        // the wrong argument or skipped.
+        Artifact {
+            path: PUBLIC_CORPUS_ARTIFACT_PATH,
+            contents: render_corpus_artifact(&corpus.bundle_at(Visibility::Public)),
+        },
         Artifact {
             path: TYPESCRIPT_ARTIFACT_PATH,
             contents: codegen::emit_typescript(&model),
@@ -49,6 +57,10 @@ fn artifacts() -> Vec<Artifact> {
         Artifact {
             path: SCHEMA_ARTIFACT_PATH,
             contents: codegen::render_json_schema(&codegen::emit_json_schema(&model)),
+        },
+        Artifact {
+            path: PARITY_ARTIFACT_PATH,
+            contents: codegen::render_json_schema(&codegen::digest_parity_cases()),
         },
     ]
 }

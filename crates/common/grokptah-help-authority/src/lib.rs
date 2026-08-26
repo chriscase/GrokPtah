@@ -265,6 +265,64 @@ impl Authority {
         }
     }
 
+    /// The corpus this principal is entitled to, as a corpus.
+    ///
+    /// Filtering happens here, in the host, and the filtered document is what
+    /// crosses the boundary. A renderer that received the whole corpus and was
+    /// asked to hide part of it would be holding the content it is meant not
+    /// to have; there would be nothing left to enforce.
+    ///
+    /// Record digests are preserved so a citation still verifies against the
+    /// full corpus, while the corpus-level digest is recomputed: a filtered
+    /// view is honestly a different document and says so.
+    #[must_use]
+    pub fn visible_corpus(&self, principal: &Principal) -> Corpus {
+        let manifest = self.manifest_for(principal);
+        let allowed: std::collections::BTreeSet<&str> = manifest
+            .entries
+            .iter()
+            .map(|entry| entry.article_id.as_str())
+            .collect();
+        let mut filtered = self.corpus.clone();
+        filtered
+            .articles
+            .retain(|article| allowed.contains(article.id.as_str()));
+        filtered
+            .chunks
+            .retain(|chunk| allowed.contains(chunk.article_id.as_str()));
+        let cited: std::collections::BTreeSet<&str> = filtered
+            .articles
+            .iter()
+            .flat_map(|article| article.source_ids.iter().map(String::as_str))
+            .collect();
+        filtered
+            .sources
+            .retain(|source| cited.contains(source.id.as_str()));
+
+        let source_set: Vec<String> = filtered
+            .sources
+            .iter()
+            .map(|source| format!("{}#{}", source.path, source.heading))
+            .collect();
+        filtered.source_digest = grokptah_help_contract::digest::domain_digest(
+            grokptah_help_contract::digest::domain::SOURCE_SET,
+            &source_set.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let mut fields: Vec<&str> = vec![&filtered.schema_version, &filtered.content_version];
+        for article in &filtered.articles {
+            fields.push(&article.digest);
+        }
+        for chunk in &filtered.chunks {
+            fields.push(&chunk.digest);
+        }
+        fields.push(&filtered.source_digest);
+        filtered.digest = grokptah_help_contract::digest::domain_digest(
+            grokptah_help_contract::digest::domain::CORPUS,
+            &fields,
+        );
+        filtered
+    }
+
     /// Mint a grant for a principal against the manifest it is entitled to.
     ///
     /// The grant records the corpus digest and manifest digest it was issued

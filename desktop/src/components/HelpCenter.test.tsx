@@ -1,290 +1,265 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { HelpCenter } from "./HelpCenter";
+/**
+ * Help Center surface gates.
+ *
+ * Two things are being held down here. First, accessibility: a dialog that
+ * traps focus, returns it, announces status, and is reachable by keyboard —
+ * because Help is the surface a reader reaches when something has already gone
+ * wrong for them. Second, the boundary: this component must reach the host
+ * only through the three Help commands, and must never mint a chat session.
+ */
 
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+
+/** Every Tauri call this component makes, recorded. */
+const invoked: Array<{ command: string; args: unknown }> = [];
+let nextProjection: unknown = null;
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (command: string, args: unknown) => {
+    invoked.push({ command, args });
+    if (command === "help_ask" || command === "help_follow" || command === "help_cancel") {
+      return Promise.resolve(
+        nextProjection ?? {
+          handle: "help-00000001",
+          status: "abstained",
+          claims: [],
+          error: null,
+          message: null,
+        },
+      );
+    }
+    return Promise.resolve(null);
+  },
+}));
+
+const { HelpCenter } = await import("./HelpCenter");
+
+function open() {
+  return render(<HelpCenter open onClose={() => {}} sessionToken="tok" />);
+}
+
+beforeEach(() => {
+  invoked.length = 0;
+  nextProjection = null;
+});
+
+// This suite does not run with vitest globals, so React Testing Library never
+// registers its own afterEach. Without this, every render stays in the
+// document and the next query finds several of everything.
 afterEach(cleanup);
 
-describe("HelpCenter", () => {
-  it("renders the offline corpus with an accessible dialog and article", () => {
-    render(<HelpCenter open onClose={vi.fn()} />);
-
-    expect(screen.getByRole("dialog", { name: "Help Center" })).toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "Search help" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Sessions, builds, and chats" })).toBeInTheDocument();
-    expect(screen.getByText(/Product corpus v1/)).toBeInTheDocument();
+describe("Help Center accessibility", () => {
+  it("is a labelled modal dialog", () => {
+    open();
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    expect(screen.getByRole("heading", { name: "Help Center" })).toBeInTheDocument();
   });
 
-  it("filters articles deterministically and exposes the selected article", () => {
-    render(<HelpCenter open onClose={vi.fn()} />);
-    const input = screen.getByRole("textbox", { name: "Search help" });
-
-    fireEvent.change(input, { target: { value: "provider route" } });
-
-    expect(screen.getByRole("heading", { name: "Provider routes and gateway policy" })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "Sessions, builds, and chats" })).not.toBeInTheDocument();
-    expect(screen.getByText(/Source-backed offline guidance/)).toBeInTheDocument();
-    expect(screen.getByText(/Heuristic match confidence:/)).toHaveTextContent(/ranking signal only, not certification/);
+  it("moves focus to the search field when it opens", async () => {
+    open();
+    await waitFor(() => expect(screen.getByLabelText("Search Help")).toHaveFocus());
   });
 
-  it("closes on Escape without changing the source corpus", () => {
-    const onClose = vi.fn();
-    render(<HelpCenter open onClose={onClose} />);
-
-    fireEvent.keyDown(window, { key: "Escape" });
-
-    expect(onClose).toHaveBeenCalledOnce();
-  });
-
-  it("cancels a nested confirmation before closing the Help Center", () => {
-    const onClose = vi.fn();
-    const onAskAssistant = vi.fn().mockResolvedValue({
-      text: "A bounded answer.",
-      citations: ["product.readme"],
-      uncertainty: "The selected article is the authority.",
-    });
-    render(<HelpCenter open onClose={onClose} onAskAssistant={onAskAssistant} />);
-
-    fireEvent.click(screen.getByRole("button", { name: "Prepare cited question" }));
-    expect(screen.getByRole("alertdialog", { name: "Confirm assistant request" })).toBeInTheDocument();
-    fireEvent.keyDown(window, { key: "Escape" });
-
-    expect(onClose).not.toHaveBeenCalled();
-    expect(screen.queryByRole("alertdialog", { name: "Confirm assistant request" })).not.toBeInTheDocument();
-  });
-
-  it("keeps keyboard focus inside the modal and restores the opener", () => {
-    const onClose = vi.fn();
+  it("returns focus to whatever opened it", async () => {
     const opener = document.createElement("button");
-    opener.type = "button";
-    opener.textContent = "Open Help";
     document.body.appendChild(opener);
     opener.focus();
-
-    const { unmount } = render(<HelpCenter open onClose={onClose} />);
-    const dialog = screen.getByRole("dialog", { name: "Help Center" });
-    const close = screen.getByRole("button", { name: "Close Help Center" });
-    const focusables = dialog.querySelectorAll<HTMLElement>(
-      'button:not([disabled]), input:not([disabled]), select:not([disabled])',
-    );
-    const last = focusables[focusables.length - 1];
-
-    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "Search help" }));
-    last.focus();
-    fireEvent.keyDown(window, { key: "Tab" });
-    expect(document.activeElement).toBe(close);
-
-    close.focus();
-    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
-    expect(document.activeElement).toBe(last);
-
+    const { unmount } = render(<HelpCenter open onClose={() => {}} sessionToken="tok" />);
+    await waitFor(() => expect(screen.getByLabelText("Search Help")).toHaveFocus());
     unmount();
-    expect(document.activeElement).toBe(opener);
+    await waitFor(() => expect(opener).toHaveFocus());
     opener.remove();
   });
 
-  it("makes the application background inert while Help is open", () => {
+  it("closes on Escape", async () => {
     const onClose = vi.fn();
-    const { rerender } = render(
-      <div className="app-shell">
-        <main data-testid="app-background">Active coding lane</main>
-        <HelpCenter open onClose={onClose} />
-      </div>,
-    );
-
-    const background = screen.getByTestId("app-background");
-    expect(background).toHaveAttribute("inert");
-    expect(background).toHaveAttribute("aria-hidden", "true");
-
-    rerender(
-      <div className="app-shell">
-        <main data-testid="app-background">Active coding lane</main>
-        <HelpCenter open={false} onClose={onClose} />
-      </div>,
-    );
-    expect(background).not.toHaveAttribute("inert");
-    expect(background).not.toHaveAttribute("aria-hidden");
+    render(<HelpCenter open onClose={onClose} sessionToken="tok" />);
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
   });
 
-  it("renders an honest empty state for an unknown query", () => {
-    render(<HelpCenter open onClose={vi.fn()} />);
-    fireEvent.change(screen.getByRole("textbox", { name: "Search help" }), {
-      target: { value: "teleport my repository" },
-    });
-
-    expect(screen.getByRole("heading", { name: "No matching guidance" })).toBeInTheDocument();
+  it("keeps Tab inside the dialog", async () => {
+    const user = userEvent.setup();
+    open();
+    await waitFor(() => expect(screen.getByLabelText("Search Help")).toHaveFocus());
+    const dialog = screen.getByRole("dialog");
+    for (let step = 0; step < 12; step += 1) {
+      await user.tab();
+      expect(dialog.contains(document.activeElement)).toBe(true);
+    }
   });
 
-  it("requires confirmation before calling the optional assistant and validates citations", async () => {
-    const onAskAssistant = vi.fn().mockResolvedValue({
-      text: "Builds and chats are separate surfaces.",
-      citations: ["product.readme"],
-      uncertainty: "This answer is limited to the selected article.",
-    });
-    render(<HelpCenter open onClose={vi.fn()} onAskAssistant={onAskAssistant} assistantProviderLabel="Company gateway · review-model" />);
-
-    fireEvent.click(screen.getByRole("button", { name: "Prepare cited question" }));
-    expect(onAskAssistant).not.toHaveBeenCalled();
-    expect(screen.getByRole("alertdialog", { name: "Confirm assistant request" })).toBeInTheDocument();
-    expect(screen.getByText(/Company gateway · review-model/)).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Send cited context" }));
-    await waitFor(() => expect(onAskAssistant).toHaveBeenCalledOnce());
-    expect(screen.getByText(/Draft answer — not product truth/)).toBeInTheDocument();
+  it("announces result counts in a live region", async () => {
+    const user = userEvent.setup();
+    open();
+    const status = screen.getAllByRole("status")[0];
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(status).toHaveTextContent(/Browsing \d+ Help articles?/);
+    await user.type(screen.getByLabelText("Search Help"), "recover an interrupted run");
+    await waitFor(() => expect(status).toHaveTextContent(/\d+ Help articles? match/));
   });
 
-  it("falls back to cited guidance when the assistant answer is ungrounded", async () => {
-    const onAskAssistant = vi.fn().mockResolvedValue({
-      text: "It is fully certified.",
-      citations: ["unknown-source"],
-      uncertainty: "",
-    });
-    render(<HelpCenter open onClose={vi.fn()} onAskAssistant={onAskAssistant} />);
-    fireEvent.click(screen.getByRole("button", { name: "Prepare cited question" }));
-    fireEvent.click(screen.getByRole("button", { name: "Send cited context" }));
-    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/answer rejected/));
-    expect(screen.getByText(/Source-backed offline guidance/)).toBeInTheDocument();
-  });
-
-  it("requires confirmation before provider semantic ranking and preserves corpus bounds", async () => {
-    const onSearchSemantic = vi.fn().mockResolvedValue({
-      results: [{ articleId: "providers.gateway", score: 0.88, rationale: "Gateway policy match." }],
-      uncertainty: "Provider ranking is not product certification.",
-    });
-    render(
-      <HelpCenter
-        open
-        onClose={vi.fn()}
-        onSearchSemantic={onSearchSemantic}
-        assistantProviderLabel="Company gateway · review-model"
-      />,
+  it("says so plainly when nothing matches", async () => {
+    const user = userEvent.setup();
+    open();
+    await user.type(screen.getByLabelText("Search Help"), "capital of Portugal");
+    await waitFor(() =>
+      expect(screen.getAllByRole("status")[0]).toHaveTextContent(/No Help article matches/),
     );
-    fireEvent.change(screen.getByRole("textbox", { name: "Search help" }), {
-      target: { value: "why is the company gateway model weak?" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Prepare meaning search" }));
-    expect(onSearchSemantic).not.toHaveBeenCalled();
-    expect(screen.getByRole("alertdialog", { name: "Confirm meaning search" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Search by meaning" }));
-    await waitFor(() => expect(onSearchSemantic).toHaveBeenCalledOnce());
-    expect(screen.getByRole("heading", { name: "Provider routes and gateway policy" })).toBeInTheDocument();
-    expect(screen.getByText(/Provider semantic ranking/)).toBeInTheDocument();
-    expect(screen.getByText(/Provider ranking score: 88%/)).toBeInTheDocument();
   });
 
-  it("keeps lexical guidance when semantic ranking is rejected", async () => {
-    const onSearchSemantic = vi.fn().mockResolvedValue({
-      results: [{ articleId: "providers.gateway", score: 2, rationale: "out of bounds" }],
-      uncertainty: "bounded",
-    });
-    render(
-      <HelpCenter
-        open
-        onClose={vi.fn()}
-        onSearchSemantic={onSearchSemantic}
-        assistantProviderLabel="Company gateway · review-model"
-      />,
-    );
-    fireEvent.change(screen.getByRole("textbox", { name: "Search help" }), {
-      target: { value: "why is the company gateway model weak?" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Prepare meaning search" }));
-    fireEvent.click(screen.getByRole("button", { name: "Search by meaning" }));
-    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/ranking rejected/));
-    expect(screen.getByRole("heading", { name: "Review code through a restricted company gateway" })).toBeInTheDocument();
+  it("names its landmarks", () => {
+    open();
+    expect(screen.getByRole("navigation", { name: "Help articles" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Help article")).toBeInTheDocument();
+    expect(screen.getByLabelText("Written answer")).toBeInTheDocument();
+  });
+});
+
+describe("Help Center boundary", () => {
+  it("renders offline results without calling the host at all", async () => {
+    const user = userEvent.setup();
+    open();
+    await user.type(screen.getByLabelText("Search Help"), "recover an interrupted run");
+    await waitFor(() => expect(screen.getAllByRole("status")[0]).toHaveTextContent(/match/));
+    expect(
+      invoked.filter((call) => call.command !== "help_session"),
+      "search reached the host; offline retrieval must be local",
+    ).toEqual([]);
   });
 
-  it("traps Tab inside the top confirmation and restores the layer opener, not the Help opener", () => {
-    const onClose = vi.fn();
-    const opener = document.createElement("button");
-    opener.type = "button";
-    opener.textContent = "Open Help";
-    document.body.appendChild(opener);
-    opener.focus();
-    const focusSpy = vi.spyOn(opener, "focus");
-
-    const { unmount } = render(
-      <HelpCenter open onClose={onClose} onAskAssistant={vi.fn()} />,
-    );
-    const prepare = screen.getByRole("button", { name: "Prepare cited question" });
-    focusSpy.mockClear();
-    fireEvent.click(prepare);
-
-    const alert = screen.getByRole("alertdialog", { name: "Confirm assistant request" });
-    const primary = screen.getByRole("button", { name: "Send cited context" });
-    const cancel = screen.getByRole("button", { name: "Cancel" });
-    expect(document.activeElement).toBe(primary);
-    expect(focusSpy).not.toHaveBeenCalled();
-
-    cancel.focus();
-    fireEvent.keyDown(window, { key: "Tab" });
-    expect(document.activeElement).toBe(primary);
-    expect(document.activeElement).not.toBe(
-      screen.getByRole("button", { name: "Close Help Center", hidden: true }),
-    );
-
-    primary.focus();
-    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
-    expect(document.activeElement).toBe(cancel);
-    expect(alert.contains(document.activeElement)).toBe(true);
-
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(onClose).not.toHaveBeenCalled();
-    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
-    expect(document.activeElement).toBe(prepare);
-    expect(focusSpy).not.toHaveBeenCalled();
-
-    unmount();
-    expect(focusSpy).toHaveBeenCalled();
-    expect(document.activeElement).toBe(opener);
-    opener.remove();
+  it("never creates a chat session", async () => {
+    const user = userEvent.setup();
+    open();
+    await user.type(screen.getByLabelText("Search Help"), "recover an interrupted run");
+    await user.click(screen.getByRole("button", { name: /Ask for a written answer/ }));
+    await waitFor(() => expect(invoked.length).toBeGreaterThan(0));
+    for (const call of invoked) {
+      expect(call.command).not.toBe("session_new_kind");
+      expect(call.command).not.toBe("session_new");
+      expect(call.command).not.toBe("session_prompt");
+      expect(call.command).not.toBe("session_delete");
+    }
   });
 
-  it("closes stacked confirmations one layer at a time", () => {
-    const onClose = vi.fn();
-    render(
-      <HelpCenter
-        open
-        onClose={onClose}
-        onAskAssistant={vi.fn()}
-        onSearchSemantic={vi.fn()}
-      />,
-    );
-    fireEvent.change(screen.getByRole("textbox", { name: "Search help" }), {
-      target: { value: "gateway" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Prepare meaning search" }));
-    expect(screen.getByRole("alertdialog", { name: "Confirm meaning search" })).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: "Prepare cited question", hidden: true }));
-    expect(screen.getByRole("alertdialog", { name: "Confirm assistant request" })).toBeInTheDocument();
-    expect(screen.queryByRole("alertdialog", { name: "Confirm meaning search" })).not.toBeInTheDocument();
-
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(onClose).not.toHaveBeenCalled();
-    expect(screen.queryByRole("alertdialog", { name: "Confirm assistant request" })).not.toBeInTheDocument();
-    expect(screen.getByRole("alertdialog", { name: "Confirm meaning search" })).toBeInTheDocument();
-
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(onClose).not.toHaveBeenCalled();
-    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
-
-    fireEvent.keyDown(window, { key: "Escape" });
-    expect(onClose).toHaveBeenCalledOnce();
+  it("sends only a question, a locale, and the opaque session handle", async () => {
+    const user = userEvent.setup();
+    open();
+    await user.type(screen.getByLabelText("Search Help"), "recover an interrupted run");
+    await user.click(screen.getByRole("button", { name: /Ask for a written answer/ }));
+    await waitFor(() => expect(invoked.some((c) => c.command === "help_ask")).toBe(true));
+    const ask = invoked.find((call) => call.command === "help_ask");
+    expect(ask).toBeDefined();
+    const payload = (ask!.args as { ask: Record<string, unknown> }).ask;
+    expect(Object.keys(payload).sort()).toEqual(["locale", "question", "session"]);
+    expect(payload.session).toBe("tok");
+    // Nothing that could name a route, a chunk, or an authority.
+    const serialized = JSON.stringify(payload);
+    for (const forbidden of ["route", "model", "chunk", "grant", "capability", "tenant"]) {
+      expect(serialized).not.toContain(forbidden);
+    }
   });
 
-  it("does not make consent-layer siblings inert while Help is open", () => {
-    render(
-      <div className="app-shell">
-        <main data-testid="app-background">Active coding lane</main>
-        <div data-modal-layer="consent" data-testid="consent-layer">
-          Allow this tool?
-        </div>
-        <HelpCenter open onClose={vi.fn()} />
-      </div>,
+  it("shows an abstention as an abstention, keeping the search results", async () => {
+    const user = userEvent.setup();
+    open();
+    await user.type(screen.getByLabelText("Search Help"), "recover an interrupted run");
+    await user.click(screen.getByRole("button", { name: /Ask for a written answer/ }));
+    await waitFor(() =>
+      expect(screen.getByText(/could not support an answer/)).toBeInTheDocument(),
     );
+    // The offline results are still on screen: a model declining does not
+    // leave the reader with nothing.
+    expect(screen.getAllByRole("status")[0]).toHaveTextContent(/match/);
+  });
 
-    expect(screen.getByTestId("app-background")).toHaveAttribute("inert");
-    expect(screen.getByTestId("consent-layer")).not.toHaveAttribute("inert");
-    expect(screen.getByTestId("consent-layer")).not.toHaveAttribute("aria-hidden", "true");
+  it("re-checks a returned answer and drops an unsupported claim", async () => {
+    nextProjection = {
+      handle: "help-00000001",
+      status: "answered",
+      claims: [
+        {
+          ordinal: 0,
+          text: "GrokPtah approves every computer action for you.",
+          citations: [
+            {
+              source_id: "product.readme.features",
+              path: "README.md",
+              heading: "Features (desktop)",
+              quote: "this text is not in the corpus at all",
+            },
+          ],
+        },
+      ],
+      error: null,
+      message: null,
+    };
+    const user = userEvent.setup();
+    open();
+    await user.type(screen.getByLabelText("Search Help"), "recover an interrupted run");
+    await user.click(screen.getByRole("button", { name: /Ask for a written answer/ }));
+    await waitFor(() =>
+      expect(screen.getByText(/could not support an answer/)).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/approves every computer action/)).not.toBeInTheDocument();
+  });
+
+  it("renders a supported claim with its exact quote", async () => {
+    const { HELP_CORPUS } = await import("../lib/help/canonical/corpus");
+    const chunk = HELP_CORPUS.chunks.find(
+      (candidate) => candidate.kind === "body" && candidate.text.length > 80,
+    )!;
+    const source = HELP_CORPUS.sources.find((s) => s.id === chunk.source_ids[0])!;
+    // Trimmed: getByText normalises whitespace, so a quote ending in a space
+    // can never match the rendered node exactly.
+    const quote = chunk.text.slice(0, 60).trim();
+    nextProjection = {
+      handle: "help-00000001",
+      status: "answered",
+      claims: [
+        {
+          ordinal: 0,
+          text: "A supported statement.",
+          citations: [
+            { source_id: source.id, path: source.path, heading: source.heading, quote },
+          ],
+        },
+      ],
+      error: null,
+      message: null,
+    };
+    const user = userEvent.setup();
+    open();
+    await user.type(screen.getByLabelText("Search Help"), "recover an interrupted run");
+    await user.click(screen.getByRole("button", { name: /Ask for a written answer/ }));
+    await waitFor(() =>
+      expect(screen.getByText("A supported statement.")).toBeInTheDocument(),
+    );
+    expect(screen.getByText((content) => content.trim() === quote)).toBeInTheDocument();
+    expect(screen.getByLabelText("Sources for this statement")).toBeInTheDocument();
+  });
+
+  it("reports an unavailable answer with the host's fixed message only", async () => {
+    nextProjection = {
+      handle: "help-00000001",
+      status: "unavailable",
+      claims: [],
+      error: "not_available",
+      message: "Help cannot answer that right now.",
+    };
+    const user = userEvent.setup();
+    open();
+    await user.type(screen.getByLabelText("Search Help"), "recover an interrupted run");
+    await user.click(screen.getByRole("button", { name: /Ask for a written answer/ }));
+    await waitFor(() =>
+      expect(screen.getByText("Help cannot answer that right now.")).toBeInTheDocument(),
+    );
+    // No reason, no code, nothing that distinguishes one refusal from another.
+    for (const leak of ["revoked", "expired", "capability", "tenant", "stale"]) {
+      expect(screen.queryByText(new RegExp(leak, "i"))).not.toBeInTheDocument();
+    }
   });
 });

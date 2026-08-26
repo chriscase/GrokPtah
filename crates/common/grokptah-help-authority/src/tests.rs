@@ -641,3 +641,39 @@ fn the_authority_has_no_provider_to_call() {
         );
     }
 }
+
+#[test]
+fn a_visible_corpus_is_filtered_before_it_crosses_the_boundary() {
+    let authority = fixture();
+    let public = authority.principal_for("tok-public").unwrap();
+    let visible = authority.visible_corpus(&public);
+
+    assert!(!visible.articles.is_empty());
+    for article in &visible.articles {
+        assert_eq!(article.visibility, Visibility::Public);
+    }
+    for source in &visible.sources {
+        assert_eq!(
+            source.visibility,
+            Visibility::Public,
+            "a restricted source crossed to a public renderer"
+        );
+    }
+    for chunk in &visible.chunks {
+        assert_eq!(chunk.visibility, Visibility::Public);
+    }
+    // Smaller than the whole corpus, and honest about being a different document.
+    assert!(visible.articles.len() < authority.corpus().articles.len());
+    assert_ne!(visible.digest, authority.corpus().digest);
+    visible
+        .verify()
+        .expect("a filtered view is still self-consistent");
+}
+
+#[test]
+fn an_operator_sees_more_than_a_public_reader() {
+    let authority = fixture();
+    let public = authority.visible_corpus(&authority.principal_for("tok-public").unwrap());
+    let operator = authority.visible_corpus(&authority.principal_for("tok-operator").unwrap());
+    assert!(operator.articles.len() > public.articles.len());
+}

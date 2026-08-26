@@ -245,6 +245,41 @@ fn model_matches_rust_serde() {
 fn model_enum_variants_match_rust_serde() {
     let pairs: Vec<(&str, Vec<String>)> = vec![
         (
+            "HelpTopic",
+            vec![
+                crate::corpus::Topic::GettingStarted,
+                crate::corpus::Topic::Providers,
+                crate::corpus::Topic::ComputerUse,
+                crate::corpus::Topic::Operations,
+            ]
+            .into_iter()
+            .map(|value| {
+                serde_json::to_value(value)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect(),
+        ),
+        (
+            "HelpChunkKind",
+            vec![
+                crate::corpus::ChunkKind::Title,
+                crate::corpus::ChunkKind::Summary,
+                crate::corpus::ChunkKind::Body,
+            ]
+            .into_iter()
+            .map(|value| {
+                serde_json::to_value(value)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect(),
+        ),
+        (
             "HelpVisibility",
             vec![Visibility::Public, Visibility::Gated, Visibility::Operator]
                 .into_iter()
@@ -507,4 +542,90 @@ fn digests_bind_a_request_to_its_exact_context_bytes() {
         left, right,
         "editing context bytes must change the request digest"
     );
+}
+
+#[test]
+fn digest_labels_match_serde_labels() {
+    // `as_str` feeds digests; serde feeds the JSON both languages read. If the
+    // two disagree, Rust and TypeScript digest different strings for the same
+    // record and the corpus verifies in exactly one of them.
+    fn serde_label<T: serde::Serialize>(value: T) -> String {
+        serde_json::to_value(value)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+    for topic in [
+        crate::corpus::Topic::GettingStarted,
+        crate::corpus::Topic::Providers,
+        crate::corpus::Topic::ComputerUse,
+        crate::corpus::Topic::Operations,
+    ] {
+        assert_eq!(
+            topic.as_str(),
+            serde_label(topic),
+            "Topic::as_str disagrees with serde"
+        );
+    }
+    for kind in [
+        crate::corpus::ChunkKind::Title,
+        crate::corpus::ChunkKind::Summary,
+        crate::corpus::ChunkKind::Body,
+    ] {
+        assert_eq!(
+            kind.as_str(),
+            serde_label(kind),
+            "ChunkKind::as_str disagrees with serde"
+        );
+    }
+    for visibility in [Visibility::Public, Visibility::Gated, Visibility::Operator] {
+        assert_eq!(
+            visibility.as_str(),
+            serde_label(visibility),
+            "Visibility::as_str disagrees with serde"
+        );
+    }
+    for code in [
+        PublicErrorCode::NotAvailable,
+        PublicErrorCode::Busy,
+        PublicErrorCode::Timeout,
+    ] {
+        assert_eq!(code.as_str(), serde_label(code));
+    }
+    for status in [
+        ProjectionStatus::Queued,
+        ProjectionStatus::Running,
+        ProjectionStatus::Answered,
+        ProjectionStatus::Abstained,
+        ProjectionStatus::Unavailable,
+    ] {
+        assert_eq!(status.as_str(), serde_label(status));
+    }
+    for kind in [
+        RedactionKind::Secret,
+        RedactionKind::Path,
+        RedactionKind::Control,
+        RedactionKind::Bidi,
+        RedactionKind::Markup,
+    ] {
+        assert_eq!(kind.as_str(), serde_label(kind));
+    }
+    for outcome in [
+        Outcome::Answered,
+        Outcome::Abstained,
+        Outcome::Denied,
+        Outcome::Cancelled,
+        Outcome::Abandoned,
+        Outcome::TimedOut,
+    ] {
+        assert_eq!(outcome.as_str(), serde_label(outcome));
+    }
+    for certainty in [
+        SendCertainty::NotSent,
+        SendCertainty::Sent,
+        SendCertainty::Unknown,
+    ] {
+        assert_eq!(certainty.as_str(), serde_label(certainty));
+    }
 }

@@ -115,8 +115,13 @@ pub struct Chunk {
     pub digest: String,
 }
 
+// kebab-case, not snake_case: `as_str` below feeds the article digest while
+// serde feeds the JSON, and the two must be the same string. When they were
+// not, Rust digested `computer-use` and TypeScript digested `computer_use`,
+// so the shipped corpus failed verification in one language and passed in the
+// other. `model_enum_variants_match_rust_serde` now covers this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum Topic {
     GettingStarted,
     Providers,
