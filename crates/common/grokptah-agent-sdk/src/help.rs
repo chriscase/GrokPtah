@@ -288,9 +288,9 @@ fn valid_capability_id(value: &str) -> bool {
         && segments.all(|segment| {
             !segment.is_empty()
                 && segment.as_bytes()[0].is_ascii_lowercase()
-                && segment.bytes().all(|byte| {
-                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
-                })
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
         })
 }
 
@@ -312,7 +312,8 @@ fn validate_authorization(authorization: &HelpAuthorization) -> Result<(), HelpP
     }
     let mut ids = HashSet::new();
     for capability in &authorization.authorized_capabilities {
-        if !valid_id(capability, 128) || !valid_capability_id(capability) || !ids.insert(capability) {
+        if !valid_id(capability, 128) || !valid_capability_id(capability) || !ids.insert(capability)
+        {
             return Err(error("invalid Help capability set"));
         }
     }
@@ -682,8 +683,7 @@ mod tests {
                 required_capabilities: vec![],
                 text: "Help answers cite source bytes.".into(),
                 text_digest:
-                    "sha256:a202decb78b381e5e0ccf96123deb430452f49f086ae58a54c98c37756e161bb"
-                        .into(),
+                    "sha256:a202decb78b381e5e0ccf96123deb430452f49f086ae58a54c98c37756e161bb".into(),
                 span_start: 0,
                 span_end: "Help answers cite source bytes.".len(),
                 source_bindings: vec![HelpSourceBinding {

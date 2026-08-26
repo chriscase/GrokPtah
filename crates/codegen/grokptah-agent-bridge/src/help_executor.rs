@@ -386,8 +386,7 @@ mod tests {
                 required_capabilities: vec![],
                 text: "Help answers cite source bytes.".into(),
                 text_digest:
-                    "sha256:a202decb78b381e5e0ccf96123deb430452f49f086ae58a54c98c37756e161bb"
-                        .into(),
+                    "sha256:a202decb78b381e5e0ccf96123deb430452f49f086ae58a54c98c37756e161bb".into(),
                 span_start: 0,
                 span_end: "Help answers cite source bytes.".len(),
                 source_bindings: vec![HelpSourceBinding {
