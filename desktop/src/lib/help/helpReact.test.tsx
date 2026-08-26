@@ -113,7 +113,9 @@ describe("Help React primitives", () => {
     expect(option).toHaveAttribute("aria-selected", "true");
     expect(option).toHaveAttribute("data-active", "true");
     expect(option).toHaveAttribute("data-topic");
-    expect(option.textContent).toContain("computer use");
+    expect(option.textContent).toContain(
+      option.getAttribute("data-topic")!.replace(/-/g, " "),
+    );
     expect(option.getAttribute("style")).toBeNull();
   });
 

@@ -280,6 +280,10 @@ function validSafeString(value: unknown, maxBytes: number): value is string {
   return validBoundedString(value, maxBytes) && !containsHelpSecret(value) && !PRIVILEGED.test(value);
 }
 
+function validOpaqueString(value: unknown, maxBytes: number): value is string {
+  return validBoundedString(value, maxBytes) && !PRIVILEGED.test(value) && !/(?:xai-|sk-|api[_ -]?key|private key)/i.test(value);
+}
+
 function validDigestString(value: unknown): value is string {
   return validBoundedString(value, 71) && DIGEST.test(value);
 }
@@ -318,7 +322,7 @@ function validCapabilitySet(value: unknown): value is string[] {
     new Set(value).size === value.length &&
     value.every(
       (capability) =>
-        validSafeString(capability, 128) && CAPABILITY_ID.test(capability),
+        validOpaqueString(capability, 128) && CAPABILITY_ID.test(capability),
     )
   );
 }
@@ -415,7 +419,7 @@ function contextFromResults(
 export function buildHelpAuthorityRequest(
   options: HelpAuthorityRequestOptions,
 ): HelpAuthorityRequest {
-  if (!validSafeString(options.requestId, HELP_AUTHORITY_LIMITS.maxRequestIdBytes)) {
+  if (!validOpaqueString(options.requestId, HELP_AUTHORITY_LIMITS.maxRequestIdBytes)) {
     throw new Error("help authority: requestId is invalid");
   }
   const redacted = redactHelpText(typeof options.query === "string" ? options.query : "").text.trim();
@@ -425,10 +429,10 @@ export function buildHelpAuthorityRequest(
   }
   if (
     !isRecord(options.provider) ||
-    !validSafeString(options.provider.profile, 256) ||
-    !validSafeString(options.provider.tenant, 256) ||
-    !validSafeString(options.provider.model, 256) ||
-    !validSafeString(options.provider.routeRevision, 256) ||
+    !validOpaqueString(options.provider.profile, 256) ||
+    !validOpaqueString(options.provider.tenant, 256) ||
+    !validOpaqueString(options.provider.model, 256) ||
+    !validOpaqueString(options.provider.routeRevision, 256) ||
     !DIALECTS.has(options.provider.dialect)
   ) {
     throw new Error("help authority: provider identity is invalid");
@@ -483,8 +487,8 @@ function parseIdentity(value: unknown): HelpAuthorityValidation | HelpAuthorityI
     !validDigestString(value.corpusDigest) ||
     !validDigestString(value.sourceDigest) ||
     !validDigestString(value.modelDigest) ||
-    !validSafeString(value.modelId, 256) ||
-    !validSafeString(value.modelVersion, 256)
+    !validOpaqueString(value.modelId, 256) ||
+    !validOpaqueString(value.modelVersion, 256)
   ) {
     return reject("invalid-field", "identity fields");
   }
@@ -502,10 +506,10 @@ function parseIdentity(value: unknown): HelpAuthorityValidation | HelpAuthorityI
 function parseProvider(value: unknown): HelpAuthorityValidation | HelpAuthorityProvider {
   if (!isRecord(value) || !hasOnlyKeys(value, PROVIDER_KEYS)) return reject("invalid-field", "provider");
   if (
-    !validSafeString(value.profile, 256) ||
-    !validSafeString(value.tenant, 256) ||
-    !validSafeString(value.model, 256) ||
-    !validSafeString(value.routeRevision, 256) ||
+    !validOpaqueString(value.profile, 256) ||
+    !validOpaqueString(value.tenant, 256) ||
+    !validOpaqueString(value.model, 256) ||
+    !validOpaqueString(value.routeRevision, 256) ||
     typeof value.dialect !== "string" ||
     !DIALECTS.has(value.dialect as HelpAuthorityDialect)
   ) {
@@ -538,7 +542,7 @@ function parseDeadline(value: unknown): HelpAuthorityValidation | HelpAuthorityD
 function parseSourceBinding(value: unknown): HelpAuthorityValidation | HelpSourceBinding {
   if (!isRecord(value) || !hasOnlyKeys(value, SOURCE_BINDING_KEYS)) return reject("invalid-context", "source binding shape");
   if (
-    !validSafeString(value.sourceId, 256) ||
+    !validOpaqueString(value.sourceId, 256) ||
     !validDigestString(value.sourceSectionDigest) ||
     typeof value.sourceByteLength !== "number" ||
     !Number.isSafeInteger(value.sourceByteLength) ||
@@ -569,8 +573,8 @@ function parseContext(value: unknown): HelpAuthorityValidation | HelpAuthorityCo
   for (const item of value) {
     if (!isRecord(item) || !hasOnlyKeys(item, CONTEXT_KEYS)) return reject("invalid-context", "context chunk shape");
     if (
-      !validSafeString(item.chunkId, 256) ||
-      !validSafeString(item.articleId, 256) ||
+      !validOpaqueString(item.chunkId, 256) ||
+      !validOpaqueString(item.articleId, 256) ||
       (item.access !== "public" && item.access !== "gated" && item.access !== "operator") ||
       !validCapabilitySet(item.requiredCapabilities) ||
       !validSafeString(item.text, HELP_AUTHORITY_LIMITS.maxContextTextBytes) ||
@@ -641,7 +645,7 @@ function parseCleanup(value: unknown, maxBytes: number): HelpAuthorityValidation
     (jsonBytes(value) === null || (jsonBytes(value) as number) > maxBytes) ||
     value.schema !== HELP_AUTHORITY_SCHEMA ||
     value.kind !== "cleanup" ||
-    !validSafeString(value.requestId, HELP_AUTHORITY_LIMITS.maxRequestIdBytes) ||
+    !validOpaqueString(value.requestId, HELP_AUTHORITY_LIMITS.maxRequestIdBytes) ||
     (value.status !== "finalized" && value.status !== "uncertain") ||
     (value.providerTask !== "joined" && value.providerTask !== "not_joined") ||
     typeof value.abortRequested !== "boolean" ||
@@ -699,7 +703,7 @@ function parseClaims(
     if (
       !isRecord(item) ||
       !hasOnlyKeys(item, CLAIM_KEYS) ||
-      !validSafeString(item.claimId, 256) ||
+      !validOpaqueString(item.claimId, 256) ||
       ids.has(item.claimId) ||
       !validSafeString(item.text, HELP_AUTHORITY_LIMITS.maxClaimTextBytes) ||
       !validSpan(item.spanStart, answerBytes) ||
@@ -709,7 +713,7 @@ function parseClaims(
       item.citationIds.length === 0 ||
       item.citationIds.length > HELP_AUTHORITY_LIMITS.maxCitations ||
       new Set(item.citationIds).size !== item.citationIds.length ||
-      !item.citationIds.every((id) => validSafeString(id, 256))
+      !item.citationIds.every((id) => validOpaqueString(id, 256))
     ) {
       return reject("unsupported-claim", "claim fields");
     }
@@ -752,22 +756,22 @@ function parseCitations(
     if (
       !isRecord(item) ||
       !hasOnlyKeys(item, CITATION_KEYS) ||
-      !validSafeString(item.citationId, 256) ||
+      !validOpaqueString(item.citationId, 256) ||
       ids.has(item.citationId) ||
-      !validSafeString(item.chunkId, 256) ||
-      !validSafeString(item.articleId, 256) ||
+      !validOpaqueString(item.chunkId, 256) ||
+      !validOpaqueString(item.articleId, 256) ||
       !validSpan(item.spanStart, 4096) ||
       !validSpan(item.spanEnd, 4096) ||
       item.spanEnd <= item.spanStart ||
       !validSafeString(item.quotedText, HELP_AUTHORITY_LIMITS.maxQuotedTextBytes) ||
       !validDigestString(item.quotedTextHash) ||
-      !validSafeString(item.sourceId, 256) ||
+      !validOpaqueString(item.sourceId, 256) ||
       !validDigestString(item.sourceSectionDigest) ||
       !Array.isArray(item.claimIds) ||
       item.claimIds.length === 0 ||
       item.claimIds.length > HELP_AUTHORITY_LIMITS.maxClaims ||
       new Set(item.claimIds).size !== item.claimIds.length ||
-      !item.claimIds.every((id) => validSafeString(id, 256))
+      !item.claimIds.every((id) => validOpaqueString(id, 256))
     ) {
       return reject("invalid-citation", "citation fields");
     }
@@ -812,7 +816,7 @@ export function validateHelpAuthorityRequest(raw: unknown): HelpAuthorityValidat
   if (requestBytes === null || requestBytes > HELP_AUTHORITY_LIMITS.maxRequestBytes) return reject("oversized", "request");
   if (raw.schema !== HELP_AUTHORITY_SCHEMA) return reject("wrong-schema", String(raw.schema));
   if (raw.kind !== "request") return reject("wrong-kind", String(raw.kind));
-  if (!validSafeString(raw.requestId, HELP_AUTHORITY_LIMITS.maxRequestIdBytes)) return reject("invalid-field", "requestId");
+  if (!validOpaqueString(raw.requestId, HELP_AUTHORITY_LIMITS.maxRequestIdBytes)) return reject("invalid-field", "requestId");
   const authorization = parseAuthorization(raw.authorization);
   if ("accepted" in authorization) return authorization;
   const identity = parseIdentity(raw.identity);
@@ -879,7 +883,7 @@ export function validateHelpAuthorityResponse(
   if (responseBytes === null || responseBytes > HELP_AUTHORITY_LIMITS.maxResponseBytes) return reject("oversized", "response");
   if (raw.schema !== HELP_AUTHORITY_SCHEMA) return reject("wrong-schema", String(raw.schema));
   if (raw.kind !== "response") return reject("wrong-kind", String(raw.kind));
-  if (!validSafeString(raw.requestId, HELP_AUTHORITY_LIMITS.maxRequestIdBytes) || raw.requestId !== request.requestId) {
+  if (!validOpaqueString(raw.requestId, HELP_AUTHORITY_LIMITS.maxRequestIdBytes) || raw.requestId !== request.requestId) {
     return reject("invalid-field", "requestId");
   }
   const identity = parseIdentity(raw.identity);
