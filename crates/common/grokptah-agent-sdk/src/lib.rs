@@ -15,6 +15,10 @@ pub mod computer;
 pub mod error;
 /// Provider-neutral contracts for external cloud or host-owned workers.
 pub mod external_worker;
+/// Host-neutral headless authority entry point for a Linux or cloud worker.
+pub mod headless;
+/// Share-safe guards for public projections.
+pub mod projection;
 /// Durable run, review, and event types.
 pub mod run;
 
@@ -28,12 +32,18 @@ pub use computer::{
 };
 pub use error::{ErrorCode, ErrorEnvelope, ErrorEventRange};
 pub use external_worker::{
-    ExternalWorkerArtifact, ExternalWorkerEvent, ExternalWorkerExecutionMode,
-    ExternalWorkerFollowUpRequest, ExternalWorkerLaunchRequest, ExternalWorkerLaunchResult,
-    ExternalWorkerProvider, ExternalWorkerRecord, ExternalWorkerRunRecord, ExternalWorkerState,
-    EXTERNAL_WORKER_CONTRACT_VERSION,
+    EXTERNAL_WORKER_CONTRACT_VERSION, ExternalWorkerArtifact, ExternalWorkerEvent,
+    ExternalWorkerExecutionMode, ExternalWorkerFollowUpRequest, ExternalWorkerLaunchRequest,
+    ExternalWorkerLaunchResult, ExternalWorkerProvider, ExternalWorkerRecord,
+    ExternalWorkerRunRecord, ExternalWorkerState,
 };
+pub use headless::{
+    CapabilityRevision, HEADLESS_CONTRACT_VERSION, HeadlessAdmission, HeadlessAuthority,
+    HeadlessHostInfo, HeadlessLimits, HeadlessOperation, HeadlessPlatform,
+};
+pub use projection::{LeakFinding, LeakKind};
 pub use run::{
-    Bounds, ChangedFile, DurableRun, DurableRunState, ExecutionMode, IdempotencyKey, ReviewReceipt,
-    RunEvent, RunEventPage, RunNotification, RunScope, SubmitTaskRequest,
+    AuthorityBounds, Bounds, BoundsConversionError, ChangedFile, DurableRun, DurableRunState,
+    ExecutionMode, IdempotencyKey, ReviewReceipt, RunEvent, RunEventPage, RunNotification,
+    RunScope, SubmitTaskRequest,
 };

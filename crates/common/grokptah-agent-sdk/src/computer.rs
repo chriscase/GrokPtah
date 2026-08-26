@@ -2,7 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::run::RunScope;
+use crate::projection::{ensure_json_share_safe, ensure_share_safe_metadata};
+use crate::run::{MAX_REASON_BYTES, MAX_REQUEST_ID_BYTES, MAX_TIMESTAMP_BYTES, RunScope};
+
+/// Maximum serialized bytes in one redacted Computer Use event detail.
+pub const MAX_COMPUTER_EVENT_DETAIL_BYTES: usize = 256 * 1024;
+/// Maximum UTF-8 bytes in a share-safe Computer Use disposition.
+pub const MAX_DISPOSITION_BYTES: usize = 128;
+/// Maximum action classes one lease may grant.
+pub const MAX_ACTION_CLASSES: usize = 8;
+/// Maximum lease duration accepted by the versioned public contract.
+pub const MAX_LEASE_TTL_MS: u64 = 5 * 60 * 1000;
 
 /// A semantic action class allowed by an explicit lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,7 +29,7 @@ pub type ComputerRunScope = RunScope;
 
 /// Lease/revision-fenced Computer Use control request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ComputerControlRequest {
     /// Fresh idempotency key for this control intent.
     pub request_id: String,
@@ -36,15 +46,41 @@ pub struct ComputerControlRequest {
 impl ComputerControlRequest {
     /// Validate a lease request before it crosses a product boundary.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.request_id.trim().is_empty() || self.request_id.len() > 256 {
-            return Err("request_id must be non-empty and bounded");
-        }
+        ensure_share_safe_metadata("request_id", &self.request_id, MAX_REQUEST_ID_BYTES)
+            .map_err(|finding| finding.kind.reason_code())?;
         self.scope.validate()?;
         if self.action_classes.is_empty() {
             return Err("at least one action class is required");
         }
+        if self.action_classes.len() > MAX_ACTION_CLASSES {
+            return Err("action_classes exceeds its bound");
+        }
+        // A lease must not silently grant the same class twice; duplicates
+        // make an audit of what was granted ambiguous.
+        for (index, class) in self.action_classes.iter().enumerate() {
+            if self.action_classes[..index].contains(class) {
+                return Err("action_classes must not repeat a class");
+            }
+        }
         if self.ttl_ms == 0 {
             return Err("ttl_ms must be greater than zero");
+        }
+        if self.ttl_ms > MAX_LEASE_TTL_MS {
+            return Err("ttl_ms exceeds the contract lease ceiling");
+        }
+        Ok(())
+    }
+
+    /// Reject a lease request that is not fenced to the revision the operator
+    /// actually observed.
+    ///
+    /// A control request carries the revision the human approved. If the
+    /// authority has advanced past it, the approval no longer describes what
+    /// is on screen and the request must fail closed rather than replay
+    /// against newer state.
+    pub fn ensure_fresh_against(&self, authority_version: u64) -> Result<(), &'static str> {
+        if self.expected_version != authority_version {
+            return Err("expected_version is stale for this run revision");
         }
         Ok(())
     }
@@ -52,7 +88,7 @@ impl ComputerControlRequest {
 
 /// Safe response envelope for a Computer Use control operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ComputerControlResponse {
     /// Exact run scope returned by the authority.
     pub scope: ComputerRunScope,
@@ -66,16 +102,15 @@ impl ComputerControlResponse {
     /// Validate the bounded result returned by an authority.
     pub fn validate(&self) -> Result<(), &'static str> {
         self.scope.validate()?;
-        if self.disposition.trim().is_empty() || self.disposition.len() > 128 {
-            return Err("disposition must be non-empty and bounded");
-        }
+        ensure_share_safe_metadata("disposition", &self.disposition, MAX_DISPOSITION_BYTES)
+            .map_err(|finding| finding.kind.reason_code())?;
         Ok(())
     }
 }
 
 /// One redacted Computer Use audit event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ComputerEvent {
     /// Strictly increasing event sequence.
     pub seq: u64,
@@ -90,21 +125,19 @@ pub struct ComputerEvent {
 impl ComputerEvent {
     /// Validate the share-safe, bounded event projection.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.ts.trim().is_empty() || self.kind.trim().is_empty() || self.kind.len() > 128 {
-            return Err("computer event metadata must be non-empty and bounded");
-        }
-        let bytes = serde_json::to_vec(&self.detail)
-            .map_err(|_| "computer event detail is not serializable")?;
-        if bytes.len() > 256 * 1024 {
-            return Err("computer event detail exceeds its byte bound");
-        }
+        ensure_share_safe_metadata("ts", &self.ts, MAX_TIMESTAMP_BYTES)
+            .map_err(|finding| finding.kind.reason_code())?;
+        ensure_share_safe_metadata("kind", &self.kind, MAX_REASON_BYTES)
+            .map_err(|finding| finding.kind.reason_code())?;
+        ensure_json_share_safe("detail", &self.detail, MAX_COMPUTER_EVENT_DETAIL_BYTES)
+            .map_err(|finding| finding.kind.reason_code())?;
         Ok(())
     }
 }
 
 /// Cursor-paged Computer Use audit events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ComputerEventPage {
     /// Retained events in sequence order.
     pub entries: Vec<ComputerEvent>,

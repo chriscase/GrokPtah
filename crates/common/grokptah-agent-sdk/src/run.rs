@@ -2,6 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::projection::{
+    ensure_json_share_safe, ensure_no_credential_material, ensure_share_safe_metadata,
+};
+
 /// Maximum model rounds accepted by the versioned public contract.
 pub const MAX_ROUNDS: u16 = 24;
 /// Maximum UTF-8 bytes in a public request identity.
@@ -12,13 +16,23 @@ pub const MAX_PROMPT_PREVIEW_BYTES: usize = 512;
 pub const MAX_EVENT_UPDATE_BYTES: usize = 256 * 1024;
 /// Maximum UTF-8 bytes in a review diff projection.
 pub const MAX_REVIEW_DIFF_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum UTF-8 bytes in an RFC3339 timestamp projection.
+pub const MAX_TIMESTAMP_BYTES: usize = 64;
+/// Maximum UTF-8 bytes in a workspace fingerprint.
+pub const MAX_FINGERPRINT_BYTES: usize = 256;
+/// Maximum UTF-8 bytes in a repository-relative changed-file path.
+pub const MAX_CHANGED_PATH_BYTES: usize = 1024;
+/// Maximum UTF-8 bytes in a changed-file summary.
+pub const MAX_CHANGED_SUMMARY_BYTES: usize = 512;
+/// Maximum UTF-8 bytes in a share-safe recovery reason or poll operation.
+pub const MAX_REASON_BYTES: usize = 128;
 
 /// An idempotency key for one caller intent.
 pub type IdempotencyKey = String;
 
 /// The exact identity fence required for a run operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunScope {
     /// Authenticated GrokPtah session identity.
     pub session_id: String,
@@ -39,7 +53,7 @@ impl RunScope {
 
 /// Prompt and execution bounds selected by the caller and policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Bounds {
     /// Maximum UTF-8 prompt bytes.
     pub max_prompt_bytes: Option<u32>,
@@ -67,6 +81,145 @@ impl Bounds {
         }
         Ok(())
     }
+
+    /// Project authority-side bounds widths into the public contract.
+    ///
+    /// The trusted host resolves bounds at `usize`/`u32`/`u64`; the public
+    /// contract is narrower (`u32`/`u16`/`u64`). Narrowing is the direction
+    /// that can silently truncate, so every narrowing step is checked and
+    /// fails closed rather than wrapping. Width failures are reported before
+    /// contract-ceiling failures so a caller can tell a representation problem
+    /// from a policy problem.
+    pub fn from_authority_widths(
+        max_prompt_bytes: usize,
+        max_rounds: u32,
+        max_duration_ms: u64,
+    ) -> Result<Self, BoundsConversionError> {
+        if max_prompt_bytes == 0 || max_rounds == 0 || max_duration_ms == 0 {
+            return Err(BoundsConversionError::ZeroValue);
+        }
+        if u64::try_from(max_prompt_bytes).unwrap_or(u64::MAX) > u64::from(u32::MAX) {
+            return Err(BoundsConversionError::PromptBytesOverflow);
+        }
+        if max_rounds > u32::from(u16::MAX) {
+            return Err(BoundsConversionError::RoundsOverflow);
+        }
+        if max_rounds > u32::from(MAX_ROUNDS) {
+            return Err(BoundsConversionError::RoundsAboveContract);
+        }
+        Ok(Self {
+            max_prompt_bytes: Some(max_prompt_bytes as u32),
+            max_rounds: Some(max_rounds as u16),
+            max_duration_ms: Some(max_duration_ms),
+        })
+    }
+
+    /// Resolve public bounds back into authority-side widths under a ceiling.
+    ///
+    /// A caller may only narrow: an absent field inherits the ceiling and any
+    /// field above the ceiling is rejected. Widening from the public contract
+    /// to the authority widths is lossless by construction, so the only
+    /// failures here are zero, above-contract, and above-ceiling.
+    pub fn resolve_authority_widths(
+        &self,
+        ceiling: AuthorityBounds,
+    ) -> Result<AuthorityBounds, BoundsConversionError> {
+        ceiling.validate()?;
+        if self.max_prompt_bytes.is_some_and(|value| value == 0)
+            || self.max_rounds.is_some_and(|value| value == 0)
+            || self.max_duration_ms.is_some_and(|value| value == 0)
+        {
+            return Err(BoundsConversionError::ZeroValue);
+        }
+        if self.max_rounds.is_some_and(|value| value > MAX_ROUNDS) {
+            return Err(BoundsConversionError::RoundsAboveContract);
+        }
+
+        let max_prompt_bytes = match self.max_prompt_bytes {
+            Some(value) => {
+                usize::try_from(value).map_err(|_| BoundsConversionError::PromptBytesOverflow)?
+            }
+            None => ceiling.max_prompt_bytes,
+        };
+        let max_rounds = self.max_rounds.map_or(ceiling.max_rounds, u32::from);
+        let max_duration_ms = self.max_duration_ms.unwrap_or(ceiling.max_duration_ms);
+
+        if max_prompt_bytes > ceiling.max_prompt_bytes
+            || max_rounds > ceiling.max_rounds
+            || max_duration_ms > ceiling.max_duration_ms
+        {
+            return Err(BoundsConversionError::AboveCeiling);
+        }
+        Ok(AuthorityBounds {
+            max_prompt_bytes,
+            max_rounds,
+            max_duration_ms,
+        })
+    }
+}
+
+/// Why a bounds conversion was refused.
+///
+/// Every variant is a fail-closed outcome: the seam never truncates, wraps, or
+/// silently substitutes a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundsConversionError {
+    /// A bound was zero, which no side of the contract accepts.
+    ZeroValue,
+    /// The authority prompt-byte bound does not fit the public `u32`.
+    PromptBytesOverflow,
+    /// The authority round bound does not fit the public `u16`.
+    RoundsOverflow,
+    /// The round bound is above the versioned contract ceiling.
+    RoundsAboveContract,
+    /// The caller tried to widen past the authority ceiling.
+    AboveCeiling,
+}
+
+impl BoundsConversionError {
+    /// Stable, share-safe reason code for an [`crate::ErrorEnvelope`].
+    pub fn reason_code(self) -> &'static str {
+        match self {
+            Self::ZeroValue => "bounds_zero",
+            Self::PromptBytesOverflow => "bounds_prompt_bytes_overflow",
+            Self::RoundsOverflow => "bounds_rounds_overflow",
+            Self::RoundsAboveContract => "bounds_rounds_above_contract",
+            Self::AboveCeiling => "bounds_above_ceiling",
+        }
+    }
+}
+
+impl std::fmt::Display for BoundsConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason_code())
+    }
+}
+
+/// The authority-side integer width profile for resolved run bounds.
+///
+/// This is a conversion *result*, not a wire type: it is deliberately not
+/// `Serialize`/`Deserialize` so it cannot become a second public DTO. It
+/// mirrors the widths the trusted host resolves bounds at (`usize`, `u32`,
+/// `u64`) so [`Bounds`] can be converted without a lossy cast at the call
+/// site. The host's own resolved-bounds type remains the authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthorityBounds {
+    /// Maximum UTF-8 prompt bytes, at the authority's width.
+    pub max_prompt_bytes: usize,
+    /// Maximum model rounds, at the authority's width.
+    pub max_rounds: u32,
+    /// Maximum wall-clock duration in milliseconds.
+    pub max_duration_ms: u64,
+}
+
+impl AuthorityBounds {
+    /// Reject a ceiling that is zero in any dimension.
+    pub fn validate(&self) -> Result<(), BoundsConversionError> {
+        if self.max_prompt_bytes == 0 || self.max_rounds == 0 || self.max_duration_ms == 0 {
+            return Err(BoundsConversionError::ZeroValue);
+        }
+        Ok(())
+    }
 }
 
 /// Whether a run shares the workspace or receives an isolated worktree.
@@ -81,7 +234,7 @@ pub enum ExecutionMode {
 
 /// Cross-product submit request. The authority adds the exact session fence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubmitTaskRequest {
     /// Fresh idempotency key for this intent.
     pub request_id: IdempotencyKey,
@@ -147,7 +300,7 @@ pub enum DurableRunState {
 
 /// Bounded durable run projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DurableRun {
     /// Durable run identity.
     pub run_id: String,
@@ -174,18 +327,23 @@ impl DurableRun {
         validate_identity(&self.session_id, "session_id")?;
         validate_identity(&self.workspace, "workspace")?;
         validate_identity(&self.request_id, "request_id")?;
-        if self.prompt_preview.len() > MAX_PROMPT_PREVIEW_BYTES {
-            return Err("prompt_preview exceeds its byte bound");
-        }
-        if self.created_at.trim().is_empty() || self.updated_at.trim().is_empty() {
-            return Err("durable timestamps must not be empty");
-        }
+        ensure_no_credential_material(
+            "prompt_preview",
+            &self.prompt_preview,
+            MAX_PROMPT_PREVIEW_BYTES,
+        )
+        .map_err(|finding| finding.kind.reason_code())?;
+        ensure_share_safe_metadata("created_at", &self.created_at, MAX_TIMESTAMP_BYTES)
+            .map_err(|finding| finding.kind.reason_code())?;
+        ensure_share_safe_metadata("updated_at", &self.updated_at, MAX_TIMESTAMP_BYTES)
+            .map_err(|finding| finding.kind.reason_code())?;
         Ok(())
     }
 }
 
 /// One durable event journal entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunEvent {
     /// Strictly increasing journal sequence.
     pub seq: u64,
@@ -198,21 +356,17 @@ pub struct RunEvent {
 impl RunEvent {
     /// Validate the bounded serialized event projection.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.ts.trim().is_empty() {
-            return Err("event timestamp must not be empty");
-        }
-        let bytes =
-            serde_json::to_vec(&self.update).map_err(|_| "event update is not serializable")?;
-        if bytes.len() > MAX_EVENT_UPDATE_BYTES {
-            return Err("event update exceeds its byte bound");
-        }
+        ensure_share_safe_metadata("ts", &self.ts, MAX_TIMESTAMP_BYTES)
+            .map_err(|finding| finding.kind.reason_code())?;
+        ensure_json_share_safe("update", &self.update, MAX_EVENT_UPDATE_BYTES)
+            .map_err(|finding| finding.kind.reason_code())?;
         Ok(())
     }
 }
 
 /// Cursor-paged durable events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunEventPage {
     /// Retained entries in sequence order.
     pub entries: Vec<RunEvent>,
@@ -224,10 +378,15 @@ pub struct RunEventPage {
 
 /// Stream notification for event consumers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum RunNotification {
     /// A scoped event journal update.
-    Event { scope: RunScope, event: RunEvent },
+    Event {
+        /// Exact run identity the event belongs to.
+        scope: RunScope,
+        /// The bounded, redacted journal entry.
+        event: RunEvent,
+    },
     /// The client must poll before reconnecting.
     Recovery {
         /// Exact run identity that needs recovery.
@@ -243,8 +402,62 @@ pub enum RunNotification {
     },
 }
 
+impl RunEventPage {
+    /// Validate every retained entry and the page's cursor monotonicity.
+    ///
+    /// A page that claims an expired cursor must not also carry a next cursor:
+    /// the consumer would otherwise resume from a window the authority has
+    /// already dropped.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let mut previous: Option<u64> = None;
+        for entry in &self.entries {
+            entry.validate()?;
+            if previous.is_some_and(|seq| entry.seq <= seq) {
+                return Err("event sequences must strictly increase");
+            }
+            previous = Some(entry.seq);
+        }
+        if self.cursor_expired && self.next_cursor.is_some() {
+            return Err("an expired cursor must not advertise a next cursor");
+        }
+        if let (Some(next), Some(last)) = (self.next_cursor, previous)
+            && next < last
+        {
+            return Err("next cursor must not rewind behind the page");
+        }
+        Ok(())
+    }
+}
+
+impl RunNotification {
+    /// The exact scope this notification is bound to.
+    pub fn scope(&self) -> &RunScope {
+        match self {
+            Self::Event { scope, .. } | Self::Recovery { scope, .. } => scope,
+        }
+    }
+
+    /// Validate the share-safe notification before it reaches a consumer.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.scope().validate()?;
+        match self {
+            Self::Event { event, .. } => event.validate(),
+            Self::Recovery {
+                reason, poll_tool, ..
+            } => {
+                ensure_share_safe_metadata("reason", reason, MAX_REASON_BYTES)
+                    .map_err(|finding| finding.kind.reason_code())?;
+                ensure_share_safe_metadata("poll_tool", poll_tool, MAX_REASON_BYTES)
+                    .map_err(|finding| finding.kind.reason_code())?;
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Exact changed-file summary used for human review.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChangedFile {
     /// Repository-relative path.
     pub path: String,
@@ -254,7 +467,7 @@ pub struct ChangedFile {
 
 /// Review projection for an isolated run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReviewReceipt {
     /// Changed files included in the exact review.
     pub changed_files: Vec<ChangedFile>,
@@ -269,20 +482,21 @@ pub struct ReviewReceipt {
 impl ReviewReceipt {
     /// Validate the bounded, repository-relative review projection.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.fingerprint.trim().is_empty() {
-            return Err("fingerprint must not be empty");
-        }
-        if self.diff.len() > MAX_REVIEW_DIFF_BYTES {
-            return Err("review diff exceeds its byte bound");
-        }
+        ensure_share_safe_metadata("fingerprint", &self.fingerprint, MAX_FINGERPRINT_BYTES)
+            .map_err(|finding| finding.kind.reason_code())?;
+        ensure_no_credential_material("diff", &self.diff, MAX_REVIEW_DIFF_BYTES)
+            .map_err(|finding| finding.kind.reason_code())?;
         for file in &self.changed_files {
-            if file.path.trim().is_empty()
-                || file.path.starts_with('/')
-                || file.path.contains("..")
-                || file.summary.len() > 512
-            {
-                return Err("changed files must be bounded repository-relative summaries");
-            }
+            // Paths are authority metadata: repository-relative, no absolute
+            // host path, no traversal, no provider URL, no credential.
+            ensure_share_safe_metadata("changed_files.path", &file.path, MAX_CHANGED_PATH_BYTES)
+                .map_err(|finding| finding.kind.reason_code())?;
+            ensure_no_credential_material(
+                "changed_files.summary",
+                &file.summary,
+                MAX_CHANGED_SUMMARY_BYTES,
+            )
+            .map_err(|finding| finding.kind.reason_code())?;
         }
         Ok(())
     }
@@ -351,29 +565,35 @@ mod tests {
 
     #[test]
     fn public_contract_validators_reject_unbounded_values() {
-        assert!(Bounds {
-            max_rounds: Some(25),
-            ..Bounds::default()
-        }
-        .validate()
-        .is_err());
-        assert!(RunEvent {
-            seq: 1,
-            ts: "2026-01-01T00:00:00Z".into(),
-            update: serde_json::json!({"text": "x"}),
-        }
-        .validate()
-        .is_ok());
-        assert!(ReviewReceipt {
-            changed_files: vec![ChangedFile {
-                path: "../secret".into(),
-                summary: "x".into()
-            }],
-            diff: String::new(),
-            diff_truncated: false,
-            fingerprint: "fp".into(),
-        }
-        .validate()
-        .is_err());
+        assert!(
+            Bounds {
+                max_rounds: Some(25),
+                ..Bounds::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            RunEvent {
+                seq: 1,
+                ts: "2026-01-01T00:00:00Z".into(),
+                update: serde_json::json!({"text": "x"}),
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            ReviewReceipt {
+                changed_files: vec![ChangedFile {
+                    path: "../secret".into(),
+                    summary: "x".into()
+                }],
+                diff: String::new(),
+                diff_truncated: false,
+                fingerprint: "fp".into(),
+            }
+            .validate()
+            .is_err()
+        );
     }
 }
