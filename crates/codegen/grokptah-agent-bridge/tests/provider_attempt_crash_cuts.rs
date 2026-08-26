@@ -145,14 +145,13 @@ fn the_durable_record_refuses_to_rewind_an_interrupted_send() {
         })
         .unwrap();
 
-    for forbidden in [SendState::KnownNotSent] {
-        let outcome = store.update_attempt(opened.attempt_id.as_str(), |attempt| {
-            // Bypass `advance` entirely: a caller could just assign the field.
-            attempt.send_state = forbidden;
-            Ok(())
-        });
-        assert!(outcome.is_err(), "{forbidden:?} rewind was accepted");
-    }
+    let forbidden = SendState::KnownNotSent;
+    let outcome = store.update_attempt(opened.attempt_id.as_str(), |attempt| {
+        // Bypass `advance` entirely: a caller could just assign the field.
+        attempt.send_state = forbidden;
+        Ok(())
+    });
+    assert!(outcome.is_err(), "{forbidden:?} rewind was accepted");
     // And the record on disk is untouched by the rejected write.
     let recovered = restart(&home, Some(store))
         .list_attempts_for_run("run-0003")
@@ -169,7 +168,8 @@ fn an_attempts_binding_cannot_be_rewritten_after_it_is_opened() {
     let opened = attempt("run-0004", 1);
     store.open_attempt(&opened).unwrap();
 
-    let rewrites: Vec<(&str, Box<dyn Fn(&mut ProviderAttempt)>)> = vec![
+    type AttemptRewrite = Box<dyn Fn(&mut ProviderAttempt)>;
+    let rewrites: Vec<(&str, AttemptRewrite)> = vec![
         (
             "model",
             Box::new(|attempt: &mut ProviderAttempt| {
