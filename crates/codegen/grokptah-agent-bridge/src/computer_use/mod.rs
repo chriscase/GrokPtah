@@ -38,6 +38,7 @@ mod isolated_visual_package;
 mod isolated_visual_protocol;
 mod isolated_visual_runtime;
 mod isolated_visual_selfcheck;
+mod isolated_visual_soak;
 mod isolated_visual_status;
 mod isolated_visual_stream;
 #[cfg(target_os = "macos")]

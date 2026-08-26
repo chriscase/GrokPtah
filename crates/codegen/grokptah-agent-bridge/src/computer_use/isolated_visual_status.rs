@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use super::isolated_visual_harness::run_real_measured_launch;
 use super::isolated_visual_selfcheck::run_isolated_visual_selfcheck;
+use super::isolated_visual_soak::hardware_soak_startable;
 
 /// One reason isolated visual Computer Use is not dispatchable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -47,6 +48,9 @@ pub struct ComputerIsolatedVisualStatus {
     /// this host. `not_attempted` means no guest, helper, or package has
     /// been touched at all.
     pub measured_launch_stage: &'static str,
+    /// Whether a qualifying hardware soak could be started on this host.
+    /// False until a measured launch has actually reached stop and reap.
+    pub hardware_soak_startable: bool,
     /// Every reason dispatch is unavailable, in a stable order.
     pub blockers: Vec<ComputerIsolatedVisualBlocker>,
 }
@@ -76,6 +80,7 @@ pub fn computer_isolated_visual_status() -> ComputerIsolatedVisualStatus {
         dispatch_enabled: false,
         contract_self_check_passed,
         measured_launch_stage: measured_launch.launch_attempted.as_str(),
+        hardware_soak_startable: hardware_soak_startable(),
         blockers,
     }
 }
@@ -106,6 +111,10 @@ mod tests {
             status.measured_launch_stage,
             LaunchStage::NotAttempted.as_str(),
             "status must not report a launch stage it did not reach"
+        );
+        assert!(
+            !status.hardware_soak_startable,
+            "a soak must not be startable before the hardware gates pass"
         );
     }
 

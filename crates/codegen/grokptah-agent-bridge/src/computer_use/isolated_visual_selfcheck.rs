@@ -64,6 +64,10 @@ use super::isolated_visual_protocol::{
     IsolatedVisualProtocolPayload, IsolatedVisualProtocolSession,
 };
 use super::isolated_visual_runtime::IsolatedVisualRuntimeSession;
+use super::isolated_visual_soak::{
+    hardware_soak_startable, plan_soak, start_soak, CanaryKind, CanaryReport, HardwareGateEvidence,
+    SoakRefusal, CANARY_ITERATIONS, QUALIFYING_SOAK,
+};
 use super::isolated_visual_stream::{IsolatedVisualStream, ISOLATED_VISUAL_GUEST_INPUT_COMMAND};
 use super::types::{
     ComputerError, ComputerErrorCode, ComputerKey, ComputerResult, ComputerSurfaceBinding,
@@ -146,6 +150,7 @@ pub(crate) fn run_isolated_visual_selfcheck() -> ComputerResult<()> {
     check_driven_failure()?;
     check_artifact_receipts()?;
     check_measured_launch_policy()?;
+    check_soak_is_not_startable()?;
     #[cfg(unix)]
     bind_deadline_entrypoints();
     Ok(())
@@ -824,6 +829,59 @@ fn check_driven_session() -> ComputerResult<()> {
         runtime.terminal_check().is_err(),
         "restart interruption left the isolated input gate live",
     )
+}
+
+/// A soak cannot be started, and a source canary can never be mistaken for a
+/// hardware result.
+///
+/// This deliberately does not run the source canary: the canary runs this
+/// rehearsal, so calling it from inside would recurse. What it checks is the
+/// classification and the refusal.
+fn check_soak_is_not_startable() -> ComputerResult<()> {
+    require(
+        !hardware_soak_startable(),
+        "a hardware soak is startable without a measured launch",
+    )?;
+    require(
+        start_soak(QUALIFYING_SOAK, None) == Err(SoakRefusal::HardwareGatesUnmet),
+        "a qualifying soak started without hardware gate evidence",
+    )?;
+    require(
+        plan_soak(QUALIFYING_SOAK) == Ok(QUALIFYING_SOAK)
+            && plan_soak(std::time::Duration::ZERO) == Err(SoakRefusal::DurationNotPositive),
+        "soak planning does not behave as specified",
+    )?;
+
+    // No source canary is hardware evidence, at any iteration count.
+    for iterations in [1, CANARY_ITERATIONS, u32::MAX] {
+        let source = CanaryReport {
+            kind: CanaryKind::SourceContract,
+            iterations,
+            stable: true,
+        };
+        require(
+            !source.is_hardware_evidence(),
+            "a source canary was classified as hardware evidence",
+        )?;
+    }
+
+    // The gate is a gate in both directions: an unfinished launch cannot mint
+    // evidence, which is what keeps the refusal above from being a stub.
+    let unfinished = super::isolated_visual_harness::MeasuredLaunchReport {
+        launch_attempted: LaunchStage::UnicodeAcknowledged,
+        outcome: LaunchOutcome::Completed,
+        authenticated_frames: 4,
+        acknowledged_inputs: 3,
+    };
+    require(
+        !unfinished.proves_hardware_launch(),
+        "an unfinished launch claimed to prove hardware",
+    )?;
+    let _ = HardwareGateEvidence::from_measured_launch;
+    // The canary runs this rehearsal, so it is bound rather than called:
+    // calling it from inside would recurse. Its own tests run it for real.
+    let _: fn(u32) -> CanaryReport = super::isolated_visual_soak::run_source_canary;
+    Ok(())
 }
 
 /// The measured launch policy: stages are ordered, an uncertain step is never
