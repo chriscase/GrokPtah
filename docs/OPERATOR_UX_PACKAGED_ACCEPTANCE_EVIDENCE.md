@@ -120,8 +120,11 @@ Lint and Playwright are **not** claimed; neither exists in this desktop package.
 | `npm run verify:public` | pass (regression only; public bundle + consumer fixture) |
 | `git diff --check` | clean |
 | privacy scan | no live credentials or private identity paths; tests use absence needles only (`sk-test-not-a-real-key`, `/Users/secret`) |
+| GitHub `Desktop / desktop` on `297050a1` | **fail (parent lock residual)** — `Typecheck + unit tests` passed; `Cargo tests (desktop)` failed `cargo test --locked` because `desktop/src-tauri/Cargo.lock` does not record path dep `grokptah-agent-sdk` already present in `grokptah-agent-bridge` at `8ad3be07`. This draft does not alter lockfiles. |
 
 JSDOM printed `HTMLCanvasElement.prototype.getContext` when `App.operatorUx.test.tsx` imported `App.tsx` (xterm). Tests still passed. That is not packaged AT.
+
+GitHub Desktop CI cargo failure is inherited from the selected parent. Reproducing `cargo metadata --locked` in `desktop/src-tauri` on the clean parent tree yields the same error. Fixing it requires a lockfile edit, which this allowlist forbids.
 
 ## Residuals
 
