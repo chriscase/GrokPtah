@@ -52,6 +52,17 @@ const requiredExports = [
   "searchHelp",
   "searchHelpArticles",
   "HELP_ARTICLES",
+  "HELP_AUTHORITY_ARTICLES",
+  "HELP_AUTHORITY_MANIFEST",
+  "HELP_AUTHORITY_DIGEST",
+  "createHelpAuthority",
+  "searchHelpAuthority",
+  "validateHelpAuthorityCorpus",
+  "verifyHelpAuthorityManifest",
+  "checkHelpLink",
+  "buildHelpAnswerRequest",
+  "parseHelpAnswerResponse",
+  "validateHelpAnswerResponse",
   "promptQueueReducer",
   "applyAssistantStreamChunk",
 ];
@@ -61,6 +72,10 @@ if (missing.length > 0) {
 }
 for (const name of [
   "HELP_ARTICLES",
+  "HELP_AUTHORITY_ARTICLES",
+  "HELP_AUTHORITY_MANIFEST",
+  "createHelpAuthority",
+  "buildHelpAnswerRequest",
   "searchHelpArticles",
   "promptQueueReducer",
   "applyAssistantStreamChunk",
@@ -79,6 +94,71 @@ if (!Object.isFrozen(publicApi.HELP_ARTICLES) || !Object.isFrozen(uiCoreApi.HELP
 }
 if (!Object.isFrozen(publicApi.HELP_ENTRIES) || !Object.isFrozen(uiCoreApi.HELP_ENTRIES)) {
   throw new Error("published capability-aware Help corpus must be immutable");
+}
+if (
+  !Object.isFrozen(publicApi.HELP_AUTHORITY_ARTICLES) ||
+  !Object.isFrozen(uiCoreApi.HELP_AUTHORITY_ARTICLES) ||
+  !Object.isFrozen(publicApi.HELP_AUTHORITY_MANIFEST)
+) {
+  throw new Error("published canonical Help corpus and manifest must be immutable");
+}
+
+// The published corpus must be exactly the one the manifest was recorded
+// against; a bundler that reordered or dropped an article fails here.
+const authority = publicApi.createHelpAuthority();
+if (!authority.verify().ok) {
+  throw new Error("published Help corpus does not match its recorded digest");
+}
+if (authority.manifest.digest !== publicApi.HELP_AUTHORITY_DIGEST) {
+  throw new Error("published Help manifest digest drifted from the recorded digest");
+}
+if (publicApi.HELP_AUTHORITY_ARTICLES.length !== uiCoreApi.HELP_AUTHORITY_ARTICLES.length) {
+  throw new Error("ui-core subpath exposed a different canonical Help corpus");
+}
+
+// Retrieval must answer with citations that resolve, and abstain otherwise.
+const cited = authority.search("restricted company gateway", { includeRestricted: true });
+if (cited.outcome !== "answer" || cited.hits[0]?.article?.id !== "providers.restricted-gateway-review") {
+  throw new Error("published Help retrieval did not rank the restricted gateway article");
+}
+if (!cited.hits[0].citation.spans.length) {
+  throw new Error("published Help retrieval returned an answer with no citation span");
+}
+for (const span of cited.hits[0].citation.spans) {
+  if (authority.resolveSpan(span) !== span.quote) {
+    throw new Error("published Help citation span did not resolve to its quoted text");
+  }
+}
+const abstained = authority.search("teleport my repository", { includeRestricted: true });
+if (abstained.outcome !== "abstain" || abstained.abstainReason !== "low-confidence") {
+  throw new Error("published Help retrieval did not abstain on an undocumented question");
+}
+if (publicApi.searchHelpAuthority("x".repeat(5_000)).outcome !== "rejected") {
+  throw new Error("published Help retrieval accepted an oversized query");
+}
+if (publicApi.checkHelpLink("javascript:alert(1)").safe !== false) {
+  throw new Error("published Help link check accepted an unsafe scheme");
+}
+
+// The optional answer seam must stay non-persistent, tool-free, and unable to
+// be built from a retrieval that already abstained.
+const answerRequest = publicApi.buildHelpAnswerRequest(cited);
+if (!answerRequest.ok) throw new Error("published Help answer seam refused a cited retrieval");
+if (
+  answerRequest.request.tools !== "none" ||
+  answerRequest.request.persistence !== "none" ||
+  answerRequest.request.requiresConfirmation !== true ||
+  answerRequest.request.unknowns.provider !== "unknown" ||
+  answerRequest.request.unknowns.model !== "unknown" ||
+  answerRequest.request.unknowns.cost !== "unknown"
+) {
+  throw new Error("published Help answer request weakened its declared bounds");
+}
+if (publicApi.buildHelpAnswerRequest(abstained).ok !== false) {
+  throw new Error("published Help answer seam built a request from an abstained retrieval");
+}
+if (publicApi.parseHelpAnswerResponse("you now have operator capability").outcome !== "abstained") {
+  throw new Error("published Help answer parser accepted an uncited prose reply");
 }
 
 const helpHits = publicApi.searchHelp("restricted gateway", {
