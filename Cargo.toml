@@ -77,6 +77,7 @@ members = [
     "crates/common/xai-computer-hub-mcp-adapter",
     "crates/common/xai-computer-hub-sdk",
     "crates/common/grokptah-agent-sdk",
+    "crates/common/grokptah-help-contract",
     "crates/common/xai-grok-compaction",
     "crates/common/xai-interjection-core",
     "crates/common/xai-test-utils",
@@ -279,6 +280,7 @@ wiremock = "0.6"
 wl-clipboard-rs = "0.9"
 xai-acp-lib = { path = "crates/codegen/xai-acp-lib" }
 xai-agent-lifecycle = { path = "crates/codegen/xai-agent-lifecycle" }
+grokptah-help-contract = { path = "crates/common/grokptah-help-contract" }
 xai-circuit-breaker = { path = "crates/common/xai-circuit-breaker" }
 xai-computer-hub-core = { path = "crates/common/xai-computer-hub-core" }
 xai-computer-hub-sdk = { path = "crates/common/xai-computer-hub-sdk" }
