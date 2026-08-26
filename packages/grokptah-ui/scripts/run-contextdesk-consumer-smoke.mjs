@@ -192,13 +192,13 @@ try {
         dependencies: {
           "@grokptah/client": `file:${clientArchive}`,
           "@grokptah/ui": `file:${uiArchive}`,
-          react: `file:${hostPackages[0]}`,
-          "react-dom": `file:${hostPackages[1]}`,
+          react: hostConfiguration.expected.react,
+          "react-dom": hostConfiguration.expected["react-dom"],
         },
         devDependencies: {
-          "@types/react": `file:${hostPackages[2]}`,
-          "@types/react-dom": `file:${hostPackages[3]}`,
-          typescript: `file:${hostPackages[4]}`,
+          "@types/react": hostConfiguration.expected["@types/react"],
+          "@types/react-dom": hostConfiguration.expected["@types/react-dom"],
+          typescript: hostConfiguration.expected.typescript,
         },
       },
       null,
