@@ -59,31 +59,66 @@ try {
   parseExternalWorkerNotification,
   applyExternalWorkerNotification,
   createExternalWorkerMonitor,
-  HELP_ARTICLES,
-  HELP_ENTRIES,
+  HELP_PUBLIC_CORPUS,
+  assertPublicOnly,
+  verifyHelpCorpus,
+  verifyHelpProjection,
   applyAssistantStreamChunk,
   createPromptQueueEntry,
   emptyPromptQueueState,
   promptQueueReducer,
-  searchHelpArticles,
+  searchHelpCorpus,
 } from "@grokptah/client";
 import {
-  HELP_ARTICLES as UI_CORE_HELP_ARTICLES,
-  searchHelpArticles as uiCoreSearchHelpArticles,
+  HELP_PUBLIC_CORPUS as UI_CORE_HELP_CORPUS,
+  searchHelpCorpus as uiCoreSearchHelpCorpus,
 } from "@grokptah/client/ui-core";
 
-if (HELP_ARTICLES.length < 1) throw new Error("consumer could not read the Help Center corpus");
-if (!Object.isFrozen(HELP_ARTICLES) || !Object.isFrozen(HELP_ENTRIES)) {
-  throw new Error("consumer Help corpora were not immutable");
+if (HELP_PUBLIC_CORPUS.articles.length < 1) {
+  throw new Error("consumer could not read the published Help corpus");
 }
-if (UI_CORE_HELP_ARTICLES.length !== HELP_ARTICLES.length) {
-  throw new Error("ui-core subpath exposed a different Help Center corpus");
+// A consumer must be able to re-check the bundle it was handed rather than
+// trusting that the build filtered correctly.
+verifyHelpCorpus(HELP_PUBLIC_CORPUS);
+assertPublicOnly(HELP_PUBLIC_CORPUS);
+if (UI_CORE_HELP_CORPUS.digest !== HELP_PUBLIC_CORPUS.digest) {
+  throw new Error("ui-core subpath exposed a different Help corpus");
 }
-if (searchHelpArticles("restricted company gateway")[0]?.article?.id !== "providers.restricted-gateway-review") {
-  throw new Error("consumer Help Center ranking did not match the published contract");
+const outcome = searchHelpCorpus("recover an interrupted run");
+if (outcome.kind !== "results" || outcome.results[0]?.articleId !== "operations.durable-recovery") {
+  throw new Error("consumer Help retrieval did not match the published contract");
 }
-if (uiCoreSearchHelpArticles("restricted company gateway")[0]?.article?.id !== "providers.restricted-gateway-review") {
-  throw new Error("ui-core consumer Help Center ranking did not match the published contract");
+const uiCoreOutcome = uiCoreSearchHelpCorpus("recover an interrupted run");
+if (uiCoreOutcome.kind !== "results") {
+  throw new Error("ui-core consumer Help retrieval did not match the published contract");
+}
+if (searchHelpCorpus("what is the capital of Portugal").kind !== "abstained") {
+  throw new Error("consumer Help retrieval answered a question the corpus cannot answer");
+}
+// Verification can only remove claims. A consumer that receives an answer it
+// cannot re-check against its own corpus must be able to discard it.
+const rechecked = verifyHelpProjection({
+  handle: "consumer",
+  status: "answered",
+  claims: [
+    {
+      ordinal: 0,
+      text: "An invented statement.",
+      citations: [
+        {
+          source_id: HELP_PUBLIC_CORPUS.sources[0].id,
+          path: HELP_PUBLIC_CORPUS.sources[0].path,
+          heading: HELP_PUBLIC_CORPUS.sources[0].heading,
+          quote: "text that is not anywhere in the corpus",
+        },
+      ],
+    },
+  ],
+  error: null,
+  message: null,
+}, HELP_PUBLIC_CORPUS);
+if (rechecked.projection.claims.length !== 0 || rechecked.projection.status !== "abstained") {
+  throw new Error("consumer verification kept a claim it could not re-check");
 }
 if (applyAssistantStreamChunk("", "consumer").text !== "consumer") {
   throw new Error("consumer stream helper did not apply a bounded update");

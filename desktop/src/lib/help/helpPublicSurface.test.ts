@@ -12,8 +12,13 @@ import { describe, expect, it } from "vitest";
 import * as publicSurface from "./publicSurface";
 import * as uiCore from "../uiCore";
 import { HELP_PUBLIC_CORPUS, HelpBundleNotPublicError, assertPublicOnly } from "./publicSurface";
-import { HELP_CORPUS } from "./canonical/corpus";
+// Read the private artifact directly. `src/lib` must never import it — that is
+// the property under test — but a test file is not bundled and needs both
+// corpora in hand to compare them.
+import fullCorpusJson from "./canonical/help-corpus.v1.json";
 import type { HelpCorpus } from "./generated/contract";
+
+const FULL = fullCorpusJson as unknown as HelpCorpus;
 
 /** Names that must never be reachable from a published bundle. */
 const FORBIDDEN_EXPORTS = [
@@ -82,14 +87,12 @@ describe("the published Help surface", () => {
     // The restricted text must be absent, not merely unlisted: a bundle that
     // carries it has leaked it whatever the index says.
     const serialized = JSON.stringify(HELP_PUBLIC_CORPUS);
-    const restricted = HELP_CORPUS.chunks.filter((chunk) => chunk.visibility !== "public");
+    const restricted = FULL.chunks.filter((chunk) => chunk.visibility !== "public");
     expect(restricted.length).toBeGreaterThan(0);
     for (const chunk of restricted) {
       expect(serialized).not.toContain(chunk.text);
     }
-    const restrictedSources = HELP_CORPUS.sources.filter(
-      (source) => source.visibility !== "public",
-    );
+    const restrictedSources = FULL.sources.filter((source) => source.visibility !== "public");
     for (const source of restrictedSources) {
       expect(serialized).not.toContain(source.id);
     }

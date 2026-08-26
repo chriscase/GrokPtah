@@ -26,14 +26,16 @@
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 
-import type { HelpProjection, HelpTopic } from "../lib/help/generated/contract";
-import { HELP_CORPUS, getHelpArticle, getHelpSource } from "../lib/help/canonical/corpus";
+import type { HelpCorpus, HelpProjection, HelpTopic } from "../lib/help/generated/contract";
+import { HELP_PUBLIC_CORPUS } from "../lib/help/canonical/corpus";
+import { findArticleIn, findSourceIn } from "../lib/help/canonical/corpus";
+import { verifyHelpCorpus } from "../lib/help/canonical/verify";
 import {
   HELP_RETRIEVAL_DEFAULT_LIMIT,
   searchHelpCorpus,
   type HelpRetrievalOutcome,
 } from "../lib/help/retrieval/hybrid";
-import { helpAsk, helpCancel, helpFollow } from "../lib/help/host";
+import { helpAsk, helpCancel, helpFollow, helpVisibleCorpus } from "../lib/help/host";
 import { verifyHelpProjection } from "../lib/help/verify";
 
 export type HelpCenterProps = {
@@ -72,7 +74,19 @@ type AnswerState =
 export function HelpCenter({ open, onClose, sessionToken }: HelpCenterProps) {
   const [query, setQuery] = useState("");
   const [topic, setTopic] = useState<HelpTopic | "all">("all");
-  const [selectedId, setSelectedId] = useState<string>(HELP_CORPUS.articles[0]?.id ?? "");
+  /**
+   * The corpus in hand.
+   *
+   * Starts as the public set this bundle ships, so search works before any
+   * host round-trip and works at all if the host is unreachable. The host then
+   * returns the corpus this principal is entitled to, which may be larger. The
+   * renderer never filters: what it holds is what it may see, so a modified
+   * renderer has nothing extra to reveal.
+   */
+  const [corpus, setCorpus] = useState<HelpCorpus>(HELP_PUBLIC_CORPUS);
+  const [selectedId, setSelectedId] = useState<string>(
+    HELP_PUBLIC_CORPUS.articles[0]?.id ?? "",
+  );
   const [answer, setAnswer] = useState<AnswerState>({ status: "idle" });
 
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -86,30 +100,24 @@ export function HelpCenter({ open, onClose, sessionToken }: HelpCenterProps) {
 
   // Retrieval is synchronous and local, so results are just derived state.
   const outcome: HelpRetrievalOutcome = useMemo(
-    () =>
-      searchHelpCorpus(query, {
-        topic,
-        limit: HELP_RETRIEVAL_DEFAULT_LIMIT,
-        corpus: HELP_CORPUS,
-      }),
-    [query, topic],
+    () => searchHelpCorpus(query, { topic, limit: HELP_RETRIEVAL_DEFAULT_LIMIT, corpus }),
+    [query, topic, corpus],
   );
 
   const results = outcome.kind === "results" ? outcome.results : [];
 
   const browseArticles = useMemo(
-    () =>
-      HELP_CORPUS.articles.filter(
-        (article) => topic === "all" || article.topic === topic,
-      ),
-    [topic],
+    () => corpus.articles.filter((article) => topic === "all" || article.topic === topic),
+    [topic, corpus],
   );
 
   const visibleArticles = query.trim()
-    ? results.map((result) => getHelpArticle(result.articleId)).filter((a) => a !== undefined)
+    ? results
+        .map((result) => findArticleIn(corpus, result.articleId))
+        .filter((article) => article !== undefined)
     : browseArticles;
 
-  const selected = getHelpArticle(selectedId) ?? visibleArticles[0];
+  const selected = findArticleIn(corpus, selectedId) ?? visibleArticles[0];
 
   // Keep the selection inside what is on screen, so the detail pane never
   // shows an article the list no longer offers.
@@ -126,10 +134,15 @@ export function HelpCenter({ open, onClose, sessionToken }: HelpCenterProps) {
     }
   }, []);
 
-  const applyProjection = useCallback((projection: HelpProjection) => {
+  const applyProjection = useCallback(
+    (projection: HelpProjection) => {
     // The host already validated. Re-checking here can only remove claims,
-    // never add one, and it catches a projection altered in transit.
-    const { projection: verified } = verifyHelpProjection(projection, HELP_CORPUS);
+    // never add one, and it catches a projection altered in transit. It runs
+    // against the corpus the host said this principal may see, not against the
+    // public floor: checking an entitled reader's answer against the public
+    // set would drop every citation into gated content and read as the host
+    // having lied.
+    const { projection: verified } = verifyHelpProjection(projection, corpus);
     switch (verified.status) {
       case "answered":
         setAnswer({ status: "answered", projection: verified });
@@ -147,7 +160,9 @@ export function HelpCenter({ open, onClose, sessionToken }: HelpCenterProps) {
         setAnswer({ status: "asking", handle: verified.handle });
         return false;
     }
-  }, []);
+    },
+    [corpus],
+  );
 
   const poll = useCallback(
     (handle: string) => {
@@ -201,6 +216,27 @@ export function HelpCenter({ open, onClose, sessionToken }: HelpCenterProps) {
     stopPolling();
     setAnswer({ status: "idle" });
   }, [query, stopPolling]);
+
+  // Ask the host what this principal may see. Verified before adoption: a
+  // corpus that does not match its own digests is not adopted at all, and the
+  // public floor stays in place rather than being replaced by something
+  // unverifiable.
+  useEffect(() => {
+    if (!open || !sessionToken) return;
+    let cancelled = false;
+    void helpVisibleCorpus(sessionToken)
+      .then((visible) => {
+        if (cancelled || !visible || visible.articles.length === 0) return;
+        verifyHelpCorpus(visible);
+        setCorpus(visible);
+      })
+      .catch(() => {
+        // Offline search over the public set is the floor, not a failure.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, sessionToken]);
 
   // Focus management: remember the opener, move focus in, restore on close.
   useEffect(() => {
@@ -333,7 +369,7 @@ export function HelpCenter({ open, onClose, sessionToken }: HelpCenterProps) {
                 <h4>Sources</h4>
                 <ul className="help-article-sources">
                   {selected.source_ids.map((sourceId) => {
-                    const source = getHelpSource(sourceId);
+                    const source = findSourceIn(corpus, sourceId);
                     if (!source) return null;
                     return (
                       <li key={sourceId}>

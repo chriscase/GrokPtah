@@ -10,7 +10,15 @@
 
 import { describe, expect, it } from "vitest";
 
-import { HELP_CORPUS } from "./canonical/corpus";
+// The gold set exercises retrieval over the *full* corpus, because that is
+// what the host searches. The bundle's public subset is checked separately
+// below. Test files are not bundled, so reading the private artifact here does
+// not put it in anyone's package.
+import fullCorpusJson from "./canonical/help-corpus.v1.json";
+import { HELP_PUBLIC_CORPUS } from "./canonical/corpus";
+import type { HelpCorpus } from "./generated/contract";
+
+const CORPUS = fullCorpusJson as unknown as HelpCorpus;
 import {
   HELP_ABSTENTION_THRESHOLD,
   HELP_RETRIEVAL_MAX_LIMIT,
@@ -50,7 +58,7 @@ describe("offline hybrid retrieval", () => {
   it("finds the right article for questions a reader would type", () => {
     const misses: string[] = [];
     for (const probe of POSITIVES) {
-      const outcome = searchHelpCorpus(probe.query);
+      const outcome = searchHelpCorpus(probe.query, { corpus: CORPUS });
       if (outcome.kind !== "results") {
         misses.push(`${probe.query} -> abstained`);
         continue;
@@ -66,7 +74,7 @@ describe("offline hybrid retrieval", () => {
   it("abstains rather than guessing at questions the corpus cannot answer", () => {
     const wrong: string[] = [];
     for (const query of NEGATIVES) {
-      const outcome = searchHelpCorpus(query);
+      const outcome = searchHelpCorpus(query, { corpus: CORPUS });
       if (outcome.kind === "results") {
         wrong.push(`${query} -> ${outcome.results[0]?.articleId} @ ${outcome.results[0]?.score.fused.toFixed(3)}`);
       }
@@ -75,54 +83,54 @@ describe("offline hybrid retrieval", () => {
   });
 
   it("reports why it abstained", () => {
-    expect(searchHelpCorpus("").kind).toBe("abstained");
-    const empty = searchHelpCorpus("");
+    expect(searchHelpCorpus("", { corpus: CORPUS }).kind).toBe("abstained");
+    const empty = searchHelpCorpus("", { corpus: CORPUS });
     if (empty.kind === "abstained") expect(empty.reason).toBe("no-query");
-    const unknown = searchHelpCorpus("capital of Portugal");
+    const unknown = searchHelpCorpus("capital of Portugal", { corpus: CORPUS });
     if (unknown.kind === "abstained") expect(unknown.reason).toBe("below-threshold");
   });
 
   it("is deterministic", () => {
-    const first = searchHelpCorpus("recover an interrupted run");
-    const second = searchHelpCorpus("recover an interrupted run");
+    const first = searchHelpCorpus("recover an interrupted run", { corpus: CORPUS });
+    const second = searchHelpCorpus("recover an interrupted run", { corpus: CORPUS });
     expect(JSON.stringify(first)).toBe(JSON.stringify(second));
   });
 
   it("binds results to the corpus it searched", () => {
-    const outcome = searchHelpCorpus("recover an interrupted run");
-    expect(outcome.corpusDigest).toBe(HELP_CORPUS.digest);
+    const outcome = searchHelpCorpus("recover an interrupted run", { corpus: CORPUS });
+    expect(outcome.corpusDigest).toBe(CORPUS.digest);
     expect(outcome.mode).toBe("offline-hybrid");
   });
 
   it("returns the exact chunk bytes, not a paraphrase", () => {
-    const outcome = searchHelpCorpus("recover an interrupted run");
+    const outcome = searchHelpCorpus("recover an interrupted run", { corpus: CORPUS });
     expect(outcome.kind).toBe("results");
     if (outcome.kind !== "results") return;
     for (const result of outcome.results) {
-      const chunk = HELP_CORPUS.chunks.find((candidate) => candidate.id === result.chunkId);
+      const chunk = CORPUS.chunks.find((candidate) => candidate.id === result.chunkId);
       expect(chunk).toBeDefined();
       expect(result.text).toBe(chunk!.text);
     }
   });
 
   it("shows at most one result per article", () => {
-    const outcome = searchHelpCorpus("run");
+    const outcome = searchHelpCorpus("run", { corpus: CORPUS });
     if (outcome.kind !== "results") return;
     const ids = outcome.results.map((result) => result.articleId);
     expect(new Set(ids).size).toBe(ids.length);
   });
 
   it("honours the limit and its ceiling", () => {
-    const outcome = searchHelpCorpus("run", { limit: 2 });
+    const outcome = searchHelpCorpus("run", { limit: 2, corpus: CORPUS });
     if (outcome.kind === "results") expect(outcome.results.length).toBeLessThanOrEqual(2);
-    const huge = searchHelpCorpus("run", { limit: 10_000 });
+    const huge = searchHelpCorpus("run", { limit: 10_000, corpus: CORPUS });
     if (huge.kind === "results") {
       expect(huge.results.length).toBeLessThanOrEqual(HELP_RETRIEVAL_MAX_LIMIT);
     }
   });
 
   it("filters by topic without leaking other topics", () => {
-    const outcome = searchHelpCorpus("safety", { topic: "computer-use" });
+    const outcome = searchHelpCorpus("safety", { topic: "computer-use", corpus: CORPUS });
     if (outcome.kind !== "results") return;
     for (const result of outcome.results) {
       expect(result.topic).toBe("computer-use");
@@ -132,8 +140,7 @@ describe("offline hybrid retrieval", () => {
   it("keeps the abstention threshold above every negative's best score", () => {
     // Documents the calibration rather than asserting a magic number twice.
     for (const query of NEGATIVES) {
-      const outcome = searchHelpCorpus(query);
-      expect(outcome.kind).toBe("abstained");
+      expect(searchHelpCorpus(query, { corpus: CORPUS }).kind).toBe("abstained");
     }
     expect(HELP_ABSTENTION_THRESHOLD).toBeGreaterThan(0);
     expect(HELP_ABSTENTION_THRESHOLD).toBeLessThan(1);
@@ -149,7 +156,7 @@ describe("offline hybrid retrieval", () => {
       throw new Error("retrieval must not reach the network");
     }) as typeof fetch;
     try {
-      searchHelpCorpus("recover an interrupted run");
+      searchHelpCorpus("recover an interrupted run", { corpus: CORPUS });
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -176,5 +183,38 @@ describe("text normalisation", () => {
     const right = vectorize(trigrams("recovering durable runs"));
     const unrelated = vectorize(trigrams("sourdough starter hydration"));
     expect(cosine(left, right)).toBeGreaterThan(cosine(left, unrelated));
+  });
+});
+
+describe("retrieval over the bundled public corpus", () => {
+  it("answers public questions from the bundle alone", () => {
+    const outcome = searchHelpCorpus("recover an interrupted run", {
+      corpus: HELP_PUBLIC_CORPUS,
+    });
+    expect(outcome.kind).toBe("results");
+    if (outcome.kind !== "results") return;
+    expect(outcome.results[0]?.articleId).toBe("operations.durable-recovery");
+  });
+
+  it("cannot surface a gated article, because it does not have one", () => {
+    // Not "filters it out" — the bytes are not present. A renderer holding the
+    // public bundle has nothing restricted to reveal even if it tried.
+    const gated = CORPUS.articles.find((article) => article.visibility !== "public");
+    expect(gated).toBeDefined();
+    expect(HELP_PUBLIC_CORPUS.articles.some((a) => a.id === gated!.id)).toBe(false);
+
+    const outcome = searchHelpCorpus(gated!.title, { corpus: HELP_PUBLIC_CORPUS });
+    if (outcome.kind === "results") {
+      expect(outcome.results.map((result) => result.articleId)).not.toContain(gated!.id);
+    }
+  });
+
+  it("finds a gated article when the host supplies the wider corpus", () => {
+    const gated = CORPUS.articles.find((article) => article.id === "operations.queue-and-steer");
+    expect(gated).toBeDefined();
+    const outcome = searchHelpCorpus("queue a prompt and steer a run", { corpus: CORPUS });
+    expect(outcome.kind).toBe("results");
+    if (outcome.kind !== "results") return;
+    expect(outcome.results.map((result) => result.articleId)).toContain(gated!.id);
   });
 });

@@ -120,15 +120,35 @@ describe("Help Center accessibility", () => {
 });
 
 describe("Help Center boundary", () => {
-  it("renders offline results without calling the host at all", async () => {
+  it("searches without calling the host", async () => {
     const user = userEvent.setup();
     open();
+    // Opening asks the host once for the corpus this principal may see. That
+    // is an entitlement fetch, not a search; everything after it must be local.
+    await waitFor(() => expect(screen.getByLabelText("Search Help")).toHaveFocus());
+    const afterOpen = invoked.length;
     await user.type(screen.getByLabelText("Search Help"), "recover an interrupted run");
     await waitFor(() => expect(screen.getAllByRole("status")[0]).toHaveTextContent(/match/));
     expect(
-      invoked.filter((call) => call.command !== "help_session"),
+      invoked.slice(afterOpen),
       "search reached the host; offline retrieval must be local",
     ).toEqual([]);
+  });
+
+  it("asks the host only for the corpus this principal may see", async () => {
+    open();
+    await waitFor(() => expect(invoked.some((c) => c.command === "help_visible_corpus")).toBe(true));
+    const call = invoked.find((c) => c.command === "help_visible_corpus");
+    expect(call!.args).toEqual({ session: "tok" });
+  });
+
+  it("keeps working offline when the host cannot be reached", async () => {
+    // The bundled public corpus is the floor, not a failure state.
+    const user = userEvent.setup();
+    render(<HelpCenter open onClose={() => {}} sessionToken="" />);
+    await user.type(screen.getByLabelText("Search Help"), "recover an interrupted run");
+    await waitFor(() => expect(screen.getAllByRole("status")[0]).toHaveTextContent(/match/));
+    expect(invoked.some((call) => call.command === "help_visible_corpus")).toBe(false);
   });
 
   it("never creates a chat session", async () => {

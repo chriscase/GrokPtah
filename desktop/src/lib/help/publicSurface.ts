@@ -30,8 +30,7 @@
  */
 
 import type { HelpCorpus } from "./generated/contract";
-import publicCorpusJson from "./canonical/help-corpus-public.v1.json";
-import { verifyHelpCorpus } from "./canonical/corpus";
+import { HELP_PUBLIC_CORPUS, HELP_PUBLIC_CORPUS_DIGEST } from "./canonical/corpus";
 
 /** Raised when a bundle that must be public-only is not. */
 export class HelpBundleNotPublicError extends Error {
@@ -66,13 +65,11 @@ export function assertPublicOnly(corpus: HelpCorpus): void {
   }
 }
 
-/** The public Help corpus. Verified and public-only, or this module throws. */
-export const HELP_PUBLIC_CORPUS: HelpCorpus = publicCorpusJson as HelpCorpus;
-
-verifyHelpCorpus(HELP_PUBLIC_CORPUS);
+// Verified at load inside `canonical/corpus`; re-checked here for the property
+// that matters to a *published* bundle specifically.
 assertPublicOnly(HELP_PUBLIC_CORPUS);
 
-export const HELP_PUBLIC_CORPUS_DIGEST = HELP_PUBLIC_CORPUS.digest;
+export { HELP_PUBLIC_CORPUS, HELP_PUBLIC_CORPUS_DIGEST };
 
 // ---- offline retrieval ----------------------------------------------------
 export {
@@ -95,7 +92,7 @@ export {
   type HelpClaimRejection,
   type HelpVerification,
 } from "./verify";
-export { HelpCorpusDigestMismatchError, verifyHelpCorpus } from "./canonical/corpus";
+export { HelpCorpusDigestMismatchError, isPublicOnly, verifyHelpCorpus } from "./canonical/verify";
 export { HELP_DIGEST_DOMAINS, domainDigest, lengthPrefixed, sha256Hex } from "./canonical/digest";
 
 // ---- safe projections and rendering types --------------------------------
