@@ -713,6 +713,7 @@ describe("PermissionModal (#141 + operator consent)", () => {
         </>
       );
     }
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     flushSync(() => {
       root.render(<RaceHost />);
     });
@@ -738,18 +739,26 @@ describe("PermissionModal (#141 + operator consent)", () => {
 
   it("sends at most one answer per request under StrictMode, rapid replace, Escape, and late ack", async () => {
     const answers: string[] = [];
+    let releaseStrict: ((value: ConsentAcknowledgement) => void) | undefined;
+    const strictPending = new Promise<ConsentAcknowledgement>((resolve) => {
+      releaseStrict = resolve;
+    });
     render(
       <StrictMode>
         <PermissionHarness
           initial={[makeReq("strict-1", "sess-1")]}
           focusedSessionId="sess-1"
           onAnswer={(requestId, decision) => answers.push(`${requestId}:${decision}`)}
+          respondImpl={() => strictPending}
         />
       </StrictMode>,
     );
     fireEvent.click(screen.getByTestId("permission-allow"));
     fireEvent.click(screen.getByTestId("permission-allow"));
+    fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(answers).toEqual(["strict-1:allow"]));
+    releaseStrict?.("acknowledged");
+    await waitFor(() => expect(screen.queryByTestId("permission-modal")).toBeNull());
     cleanup();
 
     function RapidHost() {
@@ -834,7 +843,9 @@ describe("PermissionModal (#141 + operator consent)", () => {
     await waitFor(() => expect(answers.filter((row) => row.startsWith("late-b:"))).toEqual([
       "late-b:allow",
     ]));
-    finishLate?.("lost");
+    await act(async () => {
+      finishLate?.("lost");
+    });
     fireEvent.click(screen.getByTestId("permission-allow"));
     fireEvent.keyDown(window, { key: "Escape" });
     expect(answers.filter((row) => row.startsWith("late-b:"))).toEqual(["late-b:allow"]);

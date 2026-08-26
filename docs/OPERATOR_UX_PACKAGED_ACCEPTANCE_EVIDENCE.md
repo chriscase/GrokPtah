@@ -152,15 +152,16 @@ Lint and Playwright are **not** claimed; neither exists in this desktop package.
 
 | Command | Result |
 | --- | --- |
-| `npm ci` | pending this successor (pass on `f39d4628`) |
-| `npx tsc --noEmit` | pending this successor |
-| focused Vitest (`operatorConsentPresentation`, `PermissionModal`, `App.operatorUx`) | pending this successor (31/31 on `f39d4628`) |
-| `npx vitest run` | pending this successor (50 files / 310 tests on `f39d4628`) |
+| `npm ci` | pass |
+| `npx tsc --noEmit` | pass |
+| focused Vitest (`operatorConsentPresentation`, `PermissionModal`, `App.operatorUx`) | 37/37 pass |
+| `npx vitest run` | 50 files / 316 tests pass |
 | `npx vite build` | pass (client production; chunk-size warning only) |
 | `npm run verify:public` | pass (regression only; public bundle + consumer fixture) |
+| `npm audit --omit=dev` | pass (0 production vulnerabilities) |
 | `git diff --check` | clean |
 | privacy scan | no live credentials or private identity paths; tests use absence needles only (`/etc/passwd`, `/opt/x`, `src/main.rs`, `git status`, `tok_opaque_9f3a`, bidi/Cf controls, prototype keys, `/Users/secret`) |
-| GitHub `Desktop / desktop` on `297050a1` / `7a094647` | **fail (parent lock residual)** — `Typecheck + unit tests` passed; `Cargo tests (desktop)` failed `cargo test --locked` because `desktop/src-tauri/Cargo.lock` does not record path dep `grokptah-agent-sdk` already present in `grokptah-agent-bridge` at `8ad3be07`. This draft does not alter lockfiles. The unchanged parent lock mismatch remains an inherited hosted blocker. |
+| GitHub `Desktop / desktop` on `f39d4628` | **fail (parent lock residual)** — `Typecheck + unit tests` passed; `Cargo tests (desktop)` failed `cargo test --locked` because `desktop/src-tauri/Cargo.lock` does not record path dep `grokptah-agent-sdk` already present in `grokptah-agent-bridge` at `8ad3be07`. This draft does not alter lockfiles. The unchanged parent lock mismatch remains an inherited hosted blocker. |
 
 JSDOM printed `HTMLCanvasElement.prototype.getContext` when `App.operatorUx.test.tsx` imported `App.tsx` (xterm). Tests still passed. That is not packaged AT.
 
