@@ -194,11 +194,19 @@ export class HelpAuthorityExecutor {
 
     try {
       if (failure === null) {
+        type RaceOutcome =
+          | { readonly type: "provider"; readonly value: unknown }
+          | { readonly type: "error"; readonly error: unknown }
+          | { readonly type: "deadline" }
+          | { readonly type: "cancelled" };
+        const providerOutcome: Promise<RaceOutcome> = providerTask.then(
+          (value): RaceOutcome => ({ type: "provider", value }),
+          (error: unknown): RaceOutcome => ({ type: "error", error }),
+        );
         const outcome = await Promise.race([
-          providerTask.then((value) => ({ type: "provider" as const, value })),
-          providerTask.catch((error: unknown) => ({ type: "error" as const, error })),
-          deadline.then((value) => ({ type: value as "deadline" })),
-          cancelled.then((value) => ({ type: value as "cancelled" })),
+          providerOutcome,
+          deadline.then((): RaceOutcome => ({ type: "deadline" })),
+          cancelled.then((): RaceOutcome => ({ type: "cancelled" })),
         ]);
         if (outcome.type === "provider") raw = outcome.value;
         else if (outcome.type === "error") transportError = outcome.error;

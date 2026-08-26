@@ -280,6 +280,10 @@ function validSafeString(value: unknown, maxBytes: number): value is string {
   return validBoundedString(value, maxBytes) && !containsHelpSecret(value) && !PRIVILEGED.test(value);
 }
 
+function validDigestString(value: unknown): value is string {
+  return validBoundedString(value, 71) && DIGEST.test(value);
+}
+
 function reject(reason: HelpAuthorityRejection, detail: string): HelpAuthorityValidation {
   return { accepted: false, reason, detail };
 }
@@ -476,12 +480,9 @@ function parseAuthorization(value: unknown): HelpAuthorityValidation | HelpAutho
 function parseIdentity(value: unknown): HelpAuthorityValidation | HelpAuthorityIdentity {
   if (!isRecord(value) || !hasOnlyKeys(value, IDENTITY_KEYS)) return reject("invalid-field", "identity");
   if (
-    !validSafeString(value.corpusDigest, 71) ||
-    !validSafeString(value.sourceDigest, 71) ||
-    !validSafeString(value.modelDigest, 71) ||
-    !DIGEST.test(value.corpusDigest) ||
-    !DIGEST.test(value.sourceDigest) ||
-    !DIGEST.test(value.modelDigest) ||
+    !validDigestString(value.corpusDigest) ||
+    !validDigestString(value.sourceDigest) ||
+    !validDigestString(value.modelDigest) ||
     !validSafeString(value.modelId, 256) ||
     !validSafeString(value.modelVersion, 256)
   ) {
@@ -538,8 +539,7 @@ function parseSourceBinding(value: unknown): HelpAuthorityValidation | HelpSourc
   if (!isRecord(value) || !hasOnlyKeys(value, SOURCE_BINDING_KEYS)) return reject("invalid-context", "source binding shape");
   if (
     !validSafeString(value.sourceId, 256) ||
-    !validSafeString(value.sourceSectionDigest, 71) ||
-    !DIGEST.test(value.sourceSectionDigest) ||
+    !validDigestString(value.sourceSectionDigest) ||
     typeof value.sourceByteLength !== "number" ||
     !Number.isSafeInteger(value.sourceByteLength) ||
     value.sourceByteLength < 1 ||
@@ -574,8 +574,7 @@ function parseContext(value: unknown): HelpAuthorityValidation | HelpAuthorityCo
       (item.access !== "public" && item.access !== "gated" && item.access !== "operator") ||
       !validCapabilitySet(item.requiredCapabilities) ||
       !validSafeString(item.text, HELP_AUTHORITY_LIMITS.maxContextTextBytes) ||
-      !validSafeString(item.textDigest, 71) ||
-      !DIGEST.test(item.textDigest) ||
+      !validDigestString(item.textDigest) ||
       !validSpan(item.spanStart, 4096) ||
       !validSpan(item.spanEnd, 4096) ||
       item.spanEnd <= item.spanStart ||
@@ -761,11 +760,9 @@ function parseCitations(
       !validSpan(item.spanEnd, 4096) ||
       item.spanEnd <= item.spanStart ||
       !validSafeString(item.quotedText, HELP_AUTHORITY_LIMITS.maxQuotedTextBytes) ||
-      !validSafeString(item.quotedTextHash, 71) ||
-      !DIGEST.test(item.quotedTextHash) ||
+      !validDigestString(item.quotedTextHash) ||
       !validSafeString(item.sourceId, 256) ||
-      !validSafeString(item.sourceSectionDigest, 71) ||
-      !DIGEST.test(item.sourceSectionDigest) ||
+      !validDigestString(item.sourceSectionDigest) ||
       !Array.isArray(item.claimIds) ||
       item.claimIds.length === 0 ||
       item.claimIds.length > HELP_AUTHORITY_LIMITS.maxClaims ||

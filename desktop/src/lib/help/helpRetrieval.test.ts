@@ -232,7 +232,7 @@ describe("Help query redaction", () => {
   });
 
   it("keeps a credential out of retrieval output while still answering the question", () => {
-    const outcome = searchHelpCorpus("my key xai-AbCdEf0123456789AbCdEf stopped working on the gateway");
+    const outcome = searchHelpCorpus("my key xai-AbCdEf0123456789AbCdEf stopped working on the company gateway");
     expect(outcome.redactions.length).toBeGreaterThan(0);
     expect(outcome.query).not.toContain("AbCdEf");
     expect(JSON.stringify(outcome)).not.toContain("AbCdEf");

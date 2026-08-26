@@ -104,7 +104,7 @@ describe("Help React primitives", () => {
 
   it("conveys state through semantics and text, not color", () => {
     render(<Harness />);
-    fireEvent.change(screen.getByLabelText("Search Help"), { target: { value: "computer use" } });
+    fireEvent.change(screen.getByLabelText("Search Help"), { target: { value: "semantic search" } });
     const option = within(screen.getByRole("listbox")).getAllByRole("option")[0]!;
 
     // Selection is aria-selected plus a data attribute, and topic is spelled
