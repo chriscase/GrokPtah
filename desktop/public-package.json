@@ -12,11 +12,19 @@
     "./ui-core": {
       "types": "./types/uiCore.d.ts",
       "import": "./ui-core.js"
+    },
+    "./host": {
+      "browser": null,
+      "worker": null,
+      "types": "./types/host.d.ts",
+      "import": "./grokptah-host.js",
+      "default": null
     }
   },
   "files": [
     "grokptah-public.js",
     "ui-core.js",
+    "grokptah-host.js",
     "types"
   ]
 }
