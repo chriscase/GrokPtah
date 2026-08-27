@@ -15,6 +15,12 @@ export * from "./help";
 // modules are transport-free and grant no capability.
 export * from "./helpAuthority";
 export * from "./helpAnswer";
+// The consumer contract above the authority: one presentation status per
+// retrieval outcome, verified citation spans, capability and access labels
+// that never assert live availability, and the wording for the optional
+// model seam's unknowns and timeout. React-free, so a product with its own
+// visual language renders the same states the desktop Help Center renders.
+export * from "./helpCenterView";
 // The source-cited Help Center corpus is exported under explicit names so the
 // original bounded `searchHelp` contract remains backward compatible while
 // consumers can opt into semantic-ranking and assistant request validation.

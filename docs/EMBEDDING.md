@@ -123,6 +123,15 @@ import {
 } from "@grokptah/client/ui-core";
 ```
 
+The same entry also exposes the Help consumer contract
+(`grokptah.help-center-view.v1`: `helpViewState`, `helpBrowseArticles`,
+`verifyHelpSpans`, `summarizeHelpAnswer`, `describeHelpAskTimeout`), so a
+product with its own visual language renders the same Help states the desktop
+renders — one presentation status per retrieval outcome, verified citation
+spans, capability labels that never assert live availability, and honest
+wording for an optional model seam's unknowns and timeout. See
+[`HELP_CENTER_CONSUMER_CONTRACT.md`](HELP_CENTER_CONSUMER_CONTRACT.md).
+
 The reducer inputs and stream cursors remain host-neutral. A consumer owns its
 rendering, focus management, transport adapter, and approval presentation.
 The generated package now exposes the same headless surface as the

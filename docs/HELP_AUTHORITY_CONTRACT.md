@@ -17,6 +17,7 @@ performs no I/O; and it is Tauri-free so browser bundles can consume it.
 | `desktop/src/lib/helpAuthority.ts` | Canonical corpus, manifest, digest, hybrid retrieval |
 | `desktop/src/lib/helpAnswer.ts` | Optional AI answer seam (request/reply values, no transport) |
 | `desktop/src/lib/helpAuthority.fixtures.ts` | Deterministic retrieval fixtures |
+| `desktop/src/lib/helpCenterView.ts` | Consumer presentation contract (see below) |
 | `desktop/src/lib/help.ts` | Upstream capability-aware corpus (unchanged, still exported) |
 | `desktop/src/lib/helpCenter.ts` | Upstream source-cited corpus (unchanged, still exported) |
 
@@ -214,6 +215,19 @@ if (result.outcome !== "answer") {
   if (answer.ok) await confirmThenSend(answer.request); // your transport
 }
 ```
+
+## Consumers
+
+How a UI is allowed to present these outcomes is a separate contract,
+`grokptah.help-center-view.v1`, specified in
+[`HELP_CENTER_CONSUMER_CONTRACT.md`](HELP_CENTER_CONSUMER_CONTRACT.md). It sits
+above this one and restates none of it: it maps a `HelpRetrievalResult` to one
+mutually exclusive presentation status, re-verifies every citation span before
+it is rendered, labels access and capability without asserting live
+availability, and fixes the wording for the optional seam's unknowns and
+timeout. `desktop/src/components/HelpCenter.tsx` is its reference
+implementation, carrying the focus, keyboard, live-region, and contrast
+behaviour an embedder is expected to match.
 
 ## Boundaries
 

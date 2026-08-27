@@ -6854,6 +6854,378 @@ html[data-accent="violet"] {
   border: 0 !important;
 }
 
+/* ------------------------------------------------------------------ *
+ * Help Center: authority-backed consumer surface
+ *
+ * Every colour below is a token already defined for this theme, checked
+ * against --bg-panel at AA for body text. Meaning is never carried by colour
+ * alone: each state, badge, and capability also carries words.
+ * ------------------------------------------------------------------ */
+
+/* The active option in the combobox listbox. It is named through
+   aria-activedescendant rather than focused, so it needs a visible marker of
+   its own — :focus-visible never fires on it. */
+.help-list-item.is-active {
+  border-color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.help-list-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  align-items: center;
+}
+
+.help-access,
+.help-badge-answer,
+.help-badge-suggestion {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.05rem 0.45rem;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.help-access-public {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.help-access-gated {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.help-access-operator {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.help-badge-answer {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.help-badge-suggestion {
+  color: var(--muted);
+}
+
+/* Retrieval outcome banner. One state is rendered at a time. */
+.help-state {
+  display: grid;
+  gap: 0.3rem;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  padding: 0.7rem 0.85rem;
+  margin-bottom: 0.9rem;
+  background: var(--bg-elevated);
+}
+
+.help-state-answer { border-left-color: var(--ok); }
+.help-state-ambiguous,
+.help-state-low-confidence { border-left-color: var(--accent); }
+.help-state-no-match { border-left-color: var(--muted); }
+.help-state-rejected { border-left-color: var(--danger); }
+.help-state-browse { border-left-color: var(--border); }
+
+.help-state-headline {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.help-state-detail {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.help-state-verdict,
+.help-suggestion-note {
+  margin: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.help-state-verdict code {
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.help-suggestion-note {
+  border-left: 2px solid var(--accent);
+  padding-left: 0.55rem;
+  margin-bottom: 0.6rem;
+}
+
+/* Access, audience, and documented capabilities. */
+.help-labels {
+  display: grid;
+  gap: 0.35rem;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 0.65rem 0.75rem;
+  margin: 0.7rem 0;
+  background: var(--surface-chip);
+}
+
+.help-label-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: baseline;
+  margin: 0;
+  font-size: 11px;
+  color: var(--text);
+}
+
+.help-label-key {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.help-label-detail {
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.help-capabilities {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0.15rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.help-capability {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.15rem 0.45rem;
+  font-size: 10px;
+}
+
+.help-capability-label { color: var(--text); font-weight: 600; }
+.help-capability code { color: var(--tool); font-family: var(--font-mono); }
+
+/* "live: unknown" is the load-bearing half of a capability chip: it is what
+   stops a documented capability from reading as an available one. It is never
+   dimmer than the label it qualifies. */
+.help-capability-live {
+  color: var(--text);
+  font-family: var(--font-mono);
+  border-left: 1px solid var(--border);
+  padding-left: 0.35rem;
+}
+
+.help-capability-note {
+  margin: 0.2rem 0 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text);
+}
+
+.help-passage {
+  display: grid;
+  gap: 0.25rem;
+  margin-bottom: 0.8rem;
+}
+
+.help-passage-sources {
+  margin: 0;
+  font-size: 10px;
+  color: var(--muted);
+}
+
+/* Verified citation spans. */
+.help-citations {
+  display: grid;
+  gap: 0.4rem;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 0.7rem 0.8rem;
+  margin: 0.8rem 0;
+  background: var(--surface-chip);
+}
+
+.help-citations > ul {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.help-citation {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.help-citation-quote {
+  margin: 0;
+  border-left: 2px solid var(--accent);
+  padding-left: 0.55rem;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.help-citation-note,
+.help-citation-meta,
+.help-citation-sources {
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.help-citation-meta { font-family: var(--font-mono); }
+
+.help-citation-note { margin: 0; line-height: 1.4; }
+
+.help-citation-dropped {
+  margin: 0;
+  font-size: 11px;
+  color: var(--danger);
+}
+
+.help-digest {
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+/* Optional model seam. */
+.help-assistant-blocked {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text);
+  border-left: 2px solid var(--accent);
+  padding-left: 0.55rem;
+}
+
+/* A refusal from the seam itself: nothing was sent, and the reason is shown
+   rather than left as a button that appears to do nothing. */
+.help-ask-refused {
+  margin: 0.4rem 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--danger);
+}
+
+.help-ask-refused code {
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.help-ask-pending,
+.help-ask-result {
+  display: grid;
+  gap: 0.3rem;
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  padding: 0.6rem 0.7rem;
+  margin-top: 0.5rem;
+  background: var(--bg-elevated);
+}
+
+.help-ask-pending { border-left-color: var(--accent); }
+.help-ask-answered { border-left-color: var(--ok); }
+.help-ask-declined { border-left-color: var(--muted); }
+.help-ask-timeout,
+.help-ask-failed,
+.help-ask-rejected { border-left-color: var(--danger); }
+
+.help-ask-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+/* Unknowns are shown at reading size, not as fine print: they are the point. */
+.help-ask-unknowns {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+}
+
+.help-answer-confirm {
+  display: grid;
+  gap: 0.5rem;
+  max-width: 34rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem;
+  background: var(--bg-panel);
+  color: var(--text);
+}
+
+.help-answer-confirm p { margin: 0; font-size: 12px; line-height: 1.5; }
+
+.help-answer-bundle {
+  display: grid;
+  gap: 0.2rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.help-answer-bundle code { font-family: var(--font-mono); }
+
+.help-answer-confirm button {
+  min-height: 32px;
+  border-radius: var(--radius);
+}
+
+/* Readers who ask the platform for more contrast get it: secondary text is
+   promoted to full-strength, and every boundary becomes visible. */
+@media (prefers-contrast: more) {
+  .help-center .help-label-detail,
+  .help-center .help-state-verdict,
+  .help-center .help-suggestion-note,
+  .help-center .help-citation-note,
+  .help-center .help-citation-meta,
+  .help-center .help-citation-sources,
+  .help-center .help-passage-sources,
+  .help-center .help-answer-bundle,
+  .help-center .help-badge-suggestion,
+  .help-center .help-result-count,
+  .help-center .help-retrieval-mode,
+  .help-center .help-list-item > span:not(.help-list-topic),
+  .help-center .help-list-item small {
+    color: var(--text);
+  }
+
+  .help-center .help-state,
+  .help-center .help-labels,
+  .help-center .help-citations,
+  .help-center .help-capability,
+  .help-center .help-ask-pending,
+  .help-center .help-ask-result,
+  .help-center .help-list-item {
+    border-color: var(--text);
+  }
+
+  .help-center .help-list-item.is-active,
+  .help-center .help-list-item.is-selected {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+}
+
 @media (max-width: 720px) {
   .help-layout {
     grid-template-columns: 1fr;
@@ -6887,11 +7259,31 @@ html[data-accent="violet"] {
   .help-source-card,
   .help-assistant-card,
   .help-semantic-confirm,
-  .help-assistant-confirm {
+  .help-assistant-confirm,
+  .help-answer-confirm,
+  .help-state,
+  .help-labels,
+  .help-capability,
+  .help-citations,
+  .help-ask-pending,
+  .help-ask-result,
+  .help-access,
+  .help-badge-answer,
+  .help-badge-suggestion {
     border-color: CanvasText;
   }
 
+  /* State is carried by the left rule in colour themes; forced colours drop
+     that hue, so the words in each banner remain the only thing a reader has
+     to rely on. They always say the state in full. */
+  .help-state,
+  .help-ask-pending,
+  .help-ask-result {
+    border-left-color: CanvasText;
+  }
+
   .help-list-item.is-selected,
+  .help-list-item.is-active,
   .help-list-item:hover {
     border-color: Highlight;
     background: Canvas;
@@ -6905,6 +7297,7 @@ html[data-accent="violet"] {
   .help-semantic-confirm button:focus-visible,
   .help-assistant-card button:focus-visible,
   .help-assistant-confirm button:focus-visible,
+  .help-answer-confirm button:focus-visible,
   .help-header > button:focus-visible {
     outline-color: Highlight;
   }

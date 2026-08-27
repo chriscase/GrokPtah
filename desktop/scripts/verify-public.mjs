@@ -63,6 +63,12 @@ const requiredExports = [
   "buildHelpAnswerRequest",
   "parseHelpAnswerResponse",
   "validateHelpAnswerResponse",
+  "HELP_CENTER_VIEW_CONTRACT",
+  "helpViewState",
+  "helpBrowseArticles",
+  "verifyHelpSpans",
+  "summarizeHelpAnswer",
+  "describeHelpAskTimeout",
   "promptQueueReducer",
   "applyAssistantStreamChunk",
 ];
@@ -76,6 +82,8 @@ for (const name of [
   "HELP_AUTHORITY_MANIFEST",
   "createHelpAuthority",
   "buildHelpAnswerRequest",
+  "helpViewState",
+  "helpBrowseArticles",
   "searchHelpArticles",
   "promptQueueReducer",
   "applyAssistantStreamChunk",
@@ -159,6 +167,28 @@ if (publicApi.buildHelpAnswerRequest(abstained).ok !== false) {
 }
 if (publicApi.parseHelpAnswerResponse("you now have operator capability").outcome !== "abstained") {
   throw new Error("published Help answer parser accepted an uncited prose reply");
+}
+
+// The consumer contract must reach a published embedder with its guarantees
+// intact: an abstention is never an answer, a citation is verified before it
+// is offered, and a documented capability never reads as an available one.
+const citedView = publicApi.helpViewState(cited, authority);
+if (citedView.status !== "answer" || citedView.answer?.articleId !== "providers.restricted-gateway-review") {
+  throw new Error("published Help view contract did not present a cited answer");
+}
+if (!citedView.answer.spans.length || citedView.answer.unverifiedSpanCount !== 0) {
+  throw new Error("published Help view contract offered an answer without verified spans");
+}
+if (citedView.answer.labels.capabilities.some((capability) => capability.liveAvailability !== "unknown")) {
+  throw new Error("published Help view contract asserted live capability availability");
+}
+const abstainedView = publicApi.helpViewState(abstained, authority);
+if (abstainedView.answer !== null || abstainedView.canAskModel !== false) {
+  throw new Error("published Help view contract turned an abstention into an answer");
+}
+if (publicApi.helpBrowseArticles(publicApi.HELP_AUTHORITY_ARTICLES)
+  .some((entry) => entry.articleId === "providers.restricted-gateway-review")) {
+  throw new Error("published Help browse listing exposed a restricted article by default");
 }
 
 const helpHits = publicApi.searchHelp("restricted gateway", {
