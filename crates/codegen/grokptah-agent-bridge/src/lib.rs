@@ -7,7 +7,7 @@ mod agents_personas;
 mod auth_store;
 pub mod certification;
 mod completion;
-mod computer_agent;
+pub mod computer_agent;
 pub mod computer_use;
 mod discover;
 pub mod eval_oracle;
@@ -106,7 +106,16 @@ pub use completion::{
     enrich_terminal_handoff, CompletionClaims, CompletionEvidence, CompletionObservations,
     CompletionUsage,
 };
-pub use computer_agent::{ComputerAgentEligibility, ComputerAgentProposal};
+pub use computer_agent::boundary::{
+    normalize_model_response, normalize_with_repair, proposal_fingerprint,
+    render_observation_for_profile, scan_model_text, HostVerification, ModelBoundaryContext,
+    ModelBoundaryRejection, NeedleClass, RawModelPayload, RawModelResponse, RawToolCall,
+    RepairBudget, RepairTurn,
+};
+pub use computer_agent::profile::{ModelBoundaryCeilings, ModelBoundaryProfile, ObservationDetail};
+pub use computer_agent::{
+    ComputerAgentEligibility, ComputerAgentProposal, ComputerProposalRequest,
+};
 pub use computer_use::{
     canonical_workspace_string, project_run_at, ActionClass, ActionGrant, ActionGrantSummary,
     ActionOutcome, ActionOutcomeSummary, ComputerAction, ComputerAuditEntry, ComputerBackend,

@@ -55,5 +55,5 @@ pub use types::{
     ComputerCapabilities, ComputerControlDisposition, ComputerError, ComputerErrorCode,
     ComputerObservation, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
     EvidenceRef, GrantIssuer, ObservationGeometry, PointerButton, SemanticAction, SemanticElement,
-    Sensitivity,
+    Sensitivity, MAX_ID_BYTES, MAX_LABEL_BYTES, MAX_TEXT_ENTRY_BYTES,
 };

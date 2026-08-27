@@ -4,12 +4,15 @@
 //! capture a window, request OS permissions, stage an approval, or execute an
 //! action.
 
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
+use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
-    set_grokptah_home_override, AgentHost, ComputerBackend, ComputerUseLimits, EffortLevel,
-    HostConfig, SimulatorBackend,
+    set_grokptah_home_override, ActionClass, ActionGrant, AgentHost, ComputerBackend,
+    ComputerProposalRequest, ComputerUseLimits, EffortLevel, GrantIssuer, HostConfig,
+    HostVerification, SimulatorBackend,
 };
 use serde::Serialize;
 
@@ -63,12 +66,37 @@ async fn main() -> Result<()> {
         )
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    // The simulator has no durable run behind it, so this proof supplies the
+    // host-verified request the desktop cockpit would otherwise build from a
+    // live Computer Run. Nothing here is dispatched: the proposal is printed
+    // and discarded.
+    let now = Utc::now();
+    let request = ComputerProposalRequest {
+        grant: ActionGrant {
+            grant_id: "live-proof-grant".into(),
+            run_id: "live-computer-model-proof".into(),
+            target: observation.target.clone(),
+            action_classes: BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
+            issued_by: GrantIssuer::LocalUser,
+            issued_at: now - Duration::seconds(1),
+            expires_at: now + Duration::minutes(5),
+            uses_remaining: Some(1),
+            revoked_at: None,
+        },
+        verification: HostVerification::fresh(
+            observation.observation_id.clone(),
+            observation.sequence,
+        ),
+        limits: ComputerUseLimits::default(),
+        seen_fingerprints: BTreeSet::new(),
+        observation,
+    };
     let proposal_started = Instant::now();
     let proposal = host
         .propose_computer_action(
             session.id,
             "Enter Ada Lovelace in the visible Name field. Do not submit yet.",
-            &observation,
+            &request,
         )
         .await?;
     let proposal_ms = proposal_started.elapsed().as_millis();

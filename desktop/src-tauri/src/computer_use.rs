@@ -4,12 +4,12 @@ use std::sync::Arc;
 use base64::Engine;
 use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
-    canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
-    ComputerAgentProposal, ComputerCapabilities, ComputerError, ComputerObservation,
-    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
-    ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
-    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
-    MacOsObservationPlatform, SemanticAction, SimulatorBackend,
+    canonical_workspace_string, proposal_fingerprint, ActionClass, ActionGrant, AgentHostHandle,
+    ComputerAction, ComputerAgentProposal, ComputerCapabilities, ComputerError,
+    ComputerObservation, ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus, ComputerProposalRequest, ComputerRun, ComputerRunProjection,
+    ComputerRunState, ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
+    HostVerification, MacOsObservationPlatform, SemanticAction, SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -74,6 +74,13 @@ pub struct DesktopComputerUse {
     native_services: std::sync::Mutex<HashMap<String, Arc<ComputerUseService>>>,
     simulator_operation: Mutex<()>,
     pending_approval: std::sync::Mutex<Option<PendingComputerApproval>>,
+    /// Proposal fingerprints already accepted for one observation.
+    ///
+    /// A single slot rather than a growing map: a dispatched action
+    /// invalidates the observation, so a repeat is only ever possible against
+    /// the frame still on screen. Rebinding the slot when the observation
+    /// changes is what keeps this from accumulating.
+    proposed_fingerprints: std::sync::Mutex<Option<(String, BTreeSet<String>)>>,
 }
 
 impl DesktopComputerUse {
@@ -106,6 +113,7 @@ impl DesktopComputerUse {
             native_services: std::sync::Mutex::new(HashMap::new()),
             simulator_operation: Mutex::new(()),
             pending_approval: std::sync::Mutex::new(None),
+            proposed_fingerprints: std::sync::Mutex::new(None),
         }
     }
 
@@ -513,13 +521,19 @@ impl DesktopComputerUse {
         self.cockpit_snapshot(owner_session_id)
     }
 
+    /// Everything the host can vouch for before a model is asked anything.
+    ///
+    /// The grant, the observation binding, and the last dispatched action's
+    /// postcondition all come from the durable run record here, so the model
+    /// boundary compares claims against the host's own view rather than
+    /// against anything the model supplied.
     pub fn model_proposal_context(
         &self,
         owner_session_id: Uuid,
         run_id: &str,
         expected_version: u64,
         observation_id: &str,
-    ) -> Result<ComputerObservation, String> {
+    ) -> Result<ComputerProposalRequest, String> {
         if self
             .pending_approval
             .lock()
@@ -532,11 +546,65 @@ impl DesktopComputerUse {
         if run.version != expected_version || run.state != ComputerRunState::Ready {
             return Err("The Computer Run changed before the model request started".into());
         }
-        run.current_observation
+        let grant = run
+            .grant
+            .clone()
+            .ok_or_else(|| "The Computer Run has no live authorization".to_string())?;
+        let observation = run
+            .current_observation
             .filter(|observation| observation.observation_id == observation_id)
             .ok_or_else(|| {
-                "The Computer observation changed before the model request started".into()
-            })
+                "The Computer observation changed before the model request started".to_string()
+            })?;
+        let verification = HostVerification {
+            observation_id: observation.observation_id.clone(),
+            observation_sequence: observation.sequence,
+            last_action_outcome: run.last_outcome,
+        };
+        Ok(ComputerProposalRequest {
+            grant,
+            verification,
+            limits: run.limits,
+            seen_fingerprints: self.fingerprints_for(&observation.observation_id)?,
+            observation,
+        })
+    }
+
+    /// Fingerprints already accepted against one observation.
+    fn fingerprints_for(&self, observation_id: &str) -> Result<BTreeSet<String>, String> {
+        Ok(self
+            .proposed_fingerprints
+            .lock()
+            .map_err(|_| "Computer Use proposal state is unavailable".to_string())?
+            .as_ref()
+            .filter(|(seen_for, _)| seen_for == observation_id)
+            .map(|(_, fingerprints)| fingerprints.clone())
+            .unwrap_or_default())
+    }
+
+    /// Records an accepted proposal, rebinding the slot when the observation
+    /// has moved on.
+    fn record_fingerprint(
+        &self,
+        observation_id: &str,
+        proposal: &ComputerAgentProposal,
+    ) -> Result<(), String> {
+        let mut slot = self
+            .proposed_fingerprints
+            .lock()
+            .map_err(|_| "Computer Use proposal state is unavailable".to_string())?;
+        match slot.as_mut() {
+            Some((seen_for, fingerprints)) if seen_for == observation_id => {
+                fingerprints.insert(proposal_fingerprint(proposal));
+            }
+            _ => {
+                *slot = Some((
+                    observation_id.to_owned(),
+                    BTreeSet::from([proposal_fingerprint(proposal)]),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub async fn apply_model_proposal(
@@ -551,7 +619,7 @@ impl DesktopComputerUse {
         if proposal.observation_id() != observation_id {
             return Err("The model proposal does not match the requested observation".into());
         }
-        match proposal {
+        match &proposal {
             ComputerAgentProposal::Action {
                 action, summary, ..
             } => {
@@ -560,11 +628,12 @@ impl DesktopComputerUse {
                     run_id,
                     expected_version,
                     observation_id,
-                    action,
+                    action.clone(),
                 )?;
+                self.record_fingerprint(observation_id, &proposal)?;
                 Ok(ComputerAgentProposalResult {
                     snapshot,
-                    summary,
+                    summary: summary.clone(),
                     completed: false,
                 })
             }
@@ -583,9 +652,10 @@ impl DesktopComputerUse {
                 service
                     .complete(&Uuid::new_v4().to_string(), run_id, expected_version)
                     .map_err(|error| error.to_string())?;
+                self.record_fingerprint(observation_id, &proposal)?;
                 Ok(ComputerAgentProposalResult {
                     snapshot: self.cockpit_snapshot(owner_session_id)?,
-                    summary,
+                    summary: summary.clone(),
                     completed: true,
                 })
             }
@@ -1083,6 +1153,7 @@ mod tests {
                 native_services: std::sync::Mutex::new(HashMap::new()),
                 simulator_operation: Mutex::new(()),
                 pending_approval: std::sync::Mutex::new(None),
+                proposed_fingerprints: std::sync::Mutex::new(None),
             },
         )
     }
@@ -1218,6 +1289,72 @@ mod tests {
             )
             .await;
         assert!(stale.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_model_request_carries_the_hosts_own_view_not_the_models() {
+        let (_dir, desktop) = test_desktop();
+        let owner = Uuid::new_v4();
+        let target = SimulatorBackend::demo_target();
+        let started = desktop
+            .start_simulator(owner, &target.app_id)
+            .await
+            .unwrap();
+        let run = started.run.unwrap();
+        let observation = run.current_observation.as_ref().unwrap().clone();
+
+        let request = desktop
+            .model_proposal_context(owner, &run.run_id, run.version, &observation.observation_id)
+            .unwrap();
+        assert_eq!(
+            request.observation.observation_id,
+            observation.observation_id
+        );
+        assert_eq!(
+            request.verification.observation_id,
+            observation.observation_id
+        );
+        assert_eq!(
+            request.verification.observation_sequence,
+            observation.sequence
+        );
+        // Nothing has been dispatched, so there is no postcondition to claim.
+        // This is what makes an unearned `complete` fail at the boundary.
+        assert!(request.verification.last_action_outcome.is_none());
+        assert_eq!(request.grant.run_id, run.run_id);
+        assert!(request.seen_fingerprints.is_empty());
+
+        // An accepted proposal is remembered for exactly this frame, so a
+        // repeat of it is recognizable as a repeat rather than as progress.
+        let proposal = ComputerAgentProposal::Action {
+            observation_id: observation.observation_id.clone(),
+            action: ComputerAction::SetValue {
+                element_id: format!("{}-name", observation.observation_id),
+                text: "Ada Lovelace".into(),
+            },
+            summary: "Enter the visible name".into(),
+        };
+        desktop
+            .apply_model_proposal(
+                owner,
+                &run.run_id,
+                run.version,
+                &observation.observation_id,
+                proposal.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            desktop
+                .fingerprints_for(&observation.observation_id)
+                .unwrap(),
+            BTreeSet::from([proposal_fingerprint(&proposal)])
+        );
+        // A different frame starts from nothing rather than inheriting it.
+        assert!(desktop
+            .fingerprints_for("some-other-observation")
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

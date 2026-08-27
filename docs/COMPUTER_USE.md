@@ -175,7 +175,74 @@ deterministic simulator. Its report is redacted and explicitly records that no a
 | Duplicate/concurrent model requests | One Computer model operation may run per session |
 | Stop, Take over, or run change during inference | The request is cancelled; any late proposal fails run/version/observation revalidation |
 | Completion with hidden action arguments | Unknown or action-bearing completion fields are rejected |
+| Repeated key smuggling a second value | Object keys are parsed strictly; any repeat is refused at any depth |
+| Truncated or length-stopped output | An incomplete response is never treated as a prefix of a valid one |
+| Model "done" with no host evidence | Completion needs a positive host postcondition on the exact frame |
 | Valid action proposal | It is staged visibly and still requires the same local one-use approval as a manual action |
+
+### Strict model-output adapter and adaptive profiles
+
+Small local models and frontier models share one contract and differ only in budget.
+`computer_agent::boundary` is the single place an untrusted model response becomes either a
+`ComputerAgentProposal` or a typed `ModelBoundaryRejection`. There is no partial acceptance: a
+response that is not exactly one schema-valid semantic action bound to the exact fresh
+observation is refused whole.
+
+The adapter is a **pre-filter, not a replacement**. `computer_use::policy` still revalidates
+target, grant, freshness, sensitivity, and geometry immediately before dispatch. The adapter
+exists so a cheap model's noise never reaches the kernel, the operator, or the screen.
+
+What it refuses, each as its own assertable reason: prose and fenced JSON blocks; silence;
+truncated and provider-length-stopped output; malformed JSON; repeated object keys at any depth;
+unknown fields; missing or mistyped fields; unknown actions; the kernel's own operator-only
+actions (`key_chord`, `pointer_click`, `wait`); argument sets that do not match the named action;
+bounded arguments past the profile or run ceiling; injection-shaped, path-, URL-, credential-,
+clipboard-, and network-bearing model-authored text; control characters and bidirectional
+overrides; stale frames; a fingerprint already proposed for that frame; unobserved, disabled, or
+sensitive elements; unadvertised actions; expired, revoked, exhausted, mismatched, or missing
+grants; host evidence that does not bind to the frame; and completion claims without positive
+postcondition evidence.
+
+Freshness is checked twice on purpose. The adapter refuses a frame already past the run's
+`maxObservationAgeMillis`, and `computer_use::policy` checks the same age again immediately
+before dispatch. Checking it early means a slow model turn is refused outright instead of
+becoming an operator approval prompt for an action that can no longer be dispatched.
+
+Numbers are never coerced: a fractional or stringified delta is refused rather than rounded or
+parsed. Explicit JSON `null` for an unused optional argument is normalized to absent, because it
+is security-equivalent to omitting the key and every small model emits it.
+
+Repair rounds carry only a fixed, content-free sentence per reason, so a retry cannot become an
+oracle for probing the boundary. A repair is spent only on a *format* failure; a refusal that is a
+fact about the world (dead grant, stale frame, unverifiable completion, exceeded budget) ends the
+turn immediately.
+
+| Profile | Context detail | Elements / bytes | Prompt / completion tokens | Turn budget | Repairs | Text entry | Scroll | Host verification |
+|---|---|---|---|---|---|---|---|---|
+| `Efficient` | semantic only | 48 / 24 KiB | 8 000 / 512 | 20 s | 1 | 1 KiB | ±2 000 | **required** |
+| `Balanced` | semantic + geometry | 256 / 128 KiB | 32 000 / 2 048 | 60 s | 2 | 4 KiB | ±10 000 | optional |
+| `Frontier` | semantic + redacted evidence reference | 1 024 / 512 KiB | 128 000 / 4 096 | 120 s | 3 | 16 KiB | ±10 000 | optional |
+
+`Efficient` is the `Default` and the profile for any model without a durable provider capability,
+including one that only passed this process's simulator qualification. It is semantic-only — no
+screenshot bytes, no raw accessibility tree, no geometry — allows one repair, and refuses to
+propose anything at all when the host supplies no independent verification of the frame.
+`Balanced` and `Frontier` come from a durable `semantic_act` and `visual_fallback_act` capability
+respectively.
+
+No profile ever admits screenshot bytes, an evidence asset token, a content hash, or a host path.
+An observation over a profile's element or byte ceiling is **refused, not trimmed**: a silently
+trimmed frame would let the model act on a view the operator never saw. Every profile's ceilings
+are proven to only narrow `ComputerUseLimits::ceiling()`, and a run's own stricter limit narrows
+the profile further.
+
+Completion is never taken on the model's word in any profile. It requires the host's own
+`expected_postcondition_met == Some(true)` against the exact current observation; an uncertain
+outcome and a failed one are both refusals.
+
+`computer_agent::fixtures` supplies deterministic fake small-model and frontier responses — prose,
+fenced JSON, truncation, duplicate keys, invented arguments, needle-bearing text, false completion
+— so the boundary is exercised without any provider call, credential, or clock read.
 
 ## macOS observation and semantic action slices (#269, #270)
 

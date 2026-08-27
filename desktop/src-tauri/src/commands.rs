@@ -900,7 +900,7 @@ pub async fn computer_use_cockpit_propose_agent_action(
     objective: String,
 ) -> Result<crate::computer_use::ComputerAgentProposalResult, String> {
     let owner = computer_owner(&state, &session_id)?;
-    let observation = state.computer_use.model_proposal_context(
+    let request = state.computer_use.model_proposal_context(
         owner,
         &run_id,
         expected_version,
@@ -908,7 +908,7 @@ pub async fn computer_use_cockpit_propose_agent_action(
     )?;
     let proposal = state
         .host
-        .propose_computer_action(owner, &objective, &observation)
+        .propose_computer_action(owner, &objective, &request)
         .await
         .map_err(map_err)?;
     state

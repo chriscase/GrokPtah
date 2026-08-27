@@ -1049,11 +1049,15 @@ impl AgentHostHandle {
 
     /// Ask the selected, qualified model for one bounded semantic proposal.
     /// This method cannot dispatch an OS action.
+    ///
+    /// The caller supplies the whole host-verified request: the exact frame,
+    /// the live grant, its own verification of both, and the fingerprints
+    /// already proposed in this run. Nothing here is inferred from the model.
     pub async fn propose_computer_action(
         &self,
         session_id: Uuid,
         objective: &str,
-        observation: &crate::computer_use::ComputerObservation,
+        request: &crate::computer_agent::ComputerProposalRequest,
     ) -> Result<ComputerAgentProposal> {
         let (_operation_id, cancel, _guard) = self.begin_computer_agent_operation(session_id)?;
         let (model, effort) = self.selected_computer_model(session_id)?;
@@ -1072,12 +1076,20 @@ impl AgentHostHandle {
         if !durable_authority && !session_authority {
             bail!("selected model is not qualified for semantic Computer actions");
         }
+        // Without a durable provider capability the only thing this model has
+        // proved is that it satisfies the local deterministic simulator, which
+        // is exactly the small-model case: hold it to the strictest ceilings.
+        let profile = crate::computer_agent::profile::ModelBoundaryProfile::for_authority(
+            resolved.eligibility.tier,
+            durable_authority,
+        );
         let proposal = propose_semantic_action(
             &credentials,
             &model,
             effort,
+            profile,
             objective,
-            observation,
+            request,
             &cancel,
         )
         .await
