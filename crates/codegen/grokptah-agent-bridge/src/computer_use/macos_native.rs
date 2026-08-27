@@ -721,7 +721,12 @@ mod tests {
         assert!(shim.contains("GPT_MAC_INTERRUPTED"));
         assert!(shim.contains("GPT_MAC_UNCERTAIN_OUTCOME"));
         assert!(shim.contains("GPTCaptureUserInteractionState"));
-        assert!(shim.contains("CGEventGetLocation"));
+        // The before/after interaction fence samples the pointer through
+        // AppKit. Reading it with `CGEventGetLocation` requires creating a
+        // CGEvent, which pulls in the global-input-injection family the
+        // release gate forbids, so both halves are pinned here.
+        assert!(shim.contains("NSEvent.mouseLocation"));
+        assert!(!shim.contains("CGEventGetLocation"));
         assert!(shim.contains("measured_background"));
         assert!(shim.contains("AXUIElementPerformAction"));
         assert!(shim.contains("AXUIElementSetAttributeValue"));

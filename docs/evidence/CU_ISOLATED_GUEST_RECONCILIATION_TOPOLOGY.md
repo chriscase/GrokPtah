@@ -120,6 +120,20 @@ boundary this branch adds.
 | `mcp_continuity_probe::continuity_probe_is_evidence_first_and_recoverable` | `continuity probe harness timed out` after 98s | Reproduced identically on clean `404ea3c2`. Installing the harness's npm dependencies does not change it. MCP continuity lane, not packaged Computer Use |
 | 6 × `grokptah-service` `always_on_grokbot` tests | all six panic with `unknown tool ptah_set_managed_execution` | The tool exists in the bridge (`mcp_control.rs`) but the hosted service does not expose it. That is an always-on lane gap; no service production code is touched here |
 
+## 5b. Two macOS-only failures the repaired jobs then exposed
+
+Fixing the earlier steps let the bridge test suite run on macOS for the first
+time on this branch: **787 passed, 2 failed**, with fmt and clippy clean.
+
+| Test | Cause | Repair |
+| --- | --- | --- |
+| `macos_native::…::native_shim_exposes_semantic_accessibility_without_raw_input` | **Self-inflicted.** The test pins the shim's API surface and asserted `shim.contains("CGEventGetLocation")`. Replacing the CGEvent pointer read broke that assertion — the donor in fact held a contradiction, since the release gate simultaneously banned the `CGEventCreate` needed to obtain the event | pin the new mechanism instead: assert `NSEvent.mouseLocation` is present **and** `CGEventGetLocation` is absent, so it cannot drift back |
+| `isolated_visual_artifacts::…::writable_handles_wrong_modes_and_sparse_oversize_fail_closed` | Pre-existing and root-dependent. The setup opens a `0o500` file read-write; that succeeds only for a user who bypasses the permission check. This container runs as **uid 0**, so it passed locally and failed as an ordinary macOS CI user with `EACCES`, before the assertion was reached | chmod the fixture to `0o700` first. What is under test is that a writable *handle* is refused, not whether the process could obtain one |
+
+The first is the one genuinely introduced here. A sweep for the same
+root-dependent pattern elsewhere in the crate found no other case: the other
+restrictive fixtures use `0o400`/`0o422`, both of which keep owner read.
+
 ## 5a. CI status
 
 Three checks were red on the pull request. Each was diagnosed to its first
