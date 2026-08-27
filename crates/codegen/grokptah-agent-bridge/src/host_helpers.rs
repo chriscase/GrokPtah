@@ -426,9 +426,20 @@ pub(crate) struct AgentToolCall {
 const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: u32 = 16;
 const NUDGE_AFTER_IDENTICAL_TOOL_CALLS: u32 = 8;
 const MAX_CONSECUTIVE_TRUE_NOOPS: u32 = 4;
+/// Ceiling for a repeat that is *also* observably inert: the same call
+/// signature returning the same observation.
+///
+/// Deliberately below every other ceiling. This threshold can only ever stop a
+/// turn sooner than the existing ones would have; it never extends one.
+const MAX_CONSECUTIVE_INERT_REPEATS: u32 = 4;
 
 const _: () = assert!(NUDGE_AFTER_IDENTICAL_TOOL_CALLS < MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS);
 const _: () = assert!(MAX_CONSECUTIVE_TRUE_NOOPS < NUDGE_AFTER_IDENTICAL_TOOL_CALLS);
+// The inert ceiling must never exceed any existing ceiling, or this would
+// become a way to run *longer* than the current gate allows. Enforced at
+// compile time so the relation cannot be edited away silently.
+const _: () = assert!(MAX_CONSECUTIVE_INERT_REPEATS <= MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS);
+const _: () = assert!(MAX_CONSECUTIVE_INERT_REPEATS <= MAX_CONSECUTIVE_TRUE_NOOPS);
 
 /// Tracks action stationarity within one model turn (#209).
 ///
@@ -442,6 +453,13 @@ pub(crate) struct IdenticalToolCallRun {
     run_len: u32,
     is_true_noop_run: bool,
     nudged: bool,
+    /// Digest of the observation the previous identical call produced.
+    last_observation: Option<u64>,
+    /// Consecutive rounds where the call signature *and* its observation both
+    /// repeated. This is what separates a stuck loop from a productive wait:
+    /// polling that keeps returning fresh output is not inert, and keeps the
+    /// full identical-call budget it has today.
+    inert_run_len: u32,
 }
 
 impl IdenticalToolCallRun {
@@ -463,6 +481,8 @@ impl IdenticalToolCallRun {
             self.last_signature_hash = Some(hash);
             self.is_true_noop_run = is_true_noop;
             self.nudged = false;
+            self.last_observation = None;
+            self.inert_run_len = 0;
         }
         self.tool_name = tool_name.to_string();
         self.run_len
@@ -481,6 +501,30 @@ impl IdenticalToolCallRun {
 
     pub(crate) fn tool_name(&self) -> String {
         self.tool_name.clone()
+    }
+
+    /// Record what the round's tool calls actually produced.
+    ///
+    /// Called after [`Self::observe`] for the same round, once the tool results
+    /// are in the wire context. An observation that differs from the previous
+    /// one means something outside the model moved, so the inert run restarts.
+    pub(crate) fn observe_outcome(&mut self, observation: u64) {
+        if self.last_observation == Some(observation) {
+            self.inert_run_len = self.inert_run_len.saturating_add(1);
+        } else {
+            self.inert_run_len = 1;
+        }
+        self.last_observation = Some(observation);
+    }
+
+    /// The tighter stop: the same call returning the same observation.
+    ///
+    /// Checked before [`Self::stop_info`], and never instead of it — this can
+    /// only fire earlier than the identical-call ceiling, so no turn that stops
+    /// today survives longer because of it.
+    pub(crate) fn inert_stop_info(&self) -> Option<(u32, String)> {
+        (self.inert_run_len >= MAX_CONSECUTIVE_INERT_REPEATS)
+            .then(|| (self.inert_run_len, self.tool_name.clone()))
     }
 
     pub(crate) fn stop_info(&self) -> Option<(u32, String, bool)> {
@@ -545,6 +589,58 @@ pub(crate) fn action_stationarity_stop_message(
         "Stopped after {run_len} consecutive {reason} (`{tool_name}`) without making progress. \
          Ask me to continue with a different approach."
     )
+}
+
+/// Stop message for an observably inert repeat.
+///
+/// Shares the `Stopped after ... without making progress.` shape of
+/// [`action_stationarity_stop_message`] so the existing incomplete-stop
+/// detection classifies it without modification, while still saying plainly
+/// that the observation never changed.
+pub(crate) fn action_inert_repeat_stop_message(run_len: u32, tool_name: &str) -> String {
+    format!(
+        "Stopped after {run_len} consecutive identical tool calls (`{tool_name}`) that each \
+         returned the same result, without making progress. Ask me to continue with a \
+         different approach."
+    )
+}
+
+/// Digest of the observations this round's tool calls produced.
+///
+/// Walks back over the trailing tool results, stopping at the model boundary
+/// that issued them, so only this round's observations are hashed. Returns
+/// `None` when the round produced no tool result to compare, which keeps the
+/// inert run from advancing on nothing.
+pub(crate) fn round_observation_digest(messages: &[serde_json::Value]) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+
+    let mut contents: Vec<&str> = Vec::new();
+    for message in messages.iter().rev() {
+        match message.get("role").and_then(serde_json::Value::as_str) {
+            Some("tool") => {
+                contents.push(
+                    message
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                );
+            }
+            // Host-authored coaching is interleaved with results and is not an
+            // observation; skip it without ending the round.
+            Some("system") => {}
+            // Anything else is the boundary that issued these calls.
+            _ => break,
+        }
+    }
+    if contents.is_empty() {
+        return None;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for content in contents.iter().rev() {
+        content.hash(&mut hasher);
+        0xffu8.hash(&mut hasher);
+    }
+    Some(hasher.finish())
 }
 
 pub(crate) enum AgentStep {
@@ -4267,5 +4363,223 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
         assert!(stationarity.contains("true no-op tool calls"));
         assert!(!is_round_limit_stop_message(&stationarity));
         assert!(round_limit_stop_message(4).contains("tool rounds without a final answer"));
+    }
+
+    // ---- observably inert repeats (productive wait vs stuck loop) ----
+
+    fn tool_msg(content: &str) -> serde_json::Value {
+        serde_json::json!({"role": "tool", "tool_call_id": "c", "content": content})
+    }
+
+    /// Drive one round: the model issues `sig`, and the tools return `observed`.
+    fn round(run: &mut IdenticalToolCallRun, sig: &str, observed: &str) {
+        run.observe(sig, "get_task_output", false);
+        let messages = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg(observed),
+        ];
+        let digest = round_observation_digest(&messages).expect("round produced a result");
+        run.observe_outcome(digest);
+    }
+
+    #[test]
+    fn an_inert_repeat_stops_before_the_identical_call_ceiling() {
+        let mut run = IdenticalToolCallRun::default();
+        for _ in 1..MAX_CONSECUTIVE_INERT_REPEATS {
+            round(&mut run, "poll", "same output");
+        }
+        assert!(run.inert_stop_info().is_none(), "must not stop early");
+
+        round(&mut run, "poll", "same output");
+        let (run_len, tool_name) = run.inert_stop_info().expect("inert repeat must stop");
+        assert_eq!(run_len, MAX_CONSECUTIVE_INERT_REPEATS);
+        assert_eq!(tool_name, "get_task_output");
+        // It fired strictly before the pre-existing identical-call ceiling,
+        // which has not been reached yet.
+        assert!(run.run_len() < MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS);
+        assert!(run.stop_info().is_none());
+    }
+
+    #[test]
+    fn a_productive_wait_keeps_the_budget_it_already_had() {
+        let mut run = IdenticalToolCallRun::default();
+        // The same poll, but the world keeps moving underneath it.
+        for i in 0..MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS {
+            round(&mut run, "poll", &format!("built {i} of many"));
+            assert!(
+                run.inert_stop_info().is_none(),
+                "a wait with fresh output is not inert at step {i}"
+            );
+        }
+        // The existing identical-call gate is untouched and still fires.
+        assert_eq!(run.run_len(), MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS);
+        assert!(run.stop_info().is_some());
+    }
+
+    #[test]
+    fn one_fresh_observation_restarts_the_inert_run() {
+        let mut run = IdenticalToolCallRun::default();
+        round(&mut run, "poll", "same");
+        round(&mut run, "poll", "same");
+        round(&mut run, "poll", "same");
+        // Something outside finally moved.
+        round(&mut run, "poll", "progress!");
+        assert!(run.inert_stop_info().is_none());
+        // And it takes a full fresh inert run to trip again: the first round
+        // after the change only re-seeds the comparison.
+        for _ in 1..MAX_CONSECUTIVE_INERT_REPEATS {
+            round(&mut run, "poll", "stuck again");
+        }
+        assert!(
+            run.inert_stop_info().is_none(),
+            "a restarted inert run must not inherit the old count"
+        );
+        round(&mut run, "poll", "stuck again");
+        assert!(run.inert_stop_info().is_some());
+    }
+
+    #[test]
+    fn a_different_action_resets_the_inert_run() {
+        let mut run = IdenticalToolCallRun::default();
+        for _ in 0..MAX_CONSECUTIVE_INERT_REPEATS {
+            round(&mut run, "poll", "same");
+        }
+        assert!(run.inert_stop_info().is_some());
+        round(&mut run, "a different call", "same");
+        assert!(
+            run.inert_stop_info().is_none(),
+            "a new action is not a continuation of an inert run"
+        );
+    }
+
+    #[test]
+    fn the_inert_gate_can_only_stop_sooner_than_the_existing_gate() {
+        // The guarantee that this change weakens nothing, asserted on behavior
+        // rather than on the constants: for an identical repeating call, the
+        // round at which the inert gate fires is never later than the round at
+        // which the pre-existing identical-call gate fires.
+        let mut inert = IdenticalToolCallRun::default();
+        let mut existing = IdenticalToolCallRun::default();
+        let mut inert_stop_round = None;
+        let mut existing_stop_round = None;
+
+        for step in 1..=MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS {
+            round(&mut inert, "poll", "same output");
+            existing.observe("poll", "get_task_output", false);
+            if inert_stop_round.is_none() && inert.inert_stop_info().is_some() {
+                inert_stop_round = Some(step);
+            }
+            if existing_stop_round.is_none() && existing.stop_info().is_some() {
+                existing_stop_round = Some(step);
+            }
+        }
+
+        let inert_stop = inert_stop_round.expect("an inert run must stop");
+        let existing_stop = existing_stop_round.expect("the existing gate must still stop");
+        assert!(
+            inert_stop <= existing_stop,
+            "inert gate fired at {inert_stop} but the existing gate fired at {existing_stop}"
+        );
+    }
+
+    #[test]
+    fn an_inert_stop_reads_as_an_incomplete_turn_not_a_round_limit() {
+        let msg = action_inert_repeat_stop_message(4, "get_task_output");
+        assert!(is_incomplete_stop_message(&msg));
+        assert!(!is_round_limit_stop_message(&msg));
+        assert!(msg.contains("returned the same result"));
+    }
+
+    #[test]
+    fn a_round_digest_covers_only_the_current_round() {
+        let earlier = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("OLD"),
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("NEW"),
+        ];
+        let only_new = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("NEW"),
+        ];
+        assert_eq!(
+            round_observation_digest(&earlier),
+            round_observation_digest(&only_new),
+            "a prior round's results must not leak into this round's digest"
+        );
+    }
+
+    #[test]
+    fn a_round_digest_ignores_interleaved_host_coaching() {
+        let plain = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("result"),
+        ];
+        let coached = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            serde_json::json!({"role": "system", "content": "coaching text"}),
+            tool_msg("result"),
+        ];
+        assert_eq!(
+            round_observation_digest(&plain),
+            round_observation_digest(&coached),
+            "host-authored coaching is not an observation"
+        );
+    }
+
+    #[test]
+    fn a_round_digest_distinguishes_different_results() {
+        let a = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("alpha"),
+        ];
+        let b = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("beta"),
+        ];
+        assert_ne!(round_observation_digest(&a), round_observation_digest(&b));
+    }
+
+    #[test]
+    fn a_round_with_no_tool_result_yields_no_observation() {
+        let messages = vec![serde_json::json!({"role": "assistant", "content": "text only"})];
+        assert!(round_observation_digest(&messages).is_none());
+    }
+
+    #[test]
+    fn multi_call_rounds_are_order_sensitive() {
+        let forward = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("one"),
+            tool_msg("two"),
+        ];
+        let reversed = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("two"),
+            tool_msg("one"),
+        ];
+        assert_ne!(
+            round_observation_digest(&forward),
+            round_observation_digest(&reversed)
+        );
+    }
+
+    #[test]
+    fn concatenation_cannot_forge_an_identical_observation() {
+        // "ab" + "c" must not digest the same as "a" + "bc".
+        let split_a = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("ab"),
+            tool_msg("c"),
+        ];
+        let split_b = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("a"),
+            tool_msg("bc"),
+        ];
+        assert_ne!(
+            round_observation_digest(&split_a),
+            round_observation_digest(&split_b)
+        );
     }
 }

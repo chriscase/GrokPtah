@@ -23,8 +23,8 @@ use crate::computer_agent::{
 use crate::event_bus::{session_id_of, JournalPage};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
-    action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
-    auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
+    action_inert_repeat_stop_message, action_stationarity_nudge, action_stationarity_stop_message,
+    api_context_messages, auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
     call_xai_agent_step_observed, call_xai_chat, cargo_test_failure_coaching,
     cargo_test_output_failed, cargo_test_output_passed, cargo_test_reverify_coaching,
     coding_agent_tools, count_cargo_test_failures, emit_message, emit_thought,
@@ -33,7 +33,7 @@ use crate::host_helpers::{
     multi_failure_partial_edit_coaching, normalize_sandbox_profile, offline_plan_steps,
     parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model, push_assistant,
     push_thought, push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
-    round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
+    round_limit_stop_message, round_observation_digest, sandbox_blocks_shell, sandbox_is_readonly,
     should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
     surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
     IdenticalToolCallRun, McpToolIndex,
@@ -8501,6 +8501,23 @@ impl AgentHostHandle {
             // Give an explicit steering prompt one model boundary to break a
             // stationary run before applying the automatic stop.
             if steering_count == 0 {
+                // An observably inert repeat stops before the identical-call
+                // ceiling. A wait whose observation keeps changing is not inert
+                // and still gets the full budget it has today.
+                if let Some((run_len, tool_name)) = identical_tool_calls.inert_stop_info() {
+                    let msg = action_inert_repeat_stop_message(run_len, &tool_name);
+                    self.mark_run_stop(session_id, RunStopCause::Stationarity, "stationarity")?;
+                    let _ = event_tx.send(SessionUpdate::AgentProgress {
+                        session_id,
+                        round: round as u32,
+                        max_rounds: visible_max_rounds as u32,
+                        last_tool: Some(tool_name),
+                        detail: msg.clone(),
+                    });
+                    emit_message(event_tx, session_id, &msg);
+                    push_assistant(self, session_id, &msg);
+                    return Ok(msg);
+                }
                 if let Some((run_len, tool_name, true_noop)) = identical_tool_calls.stop_info() {
                     let msg = action_stationarity_stop_message(run_len, &tool_name, true_noop);
                     self.mark_run_stop(session_id, RunStopCause::Stationarity, "stationarity")?;
@@ -9028,6 +9045,12 @@ impl AgentHostHandle {
                         tool_name,
                         is_true_noop_tool_step(&tool_calls),
                     );
+                    // The tool results for this round are already in the wire
+                    // context here, so the same call returning the same result
+                    // is detectable without waiting another boundary.
+                    if let Some(observation) = round_observation_digest(&messages) {
+                        identical_tool_calls.observe_outcome(observation);
+                    }
                     // Usage belongs to the model boundary that produced these
                     // calls. Let every tool in that accepted response settle,
                     // then stop here so the final loop exit cannot overwrite a
