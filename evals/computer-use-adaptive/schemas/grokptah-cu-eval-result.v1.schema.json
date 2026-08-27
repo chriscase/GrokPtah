@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokptah:schema:cu-eval-result:v1",
+  "title": "GrokPtah Computer Use adaptive evaluation episode result v1",
+  "description": "One synthetic or live episode. Cost and model-quality fields are null unless an authoritative provider receipt exists. Fake adapters must not populate cost.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "episodeId",
+    "scenarioId",
+    "family",
+    "variant",
+    "profile",
+    "adapter",
+    "repetition",
+    "seed",
+    "providerCalls",
+    "eligibility",
+    "outcomeClass",
+    "taskSuccess",
+    "metrics",
+    "safety",
+    "evidenceRef"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "grokptah.cu_eval_episode_result.v1" },
+    "episodeId": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "scenarioId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "family": { "type": "string" },
+    "variant": { "type": "string" },
+    "profile": { "type": "string", "enum": ["economy", "balanced", "high_assurance"] },
+    "adapter": { "type": "string" },
+    "repetition": { "type": "integer", "minimum": 0 },
+    "seed": { "type": "integer", "minimum": 0 },
+    "providerCalls": { "type": "integer", "minimum": 0 },
+    "eligibility": {
+      "type": "string",
+      "enum": ["synthetic_only", "live_reusable_schema", "live_authoritative"],
+      "description": "synthetic_only never implies live eligibility. live_reusable_schema means the same schema was used without weakening fake-vs-live rules. live_authoritative requires providerCalls>0 and an authoritative receipt."
+    },
+    "outcomeClass": {
+      "type": "string",
+      "enum": ["success", "abstain", "escalate", "fail_closed", "uncertain", "no_progress"]
+    },
+    "taskSuccess": { "type": "boolean" },
+    "metrics": { "$ref": "#/$defs/metrics" },
+    "safety": { "$ref": "#/$defs/safety" },
+    "evidenceRef": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "expectedOutcome": {
+      "type": "string",
+      "enum": ["success", "abstain", "escalate", "fail_closed", "uncertain", "no_progress"]
+    },
+    "expectedTaskSuccess": { "type": "boolean" },
+    "fixtureMatch": { "type": "boolean" }
+  },
+  "$defs": {
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unauthorizedDispatches",
+        "invalidActions",
+        "staleActionAttempts",
+        "abstentions",
+        "escalations",
+        "postconditionFailures",
+        "physicalDispatches",
+        "observationBytes",
+        "imageBytes",
+        "modelInputUnits",
+        "modelOutputUnits",
+        "latencyVirtualMs",
+        "costUsd",
+        "recoveryConvergedAfterTwoRestarts",
+        "modelInputUnitsKind",
+        "latencyKind"
+      ],
+      "properties": {
+        "unauthorizedDispatches": { "type": "integer", "minimum": 0 },
+        "invalidActions": { "type": "integer", "minimum": 0 },
+        "staleActionAttempts": { "type": "integer", "minimum": 0 },
+        "abstentions": { "type": "integer", "minimum": 0 },
+        "escalations": { "type": "integer", "minimum": 0 },
+        "postconditionFailures": { "type": "integer", "minimum": 0 },
+        "physicalDispatches": { "type": "integer", "minimum": 0 },
+        "observationBytes": { "type": "integer", "minimum": 0 },
+        "imageBytes": { "type": "integer", "minimum": 0 },
+        "modelInputUnits": { "type": "integer", "minimum": 0 },
+        "modelOutputUnits": { "type": "integer", "minimum": 0 },
+        "latencyVirtualMs": { "type": "integer", "minimum": 0 },
+        "costUsd": { "type": ["number", "null"] },
+        "recoveryConvergedAfterTwoRestarts": { "type": ["boolean", "null"] },
+        "modelInputUnitsKind": {
+          "type": "string",
+          "enum": ["compact_observation_bytes", "provider_tokenizer_tokens"]
+        },
+        "latencyKind": {
+          "type": "string",
+          "enum": ["virtual_clock_ms", "wall_clock_ms"]
+        }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["violation", "codes"],
+      "properties": {
+        "violation": { "type": "boolean" },
+        "codes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

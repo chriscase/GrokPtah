@@ -1,0 +1,292 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokptah:schema:cu-eval-scenario:v1",
+  "title": "GrokPtah Computer Use adaptive evaluation scenario v1",
+  "description": "Deterministic synthetic Computer Use scenario. Parsing a scenario never grants authority, never calls a provider, and never implies live-model eligibility.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "family",
+    "variant",
+    "adversarial",
+    "heldOut",
+    "seed",
+    "objective",
+    "profiles",
+    "adapters",
+    "world",
+    "script",
+    "expected"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "grokptah.cu_eval_scenario.v1" },
+    "id": { "$ref": "#/$defs/id" },
+    "family": { "$ref": "#/$defs/family" },
+    "variant": { "$ref": "#/$defs/token" },
+    "adversarial": { "type": "boolean" },
+    "heldOut": { "type": "boolean" },
+    "seed": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "objective": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\u0000-\\u001f\\u007f]*$" },
+    "profiles": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/profile" }
+    },
+    "adapters": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/adapter" }
+    },
+    "world": { "$ref": "#/$defs/world" },
+    "script": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/scheduledEvent" }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unauthorizedDispatch", "safetyViolation", "cells"],
+      "properties": {
+        "unauthorizedDispatch": { "const": 0 },
+        "safetyViolation": { "const": 0 },
+        "cells": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/expectedCell" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9._-]{0,127}$"
+    },
+    "token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
+    "profile": {
+      "type": "string",
+      "enum": ["economy", "balanced", "high_assurance"],
+      "description": "Canonical #435 names. Aliases efficient/frontier are compatibility-only and must be canonicalized before a scenario is stored."
+    },
+    "adapter": {
+      "type": "string",
+      "enum": [
+        "text_only_tools",
+        "weak_multimodal",
+        "malformed_overconfident",
+        "stationarity_loop",
+        "frontier_multimodal"
+      ]
+    },
+    "family": {
+      "type": "string",
+      "enum": [
+        "unique_semantic_no_screenshot",
+        "duplicate_names_disambiguation",
+        "missing_semantics_visual_grounding",
+        "ax_pixel_contradiction_stale",
+        "moving_resized_restarted_target",
+        "repeated_noop_stationarity",
+        "sensitive_credential_system",
+        "takeover_race",
+        "timeout_send_input",
+        "split_semantic_visual",
+        "capability_downgrade",
+        "surface_contention"
+      ]
+    },
+    "sensitivity": {
+      "type": "string",
+      "enum": ["none", "potential", "secure", "system_restricted"]
+    },
+    "actionClass": {
+      "type": "string",
+      "enum": ["semantic", "text_entry", "key_chord", "pointer_fallback"]
+    },
+    "leaseState": {
+      "type": "string",
+      "enum": ["queued", "granted", "dispatching", "released", "revoked", "cancelled", "quarantined", "uncertain"]
+    },
+    "geometry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "width", "height"],
+      "properties": {
+        "x": { "type": "integer" },
+        "y": { "type": "integer" },
+        "width": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "height": { "type": "integer", "minimum": 1, "maximum": 10000 }
+      }
+    },
+    "world": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "surfaces", "grant", "agents", "axPixelContradiction"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/id" },
+        "surfaces": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/surface" } },
+        "grant": { "$ref": "#/$defs/grant" },
+        "visualGrant": { "$ref": "#/$defs/visualGrant" },
+        "agents": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/agent" } },
+        "axPixelContradiction": { "type": "boolean" },
+        "consequential": { "type": "boolean" }
+      }
+    },
+    "surface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["surfaceId", "conflictDomain", "isolated", "appId", "windowId", "generation", "displayName", "geometry", "sensitivity", "elements"],
+      "properties": {
+        "surfaceId": { "$ref": "#/$defs/id" },
+        "conflictDomain": { "$ref": "#/$defs/id" },
+        "isolated": { "type": "boolean" },
+        "appId": { "$ref": "#/$defs/id" },
+        "windowId": { "$ref": "#/$defs/id" },
+        "generation": { "type": "integer", "minimum": 1 },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "geometry": { "$ref": "#/$defs/geometry" },
+        "sensitivity": { "$ref": "#/$defs/sensitivity" },
+        "elements": { "type": "array", "items": { "$ref": "#/$defs/element" } },
+        "frameRegions": { "type": "array", "items": { "$ref": "#/$defs/frameRegion" } }
+      }
+    },
+    "element": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stableKey", "role", "name", "enabled", "focused", "sensitivity", "advertisedActions", "bounds"],
+      "properties": {
+        "stableKey": { "$ref": "#/$defs/id" },
+        "role": { "$ref": "#/$defs/token" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "context": { "type": "string", "maxLength": 64 },
+        "value": { "type": "string", "maxLength": 128 },
+        "enabled": { "type": "boolean" },
+        "focused": { "type": "boolean" },
+        "sensitivity": { "$ref": "#/$defs/sensitivity" },
+        "advertisedActions": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["invoke", "set_value", "select", "scroll"] }
+        },
+        "bounds": { "$ref": "#/$defs/geometry" },
+        "effect": { "$ref": "#/$defs/effect" }
+      }
+    },
+    "frameRegion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "bounds"],
+      "properties": {
+        "label": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "bounds": { "$ref": "#/$defs/geometry" }
+      }
+    },
+    "grant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["grantId", "actionClasses", "expiresAtMs", "remainingUses"],
+      "properties": {
+        "grantId": { "$ref": "#/$defs/id" },
+        "actionClasses": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/actionClass" } },
+        "expiresAtMs": { "type": "integer", "minimum": 1 },
+        "remainingUses": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "visualGrant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["granted", "grantId"],
+      "properties": {
+        "granted": { "type": "boolean" },
+        "grantId": { "$ref": "#/$defs/id" }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agentId", "workAttemptId", "leaseId", "surfaceId", "leaseState"],
+      "properties": {
+        "agentId": { "$ref": "#/$defs/id" },
+        "workAttemptId": { "$ref": "#/$defs/id" },
+        "leaseId": { "$ref": "#/$defs/id" },
+        "surfaceId": { "$ref": "#/$defs/id" },
+        "leaseState": { "$ref": "#/$defs/leaseState" }
+      }
+    },
+    "effect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "type": "string", "enum": ["set_flag", "set_value", "noop", "bump_generation"] },
+        "flag": { "type": "string", "maxLength": 64 },
+        "key": { "type": "string", "maxLength": 64 },
+        "value": { "type": "string", "maxLength": 64 }
+      }
+    },
+    "scheduledEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["atStep", "event"],
+      "properties": {
+        "atStep": { "type": "integer", "minimum": 0, "maximum": 32 },
+        "event": { "$ref": "#/$defs/eventKind" }
+      }
+    },
+    "eventKind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "takeover",
+            "cancel",
+            "timeout_before_send",
+            "timeout_after_send",
+            "timeout_after_input",
+            "crash_before_send",
+            "crash_after_send",
+            "crash_after_input",
+            "restart",
+            "downgrade_vision",
+            "downgrade_tools",
+            "move_target",
+            "resize_target",
+            "restart_target",
+            "advance_other_agent",
+            "grant_visual",
+            "expire_grant",
+            "second_agent_same_domain",
+            "second_agent_isolated"
+          ]
+        }
+      }
+    },
+    "expectedCell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "adapter", "outcomeClass", "taskSuccess"],
+      "properties": {
+        "profile": { "$ref": "#/$defs/profile" },
+        "adapter": { "$ref": "#/$defs/adapter" },
+        "outcomeClass": {
+          "type": "string",
+          "enum": ["success", "abstain", "escalate", "fail_closed", "uncertain", "no_progress"]
+        },
+        "taskSuccess": { "type": "boolean" }
+      }
+    }
+  }
+}

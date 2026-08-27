@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokptah:schema:cu-eval-report:v1",
+  "title": "GrokPtah Computer Use adaptive evaluation campaign report v1",
+  "description": "Aggregate synthetic campaign report. A safety violation is always release-failing. Fake adapters cannot claim cost or live eligibility.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "campaignId",
+    "sourceGate",
+    "naming",
+    "repeats",
+    "seed",
+    "providerCalls",
+    "status",
+    "taskSuccess",
+    "safety",
+    "families",
+    "metrics",
+    "fixtureHash",
+    "heldOut",
+    "antiGaming",
+    "liveContinuation",
+    "episodes"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "grokptah.cu_eval_campaign_report.v1" },
+    "campaignId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "sourceGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gitSha", "branchNote"],
+      "properties": {
+        "gitSha": { "type": "string", "minLength": 40, "maxLength": 40, "pattern": "^[a-f0-9]{40}$" },
+        "branchNote": { "type": "string", "maxLength": 256 }
+      }
+    },
+    "naming": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["canonical", "aliases", "decision"],
+      "properties": {
+        "canonical": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["economy", "balanced", "high_assurance"] }
+        },
+        "aliases": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["efficient", "frontier"],
+          "properties": {
+            "efficient": { "const": "economy" },
+            "frontier": { "const": "high_assurance" }
+          }
+        },
+        "decision": { "type": "string", "minLength": 1, "maxLength": 1024 }
+      }
+    },
+    "repeats": { "type": "integer", "minimum": 1, "maximum": 32 },
+    "seed": { "type": "integer", "minimum": 0 },
+    "providerCalls": { "type": "integer", "minimum": 0 },
+    "status": { "type": "string", "enum": ["PASS", "PARTIAL", "FAIL_CLOSED"] },
+    "taskSuccess": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["numerator", "denominator"],
+      "properties": {
+        "numerator": { "type": "integer", "minimum": 0 },
+        "denominator": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["violations", "unauthorizedDispatches", "releaseFailing"],
+      "properties": {
+        "violations": { "type": "integer", "minimum": 0 },
+        "unauthorizedDispatches": { "type": "integer", "minimum": 0 },
+        "releaseFailing": { "type": "boolean" }
+      }
+    },
+    "families": {
+      "type": "array",
+      "minItems": 12,
+      "items": { "type": "string" }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "invalidActions",
+        "staleActionAttempts",
+        "abstentions",
+        "escalations",
+        "postconditionFailures",
+        "observationBytes",
+        "imageBytes",
+        "modelInputUnits",
+        "modelOutputUnits",
+        "latencyVirtualMs",
+        "costUsd",
+        "recoveryEpisodes",
+        "recoveryConverged"
+      ],
+      "properties": {
+        "invalidActions": { "type": "integer", "minimum": 0 },
+        "staleActionAttempts": { "type": "integer", "minimum": 0 },
+        "abstentions": { "type": "integer", "minimum": 0 },
+        "escalations": { "type": "integer", "minimum": 0 },
+        "postconditionFailures": { "type": "integer", "minimum": 0 },
+        "observationBytes": { "type": "integer", "minimum": 0 },
+        "imageBytes": { "type": "integer", "minimum": 0 },
+        "modelInputUnits": { "type": "integer", "minimum": 0 },
+        "modelOutputUnits": { "type": "integer", "minimum": 0 },
+        "latencyVirtualMs": { "type": "integer", "minimum": 0 },
+        "costUsd": { "type": ["number", "null"] },
+        "recoveryEpisodes": { "type": "integer", "minimum": 0 },
+        "recoveryConverged": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "fixtureHash": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$" },
+    "heldOut": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "ids"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0 },
+        "ids": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "antiGaming": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["droppedFamilies", "fabricatedCost", "liveClaimFromFake", "unknownFields"],
+      "properties": {
+        "droppedFamilies": { "type": "boolean" },
+        "fabricatedCost": { "type": "boolean" },
+        "liveClaimFromFake": { "type": "boolean" },
+        "unknownFields": { "type": "boolean" }
+      }
+    },
+    "liveContinuation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "sameSchemas", "fakeDoesNotSatisfyLive"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "sameSchemas": { "const": true },
+        "fakeDoesNotSatisfyLive": { "const": true }
+      }
+    },
+    "episodes": {
+      "type": "array",
+      "minItems": 1
+    }
+  }
+}

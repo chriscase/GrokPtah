@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokptah:schema:cu-eval-evidence:v1",
+  "title": "GrokPtah Computer Use adaptive evaluation evidence v1",
+  "description": "Redacted reproducible evidence. No credentials, raw screenshots of real displays, host paths, grant secrets, or provider tokens.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "evidenceId",
+    "scenarioId",
+    "profile",
+    "adapter",
+    "observationIds",
+    "dispatchIds",
+    "authority",
+    "trace",
+    "redacted"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "grokptah.cu_eval_evidence.v1" },
+    "evidenceId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "scenarioId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "profile": { "type": "string", "enum": ["economy", "balanced", "high_assurance"] },
+    "adapter": { "type": "string" },
+    "observationIds": { "type": "array", "items": { "type": "string" } },
+    "dispatchIds": { "type": "array", "items": { "type": "string" } },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "grantId", "leaseIds", "visualGrantId"],
+      "properties": {
+        "runId": { "type": "string" },
+        "grantId": { "type": "string" },
+        "leaseIds": { "type": "array", "items": { "type": "string" } },
+        "visualGrantId": { "type": ["string", "null"] }
+      }
+    },
+    "trace": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["step", "clockMs", "kind", "detail"],
+        "properties": {
+          "step": { "type": "integer", "minimum": 0 },
+          "clockMs": { "type": "integer", "minimum": 0 },
+          "kind": { "type": "string" },
+          "detail": { "type": "string", "maxLength": 256 }
+        }
+      }
+    },
+    "redacted": { "const": true }
+  }
+}
