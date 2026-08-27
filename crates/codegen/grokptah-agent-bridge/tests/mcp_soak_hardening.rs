@@ -548,6 +548,7 @@ fn soak_restart_recovery_matrix() {
         final_response: Some("partial finalization".into()),
         error_code: None,
         stop_cause: None,
+        stop_detail: None,
         aggregates: Default::default(),
         progress: None,
         execution: None,

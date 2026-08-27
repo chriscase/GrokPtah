@@ -49,8 +49,8 @@ use crate::orchestration::{
     ContinuationTestInput, MissedRunPolicy, OrchStore, PromotionState, RoutineConcurrencyPolicy,
     RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger,
     RunAggregates, RunBounds, RunExecution, RunExecutionMode, RunPurpose, RunRecord, RunState,
-    RunStopCause, WorkAttemptView, WorkItem, WorkItemSnapshot, WorkPolicy, WorkTemplate,
-    DEFAULT_AGENT_TOOL_IDS,
+    RunStopCause, RunStopDetail, RunStopDetailKind, WorkAttemptView, WorkItem, WorkItemSnapshot,
+    WorkPolicy, WorkTemplate, DEFAULT_AGENT_TOOL_IDS,
 };
 use crate::permission::{
     evaluate_tool_gate, PendingPermissionView, PermissionDecision, PermissionRequest, ToolGate,
@@ -466,11 +466,27 @@ impl RunUsageTracker {
             .flatten()
     }
 
-    fn mark_host_stop(&self, cause: RunStopCause, code: &str) -> Result<()> {
+    /// Record a stop together with its structured qualifier.
+    ///
+    /// The cause and code are written exactly as before; the detail is purely
+    /// additive, so a stop that carries no detail is indistinguishable from one
+    /// recorded before this field existed.
+    fn mark_host_stop_detailed(
+        &self,
+        cause: RunStopCause,
+        code: &str,
+        detail: Option<RunStopDetail>,
+    ) -> Result<()> {
+        // A malformed detail must never block recording the stop itself: the
+        // cause is the fail-closed signal and takes priority over its label.
+        let detail = detail.filter(|detail| detail.validate().is_ok());
         self.store
             .update_run(&self.run_id, |run| {
                 run.error_code = Some(code.into());
                 run.stop_cause = Some(cause);
+                if detail.is_some() {
+                    run.stop_detail = detail.clone();
+                }
                 run.updated_at = Utc::now();
                 Ok(())
             })?
@@ -2524,6 +2540,7 @@ impl AgentHostHandle {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: RunAggregates::default(),
             progress: None,
             execution,
@@ -4226,8 +4243,18 @@ impl AgentHostHandle {
     }
 
     fn mark_run_stop(&self, session_id: Uuid, cause: RunStopCause, code: &str) -> Result<()> {
+        self.mark_run_stop_detailed(session_id, cause, code, None)
+    }
+
+    fn mark_run_stop_detailed(
+        &self,
+        session_id: Uuid,
+        cause: RunStopCause,
+        code: &str,
+        detail: Option<RunStopDetail>,
+    ) -> Result<()> {
         if let Some(tracker) = self.run_usage_trackers.lock().get(&session_id).cloned() {
-            tracker.mark_host_stop(cause, code)?;
+            tracker.mark_host_stop_detailed(cause, code, detail)?;
         }
         Ok(())
     }
@@ -8506,7 +8533,17 @@ impl AgentHostHandle {
                 // and still gets the full budget it has today.
                 if let Some((run_len, tool_name)) = identical_tool_calls.inert_stop_info() {
                     let msg = action_inert_repeat_stop_message(run_len, &tool_name);
-                    self.mark_run_stop(session_id, RunStopCause::Stationarity, "stationarity")?;
+                    let mut detail = RunStopDetail::new(RunStopDetailKind::InertRepeat, run_len)
+                        .with_tool(tool_name.clone());
+                    if let Some(digest) = identical_tool_calls.observation_digest() {
+                        detail = detail.with_observation_digest(digest);
+                    }
+                    self.mark_run_stop_detailed(
+                        session_id,
+                        RunStopCause::Stationarity,
+                        "stationarity",
+                        Some(detail),
+                    )?;
                     let _ = event_tx.send(SessionUpdate::AgentProgress {
                         session_id,
                         round: round as u32,
@@ -8520,7 +8557,17 @@ impl AgentHostHandle {
                 }
                 if let Some((run_len, tool_name, true_noop)) = identical_tool_calls.stop_info() {
                     let msg = action_stationarity_stop_message(run_len, &tool_name, true_noop);
-                    self.mark_run_stop(session_id, RunStopCause::Stationarity, "stationarity")?;
+                    let kind = if true_noop {
+                        RunStopDetailKind::TrueNoop
+                    } else {
+                        RunStopDetailKind::IdenticalCalls
+                    };
+                    self.mark_run_stop_detailed(
+                        session_id,
+                        RunStopCause::Stationarity,
+                        "stationarity",
+                        Some(RunStopDetail::new(kind, run_len).with_tool(tool_name.clone())),
+                    )?;
                     let _ = event_tx.send(SessionUpdate::AgentProgress {
                         session_id,
                         round: round as u32,
@@ -11414,6 +11461,7 @@ mod tests {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: RunAggregates::default(),
             progress: None,
             execution: None,
@@ -11875,6 +11923,7 @@ mod tests {
             final_response: Some("Continue by implementing deterministic recovery.".into()),
             error_code: None,
             stop_cause: Some(RunStopCause::Completed),
+            stop_detail: None,
             aggregates: RunAggregates {
                 changes: vec![crate::orchestration::ChangeRecord {
                     path: "src/recovery.rs".into(),
@@ -12021,6 +12070,7 @@ mod tests {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: RunAggregates::default(),
             progress: None,
             execution: None,
@@ -12313,6 +12363,7 @@ mod tests {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: RunAggregates::default(),
             progress: None,
             execution: None,
@@ -12406,6 +12457,7 @@ mod tests {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: RunAggregates::default(),
             progress: None,
             execution: None,

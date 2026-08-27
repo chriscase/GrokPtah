@@ -217,6 +217,7 @@ fn service_store_seed(
             final_response: None,
             error_code: Some("interrupted".into()),
             stop_cause: None,
+            stop_detail: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,

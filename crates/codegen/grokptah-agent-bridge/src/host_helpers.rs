@@ -454,7 +454,7 @@ pub(crate) struct IdenticalToolCallRun {
     is_true_noop_run: bool,
     nudged: bool,
     /// Digest of the observation the previous identical call produced.
-    last_observation: Option<u64>,
+    last_observation: Option<String>,
     /// Consecutive rounds where the call signature *and* its observation both
     /// repeated. This is what separates a stuck loop from a productive wait:
     /// polling that keeps returning fresh output is not inert, and keeps the
@@ -508,13 +508,19 @@ impl IdenticalToolCallRun {
     /// Called after [`Self::observe`] for the same round, once the tool results
     /// are in the wire context. An observation that differs from the previous
     /// one means something outside the model moved, so the inert run restarts.
-    pub(crate) fn observe_outcome(&mut self, observation: u64) {
-        if self.last_observation == Some(observation) {
+    pub(crate) fn observe_outcome(&mut self, observation: String) {
+        if self.last_observation.as_deref() == Some(observation.as_str()) {
             self.inert_run_len = self.inert_run_len.saturating_add(1);
         } else {
             self.inert_run_len = 1;
         }
         self.last_observation = Some(observation);
+    }
+
+    /// The digest that the current inert run is repeating, for the durable
+    /// stop detail. Safe to persist: it is derived from content-free features.
+    pub(crate) fn observation_digest(&self) -> Option<String> {
+        self.last_observation.clone()
     }
 
     /// The tighter stop: the same call returning the same observation.
@@ -605,25 +611,74 @@ pub(crate) fn action_inert_repeat_stop_message(run_len: u32, tool_name: &str) ->
     )
 }
 
-/// Digest of the observations this round's tool calls produced.
+/// Content-free features of one tool result.
 ///
-/// Walks back over the trailing tool results, stopping at the model boundary
-/// that issued them, so only this round's observations are hashed. Returns
-/// `None` when the round produced no tool result to compare, which keeps the
-/// inert run from advancing on nothing.
-pub(crate) fn round_observation_digest(messages: &[serde_json::Value]) -> Option<u64> {
-    use std::hash::{Hash, Hasher};
+/// These are aggregate statistics, never the bytes themselves. They are what
+/// distinguishes a poll whose output is growing from one that is frozen,
+/// without the digest ever being a function of the payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservationFeatures {
+    bytes: u64,
+    lines: u64,
+    /// Count of each ASCII digit `0`-`9`.
+    ///
+    /// A plain digit *count* is not enough: `"built 0 of many"` and
+    /// `"built 1 of many"` have the same length, the same line count, and the
+    /// same number of digits, so a counter advancing inside a fixed-width
+    /// progress line would read as inert and cut a live poll short. The
+    /// per-digit histogram separates them while staying an aggregate that
+    /// cannot be inverted back into the text.
+    digit_histogram: [u32; 10],
+    empty: bool,
+}
 
-    let mut contents: Vec<&str> = Vec::new();
+impl ObservationFeatures {
+    fn of(content: &str) -> Self {
+        let mut digit_histogram = [0u32; 10];
+        for ch in content.chars() {
+            if let Some(value) = ch.to_digit(10) {
+                let slot = &mut digit_histogram[value as usize];
+                *slot = slot.saturating_add(1);
+            }
+        }
+        Self {
+            bytes: content.len() as u64,
+            lines: content.lines().count() as u64,
+            digit_histogram,
+            empty: content.trim().is_empty(),
+        }
+    }
+}
+
+/// Deterministic digest of the observations this round's tool calls produced.
+///
+/// Three properties matter and are each tested:
+///
+/// - **Deterministic and durable.** SHA-256, not `DefaultHasher`, whose output
+///   is explicitly not stable across Rust releases. This digest is persisted on
+///   the stop detail, so a toolchain bump must not change it.
+/// - **Content-free.** Only aggregate features are hashed: byte length, line
+///   count, digit count, emptiness. No prompt, model response, tool argument,
+///   path, credential, or payload byte reaches the hasher, so the stored digest
+///   cannot be brute-forced back into output.
+/// - **Round-scoped.** Walks back over trailing tool results and stops at the
+///   model boundary that issued them, skipping host-authored coaching, which is
+///   not an observation.
+///
+/// Returns `None` when the round produced no tool result to compare, which
+/// keeps an inert run from advancing on nothing.
+pub(crate) fn round_observation_digest(messages: &[serde_json::Value]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut features: Vec<ObservationFeatures> = Vec::new();
     for message in messages.iter().rev() {
         match message.get("role").and_then(serde_json::Value::as_str) {
             Some("tool") => {
-                contents.push(
-                    message
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or(""),
-                );
+                let content = message
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                features.push(ObservationFeatures::of(content));
             }
             // Host-authored coaching is interleaved with results and is not an
             // observation; skip it without ending the round.
@@ -632,15 +687,29 @@ pub(crate) fn round_observation_digest(messages: &[serde_json::Value]) -> Option
             _ => break,
         }
     }
-    if contents.is_empty() {
+    if features.is_empty() {
         return None;
     }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for content in contents.iter().rev() {
-        content.hash(&mut hasher);
-        0xffu8.hash(&mut hasher);
+
+    let mut hasher = Sha256::new();
+    // Domain separation, so this digest can never collide with another
+    // sha256 use in the store.
+    hasher.update(b"grokptah.observation.v1\n");
+    hasher.update((features.len() as u64).to_be_bytes());
+    for feature in features.iter().rev() {
+        hasher.update(feature.bytes.to_be_bytes());
+        hasher.update(feature.lines.to_be_bytes());
+        for count in feature.digit_histogram {
+            hasher.update(count.to_be_bytes());
+        }
+        hasher.update([u8::from(feature.empty)]);
     }
-    Some(hasher.finish())
+    let mut out = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        use std::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+    }
+    Some(out)
 }
 
 pub(crate) enum AgentStep {
@@ -4548,20 +4617,102 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
 
     #[test]
     fn multi_call_rounds_are_order_sensitive() {
+        // Order is encoded, so two results whose features differ cannot be
+        // swapped without changing the digest.
         let forward = vec![
             serde_json::json!({"role": "assistant", "content": ""}),
-            tool_msg("one"),
-            tool_msg("two"),
+            tool_msg("short"),
+            tool_msg("a much longer result"),
         ];
         let reversed = vec![
             serde_json::json!({"role": "assistant", "content": ""}),
-            tool_msg("two"),
-            tool_msg("one"),
+            tool_msg("a much longer result"),
+            tool_msg("short"),
         ];
         assert_ne!(
             round_observation_digest(&forward),
             round_observation_digest(&reversed)
         );
+    }
+
+    #[test]
+    fn a_counter_advancing_inside_a_fixed_width_line_is_not_inert() {
+        // The regression that motivated the digit histogram: a build poll whose
+        // line keeps its shape while its counter moves is real progress, and
+        // must not be mistaken for a frozen result.
+        let mut previous: Option<String> = None;
+        for i in 0..10 {
+            let messages = vec![
+                serde_json::json!({"role": "assistant", "content": ""}),
+                tool_msg(&format!("built {i} of many")),
+            ];
+            let digest = round_observation_digest(&messages).expect("digest");
+            assert_ne!(
+                previous.as_deref(),
+                Some(digest.as_str()),
+                "step {i} looks inert but the counter advanced"
+            );
+            previous = Some(digest);
+        }
+    }
+
+    #[test]
+    fn same_shape_results_are_known_to_be_indistinguishable() {
+        // Documented limitation, asserted rather than hidden. The digest is
+        // content-free by construction, so two different results with identical
+        // length, line count, digit histogram, and emptiness collide. The
+        // consequence is bounded: such a run stops at the inert ceiling with a
+        // truthful "no observable progress" message instead of at the higher
+        // identical-call ceiling. It can never run longer than today.
+        let a = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("one"),
+        ];
+        let b = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("two"),
+        ];
+        assert_eq!(
+            round_observation_digest(&a),
+            round_observation_digest(&b),
+            "if this ever differs the limitation has been fixed; update the docs"
+        );
+    }
+
+    #[test]
+    fn the_digest_is_a_stable_hex_sha256_not_a_process_local_hash() {
+        // The digest is persisted on the durable stop detail, so it has to be
+        // reproducible across processes and toolchain versions. `DefaultHasher`
+        // is explicitly not stable across Rust releases; SHA-256 is.
+        let messages = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg("stable"),
+        ];
+        let digest = round_observation_digest(&messages).expect("digest");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            Some(digest),
+            round_observation_digest(&messages),
+            "the digest must be deterministic for identical input"
+        );
+    }
+
+    #[test]
+    fn the_digest_never_contains_observation_text() {
+        // A digest that is persisted and shown to operators must not carry the
+        // output it summarizes.
+        let secret = "AKIAIOSFODNN7EXAMPLE /home/someone/.ssh/id_ed25519 hunter2";
+        let messages = vec![
+            serde_json::json!({"role": "assistant", "content": ""}),
+            tool_msg(secret),
+        ];
+        let digest = round_observation_digest(&messages).expect("digest");
+        for fragment in ["AKIA", "id_ed25519", "hunter2", "/home/someone"] {
+            assert!(!digest.contains(fragment), "digest leaked {fragment}");
+        }
+        // Only hex, so no substring of any payload can survive.
+        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]

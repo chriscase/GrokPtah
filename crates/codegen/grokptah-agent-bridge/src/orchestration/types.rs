@@ -64,6 +64,102 @@ pub enum RunStopCause {
     Failed,
 }
 
+/// Which flavour of a host-decided stop fired.
+///
+/// This is a qualifier on [`RunStopCause`], never a replacement for it. The
+/// cause remains the single terminal authority; this only records the shape of
+/// the evidence so an operator does not have to read prose to tell a model that
+/// is repeating itself from one that is repeating itself and getting nowhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStopDetailKind {
+    /// The same call signature repeated to the identical-call ceiling.
+    IdenticalCalls,
+    /// A `true` no-op chain.
+    TrueNoop,
+    /// The same call *and* the same observation: nothing outside moved.
+    InertRepeat,
+}
+
+impl RunStopDetailKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IdenticalCalls => "identical_calls",
+            Self::TrueNoop => "true_noop",
+            Self::InertRepeat => "inert_repeat",
+        }
+    }
+}
+
+/// Maximum length of the bounded tool label carried on a stop detail.
+pub const MAX_STOP_DETAIL_TOOL_BYTES: usize = 128;
+
+/// Durable, operator-readable qualifier for a host-decided stop.
+///
+/// Every field is a counter, an enum, a bounded tool *name*, or a digest. It
+/// carries no prompt, model response, tool arguments, path, credential, or raw
+/// payload, so it is safe on a redacted read surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunStopDetail {
+    pub kind: RunStopDetailKind,
+    /// Consecutive repeats observed when the stop fired.
+    pub repeats: u32,
+    /// Bounded tool name only. Never arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Hex SHA-256 over content-free observation features. Present only for an
+    /// inert repeat, where an unchanged observation is the evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_digest: Option<String>,
+}
+
+impl RunStopDetail {
+    pub fn new(kind: RunStopDetailKind, repeats: u32) -> Self {
+        Self {
+            kind,
+            repeats,
+            tool: None,
+            observation_digest: None,
+        }
+    }
+
+    pub fn with_tool(mut self, tool: impl Into<String>) -> Self {
+        let tool = tool.into();
+        self.tool = Some(
+            crate::textutil::truncate_at_char_boundary(&tool, MAX_STOP_DETAIL_TOOL_BYTES)
+                .to_string(),
+        );
+        self
+    }
+
+    pub fn with_observation_digest(mut self, digest: impl Into<String>) -> Self {
+        self.observation_digest = Some(digest.into());
+        self
+    }
+
+    /// Reject anything that could smuggle content onto the read surface.
+    pub fn validate(&self) -> Result<(), OrchError> {
+        if let Some(tool) = self.tool.as_deref() {
+            if tool.is_empty() || tool.len() > MAX_STOP_DETAIL_TOOL_BYTES {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "stop detail tool label is empty or exceeds its bound",
+                ));
+            }
+        }
+        if let Some(digest) = self.observation_digest.as_deref() {
+            if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "stop detail observation digest must be hex sha256",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunBounds {
@@ -464,6 +560,10 @@ pub struct RunRecord {
     pub error_code: Option<String>,
     #[serde(default)]
     pub stop_cause: Option<RunStopCause>,
+    /// Structured qualifier for `stop_cause`. Optional so records written
+    /// before this field existed still load unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_detail: Option<RunStopDetail>,
     /// Durable per-run aggregates for journal rollover (#196 residual).
     #[serde(default)]
     pub aggregates: RunAggregates,

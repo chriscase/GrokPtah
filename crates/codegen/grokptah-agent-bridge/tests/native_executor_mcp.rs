@@ -409,6 +409,7 @@ fn run_record(
         final_response: None,
         error_code: None,
         stop_cause: None,
+        stop_detail: None,
         aggregates: Default::default(),
         progress: None,
         execution: None,

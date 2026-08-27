@@ -13,7 +13,8 @@ use axum::{Json, Router};
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
     hash_payload, AgentModelSpec, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
-    RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist,
+    RunExecutionMode, RunRecord, RunState, RunStopCause, RunStopDetail, RunStopDetailKind,
+    WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     discovered_tool_names, model_selection_key, set_grokptah_home_override, start_control_server,
@@ -1079,6 +1080,7 @@ fn restart_interrupted_no_auto_resume() {
         final_response: None,
         error_code: None,
         stop_cause: None,
+        stop_detail: None,
         aggregates: Default::default(),
         progress: None,
         execution: None,
@@ -1122,6 +1124,7 @@ fn restart_clears_queued_admission_position() {
         final_response: None,
         error_code: None,
         stop_cause: None,
+        stop_detail: None,
         aggregates: Default::default(),
         progress: None,
         execution: None,
@@ -1184,6 +1187,7 @@ async fn interrupted_run_retry_is_explicit_linked_and_idempotent() {
             final_response: None,
             error_code: Some("interrupted".into()),
             stop_cause: None,
+            stop_detail: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,
@@ -1871,6 +1875,7 @@ fn run_event_pages_filter_before_limit_across_sessions() {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: Default::default(),
             progress: None,
             execution: None,
@@ -2616,6 +2621,78 @@ async fn dropping_control_service_releases_pending_admission_slot() {
         .unwrap();
     set_grokptah_home_override(None);
     std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn the_progress_projection_is_redacted_and_reports_the_stop_detail() {
+    let (home, _lock) = setup_home();
+    let host = started_host();
+    let ws = tempdir().unwrap();
+    host.set_project_cwd(ws.path()).unwrap();
+    let session = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(session.id, ws.path()).unwrap();
+    let orch = orch_for(&host, &home, &ws, 2);
+    let auth = orch.auth_header(Some("Bearer t")).unwrap();
+
+    let secret_prompt = "SENSITIVE-PROMPT /home/someone/.ssh/id_ed25519 hunter2";
+    let accepted = orch
+        .submit_task(
+            &auth,
+            "redaction-1",
+            session.id,
+            ws.path(),
+            secret_prompt.into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let run_id = accepted["runId"].as_str().unwrap().to_string();
+
+    // Label the stop exactly as the turn path does.
+    orch.store()
+        .update_run(&run_id, |run| {
+            run.stop_cause = Some(RunStopCause::Stationarity);
+            run.stop_detail = Some(
+                RunStopDetail::new(RunStopDetailKind::InertRepeat, 4)
+                    .with_tool("get_task_output")
+                    .with_observation_digest("c".repeat(64)),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    let progress = orch.get_progress(&auth, &run_id).unwrap();
+    let encoded = serde_json::to_string(&progress).unwrap();
+
+    // The user's own prompt must not ride along on a status read.
+    assert!(
+        progress.get("promptPreview").is_none(),
+        "progress projection still exposes promptPreview"
+    );
+    for leak in ["SENSITIVE-PROMPT", "/home/someone", "id_ed25519", "hunter2"] {
+        assert!(!encoded.contains(leak), "progress projection leaked {leak}");
+    }
+
+    // What it does carry is the structured, operator-readable stop.
+    assert_eq!(progress["stopCause"], "stationarity");
+    assert_eq!(progress["stopDetail"]["kind"], "inert_repeat");
+    assert_eq!(progress["stopDetail"]["repeats"], 4);
+    assert_eq!(progress["stopDetail"]["tool"], "get_task_output");
+    // Lifecycle and bounds remain readable.
+    assert!(progress.get("state").is_some());
+    assert!(progress["bounds"]["maxRounds"].is_number());
+
+    orch.cancel(
+        &auth,
+        "redaction-cancel",
+        session.id,
+        ws.path(),
+        Some(&run_id),
+    )
+    .await
+    .unwrap();
+    set_grokptah_home_override(None);
 }
 
 #[tokio::test]

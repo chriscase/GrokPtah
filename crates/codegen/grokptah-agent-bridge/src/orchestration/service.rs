@@ -5038,6 +5038,19 @@ impl OrchestrationService {
         self.progress_value(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
+    /// Redacted lifecycle/status projection.
+    ///
+    /// Deliberately carries no user or model content. `promptPreview` used to
+    /// be echoed here; it is the user's own prompt text and has no bearing on
+    /// lifecycle, so it is gone. Callers that legitimately need it still read
+    /// the full record through `ptah_get_run` / `ptah_list_runs`, which is
+    /// where the desktop inspector already gets it.
+    ///
+    /// What remains is bounded and safe: identity, lifecycle state, queue and
+    /// busy status, journal range, the declared bounds, the host-decided stop
+    /// cause plus its structured detail, and `progress`, whose `detail` field
+    /// is host-authored template text (`"Model step 3/24"`, `` "Tool `x`" ``),
+    /// never model prose or tool output.
     fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
         self.refresh_queue_position(&mut run);
         let busy = self.host.session_busy(run.session_id);
@@ -5049,12 +5062,12 @@ impl OrchestrationService {
             "busy": busy,
             "startSeq": run.start_seq,
             "endSeq": run.end_seq,
-            "promptPreview": run.prompt_preview,
             "progress": run.progress,
             "createdAt": run.created_at,
             "updatedAt": run.updated_at,
             "terminalResult": run.terminal_result,
             "stopCause": run.stop_cause,
+            "stopDetail": run.stop_detail,
             "bounds": run.bounds,
             "errorCode": run.error_code,
         }))
@@ -6846,6 +6859,7 @@ impl OrchestrationService {
             final_response: None,
             error_code: None,
             stop_cause: None,
+            stop_detail: None,
             aggregates: RunAggregates::default(),
             progress: None,
             execution: None,
