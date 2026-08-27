@@ -26,9 +26,14 @@ execution hosts and multiple clients over the same authority-scoped workflow:
    application with sessions, streaming replies, permissions, plan mode,
    files/git, persistent agents, remote runs, MCP/plugins/skills, Help Center,
    and a multi-tab terminal.
-2. **Headless service (local, private host, or VM)** — the same bridge runtime
-   and authenticated control plane without Tauri, suitable for long-running
-   agents that remain available while a laptop is offline.
+2. **Headless host (local, private host, or VM)** — `grokptah-headless`, a
+   Tauri-free host that starts, observes, steers, pauses, resumes, and durably
+   recovers runs from a terminal or a supervisor, so work survives the desktop
+   exiting. It owns a home of its own (never the desktop's), enforces
+   capabilities, leases, replay, and redaction, and drives model work through an
+   injected engine port — today the deterministic offline fixture engine, with a
+   provider-backed engine still to come
+   ([headless host guide](docs/HEADLESS_HOST.md)).
 3. **CLI / TUI (upstream path)** — the original terminal UI from Grok Build
    (`xai-grok-pager`), still buildable for people who prefer the ratatui pager.
 

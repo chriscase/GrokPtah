@@ -1,0 +1,70 @@
+name: Headless Host
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/common/grokptah-headless-host/**"
+      - "crates/common/grokptah-agent-sdk/**"
+      - ".github/workflows/headless-host.yml"
+  pull_request:
+    paths:
+      - "crates/common/grokptah-headless-host/**"
+      - "crates/common/grokptah-agent-sdk/**"
+      - ".github/workflows/headless-host.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: headless-host-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  headless-host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'READ_ONLY' || 'READ_WRITE' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+      - name: Configure compiler-cache namespace
+        env:
+          SCCACHE_NAMESPACE: grokptah-headless-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.92-${{ hashFiles('Cargo.lock') }}
+        run: echo "SCCACHE_GHA_VERSION=${SCCACHE_NAMESPACE}" >> "$GITHUB_ENV"
+      - name: Install compiler cache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          version: "v0.16.0"
+      - name: Format and lint the headless host
+        # Clippy is not `-D warnings` here: it also lints the grokptah-agent-sdk
+        # path dependency, which carries one pre-existing collapsible_if that
+        # reproduces at this crate's base commit. The step below asserts the
+        # headless crate itself is diagnostic-free.
+        run: |
+          cargo fmt -p grokptah-headless-host -- --check
+          cargo clippy -p grokptah-headless-host --all-targets --all-features --locked \
+            2>&1 | tee clippy.log
+          if grep -q 'grokptah-headless-host/' clippy.log; then
+            echo "::error::clippy reported diagnostics inside grokptah-headless-host"
+            exit 1
+          fi
+      - name: Offline contract tests (no network, no credentials)
+        run: cargo test -p grokptah-headless-host --all-features --locked
+      - name: Cross-platform check
+        run: |
+          rustup target add x86_64-pc-windows-msvc aarch64-apple-darwin
+          cargo check -p grokptah-headless-host --all-targets --all-features \
+            --target x86_64-pc-windows-msvc
+          cargo check -p grokptah-headless-host --all-targets --all-features \
+            --target aarch64-apple-darwin
+      - name: Library builds without the operator binary
+        run: cargo check -p grokptah-headless-host --no-default-features --locked

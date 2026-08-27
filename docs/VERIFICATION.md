@@ -18,6 +18,16 @@ All are runnable from a clean clone with caches disabled
 | Agent bridge | `cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked -- --test-threads=1` | `crates/codegen/grokptah-agent-bridge` |
 | Offline oracles | `cargo test --locked eval_oracle -- --nocapture` | `crates/codegen/grokptah-agent-bridge` |
 | Focused upstream support | `cargo fmt -p xai-grok-env -p xai-grok-shell-base -- --check && cargo clippy -p xai-grok-env -p xai-grok-shell-base --all-targets --all-features --locked -- -D warnings && cargo test -p xai-grok-shell-base --all-features --locked` | repository root |
+| Headless host | `cargo fmt -p grokptah-headless-host -- --check && cargo clippy -p grokptah-headless-host --all-targets --all-features --locked && cargo test -p grokptah-headless-host --all-features --locked` | repository root |
+
+The headless host suite is fully offline and deterministic (temporary homes, a
+fixed clock, and the scripted fixture engine), so it needs no credential, no
+network, and no `--test-threads=1`: each test owns its own home and lock. Its
+Clippy line is deliberately not `-D warnings` yet, because it also lints its
+`grokptah-agent-sdk` path dependency, which carries one pre-existing
+`clippy::collapsible_if` at `external_worker.rs:196` that reproduces at the base
+commit. The headless crate itself emits no diagnostics; see
+[headless host guide](./HEADLESS_HOST.md).
 
 The deterministic reliability campaign is also a supported focused check:
 
