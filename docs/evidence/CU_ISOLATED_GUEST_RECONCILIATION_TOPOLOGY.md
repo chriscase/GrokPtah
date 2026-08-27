@@ -130,7 +130,14 @@ time on this branch: **787 passed, 2 failed**, with fmt and clippy clean.
 | `macos_native::…::native_shim_exposes_semantic_accessibility_without_raw_input` | **Self-inflicted.** The test pins the shim's API surface and asserted `shim.contains("CGEventGetLocation")`. Replacing the CGEvent pointer read broke that assertion — the donor in fact held a contradiction, since the release gate simultaneously banned the `CGEventCreate` needed to obtain the event | pin the new mechanism instead: assert `NSEvent.mouseLocation` is present **and** `CGEventGetLocation` is absent, so it cannot drift back |
 | `isolated_visual_artifacts::…::writable_handles_wrong_modes_and_sparse_oversize_fail_closed` | Pre-existing and root-dependent. The setup opens a `0o500` file read-write; that succeeds only for a user who bypasses the permission check. This container runs as **uid 0**, so it passed locally and failed as an ordinary macOS CI user with `EACCES`, before the assertion was reached | chmod the fixture to `0o700` first. What is under test is that a writable *handle* is refused, not whether the process could obtain one |
 
-The first is the one genuinely introduced here. A sweep for the same
+A third round then surfaced one more of mine, in this branch's own integration
+suite: `packaged_authority_cannot_be_minted_off_a_signed_macos_package`
+asserted `UnsupportedPlatform` unconditionally. That is the non-macOS reason.
+On macOS the call runs the real verifier and refuses on what it finds in the
+bundle, which is package- and host-specific. The refusal on both platforms is
+the gate and is still asserted; only the non-macOS reason is pinned.
+
+The first and third are the ones genuinely introduced here. A sweep for the same
 root-dependent pattern elsewhere in the crate found no other case: the other
 restrictive fixtures use `0o400`/`0o422`, both of which keep owner read.
 

@@ -823,13 +823,21 @@ fn an_unknown_manifest_field_is_rejected_rather_than_ignored() {
 fn packaged_authority_cannot_be_minted_off_a_signed_macos_package() {
     // This is the boundary this whole file sits behind. Admitting a packaged
     // launch requires a verified artifact receipt, and the only way to obtain
-    // one is to measure a real signed bundle. In Cloud that path fails closed,
-    // so nothing here can claim a launch happened.
+    // one is to measure a real signed bundle. No CI host has one, so this must
+    // refuse everywhere — that refusal is the gate.
+    //
+    // Only the reason differs, and asserting the non-macOS reason everywhere is
+    // what broke this on the macOS runner: off macOS the call refuses on the
+    // platform before looking at anything, while on macOS it runs the real
+    // verifier and refuses on what it finds in the bundle. That second reason
+    // is package- and host-specific, so it is deliberately not pinned here.
     let error = grokptah_agent_bridge::computer_use::measure_packaged_isolated_visual_artifacts(
         &manifest(),
     )
-    .expect_err("a non-macOS host must not produce a packaged artifact receipt");
-    assert_eq!(error.code, ComputerErrorCode::UnsupportedPlatform);
+    .expect_err("no packaged artifact receipt without a signed package");
+    if !cfg!(target_os = "macos") {
+        assert_eq!(error.code, ComputerErrorCode::UnsupportedPlatform);
+    }
 }
 
 // ---------------------------------------------------------------------------
