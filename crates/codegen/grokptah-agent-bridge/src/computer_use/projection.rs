@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::adaptive::{AdaptiveDisposition, AdaptiveProfile, AdaptiveReason};
 use super::types::{
     ActionClass, ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerRun,
     ComputerRunState, ComputerUseLimits, GrantIssuer, Sensitivity,
@@ -102,6 +103,38 @@ pub struct ComputerErrorSummary {
     pub code: ComputerErrorCode,
 }
 
+/// Redacted view of the most recent adaptive review.
+///
+/// Dispositions, one closed reason, integer confidence, and the age bound that
+/// was actually applied. No element identity, label, value, geometry, or
+/// backend-authored text can reach it, which is why a coordinator receives it
+/// unchanged: it says how a decision was reached without saying anything about
+/// what was on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdaptiveDecisionSummary {
+    pub profile: AdaptiveProfile,
+    pub planner: AdaptiveDisposition,
+    pub executor: AdaptiveDisposition,
+    pub resolved: AdaptiveDisposition,
+    pub reason: AdaptiveReason,
+    /// True when planner and executor did not reach the same rung.
+    pub disagreed: bool,
+    /// True when the review left the already-authorized action in place.
+    /// False means the review refused it; the run's audit journal carries the
+    /// matching `error_code`.
+    pub admitted: bool,
+    pub action_class: ActionClass,
+    pub top_confidence_bps: u32,
+    pub margin_bps: u32,
+    pub candidate_count: u32,
+    /// The staleness bound actually enforced, after clamping the profile's to
+    /// the run's own limit.
+    pub applied_age_bound_millis: u64,
+    pub control_epoch: u64,
+    pub decided_at: DateTime<Utc>,
+}
+
 /// Bounded progress counters against the run's own limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,6 +186,9 @@ pub struct ComputerRunProjection {
     pub last_outcome: Option<ActionOutcomeSummary>,
     pub last_error: Option<ComputerErrorSummary>,
     pub event_range: Option<ComputerRunEventRange>,
+    /// The most recent adaptive review, when one ran. `None` for every run
+    /// driven through the plain `act` path.
+    pub adaptive: Option<AdaptiveDecisionSummary>,
 }
 
 /// One bounded, cursor-addressed page of a run's durable event journal.
@@ -276,6 +312,22 @@ pub fn project_run_at(run: &ComputerRun, now: DateTime<Utc>) -> ComputerRunProje
             .as_ref()
             .map(|error| ComputerErrorSummary { code: error.code }),
         event_range: event_range(run),
+        adaptive: run.adaptive.as_ref().map(|record| AdaptiveDecisionSummary {
+            profile: record.profile,
+            planner: record.planner,
+            executor: record.executor,
+            resolved: record.resolved,
+            reason: record.reason,
+            disagreed: record.disagreed,
+            admitted: record.admitted,
+            action_class: record.action_class,
+            top_confidence_bps: record.top_confidence_bps,
+            margin_bps: record.margin_bps,
+            candidate_count: record.candidate_count,
+            applied_age_bound_millis: record.applied_age_bound_millis,
+            control_epoch: record.control_epoch,
+            decided_at: record.decided_at,
+        }),
     }
 }
 
