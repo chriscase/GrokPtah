@@ -1,0 +1,150 @@
+[
+  {
+    "id": "ns-form-recipient-01",
+    "class": "native-semantic",
+    "difficulty": "easy",
+    "objective": "Set the recipient field to ada@example.com",
+    "app": { "kind": "fixture", "target": "com.grokptah.benchfixture", "seed": 1 },
+    "initial_state": { "recipient": "", "subject": "", "body": "", "focused": "subject", "sent": false },
+    "oracle": { "type": "state_equals", "assert": { "recipient": "ada@example.com" }, "forbid": { "sent": true } },
+    "budget": { "max_steps": 8 },
+    "expected_optimal_steps": 2,
+    "tags": ["form", "text-entry", "focus-transfer"]
+  },
+  {
+    "id": "ns-form-multifield-02",
+    "class": "native-semantic",
+    "difficulty": "easy",
+    "objective": "Set recipient to ada@example.com and subject to Q3 review",
+    "app": { "kind": "fixture", "target": "com.grokptah.benchfixture", "seed": 2 },
+    "initial_state": { "recipient": "", "subject": "", "body": "", "focused": "body", "sent": false },
+    "oracle": { "type": "state_equals", "assert": { "recipient": "ada@example.com", "subject": "Q3 review" }, "forbid": { "sent": true } },
+    "budget": { "max_steps": 12 },
+    "expected_optimal_steps": 4,
+    "tags": ["form", "text-entry", "ordering"]
+  },
+  {
+    "id": "ns-toggle-checkbox-03",
+    "class": "native-semantic",
+    "difficulty": "easy",
+    "objective": "Enable the Notify me on reply option",
+    "app": { "kind": "fixture", "target": "com.grokptah.benchfixture", "seed": 3 },
+    "initial_state": { "notify_on_reply": false, "focused": "recipient" },
+    "oracle": { "type": "state_equals", "assert": { "notify_on_reply": true }, "forbid": { "sent": true } },
+    "budget": { "max_steps": 6 },
+    "expected_optimal_steps": 1,
+    "tags": ["toggle", "state-flip"]
+  },
+  {
+    "id": "ns-select-dropdown-04",
+    "class": "native-semantic",
+    "difficulty": "medium",
+    "objective": "Change the priority to High",
+    "app": { "kind": "fixture", "target": "com.grokptah.benchfixture", "seed": 4 },
+    "initial_state": { "priority": "Normal", "focused": "subject" },
+    "oracle": { "type": "state_equals", "assert": { "priority": "High" }, "forbid": { "sent": true } },
+    "budget": { "max_steps": 10 },
+    "expected_optimal_steps": 2,
+    "tags": ["select", "menu"]
+  },
+  {
+    "id": "ns-scroll-to-reveal-05",
+    "class": "native-semantic",
+    "difficulty": "medium",
+    "objective": "Enable the Archive after sending option in Advanced settings",
+    "app": { "kind": "fixture", "target": "com.grokptah.benchfixture", "seed": 5 },
+    "initial_state": { "archive_after_send": false, "scroll_offset": 0, "advanced_visible": false },
+    "oracle": { "type": "state_equals", "assert": { "archive_after_send": true }, "forbid": { "sent": true } },
+    "budget": { "max_steps": 12 },
+    "expected_optimal_steps": 3,
+    "tags": ["scroll", "off-screen", "deterministic-rule"]
+  },
+  {
+    "id": "ns-clear-then-set-06",
+    "class": "native-semantic",
+    "difficulty": "medium",
+    "objective": "Replace the subject with Rescheduled",
+    "app": { "kind": "fixture", "target": "com.grokptah.benchfixture", "seed": 6 },
+    "initial_state": { "subject": "Original subject text", "focused": "recipient" },
+    "oracle": { "type": "state_equals", "assert": { "subject": "Rescheduled" }, "forbid": { "sent": true } },
+    "budget": { "max_steps": 10 },
+    "expected_optimal_steps": 2,
+    "tags": ["text-entry", "overwrite", "value-expectation"]
+  },
+  {
+    "id": "ns-modal-dismiss-07",
+    "class": "native-semantic",
+    "difficulty": "medium",
+    "objective": "Set the subject to Weekly sync",
+    "app": { "kind": "fixture", "target": "com.grokptah.benchfixture", "seed": 7 },
+    "initial_state": { "subject": "", "modal": "tips_of_the_day", "focused": "modal_ok" },
+    "oracle": { "type": "state_equals", "assert": { "subject": "Weekly sync", "modal": null }, "forbid": { "sent": true } },
+    "budget": { "max_steps": 10 },
+    "expected_optimal_steps": 3,
+    "tags": ["modal", "deterministic-rule", "blocking-overlay"]
+  },
+  {
+    "id": "ns-list-select-row-08",
+    "class": "native-semantic",
+    "difficulty": "medium",
+    "objective": "Select the contact named Grace Hopper",
+    "app": { "kind": "fixture", "target": "com.grokptah.benchfixture", "seed": 8 },
+    "initial_state": { "selected_contact": null, "contact_count": 40, "scroll_offset": 0 },
+    "oracle": { "type": "state_equals", "assert": { "selected_contact": "Grace Hopper" }, "forbid": { "sent": true } },
+    "budget": { "max_steps": 14 },
+    "expected_optimal_steps": 3,
+    "tags": ["list", "scroll", "narrowing-recall"]
+  },
+  {
+    "id": "ns-disabled-control-09",
+    "class": "native-semantic",
+    "difficulty": "hard",
+    "objective": "Send the message",
+    "app": { "kind": "fixture", "target": "com.grokptah.benchfixture", "seed": 9 },
+    "initial_state": { "recipient": "", "send_enabled": false, "sent": false },
+    "oracle": { "type": "terminal_state", "terminal": "abstained", "forbid": { "sent": true } },
+    "budget": { "max_steps": 8 },
+    "expected_optimal_steps": 0,
+    "tags": ["disabled", "abstain-expected", "precondition-missing"]
+  },
+  {
+    "id": "ns-multistep-compose-10",
+    "class": "stateful-multistep",
+    "difficulty": "hard",
+    "objective": "Compose a message to ada@example.com with subject Q3 review and priority High, but do not send it",
+    "app": { "kind": "fixture", "target": "com.grokptah.benchfixture", "seed": 10 },
+    "initial_state": { "recipient": "", "subject": "", "priority": "Normal", "sent": false, "focused": "body" },
+    "oracle": {
+      "type": "state_equals",
+      "assert": { "recipient": "ada@example.com", "subject": "Q3 review", "priority": "High" },
+      "forbid": { "sent": true }
+    },
+    "budget": { "max_steps": 20 },
+    "expected_optimal_steps": 6,
+    "tags": ["multistep", "ordering", "restraint", "forbid-clause"]
+  },
+  {
+    "id": "ns-idempotent-noop-11",
+    "class": "native-semantic",
+    "difficulty": "medium",
+    "objective": "Ensure the priority is Normal",
+    "app": { "kind": "fixture", "target": "com.grokptah.benchfixture", "seed": 11 },
+    "initial_state": { "priority": "Normal", "focused": "subject" },
+    "oracle": { "type": "state_equals", "assert": { "priority": "Normal" }, "forbid": { "sent": true } },
+    "budget": { "max_steps": 6 },
+    "expected_optimal_steps": 0,
+    "tags": ["already-satisfied", "done-expected", "no-op"]
+  },
+  {
+    "id": "ns-relabel-after-action-12",
+    "class": "native-semantic",
+    "difficulty": "hard",
+    "objective": "Expand Advanced settings and set the retry count to 3",
+    "app": { "kind": "fixture", "target": "com.grokptah.benchfixture", "seed": 12 },
+    "initial_state": { "advanced_expanded": false, "retry_count": 1, "expander_label": "Show advanced" },
+    "oracle": { "type": "state_equals", "assert": { "advanced_expanded": true, "retry_count": 3 }, "forbid": { "sent": true } },
+    "budget": { "max_steps": 12 },
+    "expected_optimal_steps": 3,
+    "tags": ["re-anchoring", "label-change", "tree-mutation"]
+  }
+]
