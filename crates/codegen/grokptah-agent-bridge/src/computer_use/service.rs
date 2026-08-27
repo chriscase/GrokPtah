@@ -7,6 +7,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::adaptive::{self, AdaptiveClaim, AdaptiveDecisionRecord};
 use super::policy::ComputerPolicy;
 use super::projection::{
     not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
@@ -322,6 +323,7 @@ impl ComputerUseService {
         result
     }
 
+    /// Dispatch one action. Unchanged: no adaptive review runs on this path.
     pub async fn act(
         &self,
         request_id: &str,
@@ -330,20 +332,85 @@ impl ComputerUseService {
         observation_id: &str,
         action: ComputerAction,
     ) -> ComputerResult<ActionOutcome> {
+        self.act_inner(
+            request_id,
+            run_id,
+            expected_version,
+            observation_id,
+            action,
+            None,
+        )
+        .await
+    }
+
+    /// Dispatch one action with a planner claim attached.
+    ///
+    /// Identical to [`Self::act`] in every authority respect -- same
+    /// idempotency receipt, same version fence, same staleness check, same
+    /// policy gate, same state machine, same dispatch site -- plus one
+    /// advisory review that runs after the policy gate has already admitted
+    /// the action and can only refuse it. See [`super::adaptive`] for why that
+    /// placement means a cheap model cannot buy its way past a kernel gate.
+    pub async fn act_with_plan(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action: ComputerAction,
+        claim: AdaptiveClaim,
+    ) -> ComputerResult<ActionOutcome> {
+        self.act_inner(
+            request_id,
+            run_id,
+            expected_version,
+            observation_id,
+            action,
+            Some(claim),
+        )
+        .await
+    }
+
+    async fn act_inner(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action: ComputerAction,
+        claim: Option<AdaptiveClaim>,
+    ) -> ComputerResult<ActionOutcome> {
         validate_id("run_id", run_id)?;
         validate_id("observation_id", observation_id)?;
         action.validate(&ComputerUseLimits::ceiling())?;
-        let payload = json!({
+        let mut payload = json!({
             "runId": run_id,
             "expectedVersion": expected_version,
             "observationId": observation_id,
             "action": action,
         });
+        // The claim is part of the replay identity: reusing a request id with a
+        // different plan must fail closed rather than replay the first answer.
+        //
+        // The key is added only when a plan is attached, so the plain `act`
+        // payload -- and therefore every durable mutation receipt already
+        // written against it -- hashes exactly as it did before this seam
+        // existed. A `null` placeholder would have invalidated them all.
+        if let Some(claim) = claim.as_ref() {
+            let encoded = serde_json::to_value(claim).map_err(|_| {
+                ComputerError::new(
+                    ComputerErrorCode::InvalidRequest,
+                    "adaptive claim is not serializable",
+                )
+            })?;
+            payload["adaptiveClaim"] = encoded;
+        }
         if let Some(replayed) = self.begin_mutation(request_id, "act", &payload)? {
             return replayed;
         }
 
         let mut budget_error = None;
+        let mut review_record: Option<AdaptiveDecisionRecord> = None;
         let prepared = self
             .store
             .update_run(run_id, |run| {
@@ -378,6 +445,29 @@ impl ComputerUseService {
                 }
                 self.policy
                     .authorize_action(run, &observation, &action, now)?;
+
+                // ---- adaptive seam ------------------------------------
+                // Reached only when the policy gate above already said yes,
+                // so this can narrow that answer and has no path that widens
+                // it. It mutates nothing but the decision record, drives no
+                // state transition, and never retries: a resolution that is
+                // not "commit" is returned as a refusal.
+                if let Some(claim) = claim.as_ref() {
+                    let outcome = adaptive::review(run, &observation, &action, claim, now);
+                    if let Some(error) = outcome.refusal() {
+                        // Carried out of the closure so the refused decision
+                        // still reaches the denial write path: returning `Err`
+                        // discards everything this closure wrote. Only a
+                        // refusal is carried, so a later denial for an
+                        // unrelated reason cannot be stamped with a record
+                        // that says the review admitted the action.
+                        review_record = Some(outcome.record().clone());
+                        return Err(error.clone());
+                    }
+                    run.adaptive = Some(outcome.record().clone());
+                }
+                // ---- end adaptive seam --------------------------------
+
                 if !backend_supports_action(&self.backend.capabilities(), action.class()) {
                     return Err(ComputerError::new(
                         ComputerErrorCode::ForbiddenAction,
@@ -417,7 +507,13 @@ impl ComputerUseService {
                 }
             }
             (Err(error), _) => {
-                self.record_denial(run_id, "act", Some(action.class()), &error);
+                self.record_denial_with_review(
+                    run_id,
+                    "act",
+                    Some(action.class()),
+                    &error,
+                    review_record.take(),
+                );
                 Err(error)
             }
         };
@@ -736,8 +832,29 @@ impl ComputerUseService {
         action_class: Option<super::types::ActionClass>,
         error: &ComputerError,
     ) {
+        self.record_denial_with_review(run_id, operation, action_class, error, None);
+    }
+
+    /// The same single denial write path, additionally stamping the adaptive
+    /// review that produced the refusal.
+    ///
+    /// Recording the refused decision here rather than through a new mutation
+    /// keeps the receipt truthful without adding a second write path: a
+    /// refusal discards the `act` closure's mutations by design, so the record
+    /// would otherwise be lost and the projection would show only admissions.
+    fn record_denial_with_review(
+        &self,
+        run_id: &str,
+        operation: &str,
+        action_class: Option<super::types::ActionClass>,
+        error: &ComputerError,
+        review: Option<AdaptiveDecisionRecord>,
+    ) {
         let _ = self.store.update_run(run_id, |run| {
             run.updated_at = Utc::now();
+            if let Some(review) = review.as_ref() {
+                run.adaptive = Some(review.clone());
+            }
             run.record_audit(operation, "denied", action_class, None, Some(error.code));
             Ok(())
         });
