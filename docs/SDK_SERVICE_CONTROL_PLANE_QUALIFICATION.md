@@ -286,24 +286,52 @@ local/VM/private-cloud service host"; it does not exist. Separately,
 end-to-end without a host-installed adapter. Both facts bound what any
 qualification in this crate can claim.
 
-### P2-D — committed lockfiles are stale, so `--locked` builds fail
+### P1-F — every committed lockfile is stale, and it fails the `desktop` CI check on every PR
 
-`cargo build --locked` fails in both workspaces at the gate SHA:
+When the bridge gained `grokptah-agent-sdk` as a path dependency, **none** of
+the three committed lockfiles were regenerated. All three lack a
+`grokptah-agent-sdk` entry, so every `--locked` command fails:
 
 ```
 error: the lock file .../Cargo.lock needs to be updated but --locked was passed
 ```
 
-Neither the root `Cargo.lock` nor
-`crates/codegen/grokptah-agent-bridge/Cargo.lock` contains a
-`grokptah-agent-sdk` entry, although the SDK is a root workspace member and a
-path dependency of the bridge. Regenerating adds one small additive hunk to
-each. A CI job that builds with `--locked` — the normal way to get a
-reproducible build — cannot build this SHA.
+| Lockfile | Missing entry | Breaks |
+| --- | --- | --- |
+| `Cargo.lock` (root) | `grokptah-agent-sdk` | `cargo … --locked` in the root workspace |
+| `crates/codegen/grokptah-agent-bridge/Cargo.lock` | `grokptah-agent-sdk`, and it in the bridge's own dep list | the workflow's `Bridge fmt + clippy + tests` step |
+| `desktop/src-tauri/Cargo.lock` | same | the workflow's `Cargo tests (desktop)` step — **first**, so nothing after it ever runs |
 
-**Not committed here.** Both lockfiles are shared surface this lane must not
-churn, and neither is needed for these tests (unlocked builds regenerate them).
-Recorded so the owner can regenerate them on a lane that owns those files.
+This is not theoretical. The `desktop` check on
+[PR #441](https://github.com/chriscase/GrokPtah/pull/441) fails at
+`Cargo tests (desktop)` after 48 seconds
+([run 33057720113](https://github.com/chriscase/GrokPtah/actions/runs/33057720113/job/98468564247)),
+before it reaches any bridge step. `.github/workflows/desktop.yml` triggers on
+`desktop/**`, `crates/codegen/grokptah-agent-bridge/**`, and `evals/**`, so
+**any** PR touching those paths hits it.
+
+Proof it is pre-existing and not caused by this branch: the commit here touches
+no file under `desktop/` and no `Cargo.toml`, and `cargo metadata --locked` in
+`desktop/src-tauri` fails identically on this tree, whose `desktop/` directory
+is byte-identical to the base SHA. Unlocked resolution succeeds and produces a
+**purely additive** 9-line diff — one package stanza plus one dependency line,
+no version changes:
+
+```
++ "grokptah-agent-sdk",
+...
++[[package]]
++name = "grokptah-agent-sdk"
++version = "0.1.0"
++dependencies = [ "serde", "serde_json" ]
+```
+
+**Not committed here.** All three are shared build inputs — `desktop/src-tauri/Cargo.lock`
+is a packaged-build input this lane was told to preserve, and lockfiles conflict
+readily across concurrent branches. This is a repo-wide blocker that wants one
+owning lane, not a drive-by fix on a qualification branch. The fix is to run
+`cargo metadata` (or any unlocked cargo command) once in each of the three
+workspaces and commit the additive result.
 
 ### P3 — pre-existing lint and format drift (not touched)
 
@@ -356,7 +384,7 @@ All from `crates/codegen/grokptah-agent-bridge` unless noted, toolchain 1.92.0.
 | `cargo clippy -p grokptah-agent-sdk --all-targets` | 1 pre-existing `collapsible_if`, outside changed lines |
 | `cargo fmt --check` | new files clean; pre-existing drift in `src/external_worker.rs` left untouched |
 | `cargo metadata --format-version 1` | valid for both the bridge crate and the root workspace |
-| `cargo build --locked` | **fails in both workspaces** — pre-existing stale lockfiles (P2-D) |
+| `cargo build --locked` | **fails in all three workspaces** — pre-existing stale lockfiles (P1-F) |
 
 The five failures are **not** regressions from this change: at the gate SHA the
 SDK does not compile (P1-A), so the bridge's test suite could not be built or
