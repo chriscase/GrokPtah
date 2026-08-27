@@ -15,6 +15,8 @@ pub mod computer;
 pub mod error;
 /// Provider-neutral contracts for external cloud or host-owned workers.
 pub mod external_worker;
+/// Operator reconciliation contracts for durable always-on runs.
+pub mod reconciliation;
 /// Durable run, review, and event types.
 pub mod run;
 
@@ -28,10 +30,18 @@ pub use computer::{
 };
 pub use error::{ErrorCode, ErrorEnvelope, ErrorEventRange};
 pub use external_worker::{
-    ExternalWorkerArtifact, ExternalWorkerEvent, ExternalWorkerExecutionMode,
-    ExternalWorkerFollowUpRequest, ExternalWorkerLaunchRequest, ExternalWorkerLaunchResult,
-    ExternalWorkerProvider, ExternalWorkerRecord, ExternalWorkerRunRecord, ExternalWorkerState,
-    EXTERNAL_WORKER_CONTRACT_VERSION,
+    EXTERNAL_WORKER_CONTRACT_VERSION, ExternalWorkerArtifact, ExternalWorkerEvent,
+    ExternalWorkerExecutionMode, ExternalWorkerFollowUpRequest, ExternalWorkerLaunchRequest,
+    ExternalWorkerLaunchResult, ExternalWorkerProvider, ExternalWorkerRecord,
+    ExternalWorkerRunRecord, ExternalWorkerState,
+};
+pub use reconciliation::{
+    AttemptObservation, AttemptOutcome, AttentionPolicy, AttentionReason, AttentionSeverity,
+    AuthorityBinding, EvidenceKind, EvidenceRecord, LeaseObservation, OpaqueRef, OperatorIdentity,
+    ProviderObservation, ProviderState, RECONCILIATION_CONTRACT_VERSION, ReconcileAction,
+    ReconcileError, ReconcileErrorCode, ReconcileOutcome, ReconcileRequest, ReconciliationEntry,
+    ReconciliationLedger, ReconciliationPage, Redactor, RunAttention, RunConfidence,
+    RunObservation, StreamObservation, UncertaintyDomain, list_attention, project_attention,
 };
 pub use run::{
     Bounds, ChangedFile, DurableRun, DurableRunState, ExecutionMode, IdempotencyKey, ReviewReceipt,

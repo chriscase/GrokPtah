@@ -1,0 +1,258 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:grokptah:schema:operator-reconciliation:v1",
+  "title": "GrokPtah Operator Reconciliation Contract v1",
+  "anyOf": [
+    { "$ref": "#/$defs/runAttention" },
+    { "$ref": "#/$defs/reconcileRequest" },
+    { "$ref": "#/$defs/reconciliationEntry" },
+    { "$ref": "#/$defs/reconciliationPage" },
+    { "$ref": "#/$defs/reconcileError" }
+  ],
+  "$defs": {
+    "opaqueRef": {
+      "description": "Operator-facing identifier carrying no host detail. Must not contain whitespace, path or URL syntax, or a traversal segment.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[^\\s/\\\\:@?#%]+$",
+      "not": { "pattern": "\\.\\." }
+    },
+    "durableRunState": {
+      "enum": [
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "interrupted",
+        "limit_reached"
+      ]
+    },
+    "runConfidence": { "enum": ["confirmed", "unconfirmed", "uncertain"] },
+    "attentionSeverity": { "enum": ["blocking", "degraded", "advisory"] },
+    "uncertaintyDomain": {
+      "description": "Where the uncertainty originates. The split is the point of the contract: a provider that answered `unknown` needs a different operator response than a lease that expired.",
+      "enum": ["model_or_provider", "worker_or_lease", "operator_decision"]
+    },
+    "attentionReason": {
+      "description": "Ordered most- to least-severe. Projections emit reasons in this order.",
+      "enum": [
+        "uncertain_outcome",
+        "crash_recovered",
+        "lease_expired",
+        "provider_ambiguity",
+        "cancel_unconfirmed",
+        "deadline_exceeded",
+        "stream_gap",
+        "stale_observation"
+      ]
+    },
+    "reconcileAction": {
+      "description": "The complete set of operator actions. There is deliberately no resend, retry, resume, or re-dispatch member; reconciliation never mutates a provider attempt.",
+      "enum": [
+        "record_evidence",
+        "acknowledge",
+        "resolve_completed",
+        "resolve_failed",
+        "resolve_cancelled"
+      ]
+    },
+    "evidenceKind": {
+      "enum": [
+        "provider_projection",
+        "host_journal",
+        "workspace_inspection",
+        "operator_statement"
+      ]
+    },
+    "evidenceRecord": {
+      "description": "Digest-addressed evidence. Carries a summary, never a payload: raw provider output routinely contains credentials, and an operator ledger is one of the longest-lived records in the system.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "digest", "summary"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/evidenceKind" },
+        "digest": { "type": "string", "minLength": 1, "maxLength": 160, "pattern": "^\\S+$" },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 512 }
+      }
+    },
+    "operatorIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operatorRef", "authorityRef"],
+      "properties": {
+        "operatorRef": { "$ref": "#/$defs/opaqueRef" },
+        "authorityRef": { "$ref": "#/$defs/opaqueRef" }
+      }
+    },
+    "runScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sessionId", "workspace", "runId"],
+      "properties": {
+        "sessionId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "workspace": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "runId": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "runAttention": {
+      "description": "The authoritative operator-facing view of one run. Carries opaque references only; no scoped identity appears here.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "runRef",
+        "state",
+        "confidence",
+        "needsAttention",
+        "reasons",
+        "domains",
+        "observedSeq",
+        "revision"
+      ],
+      "properties": {
+        "contract": { "const": "grokptah.operator-reconciliation.v1" },
+        "runRef": { "$ref": "#/$defs/opaqueRef" },
+        "state": { "$ref": "#/$defs/durableRunState" },
+        "confidence": { "$ref": "#/$defs/runConfidence" },
+        "needsAttention": { "type": "boolean" },
+        "reasons": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/attentionReason" }
+        },
+        "severity": { "$ref": "#/$defs/attentionSeverity" },
+        "domains": {
+          "type": "array",
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/uncertaintyDomain" }
+        },
+        "observedSeq": { "type": "integer", "minimum": 0 },
+        "revision": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "reconcileRequest": {
+      "description": "One operator reconciliation intent. `expectedRevision` is the stale-revision fence; `requestId` is the idempotency key.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requestId",
+        "scope",
+        "expectedRevision",
+        "action",
+        "evidence",
+        "note",
+        "operator"
+      ],
+      "properties": {
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "scope": { "$ref": "#/$defs/runScope" },
+        "expectedRevision": { "type": "integer", "minimum": 0 },
+        "action": { "$ref": "#/$defs/reconcileAction" },
+        "evidence": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/evidenceRecord" }
+        },
+        "note": { "type": "string", "maxLength": 2048 },
+        "operator": { "$ref": "#/$defs/operatorIdentity" }
+      },
+      "allOf": [
+        {
+          "description": "Asserting an outcome without evidence is how a ledger becomes fiction.",
+          "if": {
+            "properties": {
+              "action": {
+                "enum": ["resolve_completed", "resolve_failed", "resolve_cancelled"]
+              }
+            },
+            "required": ["action"]
+          },
+          "then": { "properties": { "evidence": { "minItems": 1 } } }
+        }
+      ]
+    },
+    "reconciliationEntry": {
+      "description": "One durable, append-only reconciliation record. This is both the audit trail and the restart-recovery log.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "seq",
+        "requestId",
+        "payload",
+        "action",
+        "expectedRevision",
+        "observedState",
+        "observedReasons",
+        "evidence",
+        "note",
+        "operator",
+        "recordedAtMs"
+      ],
+      "properties": {
+        "seq": { "type": "integer", "minimum": 1 },
+        "requestId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "payload": {
+          "description": "Exact fenced payload, compared verbatim to detect request-id reuse. Comparison is on canonical JSON rather than a digest so replay detection makes no collision-resistance assumption.",
+          "type": "string"
+        },
+        "action": { "$ref": "#/$defs/reconcileAction" },
+        "expectedRevision": { "type": "integer", "minimum": 0 },
+        "observedState": { "$ref": "#/$defs/durableRunState" },
+        "observedReasons": {
+          "type": "array",
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/attentionReason" }
+        },
+        "resolvedState": { "$ref": "#/$defs/durableRunState" },
+        "evidence": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/evidenceRecord" }
+        },
+        "note": { "type": "string", "maxLength": 2048 },
+        "operator": { "$ref": "#/$defs/operatorIdentity" },
+        "recordedAtMs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "reconciliationPage": {
+      "description": "One bounded, cursor-addressed page of reconciliation history. `cursorExpired` is exact: sequences are assigned contiguously, so a pruned span is always detectable.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entries", "cursorExpired", "retainedFromSeq", "retainedThroughSeq"],
+      "properties": {
+        "entries": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/reconciliationEntry" }
+        },
+        "nextCursor": { "type": "integer", "minimum": 0 },
+        "cursorExpired": { "type": "boolean" },
+        "retainedFromSeq": { "type": "integer", "minimum": 0 },
+        "retainedThroughSeq": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "reconcileError": {
+      "description": "`not_available` is returned identically for an unknown run and a cross-authority run, so the surface cannot be used to probe existence.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "enum": [
+            "invalid_request",
+            "stale_revision",
+            "conflict",
+            "already_resolved",
+            "limit_reached",
+            "not_available"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
