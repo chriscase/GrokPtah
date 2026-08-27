@@ -17,7 +17,10 @@ release (#435 packaged Economy + isolated-visual High Assurance remain open;
 ```sh
 cd evals/computer-use-adaptive
 cargo test --locked -- --test-threads=1
-cargo run --locked --bin grokptah-cu-adaptive-eval -- --out campaign-out --repeats 5
+cargo run --locked --bin grokptah-cu-adaptive-eval -- --out campaign-out --repeats 5 --seed 435272
+cargo run --locked --bin grokptah-cu-adaptive-eval -- \
+  --verify-report campaign-out/campaign-report.json \
+  --verify-evidence campaign-out/campaign-evidence.json
 ```
 
 Do not run `cargo test --workspace`. Do not `cargo clean`. Do not overlap a
@@ -28,6 +31,7 @@ protected target directory.
 - `evals/computer-use-adaptive/schemas/grokptah-cu-eval-scenario.v1.schema.json`
 - `evals/computer-use-adaptive/schemas/grokptah-cu-eval-result.v1.schema.json`
 - `evals/computer-use-adaptive/schemas/grokptah-cu-eval-evidence.v1.schema.json`
+- `evals/computer-use-adaptive/schemas/grokptah-cu-eval-evidence-set.v1.schema.json`
 - `evals/computer-use-adaptive/schemas/grokptah-cu-eval-report.v1.schema.json`
 
 Live continuation must reuse these exact schema versions. Fake adapter success

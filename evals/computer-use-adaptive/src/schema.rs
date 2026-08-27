@@ -5,7 +5,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::types::{
-    EvalError, EvalResult, EVIDENCE_SCHEMA, REPORT_SCHEMA, RESULT_SCHEMA, SCENARIO_SCHEMA,
+    EvalError, EvalResult, EVIDENCE_SCHEMA, EVIDENCE_SET_SCHEMA, REPORT_SCHEMA, RESULT_SCHEMA,
+    SCENARIO_SCHEMA,
 };
 
 pub const SCENARIO_SCHEMA_JSON: &str =
@@ -16,6 +17,8 @@ pub const EVIDENCE_SCHEMA_JSON: &str =
     include_str!("../schemas/grokptah-cu-eval-evidence.v1.schema.json");
 pub const REPORT_SCHEMA_JSON: &str =
     include_str!("../schemas/grokptah-cu-eval-report.v1.schema.json");
+pub const EVIDENCE_SET_SCHEMA_JSON: &str =
+    include_str!("../schemas/grokptah-cu-eval-evidence-set.v1.schema.json");
 
 pub fn parse_strict<T: DeserializeOwned>(json: &str) -> EvalResult<T> {
     serde_json::from_str(json).map_err(|e| EvalError::Schema(e.to_string()))
@@ -68,11 +71,12 @@ pub fn require_schema_version(value: &Value, expected: &str) -> EvalResult<()> {
     }
 }
 
-pub fn embedded_schema_ids() -> [&'static str; 4] {
+pub fn embedded_schema_ids() -> [&'static str; 5] {
     [
         SCENARIO_SCHEMA,
         RESULT_SCHEMA,
         EVIDENCE_SCHEMA,
+        EVIDENCE_SET_SCHEMA,
         REPORT_SCHEMA,
     ]
 }
@@ -81,6 +85,7 @@ pub fn schemas_are_present() -> bool {
     SCENARIO_SCHEMA_JSON.contains(SCENARIO_SCHEMA)
         && RESULT_SCHEMA_JSON.contains(RESULT_SCHEMA)
         && EVIDENCE_SCHEMA_JSON.contains(EVIDENCE_SCHEMA)
+        && EVIDENCE_SET_SCHEMA_JSON.contains(EVIDENCE_SET_SCHEMA)
         && REPORT_SCHEMA_JSON.contains(REPORT_SCHEMA)
 }
 
@@ -91,7 +96,30 @@ mod tests {
     #[test]
     fn embedded_schemas_match_version_constants() {
         assert!(schemas_are_present());
-        assert_eq!(embedded_schema_ids().len(), 4);
+        assert_eq!(embedded_schema_ids().len(), 5);
+    }
+
+    #[test]
+    fn result_schema_requires_rust_required_fields() {
+        let schema: serde_json::Value = serde_json::from_str(RESULT_SCHEMA_JSON).unwrap();
+        let required = schema["required"].as_array().unwrap();
+        for field in [
+            "expectedOutcome",
+            "expectedTaskSuccess",
+            "fixtureMatch",
+            "evidenceRef",
+        ] {
+            assert!(
+                required.iter().any(|v| v.as_str() == Some(field)),
+                "{field}"
+            );
+        }
+        let report: serde_json::Value = serde_json::from_str(REPORT_SCHEMA_JSON).unwrap();
+        assert_eq!(
+            report["properties"]["episodes"]["items"]["$ref"],
+            "urn:grokptah:schema:cu-eval-result:v1"
+        );
+        assert!(EVIDENCE_SET_SCHEMA_JSON.contains(EVIDENCE_SET_SCHEMA));
     }
 
     #[test]

@@ -73,6 +73,7 @@ pub struct AgentSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct WorldSpec {
     pub run_id: String,
     pub surfaces: Vec<SurfaceSpec>,
@@ -119,6 +120,7 @@ pub enum EventPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ScheduledEvent {
     pub at_step: u32,
     pub phase: EventPhase,

@@ -22,8 +22,15 @@ Zero provider calls. Do not run a workspace-wide build.
 ```sh
 cd evals/computer-use-adaptive
 cargo test --locked -- --test-threads=1
-cargo run --locked --bin grokptah-cu-adaptive-eval -- --out campaign-out --repeats 5
+cargo test --locked -- --test-threads=1
+cargo clippy --locked --all-targets -- -D warnings
+cargo run --locked --bin grokptah-cu-adaptive-eval -- --out campaign-out --repeats 5 --seed 435272
+cargo run --locked --bin grokptah-cu-adaptive-eval -- \
+  --verify-report campaign-out/campaign-report.json \
+  --verify-evidence campaign-out/campaign-evidence.json
 ```
+
+`--repeats 0` and any result other than synthetic PASS exit nonzero. The verifier reconstructs the matrix and does not trust report totals.
 
 Optional live continuation (same schemas, still does not call a provider in this
 lane; the binary refuses unless you intended a later live adapter):
