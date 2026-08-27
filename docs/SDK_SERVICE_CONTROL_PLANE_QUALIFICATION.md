@@ -286,7 +286,7 @@ local/VM/private-cloud service host"; it does not exist. Separately,
 end-to-end without a host-installed adapter. Both facts bound what any
 qualification in this crate can claim.
 
-### P1-F — every committed lockfile is stale, and it fails the `desktop` CI check on every PR
+### P1-F — every committed lockfile is stale, failing the `desktop` CI check on every PR (FIXED HERE)
 
 When the bridge gained `grokptah-agent-sdk` as a path dependency, **none** of
 the three committed lockfiles were regenerated. All three lack a
@@ -326,12 +326,57 @@ no version changes:
 +dependencies = [ "serde", "serde_json" ]
 ```
 
-**Not committed here.** All three are shared build inputs — `desktop/src-tauri/Cargo.lock`
-is a packaged-build input this lane was told to preserve, and lockfiles conflict
-readily across concurrent branches. This is a repo-wide blocker that wants one
-owning lane, not a drive-by fix on a qualification branch. The fix is to run
-`cargo metadata` (or any unlocked cargo command) once in each of the three
-workspaces and commit the additive result.
+**Fixed on this branch**, on explicit owner authorization, by running
+`cargo metadata` once in each of the three workspaces and committing the
+additive result. Nothing was upgraded: `cargo metadata` performs minimal
+resolution, preserving every already-locked version.
+
+Verified additive across all three files — comparing every `name`, `version`,
+`source`, and `checksum` line before and after, the **only** change is the
+addition of `name = "grokptah-agent-sdk"` / `version = "0.1.0"`; zero lines
+removed, zero versions, sources, or checksums altered:
+
+| Lockfile | Diff | Removed |
+| --- | --- | --- |
+| `Cargo.lock` | +8 | 0 |
+| `crates/codegen/grokptah-agent-bridge/Cargo.lock` | +9 | 0 |
+| `desktop/src-tauri/Cargo.lock` | +9 | 0 |
+
+Before → after, same commands, same tree otherwise:
+
+| Command | Before | After |
+| --- | --- | --- |
+| `cargo metadata --locked` (root) | exit 101 | **exit 0** |
+| `cargo metadata --locked` (bridge) | exit 101 | **exit 0** |
+| `cargo metadata --locked` (desktop) | exit 101 | **exit 0** |
+| `cargo test --locked` in `desktop/src-tauri` — the exact failing CI step | exit 101 at lock resolution | **13 passed / 0 failed** |
+| `cargo test --locked -p grokptah-agent-sdk` | could not run | **12 passed / 0 failed** |
+
+Reproducing the desktop gate on Linux additionally needs the GTK/WebKit
+development packages (`libgtk-3-dev`, `libwebkit2gtk-4.1-dev`,
+`libsoup-3.0-dev`) and `libdbus-1-dev`; CI runs `macos-latest`, where they are
+not required. Those are container prerequisites, not repository changes.
+
+### P1-G — a second pre-existing blocker sits behind the lockfile one
+
+Clearing P1-F lets the `desktop` job advance past `Cargo tests (desktop)` into
+`Bridge fmt + clippy + tests`, which then fails on its own, for reasons that
+predate this branch. The workflow step runs under `bash -e`, so the first
+failing command ends it:
+
+| Command | Result | Cause |
+| --- | --- | --- |
+| `cargo fmt --check` | **fails** | 25 lines across 2 hunks in `src/external_worker.rs`; rustfmt 1.92 formats those `assert!` chains differently than the committed text |
+| `cargo clippy --locked --all-targets -- -D warnings` | **fails** | 8 lib + 7 lib-test lint errors across `src/external_worker.rs`, `src/host.rs`, `src/mcp_control.rs`, `src/orchestration/service.rs`, `src/computer_use/macos_observation.rs` |
+| `cargo test --locked -- --test-threads=1` | not reached | — |
+
+Neither implicates this branch's files: `tests/sdk_service_control_plane.rs`
+and `tests/sdk_control_plane_harness/mod.rs` have **0** rustfmt drift and **0**
+clippy findings. Both are source edits in `src/`, outside what this lane was
+authorized to change, so **neither is fixed here**. Clearing them is a
+mechanical follow-up (`cargo fmt` on that one file, then the four `clippy --fix`
+suggestions plus three manual ones), and it should be done by a lane that owns
+`src/`.
 
 ### P3 — pre-existing lint and format drift (not touched)
 
@@ -384,7 +429,11 @@ All from `crates/codegen/grokptah-agent-bridge` unless noted, toolchain 1.92.0.
 | `cargo clippy -p grokptah-agent-sdk --all-targets` | 1 pre-existing `collapsible_if`, outside changed lines |
 | `cargo fmt --check` | new files clean; pre-existing drift in `src/external_worker.rs` left untouched |
 | `cargo metadata --format-version 1` | valid for both the bridge crate and the root workspace |
-| `cargo build --locked` | **fails in all three workspaces** — pre-existing stale lockfiles (P1-F) |
+| `cargo metadata --locked` ×3 workspaces | **exit 0** after the P1-F fix (was 101) |
+| `cargo test --locked` in `desktop/src-tauri` | **13 passed / 0 failed** (was exit 101) |
+| `cargo test --locked -p grokptah-agent-sdk` | **12 passed / 0 failed** |
+| `cargo test --locked` ×7 focused bridge suites | **119 passed / 0 failed** |
+| `cargo fmt --check` / `cargo clippy -- -D warnings` (bridge) | **fail** — pre-existing `src/` issues (P1-G); new files clean |
 
 The five failures are **not** regressions from this change: at the gate SHA the
 SDK does not compile (P1-A), so the bridge's test suite could not be built or
