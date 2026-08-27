@@ -119,6 +119,16 @@ impl IsolatedVisualHost {
                 "isolated guest concurrency budget exhausted",
             ));
         }
+        if self
+            .store
+            .list_guests()?
+            .iter()
+            .any(|other| other.is_live() && other.work_attempt_id == request.work_attempt_id)
+        {
+            return Err(IsolatedError::conflict(
+                "work attempt already has a live isolated guest",
+            ));
+        }
         let now = self.clock.now();
         let guest_id = Uuid::new_v4().to_string();
         let guest = IsolatedGuestRecord {
@@ -494,23 +504,24 @@ impl IsolatedVisualHost {
         let lease = self.require_matching_lease(&guest, lease_id)?;
         if let Some(dispatch) = &lease.dispatch {
             if dispatch.dispatch_id == event.dispatch_id {
-                match dispatch.state {
-                    ComputerDispatchState::Prepared | ComputerDispatchState::Injected => {
-                        return Ok(lease)
-                    }
-                    ComputerDispatchState::Acknowledged => return Ok(lease),
-                    _ => {
-                        return Err(IsolatedError::conflict(
-                            "dispatch_id was reused with a terminal outcome",
-                        ))
-                    }
+                let expected = event.payload_sha256()?;
+                if dispatch.payload_sha256 != expected {
+                    return Err(IsolatedError::conflict(
+                        "dispatch_id was reused with a different payload",
+                    ));
                 }
+                return Ok(lease);
             }
+            return Err(IsolatedError::conflict(
+                "lease already has an in-flight dispatch_id",
+            ));
         }
         if lease.state != ComputerSurfaceLeaseState::Dispatching {
             self.prepare_dispatch(guest_id, lease_id, event.clone())
         } else {
-            Ok(lease)
+            Err(IsolatedError::invalid_state(
+                "dispatching lease is missing a bound dispatch record",
+            ))
         }
     }
 

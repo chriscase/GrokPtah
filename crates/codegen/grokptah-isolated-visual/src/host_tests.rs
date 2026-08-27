@@ -269,6 +269,36 @@ fn duplicate_dispatch_is_exactly_once() {
 }
 
 #[test]
+fn dispatching_lease_rejects_a_second_dispatch_id() {
+    let (_dir, mut host, _clock) = open_host();
+    let (guest, lease) = create_running(&mut host);
+    host.ingest_frame(&guest.guest_id, &lease.lease_id, 2, 2, &[1, 2, 3, 4])
+        .unwrap();
+    let guest = host.guest(&guest.guest_id).unwrap();
+    let lease = host
+        .leases()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.lease_id == lease.lease_id)
+        .unwrap();
+    let mut first = pointer(&guest, &lease);
+    first.frame_epoch = guest.frame_epoch;
+    first.lease_revision = lease.revision;
+    host.prepare_dispatch(&guest.guest_id, &lease.lease_id, first.clone())
+        .unwrap();
+    let mut second = first.clone();
+    second.dispatch_id = "dispatch-other".into();
+    second.kind = IsolatedInputKind::PointerMove { x: 11, y: 11 };
+    assert_eq!(
+        host.inject_dispatch(&guest.guest_id, &lease.lease_id, second, false)
+            .unwrap_err()
+            .code,
+        IsolatedErrorCode::Conflict
+    );
+    assert_eq!(host.simulator().input_len(&guest.guest_id), 0);
+}
+
+#[test]
 fn crash_after_inject_then_two_restarts_do_not_replay() {
     let (dir, mut host, clock) = open_host();
     let (guest, lease) = create_running(&mut host);

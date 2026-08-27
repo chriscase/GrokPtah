@@ -24,8 +24,8 @@ mod store;
 mod types;
 
 pub use isolated_visual::{
-    isolated_visual_admission, IsolatedEvidenceClass, IsolatedPreflight, IsolatedVisualHost,
-    IsolatedVisualProjection,
+    isolated_visual_admission, map_isolated_error, ComputerSurfaceLease, IsolatedEvidenceClass,
+    IsolatedPreflight, IsolatedVisualHost, IsolatedVisualProjection,
 };
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
