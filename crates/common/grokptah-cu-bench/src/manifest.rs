@@ -34,6 +34,8 @@ pub enum ArtifactKind {
     Invariants,
     /// The execution profiles under comparison.
     Profiles,
+    /// The bounded efficiency envelope each model class declares.
+    EfficiencyEnvelopes,
     /// The qualification thresholds, per model class and profile.
     Thresholds,
     /// The scenario fixtures.
@@ -47,6 +49,7 @@ impl ArtifactKind {
         Self::Taxonomy,
         Self::Invariants,
         Self::Profiles,
+        Self::EfficiencyEnvelopes,
         Self::Thresholds,
         Self::Scenarios,
         Self::WorkflowMatrix,
@@ -59,6 +62,7 @@ impl ArtifactKind {
             Self::Taxonomy => "schema/hazard-families.json",
             Self::Invariants => "schema/invariants.json",
             Self::Profiles => "schema/profiles.json",
+            Self::EfficiencyEnvelopes => "schema/efficiency-envelopes.json",
             Self::Thresholds => "schema/thresholds.json",
             Self::Scenarios => "schema/scenarios.json",
             Self::WorkflowMatrix => "schema/workflow-matrix.json",
@@ -72,6 +76,7 @@ impl ArtifactKind {
             Self::Taxonomy => canonical_json_pretty(&taxonomy_doc()),
             Self::Invariants => canonical_json_pretty(&invariants_doc()),
             Self::Profiles => canonical_json_pretty(&profiles_doc()),
+            Self::EfficiencyEnvelopes => canonical_json_pretty(&envelopes_doc()),
             Self::Thresholds => canonical_json_pretty(&QualificationThresholds::matrix()),
             Self::Scenarios => canonical_json_pretty(&crate::catalog::all()),
             Self::WorkflowMatrix => canonical_json_pretty(&crate::matrix::workflow_matrix()),
@@ -128,6 +133,14 @@ fn invariants_doc() -> Vec<InvariantRow> {
             refusal: invariant.refusal(),
             authority_bearing: invariant.is_authority_bearing(),
         })
+        .collect()
+}
+
+#[must_use]
+fn envelopes_doc() -> Vec<crate::efficiency::EfficiencyEnvelope> {
+    crate::modelclass::ModelClass::ALL
+        .iter()
+        .map(|class| crate::efficiency::EfficiencyEnvelope::for_class(*class))
         .collect()
 }
 

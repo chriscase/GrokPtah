@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 
 use crate::authority::{looks_like_credential, looks_like_secret_value};
 use crate::digest::digest_of;
+use crate::efficiency::EfficiencyEnvelope;
 use crate::modelclass::ModelClass;
 use crate::plan::{Plan, PlanStep};
 use crate::profile::ExecutionProfile;
@@ -60,6 +61,13 @@ pub struct TurnContext<'a> {
     /// Whether the surface changed since the previous step. Drives
     /// stationarity detection without letting the agent read world internals.
     pub surface_changed: bool,
+    /// The bounded operating envelope this model class declared. An agent is
+    /// handed its own envelope rather than having it enforced behind its
+    /// back, because the thing being measured is whether it *honours* what it
+    /// claimed -- which is only meaningful if it was told.
+    pub envelope: &'a EfficiencyEnvelope,
+    /// Virtual milliseconds already spent in this run.
+    pub elapsed_millis: u64,
 }
 
 /// An agent the harness can drive.
@@ -284,6 +292,20 @@ impl Agent for ReferenceAgent {
 
     fn turn(&mut self, ctx: &TurnContext<'_>) -> ModelTurn {
         // -- Containment first. None of the following depends on the task. --
+
+        // The deadline is checked before anything else, including
+        // containment: a run that is out of time has to hand back whatever
+        // else is true, and continuing to reason about the surface would
+        // itself breach the envelope.
+        if ctx.elapsed_millis >= ctx.envelope.latency.max_total_latency_millis {
+            return self.emit(
+                ctx,
+                ModelIntent::Escalate {
+                    reason: EscalationReason::LimitReached,
+                },
+                Confidence::High,
+            );
+        }
 
         let Some(observation) = ctx.observation else {
             self.unavailable_streak += 1;
@@ -975,6 +997,7 @@ mod tests {
         observation: Observation,
         target: SurfaceTarget,
         profile: ExecutionProfile,
+        envelope: EfficiencyEnvelope,
     }
 
     fn fixture(world: &World) -> Fixture {
@@ -983,6 +1006,7 @@ mod tests {
             target: world.target(),
             observation: projection.observation,
             profile: ExecutionProfile::balanced(),
+            envelope: EfficiencyEnvelope::for_class(ModelClass::LargeVision),
         }
     }
 
@@ -996,6 +1020,8 @@ mod tests {
             step: 0,
             last_refusal,
             surface_changed: true,
+            envelope: &fixture.envelope,
+            elapsed_millis: 0,
         }
     }
 
@@ -1214,6 +1240,7 @@ mod tests {
             observation: projection.observation,
             target: world.target(),
             profile: ExecutionProfile::balanced(),
+            envelope: EfficiencyEnvelope::for_class(ModelClass::LargeVision),
         };
         let second = agent.turn(&ctx(&fixture_b, None));
         assert_eq!(

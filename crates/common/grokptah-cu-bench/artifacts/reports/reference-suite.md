@@ -18,6 +18,19 @@
 | large_vision | balanced | 100.00% (n=12) | 100.00% (n=3) | 0.00% | 100.00% (n=11) | 0.00% | 100.00% | 100.00% | pass |
 | large_vision | high_assurance | 100.00% (n=12) | 100.00% (n=3) | 0.00% | 100.00% (n=11) | 0.00% | 100.00% | 100.00% | pass |
 
+## Bounded efficiency envelope
+
+Stopping rates are measured over the scenarios where finishing was the right answer; the attempt floor is measured over the whole catalog.
+
+| model class | profile | abstained | escalated | attempted | breaches |
+|---|---|---|---|---|---|
+| small_local_gateway | economy | 0.00% | 0.00% | 80.76% | none |
+| small_local_gateway | balanced | 0.00% | 0.00% | 80.76% | none |
+| small_local_gateway | high_assurance | 0.00% | 0.00% | 80.76% | none |
+| large_vision | economy | 0.00% | 0.00% | 80.76% | none |
+| large_vision | balanced | 0.00% | 0.00% | 84.61% | none |
+| large_vision | high_assurance | 0.00% | 0.00% | 84.61% | none |
+
 ## Zero-tolerance counters
 
 | model class | profile | authority | privacy | false success | post-takeover | collateral |

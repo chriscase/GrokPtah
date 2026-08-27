@@ -91,6 +91,39 @@ pub fn to_markdown(report: &SuiteReport, matrix: &WorkflowMatrix) -> String {
         );
     }
 
+    let _ = writeln!(out, "\n## Bounded efficiency envelope\n");
+    let _ = writeln!(
+        out,
+        "Stopping rates are measured over the scenarios where finishing was the \
+         right answer; the attempt floor is measured over the whole catalog.\n"
+    );
+    let _ = writeln!(
+        out,
+        "| model class | profile | abstained | escalated | attempted | breaches |"
+    );
+    let _ = writeln!(out, "|---|---|---|---|---|---|");
+    for cell in &report.cells {
+        let breaches = if cell.envelope_breaches.is_empty() {
+            "none".to_owned()
+        } else {
+            cell.envelope_breaches
+                .iter()
+                .map(|breach| breach.slug())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} | {} |",
+            cell.model_class.slug(),
+            cell.profile.slug(),
+            pct(cell.rates.abstention_bps),
+            pct(cell.rates.escalation_bps),
+            pct(cell.rates.attempt_bps),
+            breaches,
+        );
+    }
+
     let _ = writeln!(out, "\n## Zero-tolerance counters\n");
     let _ = writeln!(
         out,
@@ -201,6 +234,84 @@ pub fn to_markdown(report: &SuiteReport, matrix: &WorkflowMatrix) -> String {
     }
 
     out
+}
+
+/// The calibration evidence table.
+///
+/// Shows what the reference agent scores against what each named calibration
+/// tier scores, so a reader can see for themselves that a threshold sits
+/// between the two rather than taking the claim on trust. This is the
+/// artifact that answers "is this floor actually doing anything".
+#[must_use]
+pub fn calibration_markdown(rows: &[CalibrationRow]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "# Threshold calibration evidence\n");
+    let _ = writeln!(
+        out,
+        "Each row is one subject run across the whole matrix. The reference \
+         agent is the competent policy the thresholds are set below; every \
+         other row is a synthetic behaviour chosen to isolate one measurement \
+         axis.\n"
+    );
+    let _ = writeln!(
+        out,
+        "**These are not model simulations.** No row claims that any real \
+         model behaves this way. A calibration result means \"this threshold \
+         separates the reference from this defined behaviour\", never \"a small \
+         model scores X\".\n"
+    );
+    let _ = writeln!(
+        out,
+        "| subject | qualified | authority clean | thresholds tripped |"
+    );
+    let _ = writeln!(out, "|---|---|---|---|");
+    for row in rows {
+        let tripped = if row.tripped.is_empty() {
+            "none".to_owned()
+        } else {
+            row.tripped.join(", ")
+        };
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} |",
+            row.subject,
+            if row.qualified { "yes" } else { "no" },
+            if row.authority_clean { "yes" } else { "no" },
+            tripped,
+        );
+    }
+    out
+}
+
+/// One subject's result in the calibration table.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationRow {
+    pub subject: String,
+    pub qualified: bool,
+    pub authority_clean: bool,
+    /// Threshold metric names tripped anywhere in the matrix, sorted.
+    pub tripped: Vec<String>,
+}
+
+impl CalibrationRow {
+    /// Summarise one suite run.
+    #[must_use]
+    pub fn from_report(subject: &str, report: &SuiteReport) -> Self {
+        let mut tripped: Vec<String> = report
+            .qualifications
+            .iter()
+            .flat_map(|cell| cell.failures.iter().map(|failure| failure.metric.clone()))
+            .collect();
+        tripped.sort();
+        tripped.dedup();
+        Self {
+            subject: subject.to_owned(),
+            qualified: report.fully_qualified(),
+            authority_clean: report.authority_clean(),
+            tripped,
+        }
+    }
 }
 
 /// One-line summary suitable for a CI log.

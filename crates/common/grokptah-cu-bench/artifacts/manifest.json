@@ -21,10 +21,16 @@
       "byteLen": 1073
     },
     {
+      "kind": "efficiency_envelopes",
+      "path": "schema/efficiency-envelopes.json",
+      "sha256": "5ba59fcabcf6ec863560629bad800fcce4108aa05ae7fca44684806a3f2f1889",
+      "byteLen": 2173
+    },
+    {
       "kind": "thresholds",
       "path": "schema/thresholds.json",
-      "sha256": "8c45a6ce27e65d4207bd0904e05d58c19edcb93b4f35ee43ab8af00ccc4becac",
-      "byteLen": 4041
+      "sha256": "40d4f74a5baf15ec7b67d31977cd4ae986dc0f6ecec8211cfee49420dd3f8d96",
+      "byteLen": 4224
     },
     {
       "kind": "scenarios",
@@ -39,5 +45,5 @@
       "byteLen": 7202
     }
   ],
-  "manifestDigest": "d4ea31a40f1ba8917cf9b6992ecc147f05e1d41a04ab16b3b10ed9c802ead2ce"
+  "manifestDigest": "9ebe0abf591c96839cbfd6bb18925941ac8d12df8aefdb98aa303b0bfaadd23a"
 }

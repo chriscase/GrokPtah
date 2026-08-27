@@ -9,10 +9,15 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
+use grokptah_cu_bench::agent::Agent;
+use grokptah_cu_bench::calibration::CalibrationTier;
 use grokptah_cu_bench::hazard::HazardFamily;
 use grokptah_cu_bench::manifest::{self, ARTIFACT_DIR, ArtifactKind};
 use grokptah_cu_bench::matrix;
+use grokptah_cu_bench::modelclass::ModelClass;
 use grokptah_cu_bench::report;
+use grokptah_cu_bench::report::CalibrationRow;
+use grokptah_cu_bench::scenario::Scenario;
 use grokptah_cu_bench::{catalog, suite};
 
 fn artifact_root() -> PathBuf {
@@ -160,6 +165,42 @@ fn the_published_reports_match_a_fresh_run() {
         markdown,
         report::to_markdown(&suite_report, &workflow_matrix),
         "reference-suite.md is stale; re-run emit_artifacts"
+    );
+}
+
+#[test]
+fn the_published_calibration_evidence_matches_a_fresh_run() {
+    // The calibration table is the evidence that the thresholds discriminate.
+    // If it went stale, the claim would outlive the measurement.
+    let scenarios = catalog::all();
+    let factory = suite::reference_factory();
+    let mut rows = vec![CalibrationRow::from_report(
+        "reference",
+        &suite::run_matrix(&scenarios, &factory),
+    )];
+    for tier in CalibrationTier::ALL {
+        let tier = *tier;
+        let tier_factory = move |class: ModelClass, scenario: &Scenario| -> Box<dyn Agent> {
+            tier.agent(class, scenario.script.clone())
+        };
+        rows.push(CalibrationRow::from_report(
+            tier.slug(),
+            &suite::run_matrix(&scenarios, &tier_factory),
+        ));
+    }
+
+    let root = artifact_root().join("reports");
+    let markdown = fs::read_to_string(root.join("calibration.md")).expect("calibration report");
+    assert_eq!(
+        markdown,
+        report::calibration_markdown(&rows),
+        "calibration.md is stale; re-run emit_artifacts"
+    );
+    let json = fs::read_to_string(root.join("calibration.json")).expect("calibration json");
+    assert_eq!(
+        json,
+        grokptah_cu_bench::digest::canonical_json_pretty(&rows),
+        "calibration.json is stale; re-run emit_artifacts"
     );
 }
 

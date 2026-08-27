@@ -8,7 +8,12 @@
 use std::fs;
 use std::path::Path;
 
+use grokptah_cu_bench::agent::Agent;
+use grokptah_cu_bench::calibration::CalibrationTier;
 use grokptah_cu_bench::manifest::{self, ARTIFACT_DIR, ArtifactKind};
+use grokptah_cu_bench::modelclass::ModelClass;
+use grokptah_cu_bench::report::CalibrationRow;
+use grokptah_cu_bench::scenario::Scenario;
 use grokptah_cu_bench::{catalog, matrix, report, suite};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -43,6 +48,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         report::to_markdown(&suite_report, &workflow_matrix),
     )?;
     println!("wrote {}", reports.join("reference-suite.md").display());
+
+    // Calibration evidence: the reference against every named tier, so a
+    // reader can check that each threshold sits between two measurements.
+    let mut rows = vec![CalibrationRow::from_report("reference", &suite_report)];
+    for tier in CalibrationTier::ALL {
+        let tier = *tier;
+        let tier_factory = move |class: ModelClass, scenario: &Scenario| -> Box<dyn Agent> {
+            tier.agent(class, scenario.script.clone())
+        };
+        let tier_report = suite::run_matrix(&scenarios, &tier_factory);
+        rows.push(CalibrationRow::from_report(tier.slug(), &tier_report));
+    }
+    fs::write(
+        reports.join("calibration.md"),
+        report::calibration_markdown(&rows),
+    )?;
+    fs::write(
+        reports.join("calibration.json"),
+        grokptah_cu_bench::digest::canonical_json_pretty(&rows),
+    )?;
+    println!("wrote {}", reports.join("calibration.md").display());
+
     println!("{}", report::one_line(&suite_report));
     Ok(())
 }
