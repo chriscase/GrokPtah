@@ -1,7 +1,8 @@
 # GrokPtah agent SDK seam
 
-Status: **contract shipped, adapters pending.** This document is the design
-packet and the implementation guide for `crates/codegen/grokptah-agent-sdk`.
+Status: **contract shipped; service adapter shipped; desktop adapter and a
+live two-host run pending.** This document is the design packet and the
+implementation guide for `crates/codegen/grokptah-agent-sdk`.
 
 ## Why this exists
 
@@ -59,21 +60,155 @@ ADR-002 §3 also records a required future contract:
 
 One trait, `client::AgentControlPlane`, with the operations a consumer needs:
 
-| Method | Capability | Backing runtime surface |
-|---|---|---|
-| `capabilities` | — | *new*: assembled by the adapter from host config; see below |
-| `create_session` | `session.create` | `ptah_create_session` |
-| `list_sessions` | `session.list` | `ptah_list_sessions` |
-| `submit_task` | `task.submit` | `ptah_submit_task` |
-| `observe_run` | `run.observe` | `ptah_get_run` + `ptah_get_progress` + `ptah_get_handoff` + `ptah_get_changes` |
-| `stream_events` | `run.events.page` | `ptah_get_events` |
-| `request_follow_up` | `run.followup` | `ptah_steer` |
-| `cancel_run` | `run.cancel` | `ptah_cancel` |
-| `acquire_control` / `release_control` | `control.lease` | `ptah_claim_work` / `ptah_release_work` |
-| `fetch_artifact` | `artifact.fetch` | `ptah_review_run` (diff), `ptah_get_test_results` (report) |
+| Method | Capability | Backing runtime surface | Service adapter |
+|---|---|---|---|
+| `capabilities` | — | `tools/list` (the host-owned tool registry) | ✅ |
+| `create_session` | `session.create` | `ptah_create_session` | ✅ (not idempotent — see below) |
+| `list_sessions` | `session.list` | `ptah_list_sessions` | ✅ (adapter-side paging) |
+| `submit_task` | `task.submit` | `ptah_submit_task` | ✅ |
+| `observe_run` | `run.observe` | `ptah_get_run` alone — the durable record already carries bounds, usage, changes and verification | ✅ |
+| `stream_events` | `run.events.page` | `ptah_get_events` | ✅ |
+| `request_follow_up` | `run.followup` | `ptah_steer` | ✅ (no fence — see below) |
+| `cancel_run` | `run.cancel` | `ptah_cancel` + a re-read | ✅ |
+| `acquire_control` / `release_control` | `control.lease` | `ptah_claim_work` / `ptah_release_work` | ✅ |
+| `fetch_artifact` | `artifact.fetch` | `ptah_get_test_results` only | ✅ (test report; `ptah_review_run` declined) |
 
 `run.events.live` (the scoped SSE channel and its `ptah_recovery` gap notice) is
 declared but not yet in the trait — see P1.
+
+## The service adapter
+
+`service::ServiceControlPlane` implements the trait over the authenticated MCP
+control plane. Four properties are worth stating outright.
+
+**It cannot reach a network.** The adapter speaks the domain contract only;
+framing lives behind `service::McpTransport`, which an embedder implements over
+its own HTTP client. This crate has no HTTP client, so no code path in it can
+reach a provider, a gateway, or any route. Every test drives a scripted
+transport that emulates the `ptah_*` wire contract.
+
+**It is read-only by default.** `ServiceControlPlane::read_only` is the only
+constructor that needs no assertion from the embedder; in that mode every
+mutating method fails with `forbidden_scope` *before the transport is touched*,
+and the capability document advertises those capabilities as `Forbidden` so a
+consumer can grey out the control instead of discovering the refusal on click.
+`with_operator_authority` opts in, and is the embedder asserting what ADR-002 §5
+already states: possession of a configured service bearer is privileged
+operator access. The restriction therefore protects against consumer mistakes,
+not against a malicious consumer holding the same bearer.
+
+**Its workspace registry is learned, never declared.** A `WorkspaceRef` exists
+only after the host reported that workspace in a `ptah_list_sessions` or
+`ptah_create_session` response. A ref the host has not reported resolves to
+`workspace_mismatch` without a round trip, matching the runtime, where the
+allowlist gate is session-independent and precedes every scope check. Refs are
+`ws-` plus 16 hex characters of `SHA-256(key ‖ 0x00 ‖ path)`. With the default
+key this obfuscates the path but does not hide it — workspace paths are
+low-entropy, so an attacker who can guess one can confirm it against a ref.
+`WorkspaceRegistry::with_ref_key` takes a persistent secret for embedders that
+need real opacity; host-issued refs remain the durable fix (P1).
+
+**Redaction happens here.** `ptah_get_run` returns the *complete* durable
+`RunRecord`: `promptPreview`, `finalResponse`, the absolute `workspace` path,
+`requestId`, and `clientId` are all on the wire. None of them survive
+`project_run`, because none of them exist on `RunView`. Journal projection drops
+message and thought chunks, shell output, tool-call output, and
+`FileEdit.unified_diff`; a changed-file path the host reports as absolute is
+dropped rather than surfaced. The test-report artifact drops the recorded
+`command` string, which can carry absolute paths. Contract tests assert each of
+these against fixtures that deliberately contain the secret.
+
+### What the adapter refuses to map
+
+The host's tool surface is much larger than this contract. The adapter calls
+exactly ten tools and asserts in debug builds if asked for an eleventh. It
+declines, on purpose:
+
+| Declined | Why |
+|---|---|
+| `ptah_create_manager_plan`, `ptah_advance_manager_plan`, `ptah_tick_manager_plan`, `ptah_replan_manager_plan` | Manager plans are an **active line** — bridge #337, #338 and #339 are the three newest commits on `main`, `MANAGER_SCHEMA_VERSION` is 1, and the surface is still moving. Mapping it now would couple a public contract to a design in flight. |
+| `ptah_set_managed_execution`, `ptah_get_managed_execution`, `ptah_authorize_work_execution`, `ptah_resolve_work_input`, `ptah_list_execution_intents` | This is where a **mutation grant** is issued and durably recorded. That authority stays host-owned: a consumer of this seam must not be able to issue one, replay one, or infer that one exists. |
+| `ptah_approve_run`, `ptah_promote_run`, `ptah_discard_run`, `ptah_review_run` | Operator authority — reviewing, approving and promoting code. ADR-002 §5 keeps these operator-equivalent, and `ptah_review_run` is entangled with the approval it feeds. |
+| `ptah_*_computer_*` | Computer Use reads are redaction-safe but unmapped in this build, and advertised as `Unsupported` rather than silently missing. Computer Use *control* is permanently forbidden. |
+| Queue mutators, routines, workers, messages, work lifecycle beyond claim/release | Outside the declared v1 capability set. |
+
+A contract test advertises the manager, managed-execution and promotion tools
+from the host double and asserts the adapter never calls one.
+
+`control.lease` (`ptah_claim_work` / `ptah_release_work`) *is* mapped. It sits
+adjacent to the manager line — managed execution references the same work
+items — but claim and release predate it, carry their own schema version, and
+are part of the declared v1 capability set. They are gated behind mutation
+authority like every other mutation.
+
+## What building the adapter changed, and what it revealed
+
+Writing a real adapter is how a contract stops being a guess. Two sets of
+findings came out of it.
+
+### Contract corrections (applied here)
+
+The crate has never been published and has no consumers, so these were applied
+in place at contract 1.0 rather than as a version bump. After the first named
+consumer, the same four would require a major.
+
+1. **`ReleaseLeaseRequest` gained `credential` and `reason`.** `ptah_release_work`
+   requires both. The v1 shape could not have released a lease at all. The
+   credential is `#[serde(skip)]`, so the wire shape is unchanged and the secret
+   still cannot cross a JSON boundary; the claimant holds it, exactly as the
+   runtime intends.
+2. **`replayed` became `Option<bool>` on every receipt.** The control plane
+   replays a stored idempotency receipt byte-for-byte, so a replay is
+   *indistinguishable from fresh work on the wire*. Reporting `false` would
+   have been a claim no adapter over that boundary can support. `None` means
+   "the host does not report it"; the invariant a caller can still rely on is
+   the one that matters — the same key never does the work twice.
+3. **The battery's replay check now fails only on the dangerous outcome.** A
+   second run under a used key, or a host claiming `Some(false)`, still fails.
+   "Cannot tell" passes.
+4. **The battery's fence check distinguishes three outcomes.** Fencing
+   correctly passes; refusing to fence (`unsupported`) *skips*; silently
+   accepting a stale fence still fails.
+
+The battery also gained two lease checks, so the declared `control.lease`
+capability is now exercised on any adapter that has a claimable work item.
+
+### Bridge-side findings (not changed here)
+
+Each of these is a real gap on the runtime side. None is fixed in this branch:
+the bridge is outside this change's file allowlist, and three of the five sit
+on or beside an active line.
+
+1. **`ptah_submit_task`'s advertised `bounds` schema omits `maxTotalTokens`.**
+   `merge_bounds` accepts it and `MCP_CONTROL_COORDINATOR.md` documents it, but
+   `tool_input_schema` lists only `maxPromptBytes`, `maxRounds` and
+   `maxDurationMs`, and every schema there is `additionalProperties: false`. A
+   consumer that validates against the advertised schema — as the in-tree
+   `McpControlClient` does — cannot use the documented token ceiling. The
+   adapter sends the key only when the caller sets it, so a validating
+   transport rejects it loudly rather than the adapter dropping a ceiling
+   silently.
+2. **The durable Run record carries no monotonic revision.** `updatedAt` in
+   epoch milliseconds is the only monotonic non-decreasing quantity available,
+   so that is what the adapter derives `Revision` from. Two commits inside one
+   millisecond collapse to a single value, which a `RevisionWatermark` then
+   treats as stale — conservative, but it can drop a real update.
+3. **`ptah_steer` has no compare-and-set fence.** The queue mutators take
+   `expected_version` / `expected_revision`; steering does not. The adapter
+   refuses a fenced follow-up with `unsupported` rather than dropping the fence,
+   because a fence that silently does not fence is worse than no fence.
+4. **`ptah_create_session` accepts no `request_id`.** Session creation is not
+   idempotent at the host, so a retry after a timeout can create a second
+   session. `CreateSessionRequest::request_id` is not transmitted.
+5. **The control plane exposes no host version.** `ptah_get_capacity` reports
+   health and limits but no build identity, so `ServiceHostInfo` is supplied by
+   the embedder from whatever it used to connect.
+
+One contract-side observation, recorded as P2 rather than fixed:
+`ArtifactDescriptor` requires `byteLen` and `digest`, which a listing cannot
+know without materializing the body. The service adapter therefore leaves
+`RunView.artifacts` empty and serves its one artifact under a stable id, and
+the battery's three artifact checks skip against it.
 
 ### Capability discovery
 
@@ -246,17 +381,29 @@ Compatibility rules for future changes:
 
 ## Conformance battery
 
-`conformance::run_battery` drives any `Harness` through 22 checks: discovery,
+`conformance::run_battery` drives any `Harness` through 24 checks: discovery,
 forbidden-capability denial, submit, replay, key-reuse conflict, projection
 readability, revision monotonicity, cross-session/cross-workspace/cross-tenant
 denial, lost connection, uncertain send, follow-up acceptance and stale fencing,
 event paging and resume, oversized page limits, cursor expiry, artifact
-verification, artifact ceilings, digest mismatch, and idempotent cancellation.
+verification, artifact ceilings, digest mismatch, idempotent cancellation, and
+a control-lease round trip.
 
 A check whose precondition the harness cannot produce is reported as
 **skipped**, never silently passed. A matrix that quietly counts unrunnable
-checks as green is worse than no matrix. Against the fake, zero checks skip —
-that is what proves the checks actually run.
+checks as green is worse than no matrix.
+
+It now runs against two adapters:
+
+| Adapter | Result | Skips |
+|---|---|---|
+| `FakeControlPlane` | 24 passed, 0 failed, 0 skipped | none — the fake can produce every fault, which is what proves the checks run |
+| `ServiceControlPlane` over a scripted `ptah_*` transport | 17 passed, 0 failed, 7 skipped | cross-tenant (one owner per host), uncertain send (no such wire state), retained-range on expiry (run events carry no `eventRange`), follow-up fencing (no CAS on `ptah_steer`), and three artifact checks (see the `ArtifactDescriptor` note above) |
+
+A further test asserts the two adapters **agree on every check both can run**,
+so a difference has to show up as an explicit skip rather than as drift. That
+is the parity property the matrix exists for; what it does not yet cover is a
+*live* host, which is what ADR-002 §7 step 3 actually asks for.
 
 ## How ContextDesk consumes this
 
@@ -307,22 +454,31 @@ pass, and no existing runtime behavior changed.
 
 ### P1 — required before a real consumer ships against a live host
 
-1. **Service adapter** (`McpControlPlane`) over `grokptah-service`, mapping the
-   table above. It is the only component that may hold canonical workspace
-   paths, and it owns the `WorkspaceRef` ↔ path map. Error mapping is a string
-   match on `error.data.code`, since the mirror tokens are byte-identical.
-2. **Desktop adapter** over the in-process `OrchestrationService`, so the same
-   battery runs on both hosts. This is ADR-002 §7 step 3's remaining half.
-3. **Run the battery against both hosts in CI**, with stated pass criteria and
-   an allowed-skip list per host. Until this exists, "parity" is an assertion.
-4. **`run.events.live`**: add a `subscribe_events` method returning a bounded
+1. ~~**Service adapter** over `grokptah-service`~~ — **delivered**. See *The
+   service adapter* above. What it still needs is a real transport: an embedder
+   must supply `McpTransport` over its own HTTP client, and no such transport
+   ships here.
+2. **A live two-host run of the battery.** The matrix runs against the fake and
+   against the service adapter over a *scripted* transport. Neither is a live
+   host. Standing this up means booting `grokptah-service` against a disposable
+   `GROKPTAH_HOME`, pointing a real transport at it, and running the same
+   battery — plus the same again against the desktop's embedded control server.
+   Until then, "parity" covers wire shape, not runtime behavior.
+3. **Desktop adapter** over the in-process `OrchestrationService`, for hosts
+   that embed the runtime rather than talk to it.
+4. **Run the battery in CI** once (2) exists, with stated pass criteria and an
+   allowed-skip list per host.
+5. **`run.events.live`**: add a `subscribe_events` method returning a bounded
    stream, mapping the SSE channel plus `notifications/ptah_recovery`. A gap
    must surface as `transport_unavailable` with the resume cursor, never as a
    silently short stream.
-5. **`WorkspaceRef` issuance**: define how a host mints stable refs across
+6. **`WorkspaceRef` issuance**: define how a host mints stable refs across
    restarts. A ref that changes on restart breaks a consumer's saved state; a
-   ref derived from the path leaks the path. A per-home stable random id
-   persisted alongside the allowlist entry is the expected shape.
+   ref derived from a guessable path is confirmable against it. A per-home
+   stable random id persisted alongside the allowlist entry is the expected
+   shape, and it closes the residual weakness in the adapter's keyed digest.
+7. **The five bridge-side findings above**, each of which needs an owner on the
+   runtime side.
 
 ### P2 — worth doing, not blocking
 
@@ -339,7 +495,11 @@ pass, and no existing runtime behavior changed.
    manager-plan tools). Large, and only worth carrying once a consumer needs it.
 9. **TypeScript DTO generation** from the Rust types, so a web or desktop
    frontend consumes the same contract without a hand-maintained mirror.
-10. **Publication decision.** `publish = false` until ADR-002 §7 step 5 is met:
+10. **Split `ArtifactDescriptor` listing from verification.** Requiring
+    `byteLen` and `digest` on a descriptor forces an adapter to materialize a
+    body just to list it. Making both optional until fetch would let the service
+    adapter advertise its artifacts.
+11. **Publication decision.** `publish = false` until ADR-002 §7 step 5 is met:
     a named compatibility and version owner maintaining the matrix for a real
     external consumer.
 

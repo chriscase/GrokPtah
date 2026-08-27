@@ -77,9 +77,12 @@ attempt-time capture, and three-valued availability mapping to typed
 
 ### What remains gated
 
-* **Step 3** is half done. The battery runs against the fake only. Running it
-  against desktop and service, in CI, with stated pass criteria, is required
-  before "parity" is more than an assertion.
+* **Step 3** is partly done. The battery now runs against two adapters — the
+  deterministic fake and the service adapter over a scripted `ptah_*`
+  transport — and a test asserts the two agree wherever both can run a check.
+  Neither is a *live* host. Running it against a running `grokptah-service` and
+  the desktop's embedded control server, in CI, with stated pass criteria, is
+  what step 3 actually asks for.
 * **Step 4** requires two named running consumers on the same boundary.
   ContextDesk counts only once it exercises this in running code.
 * **Step 5** requires a named compatibility and version owner.
@@ -92,6 +95,11 @@ grants, run approval and promotion) are absent by type, not filtered at the
 transport. Authority-owned secrets never cross; the single secret on the
 boundary — a work lease token — is held in a non-`Serialize`, `Debug`-redacted
 type. Transcript content and absolute host paths have no representation.
+
+The service adapter over the authenticated MCP control plane landed under
+this decision. It maps ten `ptah_*` tools and explicitly declines the manager,
+managed-execution, and approval/promotion surfaces: those are where mutation
+grants are issued and where the newest active line is still moving.
 
 Full design, adapter mapping, versioning rules, and residual P1/P2 work:
 [`AGENT_SDK_SEAM.md`](AGENT_SDK_SEAM.md).

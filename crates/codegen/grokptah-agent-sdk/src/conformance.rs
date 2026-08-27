@@ -15,7 +15,7 @@ use crate::capability::CapabilityId;
 use crate::client::{AgentControlPlane, AgentControlPlaneExt};
 use crate::dto::*;
 use crate::error::SdkErrorCode;
-use crate::ids::{ArtifactId, RequestId, RunId, WorkspaceRef};
+use crate::ids::{AgentId, ArtifactId, AttemptId, RequestId, RunId, WorkId, WorkspaceRef};
 use crate::page::PageRequest;
 
 /// One check's result.
@@ -142,6 +142,12 @@ pub trait Harness: Send + Sync {
         false
     }
 
+    /// A work item this credential may claim, when the harness has one.
+    /// Returning `None` skips the lease checks rather than passing them.
+    async fn claimable_work(&self) -> Option<(WorkId, AgentId)> {
+        None
+    }
+
     /// Mint a fresh idempotency key. Must never repeat within one battery run.
     fn next_request_id(&self) -> RequestId;
 }
@@ -246,7 +252,7 @@ pub async fn run_battery<H: Harness>(harness: &H) -> ConformanceReport {
         Ok(accepted) => {
             report.checks.push(CheckResult {
                 name: "submit.success",
-                outcome: if accepted.replayed {
+                outcome: if accepted.replayed == Some(true) {
                     CheckOutcome::Failed("a first submission must not report replayed".into())
                 } else {
                     CheckOutcome::Passed
@@ -264,14 +270,19 @@ pub async fn run_battery<H: Harness>(harness: &H) -> ConformanceReport {
     };
 
     check!(report, "submit.replay_is_idempotent", {
+        // The invariant that matters is that the same key never does the
+        // work twice. Whether the host can *say* it replayed is secondary:
+        // the MCP boundary replays a stored receipt byte-for-byte, so an
+        // adapter there cannot tell. `Some(false)` is still a failure — that
+        // is a host claiming it did fresh work under a used key.
         match plane.submit_task(submission.clone()).await {
-            Ok(replay) if replay.run_id == accepted.run_id && replay.replayed => {
-                CheckOutcome::Passed
-            }
             Ok(replay) if replay.run_id != accepted.run_id => {
                 CheckOutcome::Failed("replay created a second run".into())
             }
-            Ok(_) => CheckOutcome::Failed("replay did not set replayed".into()),
+            Ok(replay) if replay.replayed == Some(false) => {
+                CheckOutcome::Failed("replay reported itself as fresh work".into())
+            }
+            Ok(_) => CheckOutcome::Passed,
             Err(error) => CheckOutcome::Failed(format!("replay failed: {error}")),
         }
     });
@@ -468,6 +479,13 @@ pub async fn run_battery<H: Harness>(harness: &H) -> ConformanceReport {
         };
         match plane.request_follow_up(request).await {
             Ok(_) => CheckOutcome::Failed("a stale revision fence was accepted".into()),
+            Err(error) if error.code == SdkErrorCode::StaleVersion => CheckOutcome::Passed,
+            // Refusing the fence outright is correct for a host with no
+            // compare-and-set on this operation. Silently dropping it would
+            // not be, and that is what the `Ok(_)` arm above catches.
+            Err(error) if error.code == SdkErrorCode::Unsupported => {
+                CheckOutcome::Skipped("host does not fence follow-up on a revision".into())
+            }
             Err(error) => expect_code(&error, SdkErrorCode::StaleVersion, "stale fence"),
         }
     });
@@ -626,13 +644,85 @@ pub async fn run_battery<H: Harness>(harness: &H) -> ConformanceReport {
             Err(error) => CheckOutcome::Failed(format!("cancel failed: {error}")),
             Ok(first) => match plane.cancel_run(request).await {
                 Err(error) => CheckOutcome::Failed(format!("cancel replay failed: {error}")),
-                Ok(second) if second.lifecycle == first.lifecycle && second.replayed => {
-                    CheckOutcome::Passed
+                Ok(second) if second.lifecycle != first.lifecycle => {
+                    CheckOutcome::Failed("cancel replay changed the lifecycle".into())
                 }
-                Ok(second) if !second.replayed => {
-                    CheckOutcome::Failed("cancel replay did not set replayed".into())
+                Ok(second) if second.replayed == Some(false) => {
+                    CheckOutcome::Failed("cancel replay reported itself as fresh work".into())
                 }
-                Ok(_) => CheckOutcome::Failed("cancel replay changed the lifecycle".into()),
+                Ok(_) => CheckOutcome::Passed,
+            },
+        }
+    });
+
+    // ── Control lease ────────────────────────────────────────────────────
+    check!(report, "lease.round_trip_holds_its_credential", {
+        match harness.claimable_work().await {
+            None => CheckOutcome::Skipped("harness has no claimable work item".into()),
+            Some((work_id, claimant)) => {
+                let acquire = ControlLeaseRequest {
+                    request_id: harness.next_request_id(),
+                    session_id: session.session_id.clone(),
+                    workspace: session.workspace.clone(),
+                    work_id: work_id.clone(),
+                    claimant,
+                    requested_ttl_ms: Some(30_000),
+                };
+                match plane.acquire_control(acquire).await {
+                    Err(error) => CheckOutcome::Failed(format!("claim failed: {error}")),
+                    Ok(lease) => {
+                        let encoded = serde_json::to_string(&lease).unwrap_or_default();
+                        if !lease.credential.is_empty()
+                            && encoded.contains(lease.credential.reveal())
+                        {
+                            CheckOutcome::Failed(
+                                "the lease credential reached the serialized lease".into(),
+                            )
+                        } else {
+                            let release = ReleaseLeaseRequest {
+                                request_id: harness.next_request_id(),
+                                session_id: session.session_id.clone(),
+                                workspace: session.workspace.clone(),
+                                work_id,
+                                attempt_id: lease.attempt_id.clone(),
+                                reason: BoundedText::new("conformance"),
+                                credential: lease.credential.clone(),
+                            };
+                            match plane.release_control(release).await {
+                                Ok(_) => CheckOutcome::Passed,
+                                Err(error) => {
+                                    CheckOutcome::Failed(format!("release failed: {error}"))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    check!(report, "lease.release_without_a_credential_fails_closed", {
+        match harness.claimable_work().await {
+            None => CheckOutcome::Skipped("harness has no claimable work item".into()),
+            Some((work_id, _)) => match AttemptId::new("attempt-probe") {
+                Err(error) => CheckOutcome::Failed(format!("could not mint a probe id: {error}")),
+                Ok(attempt_id) => {
+                    let release = ReleaseLeaseRequest {
+                        request_id: harness.next_request_id(),
+                        session_id: session.session_id.clone(),
+                        workspace: session.workspace.clone(),
+                        work_id,
+                        attempt_id,
+                        reason: BoundedText::new("conformance"),
+                        credential: LeaseCredential::default(),
+                    };
+                    match plane.release_control(release).await {
+                        Ok(_) => {
+                            CheckOutcome::Failed("a credential-less release was accepted".into())
+                        }
+                        Err(_) => CheckOutcome::Passed,
+                    }
+                }
             },
         }
     });

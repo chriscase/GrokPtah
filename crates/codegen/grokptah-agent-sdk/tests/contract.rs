@@ -56,7 +56,7 @@ async fn happy_path_submit_observe_stream_and_complete() {
         .await
         .expect("submit");
     assert_eq!(accepted.lifecycle, RunLifecycle::Queued);
-    assert!(!accepted.replayed);
+    assert_eq!(accepted.replayed, Some(false));
 
     plane.start_run(&accepted.run_id).expect("start");
     plane
@@ -139,8 +139,8 @@ async fn exact_replay_returns_the_original_run_without_doing_work_twice() {
     let second = plane.submit_task(request).await.expect("replay");
 
     assert_eq!(first.run_id, second.run_id);
-    assert!(!first.replayed);
-    assert!(second.replayed, "a replay must announce itself");
+    assert_eq!(first.replayed, Some(false));
+    assert_eq!(second.replayed, Some(true), "a replay must announce itself");
 }
 
 #[tokio::test]
@@ -180,7 +180,11 @@ async fn a_timeout_is_recoverable_by_replaying_the_same_key() {
         other => panic!("expected RetrySameKey, got {other:?}"),
     }
     let accepted = plane.submit_task(request).await.expect("retry succeeds");
-    assert!(!accepted.replayed, "the first attempt never landed");
+    assert_eq!(
+        accepted.replayed,
+        Some(false),
+        "the first attempt never landed"
+    );
 }
 
 // ── Stale observation ─────────────────────────────────────────────────────
@@ -391,12 +395,12 @@ async fn cancelling_a_queued_run_never_launches_a_turn_and_is_idempotent() {
     let first = plane.cancel_run(request.clone()).await.expect("cancel");
     assert_eq!(first.lifecycle, RunLifecycle::Cancelled);
     assert!(first.was_queued);
-    assert!(!first.replayed);
+    assert_eq!(first.replayed, Some(false));
 
     let second = plane.cancel_run(request).await.expect("cancel replay");
     assert_eq!(second.lifecycle, RunLifecycle::Cancelled);
     assert_eq!(second.revision, first.revision, "replay must not re-mutate");
-    assert!(second.replayed);
+    assert_eq!(second.replayed, Some(true));
 
     // A cancelled run is terminal and cannot be started.
     assert!(plane.start_run(&accepted.run_id).is_err());
@@ -809,6 +813,8 @@ async fn a_lease_is_exclusive_idempotent_and_never_serializes_its_secret() {
             workspace: session.workspace.clone(),
             work_id: work_id.clone(),
             attempt_id: lease.attempt_id.clone(),
+            reason: BoundedText::new("done"),
+            credential: lease.credential.clone(),
         })
         .await
         .expect("release");
@@ -997,6 +1003,13 @@ impl Harness for FakeHarness {
         true
     }
 
+    async fn claimable_work(&self) -> Option<(WorkId, AgentId)> {
+        Some((
+            WorkId::new("work-battery").ok()?,
+            AgentId::new("agent-battery").ok()?,
+        ))
+    }
+
     fn next_request_id(&self) -> RequestId {
         let n = self.next.fetch_add(1, Ordering::SeqCst);
         RequestId::new(format!("battery-{n:04}")).expect("minted id is valid")
@@ -1039,6 +1052,8 @@ async fn the_battery_reports_a_skip_rather_than_a_pass_when_a_fault_is_unavailab
         fn next_request_id(&self) -> RequestId {
             self.0.next_request_id()
         }
+        // `claimable_work` deliberately keeps its default: the lease checks
+        // must report as skipped, not silently pass.
         // Every optional capability keeps its default: unavailable.
     }
 
@@ -1057,6 +1072,8 @@ async fn the_battery_reports_a_skip_rather_than_a_pass_when_a_fault_is_unavailab
         "authz.cross_tenant_read_is_indistinguishable",
         "events.expired_cursor_reports_retained_range",
         "artifacts.digest_mismatch_is_integrity_error",
+        "lease.round_trip_holds_its_credential",
+        "lease.release_without_a_credential_fails_closed",
     ] {
         assert!(
             skipped.contains(&expected),

@@ -23,10 +23,10 @@
 //!   grokptah-agent-sdk   ← traits + DTOs + errors + capability document
 //!            ▲  implemented by
 //!            │
-//!   ┌────────┴─────────┬──────────────────┐
-//!   │ desktop adapter  │ service adapter   │ FakeControlPlane
-//!   │ (in-process)     │ (MCP over HTTP)   │ (deterministic)
-//!   └──────────────────┴───────────────────┘
+//!   ┌────────┴─────────┬───────────────────────┬──────────────────┐
+//!   │ desktop adapter  │ ServiceControlPlane   │ FakeControlPlane │
+//!   │ (in-process, P1) │ (ptah_* control plane)│ (deterministic)  │
+//!   └──────────────────┴───────────────────────┴──────────────────┘
 //!            │ calls
 //!            ▼
 //!   grokptah-agent-bridge (runtime; never a consumer dependency)
@@ -88,6 +88,7 @@ pub mod dto;
 pub mod error;
 pub mod ids;
 pub mod page;
+pub mod service;
 pub mod version;
 
 #[cfg(feature = "conformance")]
@@ -121,6 +122,10 @@ pub mod prelude {
         WorkspaceRef,
     };
     pub use crate::page::{Cursor, Page, PageRequest, RetainedRange};
+    pub use crate::service::{
+        McpTransport, MutationAuthority, ServiceControlPlane, ServiceHostInfo, TransportFault,
+        WorkspaceRegistry, TEST_REPORT_ARTIFACT_ID,
+    };
     pub use crate::version::{negotiate, ContractVersion, Negotiated, CONTRACT_VERSION};
 
     #[cfg(feature = "fake")]

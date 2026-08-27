@@ -829,7 +829,7 @@ impl AgentControlPlane for FakeControlPlane {
             ClaimOutcome::Replay(value) => {
                 let mut accepted: RunAccepted = serde_json::from_value(value)
                     .map_err(|e| SdkError::new(SdkErrorCode::Internal, e.to_string()))?;
-                accepted.replayed = true;
+                accepted.replayed = Some(true);
                 return Ok(accepted);
             }
             ClaimOutcome::Conflict => return Err(replayed_conflict()),
@@ -896,7 +896,7 @@ impl AgentControlPlane for FakeControlPlane {
             lifecycle: view.lifecycle,
             queue_position: view.queue_position,
             revision: view.revision,
-            replayed: false,
+            replayed: Some(false),
         };
         state.runs.insert(
             run_id_raw,
@@ -983,7 +983,7 @@ impl AgentControlPlane for FakeControlPlane {
             ClaimOutcome::Replay(value) => {
                 let mut receipt: FollowUpReceipt = serde_json::from_value(value)
                     .map_err(|e| SdkError::new(SdkErrorCode::Internal, e.to_string()))?;
-                receipt.replayed = true;
+                receipt.replayed = Some(true);
                 return Ok(receipt);
             }
             ClaimOutcome::Conflict => return Err(replayed_conflict()),
@@ -1003,7 +1003,7 @@ impl AgentControlPlane for FakeControlPlane {
                 FollowUpDisposition::Queued
             },
             revision: next,
-            replayed: false,
+            replayed: Some(false),
         };
         let response = serde_json::to_value(&receipt)
             .map_err(|e| SdkError::new(SdkErrorCode::Internal, e.to_string()))?;
@@ -1021,7 +1021,7 @@ impl AgentControlPlane for FakeControlPlane {
             ClaimOutcome::Replay(value) => {
                 let mut receipt: CancelReceipt = serde_json::from_value(value)
                     .map_err(|e| SdkError::new(SdkErrorCode::Internal, e.to_string()))?;
-                receipt.replayed = true;
+                receipt.replayed = Some(true);
                 return Ok(receipt);
             }
             ClaimOutcome::Conflict => return Err(replayed_conflict()),
@@ -1054,7 +1054,7 @@ impl AgentControlPlane for FakeControlPlane {
             lifecycle: run.view.lifecycle,
             was_queued,
             revision: run.view.revision,
-            replayed: false,
+            replayed: Some(false),
         };
         let response = serde_json::to_value(&receipt)
             .map_err(|e| SdkError::new(SdkErrorCode::Internal, e.to_string()))?;
@@ -1127,7 +1127,7 @@ impl AgentControlPlane for FakeControlPlane {
             ClaimOutcome::Replay(value) => {
                 let mut receipt: ReleaseLeaseReceipt = serde_json::from_value(value)
                     .map_err(|e| SdkError::new(SdkErrorCode::Internal, e.to_string()))?;
-                receipt.replayed = true;
+                receipt.replayed = Some(true);
                 return Ok(receipt);
             }
             ClaimOutcome::Conflict => return Err(replayed_conflict()),
@@ -1139,12 +1139,21 @@ impl AgentControlPlane for FakeControlPlane {
         if lease.attempt_id != request.attempt_id {
             return Err(FakeState::scope_denied());
         }
+        // The runtime authorizes a release against the claimant's token, not
+        // against the attempt id alone. A holder-less release is refused here
+        // too, so the fake cannot pass a check the service adapter would fail.
+        if request.credential.reveal() != lease.credential.reveal() {
+            return Err(SdkError::new(
+                SdkErrorCode::InvalidRequest,
+                "releasing a lease requires the credential returned by acquire_control",
+            ));
+        }
         state.leases.remove(request.work_id.as_str());
         let receipt = ReleaseLeaseReceipt {
             work_id: request.work_id.clone(),
             attempt_id: request.attempt_id.clone(),
             revision: Revision::new(lease.revision.value() + 1),
-            replayed: false,
+            replayed: Some(false),
         };
         let response = serde_json::to_value(&receipt)
             .map_err(|e| SdkError::new(SdkErrorCode::Internal, e.to_string()))?;

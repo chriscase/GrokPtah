@@ -44,6 +44,27 @@ async fn run(plane: &dyn AgentControlPlane) -> SdkResult<()> {
 Build your UI against `FakeControlPlane` first — it produces every failure mode
 the boundary defines, deterministically and with no host running.
 
+## Adapters
+
+| Adapter | Talks to | Status |
+|---|---|---|
+| `FakeControlPlane` | nothing — deterministic, no clock, no I/O | ships here |
+| `ServiceControlPlane` | the authenticated `ptah_*` MCP control plane | ships here; you supply an `McpTransport` over your own HTTP client |
+| desktop | the in-process runtime | not yet |
+
+`ServiceControlPlane` is **read-only unless you say otherwise**:
+
+```rust
+let observer = ServiceControlPlane::read_only(transport);        // reads only
+let operator = ServiceControlPlane::read_only(transport)
+    .with_operator_authority();                                  // may mutate
+```
+
+In read-only mode the capability document advertises mutating capabilities as
+`Forbidden`, so a UI can disable the control rather than discover the refusal
+on click. This crate has no HTTP client of its own, so nothing in it can reach
+a network; framing is entirely yours.
+
 ## Verify
 
 ```sh

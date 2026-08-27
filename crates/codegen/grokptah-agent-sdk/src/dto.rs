@@ -420,11 +420,17 @@ pub struct RunAccepted {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_position: Option<u32>,
     pub revision: Revision,
-    /// `true` when this response replayed a durable idempotency receipt rather
-    /// than starting new work. A consumer retrying after a timeout can tell
-    /// "already done" from "just did it".
-    #[serde(default)]
-    pub replayed: bool,
+    /// Whether this response replayed a durable idempotency receipt rather
+    /// than starting new work.
+    ///
+    /// `None` means the host does not report it. The MCP control plane replays
+    /// a stored receipt byte-for-byte, so a replay is indistinguishable from
+    /// fresh work on that boundary; an adapter there reports `None` rather
+    /// than asserting `false`. The invariant a caller can always rely on is
+    /// the weaker and more important one: the same key never does the work
+    /// twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed: Option<bool>,
 }
 
 // ── Follow-up ─────────────────────────────────────────────────────────────
@@ -465,8 +471,9 @@ pub struct FollowUpReceipt {
     /// re-reading, so a competing writer cannot slip between your read and
     /// your next fenced mutation.
     pub revision: Revision,
-    #[serde(default)]
-    pub replayed: bool,
+    /// See [`RunAccepted::replayed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed: Option<bool>,
 }
 
 // ── Cancellation ──────────────────────────────────────────────────────────
@@ -487,8 +494,9 @@ pub struct CancelReceipt {
     #[serde(default)]
     pub was_queued: bool,
     pub revision: Revision,
-    #[serde(default)]
-    pub replayed: bool,
+    /// See [`RunAccepted::replayed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed: Option<bool>,
 }
 
 // ── Control leases ────────────────────────────────────────────────────────
@@ -561,6 +569,15 @@ pub struct ReleaseLeaseRequest {
     pub workspace: WorkspaceRef,
     pub work_id: WorkId,
     pub attempt_id: AttemptId,
+    /// Why the lease is being given up. Durable and attributable.
+    pub reason: BoundedText,
+    /// The credential [`ControlLease`] handed back on acquisition.
+    ///
+    /// Never serialized, so releasing is possible only for the process that
+    /// actually holds the lease — the runtime authorizes a release against the
+    /// claimant's token, not against the attempt id alone.
+    #[serde(skip)]
+    pub credential: LeaseCredential,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -569,8 +586,9 @@ pub struct ReleaseLeaseReceipt {
     pub work_id: WorkId,
     pub attempt_id: AttemptId,
     pub revision: Revision,
-    #[serde(default)]
-    pub replayed: bool,
+    /// See [`RunAccepted::replayed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replayed: Option<bool>,
 }
 
 // ── Artifacts ─────────────────────────────────────────────────────────────
