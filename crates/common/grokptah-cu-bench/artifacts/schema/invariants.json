@@ -1,0 +1,110 @@
+[
+  {
+    "invariant": "surface_observable",
+    "slug": "surface_observable",
+    "refusal": "backend_unavailable",
+    "authorityBearing": false
+  },
+  {
+    "invariant": "fresh_observation_only",
+    "slug": "fresh_observation_only",
+    "refusal": "stale_observation",
+    "authorityBearing": true
+  },
+  {
+    "invariant": "observation_within_age_bound",
+    "slug": "observation_within_age_bound",
+    "refusal": "stale_observation",
+    "authorityBearing": true
+  },
+  {
+    "invariant": "target_identity_stable",
+    "slug": "target_identity_stable",
+    "refusal": "target_changed",
+    "authorityBearing": true
+  },
+  {
+    "invariant": "agent_owns_surface",
+    "slug": "agent_owns_surface",
+    "refusal": "interrupted",
+    "authorityBearing": true
+  },
+  {
+    "invariant": "sole_controller",
+    "slug": "sole_controller",
+    "refusal": "conflict",
+    "authorityBearing": true
+  },
+  {
+    "invariant": "grant_covers_action_class",
+    "slug": "grant_covers_action_class",
+    "refusal": "forbidden_action",
+    "authorityBearing": true
+  },
+  {
+    "invariant": "grant_live",
+    "slug": "grant_live",
+    "refusal": "unauthorized",
+    "authorityBearing": true
+  },
+  {
+    "invariant": "no_hard_denied_surface",
+    "slug": "no_hard_denied_surface",
+    "refusal": "sensitive_surface",
+    "authorityBearing": true
+  },
+  {
+    "invariant": "affordance_advertised",
+    "slug": "affordance_advertised",
+    "refusal": "invalid_request",
+    "authorityBearing": false
+  },
+  {
+    "invariant": "element_enabled",
+    "slug": "element_enabled",
+    "refusal": "invalid_request",
+    "authorityBearing": false
+  },
+  {
+    "invariant": "element_realized",
+    "slug": "element_realized",
+    "refusal": "invalid_request",
+    "authorityBearing": false
+  },
+  {
+    "invariant": "modal_owns_input",
+    "slug": "modal_owns_input",
+    "refusal": "invalid_request",
+    "authorityBearing": false
+  },
+  {
+    "invariant": "pointer_within_target",
+    "slug": "pointer_within_target",
+    "refusal": "invalid_request",
+    "authorityBearing": false
+  },
+  {
+    "invariant": "no_secret_echo",
+    "slug": "no_secret_echo",
+    "refusal": "sensitive_surface",
+    "authorityBearing": true
+  },
+  {
+    "invariant": "within_run_limits",
+    "slug": "within_run_limits",
+    "refusal": "limit_reached",
+    "authorityBearing": false
+  },
+  {
+    "invariant": "pointer_fallback_disabled",
+    "slug": "pointer_fallback_disabled",
+    "refusal": "invalid_request",
+    "authorityBearing": false
+  },
+  {
+    "invariant": "credential_entry_requires_operator",
+    "slug": "credential_entry_requires_operator",
+    "refusal": "permission_required",
+    "authorityBearing": true
+  }
+]

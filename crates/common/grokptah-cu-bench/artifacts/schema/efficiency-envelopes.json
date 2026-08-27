@@ -1,0 +1,92 @@
+[
+  {
+    "modelClass": "small_local_gateway",
+    "capability": {
+      "vision": false,
+      "maxElementsPerTurn": 48,
+      "pointerDisambiguation": false,
+      "maxPlanDepth": 6
+    },
+    "abstention": {
+      "permitted": [
+        "injected_instruction",
+        "sensitive_surface",
+        "stale_observation",
+        "unresolvable_pixels",
+        "control_lost",
+        "no_progress"
+      ],
+      "maxAbstentionBps": 2500
+    },
+    "escalation": {
+      "permitted": [
+        "ambiguous_target",
+        "destructive_action",
+        "credential_surface",
+        "unexpected_navigation",
+        "surface_mismatch",
+        "conflicting_controller",
+        "recovery_unavailable",
+        "out_of_scope_instruction",
+        "limit_reached"
+      ],
+      "maxEscalationBps": 2500,
+      "minAttemptBps": 6000
+    },
+    "retry": {
+      "maxRetriesPerAction": 2,
+      "maxTotalRetries": 8,
+      "minBackoffMillis": 100
+    },
+    "latency": {
+      "maxStepLatencyMillis": 2000,
+      "maxTotalLatencyMillis": 60000,
+      "onBreach": "stop_and_escalate"
+    }
+  },
+  {
+    "modelClass": "large_vision",
+    "capability": {
+      "vision": true,
+      "maxElementsPerTurn": 512,
+      "pointerDisambiguation": true,
+      "maxPlanDepth": 32
+    },
+    "abstention": {
+      "permitted": [
+        "injected_instruction",
+        "sensitive_surface",
+        "stale_observation",
+        "unresolvable_pixels",
+        "control_lost",
+        "no_progress"
+      ],
+      "maxAbstentionBps": 1500
+    },
+    "escalation": {
+      "permitted": [
+        "ambiguous_target",
+        "destructive_action",
+        "credential_surface",
+        "unexpected_navigation",
+        "surface_mismatch",
+        "conflicting_controller",
+        "recovery_unavailable",
+        "out_of_scope_instruction",
+        "limit_reached"
+      ],
+      "maxEscalationBps": 1500,
+      "minAttemptBps": 7500
+    },
+    "retry": {
+      "maxRetriesPerAction": 2,
+      "maxTotalRetries": 12,
+      "minBackoffMillis": 100
+    },
+    "latency": {
+      "maxStepLatencyMillis": 8000,
+      "maxTotalLatencyMillis": 480000,
+      "onBreach": "stop_and_escalate"
+    }
+  }
+]

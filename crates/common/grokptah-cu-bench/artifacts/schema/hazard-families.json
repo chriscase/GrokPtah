@@ -1,0 +1,107 @@
+[
+  {
+    "family": "editor_workflow",
+    "slug": "editor_workflow",
+    "role": "baseline"
+  },
+  {
+    "family": "file_workflow",
+    "slug": "file_workflow",
+    "role": "baseline"
+  },
+  {
+    "family": "browser_workflow",
+    "slug": "browser_workflow",
+    "role": "baseline"
+  },
+  {
+    "family": "terminal_workflow",
+    "slug": "terminal_workflow",
+    "role": "baseline"
+  },
+  {
+    "family": "dynamic_ax_reorder",
+    "slug": "dynamic_ax_reorder",
+    "role": "robustness"
+  },
+  {
+    "family": "duplicated_labels",
+    "slug": "duplicated_labels",
+    "role": "robustness"
+  },
+  {
+    "family": "menus_and_modals",
+    "slug": "menus_and_modals",
+    "role": "robustness"
+  },
+  {
+    "family": "virtualized_scrolling",
+    "slug": "virtualized_scrolling",
+    "role": "robustness"
+  },
+  {
+    "family": "stale_observation",
+    "slug": "stale_observation",
+    "role": "safety"
+  },
+  {
+    "family": "unexpected_navigation",
+    "slug": "unexpected_navigation",
+    "role": "safety"
+  },
+  {
+    "family": "surface_mismatch",
+    "slug": "surface_mismatch",
+    "role": "safety"
+  },
+  {
+    "family": "prompt_injection",
+    "slug": "prompt_injection",
+    "role": "safety"
+  },
+  {
+    "family": "leakage_surface",
+    "slug": "leakage_surface",
+    "role": "safety"
+  },
+  {
+    "family": "ambiguous_pixels",
+    "slug": "ambiguous_pixels",
+    "role": "safety"
+  },
+  {
+    "family": "stationarity_loop",
+    "slug": "stationarity_loop",
+    "role": "safety"
+  },
+  {
+    "family": "crash_restart",
+    "slug": "crash_restart",
+    "role": "recovery"
+  },
+  {
+    "family": "operator_takeover",
+    "slug": "operator_takeover",
+    "role": "safety"
+  },
+  {
+    "family": "competing_agents",
+    "slug": "competing_agents",
+    "role": "safety"
+  },
+  {
+    "family": "vm_helper_loss",
+    "slug": "vm_helper_loss",
+    "role": "recovery"
+  },
+  {
+    "family": "network_transition",
+    "slug": "network_transition",
+    "role": "recovery"
+  },
+  {
+    "family": "false_success_trap",
+    "slug": "false_success_trap",
+    "role": "safety"
+  }
+]

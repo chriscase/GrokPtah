@@ -1,0 +1,61 @@
+{
+  "contractVersion": "grokptah.cu-bench.comparison/1",
+  "canonicalCell": [
+    "large_vision",
+    "balanced"
+  ],
+  "evidenceClasses": [
+    "synthetic_fixture",
+    "real_provider"
+  ],
+  "outcomes": [
+    {
+      "outcome": "reproduced_locally",
+      "comparable": true,
+      "countsAsQualification": true,
+      "meaning": "Re-run against this build and every transcript digest matched."
+    },
+    {
+      "outcome": "basis_verified",
+      "comparable": true,
+      "countsAsQualification": false,
+      "meaning": "Same contract, manifest, catalog, envelope, profile and                           scenario set; internally consistent; boundaries clean. Says                           the result is about the same thing, not that it is true."
+    },
+    {
+      "outcome": "unverified_provider_claim",
+      "comparable": false,
+      "countsAsQualification": false,
+      "meaning": "Well formed, resting on a run this crate cannot reproduce.                           Recorded, never verified, never qualification."
+    },
+    {
+      "outcome": "rejected",
+      "comparable": false,
+      "countsAsQualification": false,
+      "meaning": "Failed a check. The reason is always named."
+    }
+  ],
+  "rejectionReasons": [
+    "contract_version_mismatch",
+    "manifest_digest_mismatch",
+    "catalog_digest_mismatch",
+    "envelope_digest_mismatch",
+    "trace_digest_mismatch",
+    "scenario_set_mismatch",
+    "duplicate_scenario",
+    "boundary_violations",
+    "empty_evidence",
+    "reproduction_mismatch"
+  ],
+  "boundaryChecks": [
+    "authority",
+    "privacy",
+    "false_success",
+    "post_takeover",
+    "collateral",
+    "envelope_breach",
+    "incomplete_evidence",
+    "stale_observation_accepted",
+    "unredacted_screenshot"
+  ],
+  "scopeStatement": "Measured on the synthetic fixtures in this crate under one declared basis. Establishes how two subjects behave on those fixtures. Establishes nothing about real models, real surfaces, real cost, or any system that has not been run through this catalog."
+}

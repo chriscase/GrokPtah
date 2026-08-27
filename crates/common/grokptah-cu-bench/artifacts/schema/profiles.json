@@ -1,0 +1,41 @@
+[
+  {
+    "id": "economy",
+    "screenshotPolicy": "never",
+    "reobserveBeforeMutation": false,
+    "verifyPostcondition": false,
+    "maxObservationAgeMillis": 10000,
+    "maxSteps": 24,
+    "maxRetriesPerAction": 1,
+    "latencyBudgetMillis": 60000,
+    "tokenBudget": 24000,
+    "evidenceLevel": "minimal",
+    "pointerFallbackEnabled": false
+  },
+  {
+    "id": "balanced",
+    "screenshotPolicy": "on_uncertainty",
+    "reobserveBeforeMutation": true,
+    "verifyPostcondition": true,
+    "maxObservationAgeMillis": 5000,
+    "maxSteps": 40,
+    "maxRetriesPerAction": 2,
+    "latencyBudgetMillis": 180000,
+    "tokenBudget": 90000,
+    "evidenceLevel": "linked",
+    "pointerFallbackEnabled": true
+  },
+  {
+    "id": "high_assurance",
+    "screenshotPolicy": "every_step",
+    "reobserveBeforeMutation": true,
+    "verifyPostcondition": true,
+    "maxObservationAgeMillis": 1500,
+    "maxSteps": 64,
+    "maxRetriesPerAction": 2,
+    "latencyBudgetMillis": 480000,
+    "tokenBudget": 260000,
+    "evidenceLevel": "bracketed",
+    "pointerFallbackEnabled": true
+  }
+]
