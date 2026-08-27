@@ -123,7 +123,7 @@ fn a_secret_in_a_prompt_never_reaches_disk_or_a_projection() {
     let mut host = harness.open();
 
     let secret = "xai-abcdefghijklmnopqrstuvwxyz012345";
-    let workspace = harness.workspace.path().display().to_string();
+    let workspace = harness.workspace_path().display().to_string();
     let prompt = format!("build in {workspace} using XAI_API_KEY={secret}");
     let run_id = submit(&mut host, "req-1", &prompt);
 

@@ -5,7 +5,7 @@
 //! cancel an immediate stop already in flight.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// How the host was asked to stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -91,6 +91,44 @@ impl ShutdownSignal {
     }
 }
 
+/// Cooperative cancellation for one in-flight engine step.
+///
+/// The host core is synchronous: while a step is running, the control loop is
+/// inside it and cannot process another command. A long-running step therefore
+/// needs a cancellation channel that does not depend on the loop making
+/// progress, and this is it — a plain atomic another thread (the OS signal
+/// watcher) can trip.
+///
+/// It is cooperative by construction. Nothing here interrupts a step that
+/// declines to look; an engine that ignores the signal simply runs to
+/// completion, which is why the host treats a step it could not stop as
+/// finished rather than as cancelled.
+///
+/// A fresh signal is issued per dispatch. There is deliberately no reset: a
+/// cancelled signal that could be revived would let a stale cancellation be
+/// cleared by the very code it was meant to stop.
+#[derive(Debug, Clone, Default)]
+pub struct CancelSignal {
+    cancelled: std::sync::Arc<AtomicBool>,
+}
+
+impl CancelSignal {
+    /// A signal that has not been tripped.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the in-flight step to stop at its next checkpoint.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
 /// Coarse lifecycle state reported by health.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,6 +167,18 @@ mod tests {
             ShutdownKind::Immediate
         );
         assert_eq!(signal.state(), ShutdownKind::Immediate);
+    }
+
+    #[test]
+    fn a_cancel_signal_trips_once_and_stays_tripped() {
+        let signal = CancelSignal::new();
+        let watcher = signal.clone();
+        assert!(!signal.is_cancelled());
+        watcher.cancel();
+        assert!(signal.is_cancelled());
+        // Idempotent: a second request changes nothing.
+        watcher.cancel();
+        assert!(signal.is_cancelled());
     }
 
     #[test]

@@ -23,17 +23,17 @@ use crate::authority::{
 use crate::clock::Clock;
 use crate::config::{EngineSelection, HostConfig};
 use crate::control::{ControlCommand, ControlReply, ControlRequest, parse_request};
-use crate::engine::{EngineOutcome, EngineStep, RunEngine};
+use crate::engine::{DispatchDisposition, DispatchReport, EngineOutcome, EngineStep, RunEngine};
 use crate::error::{HostError, HostResult};
 use crate::identity::{fingerprint, opaque_id};
 use crate::journal::CursorStatus;
 use crate::lease::{ControlClass, LeaseBook};
-use crate::lifecycle::{HostState, ShutdownKind, ShutdownSignal};
+use crate::lifecycle::{CancelSignal, HostState, ShutdownKind, ShutdownSignal};
 use crate::lock::HomeLock;
 use crate::projection::{self, HealthReport, HostRunStatus};
 use crate::redaction::{RedactionPolicy, relative_path};
 use crate::store::{
-    ChangedFileRecord, CompletionRecord, RecoveryReport, RunPhase, RunRecord, Store,
+    ChangedFileRecord, CompletionRecord, DispatchRecord, RecoveryReport, RunPhase, RunRecord, Store,
 };
 
 /// Maximum steering directives held for one run.
@@ -73,6 +73,7 @@ pub struct HeadlessHost {
     engine: Option<Box<dyn RunEngine>>,
     clock: Arc<dyn Clock>,
     shutdown: ShutdownSignal,
+    cancel: CancelSignal,
     prompts: BTreeMap<String, String>,
     state: HostState,
     started_at: String,
@@ -120,7 +121,7 @@ impl HeadlessHost {
         let authority = Authority::new(&config);
         let redaction = RedactionPolicy::new(config.home_str(), config.workspace_str());
 
-        Ok(Self {
+        let mut host = Self {
             config,
             authority,
             redaction,
@@ -129,13 +130,38 @@ impl HeadlessHost {
             engine,
             clock,
             shutdown,
+            cancel: CancelSignal::new(),
             prompts: BTreeMap::new(),
             state: HostState::Ready,
             started_at,
             started_at_ms,
             recovery,
             _lock: lock,
-        })
+        };
+
+        // A dispatch that never came back is escalated at start rather than
+        // left as a quiet phase change: it is the one condition an operator
+        // must reconcile against the orchestrator before any work continues.
+        for run_id in host.recovery.indeterminate_dispatch.clone() {
+            if host.store.get(&run_id)?.phase.is_terminal() {
+                continue;
+            }
+            host.attach_attention(
+                &run_id,
+                AttentionKind::DispatchUncertain,
+                "dispatch_indeterminate",
+                "a dispatch was in flight when the host stopped; reconcile it before continuing",
+            )?;
+        }
+        Ok(host)
+    }
+
+    /// Cancellation channel handed to every engine step.
+    ///
+    /// Exposed so an OS signal watcher can ask an in-flight step to stop while
+    /// the control loop is blocked inside it.
+    pub fn cancel_signal(&self) -> CancelSignal {
+        self.cancel.clone()
     }
 
     /// Report what start had to repair, alongside current health.
@@ -401,6 +427,7 @@ impl HeadlessHost {
             attention: None,
             stop_reason: None,
             completion: None,
+            dispatch: None,
         };
         self.store.insert(record)?;
         self.store
@@ -593,7 +620,13 @@ impl HeadlessHost {
         self.authorize(run_id, lease_id, ControlClass::Resume, expected_revision)?;
 
         let record = self.store.get(run_id)?;
-        // An open escalation is checked first: it is the blocker the operator
+        // An unsettled dispatch outranks every other blocker: resuming would
+        // re-run a round that may already have taken effect elsewhere, and no
+        // operator action short of reconciling can make that safe.
+        if record.dispatch_blocks_progress() {
+            return Err(indeterminate_dispatch());
+        }
+        // An open escalation is checked next: it is the blocker the operator
         // has to clear, and reporting the phase instead would send them looking
         // at the wrong thing.
         if record.attention.is_some() {
@@ -698,6 +731,10 @@ impl HeadlessHost {
             ));
         }
 
+        if resolution == AttentionResolution::Allow && record.dispatch_blocks_progress() {
+            return Err(indeterminate_dispatch());
+        }
+
         let record = self.store.get_mut(run_id)?;
         record.attention = None;
         match resolution {
@@ -746,6 +783,10 @@ impl HeadlessHost {
         let expired: Vec<(String, String)> = self
             .store
             .records()
+            // A terminal run's outcome is final. An escalation left on one is
+            // still worth clearing, but it must never turn a completed run into
+            // a failed one.
+            .filter(|record| !record.phase.is_terminal())
             .filter_map(|record| {
                 record
                     .attention
@@ -786,6 +827,10 @@ impl HeadlessHost {
             else {
                 return Ok(());
             };
+            if self.store.get(&run_id)?.dispatch_blocks_progress() {
+                self.halt_for_dispatch(&run_id)?;
+                continue;
+            }
             if !self.prompts.contains_key(&run_id) {
                 self.raise_attention(
                     &run_id,
@@ -818,12 +863,22 @@ impl HeadlessHost {
 
         let now_ms = self.clock.now_ms();
         let record = self.store.get(&run_id)?;
+
+        // Fail closed before anything else. A run whose last dispatch never
+        // settled must not take another step: repeating work that may already
+        // have happened is worse than stopping and asking.
+        if record.dispatch_blocks_progress() {
+            self.halt_for_dispatch(&run_id)?;
+            return Ok(true);
+        }
+
         let scope = record.scope();
         let round = record.rounds_used.saturating_add(1);
         let max_rounds = record.bounds.max_rounds;
         let max_duration_ms = record.bounds.max_duration_ms;
         let started_at_ms = record.started_at_ms.unwrap_or(now_ms);
         let steering = record.pending_steering.clone();
+        let ordinal = record.next_dispatch_ordinal();
 
         if now_ms.saturating_sub(started_at_ms) >= max_duration_ms {
             self.finish(&run_id, RunPhase::LimitReached, "max_duration")?;
@@ -840,19 +895,52 @@ impl HeadlessHost {
             return Ok(true);
         };
 
+        if self.engine.is_none() {
+            return Ok(false);
+        }
+
+        // Write-ahead: the record says a dispatch is in flight *before* one is.
+        // If this process dies inside the step, the next start finds that fact
+        // instead of a record that looks like nothing ever happened.
+        let started_at = self.clock.now_rfc3339();
+        {
+            let record = self.store.get_mut(&run_id)?;
+            record.dispatch = Some(DispatchRecord::started(ordinal, round, started_at));
+        }
+        self.store.persist_record(&run_id)?;
+        self.append_event(
+            &run_id,
+            "run.dispatch_started",
+            json!({ "ordinal": ordinal, "round": round }),
+        )?;
+
+        let cancel = self.cancel.clone();
         let Some(engine) = self.engine.as_mut() else {
+            // Unreachable while the host is single-threaded, but the write-ahead
+            // record is already on disk: settle it as nothing-sent rather than
+            // leaving a phantom in-flight dispatch for the next start to find.
+            let now = self.clock.now_rfc3339();
+            if let Some(dispatch) = self.store.get_mut(&run_id)?.dispatch.as_mut() {
+                dispatch.settle(DispatchReport::local(), now);
+            }
+            self.store.persist_record(&run_id)?;
             return Ok(false);
         };
-        let outcome = engine.step(&EngineStep {
+        let result = engine.step(&EngineStep {
             scope: &scope,
             round,
             prompt: &prompt,
             steering: &steering,
+            cancel: &cancel,
+            dispatch_ordinal: ordinal,
         });
 
         let now = self.clock.now_rfc3339();
         {
             let record = self.store.get_mut(&run_id)?;
+            if let Some(dispatch) = record.dispatch.as_mut() {
+                dispatch.settle(result.dispatch, now.clone());
+            }
             record.pending_steering.clear();
             record.rounds_used = round;
             record.updated_at = now;
@@ -860,7 +948,37 @@ impl HeadlessHost {
         }
         self.store.persist_record(&run_id)?;
 
-        match outcome {
+        // Read the disposition back from the record rather than from the
+        // report: settling downgrades a report whose references are unusable,
+        // and the durable value is the one that governs.
+        let settlement = self
+            .store
+            .get(&run_id)?
+            .dispatch
+            .as_ref()
+            .and_then(|dispatch| dispatch.settled.clone());
+        let disposition = settlement
+            .as_ref()
+            .map_or(DispatchDisposition::Indeterminate, |settled| {
+                settled.disposition
+            });
+        self.append_event(
+            &run_id,
+            "run.dispatch_settled",
+            json!({
+                "ordinal": ordinal,
+                "disposition": disposition.label(),
+                "attempt": settlement.as_ref().and_then(|settled| settled.attempt.clone()),
+                "receipt": settlement.as_ref().and_then(|settled| settled.receipt.clone()),
+            }),
+        )?;
+
+        if !disposition.may_advance() {
+            self.halt_for_dispatch(&run_id)?;
+            return Ok(true);
+        }
+
+        match result.outcome {
             EngineOutcome::Progress { update } => {
                 self.append_event(&run_id, "run.progress", update)?;
                 if round >= max_rounds {
@@ -965,6 +1083,60 @@ impl HeadlessHost {
         )
     }
 
+    /// Halt a run whose dispatch cannot be proven either way.
+    fn halt_for_dispatch(&mut self, run_id: &str) -> HostResult<()> {
+        self.raise_attention(
+            run_id,
+            AttentionKind::DispatchUncertain,
+            "dispatch_indeterminate",
+            "a dispatch could not be proven delivered or undelivered; reconcile it before continuing",
+        )
+    }
+
+    /// Attach an escalation without changing the run's phase.
+    ///
+    /// Used during recovery, where the phase the store already chose
+    /// (`interrupted`) is the accurate one and the escalation only explains it.
+    fn attach_attention(
+        &mut self,
+        run_id: &str,
+        kind: AttentionKind,
+        reason_code: &str,
+        detail: &str,
+    ) -> HostResult<()> {
+        let now_ms = self.clock.now_ms();
+        let now = self.clock.now_rfc3339();
+        let attention = AttentionRecord::raise(
+            &self.redaction,
+            run_id,
+            kind,
+            reason_code,
+            detail,
+            now,
+            now_ms,
+            self.config.limits.attention_ttl_ms,
+        )?;
+        let attention_id = attention.attention_id.clone();
+        {
+            let record = self.store.get_mut(run_id)?;
+            record.attention = Some(attention);
+            record
+                .stop_reason
+                .get_or_insert_with(|| reason_code.to_owned());
+        }
+        self.store.persist_record(run_id)?;
+        self.leases.revoke_run(run_id);
+        self.append_event(
+            run_id,
+            "run.needs_attention",
+            json!({
+                "attentionId": attention_id,
+                "kind": kind.label(),
+                "reasonCode": reason_code,
+            }),
+        )
+    }
+
     fn raise_attention(
         &mut self,
         run_id: &str,
@@ -1013,6 +1185,9 @@ impl HeadlessHost {
     /// start marks them `interrupted` — the difference is deliberately visible.
     pub fn shutdown(&mut self, kind: ShutdownKind) -> HostResult<StopReport> {
         self.state = HostState::Draining;
+        if kind == ShutdownKind::Immediate {
+            self.cancel.cancel();
+        }
         let mut report = StopReport {
             kind,
             paused: Vec::new(),
@@ -1083,6 +1258,15 @@ impl HeadlessHost {
         self.store.journal_mut(run_id)?.append(ts, update)?;
         Ok(())
     }
+}
+
+/// The refusal used everywhere an unsettled dispatch blocks an operation.
+fn indeterminate_dispatch() -> HostError {
+    HostError::forbidden(
+        "dispatch_indeterminate",
+        "this run has a dispatch that was never proven delivered or undelivered; \
+         reconcile it with the orchestrator and submit a fresh run",
+    )
 }
 
 fn capability_for(class: ControlClass) -> &'static str {

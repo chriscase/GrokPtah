@@ -168,7 +168,7 @@ fn serve(config: HostConfig, tick_interval: Duration, exit_on_eof: bool) -> Resu
 
     // A host that cannot be stopped by a supervisor is worse than one that
     // fails to start, so a signal wiring failure is fatal rather than ignored.
-    let _signals = signal::watch(shutdown.clone()).map_err(|error| {
+    let _signals = signal::watch(shutdown.clone(), host.cancel_signal()).map_err(|error| {
         HostError::internal(
             "signal_wiring_failed",
             format!("stop signals could not be installed ({})", error.kind()),

@@ -67,6 +67,8 @@ pub mod lease;
 pub mod lifecycle;
 /// Exclusive ownership of the host home.
 pub mod lock;
+/// The adapter boundary between this host and an agent-loop orchestrator.
+pub mod orchestration;
 /// Truthful status, health, and receipt projections.
 pub mod projection;
 /// Write-boundary redaction.
@@ -82,9 +84,15 @@ pub mod signal;
 
 pub use config::{EngineSelection, HostConfig, HostLimits};
 pub use control::{ControlCommand, ControlReply, ControlRequest, ControlResult};
+pub use engine::{DispatchDisposition, DispatchReport, RunEngine, StepResult};
 pub use error::{HostError, HostResult};
 pub use host::{HeadlessHost, StartupReport, StopReport};
-pub use lifecycle::{HostState, ShutdownKind, ShutdownSignal};
+pub use identity::ExternalRef;
+pub use lifecycle::{CancelSignal, HostState, ShutdownKind, ShutdownSignal};
+pub use orchestration::{
+    OrchestratedEngine, OrchestratorBinding, TurnOrchestrator, TurnReceipt, TurnRefusal,
+    TurnRequest,
+};
 pub use projection::{HealthReport, HostRunStatus};
 pub use store::{RunPhase, RunRecord};
 

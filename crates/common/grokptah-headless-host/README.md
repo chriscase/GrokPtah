@@ -28,6 +28,10 @@ config ─▶ home lock ─▶ store (recover) ─▶ authority ─▶ engine po
   its signal wiring. No keyring, no D-Bus, no browser, no HTTP client.
 - **Deterministic.** Time, identity, and execution are injected, so the whole
   lifecycle is exercisable offline with no provider credential and no network.
+- **Adaptable.** `orchestration::TurnOrchestrator` lets the existing agent loop
+  drive headless runs without a second runtime, send machine, or authority
+  model. A dispatch is recorded before it happens, so one that cannot be proven
+  delivered halts the run instead of being repeated.
 
 ## Configuration
 

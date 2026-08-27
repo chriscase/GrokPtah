@@ -108,6 +108,117 @@ control authority cannot outlive the process that issued it. **This lease grants
 no Computer Use authority**; that surface has its own contract and is not
 implemented here.
 
+## Orchestrator adapter
+
+The host owns lifecycle, durability, authority, and projection. Deciding what to
+say to a provider, saying it, and recording what came back belong to the agent
+loop that already does that work. `orchestration::TurnOrchestrator` is the seam
+between the two, and it is one-directional: the host defines the port, an
+orchestrator implements it, and nothing in this crate reaches into provider code.
+
+```text
+HeadlessHost ─▶ RunEngine ─▶ OrchestratedEngine<T> ─▶ T: TurnOrchestrator
+                                     │                        │
+                        binding + cancellation        the existing agent loop
+```
+
+What it deliberately is **not**:
+
+- **Not a second runtime.** The port is synchronous. An orchestrator that is
+  internally async blocks on its own executor inside `run_turn`; this crate
+  starts no runtime and holds no lock across the call.
+- **Not a second send machine.** Nothing here dispatches anything, and the host
+  never decides that a request may be repeated.
+- **Not a second authority or identity model.** The orchestrator states the
+  session and workspace it is bound to. The adapter's only authority decision is
+  to refuse when that binding disagrees with the run.
+
+### Referenced, not restated
+
+An orchestrator that talks to a provider already records what was bound, what
+was presented, and how far the answer got. That contract stays where it is. A
+`TurnReceipt` carries only opaque `ExternalRef` handles to those records, plus
+the one classification the host must act on itself.
+
+| Disposition | Means | Host does |
+| --- | --- | --- |
+| `local` | Nothing left this host | Advance |
+| `not_dispatched` | Prepared, provably did not leave | Advance |
+| `resolved` | Dispatched and durably settled | Advance |
+| `indeterminate` | Cannot be established either way | Halt and escalate |
+
+Coarsening delivery state to four values is a projection for the host's own
+decision, not a competing state machine, and its safe default is "cannot tell".
+A reference that is not bounded and opaque is not recorded, and its dispatch
+settles `indeterminate`: an unusable reference cannot be reconciled, and
+treating it as clean would hide that.
+
+### Refusals
+
+| Refusal | Means | Host does |
+| --- | --- | --- |
+| `NotConfigured` | Nothing is wired up; waiting will not help | Fails the run |
+| `Unavailable` | Configured but busy, offline, or breaker-open | Halts with an escalation an operator can allow |
+
+Both dispatched nothing, so neither can duplicate work. They differ only in
+whether an operator can fix the cause.
+
+### Write-ahead dispatch
+
+Before the engine is invoked, the run's record gains a dispatch entry — ordinal,
+round, start time, no settlement. Only after the step returns is that entry
+settled. Writing it afterwards would make a dispatch interrupted by a crash
+indistinguishable from one that never started, and those two need opposite
+handling.
+
+The ordinal is durable *before* the turn runs and is passed to the orchestrator,
+so an implementation can derive its own idempotency from the exact record the
+host will hold if this process dies mid-turn.
+
+On the next start, a dispatch with no settlement becomes `indeterminate`,
+whatever phase the record claims, and the run is interrupted with a
+`dispatch_uncertain` escalation. From there the host refuses every path that
+would repeat the round:
+
+- `resume` → `dispatch_indeterminate`
+- `resolveAttention` → `allow` → `dispatch_indeterminate`
+- ticking → never dispatches again
+
+`cancel` and `resolveAttention` → `deny` remain available, because both stop work
+rather than repeat it. To continue, reconcile the attempt with the orchestrator
+and submit a **new run** with a fresh `requestId`. The host will not pretend to
+know whether the previous attempt ran.
+
+### Cancellation
+
+Every step receives a `CancelSignal`. The host core is synchronous, so while a
+step is running the control loop is inside it — a long turn cannot be
+interrupted by an operator command, only by this channel, which the OS signal
+watcher trips on an immediate stop. Cancellation observed *before* dispatch
+halts the run as recoverable rather than failing it: nothing went out, so there
+is nothing to reconcile and nothing to throw away.
+
+### Integrating a real orchestrator
+
+Nothing in the bridge or in provider code changes to adopt this. The owning lane
+adds one file:
+
+1. Depend on `grokptah-headless-host` and implement `TurnOrchestrator` for the
+   existing agent-loop entry point. `run_turn` blocks on the loop's own runtime.
+2. Return `binding()` from the session and workspace the loop is already scoped
+   to. The workspace value is the host's alias — the workspace directory's own
+   name — never a path.
+3. Map the loop's existing send state to a `DispatchDisposition`. Anything not
+   provably delivered or undelivered maps to `indeterminate`.
+4. Put the attempt and receipt identifiers the loop already records into
+   `TurnReceipt::attempt` and `TurnReceipt::receipt` as `ExternalRef`s.
+5. Construct the host with `OrchestratedEngine::new(orchestrator)` instead of the
+   fixture engine. Configuration keeps `engine: { "kind": "disabled" }`; the
+   engine is injected, not discovered.
+
+Step 3 is the only judgement call, and it is the owning lane's to make: it is the
+component holding the evidence.
+
 ## Replay and recovery
 
 Events are append-only NDJSON, flushed before the caller is told the event
@@ -181,9 +292,15 @@ scripted fixture engine. No provider credential, no network, no wall-clock sleep
 
 ## Residuals
 
-- **No provider-backed engine.** `RunEngine` has one implementation, the offline
-  fixture engine. Wiring a real engine — and the credential, sandbox, and
-  approval questions that come with it — is a separate change.
+- **No provider-backed orchestrator.** `TurnOrchestrator` has one
+  implementation in tree, the deterministic offline fake. The adapter is ready;
+  binding it to the real agent loop is the owning lane's step, and the
+  credential, sandbox, and approval questions come with it.
+- **A long turn blocks the control loop.** The port is synchronous by design, so
+  while a turn runs the host processes no operator command. Cancellation reaches
+  it through the step's `CancelSignal`; everything else waits. Making turns
+  concurrent would mean more than one run in flight per host, which is a
+  different authority question.
 - **No Computer Use.** The control lease deliberately grants none, and no
   Computer Use surface is implemented here.
 - **Single session and workspace per host.** Multi-workspace hosting would need

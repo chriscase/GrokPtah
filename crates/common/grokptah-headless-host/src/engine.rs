@@ -18,6 +18,8 @@ use serde_json::Value;
 
 use crate::attention::AttentionKind;
 use crate::error::{HostError, HostResult, io_error};
+use crate::identity::ExternalRef;
+use crate::lifecycle::CancelSignal;
 
 /// One file an engine reports as changed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +88,123 @@ pub struct EngineStep<'a> {
     pub prompt: &'a str,
     /// Steering directives accepted since the last step, oldest first.
     pub steering: &'a [String],
+    /// Cooperative cancellation for this step. An engine that may block should
+    /// check it at each checkpoint; one that cannot is simply never cancelled.
+    pub cancel: &'a CancelSignal,
+    /// One-based dispatch ordinal, unique per run.
+    ///
+    /// The host records this before the step runs, so an engine that dispatches
+    /// externally can bind its own idempotency to the exact attempt the host
+    /// will find on disk if this process dies mid-step.
+    pub dispatch_ordinal: u32,
+}
+
+/// What a step established about work that may have left this host.
+///
+/// This is a host-side projection, not a second delivery state machine. The
+/// component that actually talks to a provider owns the full vocabulary — what
+/// was bound, what was presented, how far the answer got. All the host needs
+/// from it is the one question it must answer on its own: *may this run move?*
+///
+/// The safe default is [`Indeterminate`](Self::Indeterminate). Anything an
+/// engine cannot prove belongs there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchDisposition {
+    /// Nothing left this host. There is nothing to reconcile.
+    Local,
+    /// An external dispatch was prepared and provably did not leave.
+    NotDispatched,
+    /// An external dispatch happened and settled durably.
+    Resolved,
+    /// Whether an external dispatch happened cannot be established.
+    Indeterminate,
+}
+
+impl DispatchDisposition {
+    /// Whether the host may advance the run on this result.
+    ///
+    /// An indeterminate dispatch is the one case where continuing could repeat
+    /// work that already happened, so the run halts and waits for a human.
+    pub fn may_advance(self) -> bool {
+        !matches!(self, Self::Indeterminate)
+    }
+
+    /// Stable label for records and events.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::NotDispatched => "not_dispatched",
+            Self::Resolved => "resolved",
+            Self::Indeterminate => "indeterminate",
+        }
+    }
+}
+
+/// What one step established about external dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DispatchReport {
+    /// Whether the run may advance.
+    pub disposition: DispatchDisposition,
+    /// Reference to the attempt record the orchestrator wrote, when there is
+    /// one. Opaque here: the orchestrator's contract owns its meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<ExternalRef>,
+    /// Reference to the operation receipt the orchestrator wrote, when there is
+    /// one. Opaque here for the same reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<ExternalRef>,
+}
+
+impl DispatchReport {
+    /// A step that dispatched nothing outside this host.
+    pub fn local() -> Self {
+        Self {
+            disposition: DispatchDisposition::Local,
+            attempt: None,
+            receipt: None,
+        }
+    }
+
+    /// A step that reports an external disposition and its references.
+    pub fn external(
+        disposition: DispatchDisposition,
+        attempt: Option<ExternalRef>,
+        receipt: Option<ExternalRef>,
+    ) -> Self {
+        Self {
+            disposition,
+            attempt,
+            receipt,
+        }
+    }
+
+    /// Whether every carried reference is still within bounds.
+    pub fn refs_are_bounded(&self) -> bool {
+        self.attempt.as_ref().is_none_or(ExternalRef::is_bounded)
+            && self.receipt.as_ref().is_none_or(ExternalRef::is_bounded)
+    }
+}
+
+/// The full result of one engine step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StepResult {
+    /// What the run produced.
+    pub outcome: EngineOutcome,
+    /// What the step established about external dispatch.
+    pub dispatch: DispatchReport,
+}
+
+impl StepResult {
+    /// A result from an engine that never dispatches outside this host.
+    pub fn local(outcome: EngineOutcome) -> Self {
+        Self {
+            outcome,
+            dispatch: DispatchReport::local(),
+        }
+    }
 }
 
 /// The seam between host lifecycle and model execution.
@@ -94,7 +213,7 @@ pub trait RunEngine: Send {
     fn label(&self) -> &'static str;
 
     /// Advance one run by one bounded step.
-    fn step(&mut self, step: &EngineStep<'_>) -> EngineOutcome;
+    fn step(&mut self, step: &EngineStep<'_>) -> StepResult;
 }
 
 /// Scripted outcomes for the offline engine.
@@ -154,18 +273,20 @@ impl RunEngine for FixtureEngine {
         "fixture"
     }
 
-    fn step(&mut self, step: &EngineStep<'_>) -> EngineOutcome {
+    fn step(&mut self, step: &EngineStep<'_>) -> StepResult {
         let length = self.sequence(step.prompt).len();
         if length == 0 {
-            return EngineOutcome::Failed {
+            return StepResult::local(EngineOutcome::Failed {
                 reason_code: "fixture_missing".to_owned(),
                 detail: "no scripted outcome for this prompt".to_owned(),
-            };
+            });
         }
         let cursor = self.cursors.entry(step.scope.run_id.clone()).or_insert(0);
         let index = (*cursor).min(length - 1);
         *cursor = index + 1;
-        self.sequence(step.prompt)[index].clone()
+        // The fixture engine reaches nothing outside this host, so every step
+        // is `Local`: there is never an attempt to reconcile.
+        StepResult::local(self.sequence(step.prompt)[index].clone())
     }
 }
 
@@ -198,19 +319,24 @@ mod tests {
         .expect("script parses")
     }
 
+    fn take(engine: &mut FixtureEngine, scope: &RunScope, round: u16, prompt: &str) -> StepResult {
+        let cancel = CancelSignal::new();
+        engine.step(&EngineStep {
+            scope,
+            round,
+            prompt,
+            steering: &[],
+            cancel: &cancel,
+            dispatch_ordinal: u32::from(round),
+        })
+    }
+
     #[test]
     fn a_scripted_prompt_replays_the_same_sequence_every_time() {
         let run = |engine: &mut FixtureEngine| {
             let scope = scope();
             (1..=2)
-                .map(|round| {
-                    engine.step(&EngineStep {
-                        scope: &scope,
-                        round,
-                        prompt: "build",
-                        steering: &[],
-                    })
-                })
+                .map(|round| take(engine, &scope, round, "build"))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -223,27 +349,28 @@ mod tests {
     fn the_sequence_advances_then_holds_its_terminal_outcome() {
         let mut engine = FixtureEngine::new(script());
         let scope = scope();
-        let first = engine.step(&EngineStep {
-            scope: &scope,
-            round: 1,
-            prompt: "build",
-            steering: &[],
-        });
         assert_eq!(
-            first,
+            take(&mut engine, &scope, 1, "build").outcome,
             EngineOutcome::Progress {
                 update: json!({"note": "planning"})
             }
         );
         for round in 2..=4 {
-            let outcome = engine.step(&EngineStep {
-                scope: &scope,
-                round,
-                prompt: "build",
-                steering: &[],
-            });
-            assert!(matches!(outcome, EngineOutcome::Completed { .. }));
+            let result = take(&mut engine, &scope, round, "build");
+            assert!(matches!(result.outcome, EngineOutcome::Completed { .. }));
         }
+    }
+
+    #[test]
+    fn a_local_engine_never_reports_anything_to_reconcile() {
+        let mut engine = FixtureEngine::new(script());
+        let result = take(&mut engine, &scope(), 1, "build");
+        assert_eq!(result.dispatch, DispatchReport::local());
+        assert_eq!(result.dispatch.disposition, DispatchDisposition::Local);
+        assert!(result.dispatch.disposition.may_advance());
+        assert!(result.dispatch.refs_are_bounded());
+        assert!(!DispatchDisposition::Indeterminate.may_advance());
+        assert_eq!(DispatchDisposition::NotDispatched.label(), "not_dispatched");
     }
 
     #[test]
@@ -251,12 +378,7 @@ mod tests {
         let scope = scope();
         let mut engine = FixtureEngine::new(script());
         assert_eq!(
-            engine.step(&EngineStep {
-                scope: &scope,
-                round: 1,
-                prompt: "unknown",
-                steering: &[],
-            }),
+            take(&mut engine, &scope, 1, "unknown").outcome,
             EngineOutcome::Failed {
                 reason_code: "unscripted".to_owned(),
                 detail: "no script".to_owned(),
@@ -264,16 +386,12 @@ mod tests {
         );
 
         let mut empty = FixtureEngine::new(FixtureScript::default());
-        let outcome = empty.step(&EngineStep {
-            scope: &scope,
-            round: 1,
-            prompt: "anything",
-            steering: &[],
-        });
+        let result = take(&mut empty, &scope, 1, "anything");
         assert!(matches!(
-            outcome,
+            result.outcome,
             EngineOutcome::Failed { reason_code, .. } if reason_code == "fixture_missing"
         ));
+        assert_eq!(result.dispatch.disposition, DispatchDisposition::Local);
         assert_eq!(empty.label(), "fixture");
     }
 

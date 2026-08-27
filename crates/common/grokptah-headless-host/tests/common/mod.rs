@@ -16,11 +16,17 @@ use grokptah_headless_host::config::{EngineSelection, HostConfig};
 use grokptah_headless_host::control::{
     ControlCommand, ControlReply, ControlRequest, ControlResult,
 };
+use grokptah_headless_host::engine::RunEngine;
 use grokptah_headless_host::host::{HeadlessHost, engine_from_config};
 use grokptah_headless_host::lifecycle::ShutdownSignal;
+use grokptah_headless_host::orchestration::OrchestratedEngine;
 use grokptah_headless_host::testing;
+use grokptah_headless_host::testing::{DispatchLog, FakeOrchestrator, FakeTurn};
 use serde_json::Value;
 use tempfile::TempDir;
+
+/// Directory name of the harness workspace, and therefore its bound alias.
+pub const WORKSPACE_NAME: &str = "project";
 
 /// A disposable host home, workspace, fixture script, and clock.
 pub struct Harness {
@@ -37,8 +43,12 @@ impl Harness {
     /// Build a harness whose capabilities are all available except the gated
     /// promote capability, which stays gated and ungranted by default.
     pub fn new() -> Self {
+        // A stable, bindable directory name: the workspace alias is what an
+        // orchestrator binds to, and a random temporary name is not one.
         let workspace = TempDir::new().expect("workspace");
-        let script = workspace.path().join("fixture-script.json");
+        let root = workspace.path().join(WORKSPACE_NAME);
+        std::fs::create_dir_all(&root).expect("workspace root");
+        let script = root.join("fixture-script.json");
         std::fs::write(&script, testing::FIXTURE_SCRIPT).expect("write fixture script");
         Self {
             home: TempDir::new().expect("home"),
@@ -49,6 +59,11 @@ impl Harness {
             grants: Vec::new(),
             engine_enabled: true,
         }
+    }
+
+    /// The approved workspace root. Its directory name is the bound alias.
+    pub fn workspace_path(&self) -> PathBuf {
+        self.workspace.path().join(WORKSPACE_NAME)
     }
 
     /// Record an explicit operator grant for a gated capability.
@@ -65,7 +80,7 @@ impl Harness {
 
     /// Build a validated configuration pointing at this harness.
     pub fn config(&self) -> HostConfig {
-        let mut config = testing::config_for(self.home.path(), self.workspace.path());
+        let mut config = testing::config_for(self.home.path(), &self.workspace_path());
         for descriptor in &mut config.capabilities.capabilities {
             if descriptor.id == CAP_RESUME {
                 descriptor.availability = CapabilityAvailability::Available;
@@ -92,6 +107,32 @@ impl Harness {
         let engine = engine_from_config(&config).expect("engine builds");
         HeadlessHost::open(config, engine, self.clock.clone(), self.shutdown.clone())
             .expect("host opens")
+    }
+
+    /// Open a host driving an injected engine instead of a configured one.
+    ///
+    /// This is the shape a real deployment uses: the engine is handed in, so
+    /// the host never has to know how a turn is produced.
+    pub fn open_injected(&self, engine: Box<dyn RunEngine>) -> HeadlessHost {
+        let mut config = self.config();
+        config.engine = EngineSelection::Disabled;
+        HeadlessHost::open(
+            config,
+            Some(engine),
+            self.clock.clone(),
+            self.shutdown.clone(),
+        )
+        .expect("host opens")
+    }
+
+    /// Open a host driven by a scripted fake orchestrator through the adapter.
+    ///
+    /// Returns the shared dispatch log so a test can assert exactly which turns
+    /// the orchestrator was asked to run.
+    pub fn open_orchestrated(&self, turns: Vec<FakeTurn>) -> (HeadlessHost, DispatchLog) {
+        let log = DispatchLog::new();
+        let engine = OrchestratedEngine::new(FakeOrchestrator::fixture(log.clone(), turns));
+        (self.open_injected(Box::new(engine)), log)
     }
 
     /// Try to open a host, surfacing the refusal instead of panicking.

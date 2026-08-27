@@ -276,14 +276,19 @@ impl HostConfig {
     /// Only the workspace's own directory name is published; the absolute path
     /// stays in configuration and in the redaction policy, so no host path ever
     /// reaches a durable record, an event, or an operator projection.
+    ///
+    /// The alias is also what an orchestrator binds itself to, so a directory
+    /// name that is not a valid opaque reference — a dotfile, a name with
+    /// spaces — falls back to a derived identifier rather than producing an
+    /// alias that could never be bound.
     pub fn workspace_alias(&self) -> String {
         self.workspace
             .file_name()
             .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
+            .and_then(crate::identity::ExternalRef::new)
             .map_or_else(
                 || crate::identity::opaque_id("ws", &[self.workspace_str()]),
-                str::to_owned,
+                |name| name.as_str().to_owned(),
             )
     }
 
@@ -360,5 +365,54 @@ impl ClassifyLabel for serde_json::Error {
             serde_json::error::Category::Data => "shape",
             serde_json::error::Category::Eof => "truncated",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing;
+
+    fn config_with_workspace(name: &str) -> HostConfig {
+        let root = testing::fixture_root();
+        testing::config_for(&root.join("host-home"), &root.join("workspace").join(name))
+    }
+
+    #[test]
+    fn a_bindable_directory_name_is_published_as_the_alias() {
+        assert_eq!(
+            config_with_workspace("project").workspace_alias(),
+            "project"
+        );
+        assert_eq!(
+            config_with_workspace("my-repo.v2").workspace_alias(),
+            "my-repo.v2"
+        );
+    }
+
+    #[test]
+    fn a_name_that_could_never_be_bound_falls_back_to_a_derived_alias() {
+        // A dotfile, a name with spaces, and a traversal-shaped name all fail
+        // the opaque-reference rules, so publishing them would produce an alias
+        // an orchestrator could not bind to.
+        for awkward in [".hidden", "two words", "trailing-"] {
+            let alias = config_with_workspace(awkward).workspace_alias();
+            assert!(
+                alias.starts_with("ws-"),
+                "{awkward:?} should fall back, got {alias}"
+            );
+            assert!(
+                crate::identity::ExternalRef::new(&alias).is_some(),
+                "the fallback alias must itself be bindable"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_unbindable_workspaces_do_not_collide() {
+        assert_ne!(
+            config_with_workspace(".one").workspace_alias(),
+            config_with_workspace(".two").workspace_alias()
+        );
     }
 }

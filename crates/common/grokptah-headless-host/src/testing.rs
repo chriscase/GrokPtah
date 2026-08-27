@@ -5,7 +5,9 @@
 //! directory so the fixtures stay absolute on every supported platform without
 //! creating anything on disk.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use grokptah_agent_sdk::run::ExecutionMode;
 use grokptah_agent_sdk::{
@@ -15,6 +17,11 @@ use grokptah_agent_sdk::{
 use crate::authority::ResolvedBounds;
 use crate::authority::{CAP_EXECUTE, CAP_OBSERVE, CAP_PROMOTE, CAP_QUEUE, CAP_RESUME, CAP_REVIEW};
 use crate::config::{EngineSelection, HostConfig, HostLimits};
+use crate::engine::{DispatchDisposition, EngineOutcome};
+use crate::identity::ExternalRef;
+use crate::orchestration::{
+    OrchestratorBinding, TurnOrchestrator, TurnReceipt, TurnRefusal, TurnRequest,
+};
 use crate::store::{RunPhase, RunRecord};
 
 /// Fixed timestamp used by record fixtures.
@@ -150,6 +157,184 @@ pub fn run_record_fixture(run_id: &str, phase: RunPhase) -> RunRecord {
         attention: None,
         stop_reason: None,
         completion: None,
+        dispatch: None,
+    }
+}
+
+/// One turn the host asked a [`FakeOrchestrator`] to run.
+///
+/// Recorded so a test can assert the thing that matters most about an
+/// orchestrated host: that a given dispatch ordinal is never handed out twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchLogEntry {
+    /// Run the turn belonged to.
+    pub run_id: String,
+    /// Dispatch ordinal the host had already made durable.
+    pub ordinal: u32,
+    /// Round within the run.
+    pub round: u16,
+    /// Whether cancellation had been requested when the turn started.
+    pub cancelled: bool,
+}
+
+/// Shared record of every turn a fake orchestrator was asked to run.
+///
+/// Clonable and shared, because the orchestrator is moved into the host and a
+/// test still needs to see what it was asked to do.
+#[derive(Debug, Clone, Default)]
+pub struct DispatchLog {
+    entries: Arc<Mutex<Vec<DispatchLogEntry>>>,
+}
+
+impl DispatchLog {
+    /// An empty log.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Everything recorded so far, in order.
+    pub fn entries(&self) -> Vec<DispatchLogEntry> {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The dispatch ordinals seen so far, in order.
+    pub fn ordinals(&self) -> Vec<u32> {
+        self.entries().iter().map(|entry| entry.ordinal).collect()
+    }
+
+    fn push(&self, entry: DispatchLogEntry) {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(entry);
+    }
+}
+
+/// One scripted orchestrator turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FakeTurn {
+    /// Return this receipt.
+    Receipt(TurnReceipt),
+    /// Refuse the turn.
+    Refusal(TurnRefusal),
+    /// Dispatch, then lose the answer: the classic case where retrying could
+    /// repeat work that already happened.
+    LostAfterDispatch {
+        /// Opaque attempt reference the orchestrator managed to record.
+        attempt: String,
+    },
+}
+
+impl FakeTurn {
+    /// A turn that reached nothing outside the host.
+    pub fn local(outcome: EngineOutcome) -> Self {
+        Self::Receipt(TurnReceipt::local(outcome))
+    }
+
+    /// A turn that dispatched and reports its references.
+    pub fn dispatched(
+        outcome: EngineOutcome,
+        disposition: DispatchDisposition,
+        attempt: Option<&str>,
+        receipt: Option<&str>,
+    ) -> Self {
+        Self::Receipt(TurnReceipt::dispatched(
+            outcome,
+            disposition,
+            attempt.and_then(ExternalRef::new),
+            receipt.and_then(ExternalRef::new),
+        ))
+    }
+
+    /// A turn whose answer was lost after it went out.
+    pub fn lost(attempt: &str) -> Self {
+        Self::LostAfterDispatch {
+            attempt: attempt.to_owned(),
+        }
+    }
+}
+
+/// A deterministic, offline orchestrator driven by a scripted turn list.
+///
+/// It reaches nothing: no provider, no network, no credential. Its only job is
+/// to return exactly what the script says and record what it was asked to do.
+/// Once the script is exhausted the last turn repeats, so a test can tick past
+/// the end without the behaviour changing under it.
+#[derive(Debug)]
+pub struct FakeOrchestrator {
+    binding: OrchestratorBinding,
+    log: DispatchLog,
+    turns: VecDeque<FakeTurn>,
+    last: Option<FakeTurn>,
+}
+
+impl FakeOrchestrator {
+    /// Build an orchestrator bound to one session and workspace.
+    pub fn new(binding: OrchestratorBinding, log: DispatchLog, turns: Vec<FakeTurn>) -> Self {
+        Self {
+            binding,
+            log,
+            turns: turns.into(),
+            last: None,
+        }
+    }
+
+    /// An orchestrator bound to the standard fixture session and workspace.
+    pub fn fixture(log: DispatchLog, turns: Vec<FakeTurn>) -> Self {
+        Self::new(
+            OrchestratorBinding::new("session-fixture", "project")
+                .expect("fixture binding is bounded"),
+            log,
+            turns,
+        )
+    }
+}
+
+impl TurnOrchestrator for FakeOrchestrator {
+    fn label(&self) -> &'static str {
+        "fake"
+    }
+
+    fn binding(&self) -> OrchestratorBinding {
+        self.binding.clone()
+    }
+
+    fn run_turn(&mut self, request: &TurnRequest<'_>) -> Result<TurnReceipt, TurnRefusal> {
+        self.log.push(DispatchLogEntry {
+            run_id: request.scope.run_id.clone(),
+            ordinal: request.dispatch_ordinal,
+            round: request.round,
+            cancelled: request.cancel.is_cancelled(),
+        });
+
+        let turn = self.turns.pop_front().or_else(|| self.last.clone());
+        let turn = match turn {
+            Some(turn) => turn,
+            None => {
+                return Err(TurnRefusal::NotConfigured {
+                    reason_code: "fake_unscripted".to_owned(),
+                    detail: "no scripted turn".to_owned(),
+                });
+            }
+        };
+        self.last = Some(turn.clone());
+
+        match turn {
+            FakeTurn::Receipt(receipt) => Ok(receipt),
+            FakeTurn::Refusal(refusal) => Err(refusal),
+            FakeTurn::LostAfterDispatch { attempt } => Ok(TurnReceipt::dispatched(
+                EngineOutcome::Failed {
+                    reason_code: "answer_lost".to_owned(),
+                    detail: "the connection dropped after the request went out".to_owned(),
+                },
+                DispatchDisposition::Indeterminate,
+                ExternalRef::new(&attempt),
+                None,
+            )),
+        }
     }
 }
 

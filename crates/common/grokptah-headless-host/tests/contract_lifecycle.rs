@@ -52,12 +52,19 @@ fn a_run_goes_from_admission_to_a_reviewable_receipt() {
         .iter()
         .map(|entry| entry["update"]["event"].as_str().expect("event kind"))
         .collect();
+    // Every dispatch is bracketed: the journal records that one started before
+    // the engine ran, so a crash in between is visible as an in-flight dispatch
+    // rather than as a step that never happened.
     assert_eq!(
         kinds,
         vec![
             "run.admitted",
             "run.started",
+            "run.dispatch_started",
+            "run.dispatch_settled",
             "run.progress",
+            "run.dispatch_started",
+            "run.dispatch_settled",
             "run.completed",
             "run.finished"
         ]

@@ -26,6 +26,10 @@ pub enum AttentionKind {
     EngineFailure,
     /// The run needs an explicit decision after restart recovery.
     RecoveryRequired,
+    /// A dispatch may or may not have reached its destination. The run must not
+    /// move until a human reconciles it, because retrying could repeat work
+    /// that already happened.
+    DispatchUncertain,
 }
 
 impl AttentionKind {
@@ -36,6 +40,7 @@ impl AttentionKind {
             Self::CapabilityDenied => "capability_denied",
             Self::EngineFailure => "engine_failure",
             Self::RecoveryRequired => "recovery_required",
+            Self::DispatchUncertain => "dispatch_uncertain",
         }
     }
 }

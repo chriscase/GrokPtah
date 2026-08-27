@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::attention::AttentionRecord;
 use crate::authority::ResolvedBounds;
+use crate::engine::{DispatchDisposition, DispatchReport};
 use crate::error::{HostError, HostResult, io_error};
+use crate::identity::ExternalRef;
 use crate::journal::Journal;
 
 /// Directory holding one subdirectory per run.
@@ -108,6 +110,111 @@ impl RunPhase {
     }
 }
 
+/// What a dispatch established, once it came back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DispatchSettlement {
+    /// Whether the run may advance.
+    pub disposition: DispatchDisposition,
+    /// Opaque reference to the orchestrator's attempt record, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<ExternalRef>,
+    /// Opaque reference to the orchestrator's operation receipt, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<ExternalRef>,
+    /// When the dispatch settled, RFC3339.
+    pub settled_at: String,
+}
+
+/// The most recent dispatch this run made, written before it happened.
+///
+/// The record exists on disk *before* the engine is invoked, so a process that
+/// dies mid-step leaves proof that a dispatch was in flight. Writing it
+/// afterwards would make an interrupted dispatch indistinguishable from one
+/// that never started — and those two need opposite handling.
+///
+/// Only the latest dispatch is kept here; the journal carries the history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DispatchRecord {
+    /// One-based ordinal, unique and increasing within the run.
+    pub ordinal: u32,
+    /// The round this dispatch was taken for.
+    pub round: u16,
+    /// When the dispatch started, RFC3339.
+    pub started_at: String,
+    /// What it established. `None` means it is still in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled: Option<DispatchSettlement>,
+}
+
+impl DispatchRecord {
+    /// Record that a dispatch is about to happen.
+    pub fn started(ordinal: u32, round: u16, started_at: String) -> Self {
+        Self {
+            ordinal,
+            round,
+            started_at,
+            settled: None,
+        }
+    }
+
+    /// Whether this dispatch has not come back.
+    pub fn is_in_flight(&self) -> bool {
+        self.settled.is_none()
+    }
+
+    /// What the dispatch established, if it settled.
+    pub fn disposition(&self) -> Option<DispatchDisposition> {
+        self.settled.as_ref().map(|settled| settled.disposition)
+    }
+
+    /// Whether this run must not move until a human reconciles it.
+    ///
+    /// True while a dispatch is in flight as well as after an indeterminate
+    /// one: an in-flight record read from disk means the process died mid-step,
+    /// which is the same unanswerable question.
+    pub fn blocks_progress(&self) -> bool {
+        !matches!(
+            self.disposition(),
+            Some(
+                DispatchDisposition::Local
+                    | DispatchDisposition::NotDispatched
+                    | DispatchDisposition::Resolved
+            )
+        )
+    }
+
+    /// Settle the dispatch from what the engine reported.
+    ///
+    /// A report carrying a reference that is not bounded settles as
+    /// indeterminate: an unusable reference cannot be reconciled, and treating
+    /// it as a clean result would hide that.
+    pub fn settle(&mut self, report: DispatchReport, settled_at: String) {
+        let bounded = report.refs_are_bounded();
+        self.settled = Some(DispatchSettlement {
+            disposition: if bounded {
+                report.disposition
+            } else {
+                DispatchDisposition::Indeterminate
+            },
+            attempt: bounded.then_some(report.attempt).flatten(),
+            receipt: bounded.then_some(report.receipt).flatten(),
+            settled_at,
+        });
+    }
+
+    /// Settle a dispatch that was interrupted, with nothing proven either way.
+    pub fn settle_indeterminate(&mut self, settled_at: String) {
+        self.settled = Some(DispatchSettlement {
+            disposition: DispatchDisposition::Indeterminate,
+            attempt: None,
+            receipt: None,
+            settled_at,
+        });
+    }
+}
+
 /// One reviewable changed file recorded at completion.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -180,6 +287,9 @@ pub struct RunRecord {
     /// Completion evidence, present only for a completed run.
     #[serde(default)]
     pub completion: Option<CompletionRecord>,
+    /// The most recent dispatch, written before the engine was invoked.
+    #[serde(default)]
+    pub dispatch: Option<DispatchRecord>,
 }
 
 impl RunRecord {
@@ -197,6 +307,21 @@ impl RunRecord {
         self.phase = phase;
         self.updated_at = updated_at;
         self.revision = self.revision.saturating_add(1);
+    }
+
+    /// The ordinal the next dispatch for this run must carry.
+    pub fn next_dispatch_ordinal(&self) -> u32 {
+        self.dispatch
+            .as_ref()
+            .map_or(0, |dispatch| dispatch.ordinal)
+            .saturating_add(1)
+    }
+
+    /// Whether an unsettled or indeterminate dispatch blocks this run.
+    pub fn dispatch_blocks_progress(&self) -> bool {
+        self.dispatch
+            .as_ref()
+            .is_some_and(DispatchRecord::blocks_progress)
     }
 }
 
@@ -220,12 +345,17 @@ pub struct RecoveryReport {
     pub torn_journals: Vec<String>,
     /// Runs still paused from a previous graceful shutdown.
     pub resumable: Vec<String>,
+    /// Runs whose dispatch was in flight when the host stopped. Whether that
+    /// work reached its destination is unknown, so these are never resumed.
+    pub indeterminate_dispatch: Vec<String>,
 }
 
 impl RecoveryReport {
     /// Whether the previous shutdown left anything to repair.
     pub fn is_clean(&self) -> bool {
-        self.interrupted.is_empty() && self.torn_journals.is_empty()
+        self.interrupted.is_empty()
+            && self.torn_journals.is_empty()
+            && self.indeterminate_dispatch.is_empty()
     }
 }
 
@@ -290,6 +420,19 @@ impl Store {
                 report.torn_journals.push(run_id.clone());
             }
 
+            // A dispatch left in flight is settled first, and is decisive: it
+            // interrupts the run whatever phase the record claims, because the
+            // question it leaves open — did that work already happen? — is not
+            // one any phase can answer.
+            let interrupted_dispatch = record
+                .dispatch
+                .as_ref()
+                .is_some_and(DispatchRecord::is_in_flight);
+            if interrupted_dispatch && let Some(dispatch) = record.dispatch.as_mut() {
+                dispatch.settle_indeterminate(now.to_owned());
+                report.indeterminate_dispatch.push(run_id.clone());
+            }
+
             match record.phase {
                 RunPhase::Running | RunPhase::Queued => {
                     record.transition(RunPhase::Interrupted, now.to_owned());
@@ -297,8 +440,19 @@ impl Store {
                     record.pending_steering.clear();
                     report.interrupted.push(run_id.clone());
                 }
+                RunPhase::Paused | RunPhase::NeedsAttention if interrupted_dispatch => {
+                    record.transition(RunPhase::Interrupted, now.to_owned());
+                    record.stop_reason = Some("dispatch_indeterminate".to_owned());
+                    record.pending_steering.clear();
+                    report.interrupted.push(run_id.clone());
+                }
                 RunPhase::Paused | RunPhase::NeedsAttention => {
                     report.resumable.push(run_id.clone());
+                }
+                _ if interrupted_dispatch => {
+                    record
+                        .stop_reason
+                        .get_or_insert_with(|| "dispatch_indeterminate".to_owned());
                 }
                 _ => {}
             }
@@ -307,7 +461,14 @@ impl Store {
             store.records.insert(run_id.clone(), record);
         }
 
-        for run_id in &report.interrupted {
+        let mut repaired: Vec<&String> = report
+            .interrupted
+            .iter()
+            .chain(report.indeterminate_dispatch.iter())
+            .collect();
+        repaired.sort();
+        repaired.dedup();
+        for run_id in repaired {
             store.persist_record(run_id)?;
         }
 
@@ -525,6 +686,109 @@ mod tests {
         assert_eq!(first.interrupted.len(), 1);
         let second = Store::open(home.path(), 32, testing::TS).expect("reopen").1;
         assert!(second.interrupted.is_empty(), "recovery must be durable");
+    }
+
+    #[test]
+    fn a_dispatch_left_in_flight_is_settled_indeterminate_and_interrupts_the_run() {
+        let home = tempfile::tempdir().expect("temp home");
+        {
+            let (mut store, _) = Store::open(home.path(), 32, testing::TS).expect("store opens");
+            let mut live = record("run-dispatching", RunPhase::Running);
+            live.dispatch = Some(DispatchRecord::started(1, 1, testing::TS.into()));
+            store.insert(live).expect("insert");
+
+            // A paused run is normally resumable, but not with a dispatch that
+            // never came back.
+            let mut paused = record("run-paused-mid-dispatch", RunPhase::Paused);
+            paused.dispatch = Some(DispatchRecord::started(3, 2, testing::TS.into()));
+            store.insert(paused).expect("insert");
+        }
+
+        let (store, report) = Store::open(home.path(), 32, testing::TS).expect("store reopens");
+        assert_eq!(
+            report.indeterminate_dispatch,
+            vec!["run-dispatching", "run-paused-mid-dispatch"]
+        );
+        assert!(report.resumable.is_empty());
+        assert!(!report.is_clean());
+
+        for run_id in ["run-dispatching", "run-paused-mid-dispatch"] {
+            let record = store.get(run_id).expect("run");
+            assert_eq!(record.phase, RunPhase::Interrupted);
+            let dispatch = record.dispatch.as_ref().expect("dispatch");
+            assert!(!dispatch.is_in_flight());
+            assert_eq!(
+                dispatch.disposition(),
+                Some(DispatchDisposition::Indeterminate)
+            );
+            assert!(record.dispatch_blocks_progress());
+        }
+        assert_eq!(
+            store
+                .get("run-dispatching")
+                .expect("run")
+                .next_dispatch_ordinal(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_settled_dispatch_survives_reopen_without_being_reopened() {
+        let home = tempfile::tempdir().expect("temp home");
+        {
+            let (mut store, _) = Store::open(home.path(), 32, testing::TS).expect("store opens");
+            let mut done = record("run-done", RunPhase::Completed);
+            let mut dispatch = DispatchRecord::started(1, 1, testing::TS.into());
+            dispatch.settle(
+                DispatchReport::external(
+                    DispatchDisposition::Resolved,
+                    ExternalRef::new("attempt-1"),
+                    ExternalRef::new("receipt-1"),
+                ),
+                testing::TS.into(),
+            );
+            done.dispatch = Some(dispatch);
+            store.insert(done).expect("insert");
+        }
+
+        let (store, report) = Store::open(home.path(), 32, testing::TS).expect("store reopens");
+        assert!(report.is_clean());
+        let record = store.get("run-done").expect("run");
+        assert!(!record.dispatch_blocks_progress());
+        let settled = record.dispatch.as_ref().expect("dispatch").settled.as_ref();
+        assert_eq!(
+            settled
+                .expect("settlement")
+                .attempt
+                .as_ref()
+                .map(ExternalRef::as_str),
+            Some("attempt-1")
+        );
+    }
+
+    #[test]
+    fn an_unusable_reference_settles_indeterminate_rather_than_clean() {
+        let mut dispatch = DispatchRecord::started(1, 1, testing::TS.into());
+        let smuggled: ExternalRef =
+            serde_json::from_str("\"../escape\"").expect("serde is transparent");
+        dispatch.settle(
+            DispatchReport::external(DispatchDisposition::Resolved, Some(smuggled), None),
+            testing::TS.into(),
+        );
+        assert_eq!(
+            dispatch.disposition(),
+            Some(DispatchDisposition::Indeterminate)
+        );
+        assert!(
+            dispatch
+                .settled
+                .as_ref()
+                .expect("settlement")
+                .attempt
+                .is_none(),
+            "an unusable reference is not recorded"
+        );
+        assert!(dispatch.blocks_progress());
     }
 
     #[test]
