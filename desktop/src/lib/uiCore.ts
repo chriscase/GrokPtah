@@ -6,6 +6,7 @@
  * future `@grokptah/ui-core` package that ContextDesk and other consumers can
  * use with their own visual language.
  */
+export * from "./adaptiveComputerUse";
 export * from "./capabilities";
 export * from "./externalWorker";
 export * from "./help";
