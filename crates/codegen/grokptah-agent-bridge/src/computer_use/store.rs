@@ -101,6 +101,12 @@ impl ComputerStore {
         &self.inner.root
     }
 
+    /// Sibling durable root for isolated guest/lease records. Opening it is
+    /// fail-closed and independent of semantic Computer Run recovery.
+    pub fn isolated_visual_root(&self) -> PathBuf {
+        self.inner.root.join("isolated-visual")
+    }
+
     pub(crate) fn save_run(&self, run: &ComputerRun) -> ComputerResult<()> {
         let _guard = self.inner.lock.lock();
         let path = self.run_path(&run.run_id)?;
