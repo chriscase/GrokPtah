@@ -795,6 +795,7 @@ mod tests {
                 allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
                 max_concurrent_runs: 2,
                 bounds: RunBounds::default(),
+                reconciliation_operators: Vec::new(),
             },
         );
         // Shipped path registers bearer for journal scrubbing.

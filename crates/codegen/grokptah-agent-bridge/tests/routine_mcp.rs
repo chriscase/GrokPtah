@@ -39,6 +39,7 @@ async fn independent_mcp_client_can_inspect_and_manually_activate_a_routine() {
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let server = start_control_server(orch.clone(), 0).await.unwrap();

@@ -406,11 +406,21 @@ struct RunUsageState {
     usage: CompletionUsage,
     complete: bool,
     pending_requests: u32,
+    /// Monotonic count of attempts ever opened for this run. Unlike
+    /// `pending_requests`, which is a gauge that returns to zero, this only
+    /// increases, so it can name each attempt's durable record.
+    attempts_opened: u32,
     stop: Option<RunTokenStop>,
 }
 
 struct RunUsageTracker {
     run_id: String,
+    /// The orchestration request that created this run, restated on every
+    /// attempt record so a settlement can be bound to it.
+    request_id: String,
+    /// Authority binding inherited from the run, so an attempt is readable by
+    /// the credential whose operation produced it and no other.
+    principal: crate::orchestration::PrincipalScope,
     store: OrchStore,
     max_total_tokens: Option<u64>,
     state: Mutex<RunUsageState>,
@@ -419,11 +429,37 @@ struct RunUsageTracker {
 
 struct RunUsageAttempt {
     tracker: Arc<RunUsageTracker>,
+    /// Durable attempt record opened for this provider request.
+    attempt_id: String,
     _bounded_admission: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl RunUsageAttempt {
+    /// Record that this attempt is about to be written to the wire.
+    ///
+    /// Called immediately before the provider request. The write happens
+    /// *first* on purpose: a crash between here and the send leaves the
+    /// attempt looking uncertain, which is recoverable, while the reverse
+    /// order would let a genuinely sent request come back as "never sent" and
+    /// be retried into a duplicate.
+    fn mark_dispatched(&self) -> Result<()> {
+        self.tracker
+            .store
+            .mark_provider_attempt_sent(&self.attempt_id)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        Ok(())
+    }
+
     fn finish(self, usage: Option<&CompletionUsage>) -> Result<Option<String>> {
+        // An outcome was observed, so the attempt is no longer uncertain. A
+        // failure to record that is deliberately not fatal — the response is
+        // already in hand — and leaves the record unsettled, which is the safe
+        // direction: an operator sees one extra attempt to reconcile rather
+        // than one silently forgotten.
+        let _ = self
+            .tracker
+            .store
+            .resolve_provider_attempt(&self.attempt_id);
         self.tracker.finish_attempt(usage)
     }
 }
@@ -432,12 +468,20 @@ impl RunUsageTracker {
     fn from_run(store: OrchStore, run: &RunRecord) -> Arc<Self> {
         Arc::new(Self {
             run_id: run.run_id.clone(),
+            request_id: run.request_id.clone(),
+            principal: crate::orchestration::run_principal(
+                run.owner_id.as_deref(),
+                run.client_id.as_deref(),
+                run.session_id,
+                &run.workspace,
+            ),
             store,
             max_total_tokens: run.bounds.max_total_tokens,
             state: Mutex::new(RunUsageState {
                 usage: run.aggregates.usage.clone(),
                 complete: run.aggregates.usage_complete,
                 pending_requests: run.aggregates.usage_pending_requests,
+                attempts_opened: 0,
                 stop: None,
             }),
             bounded_admission: Arc::new(tokio::sync::Mutex::new(())),
@@ -491,13 +535,22 @@ impl RunUsageTracker {
         if let Some(stop) = self.state.lock().stop {
             bail!(stop.message());
         }
-        let pending_requests = {
+        let (pending_requests, ordinal) = {
             let mut state = self.state.lock();
             state.pending_requests = state
                 .pending_requests
                 .checked_add(1)
                 .ok_or_else(|| anyhow!("provider attempt counter overflowed"))?;
-            state.pending_requests
+            state.attempts_opened = state
+                .attempts_opened
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("provider attempt counter overflowed"))?;
+            (state.pending_requests, state.attempts_opened)
+        };
+        let rollback = || {
+            let mut state = self.state.lock();
+            state.pending_requests = state.pending_requests.saturating_sub(1);
+            state.attempts_opened = state.attempts_opened.saturating_sub(1);
         };
         match self.store.update_run(&self.run_id, |run| {
             run.aggregates.usage_pending_requests = pending_requests;
@@ -506,16 +559,31 @@ impl RunUsageTracker {
         }) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                self.state.lock().pending_requests = pending_requests.saturating_sub(1);
+                rollback();
                 bail!("run disappeared while admitting a provider request");
             }
             Err(error) => {
-                self.state.lock().pending_requests = pending_requests.saturating_sub(1);
+                rollback();
                 return Err(error);
             }
         }
+        // Fail closed: a provider request that cannot be durably accounted for
+        // is not made at all, matching how a lost run record is treated above.
+        let attempt = match self.store.begin_provider_attempt(
+            &self.run_id,
+            ordinal,
+            &self.request_id,
+            &self.principal,
+        ) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                rollback();
+                return Err(anyhow!(error.to_string()));
+            }
+        };
         Ok(RunUsageAttempt {
             tracker: self.clone(),
+            attempt_id: attempt.attempt_id,
             _bounded_admission: bounded_admission,
         })
     }
@@ -2130,7 +2198,16 @@ impl AgentHostHandle {
             "instructionByteLength": prompt.len(),
             "maxRounds": max_rounds,
         }));
-        match store.claim_idempotency("persistent_agent_resume", &request_id, &payload_hash)? {
+        // A desktop-initiated resume carries no bearer credential. It is still
+        // bound to an authority — the host's own namespace — so the receipt is
+        // attributable and cannot be replayed or read by an MCP credential.
+        let principal = crate::orchestration::host_principal(Some(session_id));
+        match store.claim_idempotency(
+            "persistent_agent_resume",
+            &request_id,
+            &payload_hash,
+            &principal,
+        )? {
             crate::orchestration::IdempotencyClaim::Replay(Ok(value)) => value
                 .as_str()
                 .map(ToOwned::to_owned)
@@ -2149,6 +2226,7 @@ impl AgentHostHandle {
                             "persistent_agent_resume",
                             &request_id,
                             &payload_hash,
+                            &principal,
                             None,
                             crate::orchestration::OrchError::new(
                                 crate::orchestration::OrchErrorCode::Conflict,
@@ -2179,6 +2257,7 @@ impl AgentHostHandle {
                             "persistent_agent_resume",
                             &request_id,
                             &payload_hash,
+                            &principal,
                             durable_run_id,
                             serde_json::Value::String(response.clone()),
                         )?;
@@ -2189,6 +2268,7 @@ impl AgentHostHandle {
                             "persistent_agent_resume",
                             &request_id,
                             &payload_hash,
+                            &principal,
                             durable_run_id,
                             crate::orchestration::OrchError::new(
                                 crate::orchestration::OrchErrorCode::Internal,
@@ -2498,6 +2578,7 @@ impl AgentHostHandle {
             workspace: durable_workspace,
             request_id: format!("desktop-turn-{turn_id}"),
             client_id: Some("desktop".into()),
+            owner_id: None,
             state: RunState::Running,
             purpose: RunPurpose::Execution,
             agent_id: agent_id.clone(),
@@ -3914,6 +3995,7 @@ impl AgentHostHandle {
             if !call_allowed {
                 None
             } else {
+                Self::mark_provider_attempt_dispatched(&usage_attempt)?;
                 match call_xai_chat(
                     &creds,
                     &model,
@@ -4158,6 +4240,18 @@ impl AgentHostHandle {
         match tracker {
             Some(tracker) => Ok(Some(tracker.begin_attempt().await?)),
             None => Ok(None),
+        }
+    }
+
+    /// Record that an admitted attempt is about to reach the provider.
+    ///
+    /// Separate from admission so the durable record distinguishes "counted
+    /// but never sent" from "sent, outcome unknown". Only the first is safe to
+    /// retry after a crash.
+    fn mark_provider_attempt_dispatched(attempt: &Option<RunUsageAttempt>) -> Result<()> {
+        match attempt {
+            Some(attempt) => attempt.mark_dispatched(),
+            None => Ok(()),
         }
     }
 
@@ -7625,6 +7719,7 @@ impl AgentHostHandle {
                 if plan_token_stop.is_some() {
                     offline_plan_steps(&goal)
                 } else {
+                    Self::mark_provider_attempt_dispatched(&usage_attempt)?;
                     match propose_plan_with_model(&creds, model, cwd, &goal, &cancel).await {
                         Ok((steps, usage)) if !steps.is_empty() => {
                             plan_token_stop = self.finish_provider_attempt(
@@ -8625,6 +8720,7 @@ impl AgentHostHandle {
                 }
             };
             let provider_observation = self.provider_observation_context(session_id);
+            Self::mark_provider_attempt_dispatched(&usage_attempt)?;
             let step = match call_xai_agent_step_observed(
                 creds,
                 model,
@@ -11367,6 +11463,7 @@ mod tests {
             workspace: "/tmp/project".into(),
             request_id: format!("request-{run_id}"),
             client_id: Some("test".into()),
+            owner_id: None,
             state: RunState::Running,
             purpose: RunPurpose::Execution,
             agent_id: None,
@@ -11831,6 +11928,7 @@ mod tests {
             workspace: agent.workspace.clone(),
             request_id: "continuation-source-request".into(),
             client_id: Some("test".into()),
+            owner_id: None,
             state: RunState::Completed,
             purpose: RunPurpose::Execution,
             agent_id: Some(agent.agent_id.clone()),
@@ -11973,6 +12071,7 @@ mod tests {
             workspace: current_agent.workspace.clone(),
             request_id: "competing-admission-request".into(),
             client_id: Some("test".into()),
+            owner_id: None,
             state: RunState::Running,
             purpose: RunPurpose::Execution,
             agent_id: Some(current_agent.agent_id.clone()),
@@ -12269,6 +12368,7 @@ mod tests {
             workspace: agent.workspace.clone(),
             request_id: "frozen-spec-request".into(),
             client_id: Some("test".into()),
+            owner_id: None,
             state: RunState::Running,
             purpose: RunPurpose::Execution,
             agent_id: Some(agent.agent_id.clone()),
@@ -12362,6 +12462,7 @@ mod tests {
             workspace: agent.workspace.clone(),
             request_id: "manager-proposal-intent".into(),
             client_id: Some("native-executor".into()),
+            owner_id: None,
             state: RunState::Running,
             purpose: RunPurpose::ManagerProposal,
             agent_id: Some(agent.agent_id.clone()),

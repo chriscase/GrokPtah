@@ -43,6 +43,7 @@ fn setup_with_guard(
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     (home, guard, host, workspace, orch)
@@ -223,7 +224,29 @@ async fn live_get_replays_scoped_events_and_resumes_after_last_event() {
         .unwrap();
     assert!(wrong_session.status().is_client_error());
     let body: Value = wrong_session.json().await.unwrap();
-    assert_eq!(body["error"]["data"]["code"], "forbidden_scope");
+    assert_eq!(body["error"]["data"]["code"], "invalid_request");
+
+    // And that answer is indistinguishable from asking for a run that never
+    // existed, so the live channel is not an existence oracle for run ids.
+    let absent = http
+        .get(live_url(
+            server.addr,
+            owner.id,
+            workspace.path(),
+            "run-that-does-not-exist",
+        ))
+        .header("Authorization", "Bearer live-event-token")
+        .header("mcp-session-id", &transport_session)
+        .send()
+        .await
+        .unwrap();
+    assert!(absent.status().is_client_error());
+    let absent_body: Value = absent.json().await.unwrap();
+    assert_eq!(
+        body["error"]["data"]["code"],
+        absent_body["error"]["data"]["code"]
+    );
+    assert_eq!(body["error"]["message"], absent_body["error"]["message"]);
 
     server.stop();
     set_grokptah_home_override(None);

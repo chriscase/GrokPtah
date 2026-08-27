@@ -127,6 +127,7 @@ async fn project_scope_matches_desktop_service_and_isolated_model_tools_across_r
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 1,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let auth = service.auth_header(Some("Bearer memory-token")).unwrap();

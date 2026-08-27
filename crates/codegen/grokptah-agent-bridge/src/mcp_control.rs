@@ -33,10 +33,11 @@ use uuid::Uuid;
 use crate::host::AgentHostHandle;
 use crate::orchestration::{
     AuthContext, ChangeRecord, ManagerStepSpec, MessageKind, MissedRunPolicy, OrchError,
-    OrchErrorCode, OrchestrationConfig, OrchestrationService, RoutineConcurrencyPolicy,
-    RoutineLifecycle, RoutineRetryPolicy, RoutineTrigger, RunExecutionMode, WorkArtifactRef,
-    WorkDependency, WorkPolicy, WorkResult, WorkTemplate, WorkerHostKind, WorkspaceAllowlist,
-    CONTROL_TOOLS, FORBIDDEN_TOOLS,
+    OrchErrorCode, OrchestrationConfig, OrchestrationService, ReconcileRequest,
+    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRetryPolicy, RoutineTrigger,
+    RunExecutionMode, SettlementEvidence, SettlementOutcome, WorkArtifactRef, WorkDependency,
+    WorkPolicy, WorkResult, WorkTemplate, WorkerHostKind, WorkspaceAllowlist, CONTROL_TOOLS,
+    FORBIDDEN_TOOLS, MAX_PROVIDER_ATTEMPT_PAGE, MAX_RECEIPT_PAGE,
 };
 use crate::{EventReceiver, JournalPage, SessionUpdate};
 
@@ -372,6 +373,7 @@ pub async fn start_control_from_env(host: AgentHostHandle) -> Option<ControlServ
             allowlist: WorkspaceAllowlist::new(roots),
             max_concurrent_runs: 4,
             bounds: Default::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let mut limits = ControlServerLimits::default();
@@ -1439,6 +1441,64 @@ fn default_event_limit() -> usize {
     50
 }
 
+fn default_page_limit() -> usize {
+    50
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListReceiptsArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default = "default_page_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetReceiptArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListProviderAttemptsArgs {
+    session_id: Uuid,
+    workspace: PathBuf,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    unsettled_only: bool,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default = "default_page_limit")]
+    limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReconcileProviderAttemptArgs {
+    /// Idempotency key of the reconciliation itself.
+    request_id: String,
+    session_id: Uuid,
+    workspace: PathBuf,
+    run_id: String,
+    attempt_id: String,
+    /// The originating run's request id, restated as proof of binding.
+    attempt_request_id: String,
+    expected_revision: u64,
+    outcome: SettlementOutcome,
+    evidence_kind: String,
+    evidence_digest: String,
+    evidence_observed_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
 fn default_computer_event_limit() -> usize {
     crate::computer_use::DEFAULT_EVENT_PAGE
 }
@@ -1881,6 +1941,63 @@ fn tool_input_schema(name: &str) -> Value {
                 "session_id": session,
                 "workspace": workspace,
                 "run_id": run_id
+            }
+        }),
+        "ptah_list_receipts" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "cursor": {"type": "string", "minLength": 1, "maxLength": 256},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200}
+            }
+        }),
+        "ptah_get_receipt" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace", "request_id"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "request_id": req_id
+            }
+        }),
+        "ptah_list_provider_attempts" => json!({
+            "type": "object",
+            "required": ["session_id", "workspace"],
+            "additionalProperties": false,
+            "properties": {
+                "session_id": session,
+                "workspace": workspace,
+                "run_id": run_id,
+                "unsettled_only": {"type": "boolean"},
+                "cursor": {"type": "string", "minLength": 1, "maxLength": 256},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200}
+            }
+        }),
+        "ptah_reconcile_provider_attempt" => json!({
+            "type": "object",
+            "required": [
+                "request_id", "session_id", "workspace", "run_id", "attempt_id",
+                "attempt_request_id", "expected_revision", "outcome",
+                "evidence_kind", "evidence_digest", "evidence_observed_at"
+            ],
+            "additionalProperties": false,
+            "properties": {
+                "request_id": req_id,
+                "session_id": session,
+                "workspace": workspace,
+                "run_id": run_id,
+                "attempt_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "attempt_request_id": req_id,
+                "expected_revision": {"type": "integer", "minimum": 1},
+                "outcome": {"type": "string", "enum": ["delivered", "not_delivered"]},
+                "evidence_kind": {"type": "string", "minLength": 1, "maxLength": 64},
+                "evidence_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "evidence_observed_at": {"type": "string", "format": "date-time"},
+                "note": {"type": "string", "maxLength": 2000}
             }
         }),
         "ptah_list_computer_runs" | "ptah_get_computer_capacity" => json!({
@@ -2721,6 +2838,65 @@ async fn dispatch_tool(
             let args: RunArgs = parse_value(args)?;
             require_nonempty(&args.run_id, "run_id")?;
             orch.get_progress_scoped(auth, args.session_id, &args.workspace, &args.run_id)
+        }
+        "ptah_list_receipts" => {
+            let args: ListReceiptsArgs = parse_value(args)?;
+            require_page_limit(args.limit, MAX_RECEIPT_PAGE)?;
+            orch.list_receipts_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                args.cursor.as_deref(),
+                args.limit,
+            )
+        }
+        "ptah_get_receipt" => {
+            let args: GetReceiptArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            orch.get_receipt_scoped(auth, args.session_id, &args.workspace, &args.request_id)
+        }
+        "ptah_list_provider_attempts" => {
+            let args: ListProviderAttemptsArgs = parse_value(args)?;
+            require_page_limit(args.limit, MAX_PROVIDER_ATTEMPT_PAGE)?;
+            if let Some(run_id) = args.run_id.as_deref() {
+                require_nonempty(run_id, "run_id")?;
+            }
+            orch.list_provider_attempts_scoped(
+                auth,
+                args.session_id,
+                &args.workspace,
+                args.run_id.as_deref(),
+                args.unsettled_only,
+                args.cursor.as_deref(),
+                args.limit,
+            )
+        }
+        "ptah_reconcile_provider_attempt" => {
+            let args: ReconcileProviderAttemptArgs = parse_value(args)?;
+            require_nonempty(&args.request_id, "request_id")?;
+            require_nonempty(&args.run_id, "run_id")?;
+            require_nonempty(&args.attempt_id, "attempt_id")?;
+            require_nonempty(&args.attempt_request_id, "attempt_request_id")?;
+            orch.reconcile_provider_attempt(
+                auth,
+                &args.request_id,
+                args.session_id,
+                &args.workspace,
+                ReconcileRequest {
+                    run_id: &args.run_id,
+                    attempt_id: &args.attempt_id,
+                    attempt_request_id: &args.attempt_request_id,
+                    expected_revision: args.expected_revision,
+                    outcome: args.outcome,
+                    evidence: SettlementEvidence {
+                        kind: args.evidence_kind,
+                        digest: args.evidence_digest,
+                        observed_at: args.evidence_observed_at,
+                    },
+                    note: args.note.as_deref(),
+                },
+            )
+            .await
         }
         "ptah_get_events" => {
             let args: EventsArgs = parse_value(args)?;
@@ -3625,6 +3801,20 @@ fn parse_value<T: for<'de> Deserialize<'de>>(value: &Value) -> Result<T, OrchErr
     })
 }
 
+/// Reject a page size outside the seam's hard bound before it reaches the
+/// store, so an oversized request is an explicit error rather than a silently
+/// clamped page the caller reads as complete.
+fn require_page_limit(limit: usize, max: usize) -> Result<(), OrchError> {
+    if (1..=max).contains(&limit) {
+        Ok(())
+    } else {
+        Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            format!("limit must be between 1 and {max}"),
+        ))
+    }
+}
+
 fn require_nonempty(value: &str, key: &str) -> Result<(), OrchError> {
     if value.trim().is_empty() {
         Err(OrchError::new(
@@ -3684,6 +3874,7 @@ mod tests {
                 allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
                 max_concurrent_runs: 2,
                 bounds: RunBounds::default(),
+                reconciliation_operators: Vec::new(),
             },
         );
         let srv = start_control_server(orch, 0).await.unwrap();
@@ -3756,6 +3947,7 @@ mod tests {
                 allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
                 max_concurrent_runs: 2,
                 bounds: RunBounds::default(),
+                reconciliation_operators: Vec::new(),
             },
         );
         let srv = start_control_server(orch, 0).await.unwrap();
@@ -3902,6 +4094,7 @@ mod tests {
                 allowlist: WorkspaceAllowlist::new(roots),
                 max_concurrent_runs: 2,
                 bounds: RunBounds::default(),
+                reconciliation_operators: Vec::new(),
             },
         )
     }
@@ -4640,6 +4833,7 @@ mod tests {
                 allowlist: WorkspaceAllowlist::new([workspace_path.clone()]),
                 max_concurrent_runs: 2,
                 bounds: RunBounds::default(),
+                reconciliation_operators: Vec::new(),
             },
         );
         let auth = orch.auth_header(Some("Bearer agent-scope-token")).unwrap();

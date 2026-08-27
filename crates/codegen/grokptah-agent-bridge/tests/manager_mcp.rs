@@ -41,6 +41,7 @@ async fn hosted_manager_plan_replays_and_unlocks_dependency_graph() {
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let server = start_control_server(orch, 0).await.unwrap();
@@ -267,6 +268,7 @@ async fn hosted_manager_tick_routes_attention_and_terminal_outcomes() {
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let store_for_fixture = host.ensure_orchestration_store().unwrap();

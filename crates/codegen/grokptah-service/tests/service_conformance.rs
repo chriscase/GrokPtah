@@ -501,6 +501,9 @@ async fn authorization_is_fail_closed_across_token_session_and_workspace() {
         "non-allowlisted create must fail: {not_allowlisted:?}"
     );
 
+    // A run owned by another session must read exactly like a run that does
+    // not exist. Anything more specific would let a caller confirm a run id it
+    // is not allowed to see.
     let cross_read = client
         .call_tool(
             "ptah_get_run",
@@ -511,12 +514,29 @@ async fn authorization_is_fail_closed_across_token_session_and_workspace() {
             }),
         )
         .await;
+    let absent_read = client
+        .call_tool(
+            "ptah_get_run",
+            json!({
+                "session_id": peer,
+                "workspace": other,
+                "run_id": "run-that-does-not-exist",
+            }),
+        )
+        .await;
     let cross_read = err_text(&cross_read).to_ascii_lowercase();
+    let absent_read = err_text(&absent_read).to_ascii_lowercase();
     assert!(
-        cross_read.contains("forbidden")
-            || cross_read.contains("scope")
-            || cross_read.contains("belong"),
-        "cross-session read must fail closed: {cross_read}"
+        !cross_read.is_empty(),
+        "cross-session read must fail closed"
+    );
+    assert_eq!(
+        cross_read, absent_read,
+        "a foreign run and a missing run must be indistinguishable"
+    );
+    assert!(
+        !cross_read.contains(&victim_run.to_ascii_lowercase()),
+        "the denial must not echo the run id back: {cross_read}"
     );
 
     let cross_events = client
@@ -547,12 +567,28 @@ async fn authorization_is_fail_closed_across_token_session_and_workspace() {
             }),
         )
         .await;
+    // Cancel names a run too, so it must not be a cheaper existence oracle
+    // than the reads.
+    let absent_cancel = client
+        .call_tool(
+            "ptah_cancel",
+            json!({
+                "request_id": "conformance-absent-cancel",
+                "session_id": peer,
+                "workspace": other,
+                "run_id": "run-that-does-not-exist",
+            }),
+        )
+        .await;
     let cross_cancel = err_text(&cross_cancel).to_ascii_lowercase();
+    let absent_cancel = err_text(&absent_cancel).to_ascii_lowercase();
     assert!(
-        cross_cancel.contains("forbidden")
-            || cross_cancel.contains("scope")
-            || cross_cancel.contains("belong"),
-        "cross-session cancel must fail closed: {cross_cancel}"
+        !cross_cancel.is_empty(),
+        "cross-session cancel must fail closed"
+    );
+    assert_eq!(
+        cross_cancel, absent_cancel,
+        "a foreign run and a missing run must be indistinguishable to cancel"
     );
 
     let victim_still = client

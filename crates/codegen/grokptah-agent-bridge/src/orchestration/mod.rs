@@ -2,11 +2,13 @@
 //!
 //! Pure policy + durable records live here; the MCP transport is a thin adapter.
 
+mod authority;
 mod authz;
 mod continuation;
 pub(crate) mod managed;
 mod manager;
 mod message;
+mod provider_attempt;
 mod routine;
 mod service;
 mod store;
@@ -15,6 +17,10 @@ mod types;
 mod worker;
 mod workload;
 
+pub use authority::{
+    authorize_optional_scope, denied, host_principal, run_principal, PrincipalScope,
+    ScopeStrictness, HOST_PRINCIPAL_OWNER_ID, HOST_PRINCIPAL_TOKEN_ID,
+};
 pub use authz::{
     authenticate_bearer, canonical_workspace, constant_time_eq, require_bearer, AuthContext,
     AuthCredential, WorkspaceAllowlist,
@@ -45,6 +51,11 @@ pub use message::{
     message_activation_unsupported, MessageKind, MessagePage, WorkMessage, MAX_MESSAGE_BODY_BYTES,
     MESSAGE_SCHEMA_VERSION,
 };
+pub use provider_attempt::{
+    attempt_id_for, attempt_request_digest, AttemptSendState, AttemptSettlement, ProviderAttempt,
+    SettlementBinding, SettlementEvidence, SettlementOutcome, MAX_SETTLEMENT_NOTE_BYTES,
+    PROVIDER_ATTEMPT_SCHEMA_VERSION,
+};
 pub use routine::{
     occurrence_dedupe_key, ActivationCause, ActivationDisposition, ActivationRecord,
     ActivationRequest, CapturedActivationPolicy, Clock, ExternalAdapterKind, FakeClock,
@@ -53,9 +64,13 @@ pub use routine::{
     ROUTINE_SCHEMA_VERSION,
 };
 pub(crate) use service::apply_run_aggregate;
-pub use service::{OrchestrationConfig, OrchestrationService};
+pub use service::{OrchestrationConfig, OrchestrationService, ReconcileRequest};
 pub(crate) use store::workspaces_match;
-pub use store::{IdempotencyClaim, OrchStore, RetentionPolicy, RetentionReport};
+pub use store::{
+    IdempotencyClaim, OrchStore, ProviderAttemptPage, ReceiptPage, ReceiptSummary, RetentionPolicy,
+    RetentionReport, MAX_PROVIDER_ATTEMPT_PAGE, MAX_PROVIDER_ATTEMPT_SCAN, MAX_RECEIPT_PAGE,
+    MAX_RECEIPT_SCAN,
+};
 pub use supervisor::{
     ManagerSupervisorReport, ManagerSupervisorStatus, RoutineSupervisor, RoutineSupervisorStatus,
     WorkloadSupervisor, WorkloadSupervisorStatus, DEFAULT_MANAGER_TICK_INTERVAL,

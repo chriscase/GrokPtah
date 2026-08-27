@@ -40,6 +40,7 @@ async fn workload_protocol_is_idempotent_scoped_and_lane_archive_safe() {
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let server = start_control_server(orch, 0).await.unwrap();

@@ -268,6 +268,7 @@ async fn idempotency_conflict_and_replay() {
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
             max_concurrent_runs: 4,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
@@ -690,6 +691,7 @@ async fn selecting_a_command_in_another_workspace_is_not_an_oracle() {
             ]),
             max_concurrent_runs: 4,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
@@ -954,6 +956,7 @@ async fn workspace_mismatch_fail_closed() {
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
@@ -985,6 +988,7 @@ async fn missing_session_workspace_is_not_controllable() {
             allowlist: WorkspaceAllowlist::new([claimed.clone()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     drop(ws);
@@ -1016,6 +1020,7 @@ async fn reject_shell_and_admin_prompts() {
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
@@ -1058,6 +1063,7 @@ fn restart_interrupted_no_auto_resume() {
         workspace: "/w".into(),
         request_id: "q".into(),
         client_id: None,
+        owner_id: None,
         state: RunState::Running,
         purpose: Default::default(),
         agent_id: None,
@@ -1101,6 +1107,7 @@ fn restart_clears_queued_admission_position() {
         workspace: "/w".into(),
         request_id: "q-restart".into(),
         client_id: Some("mcp".into()),
+        owner_id: None,
         state: RunState::Queued,
         purpose: Default::default(),
         agent_id: None,
@@ -1158,6 +1165,7 @@ async fn interrupted_run_retry_is_explicit_linked_and_idempotent() {
                 .to_string(),
             request_id: "source-request".into(),
             client_id: Some("mcp".into()),
+            owner_id: None,
             state: RunState::Interrupted,
             purpose: Default::default(),
             agent_id: None,
@@ -1280,7 +1288,27 @@ async fn interrupted_run_retry_is_explicit_linked_and_idempotent() {
         )
         .await
         .unwrap_err();
-    assert_eq!(cross_session.code.as_str(), "forbidden_scope");
+    // A run owned by another session is answered exactly as a run that does
+    // not exist: the retry seam must not confirm that `source_id` is real to a
+    // caller who may not read it.
+    let absent = orch
+        .retry_run(
+            &auth,
+            "retry-absent-source",
+            other.id,
+            ws.path(),
+            "run-that-does-not-exist",
+            "must not cross ownership".into(),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(cross_session.code.as_str(), "invalid_request");
+    assert_eq!(cross_session.code.as_str(), absent.code.as_str());
+    assert_eq!(cross_session.message, absent.message);
+    assert!(!cross_session.message.contains(source_id));
 
     set_grokptah_home_override(None);
     std::env::remove_var("GROKPTAH_AGENT_OFFLINE");
@@ -1306,6 +1334,7 @@ async fn e2e_mcp_client_valid_and_invalid_token() {
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let srv = start_control_server(orch.clone(), 0).await.unwrap();
@@ -1394,6 +1423,7 @@ fn orch_for(
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
             max_concurrent_runs: max_concurrent,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     )
 }
@@ -1850,6 +1880,7 @@ fn run_event_pages_filter_before_limit_across_sessions() {
                 .to_string(),
             request_id: "event-page-test".into(),
             client_id: None,
+            owner_id: None,
             state: RunState::Completed,
             purpose: Default::default(),
             agent_id: None,
@@ -2230,6 +2261,7 @@ async fn capacity_is_shared_across_control_service_instances() {
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
             max_concurrent_runs: 8,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let auth_one = one.auth_header(Some("Bearer t")).unwrap();
@@ -2290,6 +2322,7 @@ async fn pending_admission_bound_is_shared_across_control_services() {
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
             max_concurrent_runs: 8,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let auth_one = one.auth_header(Some("Bearer t")).unwrap();
@@ -2404,6 +2437,7 @@ async fn global_scheduler_fairness_spans_control_services() {
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
             max_concurrent_runs: 8,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let auth_one = one.auth_header(Some("Bearer t")).unwrap();
@@ -2567,6 +2601,7 @@ async fn dropping_control_service_releases_pending_admission_slot() {
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
             max_concurrent_runs: 8,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let primary_auth = primary.auth_header(Some("Bearer t")).unwrap();
@@ -2756,6 +2791,7 @@ async fn token_ceiling_wins_over_round_limit_after_last_round_tool_calls() {
                 max_total_tokens: Some(10),
                 ..RunBounds::default()
             },
+            reconciliation_operators: Vec::new(),
         },
     );
     let auth = orch.auth_header(Some("Bearer t")).unwrap();
@@ -2853,6 +2889,7 @@ async fn bounded_compaction_uses_durable_admission_and_stops_before_the_main_mod
                 max_total_tokens: Some(10),
                 ..RunBounds::default()
             },
+            reconciliation_operators: Vec::new(),
         },
     );
     let auth = orch.auth_header(Some("Bearer t")).unwrap();

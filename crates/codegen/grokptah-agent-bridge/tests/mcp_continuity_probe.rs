@@ -47,6 +47,7 @@ fn seed_run(
                 .to_string(),
             request_id: format!("{run_id}-request"),
             client_id: Some("mcp".into()),
+            owner_id: None,
             state,
             purpose: Default::default(),
             agent_id: None,
@@ -176,6 +177,7 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let server = start_control_server(service, 0).await.unwrap();

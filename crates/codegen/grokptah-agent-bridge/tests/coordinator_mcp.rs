@@ -49,6 +49,7 @@ async fn independent_worker_recovers_assignment_and_messages() {
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     orch.set_auth_credentials(vec![
@@ -536,6 +537,7 @@ async fn coordinator_identity_and_scope_are_enforced() {
             ]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     orch.set_auth_credentials(vec![

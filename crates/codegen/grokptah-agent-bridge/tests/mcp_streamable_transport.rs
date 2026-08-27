@@ -50,6 +50,7 @@ fn setup() -> (
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
             max_concurrent_runs: 4,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     guard.set("GROKPTAH_AGENT_OFFLINE", "1");
@@ -1224,6 +1225,7 @@ async fn http_retry_interrupted_run_is_explicit_and_idempotent() {
                 .to_string(),
             request_id: "http-source-request".into(),
             client_id: Some("mcp".into()),
+            owner_id: None,
             state: RunState::Interrupted,
             purpose: Default::default(),
             agent_id: None,
@@ -1508,6 +1510,7 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
             allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf()]),
             max_concurrent_runs: 4,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let srv2 = start_control_server(orch2.clone(), 0).await.unwrap();

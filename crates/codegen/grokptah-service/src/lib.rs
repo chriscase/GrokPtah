@@ -40,6 +40,12 @@ pub struct ServiceConfig {
     /// Explicit durable root for embedders and hosted deployments. `None`
     /// preserves the `GROKPTAH_HOME`/desktop discovery behavior.
     pub runtime_home: Option<RuntimeHome>,
+    /// Client credential ids permitted to settle an uncertain provider
+    /// attempt. Empty — the default — disables reconciliation entirely rather
+    /// than granting it to every valid bearer token: settling is a judgement
+    /// about something the service could not observe, so it is an explicit
+    /// deployment decision.
+    pub reconciliation_operators: Vec<String>,
 }
 
 impl ServiceConfig {
@@ -67,6 +73,7 @@ impl ServiceConfig {
             },
             agent_owner_id: "primary".into(),
             runtime_home: None,
+            reconciliation_operators: Vec::new(),
         };
         config.validate()?;
         Ok(config)
@@ -100,6 +107,16 @@ impl ServiceConfig {
         if let Ok(value) = env::var("GROKPTAH_SERVICE_CLIENTS") {
             client_credentials.extend(parse_client_credentials(&value)?);
         }
+        let reconciliation_operators = env::var("GROKPTAH_SERVICE_RECONCILIATION_OPERATORS")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let agent_owner_id = env::var("GROKPTAH_SERVICE_AGENT_OWNER")
             .unwrap_or_else(|_| "primary".into())
             .trim()
@@ -130,6 +147,7 @@ impl ServiceConfig {
             allow_remote,
             max_concurrent,
             request_timeout: Duration::from_millis(timeout_ms),
+            reconciliation_operators,
             client_credentials,
             agent_owner_id,
             runtime_home: None,
@@ -165,6 +183,19 @@ impl ServiceConfig {
                 bail!("remote listeners require every bearer token to be at least 24 characters");
             }
         }
+        // An operator id that names no configured credential can never match a
+        // caller, so it is a silent misconfiguration rather than a grant.
+        for operator in &self.reconciliation_operators {
+            if !self
+                .client_credentials
+                .iter()
+                .any(|credential| &credential.id == operator)
+            {
+                bail!(
+                    "reconciliation operator {operator} does not name a configured client credential"
+                );
+            }
+        }
         if self.workspaces.is_empty() {
             bail!(
                 "at least one workspace is required; set --workspace or GROKPTAH_SERVICE_WORKSPACES"
@@ -195,6 +226,11 @@ impl ServiceConfig {
     }
 }
 
+// Built exactly once per process from argv, then immediately consumed by
+// `run_service`. The size gap between `Run` and the two unit variants costs
+// one stack move at startup, which is not worth an allocation and a public
+// API change to box away.
+#[allow(clippy::large_enum_variant)]
 pub enum StartupAction {
     Run(ServiceConfig),
     Help,
@@ -237,6 +273,11 @@ where
                 .push(parse_client_credential(&next_value(
                     &mut iter, "--client",
                 )?)?),
+            "--reconciliation-operator" => config.reconciliation_operators.push(
+                next_value(&mut iter, "--reconciliation-operator")?
+                    .trim()
+                    .to_string(),
+            ),
             "--workspace" => {
                 if !explicit_workspaces {
                     config.workspaces.clear();
@@ -302,7 +343,7 @@ fn parse_client_credentials(value: &str) -> Result<Vec<AuthCredential>> {
 }
 
 pub fn help_text() -> &'static str {
-    "GrokPtah headless service\n\nUsage: grokptah-service [options]\n\nOptions:\n  --listen ADDR                 Bind address (default 127.0.0.1:39200)\n  --token TOKEN                 Bearer token (or GROKPTAH_SERVICE_TOKEN)\n  --workspace PATH              Allowlisted workspace; repeatable\n  --client ID=TOKEN             Additional named device credential; repeatable\n  --allow-remote                Permit non-loopback bind; health requires auth\n  --max-concurrent N            Concurrent request/run ceiling (default 4)\n  --request-timeout-ms N        Request deadline (default 120000)\n  -h, --help                    Show this help\n      --version                 Show the service version\n\nGROKPTAH_SERVICE_CLIENTS accepts comma-separated ID=TOKEN entries.\nGROKPTAH_SERVICE_AGENT_OWNER names the durable Agent owner account.\nSet GROKPTAH_HOME to choose the durable service data directory."
+    "GrokPtah headless service\n\nUsage: grokptah-service [options]\n\nOptions:\n  --listen ADDR                 Bind address (default 127.0.0.1:39200)\n  --token TOKEN                 Bearer token (or GROKPTAH_SERVICE_TOKEN)\n  --workspace PATH              Allowlisted workspace; repeatable\n  --client ID=TOKEN             Additional named device credential; repeatable\n  --reconciliation-operator ID  Credential allowed to settle an uncertain\n                                provider attempt; repeatable, default none\n  --allow-remote                Permit non-loopback bind; health requires auth\n  --max-concurrent N            Concurrent request/run ceiling (default 4)\n  --request-timeout-ms N        Request deadline (default 120000)\n  -h, --help                    Show this help\n      --version                 Show the service version\n\nGROKPTAH_SERVICE_CLIENTS accepts comma-separated ID=TOKEN entries.\nGROKPTAH_SERVICE_RECONCILIATION_OPERATORS accepts comma-separated credential\nids; settling an uncertain provider attempt is off unless one is named.\nGROKPTAH_SERVICE_AGENT_OWNER names the durable Agent owner account.\nSet GROKPTAH_HOME to choose the durable service data directory."
 }
 
 pub struct ServiceHandle {
@@ -354,6 +395,7 @@ pub async fn start_service(config: ServiceConfig) -> Result<ServiceHandle> {
             allowlist,
             max_concurrent_runs: config.max_concurrent,
             bounds: Default::default(),
+            reconciliation_operators: config.reconciliation_operators.clone(),
         },
     );
     orch.set_auth_credentials(config.client_credentials.clone())
@@ -477,6 +519,52 @@ mod tests {
             .client_credentials
             .push(AuthCredential::new("laptop", "another-token").unwrap());
         assert!(duplicate.validate().is_err());
+    }
+
+    #[test]
+    fn reconciliation_operators_are_off_by_default_and_must_name_a_real_credential() {
+        let action = parse_args([
+            "--listen",
+            "127.0.0.1:0",
+            "--token",
+            "primary-token",
+            "--workspace",
+            "/tmp/project",
+        ])
+        .unwrap();
+        let StartupAction::Run(config) = action else {
+            panic!("expected run action");
+        };
+        assert!(
+            config.reconciliation_operators.is_empty(),
+            "settling an uncertain provider attempt must be off unless a \
+             deployment explicitly turns it on"
+        );
+
+        let action = parse_args([
+            "--listen",
+            "127.0.0.1:0",
+            "--token",
+            "primary-token",
+            "--workspace",
+            "/tmp/project",
+            "--client",
+            "laptop=secondary-token",
+            "--reconciliation-operator",
+            "laptop",
+        ])
+        .unwrap();
+        let StartupAction::Run(config) = action else {
+            panic!("expected run action");
+        };
+        assert_eq!(config.reconciliation_operators, vec!["laptop".to_string()]);
+        assert!(config.validate().is_ok());
+
+        // An operator id that matches no credential can never authorize a
+        // caller, so it is rejected instead of silently granting nothing.
+        let mut typo = config;
+        typo.reconciliation_operators = vec!["labtop".into()];
+        assert!(typo.validate().is_err());
     }
 
     #[test]

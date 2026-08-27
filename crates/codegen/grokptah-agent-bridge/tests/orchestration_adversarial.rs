@@ -62,6 +62,7 @@ fn orch(
                 max_duration_ms: 60_000,
                 max_total_tokens: None,
             },
+            reconciliation_operators: Vec::new(),
         },
     );
     assert!(
@@ -245,6 +246,7 @@ async fn reads_require_run_ownership_no_global_events() {
             allowlist: WorkspaceAllowlist::new([other.path().to_path_buf()]),
             max_concurrent_runs: 4,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let auth2 = foreign

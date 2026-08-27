@@ -70,6 +70,7 @@ async fn native_executor_runs_assigned_work_without_an_external_worker() {
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let server = start_control_server(orch.clone(), 0).await.unwrap();
@@ -261,6 +262,7 @@ async fn approval_required_work_pauses_before_success() {
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let server = start_control_server(orch.clone(), 0).await.unwrap();
@@ -388,6 +390,7 @@ fn run_record(
         workspace: workspace.into(),
         request_id: intent_id.into(),
         client_id: Some("native-executor".into()),
+        owner_id: None,
         state,
         purpose: Default::default(),
         agent_id: Some(agent_id.into()),
@@ -510,6 +513,7 @@ async fn boot_native(
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let workspace_text = workspace.path().display().to_string();
@@ -768,6 +772,7 @@ async fn restart_interrupted_run_retry_forbidden_is_terminal() {
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     orch.drive_native_executor_once().await;
@@ -823,6 +828,7 @@ async fn restart_interrupted_run_retry_allowed_does_not_resume() {
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     orch.drive_native_executor_once().await;
@@ -871,6 +877,7 @@ async fn resolve_work_input_requires_parked_scope() {
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let server = start_control_server(orch.clone(), 0).await.unwrap();
@@ -1124,6 +1131,7 @@ async fn resolve_work_input_uses_real_host_pending() {
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let server = start_control_server(orch.clone(), 0).await.unwrap();
@@ -1381,6 +1389,7 @@ async fn native_skips_manual_retry_without_mutating() {
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let server = start_control_server(orch.clone(), 0).await.unwrap();
@@ -1586,6 +1595,7 @@ async fn resolve_work_input_fails_after_restart_without_host_pending() {
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let missing = orch

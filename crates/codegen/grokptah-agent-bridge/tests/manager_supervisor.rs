@@ -42,6 +42,7 @@ async fn autonomous_manager_replans_once_and_reaches_success() {
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let fixture_store = host.ensure_orchestration_store().unwrap();

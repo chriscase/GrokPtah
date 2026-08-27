@@ -105,6 +105,7 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
             ]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
+            reconciliation_operators: Vec::new(),
         },
     );
     let server = start_control_server(service, 0).await.unwrap();
@@ -191,6 +192,7 @@ fn service_store_seed(
                 .to_string(),
             request_id: "coordinator-interrupted-request".into(),
             client_id: Some("mcp".into()),
+            owner_id: None,
             state: RunState::Interrupted,
             purpose: Default::default(),
             agent_id: None,

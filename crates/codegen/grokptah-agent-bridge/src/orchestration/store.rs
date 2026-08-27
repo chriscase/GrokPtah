@@ -12,6 +12,7 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 use uuid::Uuid;
 
+use super::authority::PrincipalScope;
 use super::managed::{
     ManagedExecutionIntent, ManagedExecutionPolicy, ManagedFinalizationOutcome,
     ManagedFinalizationRecord, ManagedFinalizationStage, ManagedIntentState, ManagedRetryCause,
@@ -19,6 +20,9 @@ use super::managed::{
 };
 use super::manager::{ManagerDecisionRecord, ManagerPlan};
 use super::message::{MessagePage, WorkMessage, MAX_RETAINED_MESSAGES};
+use super::provider_attempt::{
+    AttemptSendState, ProviderAttempt, SettlementBinding, SettlementEvidence, SettlementOutcome,
+};
 use super::routine::{
     advance_next_fire, decide_lifecycle_skip, due_occurrences, in_flight_count,
     occurrence_dedupe_key, validate_activation_payload, ActivationCause, ActivationDisposition,
@@ -110,6 +114,14 @@ struct AssignmentMutation<'a> {
 /// deliberately age- and count-bounded, but never trades away an active run,
 /// a reviewable isolated run, or the source of a retry chain.
 pub const DEFAULT_MAX_TERMINAL_RUNS: usize = 500;
+/// Hard bounds on the read seam. A page is capped so one call cannot stream
+/// the whole ledger, and the directory scan behind it is capped so a store
+/// that has grown past the bound reports truncation instead of quietly
+/// presenting a partial answer as complete.
+pub const MAX_RECEIPT_PAGE: usize = 200;
+pub const MAX_RECEIPT_SCAN: usize = 5_000;
+pub const MAX_PROVIDER_ATTEMPT_PAGE: usize = 200;
+pub const MAX_PROVIDER_ATTEMPT_SCAN: usize = 10_000;
 pub const DEFAULT_MAX_IDEMPOTENCY_RECEIPTS: usize = 1_000;
 pub const DEFAULT_TERMINAL_RUN_AGE: Duration = Duration::days(30);
 pub const DEFAULT_IDEMPOTENCY_RECEIPT_AGE: Duration = Duration::days(7);
@@ -140,6 +152,13 @@ pub struct RetentionReport {
     pub idempotency_files_scanned: usize,
     pub idempotency_files_removed: usize,
     pub protected_runs: usize,
+    /// Records kept past their age/count limit because they still carry
+    /// unsettled provider evidence. Reported so an operator can see that
+    /// retention is being held open rather than silently failing to collect.
+    pub protected_unsettled_runs: usize,
+    pub protected_unsettled_receipts: usize,
+    pub provider_attempt_files_scanned: usize,
+    pub provider_attempt_files_removed: usize,
     pub skipped_files: usize,
 }
 
@@ -169,6 +188,7 @@ impl OrchStore {
         fs::create_dir_all(root.join("continuation-contexts"))?;
         fs::create_dir_all(root.join("agent-activation"))?;
         fs::create_dir_all(root.join("idempotency"))?;
+        fs::create_dir_all(root.join("provider-attempts"))?;
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
         fs::create_dir_all(root.join("work-items"))?;
@@ -236,6 +256,7 @@ impl OrchStore {
         store.recover_managed_finalization_intents()?;
         store.recover_manager_creation_intents()?;
         store.mark_unfinished_interrupted()?;
+        store.recover_provider_attempts()?;
         store.fail_orphaned_idempotency_claims()?;
         store.reconcile_workloads()?;
         // Cleanup is best-effort at the record level, but directory access
@@ -268,6 +289,15 @@ impl OrchStore {
             .inner
             .root
             .join("finalization")
+            .join(format!("{safe}.json")))
+    }
+
+    fn provider_attempt_path(&self, attempt_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(attempt_id)?;
+        Ok(self
+            .inner
+            .root
+            .join("provider-attempts")
             .join(format!("{safe}.json")))
     }
 
@@ -4617,10 +4647,19 @@ impl OrchStore {
             .filter_map(|(_, run)| run.retry_of.as_deref())
             .collect();
 
+        // Evidence that nobody has settled is never collected: an attempt that
+        // may already have reached the provider has to stay reconcilable, and
+        // deleting it would turn "we do not know" into "it never happened".
+        let unsettled = self.unsettled_attempts_by_run_unlocked()?;
         let mut eligible_runs: Vec<(&Path, &RunRecord)> = Vec::new();
         for (path, run) in &runs {
             if !run.state.is_terminal() {
                 report.protected_runs += 1;
+                continue;
+            }
+            if unsettled.contains_key(run.run_id.as_str()) {
+                report.protected_runs += 1;
+                report.protected_unsettled_runs += 1;
                 continue;
             }
             if retry_sources.contains(run.run_id.as_str()) || !safe_to_expire_run(run) {
@@ -4663,6 +4702,14 @@ impl OrchStore {
                 report.skipped_files += 1;
                 continue;
             }
+            if receipt
+                .run_id
+                .as_deref()
+                .is_some_and(|run_id| unsettled.contains_key(run_id))
+            {
+                report.protected_unsettled_receipts += 1;
+                continue;
+            }
             let linked_active = match receipt.run_id.as_deref() {
                 Some(run_id) => match self.load_run_unlocked(run_id) {
                     Ok(Some(run)) => !run.state.is_terminal(),
@@ -4695,7 +4742,62 @@ impl OrchStore {
                 Err(_) => report.skipped_files += 1,
             }
         }
+
+        self.prune_provider_attempts_unlocked(&policy, now, &mut report)?;
         Ok(report)
+    }
+
+    /// Expire only *terminal* attempt records, and only once their run is gone
+    /// or itself expirable. Unsettled evidence has no age limit.
+    fn prune_provider_attempts_unlocked(
+        &self,
+        policy: &RetentionPolicy,
+        now: chrono::DateTime<Utc>,
+        report: &mut RetentionReport,
+    ) -> anyhow::Result<()> {
+        let dir = self.inner.root.join("provider-attempts");
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut terminal = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            report.provider_attempt_files_scanned += 1;
+            let Some(attempt) = read_provider_attempt(&path) else {
+                report.skipped_files += 1;
+                continue;
+            };
+            if attempt.send_state.is_unsettled() {
+                continue;
+            }
+            // A settled attempt is the durable proof that a reconciliation
+            // happened; it outlives the ordinary receipt age so the audit
+            // trail for an operator decision is not the first thing collected.
+            if attempt.send_state == AttemptSendState::Settled {
+                continue;
+            }
+            terminal.push((path, attempt));
+        }
+        terminal.sort_by(|(_, a), (_, b)| b.updated_at.cmp(&a.updated_at));
+        for (index, (path, attempt)) in terminal.iter().enumerate() {
+            let over_count = index >= policy.max_idempotency_receipts;
+            let over_age =
+                now.signed_duration_since(attempt.updated_at) >= policy.idempotency_receipt_age;
+            if !over_count && !over_age {
+                continue;
+            }
+            match fs::remove_file(path) {
+                Ok(()) => report.provider_attempt_files_removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => report.skipped_files += 1,
+            }
+        }
+        Ok(())
     }
 
     fn read_run_entries_unlocked(
@@ -4818,6 +4920,7 @@ impl OrchStore {
         tool: &str,
         request_id: &str,
         payload_hash: &str,
+        principal: &PrincipalScope,
     ) -> Result<IdempotencyClaim, OrchError> {
         let path = self.idemp_path(request_id)?;
         let _g = self.inner.lock.lock();
@@ -4826,7 +4929,17 @@ impl OrchStore {
                 .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
             let prev: IdempotencyReceipt = serde_json::from_str(&text)
                 .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
-            if prev.request_id != request_id
+            // A receipt claimed by a different credential — or one written
+            // before principal binding existed, which can no longer prove
+            // whose it was — is never replayed. The answer is byte-identical
+            // to the payload-reuse conflict a caller gets for its own
+            // request_id, so probing another credential's request_id reveals
+            // nothing beyond what reusing your own already would.
+            if !prev
+                .principal
+                .as_ref()
+                .is_some_and(|bound| receipt_principal_matches(bound, principal))
+                || prev.request_id != request_id
                 || prev.tool != tool
                 || prev.payload_hash != payload_hash
             {
@@ -4849,6 +4962,7 @@ impl OrchStore {
             payload_hash: payload_hash.into(),
             run_id: None,
             tool: tool.into(),
+            principal: Some(principal.clone()),
             response: serde_json::Value::Null,
             error: None,
             created_at: Utc::now(),
@@ -4863,11 +4977,13 @@ impl OrchStore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn complete_idempotency(
         &self,
         tool: &str,
         request_id: &str,
         payload_hash: &str,
+        principal: &PrincipalScope,
         run_id: Option<String>,
         response: serde_json::Value,
     ) -> Result<(), OrchError> {
@@ -4875,6 +4991,7 @@ impl OrchStore {
             tool,
             request_id,
             payload_hash,
+            principal,
             run_id,
             response,
             None,
@@ -4882,11 +4999,13 @@ impl OrchStore {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn fail_idempotency(
         &self,
         tool: &str,
         request_id: &str,
         payload_hash: &str,
+        principal: &PrincipalScope,
         run_id: Option<String>,
         error: OrchError,
     ) -> Result<(), OrchError> {
@@ -4894,6 +5013,7 @@ impl OrchStore {
             tool,
             request_id,
             payload_hash,
+            principal,
             run_id,
             serde_json::Value::Null,
             Some(error),
@@ -4907,6 +5027,7 @@ impl OrchStore {
         tool: &str,
         request_id: &str,
         payload_hash: &str,
+        principal: &PrincipalScope,
         run_id: Option<String>,
         response: serde_json::Value,
         error: Option<OrchError>,
@@ -4924,7 +5045,11 @@ impl OrchStore {
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
         let previous: IdempotencyReceipt = serde_json::from_str(&text)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
-        if previous.request_id != request_id
+        if !previous
+            .principal
+            .as_ref()
+            .is_some_and(|bound| receipt_principal_matches(bound, principal))
+            || previous.request_id != request_id
             || previous.tool != tool
             || previous.payload_hash != payload_hash
         {
@@ -4944,6 +5069,7 @@ impl OrchStore {
             payload_hash: payload_hash.into(),
             run_id,
             tool: tool.into(),
+            principal: Some(principal.clone()),
             response,
             error,
             created_at: Utc::now(),
@@ -4951,6 +5077,435 @@ impl OrchStore {
         };
         atomic_write_json(&path, &receipt)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
+    }
+
+    // ── principal-scoped operation reads ───────────────────────────────
+
+    /// Read one receipt, already authorized against `principal`.
+    ///
+    /// Returns [`None`] both when no such receipt exists and when it belongs
+    /// to a different credential, so the caller can produce one denial for
+    /// both without branching on which it was.
+    pub fn load_receipt_for(
+        &self,
+        request_id: &str,
+        principal: &PrincipalScope,
+    ) -> Result<Option<IdempotencyReceipt>, OrchError> {
+        let Ok(path) = self.idemp_path(request_id) else {
+            return Ok(None);
+        };
+        let _g = self.inner.lock.lock();
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            return Ok(None);
+        };
+        let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+            return Ok(None);
+        };
+        if !receipt
+            .principal
+            .as_ref()
+            .is_some_and(|bound| receipt_principal_matches(bound, principal))
+        {
+            return Ok(None);
+        }
+        Ok(Some(receipt))
+    }
+
+    /// One bounded, deterministically ordered page of the caller's receipts.
+    ///
+    /// Ordering is newest-first by creation time, tie-broken by the receipt's
+    /// path-safe digest so a page boundary is stable across calls. The
+    /// directory scan is bounded by [`MAX_RECEIPT_SCAN`]; when the bound is
+    /// reached the page says so rather than silently presenting a truncated
+    /// ledger as complete.
+    pub fn list_receipts_for(
+        &self,
+        principal: &PrincipalScope,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<ReceiptPage, OrchError> {
+        let limit = limit.clamp(1, MAX_RECEIPT_PAGE);
+        let after = cursor.map(parse_receipt_cursor).transpose()?;
+        let _g = self.inner.lock.lock();
+        let attempts = self.unsettled_attempts_by_run_unlocked()?;
+
+        let dir = self.inner.root.join("idempotency");
+        let entries = fs::read_dir(&dir)
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        let mut rows: Vec<ReceiptSummary> = Vec::new();
+        let mut scanned = 0usize;
+        let mut scan_truncated = false;
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if scanned >= MAX_RECEIPT_SCAN {
+                scan_truncated = true;
+                break;
+            }
+            scanned += 1;
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+                continue;
+            };
+            if !receipt
+                .principal
+                .as_ref()
+                .is_some_and(|bound| receipt_principal_matches(bound, principal))
+            {
+                continue;
+            }
+            rows.push(ReceiptSummary::project(&receipt, &attempts));
+        }
+
+        rows.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.receipt_key.cmp(&b.receipt_key))
+        });
+        if let Some((after_millis, after_key)) = after {
+            rows.retain(|row| {
+                let millis = row.created_at.timestamp_millis();
+                millis < after_millis || (millis == after_millis && row.receipt_key > after_key)
+            });
+        }
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        let next_cursor = has_more
+            .then(|| rows.last().map(encode_receipt_cursor))
+            .flatten();
+        Ok(ReceiptPage {
+            receipts: rows,
+            next_cursor,
+            scanned,
+            scan_truncated,
+        })
+    }
+
+    /// Project one receipt through the same redaction the listing uses, so a
+    /// single read and a page can never disagree about what is withheld.
+    pub fn receipt_summary(
+        &self,
+        receipt: &IdempotencyReceipt,
+    ) -> Result<ReceiptSummary, OrchError> {
+        let _g = self.inner.lock.lock();
+        let unsettled = self.unsettled_attempts_by_run_unlocked()?;
+        Ok(ReceiptSummary::project(receipt, &unsettled))
+    }
+
+    // ── durable provider attempts ──────────────────────────────────────
+
+    /// Open the durable marker for the next provider attempt of a run.
+    ///
+    /// The ordinal is the send engine's own attempt counter, so this adds a
+    /// record beside the existing accounting rather than a second counter.
+    /// Re-opening an existing ordinal returns the stored record unchanged,
+    /// which keeps the call safe to repeat after a partial write.
+    pub fn begin_provider_attempt(
+        &self,
+        run_id: &str,
+        ordinal: u32,
+        request_id: &str,
+        principal: &PrincipalScope,
+    ) -> Result<ProviderAttempt, OrchError> {
+        let attempt =
+            ProviderAttempt::preparing(run_id, ordinal, request_id, principal.clone(), Utc::now())?;
+        let path = self.provider_attempt_path(&attempt.attempt_id)?;
+        let _g = self.inner.lock.lock();
+        if let Some(existing) = read_provider_attempt(&path) {
+            return Ok(existing);
+        }
+        atomic_write_json(&path, &attempt)
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        Ok(attempt)
+    }
+
+    /// Record that an attempt has been handed to the transport.
+    ///
+    /// This must be durable *before* the request is written to the wire: a
+    /// crash between this write and the send makes the attempt look
+    /// `Uncertain`, which is the safe direction. The reverse ordering would
+    /// let a genuinely sent request come back as "never sent" and be retried.
+    pub fn mark_provider_attempt_sent(
+        &self,
+        attempt_id: &str,
+    ) -> Result<ProviderAttempt, OrchError> {
+        self.mutate_provider_attempt(attempt_id, |attempt| attempt.mark_sent(Utc::now()))
+    }
+
+    /// Record that an attempt's outcome was observed.
+    pub fn resolve_provider_attempt(&self, attempt_id: &str) -> Result<ProviderAttempt, OrchError> {
+        self.mutate_provider_attempt(attempt_id, |attempt| attempt.mark_resolved(Utc::now()))
+    }
+
+    fn mutate_provider_attempt<F>(
+        &self,
+        attempt_id: &str,
+        mutate: F,
+    ) -> Result<ProviderAttempt, OrchError>
+    where
+        F: FnOnce(&mut ProviderAttempt) -> Result<(), OrchError>,
+    {
+        let path = self.provider_attempt_path(attempt_id)?;
+        let _g = self.inner.lock.lock();
+        let mut attempt = read_provider_attempt(&path).ok_or_else(|| {
+            OrchError::new(OrchErrorCode::InvalidRequest, "unknown provider attempt")
+        })?;
+        if !attempt.digest_is_intact() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "provider attempt identity digest does not match its record",
+            ));
+        }
+        mutate(&mut attempt)?;
+        atomic_write_json(&path, &attempt)
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        Ok(attempt)
+    }
+
+    /// Load one attempt already authorized against `principal`.
+    ///
+    /// Like [`Self::load_receipt_for`], a record belonging to another
+    /// credential is reported as absent.
+    pub fn load_provider_attempt_for(
+        &self,
+        attempt_id: &str,
+        principal: &PrincipalScope,
+    ) -> Result<Option<ProviderAttempt>, OrchError> {
+        let Ok(path) = self.provider_attempt_path(attempt_id) else {
+            return Ok(None);
+        };
+        let _g = self.inner.lock.lock();
+        let Some(attempt) = read_provider_attempt(&path) else {
+            return Ok(None);
+        };
+        if !receipt_principal_matches(&attempt.scope, principal) {
+            return Ok(None);
+        }
+        Ok(Some(attempt))
+    }
+
+    /// One bounded page of the caller's provider attempts, newest first.
+    ///
+    /// `run_id` narrows the page to a single run. `unsettled_only` returns
+    /// just the attempts that still need reconciliation.
+    pub fn list_provider_attempts_for(
+        &self,
+        principal: &PrincipalScope,
+        run_id: Option<&str>,
+        unsettled_only: bool,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<ProviderAttemptPage, OrchError> {
+        let limit = limit.clamp(1, MAX_PROVIDER_ATTEMPT_PAGE);
+        let after = cursor.map(parse_receipt_cursor).transpose()?;
+        let _g = self.inner.lock.lock();
+        let (mut rows, scanned, scan_truncated) =
+            self.scan_provider_attempts_unlocked(|attempt| {
+                if !receipt_principal_matches(&attempt.scope, principal) {
+                    return false;
+                }
+                if run_id.is_some_and(|run_id| attempt.run_id != run_id) {
+                    return false;
+                }
+                !unsettled_only || attempt.send_state.is_unsettled()
+            })?;
+
+        rows.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.attempt_id.cmp(&b.attempt_id))
+        });
+        if let Some((after_millis, after_key)) = after {
+            rows.retain(|row| {
+                let millis = row.created_at.timestamp_millis();
+                let key = attempt_cursor_key(&row.attempt_id);
+                millis < after_millis || (millis == after_millis && key > after_key)
+            });
+        }
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        let next_cursor = has_more
+            .then(|| {
+                rows.last().map(|row| {
+                    format!(
+                        "{}.{}",
+                        row.created_at.timestamp_millis(),
+                        attempt_cursor_key(&row.attempt_id)
+                    )
+                })
+            })
+            .flatten();
+        Ok(ProviderAttemptPage {
+            attempts: rows,
+            next_cursor,
+            scanned,
+            scan_truncated,
+        })
+    }
+
+    /// Settle one uncertain attempt with operator evidence.
+    ///
+    /// This writes a record and nothing else. It performs no provider I/O, so
+    /// it can never re-send a request that may already have been delivered —
+    /// that is the whole point of settling instead of retrying. The revision
+    /// compare-and-set, exact binding, and evidence checks live in
+    /// [`ProviderAttempt::settle`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn settle_provider_attempt(
+        &self,
+        binding: &SettlementBinding<'_>,
+        principal: &PrincipalScope,
+        expected_revision: u64,
+        outcome: SettlementOutcome,
+        evidence: SettlementEvidence,
+        note: Option<String>,
+    ) -> Result<ProviderAttempt, OrchError> {
+        let path = self.provider_attempt_path(binding.attempt_id)?;
+        let _g = self.inner.lock.lock();
+        // Authorization first, and reported as absence: an operator of another
+        // credential must not learn that this attempt exists.
+        let attempt = read_provider_attempt(&path)
+            .filter(|attempt| receipt_principal_matches(&attempt.scope, principal));
+        let Some(mut attempt) = attempt else {
+            return Err(super::authority::denied());
+        };
+        // Replaying the same reconciliation returns the settled record. The
+        // idempotency key is the reconciliation's request_id, and the proof it
+        // stands for is the evidence *kind and digest* — not the moment the
+        // operator happened to look, which is incidental and would make an
+        // honest retry read as a new decision. Reusing the key for a different
+        // verdict or different proof is the ordinary key-reuse conflict, and
+        // any other reconciliation of a settled attempt is refused by
+        // `settle` because the attempt is no longer uncertain.
+        if let Some(existing) = attempt.settlement.as_ref() {
+            if existing.request_id == binding.reconcile_request_id {
+                if existing.outcome == outcome
+                    && existing.evidence.kind == evidence.kind
+                    && existing.evidence.digest == evidence.digest
+                {
+                    return Ok(attempt);
+                }
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "reconciliation request_id reused with different evidence",
+                ));
+            }
+        }
+        attempt.settle(
+            binding,
+            expected_revision,
+            outcome,
+            evidence,
+            note,
+            Utc::now(),
+        )?;
+        atomic_write_json(&path, &attempt)
+            .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?;
+        Ok(attempt)
+    }
+
+    /// Apply restart recovery to every durable attempt.
+    ///
+    /// An attempt still `Preparing` is provably undispatched and becomes
+    /// `NotSent`; one left `Sent` becomes `Uncertain` and stays visible until
+    /// an operator settles it. Returns how many records changed.
+    pub fn recover_provider_attempts(&self) -> anyhow::Result<usize> {
+        // Held for the whole sweep so a concurrent dispatch cannot land
+        // between the read and the rewrite and have its state overwritten.
+        // Safe to hold: nothing below re-enters a locking store method.
+        let _guard = self.inner.lock.lock();
+        let dir = self.inner.root.join("provider-attempts");
+        let mut recovered = 0usize;
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(mut attempt) = read_provider_attempt(&path) else {
+                continue;
+            };
+            if attempt.recover(Utc::now()) {
+                atomic_write_json(&path, &attempt)?;
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
+    }
+
+    /// Whether a run still owns provider evidence that nobody has settled.
+    ///
+    /// Retention consults this before expiring a run or its receipt.
+    pub fn run_has_unsettled_attempts(&self, run_id: &str) -> Result<bool, OrchError> {
+        let _g = self.inner.lock.lock();
+        Ok(self
+            .unsettled_attempts_by_run_unlocked()?
+            .get(run_id)
+            .is_some_and(|count| *count > 0))
+    }
+
+    fn unsettled_attempts_by_run_unlocked(
+        &self,
+    ) -> Result<std::collections::HashMap<String, usize>, OrchError> {
+        let (rows, _, _) =
+            self.scan_provider_attempts_unlocked(|attempt| attempt.send_state.is_unsettled())?;
+        let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for row in rows {
+            *index.entry(row.run_id).or_default() += 1;
+        }
+        Ok(index)
+    }
+
+    fn scan_provider_attempts_unlocked<F>(
+        &self,
+        keep: F,
+    ) -> Result<(Vec<ProviderAttempt>, usize, bool), OrchError>
+    where
+        F: Fn(&ProviderAttempt) -> bool,
+    {
+        let dir = self.inner.root.join("provider-attempts");
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // A store opened before this seam existed simply has no attempts.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), 0, false))
+            }
+            Err(error) => return Err(OrchError::new(OrchErrorCode::Internal, error.to_string())),
+        };
+        let mut rows = Vec::new();
+        let mut scanned = 0usize;
+        let mut scan_truncated = false;
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if scanned >= MAX_PROVIDER_ATTEMPT_SCAN {
+                scan_truncated = true;
+                break;
+            }
+            scanned += 1;
+            let Some(attempt) = read_provider_attempt(&path) else {
+                continue;
+            };
+            // A record whose identity digest no longer recomputes has been
+            // tampered with; it is never presented as evidence.
+            if !attempt.digest_is_intact() {
+                continue;
+            }
+            if keep(&attempt) {
+                rows.push(attempt);
+            }
+        }
+        Ok((rows, scanned, scan_truncated))
     }
 
     pub fn append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
@@ -5256,6 +5811,154 @@ fn append_audit_entry(root: &Path, entry: &AuditEntry) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A redacted receipt projection.
+///
+/// The read seam deliberately never returns the stored `response` body or an
+/// error's message. Both are produced by tool handlers and routinely carry
+/// filesystem paths, prompt previews, and provider-shaped payloads; a
+/// principal-scoped *listing* has no need for any of it. Callers that want
+/// their own response back replay it through the idempotency path, which is
+/// still bound to the original credential. What remains here is identity,
+/// exact scope, status, and digests.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptSummary {
+    pub request_id: String,
+    pub tool: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub created_at: chrono::DateTime<Utc>,
+    /// Exact scope the operation was authorized under.
+    pub owner_id: String,
+    pub token_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// Digest of the stored response, never the response itself.
+    pub response_digest: String,
+    /// Machine-readable failure class. The human message is withheld because
+    /// it is assembled from tool input and can echo paths or prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// How many provider attempts of the linked run still need
+    /// reconciliation. Non-zero means this receipt's outcome is not the whole
+    /// story: something may have reached the provider unobserved.
+    pub unsettled_provider_attempts: usize,
+    /// Path-safe ordering key. Also the cursor component, so a page boundary
+    /// never echoes a caller-supplied identifier back onto the wire.
+    pub receipt_key: String,
+}
+
+impl ReceiptSummary {
+    fn project(
+        receipt: &IdempotencyReceipt,
+        unsettled: &std::collections::HashMap<String, usize>,
+    ) -> Self {
+        let scope = receipt.principal.clone().unwrap_or(PrincipalScope {
+            owner_id: String::new(),
+            token_id: String::new(),
+            session_id: None,
+            workspace: None,
+        });
+        Self {
+            request_id: receipt.request_id.clone(),
+            tool: receipt.tool.clone(),
+            status: receipt.status.clone(),
+            run_id: receipt.run_id.clone(),
+            created_at: receipt.created_at,
+            owner_id: scope.owner_id,
+            token_id: scope.token_id,
+            session_id: scope.session_id,
+            workspace: scope.workspace,
+            response_digest: super::types::hash_payload(&receipt.response),
+            error_code: receipt.error.as_ref().map(|e| e.code.as_str().to_string()),
+            unsettled_provider_attempts: receipt
+                .run_id
+                .as_deref()
+                .and_then(|run_id| unsettled.get(run_id).copied())
+                .unwrap_or(0),
+            receipt_key: safe_id_filename(&receipt.request_id).unwrap_or_default(),
+        }
+    }
+}
+
+/// One bounded page of receipts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptPage {
+    pub receipts: Vec<ReceiptSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub scanned: usize,
+    /// True when the ledger is larger than [`MAX_RECEIPT_SCAN`] and this page
+    /// therefore cannot claim to have considered everything.
+    pub scan_truncated: bool,
+}
+
+/// One bounded page of provider attempts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAttemptPage {
+    pub attempts: Vec<ProviderAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub scanned: usize,
+    pub scan_truncated: bool,
+}
+
+/// Whether a stored authority binding admits this caller.
+///
+/// Operation records are credential-strict: owner *and* credential must match.
+/// Session and workspace are compared only when the record carries them, so a
+/// host-internal operation without a session is still attributable.
+fn receipt_principal_matches(bound: &PrincipalScope, caller: &PrincipalScope) -> bool {
+    use super::authz::constant_time_eq;
+    if !constant_time_eq(bound.owner_id.as_bytes(), caller.owner_id.as_bytes())
+        || !constant_time_eq(bound.token_id.as_bytes(), caller.token_id.as_bytes())
+    {
+        return false;
+    }
+    if let (Some(bound_session), Some(caller_session)) = (bound.session_id, caller.session_id) {
+        if bound_session != caller_session {
+            return false;
+        }
+    }
+    match (bound.workspace.as_deref(), caller.workspace.as_deref()) {
+        (Some(bound), Some(caller)) => workspaces_match(bound, caller),
+        _ => true,
+    }
+}
+
+fn read_provider_attempt(path: &Path) -> Option<ProviderAttempt> {
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<ProviderAttempt>(&text).ok()
+}
+
+fn attempt_cursor_key(attempt_id: &str) -> String {
+    safe_id_filename(attempt_id).unwrap_or_default()
+}
+
+fn encode_receipt_cursor(row: &ReceiptSummary) -> String {
+    format!("{}.{}", row.created_at.timestamp_millis(), row.receipt_key)
+}
+
+/// Decode a page cursor into `(created_at_millis, ordering_key)`.
+///
+/// A cursor is opaque and carries no authority: every page re-filters by the
+/// caller's principal, so presenting someone else's cursor yields their
+/// position in an empty result rather than their rows.
+fn parse_receipt_cursor(cursor: &str) -> Result<(i64, String), OrchError> {
+    let invalid = || OrchError::new(OrchErrorCode::CursorExpired, "malformed page cursor");
+    let (millis, key) = cursor.split_once('.').ok_or_else(invalid)?;
+    let millis: i64 = millis.parse().map_err(|_| invalid())?;
+    if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(invalid());
+    }
+    Ok((millis, key.to_string()))
+}
+
 pub enum IdempotencyClaim {
     Perform,
     Pending,
@@ -5341,6 +6044,15 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
+    fn test_principal(token: &str) -> PrincipalScope {
+        PrincipalScope {
+            owner_id: "account-1".into(),
+            token_id: token.into(),
+            session_id: None,
+            workspace: None,
+        }
+    }
+
     fn terminal_run(run_id: &str) -> RunRecord {
         RunRecord {
             run_id: run_id.into(),
@@ -5348,6 +6060,7 @@ mod tests {
             workspace: "/tmp/w".into(),
             request_id: format!("req-{run_id}"),
             client_id: None,
+            owner_id: None,
             state: RunState::Completed,
             purpose: Default::default(),
             agent_id: None,
@@ -5406,6 +6119,7 @@ mod tests {
             workspace: "/tmp/w".into(),
             request_id: "req1".into(),
             client_id: None,
+            owner_id: None,
             state: RunState::Running,
             purpose: Default::default(),
             agent_id: None,
@@ -5772,6 +6486,7 @@ mod tests {
             workspace: "/tmp/w".into(),
             request_id: "req2".into(),
             client_id: None,
+            owner_id: None,
             state: RunState::Running,
             purpose: Default::default(),
             agent_id: None,
@@ -5812,18 +6527,33 @@ mod tests {
     fn idempotency_claim_exclusive() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        match store.claim_idempotency("t", "req", "h").unwrap() {
+        match store
+            .claim_idempotency("t", "req", "h", &test_principal("laptop"))
+            .unwrap()
+        {
             IdempotencyClaim::Perform => {}
             _ => panic!("first claim should perform"),
         }
         store
-            .complete_idempotency("t", "req", "h", None, serde_json::json!({"ok": true}))
+            .complete_idempotency(
+                "t",
+                "req",
+                "h",
+                &test_principal("laptop"),
+                None,
+                serde_json::json!({"ok": true}),
+            )
             .unwrap();
-        match store.claim_idempotency("t", "req", "h").unwrap() {
+        match store
+            .claim_idempotency("t", "req", "h", &test_principal("laptop"))
+            .unwrap()
+        {
             IdempotencyClaim::Replay(Ok(v)) => assert_eq!(v["ok"], true),
             _ => panic!("replay"),
         }
-        assert!(store.claim_idempotency("t", "req", "other").is_err());
+        assert!(store
+            .claim_idempotency("t", "req", "other", &test_principal("laptop"))
+            .is_err());
     }
 
     #[test]
@@ -5831,17 +6561,36 @@ mod tests {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         assert!(matches!(
-            store.claim_idempotency("t", "failed", "h").unwrap(),
+            store
+                .claim_idempotency("t", "failed", "h", &test_principal("laptop"))
+                .unwrap(),
             IdempotencyClaim::Perform
         ));
         let error = OrchError::new(OrchErrorCode::Internal, "failed once");
         store
-            .fail_idempotency("t", "failed", "h", None, error.clone())
+            .fail_idempotency(
+                "t",
+                "failed",
+                "h",
+                &test_principal("laptop"),
+                None,
+                error.clone(),
+            )
             .unwrap();
         assert!(store
-            .complete_idempotency("t", "failed", "h", None, serde_json::json!({"ok": true}))
+            .complete_idempotency(
+                "t",
+                "failed",
+                "h",
+                &test_principal("laptop"),
+                None,
+                serde_json::json!({"ok": true})
+            )
             .is_err());
-        match store.claim_idempotency("t", "failed", "h").unwrap() {
+        match store
+            .claim_idempotency("t", "failed", "h", &test_principal("laptop"))
+            .unwrap()
+        {
             IdempotencyClaim::Replay(Err(replayed)) => {
                 assert_eq!(replayed.code.as_str(), error.code.as_str());
                 assert_eq!(replayed.message, error.message);
@@ -5895,6 +6644,7 @@ mod tests {
                 payload_hash: "hash".into(),
                 run_id: None,
                 tool: "ptah_submit_task".into(),
+                principal: None,
                 response: serde_json::json!({"runId": "old-shared"}),
                 error: None,
                 created_at: Utc::now() - Duration::days(10),
@@ -5953,6 +6703,7 @@ mod tests {
                 payload_hash: "hash".into(),
                 run_id: None,
                 tool: "ptah_queue_prompt".into(),
+                principal: None,
                 response: serde_json::Value::Null,
                 error: None,
                 created_at: Utc::now() - Duration::days(10),
@@ -5983,13 +6734,18 @@ mod tests {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
         assert!(matches!(
-            store.claim_idempotency("t", "orphan", "h").unwrap(),
+            store
+                .claim_idempotency("t", "orphan", "h", &test_principal("laptop"))
+                .unwrap(),
             IdempotencyClaim::Perform
         ));
         drop(store);
 
         let reopened = OrchStore::open(d.path()).unwrap();
-        match reopened.claim_idempotency("t", "orphan", "h").unwrap() {
+        match reopened
+            .claim_idempotency("t", "orphan", "h", &test_principal("laptop"))
+            .unwrap()
+        {
             IdempotencyClaim::Replay(Err(e)) => {
                 assert!(e.message.contains("interrupted"));
             }
@@ -6007,6 +6763,7 @@ mod tests {
             workspace: "/tmp/w".into(),
             request_id: "req-tx".into(),
             client_id: None,
+            owner_id: None,
             state: RunState::Running,
             purpose: Default::default(),
             agent_id: None,
@@ -6051,7 +6808,9 @@ mod tests {
     fn traversal_id_rejected() {
         let d = tempdir().unwrap();
         let store = OrchStore::open(d.path()).unwrap();
-        assert!(store.claim_idempotency("t", "../x", "h").is_err());
+        assert!(store
+            .claim_idempotency("t", "../x", "h", &test_principal("laptop"))
+            .is_err());
     }
 
     #[test]

@@ -419,6 +419,11 @@ pub struct RunRecord {
     pub workspace: String,
     pub request_id: String,
     pub client_id: Option<String>,
+    /// Tenancy identity that created this run. `None` for runs written before
+    /// principal binding existed; those are attributed to the service's single
+    /// configured owner on read (see [`super::authority`]).
+    #[serde(default)]
+    pub owner_id: Option<String>,
     pub state: RunState,
     /// Immutable host-authored capability class for this Run.
     #[serde(default)]
@@ -1235,6 +1240,13 @@ pub struct IdempotencyReceipt {
     pub payload_hash: String,
     pub run_id: Option<String>,
     pub tool: String,
+    /// Authority binding of the caller that claimed this request_id.
+    ///
+    /// `None` only for receipts written before this seam existed. Such a
+    /// receipt can no longer prove whose operation it was, so the scoped read
+    /// surfaces refuse it outright rather than guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<super::authority::PrincipalScope>,
     pub response: serde_json::Value,
     /// Durable rejected/failed outcome. Exact retries replay this error.
     #[serde(default)]
@@ -1445,6 +1457,10 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_get_capacity",
     "ptah_list_runs",
     "ptah_get_run",
+    "ptah_list_receipts",
+    "ptah_get_receipt",
+    "ptah_list_provider_attempts",
+    "ptah_reconcile_provider_attempt",
     "ptah_get_progress",
     "ptah_get_events",
     "ptah_get_changes",

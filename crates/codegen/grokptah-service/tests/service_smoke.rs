@@ -635,6 +635,7 @@ fn seed_active_run(
             workspace: workspace.display().to_string(),
             request_id: "service-e2e-request".into(),
             client_id: Some("mcp".into()),
+            owner_id: None,
             state: RunState::Running,
             purpose: Default::default(),
             agent_id: Some(agent_id.clone()),
