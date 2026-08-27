@@ -893,6 +893,7 @@ fn unsupported_status(detail: Option<String>) -> ComputerPlatformStatus {
         screen_recording: ComputerPermissionStatus::Unsupported,
         accessibility: ComputerPermissionStatus::Unsupported,
         detail,
+        executor: None,
     }
 }
 
@@ -1014,6 +1015,7 @@ mod tests {
                 screen_recording: ComputerPermissionStatus::Granted,
                 accessibility: ComputerPermissionStatus::Granted,
                 detail: None,
+                executor: None,
             }
         }
 

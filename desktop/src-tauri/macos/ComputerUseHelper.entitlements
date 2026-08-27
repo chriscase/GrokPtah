@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Declared Computer Use helper identity. TCC Screen Recording and
+       Accessibility attach to this helper's signed code identity once a
+       notarized helper is assembled. No App Sandbox, Apple Events, Keychain
+       access groups, or private entitlements. -->
+</dict>
+</plist>

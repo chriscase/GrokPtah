@@ -192,6 +192,7 @@ impl ComputerObservationPlatform for MacOsObservationPlatform {
                 screen_recording: ComputerPermissionStatus::Restricted,
                 accessibility: ComputerPermissionStatus::Restricted,
                 detail: Some("native computer-use status was invalid".into()),
+                executor: None,
             }
         }
     }
@@ -946,6 +947,7 @@ mod tests {
                     screen_recording: ComputerPermissionStatus::Granted,
                     accessibility: ComputerPermissionStatus::Granted,
                     detail: None,
+                    executor: None,
                 }),
                 targets: Mutex::new(vec![fixture_target("com.example.demo", 42, -1200.0)]),
                 observation_identity: Mutex::new(None),

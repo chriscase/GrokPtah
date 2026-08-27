@@ -11,6 +11,7 @@ use super::macos_observation::{
     MacNativeIdentity, MacObservationSource, RawMacActionRequest, RawMacObservation,
     RawMacSemanticAction, RawMacSemanticNode, RawMacTarget,
 };
+use super::package_identity::{ComputerExecutorIdentity, SigningClass};
 use super::platform::{ComputerPermission, ComputerPermissionStatus, ComputerPlatformStatus};
 use super::types::{
     ActionOutcome, ComputerAction, ComputerError, ComputerErrorCode, ComputerResult,
@@ -127,6 +128,9 @@ impl MacObservationSource for NativeMacObservationSource {
                 ComputerPermissionStatus::Unsupported
             },
             detail: (!supported).then(|| "macOS 14 or later is required".into()),
+            executor: Some(ComputerExecutorIdentity::in_process_host(
+                SigningClass::Uninspected,
+            )),
         }
     }
 
@@ -576,6 +580,13 @@ mod tests {
         eprintln!("native computer-use status: {status:?}");
         status.validate().unwrap();
         assert_eq!(status.platform_id, "macos");
+        let executor = status.executor.as_ref().expect("executor identity");
+        assert_eq!(executor.bundle_id, crate::computer_use::APP_BUNDLE_ID);
+        assert_eq!(
+            executor.kind,
+            crate::computer_use::ExecutorKind::InProcessHost
+        );
+        assert_eq!(executor.tcc_principal, crate::computer_use::APP_BUNDLE_ID);
         assert!(
             status.available,
             "ScreenCaptureKit should load on the macOS 14+ test host: {status:?}"
