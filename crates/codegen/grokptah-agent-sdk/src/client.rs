@@ -36,8 +36,8 @@ use crate::capability::{CapabilityDocument, CapabilityId};
 use crate::dto::{
     ArtifactPayload, ArtifactRequest, CancelReceipt, CancelRequest, ControlLease,
     ControlLeaseRequest, CreateSessionRequest, FollowUpReceipt, FollowUpRequest, PublicEvent,
-    ReleaseLeaseReceipt, ReleaseLeaseRequest, RunAccepted, RunSelector, RunView, SessionView,
-    TaskSubmission,
+    ReceiptView, ReleaseLeaseReceipt, ReleaseLeaseRequest, RunAccepted, RunSelector, RunView,
+    SessionView, TaskSubmission,
 };
 use crate::error::{SdkError, SdkErrorCode, SdkResult};
 use crate::ids::RequestId;
@@ -93,6 +93,24 @@ pub trait AgentControlPlane: Send + Sync {
 
     /// Fetch one bounded, digest-verified artifact.
     async fn fetch_artifact(&self, request: ArtifactRequest) -> SdkResult<ArtifactPayload>;
+
+    /// Redacted receipts for mutations attributed to one run.
+    ///
+    /// Additive at contract 1.1, with a default that fails closed: an adapter
+    /// written against 1.0 keeps compiling and reports the capability as
+    /// absent rather than returning an empty page, which a consumer would
+    /// otherwise read as "this run has had no mutations".
+    async fn list_receipts(
+        &self,
+        _selector: RunSelector,
+        _page: PageRequest,
+    ) -> SdkResult<Page<ReceiptView>> {
+        Err(SdkError::new(
+            SdkErrorCode::CapabilityUnavailable,
+            "this adapter does not serve redacted receipts",
+        )
+        .with_detail("capability", CapabilityId::ReceiptRead.as_wire()))
+    }
 }
 
 /// Convenience layer over any [`AgentControlPlane`].

@@ -58,6 +58,8 @@ pub enum CapabilityId {
     ArtifactFetch,
     /// Read-only Computer Run projections.
     ComputerRead,
+    /// Read the redacted receipts of mutations already performed.
+    ReceiptRead,
 
     // ── Permanently forbidden at this seam ────────────────────────────────
     /// Computer Use *mutation*: actions, grants, evidence bytes, screenshots.
@@ -85,6 +87,7 @@ impl CapabilityId {
             Self::ControlLease => "control.lease",
             Self::ArtifactFetch => "artifact.fetch",
             Self::ComputerRead => "computer.read",
+            Self::ReceiptRead => "receipt.read",
             Self::ComputerControl => "computer.control",
             Self::ProviderCredentials => "provider.credentials",
             Self::Unknown(raw) => raw.as_str(),
@@ -104,9 +107,35 @@ impl CapabilityId {
             "control.lease" => Self::ControlLease,
             "artifact.fetch" => Self::ArtifactFetch,
             "computer.read" => Self::ComputerRead,
+            "receipt.read" => Self::ReceiptRead,
             "computer.control" => Self::ComputerControl,
             "provider.credentials" => Self::ProviderCredentials,
             other => Self::Unknown(other.to_string()),
+        }
+    }
+
+    /// Whether exercising this capability changes durable state.
+    ///
+    /// A read-only observer may hold only the read side. An identifier this
+    /// build does not recognize counts as a **mutation**: refusing an unknown
+    /// capability to an observer is recoverable, granting one is not.
+    pub fn is_mutation(&self) -> bool {
+        match self {
+            Self::SessionList
+            | Self::RunObserve
+            | Self::RunEventsPage
+            | Self::RunEventsLive
+            | Self::ArtifactFetch
+            | Self::ComputerRead
+            | Self::ReceiptRead => false,
+            Self::SessionCreate
+            | Self::TaskSubmit
+            | Self::RunFollowUp
+            | Self::RunCancel
+            | Self::ControlLease
+            | Self::ComputerControl
+            | Self::ProviderCredentials => true,
+            Self::Unknown(_) => true,
         }
     }
 

@@ -87,6 +87,7 @@ pub mod client;
 pub mod dto;
 pub mod error;
 pub mod ids;
+pub mod observe;
 pub mod page;
 pub mod service;
 pub mod version;
@@ -111,16 +112,18 @@ pub mod prelude {
         ArtifactRequest, BoundedText, CancelReceipt, CancelRequest, ChangedFile, ContentDigest,
         ControlLease, ControlLeaseRequest, CreateSessionRequest, ExecutionMode,
         FollowUpDisposition, FollowUpReceipt, FollowUpRequest, LeaseCredential, ObservationCounts,
-        PublicEvent, PublicEventKind, ReleaseLeaseReceipt, ReleaseLeaseRequest, Revision,
-        RevisionWatermark, RunAccepted, RunBoundsRequest, RunLifecycle, RunProgressView,
-        RunSelector, RunView, SessionKind, SessionView, StopCause, TaskSubmission, ToolKind,
-        ToolStatus, UsageView, VerificationStatus, VerificationView,
+        OperationClass, PublicEvent, PublicEventKind, ReceiptStatus, ReceiptView,
+        ReleaseLeaseReceipt, ReleaseLeaseRequest, Revision, RevisionWatermark, RunAccepted,
+        RunBoundsRequest, RunLifecycle, RunProgressView, RunSelector, RunView, SessionKind,
+        SessionView, StopCause, TaskSubmission, ToolKind, ToolStatus, UsageView,
+        VerificationStatus, VerificationView,
     };
     pub use crate::error::{ErrorOrigin, RetryDisposition, SdkError, SdkErrorCode, SdkResult};
     pub use crate::ids::{
         AgentId, ArtifactId, AttemptId, Label, RelativePath, RequestId, RunId, SessionId, WorkId,
         WorkspaceRef,
     };
+    pub use crate::observe::{ObserverHandle, RunObservatory};
     pub use crate::page::{Cursor, Page, PageRequest, RetainedRange};
     pub use crate::service::{
         McpTransport, MutationAuthority, ServiceControlPlane, ServiceHostInfo, TransportFault,

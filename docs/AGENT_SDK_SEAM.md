@@ -1,7 +1,7 @@
 # GrokPtah agent SDK seam
 
-Status: **contract shipped; service adapter shipped; desktop adapter and a
-live two-host run pending.** This document is the design packet and the
+Status: **contract 1.1 shipped; service adapter shipped; read-only
+observatory shipped; desktop adapter and a live two-host run pending.** This document is the design packet and the
 implementation guide for `crates/codegen/grokptah-agent-sdk`.
 
 ## Why this exists
@@ -140,6 +140,90 @@ adjacent to the manager line — managed execution references the same work
 items — but claim and release predate it, carry their own schema version, and
 are part of the declared v1 capability set. They are gated behind mutation
 authority like every other mutation.
+
+## The read-only observatory (contract 1.1)
+
+`AgentControlPlane` mixes reads and mutations, because a host adapter needs
+both. An external consumer usually needs only the reads — and "usually" is not
+a security property.
+
+`observe::RunObservatory` contains the read operations and nothing else.
+`observe::ObserverHandle` wraps any control plane and implements only that
+trait; it deliberately does **not** implement `AgentControlPlane` and exposes
+no accessor for the plane it wraps. A consumer holding one cannot submit,
+cancel, steer, create, or lease — not because a check refuses, but because the
+methods are not there. There is no flag to flip and no downcast to find.
+
+This is strictly stronger than `ServiceControlPlane::read_only`, which enforces
+the same restriction at call time on a value that still *has* the mutating
+methods. Both are useful, for different reasons:
+
+| | Enforced by | Use it when |
+|---|---|---|
+| `ServiceControlPlane::read_only` | a runtime check before the transport | one embedder keeps a single plane and wants mutations off |
+| `ObserverHandle` | the type system | you are handing a plane across a trust boundary |
+
+### Narrowing is one-way
+
+`ObserverHandle::capabilities` rewrites the host's document before returning
+it, so an observer is never told it holds authority it cannot exercise. Two
+rules govern the rewrite:
+
+* **Availability only decreases.** A capability the host already reported as
+  `Unsupported` keeps that answer. "This host cannot" is more informative than
+  "you may not", and it stays true when the handle is unwrapped.
+* **An unrecognized capability counts as a mutation.** `CapabilityId::Unknown`
+  returns `true` from `is_mutation()`, so a capability a future host invents is
+  withheld from an observer until this build knows what it does. Refusing an
+  unknown capability is recoverable; granting one is not.
+
+The host's own `contractVersion` is carried through unchanged rather than
+restamped with this build's, so a consumer negotiates against what the host
+actually said.
+
+### Redacted receipts
+
+`ReceiptView` is evidence that a mutation happened, for a consumer that did not
+perform it and may not perform one. It carries the request id, a closed
+`OperationClass`, a `ReceiptStatus`, the typed failure code when there is one,
+a digest of the payload, and the run it belongs to.
+
+What it does not carry, and why each one matters:
+
+| Absent | Why |
+|---|---|
+| The stored response body | The runtime replays a mutation's *full response* from its receipt. That body is whatever the mutation returned — prompts, workspace paths, queue entries. |
+| The failure message | Runtime messages embed absolute paths verbatim. `canonical_workspace` formats one straight into a `workspace_mismatch` (`orchestration/authz.rs`). The typed `SdkErrorCode` carries the meaning without the text. |
+| The raw tool name | Host vocabulary. A closed `OperationClass` means a host that adds a tool cannot put an arbitrary string in front of a consumer that believes it is reading a classification; anything unrecognized is `Other`. |
+| The request payload | Only its digest crosses — enough to tell one attempt from another, revealing neither. |
+
+Receipts are **run-scoped by construction**: `list_receipts` takes a full
+`RunSelector`, there is no global listing, and an out-of-scope run returns the
+same `forbidden_scope` every other read gives. A mutation with no run — a
+session creation, a lease — is simply not listed.
+
+`ReceiptStatus::Pending` is the uncertain-send fence in durable form: the host
+claimed the key and stopped before recording an outcome, so the effect is
+unknown. `ReceiptView::is_uncertain()` names it, and the projection asserts no
+`outcome` in either direction. An observer must not report such a mutation as
+applied or as refused.
+
+### What serves it today
+
+| Adapter | `receipt.read` |
+|---|---|
+| `FakeControlPlane` | `Available` — served from its durable receipt ledger |
+| `ServiceControlPlane` | `Unsupported`, with the reason |
+| any adapter written against 1.0 | the trait's default body returns `capability_unavailable` |
+
+The service adapter cannot serve receipts because **the control plane exposes
+no receipt, audit, or idempotency read** — zero of its 89 `ptah_*` tool names
+match. The durable receipts exist; nothing reads them. Reporting `unsupported`
+is the honest answer, and an empty page would be the dishonest one: a consumer
+would read it as "no mutations happened".
+
+Closing that gap is a host-side change, sketched as a packet in *Residual
+work* below.
 
 ## What building the adapter changed, and what it revealed
 
@@ -379,6 +463,14 @@ Compatibility rules for future changes:
 | Change a lifecycle state | No |
 | Make a permanently forbidden capability available | No |
 
+**1.0 → 1.1** is the first exercise of that table, and every change in it is on
+the additive side: a new capability identifier (`receipt.read`), new DTOs
+(`ReceiptView`, `ReceiptStatus`, `OperationClass`), a new trait
+(`RunObservatory`), and one new `AgentControlPlane` method with a default body
+that fails closed. An adapter written against 1.0 still compiles and reports
+the capability as absent — which is why the default body returns
+`capability_unavailable` rather than an empty page.
+
 ## Conformance battery
 
 `conformance::run_battery` drives any `Harness` through 24 checks: discovery,
@@ -479,6 +571,32 @@ pass, and no existing runtime behavior changed.
    shape, and it closes the residual weakness in the adapter's keyed digest.
 7. **The five bridge-side findings above**, each of which needs an owner on the
    runtime side.
+8. **A host-side receipt read**, to make `receipt.read` real over the service
+   boundary. Implementation packet, for whoever owns the control plane:
+
+   * **Tool**: `ptah_list_receipts`, a read. Required arguments
+     `session_id`, `workspace`, `run_id` — the same scope triple every other
+     run read takes, so it inherits the existing allowlist-then-scope gate and
+     the identical `forbidden_scope` denial. Optional `after` (opaque) and
+     `limit` (1–500), matching `ptah_get_events`.
+   * **Source**: `OrchStore`'s durable idempotency receipts, filtered to
+     `receipt.run_id == run_id`. Receipts with no run are not listed.
+   * **Response**: `{ receipts: [...], nextCursor }`, each receipt
+     `{ requestId, tool, status, errorCode, payloadHash, runId, createdAt }`.
+     Note what is *not* in it: `response` and the error `message`. Both are the
+     reason this cannot simply serialize `IdempotencyReceipt` — the stored
+     response replays a mutation's full body, and error messages embed absolute
+     paths (`orchestration/authz.rs` formats one into a `workspace_mismatch`).
+     The projection must be built, not derived by `serde`.
+   * **Retention**: already bounded — the store keeps the newest 1,000
+     completed/failed receipts and expires them after 7 days. Say so in the
+     tool's contract, because a consumer must not read absence as "never
+     happened".
+   * **Adapter side**: map it in `service.rs` alongside the other reads, flip
+     `receipt.read` from `Unsupported` to derived-from-`tools/list`, and the
+     battery's `receipts.are_scoped_and_do_not_echo_the_request` check stops
+     skipping. No SDK type changes — the contract for this already exists and
+     is exercised against the fake.
 
 ### P2 — worth doing, not blocking
 

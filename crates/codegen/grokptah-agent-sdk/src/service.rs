@@ -807,6 +807,16 @@ impl<T: McpTransport> AgentControlPlane for ServiceControlPlane<T> {
             true,
         );
 
+        // The durable receipts exist on the host, but no tool reads them.
+        offered.push(CapabilityDescriptor {
+            id: CapabilityId::ReceiptRead,
+            since: ContractVersion::new(CONTRACT_VERSION.major, 1),
+            availability: Availability::Unsupported {
+                reason: Label::new("the control plane exposes no receipt read tool")
+                    .expect("static label"),
+            },
+        });
+
         // Read-only Computer Run projections exist on the host but are not
         // mapped by this adapter build. Saying so is better than silence: a
         // consumer can tell "not built" from "host cannot".
@@ -1215,6 +1225,24 @@ impl<T: McpTransport> AgentControlPlane for ServiceControlPlane<T> {
             revision: revision_from(timestamp(&attempt, "updated_at", "updatedAt")),
             replayed: None,
         })
+    }
+
+    /// Redacted receipts are not reachable over this boundary.
+    ///
+    /// The control plane's tool registry has no receipt, audit, or idempotency
+    /// read among its `ptah_*` names — the durable receipts exist, but nothing
+    /// exposes them. Reporting `unsupported` is the honest answer; an empty
+    /// page would read as "no mutations happened".
+    async fn list_receipts(
+        &self,
+        _selector: RunSelector,
+        _page: PageRequest,
+    ) -> SdkResult<Page<ReceiptView>> {
+        Err(SdkError::new(
+            SdkErrorCode::Unsupported,
+            "the control plane exposes no receipt read; see docs/AGENT_SDK_SEAM.md",
+        )
+        .with_detail("capability", CapabilityId::ReceiptRead.as_wire()))
     }
 
     /// Fetch one bounded, digest-verified artifact.

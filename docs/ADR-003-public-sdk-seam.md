@@ -96,6 +96,12 @@ transport. Authority-owned secrets never cross; the single secret on the
 boundary — a work lease token — is held in a non-`Serialize`, `Debug`-redacted
 type. Transcript content and absolute host paths have no representation.
 
+The read-only observatory (`RunObservatory`, `ObserverHandle`) and redacted
+receipts landed under this decision at contract 1.1. They add a way to hand an
+external consumer a value that *structurally* cannot mutate — the mutating
+methods are absent from the type, rather than guarded on it — and a receipt
+projection that proves a mutation happened without revealing what it was.
+
 The service adapter over the authenticated MCP control plane landed under
 this decision. It maps ten `ptah_*` tools and explicitly declines the manager,
 managed-execution, and approval/promotion surfaces: those are where mutation

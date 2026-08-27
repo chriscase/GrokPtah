@@ -591,6 +591,91 @@ pub struct ReleaseLeaseReceipt {
     pub replayed: Option<bool>,
 }
 
+// ── Redacted receipts ─────────────────────────────────────────────────────
+
+/// What a mutation was, without naming the host tool that performed it.
+///
+/// Closed on purpose. A raw tool name is host vocabulary that changes when the
+/// host adds a tool, and it would let a newer host put an arbitrary string in
+/// front of a consumer that believes it is reading a classification. A tool
+/// this build does not recognize projects to [`OperationClass::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationClass {
+    CreateSession,
+    SubmitTask,
+    FollowUp,
+    Cancel,
+    AcquireLease,
+    ReleaseLease,
+    /// A mutation outside this contract's vocabulary.
+    Other,
+}
+
+/// Where a durable idempotency receipt stands.
+///
+/// Mirrors the runtime's three values. `Pending` is the one that matters: the
+/// host claimed the key and then stopped before recording an outcome, so the
+/// mutation may or may not have applied. See [`ReceiptView::is_uncertain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptStatus {
+    Pending,
+    Complete,
+    Failed,
+}
+
+/// Redacted evidence that a mutation happened.
+///
+/// An observer may learn *that* a request was made, what class it belonged to,
+/// whether it settled, and — when it failed — the typed reason. It may not
+/// learn what was sent or what came back.
+///
+/// # What is absent, and why
+///
+/// | Absent | Why |
+/// |---|---|
+/// | The stored response body | The runtime replays a mutation's full response from its receipt. That body carries whatever the mutation returned — run prompts, workspace paths, queue entries. |
+/// | The failure *message* | Runtime messages embed absolute paths verbatim; `canonical_workspace` formats one straight into a `workspace_mismatch`. The typed [`SdkErrorCode`] carries the meaning without the text. |
+/// | The raw tool name | Host vocabulary; see [`OperationClass`]. |
+/// | The request payload | Only its digest crosses, which is enough to tell one attempt from another without revealing either. |
+///
+/// [`SdkErrorCode`]: crate::error::SdkErrorCode
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptView {
+    pub request_id: RequestId,
+    pub operation: OperationClass,
+    pub status: ReceiptStatus,
+    /// Typed reason, present only on [`ReceiptStatus::Failed`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<crate::error::SdkErrorCode>,
+    /// Digest of the request payload. Distinguishes attempts; reveals neither.
+    pub payload_digest: ContentDigest,
+    /// The run this mutation produced or acted on, when it had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<RunId>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+impl ReceiptView {
+    /// `true` when the mutation's effect is unknown.
+    ///
+    /// A pending receipt is the uncertain-send fence in durable form: the key
+    /// was claimed and no outcome was recorded. Retrying under the same key is
+    /// safe *only* because the host will replay rather than repeat — but until
+    /// the host settles it, an observer must not report the mutation as either
+    /// applied or refused.
+    pub fn is_uncertain(&self) -> bool {
+        self.status == ReceiptStatus::Pending
+    }
+
+    /// `true` once the host has settled this key either way.
+    pub fn is_settled(&self) -> bool {
+        !self.is_uncertain()
+    }
+}
+
 // ── Artifacts ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

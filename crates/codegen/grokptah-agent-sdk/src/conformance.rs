@@ -152,6 +152,10 @@ pub trait Harness: Send + Sync {
     fn next_request_id(&self) -> RequestId;
 }
 
+/// The prompt every battery submission uses. Named so redaction checks can
+/// assert that no projection echoes it back.
+const CONFORMANCE_PROMPT: &str = "conformance: describe this project";
+
 macro_rules! check {
     ($report:expr, $name:literal, $body:expr) => {{
         let outcome: CheckOutcome = $body;
@@ -243,7 +247,7 @@ pub async fn run_battery<H: Harness>(harness: &H) -> ConformanceReport {
         request_id: harness.next_request_id(),
         session_id: session.session_id.clone(),
         workspace: session.workspace.clone(),
-        prompt: "conformance: describe this project".into(),
+        prompt: CONFORMANCE_PROMPT.into(),
         bounds: None,
         execution_mode: ExecutionMode::Shared,
         allow_queue: false,
@@ -652,6 +656,41 @@ pub async fn run_battery<H: Harness>(harness: &H) -> ConformanceReport {
                 }
                 Ok(_) => CheckOutcome::Passed,
             },
+        }
+    });
+
+    // ── Redacted receipts ────────────────────────────────────────────────
+    check!(report, "receipts.are_scoped_and_do_not_echo_the_request", {
+        match plane
+            .list_receipts(selector.clone(), PageRequest::new())
+            .await
+        {
+            Err(error)
+                if matches!(
+                    error.code,
+                    SdkErrorCode::CapabilityUnavailable | SdkErrorCode::Unsupported
+                ) =>
+            {
+                CheckOutcome::Skipped("adapter does not serve redacted receipts".into())
+            }
+            Err(error) => CheckOutcome::Failed(format!("receipts failed: {error}")),
+            Ok(page) => {
+                let encoded = serde_json::to_string(&page).unwrap_or_default();
+                if encoded.contains(CONFORMANCE_PROMPT) {
+                    CheckOutcome::Failed(
+                        "a receipt echoed the prompt of the request that produced it".into(),
+                    )
+                } else if page.items.iter().any(|receipt| {
+                    receipt
+                        .run_id
+                        .as_ref()
+                        .is_some_and(|id| id != &selector.run_id)
+                }) {
+                    CheckOutcome::Failed("a receipt from another run was listed".into())
+                } else {
+                    CheckOutcome::Passed
+                }
+            }
         }
     });
 

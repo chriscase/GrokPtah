@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{SdkError, SdkErrorCode};
 
 /// The contract version this build of the SDK speaks.
-pub const CONTRACT_VERSION: ContractVersion = ContractVersion { major: 1, minor: 0 };
+pub const CONTRACT_VERSION: ContractVersion = ContractVersion { major: 1, minor: 1 };
 
 /// Major.minor identity for the capability boundary.
 ///

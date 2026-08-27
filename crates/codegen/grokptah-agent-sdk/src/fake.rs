@@ -86,6 +86,7 @@ pub enum Operation {
     AcquireControl,
     ReleaseControl,
     FetchArtifact,
+    ListReceipts,
 }
 
 /// How a task run should end when driven to completion.
@@ -118,6 +119,10 @@ struct FakeRun {
 struct Receipt {
     payload_hash: String,
     response: serde_json::Value,
+    operation: OperationClass,
+    status: ReceiptStatus,
+    run_id: Option<String>,
+    recorded_at: DateTime<Utc>,
 }
 
 #[derive(Debug)]
@@ -238,12 +243,19 @@ impl FakeState {
         request_id: &RequestId,
         payload_hash: String,
         response: serde_json::Value,
+        operation: OperationClass,
+        run_id: Option<String>,
     ) {
+        let recorded_at = self.now();
         self.receipts.insert(
             request_id.as_str().to_string(),
             Receipt {
                 payload_hash,
                 response,
+                operation,
+                status: ReceiptStatus::Complete,
+                run_id,
+                recorded_at,
             },
         );
     }
@@ -493,6 +505,30 @@ impl FakeControlPlane {
         }
     }
 
+    /// Record a claimed-but-unsettled receipt, as a host that stopped
+    /// mid-flight leaves behind. The mutation's effect is unknown and must
+    /// never be reported as applied or refused.
+    pub fn strand_receipt(
+        &self,
+        request_id: &RequestId,
+        operation: OperationClass,
+        run_id: &RunId,
+    ) {
+        let mut state = self.lock();
+        let recorded_at = state.now();
+        state.receipts.insert(
+            request_id.as_str().to_string(),
+            Receipt {
+                payload_hash: "0".repeat(64),
+                response: serde_json::Value::Null,
+                operation,
+                status: ReceiptStatus::Pending,
+                run_id: Some(run_id.as_str().to_string()),
+                recorded_at,
+            },
+        );
+    }
+
     /// The session this host's own account owns.
     pub fn seeded_session(&self) -> Option<SessionView> {
         let state = self.lock();
@@ -584,6 +620,12 @@ fn default_capabilities() -> Vec<CapabilityDescriptor> {
         since: ContractVersion::new(CONTRACT_VERSION.major, 0),
         availability: Availability::Available,
     })
+    .chain(std::iter::once(CapabilityDescriptor {
+        // Introduced with the read-only observatory in contract 1.1.
+        id: CapabilityId::ReceiptRead,
+        since: ContractVersion::new(CONTRACT_VERSION.major, 1),
+        availability: Availability::Available,
+    }))
     .collect()
 }
 
@@ -767,7 +809,13 @@ impl AgentControlPlane for FakeControlPlane {
         );
         let response = serde_json::to_value(&view)
             .map_err(|e| SdkError::new(SdkErrorCode::Internal, e.to_string()))?;
-        state.record(&request.request_id, hash, response);
+        state.record(
+            &request.request_id,
+            hash,
+            response,
+            OperationClass::CreateSession,
+            None,
+        );
         Ok(view)
     }
 
@@ -910,7 +958,13 @@ impl AgentControlPlane for FakeControlPlane {
         );
         let response = serde_json::to_value(&accepted)
             .map_err(|e| SdkError::new(SdkErrorCode::Internal, e.to_string()))?;
-        state.record(&request.request_id, hash, response);
+        state.record(
+            &request.request_id,
+            hash,
+            response,
+            OperationClass::SubmitTask,
+            Some(accepted.run_id.as_str().to_string()),
+        );
         Ok(accepted)
     }
 
@@ -1007,7 +1061,13 @@ impl AgentControlPlane for FakeControlPlane {
         };
         let response = serde_json::to_value(&receipt)
             .map_err(|e| SdkError::new(SdkErrorCode::Internal, e.to_string()))?;
-        state.record(&request.request_id, hash, response);
+        state.record(
+            &request.request_id,
+            hash,
+            response,
+            OperationClass::FollowUp,
+            None,
+        );
         Ok(receipt)
     }
 
@@ -1058,7 +1118,13 @@ impl AgentControlPlane for FakeControlPlane {
         };
         let response = serde_json::to_value(&receipt)
             .map_err(|e| SdkError::new(SdkErrorCode::Internal, e.to_string()))?;
-        state.record(&request.request_id, hash, response);
+        state.record(
+            &request.request_id,
+            hash,
+            response,
+            OperationClass::Cancel,
+            Some(receipt.run_id.as_str().to_string()),
+        );
         Ok(receipt)
     }
 
@@ -1110,7 +1176,13 @@ impl AgentControlPlane for FakeControlPlane {
         state
             .leases
             .insert(request.work_id.as_str().to_string(), lease.clone());
-        state.record(&request.request_id, hash, serde_json::Value::Null);
+        state.record(
+            &request.request_id,
+            hash,
+            serde_json::Value::Null,
+            OperationClass::AcquireLease,
+            None,
+        );
         Ok(lease)
     }
 
@@ -1157,8 +1229,66 @@ impl AgentControlPlane for FakeControlPlane {
         };
         let response = serde_json::to_value(&receipt)
             .map_err(|e| SdkError::new(SdkErrorCode::Internal, e.to_string()))?;
-        state.record(&request.request_id, hash, response);
+        state.record(
+            &request.request_id,
+            hash,
+            response,
+            OperationClass::ReleaseLease,
+            None,
+        );
         Ok(receipt)
+    }
+
+    async fn list_receipts(
+        &self,
+        selector: RunSelector,
+        page: PageRequest,
+    ) -> SdkResult<Page<ReceiptView>> {
+        let mut state = self.lock();
+        guard!(state, Operation::ListReceipts);
+        let max_page = state.limits.max_event_page;
+        // Exact scope binding: receipts are run-scoped, never a global dump.
+        state.require_run(&selector)?;
+        let limit = page.resolve_limit(max_page)? as usize;
+        let after = page
+            .after
+            .as_ref()
+            .map(|cursor| cursor.as_str().to_string());
+
+        let mut items = Vec::new();
+        for (request_id, receipt) in state.receipts.iter() {
+            if receipt.run_id.as_deref() != Some(selector.run_id.as_str()) {
+                continue;
+            }
+            if after
+                .as_deref()
+                .is_some_and(|after| request_id.as_str() <= after)
+            {
+                continue;
+            }
+            items.push(ReceiptView {
+                request_id: RequestId::new(request_id)?,
+                operation: receipt.operation,
+                status: receipt.status,
+                outcome: None,
+                payload_digest: ContentDigest {
+                    algorithm: DigestAlgorithm::Sha256,
+                    hex: receipt.payload_hash.clone(),
+                },
+                run_id: Some(selector.run_id.clone()),
+                recorded_at: receipt.recorded_at,
+            });
+        }
+        let has_more = items.len() > limit;
+        items.truncate(limit);
+        let next_cursor = has_more
+            .then(|| {
+                items
+                    .last()
+                    .map(|receipt| Cursor::from_opaque(receipt.request_id.as_str()))
+            })
+            .flatten();
+        Ok(Page::new(items, next_cursor))
     }
 
     async fn fetch_artifact(&self, request: ArtifactRequest) -> SdkResult<ArtifactPayload> {

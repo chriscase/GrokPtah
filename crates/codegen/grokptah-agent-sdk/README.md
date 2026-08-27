@@ -65,6 +65,22 @@ In read-only mode the capability document advertises mutating capabilities as
 on click. This crate has no HTTP client of its own, so nothing in it can reach
 a network; framing is entirely yours.
 
+## Handing a plane across a trust boundary
+
+`ObserverHandle` narrows any plane to `RunObservatory` — run lifecycle, typed
+events, artifacts, and redacted receipts, and nothing else:
+
+```rust
+let observer = ObserverHandle::new(plane);   // no mutating method exists on it
+let view = observer.observe_run(selector).await?;
+let receipts = observer.list_receipts(selector, PageRequest::new()).await?;
+```
+
+It does not implement `AgentControlPlane` and exposes no accessor for the plane
+it wraps, so the authority is unreachable rather than merely refused. Its
+capability document is narrowed the same way, and a capability this build does
+not recognize is withheld rather than granted.
+
 ## Verify
 
 ```sh
