@@ -199,6 +199,22 @@ pub struct AttemptRoute {
     /// Bounded account handle this attempt bills against, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_reference: Option<AccountReference>,
+    /// Opaque digest of the exact endpoint this attempt is bound to.
+    ///
+    /// A digest rather than the URL: [`BaseCategory`] says which *kind* of
+    /// endpoint was used, which does not distinguish two private gateways.
+    /// Digesting binds the exact one so a silent re-point is detectable,
+    /// without the durable record holding a hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_digest: Option<BoundedId>,
+    /// Opaque digest of the credential material this attempt is sent under.
+    ///
+    /// [`AuthorityRevisions::credential`] counts rotations the host decided
+    /// about; this identifies the material actually presented. A refresh
+    /// between deciding and sending changes this and nothing else, which is
+    /// exactly the drift a retry must not silently paper over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_digest: Option<BoundedId>,
 }
 
 impl AttemptRoute {
@@ -212,6 +228,16 @@ impl AttemptRoute {
         }
         if !self.effort.as_ref().is_none_or(BoundedId::is_bounded) {
             return Err("attempt effort is not a bounded opaque value");
+        }
+        if !self.route_digest.as_ref().is_none_or(BoundedId::is_bounded) {
+            return Err("attempt route digest is not a bounded opaque identifier");
+        }
+        if !self
+            .credential_digest
+            .as_ref()
+            .is_none_or(BoundedId::is_bounded)
+        {
+            return Err("attempt credential digest is not a bounded opaque identifier");
         }
         match &self.account_reference {
             Some(reference)
@@ -242,6 +268,15 @@ pub struct AttemptIntent {
     /// Recorded so an [`SendState::Uncertain`] attempt can be reconciled
     /// against the provider rather than blindly repeated.
     pub provider_idempotency_key: BoundedId,
+    /// Opaque digest of the exact bytes handed to the transport.
+    ///
+    /// [`AttemptIntent::digest`] identifies what the operator asked for;
+    /// this identifies what actually went on the wire. They differ whenever
+    /// the host rewrites a request — a credential refresh, a non-stream
+    /// fallback, a dropped optional field — and a reconciliation that cannot
+    /// tell those apart is re-presenting a request the provider never saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_digest: Option<BoundedId>,
 }
 
 impl AttemptIntent {
@@ -250,6 +285,7 @@ impl AttemptIntent {
         if self.digest.is_bounded()
             && self.request_id.is_bounded()
             && self.provider_idempotency_key.is_bounded()
+            && self.body_digest.as_ref().is_none_or(BoundedId::is_bounded)
         {
             Ok(())
         } else {
@@ -280,6 +316,18 @@ pub struct ProviderReceipts {
     /// perfectly healthy route.
     #[serde(default, skip_serializing_if = "is_false")]
     pub provider_replied: bool,
+    /// The HTTP status the provider answered with, when a response head was
+    /// observed.
+    ///
+    /// A status is the cheapest unambiguous proof of delivery there is: a
+    /// provider cannot return 429 or 500 for a request it never received. It
+    /// is a protocol fact, not response content, so it carries nothing
+    /// private.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_status: Option<u16>,
+    /// What this attempt durably established, once it settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<SendOutcome>,
 }
 
 const fn is_false(value: &bool) -> bool {
@@ -299,11 +347,17 @@ impl ProviderReceipts {
     }
 
     /// Whether the provider acknowledged this attempt at all.
+    ///
+    /// Every arm is something only the provider can produce, so this is
+    /// observation rather than inference. A host that "knows" it sent the
+    /// request has no evidence; a host holding a status line or a
+    /// provider-assigned id does.
     pub fn acknowledged(&self) -> bool {
         self.provider_replied
             || self.request.is_some()
             || self.run.is_some()
             || self.usage.is_some()
+            || self.response_status.is_some()
     }
 }
 
@@ -321,12 +375,19 @@ pub struct UsageReceipt {
     pub output_tokens: u64,
 }
 
-/// Whether a request reached the provider.
+/// Whether a request reached the provider, and how far its answer got.
 ///
 /// The whole point of this enum is [`SendState::Uncertain`]: without it a host
 /// must choose between never retrying (losing recoverable work) and always
 /// retrying (duplicating charges and side effects). Naming the ambiguity lets
 /// the safe rule be stated exactly once, in [`SendState::may_auto_retry`].
+///
+/// Delivery and outcome are separate facts, so they are separate states.
+/// [`SendState::Sent`] says only that the provider proved receipt by
+/// producing a response head; it says nothing about whether the work
+/// completed. A stream that dies after the head is certainly delivered and
+/// entirely unresolved, and collapsing those two into one state is what makes
+/// a host either lose answers or repeat charges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SendState {
@@ -334,11 +395,15 @@ pub enum SendState {
     KnownNotSent,
     /// The request is in flight. Whether it arrived is not yet known.
     Sending,
-    /// The provider acknowledged the request.
+    /// The provider proved receipt by producing a response head.
     Sent,
+    /// The provider's answer is being consumed.
+    Responding,
     /// The outcome is unknown: the connection broke, the process died, or the
-    /// reply could not be parsed. The request may or may not have run.
+    /// reply could not be read. The request may or may not have run.
     Uncertain,
+    /// The outcome is durably known, and no remote work is outstanding.
+    Settled,
 }
 
 impl SendState {
@@ -348,16 +413,20 @@ impl SendState {
             Self::KnownNotSent => "known_not_sent",
             Self::Sending => "sending",
             Self::Sent => "sent",
+            Self::Responding => "responding",
             Self::Uncertain => "uncertain",
+            Self::Settled => "settled",
         }
     }
 
     /// Every state in declaration order, for schema and parity pinning.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::KnownNotSent,
         Self::Sending,
         Self::Sent,
+        Self::Responding,
         Self::Uncertain,
+        Self::Settled,
     ];
 
     /// Whether the host may re-send this attempt without asking anyone.
@@ -369,31 +438,106 @@ impl SendState {
         matches!(self, Self::KnownNotSent)
     }
 
-    /// Whether this attempt is finished, successfully or not.
+    /// Whether the provider may still be holding work for this attempt.
+    ///
+    /// Everything between handing bytes to the transport and knowing the
+    /// outcome. Retry, capacity release, and restart are all fenced on this
+    /// one predicate so they cannot disagree about what "in flight" means.
+    pub const fn is_unresolved(self) -> bool {
+        matches!(
+            self,
+            Self::Sending | Self::Sent | Self::Responding | Self::Uncertain
+        )
+    }
+
+    /// Whether this attempt is finished and nothing remote is outstanding.
+    ///
+    /// Only [`SendState::Settled`]. `Sent` is deliberately not terminal: the
+    /// provider acknowledged the request, which is precisely the moment its
+    /// outcome becomes worth waiting for rather than assuming.
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Sent | Self::Uncertain)
+        matches!(self, Self::Settled)
     }
 
     /// Whether this attempt must be reconciled against the provider before
     /// any equivalent request is issued again.
     pub const fn requires_reconciliation(self) -> bool {
-        matches!(self, Self::Sending | Self::Uncertain)
+        self.is_unresolved()
     }
 
     /// Whether `next` is a legal successor of `self`.
     ///
     /// The lattice is strictly forward: nothing returns to `KnownNotSent`, and
-    /// a terminal state never changes. Without this, a crash-recovery path
-    /// could quietly "reset" an `Uncertain` attempt into a retryable one.
+    /// `Settled` never changes. Without this, a crash-recovery path could
+    /// quietly "reset" an `Uncertain` attempt into a retryable one.
+    ///
+    /// `Uncertain` has exactly one exit, and it is not a retry: an explicit
+    /// reconciliation that established what the provider actually did. No
+    /// number of restarts, reopens, or cancellations clears it.
     pub const fn permits_transition_to(self, next: Self) -> bool {
         match (self, next) {
-            (Self::KnownNotSent, Self::Sending) => true,
-            (Self::Sending, Self::Sent | Self::Uncertain) => true,
             // A prepared request that is abandoned before dispatch is still
-            // provably unsent, so this is the one non-advancing legal case.
-            (Self::KnownNotSent, Self::KnownNotSent) => true,
+            // provably unsent, so these are the pre-boundary cases.
+            (Self::KnownNotSent, Self::KnownNotSent | Self::Sending | Self::Settled) => true,
+            // A connect-phase failure proves the bytes never reached the
+            // transport even though the record already says `sending`. That
+            // is the *only* thing this edge may carry, which
+            // [`ProviderAttempt::settle`] enforces: reaching `settled` with a
+            // provider outcome still requires passing through `sent`, and
+            // `sent` requires a receipt.
+            (Self::Sending, Self::Sent | Self::Uncertain | Self::Settled) => true,
+            (Self::Sent, Self::Responding | Self::Uncertain | Self::Settled) => true,
+            (Self::Responding, Self::Settled | Self::Uncertain) => true,
+            (Self::Uncertain, Self::Settled) => true,
             _ => false,
         }
+    }
+}
+
+/// What a [`SendState::Settled`] attempt durably established.
+///
+/// Recorded rather than inferred from the reply text: "the turn returned a
+/// string" and "the provider accepted the request" are different facts, and a
+/// host that conflates them will report a failed send as a delivered one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendOutcome {
+    /// Proven never to have reached the transport.
+    NotSent,
+    /// The provider returned a complete, definitive success.
+    Accepted,
+    /// The provider returned a complete, definitive non-success.
+    Rejected,
+    /// An [`SendState::Uncertain`] attempt resolved by an explicit
+    /// provider-side reconciliation rather than by re-sending it.
+    Reconciled,
+}
+
+impl SendOutcome {
+    /// The exact wire value used by the JSON contract.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotSent => "not_sent",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Reconciled => "reconciled",
+        }
+    }
+
+    /// Every outcome in declaration order, for schema and parity pinning.
+    pub const ALL: [Self; 4] = [
+        Self::NotSent,
+        Self::Accepted,
+        Self::Rejected,
+        Self::Reconciled,
+    ];
+
+    /// Whether this outcome asserts the provider received the request.
+    ///
+    /// `Reconciled` is deliberately absent: reconciliation establishes what
+    /// happened without this record claiming to know which way it went.
+    pub const fn implies_receipt(self) -> bool {
+        matches!(self, Self::Accepted | Self::Rejected)
     }
 }
 
@@ -462,6 +606,33 @@ impl ProviderAttempt {
         self.send_state.may_auto_retry()
     }
 
+    /// Whether the provider may still be holding work for this attempt.
+    pub const fn is_unresolved(&self) -> bool {
+        self.send_state.is_unresolved()
+    }
+
+    /// Record the outcome this attempt established and settle it.
+    ///
+    /// The outcome and the state move together so no path can mark an attempt
+    /// finished without saying what it finished as.
+    ///
+    /// Settling straight out of [`SendState::Sending`] is allowed for exactly
+    /// one outcome, [`SendOutcome::NotSent`], because a connect-phase failure
+    /// is the only thing that proves bytes never left after the record already
+    /// crossed the boundary. Claiming the provider did anything at all still
+    /// requires passing through [`SendState::Sent`], which requires a receipt.
+    pub fn settle(&mut self, outcome: SendOutcome) -> Result<(), &'static str> {
+        if self.send_state == SendState::Sending && outcome != SendOutcome::NotSent {
+            return Err(
+                "an in-flight attempt can only settle as never sent; a provider outcome needs a \
+                 receipt first",
+            );
+        }
+        self.advance(SendState::Settled)?;
+        self.receipts.outcome = Some(outcome);
+        Ok(())
+    }
+
     /// Advance the send state, refusing any transition the lattice forbids.
     ///
     /// Returns the state that was rejected, so a caller can record *what* it
@@ -518,17 +689,41 @@ impl ProviderAttempt {
         {
             return Err("an attempt with provider receipts cannot claim it was not sent");
         }
-        // `Sent` means the provider acknowledged it; without a receipt the
-        // honest state is `Uncertain`.
-        if self.send_state == SendState::Sent && !self.receipts.acknowledged() {
-            return Err("a sent attempt must carry at least one provider receipt");
+        // `Sent` and `Responding` both assert the provider answered. Without
+        // an observed receipt the honest state is `Uncertain`, so the record
+        // cannot describe a delivery it never saw.
+        if matches!(self.send_state, SendState::Sent | SendState::Responding)
+            && !self.receipts.acknowledged()
+        {
+            return Err("a delivered attempt must carry at least one provider receipt");
+        }
+        // An outcome is what settling *is*, so the two travel together.
+        match (self.send_state, self.receipts.outcome) {
+            (SendState::Settled, None) => {
+                return Err("a settled attempt must record the outcome it established");
+            }
+            (state, Some(_)) if state != SendState::Settled => {
+                return Err("only a settled attempt may record an outcome");
+            }
+            _ => {}
+        }
+        // A settled outcome may not contradict the evidence recorded beside
+        // it: `not_sent` cannot hold a provider receipt, and an accepted or
+        // rejected request cannot lack one.
+        if let Some(outcome) = self.receipts.outcome {
+            if outcome == SendOutcome::NotSent && self.receipts.acknowledged() {
+                return Err("an attempt settled as not sent cannot carry a provider receipt");
+            }
+            if outcome.implies_receipt() && !self.receipts.acknowledged() {
+                return Err("an attempt settled against the provider must carry its receipt");
+            }
         }
         // A failure that was caught before dispatch must not claim otherwise.
         if let Some(failure) = self.failure
             && failure.class() == crate::outcome::RunOutcomeClass::Blocked
-            && self.send_state.is_terminal()
+            && self.receipts.acknowledged()
         {
-            return Err("a blocked attempt never reached the provider and cannot be terminal");
+            return Err("a blocked attempt never reached the provider and cannot hold a receipt");
         }
         Ok(())
     }
@@ -577,6 +772,8 @@ mod tests {
                 "usr-0a1b2c3d",
                 AccountReferenceSource::UserId,
             ),
+            route_digest: Some(id("route:0a1b2c3d")),
+            credential_digest: Some(id("cred:0a1b2c3d")),
         }
     }
 
@@ -585,6 +782,7 @@ mod tests {
             digest: id("sha256:0a1b2c3d4e5f"),
             request_id: id("req-0001"),
             provider_idempotency_key: id("idem-0a1b2c3d"),
+            body_digest: Some(id("body:0a1b2c3d")),
         }
     }
 
@@ -609,6 +807,8 @@ mod tests {
                 output_tokens: 340,
             }),
             provider_replied: true,
+            response_status: Some(200),
+            outcome: None,
         }
     }
 
@@ -644,8 +844,21 @@ mod tests {
         let legal = [
             (KnownNotSent, KnownNotSent),
             (KnownNotSent, Sending),
+            // A request proven never to have reached the transport settles
+            // straight from the pre-boundary state.
+            (KnownNotSent, Settled),
             (Sending, Sent),
             (Sending, Uncertain),
+            // Legal only as `not_sent`; `settle` enforces which outcome.
+            (Sending, Settled),
+            (Sent, Responding),
+            (Sent, Settled),
+            (Sent, Uncertain),
+            (Responding, Settled),
+            (Responding, Uncertain),
+            // The one exit from ambiguity, and it is a reconciliation rather
+            // than a retry.
+            (Uncertain, Settled),
         ];
         for from in SendState::ALL {
             for to in SendState::ALL {
@@ -657,17 +870,24 @@ mod tests {
                 );
             }
         }
-        // A terminal attempt is finished; nothing reopens it.
-        for terminal in [Sent, Uncertain] {
-            for to in SendState::ALL {
-                assert!(
-                    !terminal.permits_transition_to(to),
-                    "{terminal:?} -> {to:?} reopened a finished attempt"
-                );
-            }
+        // A settled attempt is finished; nothing reopens it.
+        for to in SendState::ALL {
+            assert!(
+                !Settled.permits_transition_to(to),
+                "Settled -> {to:?} reopened a finished attempt"
+            );
+        }
+        // Ambiguity is never resolved by simply carrying on: the only exit
+        // from `Uncertain` is the reconciliation that settles it.
+        for to in SendState::ALL {
+            assert_eq!(
+                Uncertain.permits_transition_to(to),
+                to == Settled,
+                "Uncertain -> {to:?} disagreed about the reconciliation-only exit"
+            );
         }
         // And nothing ever returns to the retryable state.
-        for from in [Sending, Sent, Uncertain] {
+        for from in [Sending, Sent, Responding, Uncertain, Settled] {
             assert!(
                 !from.permits_transition_to(KnownNotSent),
                 "{from:?} was rewound into an auto-retryable state"
@@ -778,10 +998,69 @@ mod tests {
         honest.advance(SendState::Sent).unwrap();
         assert_eq!(honest.validate(), Ok(()));
         assert!(!honest.may_auto_retry());
+        // Delivered is not finished. Until the outcome is known the provider
+        // may still be holding work, and an "equivalent" request beside it is
+        // exactly the duplicate the idempotency key exists to prevent.
         assert!(
-            honest.permits_equivalent_retry(),
-            "a finished attempt needs no reconciliation"
+            !honest.permits_equivalent_retry(),
+            "a delivered attempt with an unknown outcome allowed an equivalent retry"
         );
+
+        // Only a settled attempt is finished.
+        let mut settled = honest.clone();
+        settled.advance(SendState::Responding).unwrap();
+        settled.settle(SendOutcome::Accepted).unwrap();
+        assert_eq!(settled.validate(), Ok(()));
+        assert!(settled.permits_equivalent_retry());
+        assert!(!settled.is_unresolved());
+
+        // Settling must say what was established, and may not contradict it.
+        let mut unstated = honest.clone();
+        unstated.send_state = SendState::Settled;
+        assert!(
+            unstated.validate().is_err(),
+            "a settled attempt validated without recording an outcome"
+        );
+        let mut contradicted = honest.clone();
+        contradicted.settle(SendOutcome::NotSent).unwrap();
+        assert!(
+            contradicted.validate().is_err(),
+            "an attempt holding a provider receipt settled as never sent"
+        );
+        let mut unwitnessed_settle = attempt();
+        unwitnessed_settle.settle(SendOutcome::Accepted).unwrap();
+        assert!(
+            unwitnessed_settle.validate().is_err(),
+            "an attempt settled against the provider with no receipt at all"
+        );
+        // A request abandoned before the transport settles honestly.
+        let mut never_left = attempt();
+        never_left.settle(SendOutcome::NotSent).unwrap();
+        assert_eq!(never_left.validate(), Ok(()));
+        assert!(never_left.permits_equivalent_retry());
+
+        // A connect failure after the record already crossed the boundary is
+        // the one thing that may settle straight out of `sending` -- and only
+        // as `not_sent`. Anything claiming the provider acted must show a
+        // receipt, which means passing through `sent` first.
+        let mut refused_connect = attempt();
+        refused_connect.advance(SendState::Sending).unwrap();
+        refused_connect.settle(SendOutcome::NotSent).unwrap();
+        assert_eq!(refused_connect.validate(), Ok(()));
+        assert!(refused_connect.permits_equivalent_retry());
+        for claimed in [
+            SendOutcome::Accepted,
+            SendOutcome::Rejected,
+            SendOutcome::Reconciled,
+        ] {
+            let mut smuggled = attempt();
+            smuggled.advance(SendState::Sending).unwrap();
+            assert!(
+                smuggled.settle(claimed).is_err(),
+                "{claimed:?} settled straight out of an in-flight send"
+            );
+            assert_eq!(smuggled.send_state, SendState::Sending);
+        }
     }
 
     #[test]

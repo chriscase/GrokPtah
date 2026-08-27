@@ -38,7 +38,7 @@ pub use account::{
 pub use attempt::{
     AttemptIntent, AttemptRoute, AttemptSubject, AuthorityRevisions, BoundedId,
     GROK_ATTEMPT_CONTRACT_VERSION, GROK_ATTEMPT_SCHEMA_VERSION, MAX_ATTEMPT_IDENTIFIER_BYTES,
-    ProviderAttempt, ProviderReceipts, Revision, SendState, UsageReceipt,
+    ProviderAttempt, ProviderReceipts, Revision, SendOutcome, SendState, UsageReceipt,
 };
 pub use capability::{CapabilityAvailability, CapabilityDescriptor, CapabilitySet, CapabilityTier};
 pub use computer::{

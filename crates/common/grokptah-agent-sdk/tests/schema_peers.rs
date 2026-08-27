@@ -227,11 +227,14 @@ fn attempt_producer_payloads() -> Vec<(&'static str, ProviderAttempt)> {
                 "usr-0a1b2c3d",
                 AccountReferenceSource::UserId,
             ),
+            route_digest: Some(bounded("route:0a1b2c3d")),
+            credential_digest: Some(bounded("cred:0a1b2c3d")),
         },
         AttemptIntent {
             digest: bounded("sha256:0a1b2c3d"),
             request_id: bounded("req-0001"),
             provider_idempotency_key: bounded("idem:0a1b2c3d"),
+            body_digest: Some(bounded("body:0a1b2c3d")),
         },
     );
 
@@ -249,9 +252,21 @@ fn attempt_producer_payloads() -> Vec<(&'static str, ProviderAttempt)> {
             output_tokens: 340,
         }),
         provider_replied: true,
+        response_status: Some(200),
+        outcome: None,
     };
     sent.advance(SendState::Sent)
         .expect("provider acknowledged");
+
+    let mut responding = sent.clone();
+    responding
+        .advance(SendState::Responding)
+        .expect("the answer is being read");
+
+    let mut settled = responding.clone();
+    settled
+        .settle(grokptah_agent_sdk::attempt::SendOutcome::Accepted)
+        .expect("the outcome is durably known");
 
     let mut uncertain = sending.clone();
     uncertain
@@ -288,11 +303,14 @@ fn attempt_producer_payloads() -> Vec<(&'static str, ProviderAttempt)> {
             model: ModelReference::new("local/mixtral-8x7b").expect("bounded model"),
             effort: None,
             account_reference: None,
+            route_digest: None,
+            credential_digest: None,
         },
         AttemptIntent {
             digest: bounded("sha256:9f8e7d6c"),
             request_id: bounded("req-0002"),
             provider_idempotency_key: bounded("idem:9f8e7d6c"),
+            body_digest: None,
         },
     );
 
@@ -300,6 +318,8 @@ fn attempt_producer_payloads() -> Vec<(&'static str, ProviderAttempt)> {
         ("known not sent", open),
         ("sending", sending),
         ("sent", sent),
+        ("responding", responding),
+        ("settled", settled),
         ("uncertain", uncertain),
         ("minimal api-key route", minimal),
     ]

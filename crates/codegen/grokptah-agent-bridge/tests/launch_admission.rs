@@ -87,6 +87,51 @@ fn attribution() -> RunAttribution {
     }
 }
 
+/// Declare one physical provider send for an admitted run, the way the send
+/// path itself does.
+///
+/// The attempt is created where a real send creates it -- at the socket, by
+/// [`grokptah_agent_bridge::send_authority`] -- rather than being pre-recorded
+/// at admission. An offline host reaches no provider, so these tests declare
+/// explicitly instead of waiting for a request that will never be issued.
+fn declare_send(
+    store: &OrchStore,
+    run_id: &str,
+    session_id: uuid::Uuid,
+    workspace: &std::path::Path,
+    prompt: &str,
+) -> grokptah_agent_bridge::send_authority::AttemptTicket {
+    use grokptah_agent_bridge::send_authority::{
+        ProviderRequestIdentity, SendBinding, SendCause, SendLedger,
+    };
+    use grokptah_agent_sdk::attempt::BoundedId;
+
+    let ledger = SendLedger::bind(
+        store.clone(),
+        SendBinding {
+            run_id: run_id.into(),
+            request_id: format!("req-{run_id}"),
+            session_id,
+            workspace: workspace.display().to_string(),
+            prompt: prompt.into(),
+            requirement: Some(requirement()),
+            profile: None,
+            effort: None,
+        },
+    )
+    .expect("an admitted run binds a ledger");
+    ledger
+        .declare(
+            SendCause::InitialSend,
+            &ProviderRequestIdentity {
+                route_digest: BoundedId::new("route:0a1b2c3d4e5f6071").unwrap(),
+                body_digest: BoundedId::new("body:1122334455667788").unwrap(),
+                credential_revision: BoundedId::new("cred:99aabbccddeeff00").unwrap(),
+            },
+        )
+        .expect("a run with no unresolved send may declare one")
+}
+
 fn requirement() -> LaunchRequirement {
     LaunchRequirement {
         provider: ProviderClass::Xai,
@@ -485,13 +530,36 @@ async fn an_admitted_run_records_a_bound_provider_attempt() {
         .expect("a ready gate admits");
     let run_id = response["runId"].as_str().expect("a run id").to_string();
 
-    let attempts = store.list_attempts_for_run(&run_id).unwrap();
-    assert_eq!(
-        attempts.len(),
-        1,
-        "exactly one attempt is opened at admission"
+    // Nothing is recorded yet: an admitted run that has issued no request has
+    // no attempt, because an attempt record would describe a send that has not
+    // happened and would burn an ordinal -- and therefore an idempotency key --
+    // that nothing was ever sent under.
+    assert!(
+        store.list_attempts_for_run(&run_id).unwrap().is_empty(),
+        "admission alone recorded a provider attempt"
     );
+
+    // The send is what creates the record, and it is bound to the exact facts
+    // the run was admitted on.
+    let ticket = declare_send(
+        &store,
+        &run_id,
+        session_id,
+        workspace.path(),
+        "do the thing",
+    );
+    let attempts = store.list_attempts_for_run(&run_id).unwrap();
+    assert_eq!(attempts.len(), 1, "one physical send, one attempt");
     let attempt = &attempts[0];
+    assert_eq!(
+        attempt.send_state,
+        grokptah_agent_sdk::attempt::SendState::KnownNotSent,
+        "a declared send is durable before it reaches the transport"
+    );
+    assert!(
+        attempt.may_auto_retry(),
+        "a request that has not left is the only safely retryable state"
+    );
     assert_eq!(attempt.ordinal, 1);
     assert_eq!(attempt.validate(), Ok(()));
 
@@ -528,6 +596,13 @@ async fn an_admitted_run_records_a_bound_provider_attempt() {
     ] {
         assert!(!encoded.contains(needle), "attempt leaked {needle:?}");
     }
+    // The exact endpoint, body, and credential are bound as digests, so a
+    // silent drift in any of them is detectable without the record holding
+    // the URL, the request, or the secret.
+    assert!(attempt.route.route_digest.is_some());
+    assert!(attempt.intent.body_digest.is_some());
+    assert!(attempt.route.credential_digest.is_some());
+    ticket.settle_not_sent().expect("nothing was dispatched");
     host.stop().unwrap();
 }
 
@@ -557,27 +632,27 @@ async fn a_retry_is_refused_while_an_attempt_is_unreconciled() {
         .expect("a ready gate admits");
     let run_id = response["runId"].as_str().expect("a run id").to_string();
 
-    // Drive the run to an interrupted state with an in-flight attempt, which
-    // is exactly what a crash mid-dispatch leaves behind.
-    let attempt_id = store.list_attempts_for_run(&run_id).unwrap()[0]
-        .attempt_id
-        .as_str()
-        .to_string();
-    // The spawned turn may already have advanced this attempt; either way the
-    // state we need is `sending`.
-    let _ = store.update_attempt(&attempt_id, |attempt| {
-        if attempt.send_state == SendState::KnownNotSent {
-            attempt
-                .advance(SendState::Sending)
-                .map_err(anyhow::Error::msg)?;
-        }
-        Ok(())
-    });
-    if store.load_attempt(&attempt_id).unwrap().unwrap().send_state != SendState::Sending {
-        // The turn settled it already; this run cannot exercise the rule.
-        host.stop().unwrap();
-        return;
-    }
+    // Drive the run to an interrupted state with an in-flight send, which is
+    // exactly what a crash mid-dispatch leaves behind: declared, handed to the
+    // transport, and never answered.
+    let ticket = declare_send(
+        &store,
+        &run_id,
+        session_id,
+        workspace.path(),
+        "do the thing",
+    );
+    ticket
+        .mark_sending()
+        .expect("the send crosses the boundary");
+    let attempt_id = ticket.attempt_id().to_string();
+    // Dropping the ticket without an observed outcome fences it rather than
+    // tidying it away -- the request is gone and may well have executed.
+    drop(ticket);
+    assert_eq!(
+        store.load_attempt(&attempt_id).unwrap().unwrap().send_state,
+        SendState::Uncertain
+    );
     let _ = store.update_run(&run_id, |run| {
         run.state = grokptah_agent_bridge::orchestration::RunState::Interrupted;
         run.terminal_result = Some("interrupted".into());

@@ -135,6 +135,14 @@
               "enum": ["user_id", "principal_id", "team_id"]
             }
           }
+        },
+        "routeDigest": {
+          "description": "Opaque digest of the exact endpoint this attempt is bound to, so a silent re-point between two gateways of the same `base` category is detectable without recording a hostname.",
+          "$ref": "#/$defs/boundedId"
+        },
+        "credentialDigest": {
+          "description": "Opaque digest of the credential material this attempt is sent under, so a rotation or refresh between deciding and sending is detectable without the record holding the secret.",
+          "$ref": "#/$defs/boundedId"
         }
       }
     },
@@ -146,13 +154,22 @@
       "properties": {
         "digest": { "$ref": "#/$defs/boundedId" },
         "requestId": { "$ref": "#/$defs/boundedId" },
-        "providerIdempotencyKey": { "$ref": "#/$defs/boundedId" }
+        "providerIdempotencyKey": { "$ref": "#/$defs/boundedId" },
+        "bodyDigest": {
+          "description": "Opaque digest of the exact bytes handed to the transport, so a reconciliation re-presents the request the provider actually saw rather than the one the operator asked for.",
+          "$ref": "#/$defs/boundedId"
+        }
       }
     },
     "sendState": {
-      "description": "Only `known_not_sent` may be retried automatically. `sending` and `uncertain` must be reconciled against the provider using `intent.providerIdempotencyKey`; `sent` is finished.",
+      "description": "Only `known_not_sent` may be retried automatically. `sending`, `sent`, `responding`, and `uncertain` all mean the provider may still be holding work and must be reconciled against it using `intent.providerIdempotencyKey`; `settled` is the only finished state. `sent` records that the provider proved receipt by producing a response head, which is a statement about delivery and not about the outcome.",
       "type": "string",
-      "enum": ["known_not_sent", "sending", "sent", "uncertain"]
+      "enum": ["known_not_sent", "sending", "sent", "responding", "uncertain", "settled"]
+    },
+    "sendOutcome": {
+      "description": "What a `settled` attempt durably established. `not_sent` may not coexist with any receipt, and `accepted`/`rejected` require one: an outcome is recorded from what the provider was observed to do, never inferred from the reply text.",
+      "type": "string",
+      "enum": ["not_sent", "accepted", "rejected", "reconciled"]
     },
     "receipts": {
       "type": "object",
@@ -161,7 +178,14 @@
         "request": { "$ref": "#/$defs/boundedId" },
         "run": { "$ref": "#/$defs/boundedId" },
         "usage": { "$ref": "#/$defs/usage" },
-        "providerReplied": { "type": "boolean" }
+        "providerReplied": { "type": "boolean" },
+        "responseStatus": {
+          "description": "The HTTP status the provider answered with, when a response head was observed. A protocol fact and unambiguous proof of delivery; never response content.",
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599
+        },
+        "outcome": { "$ref": "#/$defs/sendOutcome" }
       }
     },
     "usage": {

@@ -10,11 +10,10 @@ use parking_lot::Mutex;
 use serde_json::json;
 use uuid::Uuid;
 
-use grokptah_agent_sdk::attempt::SendState;
 use grokptah_agent_sdk::launch::LaunchReason;
 use grokptah_agent_sdk::outcome::RunOutcomeClass;
 
-use crate::attempt_binding::{self, RunPrincipalContext};
+use crate::attempt_binding;
 use crate::event_bus::{CursorExpiredError, EventBus, EventReceiver, JournalPage};
 use crate::host::AgentHostHandle;
 use crate::launch_truth::{self, LaunchGate};
@@ -186,69 +185,19 @@ impl Drop for IdempotencyLease {
     }
 }
 
-/// Open the first provider attempt for a freshly admitted run.
+/// Refuse to start a turn whose run still has an unreconciled provider send.
 ///
-/// Nothing is recorded when the admission reached no provider: an offline
-/// host issues no request, and an attempt record would imply one that can
-/// never exist.
-impl OrchestrationService {
-    fn open_first_attempt(
-        &self,
-        run: &RunRecord,
-        prompt: &str,
-        admission: &crate::launch_truth::Admission,
-    ) -> Result<(), OrchError> {
-        // Derive the ordinal from what is already recorded rather than
-        // assuming this is the first: a resumed or replayed admission must
-        // not reuse an ordinal, because the provider idempotency key is
-        // derived from it.
-        let recorded = self
-            .store
-            .list_attempts_for_run(&run.run_id)
-            .unwrap_or_default();
-        if !attempt_binding::permits_new_request(&recorded) {
-            return Err(OrchError::new(
-                OrchErrorCode::Conflict,
-                "an earlier provider attempt for this run is still unreconciled",
-            ));
-        }
-        let ordinal = attempt_binding::next_ordinal(&recorded);
-        let Some(attempt) = attempt_binding::bind_attempt(
-            &run.run_id,
-            ordinal,
-            &run.request_id,
-            prompt,
-            &RunPrincipalContext {
-                tenant: None,
-                project: None,
-                workspace: run.workspace.clone(),
-                session: run.session_id,
-                authority: attempt_binding::initial_authority(),
-            },
-            admission.facts(),
-        ) else {
-            return Ok(());
-        };
-        let attempt = attempt_binding::with_selection(
-            attempt,
-            admission.facts().map(|facts| facts.truth.provider.as_str()),
-            None,
-        );
-        self.store.open_attempt(&attempt).map_err(|error| {
-            OrchError::new(
-                OrchErrorCode::Internal,
-                format!("could not record the provider attempt: {error}"),
-            )
-        })
-    }
-}
-
-/// Move this run's open attempt to `sending`.
+/// This is a *pre-flight* check, not a state transition. The record crosses
+/// the send boundary inside [`crate::send_authority`], at the site that owns
+/// the socket, because that is the only place that knows how many physical
+/// requests a turn actually issues and what each one carries. Advancing a
+/// speculative attempt here as well would record a send that never happens
+/// and hand the provider an idempotency key nothing was ever sent under.
 ///
-/// Called immediately before the model turn, so the durable record crosses the
-/// send boundary at the same moment the request does. A run with no recorded
-/// attempt (an offline host) has nothing to advance and succeeds trivially.
-fn begin_send(store: &OrchStore, run_id: &str) -> Result<(), String> {
+/// Refusing early still matters: it turns a duplicate-send attempt into a
+/// typed, non-terminal run outcome the operator can act on, instead of an
+/// error thrown from inside a turn.
+fn refuse_unreconciled_send(store: &OrchStore, run_id: &str) -> Result<(), String> {
     let attempts = store
         .list_attempts_for_run(run_id)
         .map_err(|error| error.to_string())?;
@@ -259,20 +208,7 @@ fn begin_send(store: &OrchStore, run_id: &str) -> Result<(), String> {
                 .into(),
         );
     }
-    let Some(open) = attempts
-        .iter()
-        .find(|attempt| attempt.send_state == SendState::KnownNotSent)
-    else {
-        return Ok(());
-    };
-    store
-        .update_attempt(open.attempt_id.as_str(), |attempt| {
-            attempt
-                .advance(SendState::Sending)
-                .map_err(anyhow::Error::msg)
-        })
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    Ok(())
 }
 
 /// Record a refusal that happened at the send boundary itself.
@@ -301,52 +237,7 @@ fn record_send_refusal(store: &OrchStore, run_id: &str, reason: &str) {
 /// have executed. Recording that is what stops a later restart from quietly
 /// duplicating it.
 fn reconcile_run_attempts(store: &OrchStore, run_id: &str) {
-    let Ok(attempts) = store.list_attempts_for_run(run_id) else {
-        return;
-    };
-    for attempt in attempts {
-        if attempt.send_state != SendState::Sending {
-            continue;
-        }
-        let _ = store.update_attempt(attempt.attempt_id.as_str(), |attempt| {
-            attempt_binding::reconcile_interrupted(attempt).map_err(anyhow::Error::msg)
-        });
-    }
-}
-
-/// Settle this run's in-flight attempt once the turn is over.
-///
-/// A parsed reply is an acknowledgement even when the provider returned no
-/// identifier, so it settles as `sent`. Anything else — an error, a broken
-/// connection, a reply we could not read — settles as `uncertain`, because
-/// the request may well have executed.
-fn settle_run_attempts(
-    store: &OrchStore,
-    run_id: &str,
-    result: &Result<String, String>,
-    candidate: &RunRecord,
-) {
-    let Ok(attempts) = store.list_attempts_for_run(run_id) else {
-        return;
-    };
-    let usage = attempt_binding::usage_receipt(
-        candidate.aggregates.usage.prompt_tokens,
-        candidate.aggregates.usage.completion_tokens,
-    );
-    for attempt in attempts {
-        if attempt.send_state != SendState::Sending {
-            continue;
-        }
-        let _ = store.update_attempt(attempt.attempt_id.as_str(), |attempt| match result {
-            Ok(_) => {
-                attempt.receipts = attempt_binding::replied(usage);
-                attempt.advance(SendState::Sent).map_err(anyhow::Error::msg)
-            }
-            Err(_) => attempt
-                .advance(SendState::Uncertain)
-                .map_err(anyhow::Error::msg),
-        });
-    }
+    crate::send_authority::fence_run(store, run_id);
 }
 
 /// Translate a fail-closed launch refusal into a share-safe orchestration
@@ -2966,10 +2857,13 @@ impl OrchestrationService {
             let e = OrchError::new(OrchErrorCode::Internal, e.to_string());
             return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
         }
-        // Record the provider attempt *before* anything can reach a provider.
-        // A process that dies between here and dispatch leaves an attempt in
-        // `known_not_sent`, which is the only state that is safe to retry.
-        if let Err(e) = self.open_first_attempt(&run, &prompt, &admission) {
+        // Refuse a run whose earlier provider send is still unreconciled
+        // *before* anything can reach a provider. The sends themselves are
+        // declared at the socket by `send_authority`, which is what makes a
+        // process that dies mid-dispatch leave a truthful record.
+        if let Err(e) = refuse_unreconciled_send(&self.store, &run_id)
+            .map_err(|reason| OrchError::new(OrchErrorCode::Conflict, reason))
+        {
             if !queued {
                 self.host.release_turn_reservation(session_id, &run_id);
                 self.release_capacity(&run_id);
@@ -3252,7 +3146,7 @@ impl OrchestrationService {
             }
             // The send boundary. From here the request may reach a provider,
             // so it stops being safe to repeat on its own.
-            if let Err(error) = begin_send(&store, &rid) {
+            if let Err(error) = refuse_unreconciled_send(&store, &rid) {
                 agg_task.abort();
                 record_send_refusal(&store, &rid, &error);
                 drop(admission_guard);
@@ -3344,7 +3238,11 @@ impl OrchestrationService {
                     }
                 }
             }
-            settle_run_attempts(&store, &rid, &durable_result, &candidate);
+            // The turn's own sends were settled at the socket by
+            // `send_authority`, from what the provider actually did. Anything
+            // still unresolved here is a request nobody observed the end of,
+            // so it is fenced rather than dressed up as a delivery.
+            crate::send_authority::fence_run(&store, &rid);
             if candidate.aggregates.verification.is_none() {
                 let observations = crate::completion::observations_from_run(
                     candidate.aggregates.changes.len(),

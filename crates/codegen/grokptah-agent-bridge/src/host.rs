@@ -225,6 +225,15 @@ pub(crate) struct Inner {
     prompt_queue_revisions: HashMap<Uuid, u64>,
     /// Per-turn model-step budget override (orchestration `RunBounds.max_rounds`).
     turn_max_rounds: HashMap<Uuid, u32>,
+    /// The durable send ledger for each session's in-flight turn.
+    ///
+    /// Keyed by session because the host already enforces one in-flight turn
+    /// per session, so this slot is exact rather than a best guess. Every
+    /// provider request a turn makes -- the model call, a plan proposal, an
+    /// explorer summary, a compaction -- declares its own physical send
+    /// against this one ledger, which is why the ordinals stay unique and why
+    /// a send site cannot silently opt out of being recorded.
+    turn_ledgers: HashMap<Uuid, crate::send_authority::SendLedger>,
     event_tx: crate::event_bus::EventBus,
     /// Paths the agent wrote/edited this process (for diff review).
     edited_files: Vec<String>,
@@ -366,6 +375,28 @@ struct TurnBusyGuard {
     host: AgentHostHandle,
     session_id: Uuid,
     armed: bool,
+}
+
+/// Holds a turn's send ledger for exactly as long as the turn runs.
+///
+/// On drop it does two things that must not be left to a happy path: it
+/// releases the per-session binding, and it fences any attempt still recorded
+/// as in flight. A turn can end by returning, by erroring, by being cancelled,
+/// or by unwinding, and all four mean the same thing to a request already on
+/// the wire -- nobody observed how it ended.
+struct TurnLedgerGuard {
+    host: AgentHostHandle,
+    session_id: Uuid,
+    ledger: crate::send_authority::SendLedger,
+}
+
+impl Drop for TurnLedgerGuard {
+    fn drop(&mut self) {
+        self.host.inner.lock().turn_ledgers.remove(&self.session_id);
+        // Fencing is idempotent and only touches unresolved records, so a turn
+        // whose sends all settled normally leaves the ledger untouched.
+        self.ledger.fence();
+    }
 }
 
 struct ComputerAgentBusyGuard {
@@ -659,6 +690,7 @@ impl AgentHost {
             prompt_queues,
             prompt_queue_revisions: HashMap::new(),
             turn_max_rounds: HashMap::new(),
+            turn_ledgers: HashMap::new(),
             event_tx,
             edited_files: Vec::new(),
             edit_snapshots: HashMap::new(), // session_id → path → original
@@ -702,6 +734,20 @@ impl AgentHostHandle {
     }
 
     /// Additional live subscriber (does not steal the primary GUI receiver).
+    /// The durable send ledger for this session's in-flight turn, if any.
+    ///
+    /// Every provider request made while a turn is running looks its ledger up
+    /// here rather than being handed one, so a send site added later cannot
+    /// quietly skip the record by omitting an argument. A `None` means this
+    /// host reached no provider admission for the turn, and an unrecorded
+    /// request is then correct rather than a gap: there is nothing to record.
+    pub(crate) fn turn_ledger(
+        &self,
+        session_id: Uuid,
+    ) -> Option<crate::send_authority::SendLedger> {
+        self.inner.lock().turn_ledgers.get(&session_id).cloned()
+    }
+
     pub fn subscribe_events(&self) -> crate::event_bus::EventReceiver {
         self.inner.lock().event_tx.subscribe()
     }
@@ -1582,6 +1628,87 @@ impl AgentHostHandle {
             return None;
         }
         Some((run_id, store))
+    }
+
+    /// Bind this turn to the durable ledger its provider sends declare against.
+    ///
+    /// The returned guard removes the binding when the turn ends and fences
+    /// anything still in flight. Both halves matter: without the removal a
+    /// later turn would inherit a stale run identity, and without the fence a
+    /// turn that panicked would leave a request recorded as `sending` for a
+    /// process that is no longer waiting for it.
+    #[allow(clippy::too_many_arguments)] // Every binding here is deliberate.
+    fn install_turn_ledger(
+        &self,
+        session_id: Uuid,
+        turn_id: Uuid,
+        prompt: &str,
+        cwd: &Path,
+        external_run: Option<&ExternalRunContext>,
+        desktop_run_id: Option<&str>,
+        admission: Option<&crate::launch_truth::Admission>,
+        effort: EffortLevel,
+    ) -> Option<TurnLedgerGuard> {
+        // No enforced admission means this host reached no provider at all.
+        let facts = admission.and_then(crate::launch_truth::Admission::facts)?;
+        let store = match self.ensure_orchestration_store() {
+            Ok(store) => store,
+            Err(error) => {
+                // Fail closed and loudly rather than dispatching unrecorded:
+                // a send with no ledger behind it is the exact condition this
+                // module exists to make impossible.
+                eprintln!("[grokptah] provider send ledger unavailable: {error:#}");
+                return None;
+            }
+        };
+        // A Chat turn owns no durable run record, so it gets a run identity of
+        // its own. The ledger keys attempts by run id, not by a run row, so an
+        // identity is all it needs -- and having one is what lets a Chat send
+        // be reconciled after a crash exactly like a Build send.
+        let (run_id, request_id) = match (external_run, desktop_run_id) {
+            (Some(external), _) => (
+                external.run_id.clone(),
+                self.orchestration_request_id(&external.run_id)
+                    .unwrap_or_else(|| format!("desktop-turn-{turn_id}")),
+            ),
+            (None, Some(run_id)) => (run_id.to_string(), format!("desktop-turn-{turn_id}")),
+            (None, None) => (
+                format!("desktop-chat-{turn_id}"),
+                format!("desktop-chat-turn-{turn_id}"),
+            ),
+        };
+        let ledger = crate::send_authority::SendLedger::bind(
+            store,
+            crate::send_authority::SendBinding {
+                run_id: run_id.clone(),
+                request_id,
+                session_id,
+                workspace: cwd.display().to_string(),
+                prompt: prompt.to_string(),
+                requirement: Some(facts.requirement.clone()),
+                profile: Some(facts.truth.provider.as_str().to_string()),
+                effort: Some(effort.as_str().to_string()),
+            },
+        )?;
+        self.inner
+            .lock()
+            .turn_ledgers
+            .insert(session_id, ledger.clone());
+        Some(TurnLedgerGuard {
+            host: self.clone(),
+            session_id,
+            ledger,
+        })
+    }
+
+    /// The originating request id recorded for a durable run, if it is known.
+    fn orchestration_request_id(&self, run_id: &str) -> Option<String> {
+        self.ensure_orchestration_store()
+            .ok()?
+            .load_run(run_id)
+            .ok()
+            .flatten()
+            .map(|run| run.request_id)
     }
 
     fn start_desktop_run_aggregator(
@@ -2872,6 +2999,7 @@ impl AgentHostHandle {
                  Preserve: user goals, decisions, file paths touched, failing tests, open TODOs. \
                  Be dense (≤600 words). Do not invent facts.\n\n{blob}"
             );
+            let ledger = self.turn_ledger(id);
             match call_xai_chat(
                 &creds,
                 &model,
@@ -2879,6 +3007,7 @@ impl AgentHostHandle {
                 None,
                 &cwd,
                 SessionKind::Build,
+                ledger.as_ref(),
             )
             .await
             {
@@ -5510,6 +5639,28 @@ impl AgentHostHandle {
         let mut desktop_aggregator = desktop_run.as_ref().map(|(run_id, store)| {
             self.start_desktop_run_aggregator(run_id, session_id, store.clone())
         });
+
+        // Install the durable send ledger for this turn, whatever started it
+        // and whatever kind it is. A Chat turn spends a credential exactly
+        // like a Build turn does, so it is recorded on the same terms; before
+        // this, only runs created by the orchestration service were, and the
+        // identical request issued from the desktop Send button reached the
+        // provider with nothing on disk to say it had.
+        //
+        // A turn whose admission reached no provider installs nothing: an
+        // offline host issues no request, and an attempt record would imply
+        // one that can never exist.
+        let _send_ledger = self.install_turn_ledger(
+            session_id,
+            turn_id,
+            &prompt,
+            &cwd,
+            external_run.as_ref(),
+            desktop_run.as_ref().map(|(run_id, _)| run_id.as_str()),
+            admission.as_ref(),
+            effort,
+        );
+
         let _ = event_tx.send(SessionUpdate::TurnStarted {
             session_id,
             turn_id,
@@ -5814,6 +5965,7 @@ impl AgentHostHandle {
                 crate::auth_store::resolve_wire_credentials_for_model(model)
                     .map_err(anyhow::Error::msg)?
             {
+                let ledger = self.turn_ledger(session_id);
                 match call_xai_chat(
                     &creds,
                     model,
@@ -5821,6 +5973,7 @@ impl AgentHostHandle {
                     compacted_summary.as_deref(),
                     cwd,
                     SessionKind::Chat,
+                    ledger.as_ref(),
                 )
                 .await
                 {
@@ -5855,7 +6008,10 @@ impl AgentHostHandle {
             } else if let Some(creds) = crate::auth_store::resolve_wire_credentials_for_model(model)
                 .map_err(anyhow::Error::msg)?
             {
-                match propose_plan_with_model(&creds, model, cwd, &goal, &cancel).await {
+                let ledger = self.turn_ledger(session_id);
+                match propose_plan_with_model(&creds, model, cwd, &goal, &cancel, ledger.as_ref())
+                    .await
+                {
                     Ok(s) if !s.is_empty() => s,
                     Ok(_) => offline_plan_steps(&goal),
                     Err(e) => {
@@ -6810,6 +6966,7 @@ impl AgentHostHandle {
                 detail: format!("Model step {round}/{visible_max_rounds}"),
             });
 
+            let ledger = self.turn_ledger(session_id);
             let step = match call_xai_agent_step(
                 creds,
                 model,
@@ -6817,6 +6974,7 @@ impl AgentHostHandle {
                 &messages,
                 &tools_this_round,
                 cancel,
+                ledger.as_ref(),
                 |delta| {
                     emit_message(event_tx, session_id, delta);
                 },
@@ -8079,6 +8237,7 @@ impl AgentHostHandle {
                      Query: {query}\n\nFindings:\n{}",
                     summary.chars().take(8_000).collect::<String>()
                 );
+                let ledger = self.turn_ledger(session_id);
                 if let Ok(text) = call_xai_chat(
                     &creds,
                     &model,
@@ -8086,6 +8245,7 @@ impl AgentHostHandle {
                     None,
                     cwd,
                     SessionKind::Build,
+                    ledger.as_ref(),
                 )
                 .await
                 {
@@ -8395,6 +8555,7 @@ impl AgentHostHandle {
                 self.finish_subagent(sub_id, "cancelled", &event_tx, session_id, None);
                 return;
             }
+            let ledger = self.turn_ledger(session_id);
             let step = call_xai_agent_step(
                 &creds,
                 &model,
@@ -8402,6 +8563,7 @@ impl AgentHostHandle {
                 &messages,
                 &tools,
                 &cancel,
+                ledger.as_ref(),
                 |_d| {},
                 |_t| {},
             )

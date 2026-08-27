@@ -53,6 +53,7 @@ mod provider_qualification;
 pub mod reliability_eval;
 mod run_promotion;
 mod search_engine;
+pub mod send_authority;
 mod session;
 mod session_store;
 mod spawn_env;

@@ -144,6 +144,10 @@ pub(crate) async fn qualify_semantic_model(
             &first_messages,
             &qualification_tools(),
             cancel,
+            // Computer-use qualification is not a Chat or Build turn and has
+            // no turn ledger to declare against; its own durable run ledger
+            // owns these steps.
+            None,
             |_| {},
             |_| {},
         )
@@ -191,6 +195,10 @@ pub(crate) async fn qualify_semantic_model(
             &recovery_messages,
             &qualification_tools(),
             cancel,
+            // Computer-use qualification is not a Chat or Build turn and has
+            // no turn ledger to declare against; its own durable run ledger
+            // owns these steps.
+            None,
             |_| {},
             |_| {},
         )
@@ -233,6 +241,10 @@ pub(crate) async fn propose_semantic_action(
             &messages,
             &proposal_tools(),
             cancel,
+            // Computer-use qualification is not a Chat or Build turn and has
+            // no turn ledger to declare against; its own durable run ledger
+            // owns these steps.
+            None,
             |_| {},
             |_| {},
         )

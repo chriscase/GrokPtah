@@ -12,13 +12,11 @@
 
 use grokptah_agent_sdk::attempt::{
     AttemptIntent, AttemptRoute, AttemptSubject, AuthorityRevisions, BoundedId, ProviderAttempt,
-    ProviderReceipts, Revision, SendState, UsageReceipt,
+    Revision, SendState,
 };
 use grokptah_agent_sdk::launch::LaunchRequirement;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-
-use crate::launch_truth::AdmissionFacts;
 
 /// Everything the host knows about *who* a run acts for, before binding.
 ///
@@ -60,6 +58,49 @@ fn digest_handle(prefix: &str, value: &str) -> BoundedId {
         .expect("a hex digest with a fixed prefix is always bounded")
 }
 
+/// Reduce an endpoint to a bounded opaque handle.
+///
+/// A base URL is host detail — a private gateway hostname can name a customer
+/// or an internal service — so the durable attempt records a digest of it.
+/// Two sends to the same endpoint still compare equal, which is the whole
+/// point: it makes a silent re-point detectable without publishing where the
+/// request went.
+pub fn route_digest(base_url: &str) -> BoundedId {
+    digest_handle("route", base_url.trim().trim_end_matches('/'))
+}
+
+/// Reduce the exact wire body to a bounded opaque handle.
+///
+/// Digests the serialized request rather than recording it, so the durable
+/// record can prove which bytes were sent without holding the prompt.
+pub fn body_digest(body: &serde_json::Value) -> BoundedId {
+    digest_handle("body", &serde_json::to_string(body).unwrap_or_default())
+}
+
+/// Reduce credential material to a bounded opaque handle.
+///
+/// The digest covers the identity *and* the bearer, so a refresh that swaps
+/// the token without changing the account still moves it. The bearer itself
+/// never leaves this function.
+pub fn credential_digest(identity: &serde_json::Value, bearer: &str) -> BoundedId {
+    let mut hasher = Sha256::new();
+    hasher.update(
+        serde_json::to_string(identity)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hasher.update([0u8]);
+    hasher.update(bearer.as_bytes());
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    BoundedId::new(&format!("cred:{hex}"))
+        .expect("a hex digest with a fixed prefix is always bounded")
+}
+
 /// The opaque intent digest for one exact request.
 ///
 /// Digests the prompt rather than recording it, so a retry can be recognised
@@ -88,10 +129,9 @@ pub(crate) fn bind_attempt(
     request_id: &str,
     prompt: &str,
     context: &RunPrincipalContext,
-    admission: Option<&AdmissionFacts>,
+    requirement: Option<&LaunchRequirement>,
 ) -> Option<ProviderAttempt> {
-    let facts = admission?;
-    let requirement = &facts.requirement;
+    let requirement = requirement?;
     let subject = AttemptSubject {
         // A bare API-key route publishes no durable principal; recording that
         // honestly is the binding, not a gap in it.
@@ -109,6 +149,9 @@ pub(crate) fn bind_attempt(
         digest: intent_digest(prompt),
         request_id: BoundedId::new(request_id).unwrap_or_else(|| digest_handle("req", request_id)),
         provider_idempotency_key: provider_idempotency_key(run_id, ordinal),
+        // Set by the send site that knows the exact bytes; a binding made
+        // before the body exists honestly records that it does not know them.
+        body_digest: None,
     };
     Some(ProviderAttempt::open(
         digest_handle("att", &format!("{run_id}#{ordinal}")),
@@ -145,6 +188,10 @@ fn attempt_route(requirement: &LaunchRequirement) -> AttemptRoute {
             }),
         effort: None,
         account_reference: requirement.account_reference.clone(),
+        // Both are set by the send site, which is the only place that knows
+        // the exact endpoint and the exact credential material in use.
+        route_digest: None,
+        credential_digest: None,
     }
 }
 
@@ -163,16 +210,6 @@ pub(crate) fn with_selection(
         .filter(|value| !value.is_empty())
         .and_then(BoundedId::new);
     attempt
-}
-
-/// The receipts for a turn that came back with a complete, parseable reply.
-pub(crate) fn replied(usage: Option<UsageReceipt>) -> ProviderReceipts {
-    ProviderReceipts {
-        request: None,
-        run: None,
-        usage,
-        provider_replied: true,
-    }
 }
 
 /// Whether a run may issue a new equivalent provider request.
@@ -202,19 +239,17 @@ pub(crate) fn next_ordinal(attempts: &[ProviderAttempt]) -> u32 {
 /// silently making it look retryable.
 pub fn reconcile_interrupted(attempt: &mut ProviderAttempt) -> Result<(), &'static str> {
     match attempt.send_state {
-        SendState::Sending => attempt.advance(SendState::Uncertain),
-        // A request that never left is still provably unsent, and a finished
-        // one is finished; neither needs reconciling.
-        SendState::KnownNotSent | SendState::Sent | SendState::Uncertain => Ok(()),
+        // Everything past the transport boundary whose outcome nobody
+        // observed is exactly ambiguous, and that includes a delivered
+        // request whose answer was never read.
+        SendState::Sending | SendState::Sent | SendState::Responding => {
+            attempt.advance(SendState::Uncertain)
+        }
+        // A request that never left is still provably unsent, a settled one
+        // is finished, and an already-fenced one stays fenced; none of the
+        // three needs reconciling here.
+        SendState::KnownNotSent | SendState::Settled | SendState::Uncertain => Ok(()),
     }
-}
-
-/// Convert host-reported token counts into a bounded usage receipt.
-pub(crate) fn usage_receipt(input_tokens: u64, output_tokens: u64) -> Option<UsageReceipt> {
-    (input_tokens > 0 || output_tokens > 0).then_some(UsageReceipt {
-        input_tokens,
-        output_tokens,
-    })
 }
 
 /// The authority revisions a host records when it has no versioned decision

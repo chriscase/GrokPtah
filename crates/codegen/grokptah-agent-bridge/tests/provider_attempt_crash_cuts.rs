@@ -13,7 +13,7 @@ use grokptah_agent_bridge::orchestration::OrchStore;
 use grokptah_agent_sdk::account::{AccountReference, AccountReferenceSource, CredentialMethod};
 use grokptah_agent_sdk::attempt::{
     AttemptIntent, AttemptRoute, AttemptSubject, AuthorityRevisions, BoundedId, ProviderAttempt,
-    ProviderReceipts, Revision, SendState, UsageReceipt,
+    ProviderReceipts, Revision, SendOutcome, SendState, UsageReceipt,
 };
 use grokptah_agent_sdk::launch::{
     BaseCategory, ModelReference, ProviderClass, RequestDialect, RouteClass,
@@ -56,11 +56,14 @@ fn attempt(run_id: &str, ordinal: u32) -> ProviderAttempt {
                 "usr-0a1b2c3d",
                 AccountReferenceSource::UserId,
             ),
+            route_digest: Some(bounded("route:0a1b2c3d")),
+            credential_digest: Some(bounded("cred:0a1b2c3d")),
         },
         AttemptIntent {
             digest: bounded("sha256:0a1b2c3d"),
             request_id: bounded("req-0001"),
             provider_idempotency_key: binding::provider_idempotency_key(run_id, ordinal),
+            body_digest: Some(bounded("body:0a1b2c3d")),
         },
     )
 }
@@ -257,8 +260,10 @@ fn an_unreadable_reply_settles_as_uncertain_and_blocks_an_equivalent_request() {
     assert!(!RunFailureKind::MalformedOutput.verdict().claims_success());
 }
 
-/// Cut 4: the provider answered. The attempt is finished, so a *new* intent
-/// may proceed — what is forbidden is repeating this one blindly.
+/// Cut 4: the provider answered *and* the outcome was read. Only then is the
+/// attempt finished and a new intent free to proceed — what is forbidden is
+/// repeating this one blindly, and what is equally forbidden is treating a
+/// response head as if it were a known outcome.
 #[test]
 fn an_acknowledged_attempt_is_finished_and_stops_blocking_the_run() {
     let home = tempdir().unwrap();
@@ -282,14 +287,49 @@ fn an_acknowledged_attempt_is_finished_and_stops_blocking_the_run() {
                     output_tokens: 340,
                 }),
                 provider_replied: true,
+                response_status: Some(200),
+                outcome: None,
             };
             attempt.advance(SendState::Sent).map_err(anyhow::Error::msg)
         })
         .unwrap();
 
+    // Delivered, but the outcome is still unknown. The run stays fenced across
+    // a restart: a provider that has taken the request may still be working on
+    // it, and an "equivalent" request now is the duplicate charge.
+    let store = restart(&home, Some(store));
+    let delivered = store.list_attempts_for_run("run-0006").unwrap();
+    assert_eq!(delivered[0].send_state, SendState::Sent);
+    assert!(
+        !delivered[0].may_auto_retry(),
+        "a delivered request was re-sent"
+    );
+    assert!(
+        !store.run_permits_new_attempt("run-0006").unwrap(),
+        "a delivered request with an unknown outcome stopped fencing the run"
+    );
+    assert_eq!(store.unreconciled_attempts("run-0006").unwrap().len(), 1);
+
+    // Now the answer is read to completion. Only that settles it.
+    store
+        .update_attempt(delivered[0].attempt_id.as_str(), |attempt| {
+            attempt
+                .advance(SendState::Responding)
+                .map_err(anyhow::Error::msg)
+        })
+        .unwrap();
+    store
+        .update_attempt(delivered[0].attempt_id.as_str(), |attempt| {
+            attempt
+                .settle(SendOutcome::Accepted)
+                .map_err(anyhow::Error::msg)
+        })
+        .unwrap();
+
     let store = restart(&home, Some(store));
     let recovered = store.list_attempts_for_run("run-0006").unwrap();
-    assert_eq!(recovered[0].send_state, SendState::Sent);
+    assert_eq!(recovered[0].send_state, SendState::Settled);
+    assert_eq!(recovered[0].receipts.outcome, Some(SendOutcome::Accepted));
     assert!(
         !recovered[0].may_auto_retry(),
         "a delivered request was re-sent"

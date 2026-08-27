@@ -1243,6 +1243,7 @@ pub(crate) async fn propose_plan_with_model(
     cwd: &Path,
     goal: &str,
     cancel: &CancellationToken,
+    ledger: Option<&crate::send_authority::SendLedger>,
 ) -> Result<Vec<String>> {
     if cancel.is_cancelled() {
         bail!("cancelled");
@@ -1259,6 +1260,7 @@ pub(crate) async fn propose_plan_with_model(
         None,
         cwd,
         SessionKind::Build,
+        ledger,
     )
     .await?;
     let steps = parse_numbered_plan(&text);
@@ -1716,6 +1718,7 @@ pub(crate) async fn call_xai_agent_step<F, G>(
     messages: &[serde_json::Value],
     tools: &serde_json::Value,
     cancel: &CancellationToken,
+    ledger: Option<&crate::send_authority::SendLedger>,
     mut on_delta: F,
     mut on_thought: G,
 ) -> Result<AgentStep>
@@ -1756,11 +1759,17 @@ where
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
     let mut last_err = None::<String>;
+    // Why the *next* physical send exists. Each pass round this loop is a
+    // separate request that can separately cost money, so each is declared,
+    // ordinalled, and keyed on its own rather than reusing the record of the
+    // one before it.
+    let mut cause = crate::send_authority::SendCause::InitialSend;
     for attempt in 0..4u32 {
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
-        let send_once = |c: &crate::auth_store::WireCredentials| {
+        let send_once = |c: &crate::auth_store::WireCredentials,
+                         ticket: &crate::send_authority::AttemptTicket| {
             let mut req = client
                 .post(&url)
                 .header("Content-Type", "application/json")
@@ -1768,13 +1777,32 @@ where
             if target.dialect == crate::gateway_config::ProviderDialect::XaiChatCompletions {
                 req = req.header("x-grok-effort", effort.as_str());
             }
+            if ticket.is_bound() {
+                req = req
+                    .header("Idempotency-Key", ticket.idempotency_key())
+                    .header("X-Request-Id", ticket.request_id());
+            }
             let req = crate::auth_store::apply_auth_headers(req, c, &base);
             req.json(&body)
         };
 
+        // Durable before the socket. A host killed between here and the first
+        // byte leaves `known_not_sent`, the only safely retryable state.
+        let identity = provider_request_identity(&creds, &target, &body);
+        let mut ticket = match ledger {
+            Some(ledger) => ledger.declare(cause, &identity)?,
+            None => crate::send_authority::AttemptTicket::unbound(),
+        };
+        ticket.mark_sending()?;
+
         let resp_result = tokio::select! {
-            r = send_once(&creds).send() => r,
-            _ = cancel.cancelled() => bail!("cancelled"),
+            r = send_once(&creds, &ticket).send() => r,
+            // A cancelled in-flight request is exactly ambiguous: the bytes
+            // are already gone and nobody will read the answer.
+            _ = cancel.cancelled() => {
+                ticket.mark_uncertain()?;
+                bail!("cancelled");
+            }
         };
         let mut resp = match resp_result {
             Ok(r) => r,
@@ -1794,7 +1822,18 @@ where
                         format!("request error: {e}")
                     },
                 );
+                // A connect-phase failure is positive evidence the request
+                // never reached the provider, so it settles honestly and may
+                // be re-sent. A timeout is the opposite: the request is gone
+                // and may be running right now, so it fences and the loop
+                // stops rather than issuing a second charge.
+                if !e.is_connect() {
+                    ticket.mark_uncertain()?;
+                    bail!("{}", last_err.unwrap());
+                }
+                ticket.settle_not_sent()?;
                 if attempt < 3 {
+                    cause = crate::send_authority::SendCause::TransportRetry;
                     tokio::time::sleep(std::time::Duration::from_millis(400 * (1 << attempt)))
                         .await;
                     continue;
@@ -1802,16 +1841,50 @@ where
                 bail!("{}", last_err.unwrap());
             }
         };
+        // A response head is the provider's own proof it received the request.
+        ticket.mark_sent(
+            provider_request_id(resp.headers()).as_deref(),
+            resp.status().as_u16(),
+        )?;
+        ticket.mark_responding()?;
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
+            // 401 is a definitive answer given before anything executed, so
+            // this attempt settles rather than lingering unresolved, and the
+            // refreshed send is declared as the separate request it is.
+            ticket.settle_rejected(reqwest::StatusCode::UNAUTHORIZED.as_u16())?;
             match crate::auth_store::force_refresh(&creds).await {
                 Ok(fresh) => {
                     creds = fresh;
-                    resp = tokio::select! {
-                        r = send_once(&creds).send() => r
-                            .map_err(|e| anyhow!("request error after refresh: {e}"))?,
-                        _ = cancel.cancelled() => bail!("cancelled"),
+                    let refreshed = provider_request_identity(&creds, &target, &body);
+                    ticket = match ledger {
+                        Some(ledger) => ledger
+                            .declare(crate::send_authority::SendCause::AuthRefresh, &refreshed)?,
+                        None => crate::send_authority::AttemptTicket::unbound(),
                     };
+                    ticket.mark_sending()?;
+                    resp = tokio::select! {
+                        r = send_once(&creds, &ticket).send() => match r {
+                            Ok(resp) => resp,
+                            Err(e) => {
+                                if e.is_connect() {
+                                    ticket.settle_not_sent()?;
+                                } else {
+                                    ticket.mark_uncertain()?;
+                                }
+                                bail!("request error after refresh: {e}");
+                            }
+                        },
+                        _ = cancel.cancelled() => {
+                            ticket.mark_uncertain()?;
+                            bail!("cancelled");
+                        }
+                    };
+                    ticket.mark_sent(
+                        provider_request_id(resp.headers()).as_deref(),
+                        resp.status().as_u16(),
+                    )?;
+                    ticket.mark_responding()?;
                 }
                 Err(e) => {
                     let text = read_bounded_response_body(resp, cancel)
@@ -1847,7 +1920,16 @@ where
             } else {
                 format!("HTTP {status}: {clipped}")
             });
+            // The provider answered. That is a delivery and a decision, not
+            // an ambiguity, so the attempt settles and the retry is declared
+            // as its own physical send under a fresh ordinal and key.
+            ticket.settle_rejected(status.as_u16())?;
             if attempt < 3 {
+                cause = if status.as_u16() == 429 {
+                    crate::send_authority::SendCause::RateLimitRetry
+                } else {
+                    crate::send_authority::SendCause::ServerErrorRetry
+                };
                 tokio::time::sleep(std::time::Duration::from_millis(600 * (1 << attempt))).await;
                 continue;
             }
@@ -1855,6 +1937,7 @@ where
         }
 
         if !status.is_success() {
+            ticket.settle_rejected(status.as_u16())?;
             let text = read_bounded_response_body(resp, cancel)
                 .await
                 .unwrap_or_default();
@@ -1869,6 +1952,7 @@ where
                     object.remove("tool_choice");
                 }
                 last_err = Some("HTTP 400 (will retry without tool_choice)".into());
+                cause = crate::send_authority::SendCause::RequestShapeFallback;
                 continue;
             }
             // Some proxies reject stream+tools — fall back to non-stream once.
@@ -1881,6 +1965,7 @@ where
                     "HTTP {status} (will retry non-stream): {}",
                     text.chars().take(200).collect::<String>()
                 ));
+                cause = crate::send_authority::SendCause::StreamFallback;
                 continue;
             }
             if target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions {
@@ -1900,12 +1985,25 @@ where
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_ascii_lowercase();
+        // Past the head. Everything from here on is reading an answer the
+        // provider is already producing, so a failure is ambiguity about the
+        // *outcome* rather than about the delivery, and it fences.
         if body.get("stream").and_then(|s| s.as_bool()) == Some(false) {
-            let raw = read_bounded_response_body(resp, cancel).await?;
-            let v: serde_json::Value =
-                serde_json::from_str(&raw).map_err(|e| anyhow!("provider JSON: {e}"))?;
-            // Note: session usage is accumulated in the turn loop when available.
-            let _ = v.get("usage"); // kept for future wire-through of session_id
+            let raw = match read_bounded_response_body(resp, cancel).await {
+                Ok(raw) => raw,
+                Err(error) => {
+                    ticket.mark_uncertain()?;
+                    return Err(error);
+                }
+            };
+            let v: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(value) => value,
+                Err(e) => {
+                    ticket.mark_uncertain()?;
+                    bail!("provider JSON: {e}");
+                }
+            };
+            ticket.settle_accepted(reported_usage(&v), v["id"].as_str())?;
             return parse_agent_step_from_message(
                 &v["choices"][0]["message"],
                 false,
@@ -1914,9 +2012,21 @@ where
             );
         }
         if content_type.contains("application/json") {
-            let raw = read_bounded_response_body(resp, cancel).await?;
-            let value: serde_json::Value =
-                serde_json::from_str(&raw).map_err(|e| anyhow!("provider JSON: {e}"))?;
+            let raw = match read_bounded_response_body(resp, cancel).await {
+                Ok(raw) => raw,
+                Err(error) => {
+                    ticket.mark_uncertain()?;
+                    return Err(error);
+                }
+            };
+            let value: serde_json::Value = match serde_json::from_str(&raw) {
+                Ok(value) => value,
+                Err(e) => {
+                    ticket.mark_uncertain()?;
+                    bail!("provider JSON: {e}");
+                }
+            };
+            ticket.settle_accepted(reported_usage(&value), value["id"].as_str())?;
             return parse_agent_step_from_message(
                 &value["choices"][0]["message"],
                 false,
@@ -1937,13 +2047,23 @@ where
                 c = stream.next() => c,
                 _ = cancel.cancelled() => {
                     drop(stream);
+                    // Cancelled mid-stream. The provider is still producing an
+                    // answer nobody will read, which is the definition of an
+                    // unresolved outcome.
+                    ticket.mark_uncertain()?;
                     bail!("cancelled");
                 }
             };
             let Some(chunk) = chunk else {
                 break;
             };
-            let bytes = chunk.map_err(|e| anyhow!("stream: {e}"))?;
+            let bytes = match chunk {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    ticket.mark_uncertain()?;
+                    bail!("stream: {e}");
+                }
+            };
             if !acc.saw_data {
                 full_body.push(&bytes)?;
             }
@@ -1964,10 +2084,21 @@ where
             }
         }
         if !acc.saw_data {
-            let raw = full_body.finish()?;
-            let value: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|error| {
-                anyhow!("provider returned neither SSE nor valid JSON: {error}")
-            })?;
+            let raw = match full_body.finish() {
+                Ok(raw) => raw,
+                Err(error) => {
+                    ticket.mark_uncertain()?;
+                    return Err(error);
+                }
+            };
+            let value: serde_json::Value = match serde_json::from_str(raw.trim()) {
+                Ok(value) => value,
+                Err(error) => {
+                    ticket.mark_uncertain()?;
+                    bail!("provider returned neither SSE nor valid JSON: {error}");
+                }
+            };
+            ticket.settle_accepted(reported_usage(&value), value["id"].as_str())?;
             return parse_agent_step_from_message(
                 &value["choices"][0]["message"],
                 false,
@@ -1976,8 +2107,23 @@ where
             );
         }
 
-        ensure_stream_completed(acc.saw_data, done)?;
-        let tool_calls = finish_streamed_tool_calls(acc.tool_calls, done)?;
+        // A stream that stopped before its terminator is a truncated answer to
+        // a request that certainly ran. Fence it: re-sending would repeat work
+        // the provider has already done and billed.
+        if let Err(error) = ensure_stream_completed(acc.saw_data, done) {
+            ticket.mark_uncertain()?;
+            return Err(error);
+        }
+        let tool_calls = match finish_streamed_tool_calls(acc.tool_calls, done) {
+            Ok(tool_calls) => tool_calls,
+            Err(error) => {
+                ticket.mark_uncertain()?;
+                return Err(error);
+            }
+        };
+        // The stream completed. Usage is not carried on the SSE terminator on
+        // every route, so absent counts stay absent rather than being guessed.
+        ticket.settle_accepted(None, None)?;
 
         let reasoning_opt = if acc.reasoning.trim().is_empty() {
             None
@@ -2017,6 +2163,7 @@ where
         last_err = Some("empty stream response".into());
         if attempt < 3 {
             body["stream"] = serde_json::Value::Bool(false);
+            cause = crate::send_authority::SendCause::StreamFallback;
             continue;
         }
         bail!("{}", last_err.unwrap());
@@ -2203,6 +2350,7 @@ mod compatible_stream_tests {
                         &[serde_json::json!({"role": "user", "content": "synthetic"})],
                         &serde_json::json!([]),
                         &cancel,
+                        None,
                         move |_| cancel_after_delta.cancel(),
                         |_| {},
                     ),
@@ -2240,6 +2388,7 @@ mod compatible_stream_tests {
                     None,
                     temp.path(),
                     SessionKind::Chat,
+                    None,
                 )
                 .await;
                 let error = match result {
@@ -2435,6 +2584,91 @@ pub(crate) fn api_context_messages(session: &Session) -> Vec<(String, String)> {
 /// `history` is already windowed (post-`api_context_start`); last entry is
 /// typically the current user prompt. `compacted_summary` is the extractive
 /// stand-in for local-only prefix that left the context window.
+/// Identify one physical provider request without recording where it went or
+/// what it was sent under.
+///
+/// Every component is a digest: the endpoint, the exact bytes, and the
+/// credential material. Together they make a re-point, a rewritten body, or a
+/// refreshed token detectable after the fact, and none of them can be read
+/// back into a URL, a prompt, or a secret.
+pub(crate) fn provider_request_identity(
+    creds: &crate::auth_store::WireCredentials,
+    target: &ResolvedModelTarget,
+    body: &serde_json::Value,
+) -> crate::send_authority::ProviderRequestIdentity {
+    crate::send_authority::ProviderRequestIdentity {
+        route_digest: crate::attempt_binding::route_digest(&target.base_url),
+        body_digest: crate::attempt_binding::body_digest(body),
+        credential_revision: crate::attempt_binding::credential_digest(
+            &serde_json::json!({
+                "providerId": creds.provider_id,
+                "method": creds.method,
+                "oidcTokenAuth": creds.oidc_token_auth,
+                "userId": creds.user_id,
+                "teamId": creds.team_id,
+                "authScope": creds.auth_scope,
+                "principalType": creds.principal_type,
+                "principalId": creds.principal_id,
+                "expiresAt": creds.expires_at,
+            }),
+            &creds.bearer,
+        ),
+    }
+}
+
+/// The provider's own identifier for a request, when it published one.
+///
+/// Read from the response head rather than the body so it is available even
+/// when the body is unreadable — which is exactly the case where a
+/// reconciliation needs it most. Clipped to graphic ASCII so a hostile header
+/// cannot smuggle control characters into a durable record or a UI.
+pub(crate) fn provider_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    const CANDIDATES: [&str; 5] = [
+        "x-request-id",
+        "x-grok-request-id",
+        "request-id",
+        "openai-request-id",
+        "cf-ray",
+    ];
+    for name in CANDIDATES {
+        let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
+            continue;
+        };
+        let token: String = value
+            .trim()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            .take(96)
+            .collect();
+        if !token.is_empty() {
+            return Some(format!("prq:{name}.{token}"));
+        }
+    }
+    None
+}
+
+/// The token counts a provider reported for one response, if it reported any.
+///
+/// Absent counts stay absent. A host estimate is not a provider receipt, and
+/// recording one as if it were would make the ledger claim knowledge it does
+/// not have.
+fn reported_usage(body: &serde_json::Value) -> Option<grokptah_agent_sdk::attempt::UsageReceipt> {
+    let usage = &body["usage"];
+    let input = usage["prompt_tokens"]
+        .as_u64()
+        .or_else(|| usage["input_tokens"].as_u64());
+    let output = usage["completion_tokens"]
+        .as_u64()
+        .or_else(|| usage["output_tokens"].as_u64());
+    match (input, output) {
+        (None, None) => None,
+        (input, output) => Some(grokptah_agent_sdk::attempt::UsageReceipt {
+            input_tokens: input.unwrap_or(0),
+            output_tokens: output.unwrap_or(0),
+        }),
+    }
+}
+
 pub(crate) async fn call_xai_chat(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
@@ -2442,6 +2676,7 @@ pub(crate) async fn call_xai_chat(
     compacted_summary: Option<&str>,
     cwd: &Path,
     kind: SessionKind,
+    ledger: Option<&crate::send_authority::SendLedger>,
 ) -> Result<String> {
     // Prefer a non-expired / refreshed OIDC access token before the first call.
     let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
@@ -2451,8 +2686,10 @@ pub(crate) async fn call_xai_chat(
     if !target.capabilities.chat {
         bail!("provider model `{}` is not chat-capable", target.wire_model);
     }
-    let base = target.base_url;
-    let model_id = target.wire_model;
+    // Cloned rather than moved out: `target` stays whole so the durable
+    // attempt can be bound to the exact route it resolved to.
+    let base = target.base_url.clone();
+    let model_id = target.wire_model.clone();
     let request_timeout = target.deadline_class.chat_timeout();
     let is_compatible =
         target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions;
@@ -2520,16 +2757,35 @@ pub(crate) async fn call_xai_chat(
     });
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
-    let send_once = |c: &crate::auth_store::WireCredentials| {
+    // Declared before the socket exists, so there is no way to reach the
+    // transport without a durable record already on disk. A host killed
+    // between here and the first byte leaves `known_not_sent`, which is the
+    // only state that is safe to retry by itself.
+    let identity = provider_request_identity(&creds, &target, &body);
+    let mut ticket = match ledger {
+        Some(ledger) => ledger.declare(crate::send_authority::SendCause::InitialSend, &identity)?,
+        None => crate::send_authority::AttemptTicket::unbound(),
+    };
+
+    // Present the *recorded* key, not a fresh one. An `uncertain` attempt can
+    // only be reconciled if the provider was given something to recognise it
+    // by, and the key is derived from the run and ordinal so a host that
+    // crashes and re-reads its own record reproduces it exactly.
+    let send_once = |c: &crate::auth_store::WireCredentials,
+                     ticket: &crate::send_authority::AttemptTicket| {
         let req = client.post(&url).header("Content-Type", "application/json");
+        let req = if ticket.is_bound() {
+            req.header("Idempotency-Key", ticket.idempotency_key())
+                .header("X-Request-Id", ticket.request_id())
+        } else {
+            req
+        };
         let req = crate::auth_store::apply_auth_headers(req, c, &base);
         req.json(&body)
     };
 
-    let mut resp = send_once(&creds).send().await.map_err(|e| {
-        // Surface classify-able transport failures (DNS, TLS, timeout) so the
-        // UI is not a vague "error sending request".
-        let kind = if e.is_timeout() {
+    let classify_transport = |e: &reqwest::Error| {
+        if e.is_timeout() {
             "timeout"
         } else if e.is_connect() {
             "connect"
@@ -2537,7 +2793,9 @@ pub(crate) async fn call_xai_chat(
             "request"
         } else {
             "network"
-        };
+        }
+    };
+    let transport_error = |kind: &str, e: &reqwest::Error| {
         if is_compatible {
             anyhow!(
                 "configured provider request failed ({kind}); check its connection and request budget"
@@ -2548,17 +2806,72 @@ pub(crate) async fn call_xai_chat(
                  Check network, VPN, and that cli-chat-proxy is reachable."
             )
         }
-    })?;
+    };
+
+    // The send boundary. `sending` is durable before the first byte and is
+    // never written after it.
+    ticket.mark_sending()?;
+    let mut resp = match send_once(&creds, &ticket).send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let kind = classify_transport(&e);
+            // A connect-phase failure is positive evidence the request never
+            // reached the provider. Everything else -- a timeout above all --
+            // is ambiguous and fences instead of retrying: a request that
+            // timed out may be running right now.
+            if e.is_connect() {
+                ticket.settle_not_sent()?;
+            } else {
+                ticket.mark_uncertain()?;
+            }
+            return Err(transport_error(kind, &e));
+        }
+    };
+    // A response head is the provider's own proof of receipt.
+    ticket.mark_sent(
+        provider_request_id(resp.headers()).as_deref(),
+        resp.status().as_u16(),
+    )?;
+    ticket.mark_responding()?;
 
     // One retry after OIDC refresh on 401 (expired access token is common).
+    //
+    // A 401 is a definitive answer, so the first attempt settles as rejected
+    // rather than lingering unresolved -- the provider received the request
+    // and refused it before executing anything. The refreshed send is a
+    // *different* physical request under a different credential, so it is
+    // declared as its own attempt with its own ordinal, key, and digest
+    // instead of being smuggled through the record of the one that failed.
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED && creds.oidc_token_auth {
+        ticket.settle_rejected(reqwest::StatusCode::UNAUTHORIZED.as_u16())?;
         match crate::auth_store::force_refresh(&creds).await {
             Ok(fresh) => {
                 creds = fresh;
-                resp = send_once(&creds)
-                    .send()
-                    .await
-                    .map_err(|e| anyhow!("request error after refresh for {url}: {e}"))?;
+                let refreshed_identity = provider_request_identity(&creds, &target, &body);
+                ticket = match ledger {
+                    Some(ledger) => ledger.declare(
+                        crate::send_authority::SendCause::AuthRefresh,
+                        &refreshed_identity,
+                    )?,
+                    None => crate::send_authority::AttemptTicket::unbound(),
+                };
+                ticket.mark_sending()?;
+                resp = match send_once(&creds, &ticket).send().await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        if e.is_connect() {
+                            ticket.settle_not_sent()?;
+                        } else {
+                            ticket.mark_uncertain()?;
+                        }
+                        return Err(anyhow!("request error after refresh for {url}: {e}"));
+                    }
+                };
+                ticket.mark_sent(
+                    provider_request_id(resp.headers()).as_deref(),
+                    resp.status().as_u16(),
+                )?;
+                ticket.mark_responding()?;
             }
             Err(e) => {
                 let text = read_bounded_response_body(resp, &CancellationToken::new())
@@ -2575,6 +2888,10 @@ pub(crate) async fn call_xai_chat(
 
     if !resp.status().is_success() {
         let status = resp.status();
+        // A non-success status is still an answer: the provider received the
+        // request and decided about it. Fencing the route here would strand a
+        // perfectly healthy credential over a 400.
+        ticket.settle_rejected(status.as_u16())?;
         if is_compatible {
             bail!("configured provider returned HTTP {status}");
         }
@@ -2584,19 +2901,43 @@ pub(crate) async fn call_xai_chat(
         let clipped: String = text.chars().take(800).collect();
         bail!("HTTP {status}: {clipped}");
     }
-    let raw = read_bounded_response_body(resp, &CancellationToken::new()).await?;
-    let v: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|error| anyhow!("provider JSON: {error}"))?;
+    let status = resp.status().as_u16();
+    // Past the head and into the body: a failure from here on is the one case
+    // where the request certainly arrived and its outcome certainly is not
+    // known, so it fences.
+    let raw = match read_bounded_response_body(resp, &CancellationToken::new()).await {
+        Ok(raw) => raw,
+        Err(error) => {
+            ticket.mark_uncertain()?;
+            return Err(error);
+        }
+    };
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            // The provider answered with something we cannot read. It very
+            // likely executed the request, so this is ambiguity, not failure.
+            ticket.mark_uncertain()?;
+            return Err(anyhow!("provider JSON: {error}"));
+        }
+    };
+    let usage = reported_usage(&v);
+    let provider_run = v["id"].as_str();
+    let settle_accepted = || ticket.settle_accepted(usage, provider_run);
     // chat/completions shape
     if let Some(content) = v["choices"][0]["message"]["content"].as_str() {
         if !content.is_empty() {
-            return Ok(content.to_string());
+            let content = content.to_string();
+            settle_accepted()?;
+            return Ok(content);
         }
     }
     // responses API fallback (some catalog models use this backend)
     if let Some(content) = v["output_text"].as_str() {
         if !content.is_empty() {
-            return Ok(content.to_string());
+            let content = content.to_string();
+            settle_accepted()?;
+            return Ok(content);
         }
     }
     if let Some(arr) = v["output"].as_array() {
@@ -2607,9 +2948,15 @@ pub(crate) async fn call_xai_chat(
             }
         }
         if !parts.is_empty() {
-            return Ok(parts.join(""));
+            let joined = parts.join("");
+            settle_accepted()?;
+            return Ok(joined);
         }
     }
+    // A complete, well-formed response that carries no usable message. The
+    // provider answered and charged for it, so it settled -- it just did not
+    // say anything this host can use.
+    ticket.settle_rejected(status)?;
     bail!("empty model response: {v}");
 }
 
@@ -3045,5 +3392,610 @@ test result: FAILED. 0 passed; 3 failed; 0 ignored
         assert!(stationarity.contains("true no-op tool calls"));
         assert!(!is_round_limit_stop_message(&stationarity));
         assert!(round_limit_stop_message(4).contains("tool rounds without a final answer"));
+    }
+}
+
+/// Transport-level proof that no provider request escapes the durable ledger.
+///
+/// Every test here drives the real send path against a scripted loopback
+/// server: no provider credential, no network, and no live call. The server is
+/// the only thing that decides what the "provider" did, which is the point —
+/// the assertions are about what the ledger recorded *from what was observed*,
+/// never from what the host intended.
+#[cfg(test)]
+mod send_authority_transport_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, Response, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+    use grokptah_agent_sdk::account::CredentialMethod;
+    use grokptah_agent_sdk::attempt::{ProviderAttempt, SendOutcome, SendState};
+    use grokptah_agent_sdk::launch::{
+        BaseCategory, LaunchRequirement, ModelReference, ProviderClass, RequestDialect, RouteClass,
+    };
+
+    use super::*;
+    use crate::orchestration::OrchStore;
+    use crate::send_authority::{SendBinding, SendLedger};
+
+    /// What the scripted provider does for one request, in order.
+    #[derive(Clone)]
+    enum Act {
+        /// A complete, well-formed answer.
+        Ok(&'static str),
+        /// A definitive non-success status.
+        Status(u16),
+        /// A response head followed by a body that stops early.
+        TruncatedBody,
+        /// Never answer, so the client's own deadline fires.
+        Hang,
+    }
+
+    struct Provider {
+        script: Vec<Act>,
+        seen: AtomicUsize,
+        keys: parking_lot::Mutex<Vec<String>>,
+    }
+
+    fn credentials(provider_id: &str) -> crate::auth_store::WireCredentials {
+        crate::auth_store::WireCredentials {
+            provider_id: provider_id.into(),
+            // A synthetic value that exists only in this test process; nothing
+            // here reaches a real provider.
+            bearer: "synthetic-loopback-key".into(),
+            oidc_token_auth: false,
+            display_name: "Synthetic gateway".into(),
+            method: "test".into(),
+            user_id: None,
+            team_id: None,
+            auth_scope: None,
+            refresh_token: None,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            principal_type: None,
+            principal_id: None,
+            expires_at: None,
+        }
+    }
+
+    fn install_profile(home: &std::path::Path, provider_id: &str, base_url: &str) -> String {
+        crate::discover::set_grokptah_home_override(Some(home.to_path_buf()));
+        let mut config = crate::gateway_config::GatewayConfig::default();
+        let mut profile = crate::gateway_config::ProviderProfile::openai_compatible(
+            provider_id,
+            "Send authority test",
+            base_url,
+        );
+        let mut model = crate::gateway_config::ProviderModel::unqualified("test-model");
+        model.capabilities.tools = true;
+        model.capabilities.stream = true;
+        model.capabilities.source = crate::gateway_config::CapabilitySource::Measured;
+        model.capabilities.qualification_schema =
+            Some(crate::gateway_config::CAPABILITY_QUALIFICATION_SCHEMA.into());
+        profile.upsert_model(model);
+        config.upsert_profile(profile).unwrap();
+        crate::gateway_config::save(&config).unwrap();
+        crate::gateway_config::model_selection_key(provider_id, "test-model")
+    }
+
+    fn requirement() -> LaunchRequirement {
+        LaunchRequirement {
+            provider: ProviderClass::OpenAiCompatible,
+            credential_method: CredentialMethod::ProviderEnv,
+            route: RouteClass::CompatibleProvider,
+            base: BaseCategory::CompatibleLoopback,
+            dialect: RequestDialect::OpenAiChatCompletions,
+            model: ModelReference::new("test-model"),
+            account_reference: None,
+        }
+    }
+
+    fn ledger(store: &OrchStore, run_id: &str) -> SendLedger {
+        SendLedger::bind(
+            store.clone(),
+            SendBinding {
+                run_id: run_id.into(),
+                request_id: format!("req-{run_id}"),
+                session_id: uuid::Uuid::nil(),
+                workspace: "/synthetic/workspace".into(),
+                prompt: "synthetic prompt".into(),
+                requirement: Some(requirement()),
+                profile: Some("openai-compatible".into()),
+                effort: Some("none".into()),
+            },
+        )
+        .expect("an admitted turn binds a ledger")
+    }
+
+    async fn handler(
+        State(provider): State<Arc<Provider>>,
+        headers: HeaderMap,
+        _body: String,
+    ) -> Response<Body> {
+        if let Some(key) = headers.get("idempotency-key").and_then(|v| v.to_str().ok()) {
+            provider.keys.lock().push(key.to_string());
+        }
+        let index = provider.seen.fetch_add(1, Ordering::SeqCst);
+        let act = provider
+            .script
+            .get(index)
+            .cloned()
+            .unwrap_or(Act::Status(500));
+        match act {
+            Act::Ok(text) => Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .header("x-request-id", "loopback-0001")
+                .body(Body::from(format!(
+                    r#"{{"id":"resp-{index}","choices":[{{"message":{{"content":"{text}"}}}}],"usage":{{"prompt_tokens":11,"completion_tokens":7}}}}"#
+                )))
+                .unwrap(),
+            Act::Status(code) => Response::builder()
+                .status(StatusCode::from_u16(code).unwrap())
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"error":"scripted"}"#))
+                .unwrap(),
+            Act::TruncatedBody => Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"choices":[{"message":{"cont"#))
+                .unwrap(),
+            Act::Hang => {
+                tokio::time::sleep(Duration::from_secs(3_600)).await;
+                unreachable!("the client deadline fires first")
+            }
+        }
+    }
+
+    struct Harness {
+        _home: tempfile::TempDir,
+        store: OrchStore,
+        model: String,
+        provider: Arc<Provider>,
+        credentials: crate::auth_store::WireCredentials,
+    }
+
+    impl Harness {
+        fn attempts(&self, run_id: &str) -> Vec<ProviderAttempt> {
+            self.store.list_attempts_for_run(run_id).unwrap()
+        }
+
+        fn states(&self, run_id: &str) -> Vec<SendState> {
+            self.attempts(run_id)
+                .iter()
+                .map(|attempt| attempt.send_state)
+                .collect()
+        }
+    }
+
+    async fn harness(provider_id: &str, script: Vec<Act>) -> Harness {
+        let provider = Arc::new(Provider {
+            script,
+            seen: AtomicUsize::new(0),
+            keys: parking_lot::Mutex::new(Vec::new()),
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(handler))
+            .with_state(provider.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let home = tempfile::tempdir().unwrap();
+        let model = install_profile(home.path(), provider_id, &format!("http://{address}/v1"));
+        let store = OrchStore::open(home.path().join("orchestration")).unwrap();
+        Harness {
+            _home: home,
+            store,
+            model,
+            provider,
+            credentials: credentials(provider_id),
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// Hold the process-wide home override for a whole test.
+    ///
+    /// `install_profile` points the crate at a temporary home, which is global
+    /// state; without this two tests in the same binary would read each
+    /// other's gateway config and the failure would look like a ledger bug.
+    struct HomeGuard {
+        /// Held for its lifetime, never read: the lock *is* the guarantee.
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HomeGuard {
+        fn acquire() -> Self {
+            Self {
+                _serial: crate::discover::home_override_serial(),
+            }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            crate::discover::set_grokptah_home_override(None);
+        }
+    }
+
+    async fn chat(
+        harness: &Harness,
+        ledger: &SendLedger,
+        cwd: &std::path::Path,
+    ) -> anyhow::Result<String> {
+        call_xai_chat(
+            &harness.credentials,
+            &harness.model,
+            &[("user".into(), "synthetic".into())],
+            None,
+            cwd,
+            SessionKind::Chat,
+            Some(ledger),
+        )
+        .await
+    }
+
+    /// The baseline the whole lane exists for: a Chat turn is recorded, and it
+    /// is recorded from what the provider did rather than from the fact that a
+    /// `String` came back.
+    #[test]
+    fn a_chat_send_is_recorded_and_settled_from_the_providers_own_receipt() {
+        let _home = HomeGuard::acquire();
+        runtime().block_on(async {
+            let harness = harness("chat-ok", vec![Act::Ok("hello")]).await;
+            let ledger = ledger(&harness.store, "run-chat-ok");
+            let cwd = tempfile::tempdir().unwrap();
+            let reply = chat(&harness, &ledger, cwd.path()).await.unwrap();
+            assert_eq!(reply, "hello");
+
+            let attempts = harness.attempts("run-chat-ok");
+            assert_eq!(attempts.len(), 1, "one physical send, one attempt");
+            let attempt = &attempts[0];
+            assert_eq!(attempt.send_state, SendState::Settled);
+            assert_eq!(attempt.receipts.outcome, Some(SendOutcome::Accepted));
+            // Every one of these is something only the provider could produce.
+            assert_eq!(attempt.receipts.response_status, Some(200));
+            assert_eq!(
+                attempt.receipts.request.as_ref().map(|id| id.as_str()),
+                Some("prq:x-request-id.loopback-0001")
+            );
+            let usage = attempt.receipts.usage.expect("the provider reported usage");
+            assert_eq!(usage.input_tokens, 11);
+            assert_eq!(usage.output_tokens, 7);
+            // And the request the provider saw carried the recorded key.
+            assert_eq!(
+                harness.provider.keys.lock().as_slice(),
+                [attempt.intent.provider_idempotency_key.as_str().to_string()]
+            );
+        });
+    }
+
+    /// A timeout is the case the conservative rule exists for: the bytes are
+    /// gone, the provider may be working, and the host knows nothing. It must
+    /// fence rather than try again.
+    #[test]
+    fn a_post_boundary_timeout_fences_instead_of_retrying() {
+        let _home = HomeGuard::acquire();
+        runtime().block_on(async {
+            let harness = harness("chat-timeout", vec![Act::Hang]).await;
+            let ledger = ledger(&harness.store, "run-timeout");
+            let cwd = tempfile::tempdir().unwrap();
+            let result =
+                tokio::time::timeout(Duration::from_secs(2), chat(&harness, &ledger, cwd.path()))
+                    .await;
+            // Whether the client deadline or the test deadline fires first,
+            // the ledger must never be left claiming a delivery it never saw.
+            drop(result);
+
+            let attempts = harness.attempts("run-timeout");
+            assert_eq!(attempts.len(), 1, "a timeout must not re-send");
+            assert!(
+                attempts[0].is_unresolved(),
+                "a timed-out send settled itself: {:?}",
+                attempts[0].send_state
+            );
+            assert!(!attempts[0].may_auto_retry());
+            assert_eq!(harness.provider.seen.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    /// A definitive non-success is a delivery *and* a decision. Fencing here
+    /// would strand a credential that is working exactly as designed.
+    #[test]
+    fn a_refused_request_settles_as_rejected_and_does_not_fence_the_run() {
+        let _home = HomeGuard::acquire();
+        runtime().block_on(async {
+            let harness = harness("chat-400", vec![Act::Status(400)]).await;
+            let ledger = ledger(&harness.store, "run-rejected");
+            let cwd = tempfile::tempdir().unwrap();
+            let error = chat(&harness, &ledger, cwd.path())
+                .await
+                .expect_err("a 400 is an error to the caller");
+            // The refusal names the status without echoing the body or the URL.
+            assert!(error.to_string().contains("400"));
+
+            let attempts = harness.attempts("run-rejected");
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].send_state, SendState::Settled);
+            assert_eq!(attempts[0].receipts.outcome, Some(SendOutcome::Rejected));
+            assert!(
+                harness
+                    .store
+                    .run_permits_new_attempt("run-rejected")
+                    .unwrap(),
+                "a settled refusal must not fence the run"
+            );
+        });
+    }
+
+    /// A response head followed by a body that stops early: certainly
+    /// delivered, certainly unresolved.
+    #[test]
+    fn a_truncated_body_is_uncertain_and_blocks_an_equivalent_request() {
+        let _home = HomeGuard::acquire();
+        runtime().block_on(async {
+            let harness = harness("chat-truncated", vec![Act::TruncatedBody]).await;
+            let ledger = ledger(&harness.store, "run-truncated");
+            let cwd = tempfile::tempdir().unwrap();
+            chat(&harness, &ledger, cwd.path())
+                .await
+                .expect_err("an unreadable body is an error");
+
+            let attempts = harness.attempts("run-truncated");
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].send_state, SendState::Uncertain);
+            assert!(!attempts[0].may_auto_retry());
+            assert!(
+                !harness
+                    .store
+                    .run_permits_new_attempt("run-truncated")
+                    .unwrap(),
+                "an unresolved send stopped fencing the run"
+            );
+        });
+    }
+
+    /// The duplicate-send refusal, at the boundary rather than in a policy
+    /// someone else has to remember to consult.
+    #[test]
+    fn a_second_send_is_refused_while_the_first_is_unresolved() {
+        let _home = HomeGuard::acquire();
+        runtime().block_on(async {
+            let harness = harness(
+                "chat-duplicate",
+                vec![Act::TruncatedBody, Act::Ok("second")],
+            )
+            .await;
+            let ledger = ledger(&harness.store, "run-duplicate");
+            let cwd = tempfile::tempdir().unwrap();
+            chat(&harness, &ledger, cwd.path())
+                .await
+                .expect_err("the first send is unreadable");
+            assert_eq!(harness.states("run-duplicate"), vec![SendState::Uncertain]);
+
+            let refusal = chat(&harness, &ledger, cwd.path())
+                .await
+                .expect_err("an equivalent request must be refused");
+            let refusal = refusal.to_string();
+            assert!(refusal.contains("refusing to send"), "{refusal}");
+            assert!(refusal.contains("uncertain"), "{refusal}");
+            // The refusal names the key an operator reconciles against.
+            let attempts = harness.attempts("run-duplicate");
+            assert!(refusal.contains(attempts[0].intent.provider_idempotency_key.as_str()));
+            // And nothing new reached the provider.
+            assert_eq!(harness.provider.seen.load(Ordering::SeqCst), 1);
+            assert_eq!(attempts.len(), 1);
+        });
+    }
+
+    /// Reopening the store is not a reconciliation. No number of restarts
+    /// turns an unresolved send back into a retryable one.
+    #[test]
+    fn a_restart_never_clears_an_unresolved_send() {
+        let _home = HomeGuard::acquire();
+        runtime().block_on(async {
+            let harness = harness("chat-restart", vec![Act::TruncatedBody]).await;
+            let root = crate::discover::grokptah_home().join("orchestration");
+            {
+                let ledger = ledger(&harness.store, "run-restart");
+                let cwd = tempfile::tempdir().unwrap();
+                chat(&harness, &ledger, cwd.path())
+                    .await
+                    .expect_err("fenced");
+            }
+            // Release every live handle so the reopen is a real restart: the
+            // ledger holds an exclusive lock, exactly as a second process
+            // would find it.
+            let Harness { _home, store, .. } = harness;
+            drop(store);
+
+            for _ in 0..3 {
+                let reopened =
+                    OrchStore::open(root.clone()).expect("a restarted process reopens its ledger");
+                let recovered = reopened.list_attempts_for_run("run-restart").unwrap();
+                assert_eq!(recovered.len(), 1);
+                assert_eq!(recovered[0].send_state, SendState::Uncertain);
+                assert!(!recovered[0].may_auto_retry());
+                assert!(!reopened.run_permits_new_attempt("run-restart").unwrap());
+                drop(reopened);
+            }
+            drop(_home);
+        });
+    }
+
+    /// Each physical send is its own attempt with its own key. A retry that
+    /// reused the first key would be indistinguishable, to the provider, from
+    /// the duplicate the key exists to suppress.
+    #[test]
+    fn each_physical_send_gets_a_fresh_ordinal_and_key() {
+        let _home = HomeGuard::acquire();
+        runtime().block_on(async {
+            let harness = harness("chat-replay", vec![Act::Ok("first"), Act::Ok("second")]).await;
+            let ledger = ledger(&harness.store, "run-replay");
+            let cwd = tempfile::tempdir().unwrap();
+            chat(&harness, &ledger, cwd.path()).await.unwrap();
+            chat(&harness, &ledger, cwd.path()).await.unwrap();
+
+            let attempts = harness.attempts("run-replay");
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts[0].ordinal, 1);
+            assert_eq!(attempts[1].ordinal, 2);
+            assert_ne!(
+                attempts[0].intent.provider_idempotency_key,
+                attempts[1].intent.provider_idempotency_key,
+                "two physical sends reused one idempotency key"
+            );
+            let keys = harness.provider.keys.lock().clone();
+            assert_eq!(keys.len(), 2);
+            assert_ne!(keys[0], keys[1]);
+            // Same intent, so the digest is stable across both.
+            assert_eq!(attempts[0].intent.digest, attempts[1].intent.digest);
+        });
+    }
+
+    /// The durable record is a projection, and it must survive being read by
+    /// anyone. Nothing in it may name a credential, an endpoint, or the text
+    /// of the request.
+    #[test]
+    fn a_recorded_attempt_carries_no_secret_endpoint_or_prompt() {
+        let _home = HomeGuard::acquire();
+        runtime().block_on(async {
+            let harness = harness("chat-redaction", vec![Act::Ok("hello")]).await;
+            let ledger = ledger(&harness.store, "run-redaction");
+            let cwd = tempfile::tempdir().unwrap();
+            chat(&harness, &ledger, cwd.path()).await.unwrap();
+
+            let attempts = harness.attempts("run-redaction");
+            let encoded = serde_json::to_string(&attempts[0]).unwrap();
+            for forbidden in [
+                "synthetic-loopback-key", // the bearer
+                "127.0.0.1",              // the endpoint host
+                "http://",                // any URL at all
+                "chat/completions",       // the endpoint path
+                "synthetic prompt",       // the request text
+                "/synthetic/workspace",   // the host path
+            ] {
+                assert!(
+                    !encoded.contains(forbidden),
+                    "the durable attempt leaked {forbidden:?}: {encoded}"
+                );
+            }
+            // The bindings are present, and they are digests.
+            let route = attempts[0]
+                .route
+                .route_digest
+                .as_ref()
+                .expect("route bound");
+            assert!(route.as_str().starts_with("route:"));
+            let body = attempts[0].intent.body_digest.as_ref().expect("body bound");
+            assert!(body.as_str().starts_with("body:"));
+            let credential = attempts[0]
+                .route
+                .credential_digest
+                .as_ref()
+                .expect("credential bound");
+            assert!(credential.as_str().starts_with("cred:"));
+            // The provider's own identifiers *are* recorded -- they are the
+            // handle a reconciliation is performed against -- but only in the
+            // bounded, prefixed form the contract allows.
+            let request = attempts[0].receipts.request.as_ref().expect("receipt");
+            assert!(request.as_str().starts_with("prq:"));
+            assert!(request.is_bounded());
+            assert!(attempts[0]
+                .receipts
+                .run
+                .as_ref()
+                .is_some_and(grokptah_agent_sdk::attempt::BoundedId::is_bounded));
+        });
+    }
+
+    /// The opposite of a timeout, and the reason the two must not share a
+    /// code path: a refused connection proves the bytes never left, so the
+    /// attempt settles honestly and the run stays free to try again.
+    #[test]
+    fn a_refused_connection_settles_as_never_sent_and_frees_the_run() {
+        let _home = HomeGuard::acquire();
+        runtime().block_on(async {
+            // Bind and immediately release, so the address is real and nothing
+            // is listening on it. The connect phase fails before any byte of
+            // the request is written.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(listener);
+
+            let home = tempfile::tempdir().unwrap();
+            let model =
+                install_profile(home.path(), "chat-refused", &format!("http://{address}/v1"));
+            let store = OrchStore::open(home.path().join("orchestration")).unwrap();
+            let ledger = ledger(&store, "run-refused");
+            let cwd = tempfile::tempdir().unwrap();
+            let error = call_xai_chat(
+                &credentials("chat-refused"),
+                &model,
+                &[("user".into(), "synthetic".into())],
+                None,
+                cwd.path(),
+                SessionKind::Chat,
+                Some(&ledger),
+            )
+            .await
+            .expect_err("a closed endpoint cannot answer");
+            // The refusal never echoes where it tried to go.
+            assert!(!error.to_string().contains(&address.to_string()));
+
+            let attempts = store.list_attempts_for_run("run-refused").unwrap();
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].send_state, SendState::Settled);
+            assert_eq!(attempts[0].receipts.outcome, Some(SendOutcome::NotSent));
+            assert!(
+                !attempts[0].receipts.acknowledged(),
+                "a request that never left carried a provider receipt"
+            );
+            assert_eq!(attempts[0].validate(), Ok(()));
+            assert!(
+                store.run_permits_new_attempt("run-refused").unwrap(),
+                "a proven-unsent request fenced the run it never reached"
+            );
+        });
+    }
+
+    /// A digest binds the exact endpoint and the exact credential without
+    /// publishing either, so a silent re-point is detectable after the fact.
+    #[test]
+    fn route_and_credential_digests_change_only_when_the_thing_they_bind_does() {
+        let base = "https://gateway.example.internal/v1";
+        let same = crate::attempt_binding::route_digest(base);
+        assert_eq!(same, crate::attempt_binding::route_digest(base));
+        assert_ne!(
+            same,
+            crate::attempt_binding::route_digest("https://other.example.internal/v1")
+        );
+        assert!(!same.as_str().contains("example"));
+
+        let identity = serde_json::json!({"providerId": "p"});
+        let first = crate::attempt_binding::credential_digest(&identity, "token-one");
+        assert_eq!(
+            first,
+            crate::attempt_binding::credential_digest(&identity, "token-one")
+        );
+        // A refresh swaps the token without changing the account, and that is
+        // exactly the drift the digest has to catch.
+        assert_ne!(
+            first,
+            crate::attempt_binding::credential_digest(&identity, "token-two")
+        );
+        assert!(!first.as_str().contains("token"));
     }
 }
