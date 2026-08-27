@@ -167,7 +167,10 @@ module-level allow naming the change that must remove it.
   SDK here. `cargo check --target aarch64-apple-darwin` fails in `ring`'s C
   build before reaching any GrokPtah source. The `macos-source-typecheck`
   feature is the substitute and is deliberately narrower: it compiles the two
-  isolated modules only. Widening it to `macos_native` was tried and reverted —
+  isolated modules **and the crate-internal re-export of the packaged
+  supervisor**. That last line matters — it is `#[cfg(target_os = "macos")]`,
+  so while the feature did not cover it, a `-D warnings` `unused_imports`
+  error on it was invisible off macOS and only surfaced in CI. Widening it to `macos_native` was tried and reverted —
   that module's live roots are macOS-`cfg` call sites, so on Linux the whole
   module reads as dead and the lint surface loses fidelity rather than gaining
   it. `native_context` is the one known false positive: it is live on macOS via

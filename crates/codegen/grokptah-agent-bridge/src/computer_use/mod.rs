@@ -124,7 +124,13 @@ pub use isolated_visual_stream::{
     IsolatedVisualStream, ISOLATED_VISUAL_GUEST_INPUT_COMMAND, ISOLATED_VISUAL_STREAM_LENGTH_BYTES,
     ISOLATED_VISUAL_STREAM_MAX_FRAME_PACKET_BYTES,
 };
-#[cfg(target_os = "macos")]
+// Same reason as the module-level allow above: nothing dispatches the packaged
+// supervisor yet, so this re-export has no consumer and `-D warnings` rejects
+// it as unused. Widening it to the typecheck feature is deliberate — it is the
+// only way a non-macOS build sees this line at all, and it is exactly the line
+// that broke the macOS lint step when the feature did not cover it.
+#[allow(unused_imports)]
+#[cfg(any(target_os = "macos", feature = "macos-source-typecheck"))]
 pub(crate) use macos_isolated_runtime::IsolatedVisualPackagedRuntime;
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
