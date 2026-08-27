@@ -97,22 +97,51 @@ substrate on its own branch.
 | `isolated_visual_package.rs` | 8.4k | shipped package invariants vs the Rust contract | low |
 | `control.rs` | 4.9k | MCP mutation adapter (donor has `coordination.rs` instead) | **high — conflicts with donor design** |
 
-## 5. Pre-existing failures on the donor base
+## 5. Donor-base failures: repaired here, and what remains
 
-Reproduced on a clean checkout of `404ea3c2` with **zero** changes applied, then
-again after this change with identical results. None is in a file this change
-touches.
+All of these were reproduced on a clean checkout of `404ea3c2` with **zero**
+changes applied before being touched. None originates in the packaged launch
+boundary this branch adds.
 
-| Test | Failure |
-| --- | --- |
-| `computer_use::isolated_visual::tests::serialized_contract_contains_no_host_paths_or_channel_secret` | `assertion failed: !encoded.contains(forbidden)` |
-| `computer_use::isolated_visual_channel::tests::canonical_binding_vector_matches_freestanding_guest` | `left: 115, right: 114` |
-| `computer_use::isolated_visual_runtime::tests::runtime_requires_binding_before_channels_and_stop` | `isolated frame request nonce is not canonical` |
-| `computer_use::macos_observation::tests::secure_values_are_removed_and_evidence_is_exactly_scoped` | `left: 2, right: 1` |
-| `computer_use_release_gate::rust_computer_use_sources_remain_free_of_global_input_injection` | `macos_native_shim.m production source must not contain CGEventCreate` |
+### Repaired (five gates that were failing, none weakened)
 
-These are recorded, not fixed: each is outside the packaged launch boundary this
-change implements.
+| Test | Root cause | Repair |
+| --- | --- | --- |
+| `isolated_visual::…::serialized_contract_contains_no_host_paths_or_channel_secret` | the needle `"credential"` matched `credentialForwarding`, the profile field that *proves* forwarding is off | ban the value-bearing names instead, and assert `credentialForwarding:false`, `hostClipboard:false`, `sharedDirectories:false` — stronger than the absence of a word |
+| `isolated_visual_channel::…::canonical_binding_vector_matches_freestanding_guest` | test arithmetic: `domain-1` is 8 bytes, the expectation said 7 | corrected to 8; the exact packet length is still pinned |
+| `isolated_visual_runtime::…::runtime_requires_binding_before_channels_and_stop` | fixture used a bare 32-hex request nonce; the protocol requires a canonical UUIDv4 | fixture uses a real UUIDv4; the product gate is untouched |
+| `macos_observation::…::secure_values_are_removed_and_evidence_is_exactly_scoped` | the fixture gained a third node, so the surviving count moved 1 → 2. The product was already dropping the secure node correctly | assert the surviving *set* and that no surviving role contains `secure`, plus that neither the secret value, its label, nor its role escapes |
+| `computer_use_release_gate::rust_computer_use_sources_remain_free_of_global_input_injection` | the shim built a `CGEvent` purely to read the pointer for the before/after interaction fence, pulling in the banned global-injection family | read the pointer with AppKit `NSEvent.mouseLocation`. Only equality between two samples is ever used, so the differing coordinate origin does not change the fence. The gate still forbids `CGEventCreate` |
+
+### Still failing on the donor base, outside this lane
+
+| Test | Failure | Why it is not repaired here |
+| --- | --- | --- |
+| `mcp_continuity_probe::continuity_probe_is_evidence_first_and_recoverable` | `continuity probe harness timed out` after 98s | Reproduced identically on clean `404ea3c2`. Installing the harness's npm dependencies does not change it. MCP continuity lane, not packaged Computer Use |
+| 6 × `grokptah-service` `always_on_grokbot` tests | all six panic with `unknown tool ptah_set_managed_execution` | The tool exists in the bridge (`mcp_control.rs`) but the hosted service does not expose it. That is an always-on lane gap; no service production code is touched here |
+
+## 5a. CI status
+
+Three checks were red on the pull request. Each was diagnosed to its first
+failing step.
+
+| Check | Host | First failing step | Status |
+| --- | --- | --- | --- |
+| `always-on-grokbot` | ubuntu | `cargo clippy --locked --all-targets -- -D warnings` in `grokptah-service` — 9 lints in test sources | **repaired**, exact CI command now passes |
+| `hosted-service` | ubuntu | same service clippy step | **repaired**, same fix |
+| `desktop` | macOS | `grokptah-desktop` failed to compile: `unresolved import grokptah_agent_bridge::ComputerSurfaceCoordination` | **repaired** — the type was exported from `computer_use` but never re-exported at the crate root |
+
+The service lint repairs keep every assertion. The one that guards a gate,
+`assert!(PRELOAD_IMMUTABLE_GOLDEN, …)`, became `const { assert!(…) }`: the same
+message, now checked at compile time, so a build that flipped the flag cannot
+produce the test binary at all.
+
+Beyond its first failure the `desktop` job also runs bridge clippy under
+`-D warnings` on macOS. Two further classes were repaired for it: four
+platform-independent lints (`manual_is_multiple_of`, three `too_many_arguments`,
+and an `await_holding_lock`), and the dead-code rejection of the deliberately
+undispatched packaged supervisor, which is now documented with a single
+module-level allow naming the change that must remove it.
 
 ## 6. Compiled proof vs hardware proof
 
@@ -126,8 +155,27 @@ change implements.
 * Deterministic launch/cleanup receipts and their leak-freedom.
 * Protocol caps and misbinding refusals; artifact measurement against redirected
   symlinks, wrong modes, and oversize.
+* Public wire contract of the launch vocabulary: channel roles, guest
+  operations, authority states, and revocation reasons all pin their exact
+  serialized form, because receipts embed those names.
 * With `--features macos-source-typecheck`: `macos_isolated_runtime.rs` and
   `macos_isolated_artifacts.rs` typecheck and their 6 unit tests run.
+
+**Not verifiable in this container — exact host blockers:**
+
+* **macOS steps of the `desktop` job.** There is no macOS host and no macOS
+  SDK here. `cargo check --target aarch64-apple-darwin` fails in `ring`'s C
+  build before reaching any GrokPtah source. The `macos-source-typecheck`
+  feature is the substitute and is deliberately narrower: it compiles the two
+  isolated modules only. Widening it to `macos_native` was tried and reverted —
+  that module's live roots are macOS-`cfg` call sites, so on Linux the whole
+  module reads as dead and the lint surface loses fidelity rather than gaining
+  it. `native_context` is the one known false positive: it is live on macOS via
+  `macos_native.rs:328`.
+* **The Objective-C shim edit.** Replacing `CGEventCreate` with
+  `NSEvent.mouseLocation` is verified by the release gate (which reads the
+  source text) and by review. It is **not** compile-verified: `build.rs` skips
+  the shim off macOS, and no macOS SDK is available here.
 
 **Not proven anywhere in this branch — macOS hardware campaign:**
 

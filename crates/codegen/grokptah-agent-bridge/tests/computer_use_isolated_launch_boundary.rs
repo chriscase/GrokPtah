@@ -19,15 +19,16 @@ use grokptah_agent_bridge::computer_use::{
     measure_open_isolated_visual_artifact, measure_open_isolated_visual_artifacts,
     project_captured_artifact, redact_isolated_capture, ComputerErrorCode, ComputerSurfaceBinding,
     IsolatedGuestPhase, IsolatedGuestSession, IsolatedVisualArtifactRole,
-    IsolatedVisualChannelRole, IsolatedVisualFrame, IsolatedVisualGuestBinding,
-    IsolatedVisualGuestHealth, IsolatedVisualGuestMessage, IsolatedVisualHostMessage,
-    IsolatedVisualLaunchContract, IsolatedVisualLaunchDescriptors, IsolatedVisualManifest,
-    IsolatedVisualProtocolPayload, IsolatedVisualProtocolSession, IsolatedVisualResourceLimits,
+    IsolatedVisualAuthorityState, IsolatedVisualChannelRole, IsolatedVisualFrame,
+    IsolatedVisualGuestBinding, IsolatedVisualGuestHealth, IsolatedVisualGuestMessage,
+    IsolatedVisualGuestOperation, IsolatedVisualHostMessage, IsolatedVisualLaunchContract,
+    IsolatedVisualLaunchDescriptors, IsolatedVisualManifest, IsolatedVisualProtocolPayload,
+    IsolatedVisualProtocolSession, IsolatedVisualResourceLimits, IsolatedVisualRevocation,
     IsolatedVisualSecurityProfile, ISOLATED_VISUAL_CHANNEL_SECRET_BYTES,
     ISOLATED_VISUAL_FIRST_PRIVATE_DESCRIPTOR, ISOLATED_VISUAL_GUEST_PROTOCOL_VERSION,
-    ISOLATED_VISUAL_LAUNCH_CHANNEL_COUNT, ISOLATED_VISUAL_MANIFEST_SCHEMA_VERSION,
-    ISOLATED_VISUAL_MAX_CONFIGURATION_BYTES, ISOLATED_VISUAL_MAX_DESCRIPTOR,
-    MACOS_ISOLATED_VISUAL_CANDIDATE_BACKEND_ID,
+    ISOLATED_VISUAL_LAUNCH_CHANNEL_COUNT, ISOLATED_VISUAL_LAUNCH_RECEIPT_SCHEMA_VERSION,
+    ISOLATED_VISUAL_MANIFEST_SCHEMA_VERSION, ISOLATED_VISUAL_MAX_CONFIGURATION_BYTES,
+    ISOLATED_VISUAL_MAX_DESCRIPTOR, MACOS_ISOLATED_VISUAL_CANDIDATE_BACKEND_ID,
 };
 use serde_json::json;
 use tempfile::{tempdir, TempDir};
@@ -829,4 +830,91 @@ fn packaged_authority_cannot_be_minted_off_a_signed_macos_package() {
     )
     .expect_err("a non-macOS host must not produce a packaged artifact receipt");
     assert_eq!(error.code, ComputerErrorCode::UnsupportedPlatform);
+}
+
+// ---------------------------------------------------------------------------
+// Public wire contract of the packaged launch vocabulary
+// ---------------------------------------------------------------------------
+
+fn wire(value: &impl serde::Serialize) -> String {
+    serde_json::to_string(value).unwrap()
+}
+
+#[test]
+fn channel_roles_have_a_stable_snake_case_wire_form() {
+    // Receipts embed these names, so changing one silently rewrites the
+    // evidence a reader has already stored.
+    let encoded: Vec<String> = IsolatedVisualChannelRole::ALL.iter().map(wire).collect();
+    assert_eq!(
+        encoded,
+        vec![
+            "\"control\"",
+            "\"event\"",
+            "\"input\"",
+            "\"frame\"",
+            "\"challenge\"",
+        ]
+    );
+    assert_eq!(
+        IsolatedVisualChannelRole::ALL.len(),
+        ISOLATED_VISUAL_LAUNCH_CHANNEL_COUNT
+    );
+}
+
+#[test]
+fn guest_operations_have_a_stable_wire_form() {
+    for (operation, expected) in [
+        (IsolatedVisualGuestOperation::Start, "\"start\""),
+        (IsolatedVisualGuestOperation::ReadFrame, "\"read_frame\""),
+        (IsolatedVisualGuestOperation::WriteInput, "\"write_input\""),
+        (IsolatedVisualGuestOperation::Stop, "\"stop\""),
+        (IsolatedVisualGuestOperation::Cleanup, "\"cleanup\""),
+    ] {
+        assert_eq!(wire(&operation), expected);
+    }
+}
+
+#[test]
+fn authority_states_and_revocations_have_a_stable_wire_form() {
+    for (state, expected) in [
+        (IsolatedVisualAuthorityState::Admitted, "\"admitted\""),
+        (IsolatedVisualAuthorityState::Started, "\"started\""),
+        (IsolatedVisualAuthorityState::Stopping, "\"stopping\""),
+        (IsolatedVisualAuthorityState::Revoked, "\"revoked\""),
+        (IsolatedVisualAuthorityState::Terminated, "\"terminated\""),
+    ] {
+        assert_eq!(wire(&state), expected);
+    }
+    for (reason, expected) in [
+        (IsolatedVisualRevocation::OperatorStop, "\"operator_stop\""),
+        (IsolatedVisualRevocation::Cancelled, "\"cancelled\""),
+        (IsolatedVisualRevocation::HelperLoss, "\"helper_loss\""),
+        (
+            IsolatedVisualRevocation::RestartInterrupted,
+            "\"restart_interrupted\"",
+        ),
+        (IsolatedVisualRevocation::LeaseRevoked, "\"lease_revoked\""),
+    ] {
+        assert_eq!(wire(&reason), expected);
+    }
+}
+
+#[test]
+fn admission_is_deterministic_across_repeated_launches() {
+    let first = descriptors().admit().unwrap();
+    let second = descriptors().admit().unwrap();
+    assert_eq!(first.roles(), second.roles());
+    assert_eq!(first.channel_count(), second.channel_count());
+    assert_eq!(format!("{first:?}"), format!("{second:?}"));
+}
+
+#[test]
+fn the_published_launch_constants_are_the_ones_callers_compile_against() {
+    assert_eq!(ISOLATED_VISUAL_LAUNCH_RECEIPT_SCHEMA_VERSION, 1);
+    assert_eq!(ISOLATED_VISUAL_LAUNCH_CHANNEL_COUNT, 5);
+    assert_eq!(ISOLATED_VISUAL_FIRST_PRIVATE_DESCRIPTOR, 3);
+    assert_eq!(ISOLATED_VISUAL_MAX_DESCRIPTOR, 1_048_575);
+    // The floor is what keeps stdin/stdout/stderr out of the channel set.
+    // Checked at compile time: lowering it cannot even build.
+    const { assert!(ISOLATED_VISUAL_FIRST_PRIVATE_DESCRIPTOR > 2) };
 }

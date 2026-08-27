@@ -248,6 +248,12 @@ impl IsolatedVisualCleanupEvidence {
     /// exact process, handle, overlay, and frame-cache check. This constructor
     /// is crate-private so a model, provider, or external coordinator cannot
     /// manufacture terminal cleanup authority from serialized booleans.
+    // Only the host supervisor that actually performs the process, handle,
+    // overlay, and frame-cache checks may mint this, and that supervisor is
+    // the deliberately undispatched packaged runtime. Until it is wired up
+    // the constructor has no production caller, which is the point: evidence
+    // cannot be manufactured anywhere else.
+    #[allow(dead_code)]
     pub(crate) fn verified(
         surface: ComputerSurfaceBinding,
         helper_process_absent: bool,
@@ -637,10 +643,21 @@ mod tests {
             "overlayPath",
             "helperPath",
             "channelSecret",
-            "credential",
             "hostHome",
+            "credentials",
+            "credentialValue",
+            "apiKey",
+            "password",
+            "bearer",
         ] {
-            assert!(!encoded.contains(forbidden));
+            assert!(!encoded.contains(forbidden), "contract leaked {forbidden}");
         }
+        // `credentialForwarding` is the name of a declared-closed policy flag,
+        // not credential material, so banning the bare substring "credential"
+        // only banned the profile field that proves forwarding is off. Assert
+        // the closed value instead — strictly more than the absence of a word.
+        assert!(encoded.contains("\"credentialForwarding\":false"));
+        assert!(encoded.contains("\"hostClipboard\":false"));
+        assert!(encoded.contains("\"sharedDirectories\":false"));
     }
 }

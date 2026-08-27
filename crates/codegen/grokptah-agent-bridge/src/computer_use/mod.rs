@@ -31,8 +31,17 @@ mod isolated_visual_stream;
 // compiles these two modules on a non-macOS host so their contracts and unit
 // tests are checked in CI rather than going unwatched off macOS; it links no
 // framework and calls no native entry point.
+// The packaged supervisor is deliberately not wired into capability
+// admission: no Computer Use path launches a guest yet, so on macOS it has no
+// runtime caller and `-D warnings` rejects the whole substrate as dead. The
+// alternatives are worse — a crate-root re-export would widen the public
+// surface this boundary keeps closed, and dispatching it would claim macOS
+// behavior nothing here has proven. Remove this allow in the change that
+// actually dispatches the packaged runtime.
+#[allow(dead_code)]
 #[cfg(any(target_os = "macos", feature = "macos-source-typecheck"))]
 mod macos_isolated_artifacts;
+#[allow(dead_code)]
 #[cfg(any(target_os = "macos", feature = "macos-source-typecheck"))]
 mod macos_isolated_runtime;
 mod macos_observation;

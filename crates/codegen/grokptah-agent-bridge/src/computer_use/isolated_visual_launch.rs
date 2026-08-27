@@ -570,42 +570,165 @@ impl IsolatedVisualLaunchAuthority {
 }
 
 /// Deterministic public projection of one admitted packaged launch.
+///
+/// Fields are private for the same reason
+/// [`IsolatedVisualPackagedArtifactReceipt`]'s are: a receipt attests that
+/// admission actually happened, so only [`IsolatedVisualLaunchAuthority`] may
+/// mint one. It is `Serialize` but not `Deserialize`, and it cannot be built
+/// from a struct literal outside this module either.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IsolatedVisualLaunchReceipt {
-    pub schema_version: u32,
-    pub backend_id: String,
-    pub run_id: String,
-    pub surface_id: String,
-    pub incarnation: String,
-    pub input_domain_id: String,
-    pub agent_id: String,
-    pub lease_revision: u64,
-    pub helper_content_sha256: String,
-    pub helper_signing_requirement_sha256: String,
-    pub guest_image_sha256: String,
-    pub configuration_sha256: String,
-    pub channels: Vec<IsolatedVisualChannelRole>,
-    pub state: IsolatedVisualAuthorityState,
+    schema_version: u32,
+    backend_id: String,
+    run_id: String,
+    surface_id: String,
+    incarnation: String,
+    input_domain_id: String,
+    agent_id: String,
+    lease_revision: u64,
+    helper_content_sha256: String,
+    helper_signing_requirement_sha256: String,
+    guest_image_sha256: String,
+    configuration_sha256: String,
+    channels: Vec<IsolatedVisualChannelRole>,
+    state: IsolatedVisualAuthorityState,
+}
+
+impl IsolatedVisualLaunchReceipt {
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub fn backend_id(&self) -> &str {
+        &self.backend_id
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn surface_id(&self) -> &str {
+        &self.surface_id
+    }
+
+    pub fn incarnation(&self) -> &str {
+        &self.incarnation
+    }
+
+    pub fn input_domain_id(&self) -> &str {
+        &self.input_domain_id
+    }
+
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    pub fn lease_revision(&self) -> u64 {
+        self.lease_revision
+    }
+
+    pub fn helper_content_sha256(&self) -> &str {
+        &self.helper_content_sha256
+    }
+
+    pub fn helper_signing_requirement_sha256(&self) -> &str {
+        &self.helper_signing_requirement_sha256
+    }
+
+    pub fn guest_image_sha256(&self) -> &str {
+        &self.guest_image_sha256
+    }
+
+    pub fn configuration_sha256(&self) -> &str {
+        &self.configuration_sha256
+    }
+
+    pub fn channels(&self) -> &[IsolatedVisualChannelRole] {
+        &self.channels
+    }
+
+    pub fn state(&self) -> IsolatedVisualAuthorityState {
+        self.state
+    }
 }
 
 /// Deterministic public projection of one completed packaged teardown.
+///
+/// Private fields for the same reason as the launch receipt, and here it
+/// matters more: these booleans assert that no guest, helper, handle, overlay,
+/// or frame cache survived. Only a completed
+/// [`IsolatedVisualLaunchAuthority::complete_cleanup`] may say so.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IsolatedVisualCleanupReceipt {
-    pub schema_version: u32,
-    pub backend_id: String,
-    pub run_id: String,
-    pub surface_id: String,
-    pub incarnation: String,
-    pub input_domain_id: String,
-    pub disposition: IsolatedVisualRevocation,
-    pub helper_process_absent: bool,
-    pub no_open_handles: bool,
-    pub overlay_removed: bool,
-    pub frame_cache_removed: bool,
-    pub lease_revoked: bool,
-    pub channels_released: usize,
+    schema_version: u32,
+    backend_id: String,
+    run_id: String,
+    surface_id: String,
+    incarnation: String,
+    input_domain_id: String,
+    disposition: IsolatedVisualRevocation,
+    helper_process_absent: bool,
+    no_open_handles: bool,
+    overlay_removed: bool,
+    frame_cache_removed: bool,
+    lease_revoked: bool,
+    channels_released: usize,
+}
+
+impl IsolatedVisualCleanupReceipt {
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub fn backend_id(&self) -> &str {
+        &self.backend_id
+    }
+
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn surface_id(&self) -> &str {
+        &self.surface_id
+    }
+
+    pub fn incarnation(&self) -> &str {
+        &self.incarnation
+    }
+
+    pub fn input_domain_id(&self) -> &str {
+        &self.input_domain_id
+    }
+
+    pub fn disposition(&self) -> IsolatedVisualRevocation {
+        self.disposition
+    }
+
+    pub fn helper_process_absent(&self) -> bool {
+        self.helper_process_absent
+    }
+
+    pub fn no_open_handles(&self) -> bool {
+        self.no_open_handles
+    }
+
+    pub fn overlay_removed(&self) -> bool {
+        self.overlay_removed
+    }
+
+    pub fn frame_cache_removed(&self) -> bool {
+        self.frame_cache_removed
+    }
+
+    pub fn lease_revoked(&self) -> bool {
+        self.lease_revoked
+    }
+
+    pub fn channels_released(&self) -> usize {
+        self.channels_released
+    }
 }
 
 #[cfg(test)]
@@ -1196,7 +1319,7 @@ mod tests {
         let receipt = authority
             .complete_cleanup(&evidence_for(&binding.surface))
             .unwrap();
-        assert_eq!(receipt.disposition, IsolatedVisualRevocation::HelperLoss);
+        assert_eq!(receipt.disposition(), IsolatedVisualRevocation::HelperLoss);
         assert_eq!(authority.state(), IsolatedVisualAuthorityState::Terminated);
     }
 
@@ -1218,7 +1341,7 @@ mod tests {
         let receipt = authority
             .complete_cleanup(&evidence_for(&binding.surface))
             .unwrap();
-        assert_eq!(receipt.disposition, IsolatedVisualRevocation::Cancelled);
+        assert_eq!(receipt.disposition(), IsolatedVisualRevocation::Cancelled);
     }
 
     #[test]
@@ -1267,7 +1390,7 @@ mod tests {
             .complete_cleanup(&evidence_for(&binding.surface))
             .unwrap();
         assert_eq!(
-            receipt.disposition,
+            receipt.disposition(),
             IsolatedVisualRevocation::RestartInterrupted
         );
     }
@@ -1405,35 +1528,35 @@ mod tests {
         let (mut authority, lease, binding) = authority();
         let admitted = authority.launch_receipt();
         assert_eq!(
-            admitted.schema_version,
+            admitted.schema_version(),
             ISOLATED_VISUAL_LAUNCH_RECEIPT_SCHEMA_VERSION
         );
         assert_eq!(
-            admitted.backend_id,
+            admitted.backend_id(),
             MACOS_ISOLATED_VISUAL_CANDIDATE_BACKEND_ID
         );
-        assert_eq!(admitted.helper_content_sha256, HELPER_DIGEST);
+        assert_eq!(admitted.helper_content_sha256(), HELPER_DIGEST);
         assert_eq!(
-            admitted.helper_signing_requirement_sha256,
+            admitted.helper_signing_requirement_sha256(),
             REQUIREMENT_DIGEST
         );
-        assert_eq!(admitted.guest_image_sha256, GUEST_DIGEST);
-        assert_eq!(admitted.configuration_sha256, CONFIG_DIGEST);
-        assert_eq!(admitted.channels, IsolatedVisualChannelRole::ALL.to_vec());
-        assert_eq!(admitted.state, IsolatedVisualAuthorityState::Admitted);
+        assert_eq!(admitted.guest_image_sha256(), GUEST_DIGEST);
+        assert_eq!(admitted.configuration_sha256(), CONFIG_DIGEST);
+        assert_eq!(admitted.channels(), IsolatedVisualChannelRole::ALL.to_vec());
+        assert_eq!(admitted.state(), IsolatedVisualAuthorityState::Admitted);
 
         authority
             .record_started("agent-a", &lease, &binding)
             .unwrap();
         assert_eq!(
-            authority.launch_receipt().state,
+            authority.launch_receipt().state(),
             IsolatedVisualAuthorityState::Started
         );
         authority
             .revoke(IsolatedVisualRevocation::HelperLoss)
             .unwrap();
         assert_eq!(
-            authority.launch_receipt().state,
+            authority.launch_receipt().state(),
             IsolatedVisualAuthorityState::Revoked
         );
     }
@@ -1496,19 +1619,22 @@ mod tests {
         let receipt = authority
             .complete_cleanup(&evidence_for(&binding.surface))
             .unwrap();
-        assert!(receipt.helper_process_absent);
-        assert!(receipt.no_open_handles);
-        assert!(receipt.overlay_removed);
-        assert!(receipt.frame_cache_removed);
-        assert!(receipt.lease_revoked);
+        assert!(receipt.helper_process_absent());
+        assert!(receipt.no_open_handles());
+        assert!(receipt.overlay_removed());
+        assert!(receipt.frame_cache_removed());
+        assert!(receipt.lease_revoked());
         assert_eq!(
-            receipt.channels_released,
+            receipt.channels_released(),
             ISOLATED_VISUAL_LAUNCH_CHANNEL_COUNT
         );
-        assert_eq!(receipt.run_id, binding.run_id);
-        assert_eq!(receipt.surface_id, binding.surface.surface_id());
-        assert_eq!(receipt.incarnation, binding.surface.incarnation());
-        assert_eq!(receipt.disposition, IsolatedVisualRevocation::OperatorStop);
+        assert_eq!(receipt.run_id(), binding.run_id);
+        assert_eq!(receipt.surface_id(), binding.surface.surface_id());
+        assert_eq!(receipt.incarnation(), binding.surface.incarnation());
+        assert_eq!(
+            receipt.disposition(),
+            IsolatedVisualRevocation::OperatorStop
+        );
         assert_eq!(
             serde_json::to_string(&receipt).unwrap(),
             serde_json::to_string(&receipt).unwrap()

@@ -100,11 +100,11 @@ fn waitpid_without_interrupt(pid: libc::pid_t) -> Option<libc::pid_t> {
         // SAFETY: the PID was returned by the native launch shim and this
         // supervisor is the only code allowed to reap it.
         let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
-        if result < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                std::thread::yield_now();
-                continue;
-            }
+        // `&&` short-circuits, so `last_os_error` is still only read when the
+        // call actually failed.
+        if result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            std::thread::yield_now();
+            continue;
         }
         return Some(result);
     }

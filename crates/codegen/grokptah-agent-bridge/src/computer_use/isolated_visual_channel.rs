@@ -312,9 +312,10 @@ mod tests {
         );
         let packet = binding.encode_header_and_payload(&[0; 32]).unwrap();
         assert_eq!(&packet[..4], &ISOLATED_VISUAL_BINDING_MAGIC.to_be_bytes());
+        // run-1 (5) + surface-1 (9) + incarnation-1 (13) + domain-1 (8).
         assert_eq!(
             packet.len(),
-            ISOLATED_VISUAL_BINDING_HEADER_BYTES + 5 + 9 + 13 + 7
+            ISOLATED_VISUAL_BINDING_HEADER_BYTES + 5 + 9 + 13 + 8
         );
         assert_eq!(
             IsolatedVisualChannelBinding::decode_header_and_payload(&packet, &[0; 32]).unwrap(),
