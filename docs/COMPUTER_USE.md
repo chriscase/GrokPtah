@@ -23,6 +23,21 @@ failure, target changes, or exhausted limits. Secure and system-restricted surfa
 even when a grant exists. Pointer fallback and key chords require separate action classes; a
 semantic-action grant cannot silently expand into raw input control.
 
+## Isolated visual substrate (#288)
+
+Arbitrary GUI apps that lack semantic Accessibility/DOM structure require a
+separate guest principal. `grokptah-isolated-visual` is the host-owned
+lifecycle for that substrate: hermetic source/image resolution, `create →
+ready → running → closing`, WorkAttempt-bound surface leases, bounded
+frame/input transport, and redacted projection.
+
+Hidden windows, Spaces, virtual displays, `CGEvent`, AppleScript, and
+clipboard routing do not qualify. `ComputerUseService::isolated_visual_admission`
+fails closed until Virtualization.framework preflight, signed helper/image
+artifacts, and the 25 GiB disk gate pass. Simulator and source-compilation
+evidence are ineligible for VM qualification. See
+[`docs/COMPUTER_USE_ISOLATED_VISUAL.md`](COMPUTER_USE_ISOLATED_VISUAL.md).
+
 ## Foundation (#268)
 
 `grokptah-agent-bridge::computer_use` provides:
@@ -187,7 +202,12 @@ non-cancelling steering. Native actions are limited to activation, Accessibility
 value entry, selection, and semantic scrolling. Every mutation requires a fresh observation and
 local one-use grant. It does not register a model action or MCP tool. See
 [Computer Use on macOS](COMPUTER_USE_MACOS.md) for the privacy boundary, dispatch attestation,
-packaging requirements, and disposable smoke fixture.
+packaging requirements, and disposable smoke fixture. Packaged app/helper identity and the
+cryptographic admission contract live in
+[Computer Use packaged macOS authority](COMPUTER_USE_PACKAGE_AUTHORITY.md) (#444) and
+`grokptah-isolated-visual::packaged_authority`. Isolated guest lifecycle is documented in
+[Computer Use isolated visual](COMPUTER_USE_ISOLATED_VISUAL.md) (#288). Simulator/source
+evidence is ineligible for packaged VM qualification.
 
 ## Deliberate non-goals of the current desktop slice
 

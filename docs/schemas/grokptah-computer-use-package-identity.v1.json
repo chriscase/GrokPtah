@@ -1,0 +1,42 @@
+{
+  "schema": "grokptah-computer-use-package-identity.v1",
+  "app": {
+    "productName": "GrokPtah",
+    "bundleId": "com.chriscase.grokptah",
+    "executable": "grokptah-desktop",
+    "version": "0.1.0",
+    "minimumOsVersion": "11.0"
+  },
+  "helper": {
+    "productName": "GrokPtah Computer Use Helper",
+    "bundleId": "com.chriscase.grokptah.computer-use-helper",
+    "executable": "grokptah-computer-use-helper",
+    "version": "0.1.0",
+    "minimumOsVersion": "14.0",
+    "nestedPath": "Contents/Helpers/GrokPtah Computer Use Helper.app"
+  },
+  "demoTarget": {
+    "productName": "GrokPtah Computer Use Demo",
+    "bundleId": "com.chriscase.grokptah.computer-use-demo"
+  },
+  "computerUseMinimumOsVersion": "14.0",
+  "entitlements": {
+    "app": "desktop/src-tauri/macos/GrokPtah.entitlements",
+    "helper": "desktop/src-tauri/macos/ComputerUseHelper.entitlements",
+    "helperInfoPlist": "desktop/src-tauri/macos/ComputerUseHelper.Info.plist",
+    "sandbox": false,
+    "privateEntitlements": false,
+    "appleEvents": false,
+    "keychainAccessGroups": false
+  },
+  "tccPrincipals": {
+    "declaredScreenRecording": "helper",
+    "declaredAccessibility": "helper",
+    "inProcessHostIsNotPackagedQualification": true
+  },
+  "compatibility": {
+    "appHelperVersionPolicy": "exact-major-minor",
+    "rejectHelperNewerMajor": true,
+    "rejectHelperOlderMinor": true
+  }
+}

@@ -15,6 +15,10 @@ Outputs, from the exact commit checked out:
 
 Unsigned local builds are expected and fine; signing/notarization is a separate,
 credentialed concern and is deliberately not wired into the default build.
+`bundle.macOS.entitlements` points at the empty
+`desktop/src-tauri/macos/GrokPtah.entitlements` file so the packaged identity is
+inspectable. That file is not App Sandbox, Apple Events, or a Computer Use helper
+binary. Ad-hoc or unsigned GrokPtah.app output cannot satisfy #444.
 
 ## Verifying a produced package
 

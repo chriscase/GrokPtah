@@ -440,6 +440,16 @@ export function ComputerCockpit({
                   Refresh
                 </button>
               </div>
+              {platformStatus?.executor && (
+                <p className="settings-hint" data-testid="computer-executor-identity">
+                  TCC principal {platformStatus.executor.tccPrincipal} (
+                  {platformStatus.executor.kind.replaceAll("_", " ")},{" "}
+                  {platformStatus.executor.signingClass.replaceAll("_", " ")}).
+                  {platformStatus.executor.kind !== "packaged_helper"
+                    ? " In-process identity is not packaged helper qualification."
+                    : " Helper identity is the packaged Computer Use executor."}
+                </p>
+              )}
               {platformStatus && !nativePermissionsReady && (
                 <p className="settings-hint is-warning">
                   These grants apply to this GrokPtah installation. Codex Computer Use and Terminal

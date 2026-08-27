@@ -46,6 +46,10 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
 | Credential UI, lock/login, permission panels, privilege prompts, password managers | Explicit unsupported/denied disposition; no model-visible capture or action is allowed | `Sensitivity::{Secure,SystemRestricted}` policy; native surface classification tests |
 | MCP Computer mutations, raw shell, clipboard, AppleScript, unattended control | Explicitly unsupported in this release; #271 is a later scoped interoperability phase | `CONTROL_TOOLS` boundary; `docs/COMPUTER_USE.md` non-goals |
 | Windows/Linux native control | Explicitly unsupported until their platform issues have native consent and evidence | #275 and #276 |
+| Isolated guest identity, lease, and dispatch forgery | Proven fail-closed in the isolated-visual simulator host; VM boot is not implied | `grokptah-isolated-visual` host and adversarial matrix tests |
+| Isolated source resolver traversal/symlink/rename/object substitution | Proven fail-closed; ambient Git config/index/hooks/alternates are not consulted | `HermeticResolver` and `GitDirProbe` tests |
+| Isolated guest restart/crash-cut and cleanup | Proven: two restarts converge, Injected receipts become uncertain, cleanup requires exact evidence | isolated-visual restart and cleanup tests |
+| Isolated public projection leakage | Proven: frame bytes, paths, clipboard, credentials, and network needles fail closed | isolated-visual projection tests |
 
 ## Release blockers still open
 
@@ -56,6 +60,12 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
   review are complete.
 - Keep #288 isolated visual execution disabled until a backend provides a genuinely separate input
   surface; hidden windows, separate Spaces, and global `CGEvent` injection do not qualify.
+  Source/simulator reconstruction lives in `grokptah-isolated-visual` and is **not** VM
+  qualification. Virtualization.framework evidence class requires an observed launch receipt;
+  empty `helper.signed` / `guest.img.signed` marker files cannot admit launch. Packaged helper
+  admission binds bundle ID, executable digest, Team ID, designated requirement, entitlements,
+  and notarization/stapling/Gatekeeper observations. Occupancy is a durable exclusive lease,
+  not a process-name scan.
 
 ## Verification command
 

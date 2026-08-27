@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grokptah.local/schemas/grokptah-computer-use-package-authority.v1.schema.json",
+  "title": "GrokPtah Computer Use packaged-authority evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "sourceHead",
+    "branch",
+    "appBundleId",
+    "helperBundleId",
+    "appVersion",
+    "helperVersion",
+    "signingClass",
+    "executorKind",
+    "helperAssembled",
+    "realTccHardwareActionRan",
+    "eligibility",
+    "syntheticOracle",
+    "verdict"
+  ],
+  "properties": {
+    "schema": {
+      "const": "grokptah-computer-use-package-authority.v1"
+    },
+    "sourceHead": { "type": "string", "minLength": 40 },
+    "branch": { "type": "string", "minLength": 1 },
+    "appBundleId": { "const": "com.chriscase.grokptah" },
+    "helperBundleId": {
+      "const": "com.chriscase.grokptah.computer-use-helper"
+    },
+    "appVersion": { "type": "string" },
+    "helperVersion": { "type": "string" },
+    "signingClass": {
+      "enum": [
+        "uninspected",
+        "unsigned",
+        "ad_hoc",
+        "apple_development",
+        "developer_id",
+        "notarized_developer_id"
+      ]
+    },
+    "executorKind": {
+      "enum": ["in_process_host", "packaged_helper"]
+    },
+    "helperAssembled": { "type": "boolean" },
+    "realTccHardwareActionRan": { "type": "boolean" },
+    "diskFreeGibMilli": { "type": "integer", "minimum": 0 },
+    "os": { "type": ["string", "null"] },
+    "hardware": { "type": ["string", "null"] },
+    "commands": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "eligibility": {
+      "type": "object",
+      "required": ["packagedQualification", "reasons"],
+      "additionalProperties": false,
+      "properties": {
+        "packagedQualification": { "type": "boolean" },
+        "reasons": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "syntheticOracle": {
+      "type": "object",
+      "required": ["schema", "syntheticContract", "packagedQualification", "scenarios"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "grokptah-computer-use-package-authority.v1"
+        },
+        "syntheticContract": { "type": "boolean" },
+        "packagedQualification": { "const": false },
+        "scenarios": {
+          "type": "array",
+          "minItems": 12
+        }
+      }
+    },
+    "verdict": {
+      "enum": ["pass", "partial", "fail_closed"]
+    }
+  }
+}

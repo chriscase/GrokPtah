@@ -874,6 +874,28 @@ export type ComputerPermissionStatus =
   | "revoked"
   | "restricted";
 
+export type ComputerSigningClass =
+  | "uninspected"
+  | "unsigned"
+  | "ad_hoc"
+  | "apple_development"
+  | "developer_id"
+  | "notarized_developer_id";
+
+export type ComputerExecutorKind = "in_process_host" | "packaged_helper";
+
+export interface ComputerExecutorIdentity {
+  kind: ComputerExecutorKind;
+  bundleId: string;
+  helperBundleId: string;
+  version: string;
+  helperVersion: string;
+  signingClass: ComputerSigningClass;
+  tccPrincipal: string;
+  teamId?: string | null;
+  designatedRequirement?: string | null;
+}
+
 export interface ComputerPlatformStatus {
   platformId: string;
   available: boolean;
@@ -881,6 +903,7 @@ export interface ComputerPlatformStatus {
   screenRecording: ComputerPermissionStatus;
   accessibility: ComputerPermissionStatus;
   detail?: string | null;
+  executor?: ComputerExecutorIdentity | null;
 }
 
 export interface ComputerTargetCandidate {
