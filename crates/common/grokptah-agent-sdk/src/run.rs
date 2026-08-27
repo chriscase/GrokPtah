@@ -227,7 +227,12 @@ pub struct RunEventPage {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum RunNotification {
     /// A scoped event journal update.
-    Event { scope: RunScope, event: RunEvent },
+    Event {
+        /// Exact run identity the event belongs to.
+        scope: RunScope,
+        /// The appended durable journal entry.
+        event: RunEvent,
+    },
     /// The client must poll before reconnecting.
     Recovery {
         /// Exact run identity that needs recovery.
@@ -375,5 +380,47 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    /// Regression check for the documented `RunNotification::Event` fields.
+    ///
+    /// The crate denies `missing_docs`, so the compiler alone catches a doc
+    /// being deleted again. What it cannot catch is a future "fix" that
+    /// silences the lint by renaming or dropping a field, so this pins the
+    /// exact wire shape the documentation now describes.
+    #[test]
+    fn run_notification_event_keeps_its_documented_field_shape() {
+        let notification = RunNotification::Event {
+            scope: RunScope {
+                session_id: "sess-1".into(),
+                workspace: "ws-1".into(),
+                run_id: "run-1".into(),
+            },
+            event: RunEvent {
+                seq: 7,
+                ts: "2026-01-01T00:00:00Z".into(),
+                update: serde_json::json!({"text": "x"}),
+            },
+        };
+
+        let value = serde_json::to_value(&notification).expect("notification serializes");
+        assert_eq!(value["kind"], "event");
+        // `scope` carries the identity fence; `event` carries the journal entry.
+        assert_eq!(value["scope"]["sessionId"], "sess-1");
+        assert_eq!(value["scope"]["workspace"], "ws-1");
+        assert_eq!(value["scope"]["runId"], "run-1");
+        assert_eq!(value["event"]["seq"], 7);
+        assert_eq!(value["event"]["ts"], "2026-01-01T00:00:00Z");
+        assert_eq!(value["event"]["update"]["text"], "x");
+        // Exactly the tag plus the two documented fields, nothing more.
+        assert_eq!(
+            value.as_object().expect("object").len(),
+            3,
+            "RunNotification::Event must stay {{kind, scope, event}}"
+        );
+
+        let decoded: RunNotification =
+            serde_json::from_value(value).expect("notification round-trips");
+        assert_eq!(decoded, notification);
     }
 }

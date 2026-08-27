@@ -435,9 +435,13 @@ mod tests {
         );
         request.repository = "chriscase/GrokPtah".into();
         request.starting_ref = "refs/heads/review\n".into();
+        // `starting_ref` is a ref, so `validate_ref` governs it: it rejects
+        // '\\', '\n', '\r' and '\0' under the ref message rather than the
+        // `validate_identity` control-character message. The injected newline
+        // is still rejected; only the reported reason differs.
         assert_eq!(
             request.validate(),
-            Err("worker identity contains a control character")
+            Err("worker ref must be bounded and non-absolute")
         );
     }
 
