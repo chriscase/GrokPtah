@@ -13,6 +13,9 @@ use super::isolated_visual_helper_control::{
     read_isolated_visual_challenge_with_timeout, IsolatedVisualHelperControl,
 };
 use super::isolated_visual_input::IsolatedVisualInputMessage;
+use super::isolated_visual_launch::{
+    descriptors_are_private_and_distinct, IsolatedVisualLaunchDescriptors,
+};
 use super::isolated_visual_runtime::IsolatedVisualRuntimeSession;
 use super::isolated_visual_stream::IsolatedVisualStream;
 use super::types::{ComputerError, ComputerErrorCode, ComputerResult};
@@ -92,12 +95,6 @@ fn close_fd(descriptor: i32) {
     }
 }
 
-fn descriptors_are_distinct(descriptors: &[i32]) -> bool {
-    descriptors.iter().enumerate().all(|(index, descriptor)| {
-        *descriptor >= 0 && descriptors[..index].iter().all(|prior| prior != descriptor)
-    })
-}
-
 fn waitpid_without_interrupt(pid: libc::pid_t) -> Option<libc::pid_t> {
     for _ in 0..8 {
         // SAFETY: the PID was returned by the native launch shim and this
@@ -123,7 +120,12 @@ fn close_spawn_descriptors(result: &NativeIsolatedRuntimeSpawnResult) {
         result.challenge_fd,
     ];
     for (index, descriptor) in descriptors.iter().enumerate() {
-        if *descriptor >= 0 && descriptors[..index].iter().all(|prior| prior != descriptor) {
+        // Close each private descriptor we actually own, at most once. An
+        // invalid earlier entry must not stop a later valid one from closing,
+        // and a standard stream is never ours to close.
+        if descriptors_are_private_and_distinct(&[i64::from(*descriptor)])
+            && descriptors[..index].iter().all(|prior| prior != descriptor)
+        {
             close_fd(*descriptor);
         }
     }
@@ -215,22 +217,23 @@ impl IsolatedVisualPackagedRuntime {
             unsafe { gpt_macos_isolated_runtime_spawn_result_free(&mut native) };
             return Err(error);
         }
-        if native.pid <= 0
-            || !descriptors_are_distinct(&[
-                native.control_fd,
-                native.event_fd,
-                native.input_fd,
-                native.frame_fd,
-                native.challenge_fd,
-            ])
+        // Exact process/channel admission is the portable rule in
+        // `isolated_visual_launch`, so a non-macOS build still compiles and
+        // tests it. Standard streams and aliased descriptors fail closed here.
+        if let Err(error) = (IsolatedVisualLaunchDescriptors {
+            process_id: i64::from(native.pid),
+            control: i64::from(native.control_fd),
+            event: i64::from(native.event_fd),
+            input: i64::from(native.input_fd),
+            frame: i64::from(native.frame_fd),
+            challenge: i64::from(native.challenge_fd),
+        })
+        .admit()
         {
             close_spawn_descriptors(&native);
             terminate_process(native.pid);
             unsafe { gpt_macos_isolated_runtime_spawn_result_free(&mut native) };
-            return Err(ComputerError::new(
-                ComputerErrorCode::BackendFailure,
-                "isolated launch returned an incomplete process/channel set",
-            ));
+            return Err(error);
         }
 
         // SAFETY: each descriptor is transferred from the native result once.
@@ -519,16 +522,17 @@ impl Drop for IsolatedVisualPackagedRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        descriptors_are_distinct, finish_terminal_stop, packaged_guest_is_acquirable,
+        descriptors_are_private_and_distinct, finish_terminal_stop, packaged_guest_is_acquirable,
         IsolatedGuestLease,
     };
     use crate::computer_use::types::{ComputerError, ComputerErrorCode};
 
     #[test]
     fn native_launch_descriptor_set_must_be_complete_and_unique() {
-        assert!(descriptors_are_distinct(&[3, 4, 5, 6, 7]));
-        assert!(!descriptors_are_distinct(&[3, 4, 4, 6, 7]));
-        assert!(!descriptors_are_distinct(&[3, -1, 5, 6, 7]));
+        assert!(descriptors_are_private_and_distinct(&[3_i64, 4, 5, 6, 7]));
+        assert!(!descriptors_are_private_and_distinct(&[3_i64, 4, 4, 6, 7]));
+        assert!(!descriptors_are_private_and_distinct(&[3_i64, -1, 5, 6, 7]));
+        assert!(!descriptors_are_private_and_distinct(&[0_i64, 1, 2, 3, 4]));
     }
 
     #[test]

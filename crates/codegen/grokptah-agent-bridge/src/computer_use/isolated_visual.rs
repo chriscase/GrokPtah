@@ -267,7 +267,7 @@ impl IsolatedVisualCleanupEvidence {
         Ok(evidence)
     }
 
-    fn validates_for(&self, surface: &ComputerSurfaceBinding) -> ComputerResult<()> {
+    pub(super) fn validates_for(&self, surface: &ComputerSurfaceBinding) -> ComputerResult<()> {
         self.surface.validate()?;
         if &self.surface != surface {
             return Err(ComputerError::new(

@@ -9,6 +9,7 @@ use super::isolated_visual::IsolatedVisualManifest;
 use super::isolated_visual_artifacts::{
     measure_open_isolated_visual_artifacts, IsolatedVisualPackagedArtifactReceipt,
 };
+use super::isolated_visual_launch::descriptors_are_private_and_distinct;
 use super::types::{ComputerError, ComputerErrorCode, ComputerResult};
 
 const NATIVE_OK: i32 = 0;
@@ -97,7 +98,11 @@ fn close_returned_descriptors(result: &NativeIsolatedArtifactsResult) {
         result.configuration_fd,
     ];
     for (index, descriptor) in descriptors.iter().enumerate() {
-        if *descriptor >= 0 && descriptors[..index].iter().all(|prior| prior != descriptor) {
+        // A standard stream is never ours to close, so an unusable verifier
+        // result cannot take stdin/stdout/stderr down with it.
+        if descriptors_are_private_and_distinct(&[i64::from(*descriptor)])
+            && descriptors[..index].iter().all(|prior| prior != descriptor)
+        {
             // SAFETY: this path runs only before ownership is transferred to a
             // `File`, and each returned descriptor is closed at most once.
             unsafe {
@@ -105,12 +110,6 @@ fn close_returned_descriptors(result: &NativeIsolatedArtifactsResult) {
             }
         }
     }
-}
-
-fn descriptors_are_distinct(descriptors: &[i32]) -> bool {
-    descriptors.iter().enumerate().all(|(index, descriptor)| {
-        *descriptor >= 0 && descriptors[..index].iter().all(|prior| prior != descriptor)
-    })
 }
 
 pub(super) fn measure_packaged_artifacts(
@@ -134,10 +133,10 @@ pub(super) fn open_packaged_runtime_artifacts(
         unsafe { gpt_macos_isolated_artifacts_result_free(&mut native) };
         return Err(error);
     }
-    if !descriptors_are_distinct(&[
-        native.helper_fd,
-        native.guest_image_fd,
-        native.configuration_fd,
+    if !descriptors_are_private_and_distinct(&[
+        i64::from(native.helper_fd),
+        i64::from(native.guest_image_fd),
+        i64::from(native.configuration_fd),
     ]) {
         close_returned_descriptors(&native);
         unsafe { gpt_macos_isolated_artifacts_result_free(&mut native) };
@@ -235,8 +234,9 @@ mod tests {
 
     #[test]
     fn artifact_descriptor_set_must_be_complete_and_unique() {
-        assert!(descriptors_are_distinct(&[3, 4, 5]));
-        assert!(!descriptors_are_distinct(&[3, 4, 4]));
-        assert!(!descriptors_are_distinct(&[3, -1, 5]));
+        assert!(descriptors_are_private_and_distinct(&[3_i64, 4, 5]));
+        assert!(!descriptors_are_private_and_distinct(&[3_i64, 4, 4]));
+        assert!(!descriptors_are_private_and_distinct(&[3_i64, -1, 5]));
+        assert!(!descriptors_are_private_and_distinct(&[0_i64, 1, 2]));
     }
 }

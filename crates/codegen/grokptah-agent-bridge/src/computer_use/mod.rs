@@ -23,12 +23,17 @@ mod isolated_visual_helper;
 mod isolated_visual_helper_control;
 mod isolated_visual_input;
 mod isolated_visual_input_wire;
+mod isolated_visual_launch;
 mod isolated_visual_protocol;
 mod isolated_visual_runtime;
 mod isolated_visual_stream;
-#[cfg(target_os = "macos")]
+// Gated on macOS in a shipped build. The `macos-source-typecheck` feature also
+// compiles these two modules on a non-macOS host so their contracts and unit
+// tests are checked in CI rather than going unwatched off macOS; it links no
+// framework and calls no native entry point.
+#[cfg(any(target_os = "macos", feature = "macos-source-typecheck"))]
 mod macos_isolated_artifacts;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "macos-source-typecheck"))]
 mod macos_isolated_runtime;
 mod macos_observation;
 mod platform;
@@ -90,6 +95,14 @@ pub use isolated_visual_input_wire::{
     IsolatedVisualInputWire, ISOLATED_VISUAL_INPUT_HEADER_BYTES, ISOLATED_VISUAL_INPUT_MAGIC,
     ISOLATED_VISUAL_INPUT_MAX_PACKET_BYTES, ISOLATED_VISUAL_INPUT_TAG_BYTES,
     ISOLATED_VISUAL_INPUT_VERSION,
+};
+pub use isolated_visual_launch::{
+    IsolatedVisualAuthorityState, IsolatedVisualChannelRole, IsolatedVisualCleanupReceipt,
+    IsolatedVisualGuestBinding, IsolatedVisualGuestOperation, IsolatedVisualLaunchAuthority,
+    IsolatedVisualLaunchDescriptorSet, IsolatedVisualLaunchDescriptors,
+    IsolatedVisualLaunchReceipt, IsolatedVisualRevocation,
+    ISOLATED_VISUAL_FIRST_PRIVATE_DESCRIPTOR, ISOLATED_VISUAL_LAUNCH_CHANNEL_COUNT,
+    ISOLATED_VISUAL_LAUNCH_RECEIPT_SCHEMA_VERSION, ISOLATED_VISUAL_MAX_DESCRIPTOR,
 };
 pub use isolated_visual_protocol::{
     IsolatedVisualGuestFailure, IsolatedVisualGuestHealth, IsolatedVisualGuestMessage,
