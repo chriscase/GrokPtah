@@ -8,12 +8,21 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{Agent, ReferenceAgent};
+use crate::comparison::{ComparisonEvidence, EvidenceClass, SubmissionOutcome, TraceFixture};
 use crate::digest::fold_digests;
 use crate::modelclass::ModelClass;
 use crate::profile::{ExecutionProfile, ProfileId};
 use crate::runner::{RunRecord, execute};
 use crate::scenario::Scenario;
 use crate::scoring::{CellQualification, CellScore, qualify, score_cell};
+
+/// The cell every checked-in comparison trace is recorded against.
+///
+/// A contract needs one basis everybody uses, or "comparable" degrades into
+/// "comparable if you happened to pick the same cell". Submissions for other
+/// cells are accepted; this is the one with published reference traces.
+pub const CANONICAL_COMPARISON_CELL: (ModelClass, ProfileId) =
+    (ModelClass::LargeVision, ProfileId::Balanced);
 
 /// Build the agent for one cell.
 ///
@@ -70,6 +79,11 @@ pub struct SuiteReport {
     pub scenario_catalog_digest: String,
     pub cells: Vec<CellScore>,
     pub qualifications: Vec<CellQualification>,
+    /// What external comparison evidence this build holds -- including, and
+    /// especially, none. Carried in the report rather than left out, because
+    /// a report that does not mention comparisons reads like one where the
+    /// comparison passed.
+    pub comparison_evidence: ComparisonEvidence,
     /// Digest over every transcript in the suite, in cell order.
     pub suite_digest: String,
 }
@@ -139,14 +153,61 @@ pub fn run_matrix(scenarios: &[Scenario], factory: AgentFactory<'_>) -> SuiteRep
         scenario_catalog_digest: crate::digest::digest_of(&scenarios),
         cells,
         qualifications,
+        // No submission ships in this repository. Summarising the empty set
+        // is what makes that visible instead of implicit.
+        comparison_evidence: ComparisonEvidence::summarise(&[]),
         suite_digest: fold_digests("grokptah.cu-bench/suite", &transcripts),
     }
+}
+
+/// Run one cell and record it as a comparison trace.
+///
+/// The recording path is the same code that produces a qualification result,
+/// so a published trace cannot describe a different run from the one that was
+/// scored.
+#[must_use]
+pub fn record_trace(
+    subject: &str,
+    evidence: EvidenceClass,
+    model_class: ModelClass,
+    profile_id: ProfileId,
+    scenarios: &[Scenario],
+    factory: AgentFactory<'_>,
+) -> TraceFixture {
+    let profile = ExecutionProfile::for_id(profile_id);
+    let records = run_cell(model_class, &profile, scenarios, factory);
+    let deterministic = replay_matches(model_class, &profile, scenarios, factory, &records);
+    let score = score_cell(model_class, &profile, scenarios, &records, deterministic);
+    TraceFixture::record(subject, evidence, model_class, profile_id, &score, &records)
+}
+
+/// Re-run a subject and verify a submitted trace against it.
+///
+/// Supplying the local re-run is what upgrades a submission from
+/// `BasisVerified` to `ReproducedLocally`; it only works for subjects this
+/// crate can actually run.
+#[must_use]
+pub fn verify_trace(
+    submitted: &TraceFixture,
+    scenarios: &[Scenario],
+    factory: AgentFactory<'_>,
+) -> SubmissionOutcome {
+    let reproduction = record_trace(
+        &submitted.subject,
+        submitted.evidence.clone(),
+        submitted.basis.model_class,
+        submitted.basis.profile,
+        scenarios,
+        factory,
+    );
+    crate::comparison::verify(submitted, Some(&reproduction))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog;
+    use crate::comparison::EvidenceStatus;
 
     #[test]
     fn the_matrix_has_one_cell_per_model_class_and_profile() {
@@ -158,6 +219,37 @@ mod tests {
             ModelClass::ALL.len() * ProfileId::ALL.len()
         );
         assert_eq!(report.qualifications.len(), report.cells.len());
+    }
+
+    #[test]
+    fn a_report_with_no_submissions_says_so_explicitly() {
+        let scenarios = catalog::all();
+        let factory = reference_factory();
+        let report = run_matrix(&scenarios, &factory);
+        assert_eq!(
+            report.comparison_evidence.status,
+            EvidenceStatus::NoExternalSubmission
+        );
+        assert!(report.comparison_evidence.supports_no_comparison());
+    }
+
+    #[test]
+    fn a_recorded_trace_reproduces_itself() {
+        let scenarios = catalog::all();
+        let factory = reference_factory();
+        let (model_class, profile) = CANONICAL_COMPARISON_CELL;
+        let trace = record_trace(
+            "reference",
+            EvidenceClass::SyntheticFixture,
+            model_class,
+            profile,
+            &scenarios,
+            &factory,
+        );
+        assert_eq!(
+            verify_trace(&trace, &scenarios, &factory),
+            SubmissionOutcome::ReproducedLocally
+        );
     }
 
     #[test]

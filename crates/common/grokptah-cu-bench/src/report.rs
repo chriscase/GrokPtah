@@ -226,6 +226,15 @@ pub fn to_markdown(report: &SuiteReport, matrix: &WorkflowMatrix) -> String {
         );
     }
 
+    let _ = writeln!(out, "\n## External comparison evidence\n");
+    let _ = writeln!(
+        out,
+        "- Contract: `{}`",
+        report.comparison_evidence.contract_version
+    );
+    let _ = writeln!(out, "- Status: `{:?}`", report.comparison_evidence.status);
+    let _ = writeln!(out, "- {}\n", report.comparison_evidence.statement);
+
     let _ = writeln!(out, "\n## Comparison status\n");
     let _ = writeln!(out, "{}\n", matrix.external_comparison_statement);
     let _ = writeln!(out, "A reproducible head-to-head would require:\n");

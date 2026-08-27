@@ -36,6 +36,8 @@ pub enum ArtifactKind {
     Profiles,
     /// The bounded efficiency envelope each model class declares.
     EfficiencyEnvelopes,
+    /// The versioned external-comparison and calibration contract.
+    ComparisonContract,
     /// The qualification thresholds, per model class and profile.
     Thresholds,
     /// The scenario fixtures.
@@ -50,6 +52,7 @@ impl ArtifactKind {
         Self::Invariants,
         Self::Profiles,
         Self::EfficiencyEnvelopes,
+        Self::ComparisonContract,
         Self::Thresholds,
         Self::Scenarios,
         Self::WorkflowMatrix,
@@ -63,6 +66,7 @@ impl ArtifactKind {
             Self::Invariants => "schema/invariants.json",
             Self::Profiles => "schema/profiles.json",
             Self::EfficiencyEnvelopes => "schema/efficiency-envelopes.json",
+            Self::ComparisonContract => "schema/comparison-contract.json",
             Self::Thresholds => "schema/thresholds.json",
             Self::Scenarios => "schema/scenarios.json",
             Self::WorkflowMatrix => "schema/workflow-matrix.json",
@@ -77,6 +81,7 @@ impl ArtifactKind {
             Self::Invariants => canonical_json_pretty(&invariants_doc()),
             Self::Profiles => canonical_json_pretty(&profiles_doc()),
             Self::EfficiencyEnvelopes => canonical_json_pretty(&envelopes_doc()),
+            Self::ComparisonContract => canonical_json_pretty(&comparison_contract_doc()),
             Self::Thresholds => canonical_json_pretty(&QualificationThresholds::matrix()),
             Self::Scenarios => canonical_json_pretty(&crate::catalog::all()),
             Self::WorkflowMatrix => canonical_json_pretty(&crate::matrix::workflow_matrix()),
@@ -134,6 +139,99 @@ fn invariants_doc() -> Vec<InvariantRow> {
             authority_bearing: invariant.is_authority_bearing(),
         })
         .collect()
+}
+
+/// The comparison contract, as a lab reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComparisonContractDoc {
+    pub contract_version: String,
+    /// The cell published reference traces are recorded against.
+    pub canonical_cell: (crate::modelclass::ModelClass, crate::profile::ProfileId),
+    /// Evidence classes a submission may declare.
+    pub evidence_classes: Vec<String>,
+    /// Verification outcomes, weakest last, with what each one licenses.
+    pub outcomes: Vec<ContractOutcomeDoc>,
+    /// Every way a submission can be refused.
+    pub rejection_reasons: Vec<String>,
+    /// Boundaries a submission must attest to before any number is read.
+    pub boundary_checks: Vec<String>,
+    /// What a permitted comparison establishes, and what it does not.
+    pub scope_statement: String,
+}
+
+/// One verification outcome and what it licenses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContractOutcomeDoc {
+    pub outcome: String,
+    pub comparable: bool,
+    pub counts_as_qualification: bool,
+    pub meaning: String,
+}
+
+fn owned(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+#[must_use]
+fn comparison_contract_doc() -> ComparisonContractDoc {
+    ComparisonContractDoc {
+        contract_version: crate::comparison::COMPARISON_CONTRACT_VERSION.to_owned(),
+        canonical_cell: crate::suite::CANONICAL_COMPARISON_CELL,
+        evidence_classes: owned(&["synthetic_fixture", "real_provider"]),
+        outcomes: vec![
+            ContractOutcomeDoc {
+                outcome: "reproduced_locally".to_owned(),
+                comparable: true,
+                counts_as_qualification: true,
+                meaning: "Re-run against this build and every transcript digest matched."
+                    .to_owned(),
+            },
+            ContractOutcomeDoc {
+                outcome: "basis_verified".to_owned(),
+                comparable: true,
+                counts_as_qualification: false,
+                meaning: "Same contract, manifest, catalog, envelope, profile and                           scenario set; internally consistent; boundaries clean. Says                           the result is about the same thing, not that it is true.".to_owned(),
+            },
+            ContractOutcomeDoc {
+                outcome: "unverified_provider_claim".to_owned(),
+                comparable: false,
+                counts_as_qualification: false,
+                meaning: "Well formed, resting on a run this crate cannot reproduce.                           Recorded, never verified, never qualification.".to_owned(),
+            },
+            ContractOutcomeDoc {
+                outcome: "rejected".to_owned(),
+                comparable: false,
+                counts_as_qualification: false,
+                meaning: "Failed a check. The reason is always named.".to_owned(),
+            },
+        ],
+        rejection_reasons: owned(&[
+            "contract_version_mismatch",
+            "manifest_digest_mismatch",
+            "catalog_digest_mismatch",
+            "envelope_digest_mismatch",
+            "trace_digest_mismatch",
+            "scenario_set_mismatch",
+            "duplicate_scenario",
+            "boundary_violations",
+            "empty_evidence",
+            "reproduction_mismatch",
+        ]),
+        boundary_checks: owned(&[
+            "authority",
+            "privacy",
+            "false_success",
+            "post_takeover",
+            "collateral",
+            "envelope_breach",
+            "incomplete_evidence",
+            "stale_observation_accepted",
+            "unredacted_screenshot",
+        ]),
+        scope_statement: crate::comparison::COMPARISON_SCOPE.to_owned(),
+    }
 }
 
 #[must_use]

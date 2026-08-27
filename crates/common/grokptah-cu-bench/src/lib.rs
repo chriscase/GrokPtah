@@ -5,6 +5,7 @@ pub mod agent;
 pub mod authority;
 pub mod calibration;
 pub mod catalog;
+pub mod comparison;
 pub mod digest;
 pub mod efficiency;
 pub mod hazard;

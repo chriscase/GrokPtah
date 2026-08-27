@@ -3402,5 +3402,12 @@
       }
     }
   ],
+  "comparisonEvidence": {
+    "contractVersion": "grokptah.cu-bench.comparison/1",
+    "status": {
+      "status": "no_external_submission"
+    },
+    "statement": "No submission from outside this repository has been provided, so no comparative claim of any kind is supported."
+  },
   "suiteDigest": "e81ca344d2be2c7fadc74a0c91b7a71953cd1007f96d8a10c86b087ff98574ad"
 }

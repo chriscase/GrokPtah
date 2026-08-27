@@ -10,8 +10,10 @@ use std::path::Path;
 
 use grokptah_cu_bench::agent::Agent;
 use grokptah_cu_bench::calibration::CalibrationTier;
+use grokptah_cu_bench::comparison::EvidenceClass;
 use grokptah_cu_bench::manifest::{self, ARTIFACT_DIR, ArtifactKind};
 use grokptah_cu_bench::modelclass::ModelClass;
+use grokptah_cu_bench::profile::ProfileId;
 use grokptah_cu_bench::report::CalibrationRow;
 use grokptah_cu_bench::scenario::Scenario;
 use grokptah_cu_bench::{catalog, matrix, report, suite};
@@ -69,6 +71,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         grokptah_cu_bench::digest::canonical_json_pretty(&rows),
     )?;
     println!("wrote {}", reports.join("calibration.md").display());
+
+    // Comparison traces. The reference is published across the whole matrix,
+    // because a lab reproducing this benchmark has to reproduce all of it.
+    // The tiers are published only at the canonical cell -- one cell is
+    // enough to show the thresholds discriminate, and publishing the rest
+    // would be churn without evidence.
+    let traces = root.join("traces");
+    fs::create_dir_all(&traces)?;
+    for model_class in ModelClass::ALL {
+        for profile in ProfileId::ALL {
+            let trace = suite::record_trace(
+                "reference",
+                EvidenceClass::SyntheticFixture,
+                *model_class,
+                *profile,
+                &scenarios,
+                &factory,
+            );
+            let path = traces.join(format!(
+                "reference-{}-{}.json",
+                model_class.slug(),
+                profile.slug()
+            ));
+            fs::write(
+                &path,
+                grokptah_cu_bench::digest::canonical_json_pretty(&trace),
+            )?;
+        }
+    }
+    let (canonical_class, canonical_profile) = suite::CANONICAL_COMPARISON_CELL;
+    for tier in CalibrationTier::ALL {
+        let tier = *tier;
+        let tier_factory = move |class: ModelClass, scenario: &Scenario| -> Box<dyn Agent> {
+            tier.agent(class, scenario.script.clone())
+        };
+        let trace = suite::record_trace(
+            tier.slug(),
+            EvidenceClass::SyntheticFixture,
+            canonical_class,
+            canonical_profile,
+            &scenarios,
+            &tier_factory,
+        );
+        let path = traces.join(format!(
+            "{}-{}-{}.json",
+            tier.slug(),
+            canonical_class.slug(),
+            canonical_profile.slug()
+        ));
+        fs::write(
+            &path,
+            grokptah_cu_bench::digest::canonical_json_pretty(&trace),
+        )?;
+    }
+    println!("wrote {} comparison traces", traces.read_dir()?.count());
 
     println!("{}", report::one_line(&suite_report));
     Ok(())

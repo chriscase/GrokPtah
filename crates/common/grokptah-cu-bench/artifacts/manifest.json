@@ -27,6 +27,12 @@
       "byteLen": 2173
     },
     {
+      "kind": "comparison_contract",
+      "path": "schema/comparison-contract.json",
+      "sha256": "62194a92ef8f0d740ffd754d8e606995d2dc4cd1a4f2f2bdbf1b31efd3b46957",
+      "byteLen": 2034
+    },
+    {
       "kind": "thresholds",
       "path": "schema/thresholds.json",
       "sha256": "40d4f74a5baf15ec7b67d31977cd4ae986dc0f6ecec8211cfee49420dd3f8d96",
@@ -45,5 +51,5 @@
       "byteLen": 7202
     }
   ],
-  "manifestDigest": "9ebe0abf591c96839cbfd6bb18925941ac8d12df8aefdb98aa303b0bfaadd23a"
+  "manifestDigest": "6272ec6d94b80bd2b13160d3d92065c1acb50f1269a1724392b27d2edd7e5ff2"
 }

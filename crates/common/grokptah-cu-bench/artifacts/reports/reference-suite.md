@@ -65,6 +65,13 @@ No threshold was missed in any cell.
 | long_horizon_sessions | not covered | 0 | Not modelled. Every scenario here is bounded by a profile's step budget and runs against one surface, so nothing in this crate says anything about drift, context loss, or accumulated error over a long session. |
 | visual_comprehension | covered | 2 | Modelled only as bounded region digests with an ambiguity flag. That is enough to score whether a model guesses at pixels it cannot read; it says nothing about whether real image understanding would have resolved the region. |
 
+## External comparison evidence
+
+- Contract: `grokptah.cu-bench.comparison/1`
+- Status: `NoExternalSubmission`
+- No submission from outside this repository has been provided, so no comparative claim of any kind is supported.
+
+
 ## Comparison status
 
 No system outside this repository has been run through this benchmark. This crate therefore supports no comparative claim -- favourable, unfavourable, or neutral -- about GrokPtah relative to any other computer-use agent.

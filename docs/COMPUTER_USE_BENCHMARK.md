@@ -77,6 +77,69 @@ an authority breach would blur the one distinction this benchmark keeps sharp.
   fixtures.
 - **Nothing about long-horizon behaviour.** Runs are bounded and single-surface.
 
+## The external-comparison contract
+
+`grokptah.cu-bench.comparison/1` is a versioned, deterministic contract for
+submitting and checking a comparison. It exists because "no comparison has been
+run" is true but unhelpful: it gives a lab no submission path, and a reader no
+way to separate a rigorous result from an assertion.
+
+### What a submission carries
+
+A `TraceFixture` carries a `ComparisonBasis` — contract version, manifest
+digest, catalog digest, **efficiency-envelope digest**, model class, profile —
+plus one row per scenario, a boundary attestation, and the envelope
+measurements. The envelope digest is in the basis deliberately: two subjects
+held to different declared envelopes were not running the same experiment, and
+comparing them would be the most inviting mistake this contract can prevent.
+
+### Three levels, never collapsed
+
+- **`ReproducedLocally`** — re-run against this build; every transcript digest
+  matched. The only outcome that counts as qualification.
+- **`BasisVerified`** — same basis, internally consistent, boundaries clean.
+  This is what an external party's submission can actually reach, and it is
+  deliberately weaker than it sounds: it says two results are *about the same
+  thing*, not that either number is true.
+- **`UnverifiedProviderClaim`** — well formed, resting on a run this crate
+  cannot reproduce. Recorded, never verified, never qualification, and refused
+  on either side of a comparison.
+
+### Boundaries before numbers
+
+Nine checks run before any measurement is read: authority, privacy, false
+success, post-takeover actions, collateral effects, envelope breaches, evidence
+completeness, **stale observation accepted**, and **unredacted screenshot**.
+The last two are positive attestations rather than absences — a submission
+records the oldest observation any action was authorized against together with
+the bound it was held to, and how many screenshots it exposed together with how
+many were redacted. "We saw no staleness" is worth much less than "the oldest
+thing we acted on was 12 ms old, against a bound of 5000 ms", because the
+second is checkable by someone who does not trust the harness. A submission
+that omits the freshness bound is rejected rather than reading as "aged zero
+against a bound of zero, therefore fine".
+
+### Missing evidence is explicit
+
+Every `SuiteReport` carries `EvidenceStatus`, and today it says
+`NoExternalSubmission`. One rejected submission moves the whole set to
+`ContainsRejectedSubmissions` — partial evidence is not evidence.
+
+### What the published traces are for
+
+`artifacts/traces/` holds the reference across the full matrix (a lab
+reproducing this benchmark has to reproduce all of it) and each calibration
+tier at the canonical cell. The `overreaching` trace is published *because the
+contract must reject it*; the gate test asserts it still is.
+
+### What the contract does not do
+
+It does not make a comparison true. It establishes that two results are about
+the same fixtures under the same declared envelope, that neither breached a
+boundary, and that neither quietly dropped the scenarios it did badly on.
+Whether the numbers describe anything outside these fixtures is the next
+section's problem.
+
 ## Hardware- and provider-dependent gaps
 
 These need a real host and cannot be closed by this crate:
@@ -93,6 +156,8 @@ These need a real host and cannot be closed by this crate:
 | Model behaviour | Whether a real model actually refuses an injected instruction, or a small local model degrades the way the class model assumes |
 | Envelope realism | Whether the declared per-step and total deadlines, retry allowances, and per-turn element budgets match what a real local gateway sustains on real hardware |
 | Calibration-tier realism | Whether any real model resembles the timid, profligate, or overreaching behaviours. The tiers are synthetic by construction; they calibrate thresholds, they do not predict candidates |
+| Provider-run verification | Whether a submission's provider run happened as described. This crate has no provider access and cannot check it; `UnverifiedProviderClaim` is where that gap is recorded rather than papered over |
+| Cross-system comparison | Whether any result here transfers to a system that has not been run through this catalog. The contract can only establish that two results share a basis, never that either describes the world |
 | Token and latency cost | Real provider accounting under real prompts |
 
 ## Setting thresholds honestly

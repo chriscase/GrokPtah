@@ -124,6 +124,7 @@ cargo test -p grokptah-cu-bench                              # everything
 cargo test -p grokptah-cu-bench --test cu_bench_gate         # the CI gate
 cargo test -p grokptah-cu-bench --test cu_bench_calibration  # threshold discrimination
 cargo test -p grokptah-cu-bench --test cu_bench_boundaries   # exact-limit behaviour
+cargo test -p grokptah-cu-bench --test cu_bench_comparison   # the comparison contract
 cargo run  -p grokptah-cu-bench --example calibrate          # reference + every tier
 cargo run  -p grokptah-cu-bench --example controls           # run the controls
 cargo run  -p grokptah-cu-bench --example emit_artifacts     # regenerate artifacts
@@ -161,8 +162,50 @@ general computer-use agents are measured on. That resemblance is the only
 relationship: **no system outside this repository has been run through these
 fixtures**, so this crate supports no comparative claim of any kind.
 `ExternalComparison` has exactly one variant to keep that from being softened
-by omission, and `head_to_head_protocol()` states what a real comparison would
-require.
+by omission.
+
+### The comparison contract
+
+Saying "we did not run one" gives a lab no way to *submit* one, and a reader no
+way to tell a rigorous submission from an assertion. `comparison.rs` is the
+other half: a versioned contract (`grokptah.cu-bench.comparison/1`) for what a
+result has to carry before anything may be compared.
+
+A submission is a `TraceFixture`: a subject, an evidence class, a
+`ComparisonBasis` (contract version, manifest digest, catalog digest, **envelope
+digest**, model class, profile), one row per scenario, a boundary attestation,
+and the envelope measurements. Verification lands on one of four outcomes:
+
+| outcome | comparable | qualification | meaning |
+|---|---|---|---|
+| `ReproducedLocally` | yes | **yes** | re-run here; every transcript digest matched |
+| `BasisVerified` | yes | no | same basis, internally consistent, boundaries clean — the result is *about the same thing*, not necessarily true |
+| `UnverifiedProviderClaim` | **no** | no | well formed, resting on a run this crate cannot reproduce |
+| `Rejected` | no | no | failed a check; the reason is always named |
+
+**A provider claim never becomes qualification.** This crate has no provider
+access and must not launder a self-reported number into a measurement, so that
+outcome is terminal by construction and `compare()` refuses it on either side.
+The `run_label` a submitter attaches is never parsed, ranked, or treated as
+identifying anything.
+
+**Boundaries come before numbers.** A submission attesting to an authority
+violation, a leak, a false success, an envelope breach, incomplete evidence, a
+stale observation acted on, or an unredacted screenshot is rejected before any
+measurement is read. Comparison is downstream of qualification.
+
+**Absent evidence is stated.** `EvidenceStatus::NoExternalSubmission` is carried
+in every `SuiteReport` and printed in every report — a report that simply does
+not mention comparisons reads, to a hurried reader, exactly like one where the
+comparison passed. One rejected submission blocks the whole set: partial
+evidence is not evidence.
+
+`artifacts/traces/` holds nine recorded fixtures — the reference across the full
+matrix, and each calibration tier at the canonical cell
+(`large_vision`/`balanced`). One of them, the `overreaching` tier, is published
+**because the contract must reject it**: it is a negative fixture that proves
+the rejection path works against a real recorded run rather than only against a
+struct built in a test.
 
 ## Known limits
 

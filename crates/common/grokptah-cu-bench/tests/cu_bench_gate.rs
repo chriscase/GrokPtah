@@ -11,10 +11,12 @@ use std::path::PathBuf;
 
 use grokptah_cu_bench::agent::Agent;
 use grokptah_cu_bench::calibration::CalibrationTier;
+use grokptah_cu_bench::comparison::{self, EvidenceClass, SubmissionOutcome};
 use grokptah_cu_bench::hazard::HazardFamily;
 use grokptah_cu_bench::manifest::{self, ARTIFACT_DIR, ArtifactKind};
 use grokptah_cu_bench::matrix;
 use grokptah_cu_bench::modelclass::ModelClass;
+use grokptah_cu_bench::profile::ProfileId;
 use grokptah_cu_bench::report;
 use grokptah_cu_bench::report::CalibrationRow;
 use grokptah_cu_bench::scenario::Scenario;
@@ -201,6 +203,81 @@ fn the_published_calibration_evidence_matches_a_fresh_run() {
         json,
         grokptah_cu_bench::digest::canonical_json_pretty(&rows),
         "calibration.json is stale; re-run emit_artifacts"
+    );
+}
+
+#[test]
+fn the_published_comparison_traces_match_a_fresh_recording() {
+    let scenarios = catalog::all();
+    let factory = suite::reference_factory();
+    let root = artifact_root().join("traces");
+
+    for model_class in ModelClass::ALL {
+        for profile in ProfileId::ALL {
+            let name = format!("reference-{}-{}.json", model_class.slug(), profile.slug());
+            let on_disk = fs::read_to_string(root.join(&name))
+                .unwrap_or_else(|error| panic!("missing trace {name}: {error}"));
+            let fresh = suite::record_trace(
+                "reference",
+                EvidenceClass::SyntheticFixture,
+                *model_class,
+                *profile,
+                &scenarios,
+                &factory,
+            );
+            assert_eq!(
+                on_disk,
+                grokptah_cu_bench::digest::canonical_json_pretty(&fresh),
+                "{name} is stale; run `cargo run -p grokptah-cu-bench --example emit_artifacts`"
+            );
+        }
+    }
+
+    let (canonical_class, canonical_profile) = suite::CANONICAL_COMPARISON_CELL;
+    for tier in CalibrationTier::ALL {
+        let tier = *tier;
+        let tier_factory = move |class: ModelClass, scenario: &Scenario| -> Box<dyn Agent> {
+            tier.agent(class, scenario.script.clone())
+        };
+        let name = format!(
+            "{}-{}-{}.json",
+            tier.slug(),
+            canonical_class.slug(),
+            canonical_profile.slug()
+        );
+        let on_disk = fs::read_to_string(root.join(&name))
+            .unwrap_or_else(|error| panic!("missing trace {name}: {error}"));
+        let fresh = suite::record_trace(
+            tier.slug(),
+            EvidenceClass::SyntheticFixture,
+            canonical_class,
+            canonical_profile,
+            &scenarios,
+            &tier_factory,
+        );
+        assert_eq!(
+            on_disk,
+            grokptah_cu_bench::digest::canonical_json_pretty(&fresh),
+            "{name} is stale; re-run emit_artifacts"
+        );
+    }
+}
+
+#[test]
+fn the_published_negative_trace_is_still_refused_by_the_contract() {
+    // One trace is published because the contract must reject it. If a change
+    // made it acceptable, the rejection path would have silently stopped
+    // working and nothing else would notice.
+    let text =
+        fs::read_to_string(artifact_root().join("traces/overreaching-large_vision-balanced.json"))
+            .expect("negative trace present");
+    let trace = serde_json::from_str(&text).expect("negative trace parses");
+    assert!(
+        matches!(
+            comparison::verify(&trace, None),
+            SubmissionOutcome::Rejected { .. }
+        ),
+        "the published negative trace is no longer rejected"
     );
 }
 
