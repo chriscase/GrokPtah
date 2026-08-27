@@ -36,7 +36,7 @@ impl GitDirProbe {
         if !git_dir.is_absolute() {
             return Err(IsolatedError::forbidden("GIT_DIR must be an absolute path"));
         }
-        let git_dir = fs::canonicalize(git_dir)
+        let git_dir = dunce::canonicalize(git_dir)
             .map_err(|_| IsolatedError::forbidden("GIT_DIR cannot be canonicalized"))?;
         reject_if_exists(
             &git_dir.join("objects/info/alternates"),

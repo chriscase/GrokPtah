@@ -80,7 +80,7 @@ impl HermeticResolver {
             }
         }
         fs::create_dir_all(staging_root).map_err(io_err)?;
-        let staging_root = fs::canonicalize(staging_root).map_err(io_err)?;
+        let staging_root = dunce::canonicalize(staging_root).map_err(io_err)?;
 
         let mut total_bytes = 0u64;
         let mut seen_case = BTreeSet::new();
@@ -146,7 +146,7 @@ fn hermetic_join(root: &Path, relative: &str) -> IsolatedResult<PathBuf> {
         .parent()
         .ok_or_else(|| IsolatedError::forbidden("source path has no parent"))?;
     fs::create_dir_all(parent).map_err(io_err)?;
-    let canonical_parent = fs::canonicalize(parent).map_err(io_err)?;
+    let canonical_parent = dunce::canonicalize(parent).map_err(io_err)?;
     if !canonical_parent.starts_with(root) {
         return Err(IsolatedError::forbidden(
             "source path escaped the staging root",

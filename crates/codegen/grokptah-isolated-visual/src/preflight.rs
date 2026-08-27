@@ -153,6 +153,12 @@ fn occupancy_clear() -> bool {
     !occupied
 }
 
+impl IsolatedPreflight {
+    pub fn virtualization_framework_launched_claim(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,11 +169,5 @@ mod tests {
         assert!(!preflight.allowed_to_launch);
         assert!(preflight.fail_closed_launch().is_err());
         assert!(!preflight.virtualization_framework_launched_claim());
-    }
-}
-
-impl IsolatedPreflight {
-    pub fn virtualization_framework_launched_claim(&self) -> bool {
-        false
     }
 }

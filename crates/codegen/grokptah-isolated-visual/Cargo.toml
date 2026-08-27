@@ -5,13 +5,14 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Host-owned isolated Computer Use guest/VM lifecycle (#288/#363)"
 publish = false
-rust-version = "1.80"
+rust-version = "1.82"
 
 # Own workspace so this crate can be tested without compiling grokptah-agent-bridge.
 [workspace]
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
+dunce = "1"
 fs2 = "0.4"
 hmac = "0.12"
 serde = { version = "1", features = ["derive"] }

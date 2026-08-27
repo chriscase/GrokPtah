@@ -30,7 +30,7 @@ impl IsolatedVisualStore {
         fs::create_dir_all(root.join("guests")).map_err(io_err)?;
         fs::create_dir_all(root.join("leases")).map_err(io_err)?;
         fs::create_dir_all(root.join("quarantine")).map_err(io_err)?;
-        let root = fs::canonicalize(&root).map_err(io_err)?;
+        let root = dunce::canonicalize(&root).map_err(io_err)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
             .create(true)
