@@ -14,7 +14,12 @@ pub const MAX_STEPS: u32 = 12;
 pub const STATIONARITY_WINDOW: usize = 3;
 pub const DEFAULT_REPEATS: u32 = 5;
 pub const DEFAULT_SEED: u64 = 435_272;
+pub const MIN_REPEATS: u32 = 1;
+pub const MAX_REPEATS: u32 = 32;
 pub const MAX_OBJECTIVE_BYTES: usize = 512;
+pub const MAX_REPORT_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_EVIDENCE_SET_BYTES: usize = 64 * 1024 * 1024;
+pub const EVIDENCE_SET_SCHEMA: &str = "grokptah.cu_eval_evidence_set.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -449,6 +454,56 @@ impl CampaignStatus {
             Self::FailClosed => "FAIL_CLOSED",
         }
     }
+}
+
+/// Machine-readable process terminal verdict. PASS is the only zero-exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcessVerdict {
+    #[serde(rename = "PASS")]
+    Pass,
+    #[serde(rename = "PARTIAL")]
+    Partial,
+    #[serde(rename = "FAIL_CLOSED")]
+    FailClosed,
+    #[serde(rename = "VERIFIER_ERROR")]
+    VerifierError,
+    #[serde(rename = "MALFORMED")]
+    Malformed,
+    #[serde(rename = "INVALID_REPEATS")]
+    InvalidRepeats,
+    #[serde(rename = "LIVE_REFUSED")]
+    LiveRefused,
+}
+
+impl ProcessVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "PASS",
+            Self::Partial => "PARTIAL",
+            Self::FailClosed => "FAIL_CLOSED",
+            Self::VerifierError => "VERIFIER_ERROR",
+            Self::Malformed => "MALFORMED",
+            Self::InvalidRepeats => "INVALID_REPEATS",
+            Self::LiveRefused => "LIVE_REFUSED",
+        }
+    }
+
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Self::Pass => 0,
+            Self::Partial | Self::FailClosed | Self::VerifierError => 1,
+            Self::Malformed | Self::InvalidRepeats | Self::LiveRefused => 2,
+        }
+    }
+}
+
+pub fn validate_repeats(repeats: u32) -> EvalResult<()> {
+    if !(MIN_REPEATS..=MAX_REPEATS).contains(&repeats) {
+        return Err(EvalError::Schema(format!(
+            "repeats={repeats} is outside {MIN_REPEATS}..={MAX_REPEATS}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -11,6 +11,7 @@ use crate::types::{
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct Scenario {
     pub id: String,
     pub family: FamilyId,

@@ -9,7 +9,11 @@ A later live lane MUST:
    without weakening additionalProperties / deny-unknown-fields rules.
 2. Keep the same closed action grammar and fail-closed parsing.
 3. Set `eligibility` to `live_reusable_schema` only when `providerCalls > 0`.
-4. Set `live_authoritative` only with an authoritative provider usage receipt.
+4. Set `live_authoritative` only with a structured `ProviderReceipt`
+   (`receiptId`, `providerId`, `modelId`, `configDigest`, `contentSha256`).
+   A caller Boolean is not authority. Synthetic verification and live
+   verification are separate entry points; a synthetic campaign with
+   `providerCalls != 0` or live receipts is rejected by the synthetic verifier.
 5. Leave `costUsd` null unless the provider receipt contains a cost figure.
 6. Record `modelInputUnitsKind: provider_tokenizer_tokens` only for real
    tokenizer counts. Fake adapters may not use that kind.

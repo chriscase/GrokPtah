@@ -8,7 +8,7 @@ use grokptah_cu_adaptive_eval::SOURCE_GATE_SHA;
 fn synthetic_campaign_zero_provider_calls_and_zero_unauthorized() {
     let items = catalog();
     validate_catalog(&items).unwrap();
-    let out = run_campaign(2, 435_272);
+    let out = run_campaign(2, 435_272).unwrap();
     assert_eq!(out.report.source_gate.git_sha, SOURCE_GATE_SHA);
     assert_eq!(out.report.provider_calls, 0);
     assert_eq!(out.report.safety.unauthorized_dispatches, 0);
@@ -65,8 +65,8 @@ fn synthetic_campaign_zero_provider_calls_and_zero_unauthorized() {
 
 #[test]
 fn bounded_repeats_are_deterministic() {
-    let a = run_campaign(2, 435_272);
-    let b = run_campaign(2, 435_272);
+    let a = run_campaign(2, 435_272).unwrap();
+    let b = run_campaign(2, 435_272).unwrap();
     assert_eq!(a.report.fixture_hash, b.report.fixture_hash);
     assert_eq!(a.report.episodes.len(), b.report.episodes.len());
     for (l, r) in a.report.episodes.iter().zip(b.report.episodes.iter()) {
@@ -83,7 +83,7 @@ fn bounded_repeats_are_deterministic() {
 
 #[test]
 fn economy_uses_no_images_on_semantic_suite() {
-    let out = run_campaign(1, 435_272);
+    let out = run_campaign(1, 435_272).unwrap();
     let economy_semantic: Vec<_> = out
         .report
         .episodes
@@ -92,4 +92,22 @@ fn economy_uses_no_images_on_semantic_suite() {
         .collect();
     assert!(!economy_semantic.is_empty());
     assert!(economy_semantic.iter().all(|e| e.metrics.image_bytes == 0));
+}
+
+#[test]
+fn same_seed_reproduces_campaign_digest_and_different_seed_differs() {
+    let a = run_campaign(2, 435_272).unwrap();
+    let b = run_campaign(2, 435_272).unwrap();
+    let c = run_campaign(2, 435_273).unwrap();
+    assert_eq!(a.report.campaign_digest, b.report.campaign_digest);
+    assert_eq!(a.report.fixture_hash, b.report.fixture_hash);
+    assert_eq!(a.report.episodes.len(), c.report.episodes.len());
+    assert_ne!(a.report.campaign_digest, c.report.campaign_digest);
+    assert_ne!(a.report.episodes[0].seed, c.report.episodes[0].seed);
+    let verified = grokptah_cu_adaptive_eval::verify_campaign(
+        &a.report,
+        Some(&a.evidence),
+        grokptah_cu_adaptive_eval::verifier::VerifyMode::Synthetic,
+    );
+    assert!(verified.ok, "{verified:?}");
 }

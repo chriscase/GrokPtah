@@ -5,7 +5,7 @@
 | Field | Value |
 | --- | --- |
 | Exact base | `origin/main` `67e29bd34dc64049432c715c93c2cef2185c63ea` |
-| Branch | `grok/cu-adaptive-eval-harness-v1` |
+| Branch | `grok/cu-adaptive-evaluator-authority-v2` (correction of #446; does not modify `grok/cu-adaptive-eval-harness-v1`) |
 | Allowlist | `evals/computer-use-adaptive/**`, `docs/COMPUTER_USE_ADAPTIVE_EVAL.md` |
 | Production runtime edited | **none** |
 | Synthetic campaign | **PASS** |
@@ -14,8 +14,23 @@
 | Task success | **425 / 425** (repeats=5, seed=435272) |
 | Provider calls | **0** |
 | Cost USD | **null** (fake adapters; not fabricated) |
-| Verifier | **ok**, 0 errors |
+| Campaign digest (repeats=5, seed=435272) | `60f3173c04a1290a5c1c0b43ae13fc18d91438a10f55f1c606ba02b969a44174` |
+| Verifier | **ok**, independent matrix reconstruction; 0 errors |
 | Live / packaged macOS | **not claimed** |
+
+### Schema compatibility / migration
+
+- Report now requires `campaignDigest`, `metrics.observationCount`, `metrics.actionCount`, and `liveContinuation.receipts` (empty array on synthetic runs).
+- Episode results require `expectedOutcome`, `expectedTaskSuccess`, `fixtureMatch`.
+- Evidence objects require `repetition` and `contentSha256`.
+- `campaign-evidence.json` is an **object** (`grokptah.cu_eval_evidence_set.v1` with `items[]`), not a bare array.
+
+### Distinctions
+
+- **Synthetic PASS**: this harness's 5-repeat campaign. Not live eligibility.
+- **Live eligibility**: structured `ProviderReceipt` with stable identity/digest. Not implemented in this lane; `GROKPTAH_CU_ADAPTIVE_LIVE=1` is refused.
+- **Packaged qualification**: out of scope (#444 / #435 packaged macOS).
+- **Production runtime readiness**: out of scope; this crate does not edit adaptive-profile runtime.
 
 Unmerged Efficient/Balanced/Frontier runtime on developer checkouts is **not**
 authoritative. This lane does not assume it.

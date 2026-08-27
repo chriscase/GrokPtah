@@ -45,6 +45,7 @@ pub struct EpisodeMetrics {
     pub escalations: u64,
     pub postcondition_failures: u64,
     pub physical_dispatches: u64,
+    pub observation_count: u64,
     pub observation_bytes: u64,
     pub image_bytes: u64,
     pub model_input_units: u64,
@@ -73,11 +74,13 @@ pub struct EvidenceBundle {
     pub scenario_id: String,
     pub profile: ProfileId,
     pub adapter: AdapterId,
+    pub repetition: u32,
     pub observation_ids: Vec<String>,
     pub dispatch_ids: Vec<String>,
     pub authority: AuthorityEvidence,
     pub trace: Vec<crate::host::TraceEvent>,
     pub redacted: bool,
+    pub content_sha256: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -100,13 +103,16 @@ pub fn run_episode(
     profile: ProfileId,
     adapter: AdapterId,
     repetition: u32,
+    campaign_seed: u64,
 ) -> EpisodeBundle {
-    let seed = scenario.seed.wrapping_add(u64::from(repetition) * 17);
+    let host_seed = scenario.seed.wrapping_add(u64::from(repetition) * 17);
+    let seed =
+        crate::matrix::episode_seed(campaign_seed, scenario.seed, profile, adapter, repetition);
     let mut host = Host::new(
         scenario.world.clone(),
         profile,
         adapter.capabilities(),
-        seed,
+        host_seed,
         scenario.script.clone(),
     );
     let expected = scenario
@@ -306,12 +312,13 @@ pub fn run_episode(
         adapter.as_str(),
         repetition
     );
-    let evidence = EvidenceBundle {
+    let mut evidence = EvidenceBundle {
         schema_version: crate::types::EVIDENCE_SCHEMA.into(),
         evidence_id: evidence_id.clone(),
         scenario_id: scenario.id.clone(),
         profile,
         adapter,
+        repetition,
         observation_ids: host.observation_ids(),
         dispatch_ids: host.dispatch_ids(),
         authority: AuthorityEvidence {
@@ -322,7 +329,10 @@ pub fn run_episode(
         },
         trace: host.trace.clone(),
         redacted: true,
+        content_sha256: String::new(),
     };
+    evidence.content_sha256 =
+        crate::digest::evidence_body_digest(&evidence).expect("evidence digest");
 
     let result = EpisodeResult {
         schema_version: RESULT_SCHEMA.into(),
@@ -356,6 +366,7 @@ pub fn run_episode(
             escalations: host.escalations,
             postcondition_failures: host.postcondition_failures,
             physical_dispatches: host.physical.len() as u64,
+            observation_count: host.observation_ids().len() as u64,
             observation_bytes: host.observation_bytes,
             image_bytes: host.image_bytes,
             model_input_units: host.model_input_units,
