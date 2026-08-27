@@ -115,6 +115,13 @@ struct FakeRun {
     artifacts: BTreeMap<String, ArtifactPayload>,
 }
 
+/// Fixed salt for the fake's [`AttemptDigest`] derivation.
+///
+/// Not a secret and not meant to be: a deterministic adapter cannot mint a
+/// random one. A real adapter passes a persistent secret instead — see
+/// [`ServiceControlPlane`](crate::service::ServiceControlPlane).
+const FAKE_RECEIPT_SALT: &[u8] = b"grokptah-agent-sdk/fake/attempt-digest/v1";
+
 #[derive(Debug, Clone)]
 struct Receipt {
     payload_hash: String,
@@ -138,6 +145,11 @@ struct FakeState {
     leases: BTreeMap<String, ControlLease>,
     receipts: BTreeMap<String, Receipt>,
     receipt_retention: ReceiptRetention,
+    /// Salt for [`AttemptDigest`]. Fixed rather than random: the fake's
+    /// contract is determinism, and a fixed salt still exercises the property
+    /// the real derivation must have — equal payloads agree, unequal payloads
+    /// differ, and the host's own hash never crosses.
+    receipt_salt: Vec<u8>,
     faults: Vec<(Option<Operation>, Fault)>,
     clock_ticks: i64,
     next_id: u64,
@@ -451,8 +463,8 @@ impl FakeControlPlane {
             run,
             at,
             PublicEventKind::RunTerminal {
-                lifecycle,
-                stop_cause,
+                lifecycle: lifecycle.clone(),
+                stop_cause: stop_cause.clone(),
             },
         );
 
@@ -471,7 +483,7 @@ impl FakeControlPlane {
         run.view.usage = usage;
         run.view.verification = Some(VerificationView {
             status,
-            stop_cause,
+            stop_cause: stop_cause.clone(),
             interrupted: false,
             observations: ObservationCounts {
                 changed_files: 1,
@@ -733,7 +745,8 @@ impl FakeBuilder {
             runs: BTreeMap::new(),
             leases: BTreeMap::new(),
             receipts: BTreeMap::new(),
-            receipt_retention: self.receipt_retention,
+            receipt_retention: self.receipt_retention.clone(),
+            receipt_salt: FAKE_RECEIPT_SALT.to_vec(),
             faults: Vec::new(),
             clock_ticks: 0,
             next_id: 0,
@@ -976,7 +989,7 @@ impl AgentControlPlane for FakeControlPlane {
         };
         let accepted = RunAccepted {
             run_id: view.run_id.clone(),
-            lifecycle: view.lifecycle,
+            lifecycle: view.lifecycle.clone(),
             queue_position: view.queue_position,
             revision: view.revision,
             replayed: Some(false),
@@ -1146,7 +1159,7 @@ impl AgentControlPlane for FakeControlPlane {
         }
         let receipt = CancelReceipt {
             run_id: run.view.run_id.clone(),
-            lifecycle: run.view.lifecycle,
+            lifecycle: run.view.lifecycle.clone(),
             was_queued,
             revision: run.view.revision,
             replayed: Some(false),
@@ -1282,7 +1295,8 @@ impl AgentControlPlane for FakeControlPlane {
         let mut state = self.lock();
         guard!(state, Operation::ListReceipts);
         let max_page = state.limits.max_event_page;
-        let retention = state.receipt_retention;
+        let retention = state.receipt_retention.clone();
+        let salt = state.receipt_salt.clone();
         // Exact scope binding: receipts are run-scoped, never a global dump,
         // and an out-of-scope run gives the same denial every read gives.
         state.require_run(&selector)?;
@@ -1300,13 +1314,10 @@ impl AgentControlPlane for FakeControlPlane {
             }
             items.push(ReceiptView {
                 request_id: RequestId::new(request_id)?,
-                operation: receipt.operation,
-                status: receipt.status,
+                operation: receipt.operation.clone(),
+                status: receipt.status.clone(),
                 outcome: None,
-                payload_digest: ContentDigest {
-                    algorithm: DigestAlgorithm::Sha256,
-                    hex: receipt.payload_hash.clone(),
-                },
+                payload_digest: AttemptDigest::derive(&salt, &receipt.payload_hash),
                 run_id: Some(selector.run_id.clone()),
                 recorded_at: receipt.recorded_at,
             });

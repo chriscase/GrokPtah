@@ -28,6 +28,7 @@ use crate::ids::{
     WorkspaceRef,
 };
 use crate::page::{Cursor, RetainedRange};
+use crate::vocab::open_vocabulary;
 
 /// Longest bounded free-text summary the seam carries.
 pub const MAX_SUMMARY_BYTES: usize = 512;
@@ -103,15 +104,15 @@ impl RevisionWatermark {
 
 // ── Sessions ──────────────────────────────────────────────────────────────
 
-/// Mirrors the runtime `SessionKind`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionKind {
+open_vocabulary! {
+    /// Mirrors the runtime `SessionKind`.
+    SessionKind {
     /// Coding-agent session. The only kind that accepts task submission,
     /// follow-up, cancel, or queue control.
-    Build,
+        Build => "build",
     /// Conversational session. Read-only across this boundary.
-    Chat,
+        Chat => "chat",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,24 +153,32 @@ pub struct RunSelector {
 
 // ── Run lifecycle (mirror only — no second state machine) ─────────────────
 
-/// The run lifecycle, mirroring the runtime `RunState` exactly.
-///
-/// This enum adds no state, removes no state, and renames nothing. If the
-/// runtime gains a state, this is a contract **major** change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunLifecycle {
-    Queued,
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
-    Interrupted,
-    LimitReached,
+open_vocabulary! {
+    /// The run lifecycle, mirroring the runtime `RunState` exactly.
+    ///
+    /// This enum adds no state, removes no state, and renames nothing. If the
+    /// runtime gains a state, this is a contract **major** change.
+    RunLifecycle {
+        Queued => "queued",
+        Running => "running",
+        Completed => "completed",
+        Failed => "failed",
+        Cancelled => "cancelled",
+        Interrupted => "interrupted",
+        LimitReached => "limit_reached",
+    }
 }
 
 impl RunLifecycle {
-    pub fn is_terminal(self) -> bool {
+    /// `true` only for a state this build knows to be final.
+    ///
+    /// An [`Unknown`](Self::Unknown) lifecycle is **not** terminal. A consumer
+    /// that treated it as terminal would stop observing a run that may still
+    /// be executing, and could report a result the host never produced;
+    /// treating it as live only costs another poll. Pair this with
+    /// [`is_known`](Self::is_known) to surface "this host is ahead of this
+    /// build" rather than polling an unrecognized state forever.
+    pub fn is_terminal(&self) -> bool {
         matches!(
             self,
             Self::Completed
@@ -194,33 +203,32 @@ impl RunLifecycle {
     }
 }
 
-/// Host-decided terminal cause, mirroring the runtime `RunStopCause`.
-///
-/// This is never inferred from model prose; that is the whole point of the
-/// runtime carrying it separately from a final response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum StopCause {
-    Completed,
-    RoundLimit,
-    DurationLimit,
-    TokenCeiling,
-    TokenAccountingUnavailable,
-    TokenAccountingOverflow,
-    Stationarity,
-    RecoveryExhausted,
-    Cancelled,
-    Interrupted,
-    Failed,
+open_vocabulary! {
+    /// Host-decided terminal cause, mirroring the runtime `RunStopCause`.
+    ///
+    /// This is never inferred from model prose; that is the whole point of the
+    /// runtime carrying it separately from a final response.
+    StopCause {
+        Completed => "completed",
+        RoundLimit => "round_limit",
+        DurationLimit => "duration_limit",
+        TokenCeiling => "token_ceiling",
+        TokenAccountingUnavailable => "token_accounting_unavailable",
+        TokenAccountingOverflow => "token_accounting_overflow",
+        Stationarity => "stationarity",
+        RecoveryExhausted => "recovery_exhausted",
+        Cancelled => "cancelled",
+        Interrupted => "interrupted",
+        Failed => "failed",
+    }
 }
 
-/// Mirrors the runtime `RunExecutionMode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionMode {
-    #[default]
-    Shared,
-    IsolatedWorktree,
+open_vocabulary! {
+    /// Mirrors the runtime `RunExecutionMode`.
+    ExecutionMode {
+        Shared => "shared",
+        IsolatedWorktree => "isolated_worktree",
+    }
 }
 
 /// Caller-requested bounds. Every field may only **narrow** the host ceiling;
@@ -273,14 +281,14 @@ pub struct RunProgressView {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Evidence-backed verification, mirroring `ptah_get_handoff`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VerificationStatus {
-    Verified,
-    Unverified,
-    Failed,
-    Incomplete,
+open_vocabulary! {
+    /// Evidence-backed verification, mirroring `ptah_get_handoff`.
+    VerificationStatus {
+        Verified => "verified",
+        Unverified => "unverified",
+        Failed => "failed",
+        Incomplete => "incomplete",
+    }
 }
 
 /// Host observations. These are counts the runtime derived from typed events,
@@ -299,7 +307,7 @@ pub struct ObservationCounts {
     pub permissions_unresolved: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VerificationView {
     pub status: VerificationStatus,
@@ -390,6 +398,13 @@ pub struct RunView {
     pub updated_at: DateTime<Utc>,
 }
 
+impl Default for ExecutionMode {
+    /// The runtime's default: run in the session's own workspace.
+    fn default() -> Self {
+        Self::Shared
+    }
+}
+
 // ── Task submission ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,14 +450,14 @@ pub struct RunAccepted {
 
 // ── Follow-up ─────────────────────────────────────────────────────────────
 
-/// Mirrors the runtime `SteeringDisposition`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FollowUpDisposition {
+open_vocabulary! {
+    /// Mirrors the runtime `SteeringDisposition`.
+    FollowUpDisposition {
     /// Accepted for the active turn; it lands at the next safe model boundary.
-    Pending,
+        Pending => "pending",
     /// The session was idle, so it became a durable queued follow-up.
-    Queued,
+        Queued => "queued",
+    }
 }
 
 /// A non-cancelling follow-up.
@@ -593,36 +608,135 @@ pub struct ReleaseLeaseReceipt {
 
 // ── Redacted receipts ─────────────────────────────────────────────────────
 
-/// What a mutation was, without naming the host tool that performed it.
-///
-/// Closed on purpose. A raw tool name is host vocabulary that changes when the
-/// host adds a tool, and it would let a newer host put an arbitrary string in
-/// front of a consumer that believes it is reading a classification. A tool
-/// this build does not recognize projects to [`OperationClass::Other`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperationClass {
-    CreateSession,
-    SubmitTask,
-    FollowUp,
-    Cancel,
-    AcquireLease,
-    ReleaseLease,
+open_vocabulary! {
+    /// What a mutation was, without naming the host tool that performed it.
+    ///
+    /// The raw tool name never crosses: it is host vocabulary that changes when
+    /// the host adds a tool, and forwarding it would let a newer host put an
+    /// arbitrary string in front of a consumer that believes it is reading a
+    /// classification.
+    ///
+    /// Two different unknowns, deliberately kept apart. [`Other`](Self::Other)
+    /// is a mutation the *adapter* looked at and classified as outside this
+    /// contract's vocabulary — a decision. `Unknown` is a token that arrived on
+    /// the wire from a host this build does not understand — an absence of one.
+    /// A consumer auditing coverage needs to tell those apart.
+    OperationClass {
+        CreateSession => "create_session",
+        SubmitTask => "submit_task",
+        FollowUp => "follow_up",
+        Cancel => "cancel",
+        AcquireLease => "acquire_lease",
+        ReleaseLease => "release_lease",
     /// A mutation outside this contract's vocabulary.
-    Other,
+        Other => "other",
+    }
 }
 
-/// Where a durable idempotency receipt stands.
+open_vocabulary! {
+    /// Where a durable idempotency receipt stands.
+    ///
+    /// Mirrors the runtime's three values. `Pending` is the one that matters: the
+    /// host claimed the key and then stopped before recording an outcome, so the
+    /// mutation may or may not have applied. See [`ReceiptView::is_uncertain`].
+    ReceiptStatus {
+        Pending => "pending",
+        Complete => "complete",
+        Failed => "failed",
+    }
+}
+
+/// Tells one attempt from another without letting anyone confirm what was sent.
 ///
-/// Mirrors the runtime's three values. `Pending` is the one that matters: the
-/// host claimed the key and then stopped before recording an outcome, so the
-/// mutation may or may not have applied. See [`ReceiptView::is_uncertain`].
+/// # Why this is not the host's payload hash
+///
+/// The runtime stores `payload_hash = SHA-256(serialized request)`, unkeyed.
+/// For `submit_task` that request contains the **prompt**. Passing the host's
+/// hash through this seam verbatim would hand every reader a prompt-confirmation
+/// oracle: guess the text, hash it, compare. That is the same weakness the
+/// crate already documents for [`WorkspaceRef`] — except a prompt is the one
+/// thing this boundary exists to withhold, and unlike a path it is worth
+/// guessing.
+///
+/// It is worse than it first looks, because reads here are **not**
+/// principal-scoped (see `docs/AGENT_SDK_SEAM.md`): every credential that can
+/// reach a session sees every receipt in it, including receipts written by a
+/// different credential. The oracle would therefore work *across* consumers
+/// sharing a session, not just on one's own traffic.
+///
+/// # What crosses instead
+///
+/// `SHA-256(scope_salt ‖ 0x00 ‖ host_payload_hash)`, truncated to 16 bytes.
+/// Within one adapter and one salt this is a bijection on the host's hash, so
+/// the only property a consumer actually needs — *these two receipts are the
+/// same attempt / different attempts* — survives exactly. Everything else does
+/// not: an attacker without the salt cannot test a guess offline, and two
+/// scopes never produce a matching digest for the same payload.
+///
+/// # What you may not do with it
+///
+/// Do not compare digests across adapters, across salts, or across hosts, and
+/// do not persist one as a durable identity. It is a within-scope equality
+/// token, not a content address. [`RequestId`] is the durable identity.
+///
+/// [`WorkspaceRef`]: crate::ids::WorkspaceRef
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AttemptDigest(String);
+
+impl AttemptDigest {
+    /// Bytes of truncated digest carried across the seam.
+    pub const BYTES: usize = 16;
+
+    /// Derive from an adapter salt and the host's stored payload hash.
+    pub fn derive(scope_salt: &[u8], host_payload_hash: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(scope_salt);
+        hasher.update([0u8]);
+        hasher.update(host_payload_hash.as_bytes());
+        let full = hasher.finalize();
+        Self(hex_lower(&full[..Self::BYTES]))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for AttemptDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+open_vocabulary! {
+    /// Which population a retention budget counts against.
+    RetentionBudgetScope {
+        /// One budget shared by every receipt the host holds. Pressure from
+        /// other runs can expire this run's receipts.
+        Host => "host",
+        /// A budget applied per run.
+        Run => "run",
+    }
+}
+
+/// Receipts a retention window keeps regardless of age or count.
+///
+/// Without these a consumer would compute "this receipt is older than
+/// `max_age_days`, so it must be gone" and be wrong — the runtime keeps two
+/// classes indefinitely, and both are exactly the classes an observer most
+/// wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReceiptStatus {
-    Pending,
-    Complete,
-    Failed,
+#[serde(rename_all = "camelCase")]
+pub struct RetentionExemptions {
+    /// A receipt that never settled is never expired. Its whole purpose is to
+    /// record that an outcome is unknown; expiring it would silently convert
+    /// "may have applied" into "never happened".
+    pub unsettled_retained: bool,
+    /// A receipt whose run has not reached a terminal state is never expired,
+    /// however old, so a long-running run cannot lose the evidence of the
+    /// request that started it.
+    pub active_run_retained: bool,
 }
 
 /// Redacted evidence that a mutation happened.
@@ -638,7 +752,7 @@ pub enum ReceiptStatus {
 /// | The stored response body | The runtime replays a mutation's full response from its receipt. That body carries whatever the mutation returned — run prompts, workspace paths, queue entries. |
 /// | The failure *message* | Runtime messages embed absolute paths verbatim; `canonical_workspace` formats one straight into a `workspace_mismatch`. The typed [`SdkErrorCode`] carries the meaning without the text. |
 /// | The raw tool name | Host vocabulary; see [`OperationClass`]. |
-/// | The request payload | Only its digest crosses, which is enough to tell one attempt from another without revealing either. |
+/// | The request payload | Only a *salted* digest crosses. The host's own unkeyed `payload_hash` would be a confirmation oracle on the prompt it covers; see [`AttemptDigest`]. |
 ///
 /// [`SdkErrorCode`]: crate::error::SdkErrorCode
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -650,8 +764,10 @@ pub struct ReceiptView {
     /// Typed reason, present only on [`ReceiptStatus::Failed`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<crate::error::SdkErrorCode>,
-    /// Digest of the request payload. Distinguishes attempts; reveals neither.
-    pub payload_digest: ContentDigest,
+    /// Salted digest of the request payload. Distinguishes attempts within
+    /// this scope and reveals nothing about their contents — see
+    /// [`AttemptDigest`] for why the host's own hash must not be used here.
+    pub payload_digest: AttemptDigest,
     /// The run this mutation produced or acted on, when it had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
@@ -664,22 +780,51 @@ pub struct ReceiptView {
 /// receipts without also holding the caveat: a receipt that aged out is
 /// indistinguishable from one that never existed. Absence is never proof that
 /// a mutation did not happen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReceiptRetention {
-    /// Most settled receipts the host keeps.
+    /// Most settled receipts the budget keeps. Read it together with
+    /// [`budget_scope`](Self::budget_scope): under
+    /// [`RetentionBudgetScope::Host`] this is *not* a per-run allowance, and a
+    /// busy neighbouring run can expire this run's receipts well before the
+    /// count suggests.
     pub max_receipts: u32,
-    /// Age at which a settled receipt is expired.
+    /// Age at which an expirable receipt is dropped.
     pub max_age_days: u32,
+    /// The population `max_receipts` counts against.
+    pub budget_scope: RetentionBudgetScope,
+    /// Receipts the window keeps regardless of age or count.
+    pub exemptions: RetentionExemptions,
 }
 
 impl ReceiptRetention {
-    /// The runtime's shipped policy: the newest 1,000 settled receipts, and
-    /// nothing older than 7 days.
+    /// The runtime's shipped policy, as `OrchStore::apply_retention` applies
+    /// it: a **host-wide** budget of the newest 1,000 expirable receipts and a
+    /// 7-day ceiling, with unsettled receipts and receipts belonging to
+    /// non-terminal runs held back from both.
     pub const RUNTIME_DEFAULT: Self = Self {
         max_receipts: 1_000,
         max_age_days: 7,
+        budget_scope: RetentionBudgetScope::Host,
+        exemptions: RetentionExemptions {
+            unsettled_retained: true,
+            active_run_retained: true,
+        },
     };
+
+    /// `true` when a receipt in this state is held back from expiry.
+    ///
+    /// The conservative reading: an unknown status counts as unsettled, so a
+    /// consumer never concludes a receipt was safe to drop on the strength of
+    /// a word it could not interpret.
+    pub fn is_exempt(&self, status: &ReceiptStatus, run_is_terminal: Option<bool>) -> bool {
+        if self.exemptions.unsettled_retained
+            && !matches!(status, ReceiptStatus::Complete | ReceiptStatus::Failed)
+        {
+            return true;
+        }
+        self.exemptions.active_run_retained && run_is_terminal == Some(false)
+    }
 }
 
 /// One page of receipts, inseparable from the window it came from.
@@ -751,8 +896,11 @@ impl ReceiptView {
     /// safe *only* because the host will replay rather than repeat — but until
     /// the host settles it, an observer must not report the mutation as either
     /// applied or refused.
+    /// A status this build cannot read counts as uncertain. The dangerous
+    /// reading is the other one: "settled" licenses a consumer to retry a
+    /// mutation that may already have applied.
     pub fn is_uncertain(&self) -> bool {
-        self.status == ReceiptStatus::Pending
+        !matches!(self.status, ReceiptStatus::Complete | ReceiptStatus::Failed)
     }
 
     /// `true` once the host has settled this key either way.
@@ -763,10 +911,10 @@ impl ReceiptView {
 
 // ── Artifacts ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DigestAlgorithm {
-    Sha256,
+open_vocabulary! {
+    DigestAlgorithm {
+        Sha256 => "sha256",
+    }
 }
 
 /// A content digest over the exact bytes an artifact carries.
@@ -789,8 +937,17 @@ impl ContentDigest {
     }
 
     pub fn validate(&self) -> SdkResult<()> {
-        let expected = match self.algorithm {
+        let expected = match &self.algorithm {
             DigestAlgorithm::Sha256 => 64,
+            // Decoding an unknown algorithm keeps the surrounding record
+            // readable; *verifying* with one is impossible, so integrity
+            // checking refuses rather than passing something it did not check.
+            DigestAlgorithm::Unknown(name) => {
+                return Err(SdkError::new(
+                    SdkErrorCode::Unsupported,
+                    format!("this build cannot verify a `{name}` digest"),
+                ))
+            }
         };
         if self.hex.len() != expected
             || !self.hex.bytes().all(|b| b.is_ascii_hexdigit())
@@ -814,44 +971,49 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-/// The media an artifact may carry.
-///
-/// There is no binary variant, by design. Screenshots, Computer Use evidence
-/// assets, and other opaque blobs have no representation here, so the seam
-/// cannot become a byte-exfiltration path for the evidence store the runtime
-/// deliberately keeps host-local.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArtifactMedia {
-    PlainText,
-    Markdown,
-    Json,
-    UnifiedDiff,
+open_vocabulary! {
+    /// The media an artifact may carry.
+    ///
+    /// There is no binary variant, by design. Screenshots, Computer Use evidence
+    /// assets, and other opaque blobs have no representation here, so the seam
+    /// cannot become a byte-exfiltration path for the evidence store the runtime
+    /// deliberately keeps host-local.
+    ArtifactMedia {
+        PlainText => "plain_text",
+        Markdown => "markdown",
+        Json => "json",
+        UnifiedDiff => "unified_diff",
+    }
 }
 
 impl ArtifactMedia {
-    pub fn media_type(self) -> &'static str {
+    pub fn media_type(&self) -> &'static str {
         match self {
             Self::PlainText => "text/plain; charset=utf-8",
             Self::Markdown => "text/markdown; charset=utf-8",
             Self::Json => "application/json",
             Self::UnifiedDiff => "text/x-diff; charset=utf-8",
+            // A medium this build does not know is opaque bytes. Guessing a
+            // renderable type from an unrecognized token is how a consumer
+            // ends up rendering something the host never said was safe to
+            // render.
+            Self::Unknown(_) => "application/octet-stream",
         }
     }
 }
 
-/// What an artifact is, without saying where it lives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArtifactKind {
+open_vocabulary! {
+    /// What an artifact is, without saying where it lives.
+    ArtifactKind {
     /// Reviewed diff for an isolated run.
-    ReviewDiff,
+        ReviewDiff => "review_diff",
     /// Structured test observations.
-    TestReport,
+        TestReport => "test_report",
     /// Host-authored run summary.
-    RunSummary,
+        RunSummary => "run_summary",
     /// Structured, non-transcript run metadata.
-    Metadata,
+        Metadata => "metadata",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -930,44 +1092,44 @@ impl ArtifactPayload {
 
 // ── Events ────────────────────────────────────────────────────────────────
 
-/// Mirrors the runtime `ToolCallKind`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolKind {
-    Read,
-    Edit,
-    Search,
-    Execute,
-    Think,
-    Other,
+open_vocabulary! {
+    /// Mirrors the runtime `ToolCallKind`.
+    ToolKind {
+        Read => "read",
+        Edit => "edit",
+        Search => "search",
+        Execute => "execute",
+        Think => "think",
+        Other => "other",
+    }
 }
 
-/// Mirrors the runtime `ToolCallStatus`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolStatus {
-    Pending,
-    Running,
-    Completed,
-    Failed,
-    Denied,
+open_vocabulary! {
+    /// Mirrors the runtime `ToolCallStatus`.
+    ToolStatus {
+        Pending => "pending",
+        Running => "running",
+        Completed => "completed",
+        Failed => "failed",
+        Denied => "denied",
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TestOutcome {
-    Passed,
-    Failed,
-    Incomplete,
+open_vocabulary! {
+    TestOutcome {
+        Passed => "passed",
+        Failed => "failed",
+        Incomplete => "incomplete",
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionOutcome {
-    Requested,
-    Granted,
-    Denied,
-    Unresolved,
+open_vocabulary! {
+    PermissionOutcome {
+        Requested => "requested",
+        Granted => "granted",
+        Denied => "denied",
+        Unresolved => "unresolved",
+    }
 }
 
 /// A bounded, non-transcript event.
@@ -1030,8 +1192,39 @@ pub enum PublicEventKind {
     },
 }
 
+/// Every `kind` token this build understands.
+///
+/// Checked *before* delegating to the derived decoder so that an unknown kind
+/// becomes [`PublicEventKind::Unrecognized`] while a malformed *known* kind
+/// still fails loudly. Collapsing both into "unrecognized" would hide real
+/// corruption behind the forward-compatibility path.
+pub const KNOWN_EVENT_KINDS: &[&str] = &[
+    "turn_started",
+    "progress",
+    "tool_call",
+    "file_changed",
+    "test_observed",
+    "permission",
+    "rate_limited",
+    "follow_up_accepted",
+    "queue_changed",
+    "run_terminal",
+    "unrecognized",
+];
+
 /// One event with its durable position.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// # Decoding a page from a newer host
+///
+/// A host that adds an event kind must not break a consumer pinned to an older
+/// build, and must not break it *page-wide* — one unrecognized event in a page
+/// of five hundred would otherwise discard the other four hundred and
+/// ninety-nine. Decoding therefore checks the `kind` token against
+/// [`KNOWN_EVENT_KINDS`] first: a token this build does not have becomes
+/// [`PublicEventKind::Unrecognized`], carrying the host's word so a consumer
+/// can log or count it. A *known* kind whose fields are malformed still fails,
+/// because that is corruption rather than a newer vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicEvent {
     /// Opaque durable position. Send it back as a page cursor or a stream
@@ -1042,9 +1235,109 @@ pub struct PublicEvent {
     pub kind: PublicEventKind,
 }
 
+impl<'de> Deserialize<'de> for PublicEvent {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        let value = serde_json::Value::deserialize(d)?;
+        let cursor = value
+            .get("cursor")
+            .cloned()
+            .ok_or_else(|| D::Error::missing_field("cursor"))?;
+        let cursor: Cursor = serde_json::from_value(cursor).map_err(D::Error::custom)?;
+        let at = value
+            .get("at")
+            .cloned()
+            .ok_or_else(|| D::Error::missing_field("at"))?;
+        let at: DateTime<Utc> = serde_json::from_value(at).map_err(D::Error::custom)?;
+
+        let wire_kind = value
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .ok_or_else(|| D::Error::missing_field("kind"))?;
+        let kind = if KNOWN_EVENT_KINDS.contains(&wire_kind) {
+            serde_json::from_value(value.clone()).map_err(D::Error::custom)?
+        } else {
+            PublicEventKind::Unrecognized {
+                wire_kind: crate::vocab::unknown_label(wire_kind),
+            }
+        };
+
+        Ok(Self { cursor, at, kind })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_attempt_digest_is_never_the_host_payload_hash() {
+        let host_hash = {
+            let mut h = Sha256::new();
+            h.update(b"{\"prompt\":\"ship the release\"}");
+            hex_lower(&h.finalize())
+        };
+        let salt = b"tenant-a";
+        let digest = AttemptDigest::derive(salt, &host_hash);
+
+        // The whole point: possession of the payload — and therefore of its
+        // unkeyed hash — must not let anyone confirm it against what crosses.
+        assert_ne!(digest.as_str(), host_hash);
+        assert!(!host_hash.starts_with(digest.as_str()));
+        assert_eq!(digest.as_str().len(), AttemptDigest::BYTES * 2);
+        assert!(digest.as_str().bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn attempt_digests_compare_within_a_scope_and_never_across_one() {
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+
+        // Within one salt the only property a consumer needs survives exactly.
+        assert_eq!(
+            AttemptDigest::derive(b"scope-1", &a),
+            AttemptDigest::derive(b"scope-1", &a)
+        );
+        assert_ne!(
+            AttemptDigest::derive(b"scope-1", &a),
+            AttemptDigest::derive(b"scope-1", &b)
+        );
+        // Across salts, the same payload is not correlatable.
+        assert_ne!(
+            AttemptDigest::derive(b"scope-1", &a),
+            AttemptDigest::derive(b"scope-2", &a)
+        );
+    }
+
+    #[test]
+    fn an_unverifiable_digest_algorithm_refuses_rather_than_passes() {
+        let digest = ContentDigest {
+            algorithm: DigestAlgorithm::from_wire("blake3"),
+            hex: "00".repeat(32),
+        };
+        let error = digest
+            .validate()
+            .expect_err("cannot verify what it cannot compute");
+        assert_eq!(error.code, SdkErrorCode::Unsupported);
+        // Decoding still worked — the record around it stays readable.
+        assert_eq!(digest.algorithm.as_wire(), "blake3");
+        assert!(!digest.algorithm.is_known());
+    }
+
+    #[test]
+    fn retention_exempts_what_the_runtime_exempts() {
+        let policy = ReceiptRetention::RUNTIME_DEFAULT;
+        assert_eq!(policy.budget_scope, RetentionBudgetScope::Host);
+
+        // Unsettled is held back, settled is not.
+        assert!(policy.is_exempt(&ReceiptStatus::Pending, Some(true)));
+        assert!(!policy.is_exempt(&ReceiptStatus::Complete, Some(true)));
+        // A live run holds its receipts back however old they are.
+        assert!(policy.is_exempt(&ReceiptStatus::Complete, Some(false)));
+        // An unreadable status counts as unsettled, never as safe to drop.
+        assert!(policy.is_exempt(&ReceiptStatus::from_wire("superseded"), Some(true)));
+    }
 
     #[test]
     fn lifecycle_mirrors_the_runtime_state_machine_exactly() {

@@ -332,6 +332,44 @@ pub async fn run_battery<H: Harness>(harness: &H) -> ConformanceReport {
         }
     });
 
+    check!(report, "observe.vocabulary_is_within_this_build", {
+        // Not a pass/fail on the *host* — a host is allowed to be ahead. This
+        // reports whether it is, because a consumer that silently reads an
+        // unrecognized lifecycle as "not finished" and an unrecognized mode as
+        // "shared" is making decisions on words it does not have. Against a
+        // live host this is the first check to read after an upgrade.
+        match plane.observe_run(selector.clone()).await {
+            Err(error) => CheckOutcome::Failed(format!("observe failed: {error}")),
+            Ok(view) => {
+                let mut ahead: Vec<&str> = Vec::new();
+                if !view.lifecycle.is_known() {
+                    ahead.push("lifecycle");
+                }
+                if !view.execution_mode.is_known() {
+                    ahead.push("executionMode");
+                }
+                if view.stop_cause.as_ref().is_some_and(|c| !c.is_known()) {
+                    ahead.push("stopCause");
+                }
+                if view
+                    .verification
+                    .as_ref()
+                    .is_some_and(|v| !v.status.is_known())
+                {
+                    ahead.push("verification.status");
+                }
+                if ahead.is_empty() {
+                    CheckOutcome::Passed
+                } else {
+                    CheckOutcome::Skipped(format!(
+                        "host is ahead of this build in: {}",
+                        ahead.join(", ")
+                    ))
+                }
+            }
+        }
+    });
+
     // ── Authorization and scope ──────────────────────────────────────────
     check!(report, "authz.cross_session_read_is_forbidden_scope", {
         match RunId::new("run-does-not-exist") {

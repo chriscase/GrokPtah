@@ -12,19 +12,37 @@ use serde::{Deserialize, Serialize};
 use crate::error::{SdkError, SdkErrorCode};
 
 /// The contract version this build of the SDK speaks.
-pub const CONTRACT_VERSION: ContractVersion = ContractVersion { major: 1, minor: 1 };
+pub const CONTRACT_VERSION: ContractVersion = ContractVersion { major: 1, minor: 2 };
 
 /// Major.minor identity for the capability boundary.
 ///
 /// * A **major** bump removes or reshapes an existing field, method, error
 ///   code, or capability identifier. Consumers must be recompiled.
 /// * A **minor** bump is additive only: new optional fields, new capability
-///   identifiers, new error codes. An older consumer keeps working because
-///   unknown members decode into the forward-compatible variants
-///   ([`SdkErrorCode::Unknown`], [`CapabilityId::Unknown`]) rather than
-///   failing to parse.
+///   identifiers, new error codes, new *words* in an existing vocabulary. An
+///   older consumer keeps working because every open member decodes into a
+///   forward-compatible variant ([`SdkErrorCode::Unknown`],
+///   [`CapabilityId::Unknown`], and the `Unknown` arm every
+///   [vocabulary](crate::vocab) carries) rather than failing to parse.
+///
+/// # Minor 2 is what makes that promise true
+///
+/// At 1.0 and 1.1 the rule above was aspirational. Sixteen wire vocabularies —
+/// run lifecycle, stop cause, tool kind, receipt status, and the rest — were
+/// derived enums that *rejected* a token they did not know, and because they
+/// sit inside larger records one unknown word failed the whole [`RunView`] or
+/// the whole event page. Any word a host added was therefore a breaking change
+/// for every deployed consumer at once, whatever this doc claimed. 1.2 opens
+/// them, so a host that negotiates it may add vocabulary knowing older
+/// consumers degrade to `Unknown` instead of failing.
+///
+/// The wire contract is unchanged from 1.1; the Rust API is not. Vocabularies
+/// gained an arm (matches on them are no longer exhaustive) and stopped being
+/// `Copy`. That would be a major bump under the rule above if this crate had a
+/// consumer; it has none, and `publish = false` — see `docs/ADR-003`.
 ///
 /// [`CapabilityId::Unknown`]: crate::capability::CapabilityId::Unknown
+/// [`RunView`]: crate::dto::RunView
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContractVersion {

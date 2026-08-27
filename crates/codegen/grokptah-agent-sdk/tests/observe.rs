@@ -197,7 +197,22 @@ async fn receipts_prove_a_mutation_without_revealing_it() {
     assert_eq!(receipt.status, ReceiptStatus::Complete);
     assert!(receipt.is_settled());
     assert_eq!(receipt.run_id.as_ref(), Some(&selector.run_id));
-    receipt.payload_digest.validate().expect("a real digest");
+    // A salted attempt token of the advertised width — not the host's own
+    // payload hash, which would be a prompt-confirmation oracle. The
+    // derivation itself is proven in `dto`'s unit tests.
+    assert_eq!(
+        receipt.payload_digest.as_str().len(),
+        AttemptDigest::BYTES * 2,
+        "digest is the advertised width"
+    );
+    assert!(
+        receipt
+            .payload_digest
+            .as_str()
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit()),
+        "digest is lowercase hex"
+    );
 
     // The prompt went in through this very request. It does not come back.
     let encoded = serde_json::to_string(&page).expect("serialize receipts");
@@ -435,7 +450,7 @@ async fn retention_drops_settled_receipts_but_never_uncertain_ones() {
     let plane = FakeControlPlane::builder()
         .receipt_retention(ReceiptRetention {
             max_receipts: 2,
-            max_age_days: 7,
+            ..ReceiptRetention::RUNTIME_DEFAULT
         })
         .build();
     let (_session, selector) = completed_run(&plane).await;

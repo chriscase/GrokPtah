@@ -91,6 +91,7 @@ pub mod observe;
 pub mod page;
 pub mod service;
 pub mod version;
+pub mod vocab;
 
 #[cfg(feature = "conformance")]
 pub mod conformance;
@@ -109,14 +110,14 @@ pub mod prelude {
     };
     pub use crate::dto::{
         AppliedBounds, ArtifactDescriptor, ArtifactKind, ArtifactMedia, ArtifactPayload,
-        ArtifactRequest, BoundedText, CancelReceipt, CancelRequest, ChangedFile, ContentDigest,
-        ControlLease, ControlLeaseRequest, CreateSessionRequest, ExecutionMode,
+        ArtifactRequest, AttemptDigest, BoundedText, CancelReceipt, CancelRequest, ChangedFile,
+        ContentDigest, ControlLease, ControlLeaseRequest, CreateSessionRequest, ExecutionMode,
         FollowUpDisposition, FollowUpReceipt, FollowUpRequest, LeaseCredential, ObservationCounts,
         OperationClass, PublicEvent, PublicEventKind, ReceiptPage, ReceiptRetention, ReceiptStatus,
-        ReceiptView, ReleaseLeaseReceipt, ReleaseLeaseRequest, Revision, RevisionWatermark,
-        RunAccepted, RunBoundsRequest, RunLifecycle, RunProgressView, RunSelector, RunView,
-        SessionKind, SessionView, StopCause, TaskSubmission, ToolKind, ToolStatus, UsageView,
-        VerificationStatus, VerificationView,
+        ReceiptView, ReleaseLeaseReceipt, ReleaseLeaseRequest, RetentionBudgetScope,
+        RetentionExemptions, Revision, RevisionWatermark, RunAccepted, RunBoundsRequest,
+        RunLifecycle, RunProgressView, RunSelector, RunView, SessionKind, SessionView, StopCause,
+        TaskSubmission, ToolKind, ToolStatus, UsageView, VerificationStatus, VerificationView,
     };
     pub use crate::error::{ErrorOrigin, RetryDisposition, SdkError, SdkErrorCode, SdkResult};
     pub use crate::ids::{

@@ -1,8 +1,13 @@
 # GrokPtah agent SDK seam
 
-Status: **contract 1.1 shipped; service adapter shipped; read-only
+Status: **contract 1.2 shipped; service adapter shipped; read-only
 observatory shipped; desktop adapter and a live two-host run pending.** This document is the design packet and the
 implementation guide for `crates/codegen/grokptah-agent-sdk`.
+
+> **Portability contract:** what an external project may read from a host, the
+> scope tier it actually gets, and the forward-compatibility rules — with the
+> evidence behind each — is in
+> [`AGENT_SDK_PORTABILITY.md`](AGENT_SDK_PORTABILITY.md).
 
 ## Why this exists
 
@@ -456,6 +461,7 @@ Compatibility rules for future changes:
 | Add a capability identifier | Yes |
 | Add an error code | Yes |
 | Add a `PublicEventKind` variant | Yes (older consumers see `Unrecognized`) |
+| Add a word to any wire vocabulary | Yes, **from 1.2** (older consumers see `Unknown`) |
 | Add a trait method with a default body | Yes |
 | Add a required DTO field | No |
 | Rename or retype a field | No |
@@ -471,15 +477,28 @@ that fails closed. An adapter written against 1.0 still compiles and reports
 the capability as absent — which is why the default body returns
 `capability_unavailable` rather than an empty page.
 
+**1.1 → 1.2** makes the table above true rather than aspirational. Until 1.2
+every one of the sixteen wire vocabularies was a closed enum that *rejected* a
+token it did not know, and because they sit inside larger records one unknown
+word failed the whole `RunView` or the whole event page — so the row "add a
+word to a vocabulary" would have broken every deployed consumer at once,
+whatever this table said. 1.2 opens them: each carries an `Unknown` arm that
+round-trips the host's token, and every predicate on them takes the
+conservative branch. The wire contract is unchanged; the Rust API is not
+(vocabularies gained an arm and stopped being `Copy`), which would be a major
+bump if this crate had a consumer. It has none. See
+[`AGENT_SDK_PORTABILITY.md`](AGENT_SDK_PORTABILITY.md) §2 for the evidence.
+
 ## Conformance battery
 
-`conformance::run_battery` drives any `Harness` through 24 checks: discovery,
+`conformance::run_battery` drives any `Harness` through 26 checks: discovery,
 forbidden-capability denial, submit, replay, key-reuse conflict, projection
-readability, revision monotonicity, cross-session/cross-workspace/cross-tenant
-denial, lost connection, uncertain send, follow-up acceptance and stale fencing,
-event paging and resume, oversized page limits, cursor expiry, artifact
-verification, artifact ceilings, digest mismatch, idempotent cancellation, and
-a control-lease round trip.
+readability, revision monotonicity, vocabulary coverage,
+cross-session/cross-workspace/cross-tenant denial, lost connection, uncertain
+send, follow-up acceptance and stale fencing, event paging and resume,
+oversized page limits, cursor expiry, artifact verification, artifact ceilings,
+digest mismatch, idempotent cancellation, redacted receipts, and a
+control-lease round trip.
 
 A check whose precondition the harness cannot produce is reported as
 **skipped**, never silently passed. A matrix that quietly counts unrunnable
@@ -489,8 +508,8 @@ It now runs against two adapters:
 
 | Adapter | Result | Skips |
 |---|---|---|
-| `FakeControlPlane` | 24 passed, 0 failed, 0 skipped | none — the fake can produce every fault, which is what proves the checks run |
-| `ServiceControlPlane` over a scripted `ptah_*` transport | 17 passed, 0 failed, 7 skipped | cross-tenant (one owner per host), uncertain send (no such wire state), retained-range on expiry (run events carry no `eventRange`), follow-up fencing (no CAS on `ptah_steer`), and three artifact checks (see the `ArtifactDescriptor` note above) |
+| `FakeControlPlane` | 26 passed, 0 failed, 0 skipped | none — the fake can produce every fault, which is what proves the checks run |
+| `ServiceControlPlane` over a scripted `ptah_*` transport | 18 passed, 0 failed, 8 skipped | cross-tenant (one owner per host), uncertain send (no such wire state), retained-range on expiry (run events carry no `eventRange`), follow-up fencing (no CAS on `ptah_steer`), redacted receipts (the control plane exposes no receipt read), and three artifact checks (see the `ArtifactDescriptor` note above) |
 
 A further test asserts the two adapters **agree on every check both can run**,
 so a difference has to show up as an explicit skip rather than as drift. That
