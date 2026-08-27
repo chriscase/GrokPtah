@@ -130,11 +130,14 @@ pub use mcp_control_client::{
 /// List MCP tools for the project (spawns stdio servers when allowed).
 pub use mcp_runtime::list_mcp_tools;
 pub use orchestration::{
-    is_recognized_test_command, merge_bounds, prompt_preview, safe_id_filename, AgentRecord,
-    AgentResumePlan, AgentState, ContinuationCheckpoint, ContinuationReason, OrchStore,
-    OrchestrationConfig, OrchestrationService, PromotionState, RetentionPolicy, RetentionReport,
-    RunApproval, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState,
-    WorkspaceAllowlist, CONTROL_TOOLS, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
+    admit_step, digest_of, is_recognized_test_command, merge_bounds, project_loop, prompt_preview,
+    safe_id_filename, AgentRecord, AgentResumePlan, AgentState, AttentionGrant, AttentionReason,
+    BudgetDimension, ContinuationCheckpoint, ContinuationReason, DispatchState, EscalationTicket,
+    LoopDisposition, LoopProjection, LoopState, LoopStep, ModelTier, OrchStore,
+    OrchestrationConfig, OrchestrationService, PolicyEnvelope, PromotionState, RetentionPolicy,
+    RetentionReport, RunApproval, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState,
+    StepClass, StepSignature, StepVerdict, WaitWitness, WorkspaceAllowlist, CONTROL_TOOLS,
+    FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES, MAX_DIGEST_BYTES, SIGNATURE_HISTORY,
 };
 pub use permission::{PermissionDecision, PermissionRequest};
 pub use run_promotion::RunReview;

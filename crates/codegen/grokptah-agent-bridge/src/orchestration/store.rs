@@ -10,6 +10,7 @@ use chrono::{Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
 
+use super::agent_loop::{DispatchState, LoopState};
 use super::types::{
     safe_id_filename, AgentRecord, AgentState, AuditEntry, ContinuationCheckpoint,
     IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunRecord, RunState,
@@ -93,6 +94,7 @@ impl OrchStore {
         fs::create_dir_all(root.join("idempotency"))?;
         fs::create_dir_all(root.join("audit"))?;
         fs::create_dir_all(root.join("finalization"))?;
+        fs::create_dir_all(root.join("loop"))?;
         let root = dunce::canonicalize(root)?;
         let lock_path = root.join(".store.lock");
         let store_lock = OpenOptions::new()
@@ -141,6 +143,7 @@ impl OrchStore {
         store.recover_finalization_intents()?;
         store.mark_unfinished_interrupted()?;
         store.fail_orphaned_idempotency_claims()?;
+        store.recover_loop_dispatches()?;
         // Cleanup is best-effort at the record level, but directory access
         // failures still surface so a broken ledger cannot look healthy.
         store.prune_retention(RetentionPolicy::default())?;
@@ -177,6 +180,11 @@ impl OrchStore {
     fn agent_path(&self, agent_id: &str) -> Result<PathBuf, OrchError> {
         let safe = safe_id_filename(agent_id)?;
         Ok(self.inner.root.join("agents").join(format!("{safe}.json")))
+    }
+
+    fn loop_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
+        let safe = safe_id_filename(run_id)?;
+        Ok(self.inner.root.join("loop").join(format!("{safe}.json")))
     }
 
     fn checkpoint_path(&self, checkpoint_id: &str) -> Result<PathBuf, OrchError> {
@@ -443,7 +451,14 @@ impl OrchStore {
                 continue;
             }
             match fs::remove_file(path) {
-                Ok(()) => report.run_files_removed += 1,
+                Ok(()) => {
+                    report.run_files_removed += 1;
+                    // The loop ledger is per-run: it expires with its run
+                    // rather than accumulating behind it.
+                    if let Ok(loop_path) = self.loop_path(&run.run_id) {
+                        let _ = fs::remove_file(&loop_path);
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => report.skipped_files += 1,
             }
@@ -743,6 +758,126 @@ impl OrchStore {
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
     }
 
+    /// Load the durable loop state for one run.
+    pub fn load_loop_state(&self, run_id: &str) -> Result<Option<LoopState>, OrchError> {
+        let path = self.loop_path(run_id)?;
+        let _g = self.inner.lock.lock();
+        read_loop_state(&path)
+    }
+
+    /// Install a loop state under a compare-and-swap on its revision.
+    ///
+    /// Two things are refused, and both are ways a restarted or duplicated
+    /// worker could otherwise corrupt the ledger:
+    ///
+    /// - a write carrying an older revision than the one on disk, and
+    /// - a same-revision write that moves the dispatch backwards.
+    ///
+    /// The second is what keeps `Uncertain` absorbing across processes: a
+    /// stale worker holding a pre-crash handle cannot overwrite an unknown
+    /// outcome with `Idle` and quietly earn itself a retry.
+    pub fn commit_loop_state(&self, state: &LoopState) -> Result<(), OrchError> {
+        state.validate()?;
+        let path = self.loop_path(&state.run_id)?;
+        let _g = self.inner.lock.lock();
+        if let Some(previous) = read_loop_state(&path)? {
+            if previous.run_id != state.run_id {
+                return Err(OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "loop state file does not belong to this run",
+                ));
+            }
+            if state.revision < previous.revision {
+                return Err(stale_loop_revision(state.revision, previous.revision));
+            }
+            if state.revision == previous.revision
+                && dispatch_rank(state.dispatch) < dispatch_rank(previous.dispatch)
+            {
+                return Err(stale_loop_revision(state.revision, previous.revision));
+            }
+        }
+        atomic_write_json(&path, state)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))
+    }
+
+    /// Read-modify-write one loop state under the store lock.
+    ///
+    /// The closure receives the state as durably recorded, so a policy
+    /// decision is always taken against the revision it will be written back
+    /// at rather than against a stale in-memory copy.
+    pub fn update_loop_state<F>(
+        &self,
+        run_id: &str,
+        update: F,
+    ) -> Result<Option<LoopState>, OrchError>
+    where
+        F: FnOnce(&mut LoopState) -> Result<(), OrchError>,
+    {
+        let path = self.loop_path(run_id)?;
+        let _g = self.inner.lock.lock();
+        let Some(mut state) = read_loop_state(&path)? else {
+            return Ok(None);
+        };
+        let before_revision = state.revision;
+        let before_dispatch = state.dispatch;
+        update(&mut state)?;
+        if state.revision < before_revision
+            || (state.revision == before_revision
+                && dispatch_rank(state.dispatch) < dispatch_rank(before_dispatch))
+        {
+            return Err(stale_loop_revision(state.revision, before_revision));
+        }
+        state.validate()?;
+        atomic_write_json(&path, &state)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(Some(state))
+    }
+
+    pub fn list_loop_states(&self) -> anyhow::Result<Vec<LoopState>> {
+        let mut out = Vec::new();
+        let dir = self.inner.root.join("loop");
+        if !dir.is_dir() {
+            return Ok(out);
+        }
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(text) = fs::read_to_string(&path) {
+                if let Ok(state) = serde_json::from_str::<LoopState>(&text) {
+                    out.push(state);
+                }
+            }
+        }
+        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(out)
+    }
+
+    /// Crash recovery for the loop ledger.
+    ///
+    /// A dispatch recorded as `Sending` was in flight when the process died,
+    /// so whether the provider saw it is unknowable from here. It becomes
+    /// `Uncertain` and stops the loop for a human, exactly as the computer-use
+    /// mutation ledger does. Nothing is ever resent on this path.
+    fn recover_loop_dispatches(&self) -> anyhow::Result<usize> {
+        let mut recovered = 0;
+        let now = Utc::now();
+        for state in self.list_loop_states()? {
+            let mut state = state;
+            if !state.recover_after_restart(now) {
+                continue;
+            }
+            let path = self
+                .loop_path(&state.run_id)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            let _g = self.inner.lock.lock();
+            atomic_write_json(&path, &state)?;
+            recovered += 1;
+        }
+        Ok(recovered)
+    }
+
     pub fn append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
         let _guard = self.inner.audit_file_lock.lock();
         let result = append_audit_entry(&self.inner.root, entry);
@@ -943,6 +1078,36 @@ pub enum IdempotencyClaim {
     Perform,
     Pending,
     Replay(Result<serde_json::Value, OrchError>),
+}
+
+fn read_loop_state(path: &Path) -> Result<Option<LoopState>, OrchError> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(path)
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+    let state: LoopState = serde_json::from_str(&text)
+        .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+    Ok(Some(state))
+}
+
+/// Monotonic ordering of dispatch outcomes within one revision. `Uncertain`
+/// ranks highest so nothing can overwrite it in place.
+fn dispatch_rank(state: DispatchState) -> u8 {
+    match state {
+        DispatchState::Idle => 0,
+        DispatchState::Sending => 1,
+        DispatchState::Delivered | DispatchState::Failed => 2,
+        DispatchState::Uncertain => 3,
+    }
+}
+
+fn stale_loop_revision(attempted: u64, current: u64) -> OrchError {
+    OrchError::with_data(
+        OrchErrorCode::StaleVersion,
+        "loop state write is stale",
+        serde_json::json!({ "attemptedRevision": attempted, "currentRevision": current }),
+    )
 }
 
 fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
