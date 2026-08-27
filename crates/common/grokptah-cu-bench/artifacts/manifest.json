@@ -1,0 +1,43 @@
+{
+  "schemaVersion": "grokptah.cu-bench/1",
+  "generator": "grokptah-cu-bench 0.1.0",
+  "entries": [
+    {
+      "kind": "taxonomy",
+      "path": "schema/hazard-families.json",
+      "sha256": "5f5c225b2744423349527c572a01dd3185b4a59393dc890226fdcd614d73215e",
+      "byteLen": 2070
+    },
+    {
+      "kind": "invariants",
+      "path": "schema/invariants.json",
+      "sha256": "5934c1627d2ab4a0609da4a09c0a52ef6c395aa66daf60716f18852097219fe1",
+      "byteLen": 2690
+    },
+    {
+      "kind": "profiles",
+      "path": "schema/profiles.json",
+      "sha256": "89cb66f2f21bcb0ca0cacd1e4228f8f43a1efdec2f3d6bc7239eaacdfade5703",
+      "byteLen": 1073
+    },
+    {
+      "kind": "thresholds",
+      "path": "schema/thresholds.json",
+      "sha256": "8c45a6ce27e65d4207bd0904e05d58c19edcb93b4f35ee43ab8af00ccc4becac",
+      "byteLen": 4041
+    },
+    {
+      "kind": "scenarios",
+      "path": "schema/scenarios.json",
+      "sha256": "d6d6d716025c92512a9ff1edb41c7a5a7f745bb74b2fa83a4f28c3ee39f3502c",
+      "byteLen": 157876
+    },
+    {
+      "kind": "workflow_matrix",
+      "path": "schema/workflow-matrix.json",
+      "sha256": "c353054ecc39b10e389d8f28b9a44c69b141d0883cc9b7896c930f54b0f1c17d",
+      "byteLen": 7202
+    }
+  ],
+  "manifestDigest": "d4ea31a40f1ba8917cf9b6992ecc147f05e1d41a04ab16b3b10ed9c802ead2ce"
+}
