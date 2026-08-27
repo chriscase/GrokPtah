@@ -95,8 +95,9 @@ pub use completion::{
 };
 pub use computer_agent::{ComputerAgentEligibility, ComputerAgentProposal};
 pub use computer_use::{
-    canonical_workspace_string, project_run_at, ActionClass, ActionGrant, ActionGrantSummary,
-    ActionOutcome, ActionOutcomeSummary, ComputerAction, ComputerAgentObservation,
+    canonical_workspace_string, parse_stable_element_id, project_run_at, ActionClass, ActionGrant,
+    ActionGrantSummary, ActionOutcome, ActionOutcomeSummary, AmbiguityClass,
+    AuthorizedGroundedTarget, CoarseRegion, ComputerAction, ComputerAgentObservation,
     ComputerAuditEntry, ComputerBackend, ComputerCapabilities, ComputerClientIdentity,
     ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerErrorSummary,
     ComputerGrantRequest, ComputerObservation, ComputerObservationPlatform, ComputerPermission,
@@ -105,8 +106,12 @@ pub use computer_use::{
     ComputerRunEventPage, ComputerRunEventRange, ComputerRunProgress, ComputerRunProjection,
     ComputerRunReads, ComputerRunState, ComputerScopeCapacity, ComputerStore, ComputerTarget,
     ComputerTargetCandidate, ComputerTargetSummary, ComputerUseLimits, ComputerUseService,
-    GrantIssuer, MacOsObservationPlatform, ObservationSummary, SemanticAction, SimulatorBackend,
-    DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
+    CoordinateFallbackDecision, CoordinateFallbackReason, ElementCorroboration, EscalationEvidence,
+    GrantIssuer, GroundedCandidate, GroundingFailure, GroundingFailureCode, GroundingPolicy,
+    GroundingResolution, GroundingSession, GroundingSessionProjection, GroundingState, LabelMatch,
+    MacOsObservationPlatform, ObservationSummary, QueryDiscriminator, RegionBox, SemanticAction,
+    SimulatorBackend, StableElementId, TargetQuery, VisualCorrelation, VisualHintSource,
+    VisualRegionHint, VisualStanding, DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
 };
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,

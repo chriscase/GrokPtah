@@ -13,6 +13,7 @@
 //! session-scoped; coordinator reads take [`ComputerReadBinding`].
 
 mod control;
+mod grounding;
 mod macos_observation;
 mod platform;
 mod policy;
@@ -26,6 +27,14 @@ mod types;
 pub use control::{
     ComputerAgentObservation, ComputerClientIdentity, ComputerGrantRequest,
     ComputerRunAgentController, ComputerRunController,
+};
+pub use grounding::{
+    parse_stable_element_id, AmbiguityClass, AuthorizedGroundedTarget, CoarseRegion,
+    CoordinateFallbackDecision, CoordinateFallbackReason, ElementCorroboration, EscalationEvidence,
+    GroundedCandidate, GroundingFailure, GroundingFailureCode, GroundingPolicy,
+    GroundingResolution, GroundingSession, GroundingSessionProjection, GroundingState, LabelMatch,
+    QueryDiscriminator, RegionBox, StableElementId, TargetQuery, VisualCorrelation,
+    VisualHintSource, VisualRegionHint, VisualStanding,
 };
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
