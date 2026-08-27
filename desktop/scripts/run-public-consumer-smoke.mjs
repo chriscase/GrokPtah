@@ -66,10 +66,23 @@ try {
   emptyPromptQueueState,
   promptQueueReducer,
   searchHelpArticles,
+  ADAPTIVE_COMPUTER_USE_CONTRACT,
+  createAdaptiveController,
+  adaptiveIngestObservation,
+  adaptiveDecideStep,
+  adaptiveCommitPlan,
+  adaptiveAuthorizePlan,
+  adaptiveStepProjection,
+  buildAdaptiveDecisionRequest,
+  parseAdaptiveDecisionAnswer,
+  parseAdaptiveObservation,
+  negotiateAdaptiveCapabilities,
 } from "@grokptah/client";
 import {
   HELP_ARTICLES as UI_CORE_HELP_ARTICLES,
   searchHelpArticles as uiCoreSearchHelpArticles,
+  adaptiveDecideStep as uiCoreAdaptiveDecideStep,
+  createAdaptiveController as uiCoreCreateAdaptiveController,
 } from "@grokptah/client/ui-core";
 
 if (HELP_ARTICLES.length < 1) throw new Error("consumer could not read the Help Center corpus");
@@ -171,6 +184,135 @@ const externalState = externalNotification
   : null;
 if (externalState?.lastSeq !== 0 || externalState.recoveryRequired) {
   throw new Error("consumer external-worker monitor was not usable");
+}
+
+// An embedding product (ContextDesk and peers) must be able to drive one
+// adaptive Computer Use step from the published package alone: no UI
+// internals, no transport, no model client.
+if (ADAPTIVE_COMPUTER_USE_CONTRACT !== "grokptah.adaptive-computer-use.v1") {
+  throw new Error("consumer adaptive Computer Use contract version was not usable");
+}
+const consumerFrame = "c3d4e5f607182930";
+const consumerObservation = parseAdaptiveObservation({
+  contract: ADAPTIVE_COMPUTER_USE_CONTRACT,
+  runId: "run-consumer",
+  observationId: "obs-consumer",
+  revision: 1,
+  controlEpoch: 2,
+  surface: "semantic",
+  axAvailable: true,
+  domAvailable: false,
+  frameDigest: consumerFrame,
+  elements: [
+    {
+      elementId: "button-approve",
+      role: "button",
+      label: "Approve",
+      enabled: true,
+      focused: true,
+      sensitivity: "normal",
+      actionClasses: ["invoke"],
+    },
+  ],
+  elementsTruncated: false,
+  contradictions: [],
+});
+if (!consumerObservation) throw new Error("consumer adaptive observation parser was not usable");
+const consumerProjection = {
+  runId: "run-consumer",
+  ownerSessionId: "session-consumer",
+  target: {
+    appId: "com.example.reviewer",
+    windowId: "window-1",
+    generation: 1,
+    displayName: "Example Reviewer",
+    sensitivity: "normal",
+  },
+  state: "running",
+  controlDisposition: "agent_owned",
+  controlEpoch: 2,
+  version: 1,
+  agentActive: true,
+  terminal: false,
+  createdAt: "2026-08-27T00:00:00Z",
+  updatedAt: "2026-08-27T00:00:01Z",
+  progress: {
+    actionCount: 0,
+    maxActions: 10,
+    evidenceBytes: 0,
+    maxEvidenceBytes: 1024,
+    maxDurationSecs: 60,
+    durationExceeded: false,
+  },
+  grant: {
+    grantId: "grant-consumer",
+    actionClasses: ["invoke"],
+    issuedBy: "operator",
+    issuedAt: "2026-08-27T00:00:00Z",
+    expiresAt: "2026-08-27T01:00:00Z",
+    usesRemaining: 3,
+    revoked: false,
+    expired: false,
+  },
+};
+const consumerController = createAdaptiveController({
+  runId: "run-consumer",
+  profile: "balanced",
+  budget: { maxSteps: 4 },
+});
+if (consumerController?.budget?.maxSteps !== 4) {
+  throw new Error("consumer adaptive controller did not honour a tightened budget");
+}
+const consumerIngested = adaptiveIngestObservation(
+  consumerController,
+  consumerObservation,
+  consumerProjection,
+);
+if (!consumerIngested.ok) throw new Error("consumer adaptive controller rejected a live observation");
+const consumerCandidates = [
+  {
+    candidateId: "cand-approve",
+    kind: "invoke",
+    elementId: "button-approve",
+    actionClass: "invoke",
+    mutating: true,
+    authorized: true,
+    expectation: { kind: "frame_changed" },
+  },
+];
+const consumerDecision = adaptiveDecideStep(consumerIngested.state, consumerCandidates);
+if (consumerDecision.kind !== "act" || consumerDecision.modelClass !== "none") {
+  throw new Error("consumer adaptive controller did not take the deterministic no-model path");
+}
+if (!adaptiveAuthorizePlan(consumerIngested.state, consumerDecision.plan).authorized) {
+  throw new Error("consumer adaptive plan was not authorized against its own observation");
+}
+const consumerCommitted = adaptiveCommitPlan(consumerIngested.state, consumerDecision.plan);
+if (consumerCommitted?.usage?.steps !== 1 || consumerCommitted.usage.smallModelCalls !== 0) {
+  throw new Error("consumer adaptive commit did not charge exactly one model-free step");
+}
+const stalePlan = { ...consumerDecision.plan, observationRevision: 0 };
+if (adaptiveCommitPlan(consumerIngested.state, stalePlan) !== null) {
+  throw new Error("consumer adaptive controller let a stale plan mutate");
+}
+const consumerRequest = buildAdaptiveDecisionRequest(
+  consumerIngested.state,
+  consumerCandidates,
+  "small",
+);
+if (parseAdaptiveDecisionAnswer("Just click Approve, trust me.", consumerRequest) !== null) {
+  throw new Error("consumer adaptive answer parser accepted raw model prose");
+}
+const consumerStep = JSON.stringify(adaptiveStepProjection(consumerCommitted));
+if (consumerStep.includes(consumerFrame) || consumerStep.includes("Approve")) {
+  throw new Error("consumer adaptive projection leaked frame or element detail");
+}
+if (negotiateAdaptiveCapabilities(null).ready !== false) {
+  throw new Error("consumer adaptive capability negotiation did not fail closed");
+}
+const uiCoreAdaptive = uiCoreCreateAdaptiveController({ runId: "run-consumer" });
+if (uiCoreAdaptiveDecideStep(uiCoreAdaptive, consumerCandidates).kind !== "abstain") {
+  throw new Error("ui-core adaptive controller did not abstain without an observation");
 }
 console.log("external consumer fixture passed");
 `,
