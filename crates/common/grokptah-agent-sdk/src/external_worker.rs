@@ -434,7 +434,17 @@ mod tests {
             Err("worker ref must be bounded and non-absolute")
         );
         request.repository = "chriscase/GrokPtah".into();
+        // A ref carrying a control character is rejected by `validate_ref`,
+        // which reports the ref bound rather than the identity bound.
         request.starting_ref = "refs/heads/review\n".into();
+        assert_eq!(
+            request.validate(),
+            Err("worker ref must be bounded and non-absolute")
+        );
+        // Opaque identities are separately routed through `validate_identity`,
+        // which is where the control-character message comes from.
+        request.starting_ref = "refs/heads/review".into();
+        request.model = Some("composer\n".into());
         assert_eq!(
             request.validate(),
             Err("worker identity contains a control character")
