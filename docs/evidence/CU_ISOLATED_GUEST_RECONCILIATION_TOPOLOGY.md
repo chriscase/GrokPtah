@@ -118,7 +118,18 @@ boundary this branch adds.
 | Test | Failure | Why it is not repaired here |
 | --- | --- | --- |
 | `mcp_continuity_probe::continuity_probe_is_evidence_first_and_recoverable` | `continuity probe harness timed out` after 98s | Reproduced identically on clean `404ea3c2`. Installing the harness's npm dependencies does not change it. MCP continuity lane, not packaged Computer Use |
-| 6 × `grokptah-service` `always_on_grokbot` tests | all six panic with `unknown tool ptah_set_managed_execution` | The tool exists in the bridge (`mcp_control.rs`) but the hosted service does not expose it. That is an always-on lane gap; no service production code is touched here |
+| `mcp_streamable_transport::remote_bearer_computer_reads_fail_closed` | panics at `tests/mcp_streamable_transport.rs:2419` | Reproduced on clean `404ea3c2`. This is a Computer-read **denial** gate in the remote-bearer auth lane; changing its fixture on a guess is exactly how a denial gate gets weakened, so it is left for that lane's owner |
+| 6 × `grokptah-service` `always_on_grokbot` tests | all six panic with `unknown tool ptah_set_managed_execution` | That tool requires the `ManagedConfigure` capability, the harness credential never requests it, and the bridge has an explicit test asserting the tool must **not** leak to under-privileged callers. Exposing it to make these pass would breach that denial gate — the fix is a privilege decision for the always-on lane |
+
+### A correction to this document's earlier numbers
+
+An earlier revision reported "892 passed, 1 failed across 12 suites" for the
+bridge. That run used plain `cargo test`, which fail-fasts across *targets*:
+once `mcp_continuity_probe` failed, every alphabetically later suite —
+`mcp_streamable_transport` among them — never ran, so the count was a partial
+result reported as a total. The measured figure with `--no-fail-fast` is
+**1093 passed, 2 failed across 33 suites**, and the second failure is the
+remote-bearer row above.
 
 ## 5b. Two macOS-only failures the repaired jobs then exposed
 
@@ -190,6 +201,8 @@ module-level allow naming the change that must remove it.
 * Deterministic launch/cleanup receipts and their leak-freedom.
 * Protocol caps and misbinding refusals; artifact measurement against redirected
   symlinks, wrong modes, and oversize.
+* The whole bridge suite under `--no-fail-fast`: 1093 pass, 2 fail, both
+  reproduced on the clean donor base.
 * Public wire contract of the launch vocabulary: channel roles, guest
   operations, authority states, and revocation reasons all pin their exact
   serialized form, because receipts embed those names.
