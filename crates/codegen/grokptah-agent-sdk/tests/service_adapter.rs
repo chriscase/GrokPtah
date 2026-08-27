@@ -1242,6 +1242,51 @@ async fn a_lease_credential_reaches_the_host_but_not_the_wire_projection() {
     assert_eq!(args[0]["reason"], json!("done"));
 }
 
+// ── Receipts are not reachable over this boundary ─────────────────────────
+
+#[tokio::test]
+async fn the_service_adapter_reports_receipts_absent_rather_than_empty() {
+    let plane = operator(BridgeDouble::new());
+    let session = seeded(&plane).await;
+    let accepted = plane
+        .submit_task(submission(&session, 1))
+        .await
+        .expect("submit");
+    let before = plane.transport().call_count();
+
+    let error = plane
+        .list_receipts(
+            RunSelector {
+                session_id: session.session_id.clone(),
+                workspace: session.workspace.clone(),
+                run_id: accepted.run_id,
+            },
+            PageRequest::new(),
+        )
+        .await
+        .expect_err("the control plane exposes no receipt read");
+
+    // Unsupported, not an empty page: a consumer would read emptiness as
+    // "no mutations happened", which is the one thing this must never say.
+    assert_eq!(error.code, SdkErrorCode::Unsupported);
+    assert_eq!(error.detail("capability"), Some("receipt.read"));
+    assert_eq!(
+        plane.transport().call_count(),
+        before,
+        "refusing a capability the host lacks must not cost a round trip"
+    );
+
+    // And it is discoverable before the call.
+    let connected = plane.connect().await.expect("connect");
+    assert_eq!(
+        connected
+            .require(&CapabilityId::ReceiptRead)
+            .expect_err("unsupported on this host")
+            .code,
+        SdkErrorCode::Unsupported
+    );
+}
+
 // ── Public consumer parity ────────────────────────────────────────────────
 
 struct ServiceHarness {

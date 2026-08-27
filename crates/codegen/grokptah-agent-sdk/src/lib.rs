@@ -112,10 +112,10 @@ pub mod prelude {
         ArtifactRequest, BoundedText, CancelReceipt, CancelRequest, ChangedFile, ContentDigest,
         ControlLease, ControlLeaseRequest, CreateSessionRequest, ExecutionMode,
         FollowUpDisposition, FollowUpReceipt, FollowUpRequest, LeaseCredential, ObservationCounts,
-        OperationClass, PublicEvent, PublicEventKind, ReceiptStatus, ReceiptView,
-        ReleaseLeaseReceipt, ReleaseLeaseRequest, Revision, RevisionWatermark, RunAccepted,
-        RunBoundsRequest, RunLifecycle, RunProgressView, RunSelector, RunView, SessionKind,
-        SessionView, StopCause, TaskSubmission, ToolKind, ToolStatus, UsageView,
+        OperationClass, PublicEvent, PublicEventKind, ReceiptPage, ReceiptRetention, ReceiptStatus,
+        ReceiptView, ReleaseLeaseReceipt, ReleaseLeaseRequest, Revision, RevisionWatermark,
+        RunAccepted, RunBoundsRequest, RunLifecycle, RunProgressView, RunSelector, RunView,
+        SessionKind, SessionView, StopCause, TaskSubmission, ToolKind, ToolStatus, UsageView,
         VerificationStatus, VerificationView,
     };
     pub use crate::error::{ErrorOrigin, RetryDisposition, SdkError, SdkErrorCode, SdkResult};

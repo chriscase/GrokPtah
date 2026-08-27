@@ -137,6 +137,7 @@ struct FakeState {
     runs: BTreeMap<String, FakeRun>,
     leases: BTreeMap<String, ControlLease>,
     receipts: BTreeMap<String, Receipt>,
+    receipt_retention: ReceiptRetention,
     faults: Vec<(Option<Operation>, Fault)>,
     clock_ticks: i64,
     next_id: u64,
@@ -258,6 +259,30 @@ impl FakeState {
                 recorded_at,
             },
         );
+        self.prune_receipts();
+    }
+
+    /// Drop settled receipts beyond the advertised window.
+    ///
+    /// Only settled ones: an unsettled receipt is the durable form of an
+    /// uncertain send, and expiring it would turn "we do not know" into "it
+    /// never happened". The runtime's retention makes the same exception.
+    fn prune_receipts(&mut self) {
+        let keep = self.receipt_retention.max_receipts as usize;
+        let mut settled: Vec<(DateTime<Utc>, String)> = self
+            .receipts
+            .iter()
+            .filter(|(_, receipt)| receipt.status != ReceiptStatus::Pending)
+            .map(|(id, receipt)| (receipt.recorded_at, id.clone()))
+            .collect();
+        if settled.len() <= keep {
+            return;
+        }
+        // Newest first, then drop the tail.
+        settled.sort_by(|a, b| b.cmp(a));
+        for (_, id) in settled.into_iter().skip(keep) {
+            self.receipts.remove(&id);
+        }
     }
 }
 
@@ -581,6 +606,7 @@ fn event_range(run: &FakeRun) -> Option<RetainedRange> {
 pub struct FakeBuilder {
     owner: String,
     foreign_owner: Option<String>,
+    receipt_retention: ReceiptRetention,
     contract_version: ContractVersion,
     limits: BoundaryLimits,
     offered: Vec<CapabilityDescriptor>,
@@ -593,6 +619,7 @@ impl Default for FakeBuilder {
         Self {
             owner: "primary".to_string(),
             foreign_owner: Some("other-account".to_string()),
+            receipt_retention: ReceiptRetention::RUNTIME_DEFAULT,
             contract_version: CONTRACT_VERSION,
             limits: BoundaryLimits::default(),
             offered: default_capabilities(),
@@ -665,6 +692,13 @@ impl FakeBuilder {
         self
     }
 
+    /// Narrow the receipt window, so retention is exercisable in a test
+    /// without writing a thousand receipts.
+    pub fn receipt_retention(mut self, retention: ReceiptRetention) -> Self {
+        self.receipt_retention = retention;
+        self
+    }
+
     /// Seed a second session on the same allowlisted workspace owned by a
     /// different account, so cross-tenant denial can be exercised on **one**
     /// host rather than by comparing two hosts. Pass `None` to seed none.
@@ -699,6 +733,7 @@ impl FakeBuilder {
             runs: BTreeMap::new(),
             leases: BTreeMap::new(),
             receipts: BTreeMap::new(),
+            receipt_retention: self.receipt_retention,
             faults: Vec::new(),
             clock_ticks: 0,
             next_id: 0,
@@ -1243,27 +1278,24 @@ impl AgentControlPlane for FakeControlPlane {
         &self,
         selector: RunSelector,
         page: PageRequest,
-    ) -> SdkResult<Page<ReceiptView>> {
+    ) -> SdkResult<ReceiptPage> {
         let mut state = self.lock();
         guard!(state, Operation::ListReceipts);
         let max_page = state.limits.max_event_page;
-        // Exact scope binding: receipts are run-scoped, never a global dump.
+        let retention = state.receipt_retention;
+        // Exact scope binding: receipts are run-scoped, never a global dump,
+        // and an out-of-scope run gives the same denial every read gives.
         state.require_run(&selector)?;
         let limit = page.resolve_limit(max_page)? as usize;
-        let after = page
-            .after
-            .as_ref()
-            .map(|cursor| cursor.as_str().to_string());
+        let after = page.after.as_ref().map(parse_receipt_cursor).transpose()?;
 
-        let mut items = Vec::new();
+        let mut items: Vec<ReceiptView> = Vec::new();
         for (request_id, receipt) in state.receipts.iter() {
             if receipt.run_id.as_deref() != Some(selector.run_id.as_str()) {
                 continue;
             }
-            if after
-                .as_deref()
-                .is_some_and(|after| request_id.as_str() <= after)
-            {
+            let key = (receipt.recorded_at.timestamp_millis(), request_id.clone());
+            if after.as_ref().is_some_and(|cursor| &key <= cursor) {
                 continue;
             }
             items.push(ReceiptView {
@@ -1279,16 +1311,16 @@ impl AgentControlPlane for FakeControlPlane {
                 recorded_at: receipt.recorded_at,
             });
         }
+        // `(recorded_at, request_id)` — chronological, tie-broken, so two
+        // receipts written in the same millisecond cannot swap pages.
+        items.sort_by(|a, b| {
+            (a.recorded_at, a.request_id.as_str()).cmp(&(b.recorded_at, b.request_id.as_str()))
+        });
+
         let has_more = items.len() > limit;
         items.truncate(limit);
-        let next_cursor = has_more
-            .then(|| {
-                items
-                    .last()
-                    .map(|receipt| Cursor::from_opaque(receipt.request_id.as_str()))
-            })
-            .flatten();
-        Ok(Page::new(items, next_cursor))
+        let next_cursor = has_more.then(|| items.last().map(receipt_cursor)).flatten();
+        Ok(ReceiptPage::new(items, next_cursor, retention))
     }
 
     async fn fetch_artifact(&self, request: ArtifactRequest) -> SdkResult<ArtifactPayload> {

@@ -36,7 +36,7 @@ use crate::capability::{CapabilityDocument, CapabilityId};
 use crate::dto::{
     ArtifactPayload, ArtifactRequest, CancelReceipt, CancelRequest, ControlLease,
     ControlLeaseRequest, CreateSessionRequest, FollowUpReceipt, FollowUpRequest, PublicEvent,
-    ReceiptView, ReleaseLeaseReceipt, ReleaseLeaseRequest, RunAccepted, RunSelector, RunView,
+    ReceiptPage, ReleaseLeaseReceipt, ReleaseLeaseRequest, RunAccepted, RunSelector, RunView,
     SessionView, TaskSubmission,
 };
 use crate::error::{SdkError, SdkErrorCode, SdkResult};
@@ -104,7 +104,7 @@ pub trait AgentControlPlane: Send + Sync {
         &self,
         _selector: RunSelector,
         _page: PageRequest,
-    ) -> SdkResult<Page<ReceiptView>> {
+    ) -> SdkResult<ReceiptPage> {
         Err(SdkError::new(
             SdkErrorCode::CapabilityUnavailable,
             "this adapter does not serve redacted receipts",

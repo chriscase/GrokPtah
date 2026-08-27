@@ -571,55 +571,214 @@ pass, and no existing runtime behavior changed.
    shape, and it closes the residual weakness in the adapter's keyed digest.
 7. **The five bridge-side findings above**, each of which needs an owner on the
    runtime side.
-8. **A host-side receipt read**, to make `receipt.read` real over the service
-   boundary. Implementation packet, for whoever owns the control plane:
-
-   * **Tool**: `ptah_list_receipts`, a read. Required arguments
-     `session_id`, `workspace`, `run_id` — the same scope triple every other
-     run read takes, so it inherits the existing allowlist-then-scope gate and
-     the identical `forbidden_scope` denial. Optional `after` (opaque) and
-     `limit` (1–500), matching `ptah_get_events`.
-   * **Source**: `OrchStore`'s durable idempotency receipts, filtered to
-     `receipt.run_id == run_id`. Receipts with no run are not listed.
-   * **Response**: `{ receipts: [...], nextCursor }`, each receipt
-     `{ requestId, tool, status, errorCode, payloadHash, runId, createdAt }`.
-     Note what is *not* in it: `response` and the error `message`. Both are the
-     reason this cannot simply serialize `IdempotencyReceipt` — the stored
-     response replays a mutation's full body, and error messages embed absolute
-     paths (`orchestration/authz.rs` formats one into a `workspace_mismatch`).
-     The projection must be built, not derived by `serde`.
-   * **Retention**: already bounded — the store keeps the newest 1,000
-     completed/failed receipts and expires them after 7 days. Say so in the
-     tool's contract, because a consumer must not read absence as "never
-     happened".
-   * **Adapter side**: map it in `service.rs` alongside the other reads, flip
-     `receipt.read` from `Unsupported` to derived-from-`tools/list`, and the
-     battery's `receipts.are_scoped_and_do_not_echo_the_request` check stops
-     skipping. No SDK type changes — the contract for this already exists and
-     is exercised against the fake.
+8. **A host-side receipt read**, to make `receipt.read` real over the
+   service boundary. The full packet is below, under *Implementation
+   packet: host-side `ptah_list_receipts`*.
 
 ### P2 — worth doing, not blocking
 
-6. **Authorship-scoped transcript projection.** A consumer that submitted a run
+9. **Authorship-scoped transcript projection.** A consumer that submitted a run
    arguably may read its own final response. That needs a per-run authorship
    check (`clientId` on the durable record) plus a new capability
    (`run.transcript.read`) and a bounded projection. Do not add this by widening
    `RunView`; add it as a separate, separately-denied capability.
-7. **Computer Use read projection** behind `computer.read`, mapping the four
-   `ptah_*_computer_*` tools. The projection is already redaction-safe; the work
-   is DTO mirroring plus the `ComputerErrorCode` subset. Mutation stays
-   permanently forbidden.
-8. **Workload/routine surface** (`ptah_list_work`, `ptah_create_routine`, the
-   manager-plan tools). Large, and only worth carrying once a consumer needs it.
-9. **TypeScript DTO generation** from the Rust types, so a web or desktop
-   frontend consumes the same contract without a hand-maintained mirror.
-10. **Split `ArtifactDescriptor` listing from verification.** Requiring
+10. **Computer Use read projection** behind `computer.read`, mapping the four
+    `ptah_*_computer_*` tools. The projection is already redaction-safe; the work
+    is DTO mirroring plus the `ComputerErrorCode` subset. Mutation stays
+    permanently forbidden.
+11. **Workload/routine surface** (`ptah_list_work`, `ptah_create_routine`, the
+    manager-plan tools). Large, and only worth carrying once a consumer needs it.
+12. **TypeScript DTO generation** from the Rust types, so a web or desktop
+    frontend consumes the same contract without a hand-maintained mirror.
+13. **Split `ArtifactDescriptor` listing from verification.** Requiring
     `byteLen` and `digest` on a descriptor forces an adapter to materialize a
     body just to list it. Making both optional until fetch would let the service
     adapter advertise its artifacts.
-11. **Publication decision.** `publish = false` until ADR-002 §7 step 5 is met:
+14. **Publication decision.** `publish = false` until ADR-002 §7 step 5 is met:
     a named compatibility and version owner maintaining the matrix for a real
     external consumer.
+
+## Implementation packet: host-side `ptah_list_receipts`
+
+**Status: not implemented, and deliberately so.** The bridge cannot be built —
+let alone tested — in the container this lane runs in, so a change to it could
+not be verified. The evidence and the exact work are both below.
+
+### Why this is a packet and not a diff
+
+`cargo check --locked --all-targets` in `crates/codegen/grokptah-agent-bridge`
+fails before a single line of GrokPtah code compiles:
+
+```
+The system library `dbus-1` required by crate `libdbus-sys` was not found.
+  ... pkg-config --libs --cflags dbus-1 'dbus-1 >= 1.6'
+  Package dbus-1 was not found in the pkg-config search path.
+thread 'main' panicked at libdbus-sys-0.2.7/build.rs:25:9
+```
+
+The chain is `keyring` → `sync-secret-service` → `dbus-secret-service` →
+`libdbus-sys`, which needs `libdbus-1-dev` from the OS. Two reasons not to
+install it and press on:
+
+1. **There is no supported Linux verification path for this crate.** Every
+   bridge job in CI is `macos-latest` (`.github/workflows/desktop.yml`), where
+   `keyring` uses `apple-native` and never touches dbus.
+   `docs/VERIFICATION.md` names exactly one bridge command, and it is that
+   macOS job. A green Linux run would not be evidence the change is safe, and
+   a red one could not be distinguished from a Linux artifact.
+2. **The suite is not portable.** 27 integration targets, 7 Node interop
+   harnesses that boot real loopback MCP servers, store tests on advisory file
+   locks, and platform-gated Computer Use checks.
+
+Changing feature flags to force a Linux build would itself be a modification to
+a security-relevant dependency line, on a runtime three other lanes depend on,
+with no trustworthy signal. So: packet.
+
+The SDK half of this seam **is** implemented and tested here — contract types,
+retention semantics, deterministic ordering, the fake, and the conformance
+check. When the host tool lands, the adapter change is one method body.
+
+### What exists to build on
+
+| Piece | Where |
+|---|---|
+| `IdempotencyReceipt { request_id, payload_hash, run_id, tool, response, error, created_at, status }` | `orchestration/types.rs` |
+| Storage: one JSON file per receipt | `<GROKPTAH_HOME>/…/idempotency/*.json` |
+| Retention: newest 1,000 settled, expire at 7 days; pending and unknown preserved; receipts on a live run retained | `orchestration/store.rs`, `RetentionPolicy` |
+| Existing reads (no listing) | `load_idempotency(request_id)` only |
+| Writers, to stay private | `save_idempotency`, `claim_idempotency`, `complete_idempotency`, `fail_idempotency`, `finish_idempotency` |
+| The scope gate to reuse verbatim | `OrchestrationService::authorize_run_request` |
+
+`authorize_run_request` already gives the whole fence: unknown run →
+`invalid_request`/`forbidden_scope`, cross-session → `forbidden_scope`,
+non-allowlisted or mismatched workspace → `workspace_mismatch`. **Reuse it; do
+not write a second gate.** That is also why this needs no new state machine —
+receipt status is read straight off the durable record and classified, never
+recomputed.
+
+### The work, in order
+
+**1. `orchestration/types.rs` — the redacted projection.** Next to
+`IdempotencyReceipt`, add a projection that is *built*, never `serde`-derived
+from the record:
+
+```rust
+pub const RECEIPT_PROJECTION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptOperation {
+    CreateSession, SubmitTask, FollowUp, Cancel, AcquireLease, ReleaseLease, Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptProjection {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub operation: ReceiptOperation,   // classified from `tool`; the name never crosses
+    pub status: ReceiptStatus,         // pending | complete | failed
+    pub error_code: Option<OrchErrorCode>, // the typed code only
+    pub payload_hash: String,
+    pub run_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+```
+
+Four redaction rules, each with a reason:
+
+* **`response` never crosses.** The runtime replays a mutation's *full stored
+  response* from the receipt. That body is whatever the mutation returned —
+  prompt previews, workspace paths, queue entries.
+* **`error.message` never crosses, only `error.code`.** Runtime messages embed
+  absolute paths verbatim: `canonical_workspace` formats
+  `"cannot canonicalize {}: {e}"` straight into a `workspace_mismatch`
+  (`orchestration/authz.rs`). `error.data` is dropped whole for the same
+  reason.
+* **`tool` never crosses.** Classify into `ReceiptOperation`; anything outside
+  the set is `Other`. A host that adds a tool must not be able to put an
+  arbitrary string in front of a consumer reading a classification.
+* **An unrecognized `status` maps to `Pending`.** "We cannot tell what state
+  this is" and "claimed but unsettled" are the same fact for a caller, and both
+  mean *do not retry*. Retention already treats unknown statuses as preserve.
+
+**2. `orchestration/store.rs` — one new read, no new writer.**
+
+```rust
+pub fn list_idempotency_for_run(
+    &self,
+    run_id: &str,
+    after: Option<(i64, &str)>,   // (created_at millis, request_id)
+    limit: usize,
+) -> anyhow::Result<(Vec<IdempotencyReceipt>, bool)>
+```
+
+Scan `idempotency/*.json` exactly as `apply_retention` already does, keep
+`receipt.run_id == Some(run_id)`, sort by `(created_at, request_id)` ascending,
+skip up to and including `after`, take `limit + 1` to learn whether more
+remain. Bound the scan the same way retention does, and skip unparseable files
+rather than failing the read.
+
+**3. `orchestration/service.rs` — the scoped method.**
+
+```rust
+pub fn list_receipts_scoped(
+    &self, _auth: &AuthContext, session_id: Uuid, workspace: &Path,
+    run_id: &str, after: Option<&str>, limit: usize,
+) -> Result<serde_json::Value, OrchError>
+```
+
+Call `self.authorize_run_request(session_id, workspace, run_id)?` **first**, so
+every denial matches every other run read. Parse `after` as `"<millis>:<request_id>"`
+and reject a malformed cursor with `invalid_request`. Project, then return:
+
+```json
+{ "receipts": [ … ], "nextCursor": "1767225601500:req-0001",
+  "retention": { "maxReceipts": 1000, "maxAgeDays": 7 } }
+```
+
+`retention` comes from the store's live `RetentionPolicy`, not a constant. It
+is not decoration: a receipt that aged out is indistinguishable from one that
+never existed, and a consumer must be told the window rather than infer
+absence.
+
+**4. `orchestration/types.rs` — register the tool.** Add
+`"ptah_list_receipts"` to `CONTROL_TOOLS`. It is a read; nothing goes in
+`FORBIDDEN_TOOLS`.
+
+**5. `mcp_control.rs` — schema and dispatch.** Add `ptah_list_receipts` to the
+existing run-scoped group in `tool_input_schema`
+(`required: ["session_id","workspace","run_id"]`) plus optional `after`
+(string) and `limit` (1–500). Add a `#[serde(deny_unknown_fields)]` args struct
+and a dispatch arm mirroring `ptah_get_events` — including its explicit
+`1..=500` limit check.
+
+**6. `docs/MCP_CONTROL_COORDINATOR.md`.** Add the tool to the inventory table
+and a short semantics note covering the run scope, the bounded retention
+window, and the redaction rules above.
+
+### Tests to add on the host side
+
+Mirror the shapes already proven against the fake in this crate
+(`tests/observe.rs`), in `crates/codegen/grokptah-agent-bridge/tests/`:
+
+* empty listing for a run with no receipts returns a page plus its window;
+* multi-page walk is deterministic and paged order equals unpaged order;
+* wrong run and wrong workspace produce the *same* denials the other run reads
+  produce;
+* a receipt whose response and error message contain a known secret and an
+  absolute path projects without either;
+* a settled receipt beyond `max_receipts` is gone while a pending one survives;
+* a malformed cursor is `invalid_request`, not a silent restart.
+
+### Then, on the SDK side — one method body
+
+In `service.rs`, replace the `list_receipts` refusal with a call to the new
+tool, and change the `receipt.read` descriptor from a hard-coded `Unsupported`
+to the same `tools/list`-derived form the other capabilities use. The
+conformance check `receipts.are_scoped_and_do_not_echo_the_request` stops
+skipping and starts running. **No SDK type changes** — the contract, the
+retention type, the cursor format and the tests all exist already.
 
 ## Explicitly out of scope
 

@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use crate::capability::{Availability, CapabilityDescriptor, CapabilityDocument};
 use crate::client::AgentControlPlane;
 use crate::dto::{
-    ArtifactPayload, ArtifactRequest, PublicEvent, ReceiptView, RunSelector, RunView, SessionView,
+    ArtifactPayload, ArtifactRequest, PublicEvent, ReceiptPage, RunSelector, RunView, SessionView,
 };
 use crate::error::SdkResult;
 use crate::ids::Label;
@@ -63,7 +63,7 @@ pub trait RunObservatory: Send + Sync {
         &self,
         selector: RunSelector,
         page: PageRequest,
-    ) -> SdkResult<Page<ReceiptView>>;
+    ) -> SdkResult<ReceiptPage>;
 }
 
 /// A control plane narrowed to its reads.
@@ -151,7 +151,7 @@ impl<T: AgentControlPlane> RunObservatory for ObserverHandle<T> {
         &self,
         selector: RunSelector,
         page: PageRequest,
-    ) -> SdkResult<Page<ReceiptView>> {
+    ) -> SdkResult<ReceiptPage> {
         self.inner.list_receipts(selector, page).await
     }
 }

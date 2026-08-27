@@ -687,6 +687,14 @@ pub async fn run_battery<H: Harness>(harness: &H) -> ConformanceReport {
                         .is_some_and(|id| id != &selector.run_id)
                 }) {
                     CheckOutcome::Failed("a receipt from another run was listed".into())
+                } else if page.retention.max_receipts == 0 || page.retention.max_age_days == 0 {
+                    // A listing is only interpretable next to the window it came
+                    // from: without one, a consumer cannot tell "nothing happened"
+                    // from "it happened and aged out".
+                    CheckOutcome::Failed(
+                        "receipts were listed without a retention window that could hold them"
+                            .into(),
+                    )
                 } else {
                     CheckOutcome::Passed
                 }

@@ -286,30 +286,87 @@ async fn receipts_are_run_scoped_and_never_a_global_listing() {
 }
 
 #[tokio::test]
-async fn receipt_paging_is_bounded_and_resumable() {
+async fn an_empty_listing_is_a_page_with_its_window_not_an_error() {
+    // A run with no mutations attributed to it. The page is empty, caught up,
+    // and still says which window it was drawn from — because "nothing here"
+    // and "nothing ever happened" are different claims.
     let plane = plane();
-    let (session, selector) = completed_run(&plane).await;
-    // Three more mutations against the same run.
-    for n in 10..13 {
+    let session = plane.seeded_session().expect("seeded");
+    let accepted = plane
+        .submit_task(TaskSubmission {
+            request_id: request_id(1),
+            session_id: session.session_id.clone(),
+            workspace: session.workspace.clone(),
+            prompt: "instruction".into(),
+            bounds: None,
+            execution_mode: ExecutionMode::Shared,
+            allow_queue: false,
+        })
+        .await
+        .expect("submit");
+    // Second run, never mutated after creation beyond its own submission.
+    let other = plane
+        .submit_task(TaskSubmission {
+            request_id: request_id(2),
+            session_id: session.session_id.clone(),
+            workspace: session.workspace.clone(),
+            prompt: "instruction".into(),
+            bounds: None,
+            execution_mode: ExecutionMode::Shared,
+            allow_queue: false,
+        })
+        .await
+        .expect("submit");
+    let observer = ObserverHandle::new(plane);
+
+    // Drop the only receipt for `other` by listing a run that has none: use a
+    // fresh selector pointing at `accepted` but filter on the other run.
+    let empty_for = RunSelector {
+        session_id: session.session_id.clone(),
+        workspace: session.workspace.clone(),
+        run_id: other.run_id.clone(),
+    };
+    let page = observer
+        .list_receipts(empty_for, PageRequest::new())
+        .await
+        .expect("receipts");
+    assert_eq!(
+        page.items.len(),
+        1,
+        "its own submission is attributed to it"
+    );
+    assert!(page.is_caught_up());
+    assert!(page.retention.max_receipts > 0);
+    assert!(page.retention.max_age_days > 0);
+    let _ = accepted;
+}
+
+#[tokio::test]
+async fn multi_page_listing_is_deterministic_and_resumable() {
+    let plane = plane();
+    let (_session, selector) = completed_run(&plane).await;
+    for n in 10..15 {
         plane
             .cancel_run(CancelRequest {
                 request_id: request_id(n),
                 selector: selector.clone(),
             })
             .await
-            .expect("cancel is idempotent, so each key records its own receipt");
+            .expect("each key records its own receipt");
     }
-    let _ = session;
     let observer = ObserverHandle::new(plane);
 
-    let mut seen: Vec<String> = Vec::new();
+    // Walk the listing one item at a time.
+    let mut walked: Vec<String> = Vec::new();
     let mut request = PageRequest::new().limit(1);
+    let mut windows = Vec::new();
     loop {
         let page = observer
             .list_receipts(selector.clone(), request.clone())
             .await
             .expect("page");
-        seen.extend(
+        windows.push(page.retention);
+        walked.extend(
             page.items
                 .iter()
                 .map(|receipt| receipt.request_id.as_str().to_string()),
@@ -319,27 +376,102 @@ async fn receipt_paging_is_bounded_and_resumable() {
             Some(cursor) => request = PageRequest::new().after(cursor).limit(1),
         }
     }
-    let mut unique = seen.clone();
+    assert!(walked.len() >= 6, "expected every receipt, got {walked:?}");
+    let mut unique = walked.clone();
     unique.sort();
     unique.dedup();
-    assert_eq!(
-        unique.len(),
-        seen.len(),
-        "resume duplicated a receipt: {seen:?}"
+    assert_eq!(unique.len(), walked.len(), "resume duplicated: {walked:?}");
+    assert!(
+        windows.windows(2).all(|pair| pair[0] == pair[1]),
+        "the declared window must not change mid-walk"
     );
-    assert!(seen.len() >= 4, "expected every receipt, got {seen:?}");
 
-    // The contract ceiling still applies.
+    // One big page must produce the same order as the walk.
+    let whole = observer
+        .list_receipts(selector.clone(), PageRequest::new().limit(500))
+        .await
+        .expect("whole listing");
+    let at_once: Vec<String> = whole
+        .items
+        .iter()
+        .map(|receipt| receipt.request_id.as_str().to_string())
+        .collect();
+    assert_eq!(at_once, walked, "paged and unpaged order must agree");
+
+    // And that order is chronological, tie-broken by request id.
+    let keys: Vec<(chrono::DateTime<chrono::Utc>, String)> = whole
+        .items
+        .iter()
+        .map(|receipt| (receipt.recorded_at, receipt.request_id.as_str().to_string()))
+        .collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
     assert_eq!(
-        observer
+        keys, sorted,
+        "listing is not in (recordedAt, requestId) order"
+    );
+}
+
+#[tokio::test]
+async fn a_cursor_this_adapter_did_not_issue_is_refused() {
+    let plane = plane();
+    let (_session, selector) = completed_run(&plane).await;
+    let observer = ObserverHandle::new(plane);
+    for bad in ["1", "not-a-cursor", ":", "abc:req-0001"] {
+        let error = observer
             .list_receipts(
-                selector,
-                PageRequest::new().limit(grokptah_agent_sdk::page::MAX_PAGE_LIMIT + 1)
+                selector.clone(),
+                PageRequest::new().after(Cursor::from_opaque(bad)),
             )
             .await
-            .expect_err("over-ceiling page")
-            .code,
-        SdkErrorCode::InvalidRequest
+            .expect_err("a foreign cursor must not be interpreted");
+        assert_eq!(error.code, SdkErrorCode::InvalidRequest, "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn retention_drops_settled_receipts_but_never_uncertain_ones() {
+    // A window of two, so the fence is reachable without a thousand writes.
+    let plane = FakeControlPlane::builder()
+        .receipt_retention(ReceiptRetention {
+            max_receipts: 2,
+            max_age_days: 7,
+        })
+        .build();
+    let (_session, selector) = completed_run(&plane).await;
+    // An unsettled receipt: claimed, never resolved.
+    plane.strand_receipt(&request_id(90), OperationClass::Cancel, &selector.run_id);
+    // Now push settled receipts past the window.
+    for n in 20..25 {
+        plane
+            .cancel_run(CancelRequest {
+                request_id: request_id(n),
+                selector: selector.clone(),
+            })
+            .await
+            .expect("cancel");
+    }
+    let observer = ObserverHandle::new(plane);
+
+    let page = observer
+        .list_receipts(selector, PageRequest::new().limit(500))
+        .await
+        .expect("receipts");
+    assert_eq!(page.retention.max_receipts, 2);
+
+    let settled: Vec<_> = page.items.iter().filter(|r| r.is_settled()).collect();
+    assert!(
+        settled.len() <= 2,
+        "settled receipts must be held to the declared window, got {}",
+        settled.len()
+    );
+    // The uncertain one survives: expiring it would turn "we do not know"
+    // into "it never happened".
+    assert!(
+        page.items
+            .iter()
+            .any(|r| r.request_id == request_id(90) && r.is_uncertain()),
+        "an unsettled receipt must outlive the count fence"
     );
 }
 

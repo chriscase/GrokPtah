@@ -658,6 +658,91 @@ pub struct ReceiptView {
     pub recorded_at: DateTime<Utc>,
 }
 
+/// The bounded window a receipt listing was drawn from.
+///
+/// Travels *with* the page rather than beside it, so a consumer cannot hold
+/// receipts without also holding the caveat: a receipt that aged out is
+/// indistinguishable from one that never existed. Absence is never proof that
+/// a mutation did not happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptRetention {
+    /// Most settled receipts the host keeps.
+    pub max_receipts: u32,
+    /// Age at which a settled receipt is expired.
+    pub max_age_days: u32,
+}
+
+impl ReceiptRetention {
+    /// The runtime's shipped policy: the newest 1,000 settled receipts, and
+    /// nothing older than 7 days.
+    pub const RUNTIME_DEFAULT: Self = Self {
+        max_receipts: 1_000,
+        max_age_days: 7,
+    };
+}
+
+/// One page of receipts, inseparable from the window it came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptPage {
+    pub items: Vec<ReceiptView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<Cursor>,
+    pub retention: ReceiptRetention,
+}
+
+impl ReceiptPage {
+    pub fn new(
+        items: Vec<ReceiptView>,
+        next_cursor: Option<Cursor>,
+        retention: ReceiptRetention,
+    ) -> Self {
+        Self {
+            items,
+            next_cursor,
+            retention,
+        }
+    }
+
+    /// `true` when the caller has read everything the window still holds.
+    pub fn is_caught_up(&self) -> bool {
+        self.next_cursor.is_none()
+    }
+}
+
+/// Deterministic ordering key for a receipt listing.
+///
+/// Receipts order by `(recorded_at, request_id)`: chronological, with the
+/// request id breaking ties so two receipts written in the same millisecond
+/// cannot swap places between pages. The cursor is that pair, encoded — opaque
+/// to a consumer, stable across restarts because both halves are durable.
+pub fn receipt_cursor(receipt: &ReceiptView) -> Cursor {
+    Cursor::from_opaque(format!(
+        "{}:{}",
+        receipt.recorded_at.timestamp_millis().max(0),
+        receipt.request_id
+    ))
+}
+
+/// Decode a cursor minted by [`receipt_cursor`].
+pub fn parse_receipt_cursor(cursor: &Cursor) -> SdkResult<(i64, String)> {
+    let raw = cursor.as_str();
+    let (millis, request_id) = raw.split_once(':').ok_or_else(|| {
+        SdkError::new(
+            SdkErrorCode::InvalidRequest,
+            "cursor was not issued by this adapter",
+        )
+    })?;
+    let millis = millis.parse::<i64>().map_err(|_| {
+        SdkError::new(
+            SdkErrorCode::InvalidRequest,
+            "cursor was not issued by this adapter",
+        )
+    })?;
+    Ok((millis, request_id.to_string()))
+}
+
 impl ReceiptView {
     /// `true` when the mutation's effect is unknown.
     ///

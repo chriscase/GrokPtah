@@ -1237,7 +1237,7 @@ impl<T: McpTransport> AgentControlPlane for ServiceControlPlane<T> {
         &self,
         _selector: RunSelector,
         _page: PageRequest,
-    ) -> SdkResult<Page<ReceiptView>> {
+    ) -> SdkResult<ReceiptPage> {
         Err(SdkError::new(
             SdkErrorCode::Unsupported,
             "the control plane exposes no receipt read; see docs/AGENT_SDK_SEAM.md",
