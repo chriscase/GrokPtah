@@ -1370,6 +1370,15 @@ pub fn prompt_preview(prompt: &str) -> String {
     crate::textutil::truncate_at_char_boundary(p, 120).to_string()
 }
 
+/// Durable detail recorded when restart recovery settles an idempotency claim
+/// that was written ahead of its effect but never acknowledged.
+///
+/// The effect may or may not have happened, so this receipt is never
+/// auto-replayed. Embedding surfaces match on this exact constant to present
+/// the claim as *uncertain* rather than as a plain internal failure.
+pub const INTERRUPTED_CLAIM_DETAIL: &str =
+    "mutation was interrupted before its durable receipt completed; use a new request_id";
+
 pub fn hash_payload(v: &serde_json::Value) -> String {
     use sha2::{Digest, Sha256};
     let s = serde_json::to_string(v).unwrap_or_default();

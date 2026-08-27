@@ -51,7 +51,10 @@ remote-service conformance (multi-client, capacity, idempotency,
 authorization, reconnect, desktop receipts) is documented in
 [`HEADLESS_SERVICE.md`](./HEADLESS_SERVICE.md). Runtime, storage, capability,
 and authority boundaries are normative in
-[`ADR-002-runtime-boundaries.md`](./ADR-002-runtime-boundaries.md).
+[`ADR-002-runtime-boundaries.md`](./ADR-002-runtime-boundaries.md). The
+host-neutral embedding surface another product links against — four bounded
+operations over the same runtime, with redacted projections — is
+[`HEADLESS_AGENT_PORT.md`](./HEADLESS_AGENT_PORT.md).
 
 ## Why a bridge crate
 

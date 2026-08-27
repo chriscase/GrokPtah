@@ -5527,7 +5527,36 @@ impl OrchestrationService {
         Ok(session)
     }
 
-    fn authorize_run_request(
+    /// Server-side run-bounds ceiling currently configured for this service.
+    ///
+    /// Additive read used by embedding surfaces that must renegotiate limits
+    /// before every operation rather than caching them at bind time.
+    pub(crate) fn bounds_ceiling(&self) -> RunBounds {
+        self.config.lock().bounds.clone()
+    }
+
+    /// Re-run the Build-session + allowlisted-workspace scope gate and return
+    /// the canonical workspace.
+    ///
+    /// Additive read used at an effect boundary: negotiation is not
+    /// authorization, so a caller that already negotiated still has to pass
+    /// this immediately before causing a durable effect.
+    pub(crate) fn recheck_build_scope(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<PathBuf, OrchError> {
+        let session = self.require_build_session(session_id)?;
+        let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
+        let allowlist = self.config.lock().allowlist.clone();
+        require_workspace_match(&allowlist, cwd.as_deref(), workspace)
+    }
+
+    /// Session + workspace + run gate shared by every scoped run read.
+    ///
+    /// Crate-visible so an embedding surface rechecks authority through this
+    /// one gate instead of reconstructing it.
+    pub(crate) fn authorize_run_request(
         &self,
         session_id: Uuid,
         workspace: &Path,

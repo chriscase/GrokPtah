@@ -16,6 +16,7 @@ pub mod event_bus;
 mod events;
 mod exec_risk;
 mod gateway_config;
+pub mod headless_port;
 mod hooks;
 mod host;
 mod host_helpers;
@@ -69,6 +70,15 @@ pub use gateway_config::{
     save as save_gateway_config, CapabilitySource, ComputerUseTier, GatewayConfig,
     ModelCapabilities, ModelSelection, ProviderDeadlineClass, ProviderDialect, ProviderKind,
     ProviderModel, ProviderProfile, ProviderProfileUpdate,
+};
+pub use headless_port::{
+    orchestration_port, EffectAuthorization, HeadlessAgentPort, HeadlessAuthority, HostNegotiation,
+    OrchestrationAuthority, PortBinding, PortCancelReceipt, PortCancelView, PortDelivery,
+    PortDeliveryEvidence, PortError, PortErrorCode, PortEvent, PortEventKind, PortEventPage,
+    PortEventRange, PortEventsView, PortEvidenceGap, PortEvidenceSummary, PortExecutionMode,
+    PortHostKind, PortLimits, PortOperation, PortPrincipal, PortResult, PortReviewProjection,
+    PortRunOutcome, PortRunProjection, PortSubmitReceipt, PortSubmitRequest, PortSubmitView,
+    PortTier, HEADLESS_PORT_PROTOCOL_VERSION, HEADLESS_PORT_SCHEMA, MAX_PORT_EVENT_PAGE,
 };
 pub use isolation::prepare_isolation_cwd;
 pub use live_attestation::{
