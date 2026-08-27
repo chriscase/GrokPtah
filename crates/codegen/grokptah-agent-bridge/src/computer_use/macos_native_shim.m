@@ -124,12 +124,14 @@ static GPTMacUserInteractionState GPTCaptureUserInteractionState(void) {
     if (frontmost == nil || frontmost.processIdentifier <= 0) {
         return state;
     }
-    CGEventRef event = CGEventCreate(NULL);
-    if (event == NULL) {
-        return state;
-    }
-    state.pointer_location = CGEventGetLocation(event);
-    CFRelease(event);
+    // Read-only pointer sample for the before/after user-interaction fence.
+    // This deliberately avoids the CGEvent family: creating a CGEvent just to
+    // read a location pulls in the same API surface used for global input
+    // injection, which the release gate forbids outright. AppKit's
+    // `NSEvent.mouseLocation` reads the pointer without it. Only equality
+    // between the two samples is ever used, so the coordinate origin AppKit
+    // reports differs from CGEvent's without changing the fence.
+    state.pointer_location = NSEvent.mouseLocation;
     state.frontmost_process_id = frontmost.processIdentifier;
 
     CFArrayRef windowInfo = CGWindowListCopyWindowInfo(

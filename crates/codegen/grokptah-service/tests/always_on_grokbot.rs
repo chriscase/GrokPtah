@@ -1168,6 +1168,10 @@ impl Stage6WorkerPool {
         self.reconnect_and_assert_authority(campaign).await;
 
         self.credential_lifecycle.clear();
+        // The index also selects `old_tokens` and `authority_baselines`, and the
+        // body pushes into `self.credential_lifecycle`, so borrowing
+        // `self.lanes` across the loop would not compile.
+        #[allow(clippy::needless_range_loop)]
         for index in 0..self.lanes.len() {
             let lane = &self.lanes[index];
             let old_fingerprint = hash_payload(&json!(old_tokens[index].as_str()));

@@ -646,6 +646,9 @@ impl ComputerUseService {
     /// trusted desktop calls it only after `AgentHost` returns a qualified,
     /// exact-observation proposal and after independently validating the
     /// semantic action against the local observation.
+    // Each parameter is an independent authority or identity input that a
+    // caller must pass explicitly; bundling them would hide that.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_agent_action_proposal(
         &self,
         request_id: &str,

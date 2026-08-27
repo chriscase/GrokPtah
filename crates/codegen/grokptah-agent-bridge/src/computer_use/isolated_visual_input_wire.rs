@@ -360,6 +360,9 @@ impl WireFields {
         Ok(fields)
     }
 
+    // One flat wire record: every field is a distinct decoded scalar, and
+    // grouping them into a struct here would only rename the same tuple.
+    #[allow(clippy::too_many_arguments)]
     fn to_message(
         kind: u8,
         state: u8,

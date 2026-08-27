@@ -2122,12 +2122,20 @@ mod tests {
             BTreeSet::from([crate::computer_use::ActionClass::TextEntry])
         );
         assert_eq!(source.text_value.lock().as_str(), "public-demo-value");
-        let requests = source.action_requests.lock();
-        assert_eq!(requests.len(), 2);
-        assert!(requests.iter().all(|request| {
-            request.execution_mode == MacSemanticExecutionMode::MeasuredBackground
-        }));
-        drop(requests);
+        // Copy the facts out inside a block so the guard provably ends here.
+        // An explicit `drop` is enough at runtime, but the guard still shows up
+        // in this async fn's coroutine layout, so `await_holding_lock` fires.
+        let execution_modes: Vec<MacSemanticExecutionMode> = {
+            let requests = source.action_requests.lock();
+            requests
+                .iter()
+                .map(|request| request.execution_mode)
+                .collect()
+        };
+        assert_eq!(execution_modes.len(), 2);
+        assert!(execution_modes
+            .iter()
+            .all(|mode| *mode == MacSemanticExecutionMode::MeasuredBackground));
 
         let directory = tempfile::tempdir().unwrap();
         let service = platform
@@ -2521,11 +2529,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(observation.geometry.x, -1200.0);
-        assert_eq!(observation.elements.len(), 1);
+        // The fixture exposes three nodes. `AXSecureTextField` is hard-denied
+        // and dropped whole — label included — so exactly the two non-secure
+        // nodes survive. Asserting the surviving set, rather than a bare
+        // count, is what actually pins the omission.
+        assert_eq!(observation.elements.len(), 2);
         assert_eq!(observation.elements[0].role, "AXButton");
-        assert!(!serde_json::to_string(&observation)
-            .unwrap()
-            .contains("must-not-escape"));
+        assert_eq!(observation.elements[1].role, "AXTextField");
+        assert!(
+            observation
+                .elements
+                .iter()
+                .all(|element| !element.role.to_ascii_lowercase().contains("secure")),
+            "a secure control must never reach the exposed semantic tree"
+        );
+        let serialized = serde_json::to_string(&observation).unwrap();
+        for needle in ["must-not-escape", "Password", "AXSecureTextField"] {
+            assert!(!serialized.contains(needle), "observation leaked {needle}");
+        }
         assert_eq!(observation.elements[0].bounds.unwrap().x, 1.0);
         let evidence = observation.screenshot.unwrap();
         assert_eq!(

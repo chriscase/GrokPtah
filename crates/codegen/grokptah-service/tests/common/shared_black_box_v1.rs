@@ -835,6 +835,8 @@ fn host_capability_contract(
 
 type ScanFn<'a> = dyn FnMut(&Value, &str) + 'a;
 
+// One scenario driver threading independent fixtures through six phases.
+#[allow(clippy::too_many_arguments)]
 async fn drive_six_phases(
     kind: EndpointKind,
     scenario: &Scenario,
@@ -1928,6 +1930,8 @@ async fn wait_run_terminal(
     panic!("bootstrap/run {run_id} did not become terminal");
 }
 
+// Poll parameters are independent knobs the callers vary per call site.
+#[allow(clippy::too_many_arguments)]
 async fn wait_work_state(
     launched: &mut Launched,
     scenario: &Scenario,
@@ -2190,6 +2194,8 @@ fn collect_leak_paths(value: &Value, path: &str, out: &mut Vec<String>) {
     }
 }
 
+// Each needle is a distinct secret to hunt for; a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn scan_raw(
     value: &Value,
     origin: &str,
@@ -2356,7 +2362,9 @@ fn visit_strings(value: &mut Value, edit: &mut dyn FnMut(&str) -> String) {
     }
 }
 
-fn strip_ephemerals(value: &mut Value, key: Option<&str>) {
+// `key` is threaded through the recursion for symmetry with the other
+// walkers but is never read here; keep the shape, name it as unused.
+fn strip_ephemerals(value: &mut Value, _key: Option<&str>) {
     match value {
         Value::Object(map) => {
             let keys: Vec<String> = map.keys().cloned().collect();
@@ -2372,7 +2380,7 @@ fn strip_ephemerals(value: &mut Value, key: Option<&str>) {
         }
         Value::Array(items) => {
             for child in items {
-                strip_ephemerals(child, key);
+                strip_ephemerals(child, _key);
             }
         }
         _ => {}
@@ -2420,18 +2428,16 @@ fn collect_ids(value: &Value, key: Option<&str>, canon: &mut IdCanon) {
         Value::Array(items) => {
             let mut items = items.clone();
             if key.is_some_and(is_set_array_key) {
-                items.sort_by_key(|item| canonical_sort_key(item));
+                items.sort_by_key(canonical_sort_key);
             }
             for child in &items {
                 collect_ids(child, key, canon);
             }
         }
         Value::String(text) => {
-            if should_canonicalize(key, text) {
-                if !canon.map.contains_key(text) {
-                    let next = format!("$ID_{}", canon.map.len() + 1);
-                    canon.map.insert(text.clone(), next);
-                }
+            if should_canonicalize(key, text) && !canon.map.contains_key(text) {
+                let next = format!("$ID_{}", canon.map.len() + 1);
+                canon.map.insert(text.clone(), next);
             }
             for captured in find_generated_ids(text) {
                 if !canon.map.contains_key(&captured) {
@@ -2845,9 +2851,9 @@ fn display_path(path: &str) -> String {
 }
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .canonicalize()
+    // Repo policy bans `Path::canonicalize`: it yields \\?\ verbatim paths on
+    // Windows that break external tools and poison path-equality keys.
+    dunce::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.."))
         .expect("canonicalize repo root")
 }
 
@@ -3281,10 +3287,14 @@ fn write_golden_document_roundtrip_does_not_touch_repo_goldens() {
 
 #[test]
 fn committed_preload_is_armed() {
-    assert!(
-        PRELOAD_IMMUTABLE_GOLDEN,
-        "committed fixture must fail closed on missing/pending goldens before launch"
-    );
+    // Checked at compile time: a build that flipped the flag cannot even
+    // produce this test binary, let alone run past the gate.
+    const {
+        assert!(
+            PRELOAD_IMMUTABLE_GOLDEN,
+            "committed fixture must fail closed on missing/pending goldens before launch"
+        )
+    };
 }
 
 #[test]

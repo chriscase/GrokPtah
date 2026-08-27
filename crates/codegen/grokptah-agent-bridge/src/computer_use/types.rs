@@ -2332,6 +2332,8 @@ impl ComputerRun {
         );
     }
 
+    // Audit inputs are independent facts recorded together exactly once.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_surface_audit(
         &mut self,
         surface_event: ComputerSurfaceEvent,

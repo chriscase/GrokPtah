@@ -245,6 +245,10 @@ mod tests {
         IsolatedVisualSecurityProfile,
     };
 
+    /// The protocol requires a canonical UUIDv4 request nonce; a bare hex
+    /// string is refused, so the fixtures use a real one.
+    const REQUEST_NONCE: &str = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+
     fn contract() -> IsolatedVisualLaunchContract {
         IsolatedVisualLaunchContract {
             run_id: "run-runtime-session".into(),
@@ -289,7 +293,7 @@ mod tests {
         let mut guest =
             IsolatedVisualFrameCarrier::new_guest_with_challenge(&contract, &[7; 32]).unwrap();
         let chunks = guest
-            .seal_frame(1, "00112233445566778899aabbccddeeff", 2, 2, &[1, 2, 3, 4])
+            .seal_frame(1, REQUEST_NONCE, 2, 2, &[1, 2, 3, 4])
             .unwrap();
         assert_eq!(
             runtime.open_frame_chunk(&chunks[0]).unwrap().unwrap().bytes,
@@ -298,7 +302,7 @@ mod tests {
         let packet = runtime
             .seal_input(
                 1,
-                "00112233445566778899aabbccddeeff",
+                REQUEST_NONCE,
                 IsolatedVisualInputMessage::PointerMove { x: 1, y: 1 },
             )
             .unwrap();
@@ -330,7 +334,7 @@ mod tests {
         assert!(runtime
             .seal_input(
                 1,
-                "00112233445566778899aabbccddeeff",
+                REQUEST_NONCE,
                 IsolatedVisualInputMessage::Text { text: "x".into() }
             )
             .is_err());

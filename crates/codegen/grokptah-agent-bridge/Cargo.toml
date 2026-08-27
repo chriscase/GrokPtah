@@ -10,6 +10,15 @@ build = "build.rs"
 # Own workspace root (excluded from monorepo root Cargo.toml).
 [workspace]
 
+[features]
+# Source-only typecheck of the macOS-gated Computer Use modules on a non-macOS
+# host. It compiles `macos_isolated_runtime` / `macos_isolated_artifacts` and
+# runs their unit tests so Linux CI watches them at all; without it those files
+# are invisible off macOS. It is NOT a macOS proof: the Objective-C shim is not
+# built, no framework is linked, and no native entry point is called. Use it
+# with `cargo check` / `cargo test` only, never to produce a shipped binary.
+macos-source-typecheck = []
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"

@@ -526,6 +526,17 @@ mod tests {
     fn writable_handles_wrong_modes_and_sparse_oversize_fail_closed() {
         let (helper_dir, _helper) = write_artifact("helper", b"helper-v1", true);
         let helper_path = helper_dir.path().join("helper");
+        // `write_artifact` leaves mode 0o500. Opening that read-write only
+        // succeeds for a user who bypasses the permission check, so as root it
+        // works and as an ordinary CI user it fails with EACCES before the
+        // assertion below is ever reached. Make the file writable first: what
+        // is under test is that a writable *handle* is refused, not whether
+        // this process could obtain one.
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let mut writable = OpenOptions::new()
             .read(true)
             .write(true)

@@ -23,12 +23,26 @@ mod isolated_visual_helper;
 mod isolated_visual_helper_control;
 mod isolated_visual_input;
 mod isolated_visual_input_wire;
+mod isolated_visual_launch;
 mod isolated_visual_protocol;
 mod isolated_visual_runtime;
 mod isolated_visual_stream;
-#[cfg(target_os = "macos")]
+// Gated on macOS in a shipped build. The `macos-source-typecheck` feature also
+// compiles these two modules on a non-macOS host so their contracts and unit
+// tests are checked in CI rather than going unwatched off macOS; it links no
+// framework and calls no native entry point.
+// The packaged supervisor is deliberately not wired into capability
+// admission: no Computer Use path launches a guest yet, so on macOS it has no
+// runtime caller and `-D warnings` rejects the whole substrate as dead. The
+// alternatives are worse — a crate-root re-export would widen the public
+// surface this boundary keeps closed, and dispatching it would claim macOS
+// behavior nothing here has proven. Remove this allow in the change that
+// actually dispatches the packaged runtime.
+#[allow(dead_code)]
+#[cfg(any(target_os = "macos", feature = "macos-source-typecheck"))]
 mod macos_isolated_artifacts;
-#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+#[cfg(any(target_os = "macos", feature = "macos-source-typecheck"))]
 mod macos_isolated_runtime;
 mod macos_observation;
 mod platform;
@@ -91,6 +105,14 @@ pub use isolated_visual_input_wire::{
     ISOLATED_VISUAL_INPUT_MAX_PACKET_BYTES, ISOLATED_VISUAL_INPUT_TAG_BYTES,
     ISOLATED_VISUAL_INPUT_VERSION,
 };
+pub use isolated_visual_launch::{
+    IsolatedVisualAuthorityState, IsolatedVisualChannelRole, IsolatedVisualCleanupReceipt,
+    IsolatedVisualGuestBinding, IsolatedVisualGuestOperation, IsolatedVisualLaunchAuthority,
+    IsolatedVisualLaunchDescriptorSet, IsolatedVisualLaunchDescriptors,
+    IsolatedVisualLaunchReceipt, IsolatedVisualRevocation,
+    ISOLATED_VISUAL_FIRST_PRIVATE_DESCRIPTOR, ISOLATED_VISUAL_LAUNCH_CHANNEL_COUNT,
+    ISOLATED_VISUAL_LAUNCH_RECEIPT_SCHEMA_VERSION, ISOLATED_VISUAL_MAX_DESCRIPTOR,
+};
 pub use isolated_visual_protocol::{
     IsolatedVisualGuestFailure, IsolatedVisualGuestHealth, IsolatedVisualGuestMessage,
     IsolatedVisualHostMessage, IsolatedVisualProtocolEnvelope, IsolatedVisualProtocolPayload,
@@ -102,7 +124,13 @@ pub use isolated_visual_stream::{
     IsolatedVisualStream, ISOLATED_VISUAL_GUEST_INPUT_COMMAND, ISOLATED_VISUAL_STREAM_LENGTH_BYTES,
     ISOLATED_VISUAL_STREAM_MAX_FRAME_PACKET_BYTES,
 };
-#[cfg(target_os = "macos")]
+// Same reason as the module-level allow above: nothing dispatches the packaged
+// supervisor yet, so this re-export has no consumer and `-D warnings` rejects
+// it as unused. Widening it to the typecheck feature is deliberate — it is the
+// only way a non-macOS build sees this line at all, and it is exactly the line
+// that broke the macOS lint step when the feature did not cover it.
+#[allow(unused_imports)]
+#[cfg(any(target_os = "macos", feature = "macos-source-typecheck"))]
 pub(crate) use macos_isolated_runtime::IsolatedVisualPackagedRuntime;
 pub use macos_observation::MacOsObservationPlatform;
 pub use platform::{
