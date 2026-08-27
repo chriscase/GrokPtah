@@ -49,8 +49,12 @@ dispatch handle, host path, screenshot asset locator, credential, or general she
 
 ## Release blockers still open
 
-- Run the three-action disposable macOS fixture proof through the packaged GrokPtah identity with
-  Screen Recording and Accessibility grants. Terminal-owned grants do not prove packaged identity.
+- Run the three-action disposable macOS fixture proof through the packaged GrokPtah **helper**
+  identity with Screen Recording and Accessibility grants. Terminal-owned grants and in-process
+  host TCC do not prove packaged identity (#444).
+- Assemble, sign, and notarize the declared helper at
+  `Contents/Helpers/GrokPtah Computer Use Helper.app`. Empty entitlements and Info.plist on this
+  branch declare the identity; they are not a notarized helper.
 - Complete the named hardware matrix for focus/geometry/display changes and permission revocation.
 - Keep #271 Computer MCP mutations disabled until the shared event/approval contract and its threat
   review are complete.
