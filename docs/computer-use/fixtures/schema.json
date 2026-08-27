@@ -1,0 +1,103 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://grokptah.dev/schemas/computer-use-benchmark-fixture.v1.json",
+  "title": "Computer Use benchmark fixture (v1)",
+  "type": "array",
+  "minItems": 1,
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["id", "class", "difficulty", "objective", "app", "initial_state", "oracle", "budget", "expected_optimal_steps", "tags"],
+    "properties": {
+      "id": {
+        "type": "string",
+        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+        "maxLength": 64,
+        "description": "Stable fixture identifier. Prefix encodes the class."
+      },
+      "class": {
+        "type": "string",
+        "enum": ["native-semantic", "web-dom", "native-thin", "canvas-opaque", "adversarial", "stateful-multistep"]
+      },
+      "difficulty": { "type": "string", "enum": ["easy", "medium", "hard", "adversarial"] },
+      "objective": {
+        "type": "string",
+        "minLength": 8,
+        "maxLength": 200,
+        "description": "Operator-authored goal. Bounded because it is carried in every CompactFrame."
+      },
+      "app": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "target", "seed"],
+        "properties": {
+          "kind": { "type": "string", "enum": ["simulator", "fixture", "scripted"] },
+          "target": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "seed": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "initial_state": { "type": "object", "description": "Seeded starting state asserted before the run." },
+      "oracle": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type"],
+        "properties": {
+          "type": { "type": "string", "enum": ["state_equals", "state_contains", "no_change", "abstained", "terminal_state"] },
+          "assert": { "type": "object", "description": "Conditions that MUST hold after the run." },
+          "forbid": { "type": "object", "description": "Side effects that MUST NOT occur. Any firing is an irreversible violation." },
+          "terminal": {
+            "type": "string",
+            "enum": ["completed", "cancelled", "failed", "stalled", "limit_reached", "abstained"],
+            "description": "Required terminal run state, when the oracle type is terminal_state."
+          }
+        }
+      },
+      "budget": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["max_steps"],
+        "properties": {
+          "max_steps": { "type": "integer", "minimum": 1, "maximum": 96 }
+        }
+      },
+      "expected_optimal_steps": { "type": "integer", "minimum": 0, "maximum": 96 },
+      "attack": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["family", "description"],
+        "properties": {
+          "family": {
+            "type": "string",
+            "enum": [
+              "injection-label", "injection-value", "lookalike-target", "moving-target",
+              "secure-field", "clickjack-overlay", "locale-swap", "duplicate-labels",
+              "stationary-trap", "partial-mutation", "permission-revoke", "target-substitution"
+            ]
+          },
+          "description": { "type": "string", "minLength": 8, "maxLength": 400 },
+          "payload": { "type": "string", "maxLength": 400, "description": "Hostile string placed in observed content. Data, never an instruction." }
+        }
+      },
+      "ineligible_profiles": {
+        "type": "array",
+        "items": { "type": "string", "enum": ["economy", "balanced", "high-assurance"] },
+        "uniqueItems": true,
+        "description": "Profiles that must refuse this fixture up front rather than attempt and fail."
+      },
+      "tags": { "type": "array", "items": { "type": "string", "maxLength": 32 }, "minItems": 1, "uniqueItems": true }
+    },
+    "allOf": [
+      {
+        "if": { "properties": { "class": { "const": "adversarial" } }, "required": ["class"] },
+        "then": { "required": ["attack"] }
+      },
+      {
+        "if": { "properties": { "class": { "const": "canvas-opaque" } }, "required": ["class"] },
+        "then": {
+          "required": ["ineligible_profiles"],
+          "properties": { "ineligible_profiles": { "contains": { "const": "economy" } } }
+        }
+      }
+    ]
+  }
+}
