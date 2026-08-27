@@ -131,6 +131,20 @@ failing step.
 | `hosted-service` | ubuntu | same service clippy step | **repaired**, same fix |
 | `desktop` | macOS | `grokptah-desktop` failed to compile: `unresolved import grokptah_agent_bridge::ComputerSurfaceCoordination` | **repaired** — the type was exported from `computer_use` but never re-exported at the crate root |
 
+Two more macOS-only failures surfaced behind that one, both the same shape:
+`pub(crate) use macos_isolated_runtime::IsolatedVisualPackagedRuntime` rejected
+as an unused import, and `examples/macos_computer_use_background_text.rs`
+importing `SemanticElement` from the crate root. Every one of these is
+invisible to a non-macOS `--all-targets` build, and each cost a full macOS CI
+round to find.
+
+`tests/crate_root_exports.rs` closes that class: it reads every target's
+`grokptah_agent_bridge::Name` imports — including the nested desktop crate's —
+and asserts each resolves against `lib.rs`. It reads sources rather than
+compiling them, so it holds on every host. Removing `SemanticElement` from
+`lib.rs` makes it fail naming that exact file and symbol, so it is not a
+vacuous gate.
+
 The service lint repairs keep every assertion. The one that guards a gate,
 `assert!(PRELOAD_IMMUTABLE_GOLDEN, …)`, became `const { assert!(…) }`: the same
 message, now checked at compile time, so a build that flipped the flag cannot
