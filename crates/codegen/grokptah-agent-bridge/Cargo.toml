@@ -48,3 +48,7 @@ cc = "1"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process", "test-util"] }
 tempfile = "3"
+# Test-only: the adaptive Computer Use planner/executor contract, so its
+# vocabulary can be asserted against this crate's safety kernel rather than
+# drifting from it. Not a runtime dependency of the bridge.
+grokptah-cu-adaptive = { path = "../../common/grokptah-cu-adaptive" }

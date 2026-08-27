@@ -19,6 +19,29 @@ All are runnable from a clean clone with caches disabled
 | Offline oracles | `cargo test --locked eval_oracle -- --nocapture` | `crates/codegen/grokptah-agent-bridge` |
 | Focused upstream support | `cargo fmt -p xai-grok-env -p xai-grok-shell-base -- --check && cargo clippy -p xai-grok-env -p xai-grok-shell-base --all-targets --all-features --locked -- -D warnings && cargo test -p xai-grok-shell-base --all-features --locked` | repository root |
 
+The adaptive Computer Use contract and its synthetic benchmark
+(`crates/common/grokptah-cu-adaptive`) are a supported focused check from the
+repository root:
+
+```sh
+cargo fmt -p grokptah-cu-adaptive -- --check
+cargo clippy -p grokptah-cu-adaptive --all-targets --locked -- -D warnings
+cargo test -p grokptah-cu-adaptive --locked
+```
+
+Its bridge-side conformance test, which asserts the adaptive vocabulary against
+this fork's Computer Use safety kernel, runs from the bridge workspace:
+
+```sh
+cd crates/codegen/grokptah-agent-bridge
+cargo test --locked --test computer_adaptive_conformance
+```
+
+On Linux the bridge workspace needs `libdbus-1-dev` and `pkg-config` for the
+`keyring` dependency to build. See
+[COMPUTER_USE_ADAPTIVE.md](COMPUTER_USE_ADAPTIVE.md) for the contract, the
+profile table, and the list of things the benchmark does not measure.
+
 The deterministic reliability campaign is also a supported focused check:
 
 ```sh
