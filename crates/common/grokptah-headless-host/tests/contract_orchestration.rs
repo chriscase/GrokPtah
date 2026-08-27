@@ -544,3 +544,391 @@ fn a_recoverable_halt_can_be_allowed_and_the_run_continues() {
         "the retry is a new dispatch, not a repeat of the old ordinal"
     );
 }
+
+#[test]
+fn every_disposition_has_exactly_one_host_behaviour() {
+    // The four dispositions are the whole vocabulary the host acts on, so each
+    // one is exercised end to end rather than only where it happens to appear.
+    let cases = [
+        (FakeTurn::local(progress("local")), "running", "local"),
+        (
+            FakeTurn::dispatched(
+                progress("prepared"),
+                DispatchDisposition::NotDispatched,
+                None,
+                None,
+            ),
+            "running",
+            "not_dispatched",
+        ),
+        (
+            FakeTurn::dispatched(
+                progress("sent"),
+                DispatchDisposition::Resolved,
+                Some("attempt-1"),
+                Some("receipt-1"),
+            ),
+            "running",
+            "resolved",
+        ),
+        (
+            FakeTurn::dispatched(
+                progress("unknown"),
+                DispatchDisposition::Indeterminate,
+                Some("attempt-1"),
+                None,
+            ),
+            "needs_attention",
+            "indeterminate",
+        ),
+    ];
+
+    for (turn, expected_phase, expected_disposition) in cases {
+        let harness = Harness::new();
+        let (mut host, log) = harness.open_orchestrated(vec![turn]);
+        let run_id = submit(&mut host, "req-1", "build");
+        ok(&mut host, ControlCommand::Tick { steps: Some(1) });
+
+        assert_eq!(
+            phase(&mut host, &run_id),
+            expected_phase,
+            "phase for {expected_disposition}"
+        );
+        assert_eq!(
+            record_on_disk(&harness, &run_id)["dispatch"]["settled"]["disposition"],
+            expected_disposition
+        );
+        assert_eq!(log.ordinals(), vec![1]);
+
+        // Only the unprovable one stops the run from taking another turn.
+        ok(&mut host, ControlCommand::Tick { steps: Some(1) });
+        let advanced = log.ordinals().len() > 1;
+        assert_eq!(
+            advanced,
+            expected_disposition != "indeterminate",
+            "{expected_disposition} should {} advance",
+            if expected_disposition == "indeterminate" {
+                "not"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
+#[test]
+fn a_completed_turn_on_an_unproven_dispatch_is_not_a_completion() {
+    let harness = Harness::new();
+    let (mut host, log) = harness.open_orchestrated(vec![FakeTurn::dispatched(
+        completed(),
+        DispatchDisposition::Indeterminate,
+        Some("attempt-1"),
+        Some("receipt-1"),
+    )]);
+
+    let run_id = submit(&mut host, "req-1", "build");
+    ok(&mut host, ControlCommand::Tick { steps: Some(1) });
+
+    // The orchestrator said "completed". It could not prove the request landed,
+    // so the host records no completion and publishes no receipt.
+    let status = common::status(&mut host, &run_id);
+    assert_eq!(status["phase"], "needs_attention");
+    assert_eq!(status["receiptAvailable"], false);
+    assert_eq!(
+        refused(
+            &mut host,
+            ControlCommand::Receipt {
+                run_id: run_id.clone()
+            }
+        ),
+        "receipt_absent"
+    );
+    assert!(
+        record_on_disk(&harness, &run_id)["completion"].is_null(),
+        "an unproven dispatch must not record completion evidence"
+    );
+
+    // And no amount of ticking turns it into one.
+    ok(&mut host, ControlCommand::Tick { steps: Some(8) });
+    assert_eq!(phase(&mut host, &run_id), "needs_attention");
+    assert_eq!(log.ordinals(), vec![1]);
+}
+
+#[test]
+fn a_stop_during_a_long_turn_halts_it_without_a_second_runtime() {
+    let harness = Harness::new();
+    let (mut host, log) = harness.open_orchestrated(vec![
+        FakeTurn::cancelled_after_dispatch("attempt-1"),
+        FakeTurn::dispatched(
+            completed(),
+            DispatchDisposition::Resolved,
+            Some("attempt-2"),
+            None,
+        ),
+    ]);
+    let cancel = host.cancel_signal();
+
+    let run_id = submit(&mut host, "req-1", "build");
+    ok(&mut host, ControlCommand::Tick { steps: Some(1) });
+
+    // The stop arrived inside the turn, on the same channel the OS signal
+    // watcher uses. Nothing here spawned a runtime to deliver it.
+    assert!(cancel.is_cancelled());
+    let status = common::status(&mut host, &run_id);
+    assert_eq!(status["phase"], "needs_attention");
+    assert_eq!(status["stopReason"], "dispatch_indeterminate");
+    assert_eq!(status["attention"]["kind"], "dispatch_uncertain");
+
+    let dispatch = record_on_disk(&harness, &run_id)["dispatch"].clone();
+    assert_eq!(dispatch["settled"]["disposition"], "indeterminate");
+    assert_eq!(dispatch["settled"]["attempt"], "attempt-1");
+
+    // The second scripted turn is never reached.
+    ok(&mut host, ControlCommand::Tick { steps: Some(8) });
+    assert_eq!(log.ordinals(), vec![1]);
+}
+
+#[test]
+fn a_turn_that_aborts_before_sending_leaves_nothing_to_reconcile() {
+    let harness = Harness::new().grant(grokptah_headless_host::authority::CAP_PROMOTE);
+    let (mut host, log) = harness.open_orchestrated(vec![FakeTurn::CancelledBeforeSend]);
+
+    let run_id = submit(&mut host, "req-1", "build");
+    ok(&mut host, ControlCommand::Tick { steps: Some(1) });
+
+    let status = common::status(&mut host, &run_id);
+    assert_eq!(status["phase"], "needs_attention");
+    assert_eq!(status["attention"]["reasonCode"], "cancelled_before_send");
+    assert_eq!(status["attention"]["kind"], "recovery_required");
+
+    let dispatch = record_on_disk(&harness, &run_id)["dispatch"].clone();
+    assert_eq!(dispatch["settled"]["disposition"], "not_dispatched");
+    assert!(
+        dispatch["settled"]["attempt"].is_null(),
+        "nothing went out, so there is no attempt to reconcile"
+    );
+
+    // Nothing was sent, so this run is still allowable — unlike an unproven one.
+    let attention_id = ok(
+        &mut host,
+        ControlCommand::Attention {
+            run_id: run_id.clone(),
+        },
+    )["attention"]["attentionId"]
+        .as_str()
+        .expect("attention identity")
+        .to_owned();
+    ok(
+        &mut host,
+        ControlCommand::ResolveAttention {
+            run_id: run_id.clone(),
+            attention_id,
+            resolution: AttentionResolution::Allow,
+        },
+    );
+    assert_eq!(phase(&mut host, &run_id), "queued");
+    assert_eq!(log.ordinals(), vec![1]);
+}
+
+#[test]
+fn a_clean_stop_between_turns_is_never_reported_as_unproven() {
+    // Graceful: the run is checkpointed and stays resumable.
+    let harness = Harness::new();
+    let run_id;
+    {
+        let (mut host, _) = harness.open_orchestrated(vec![FakeTurn::dispatched(
+            progress("planning"),
+            DispatchDisposition::Resolved,
+            Some("attempt-1"),
+            None,
+        )]);
+        run_id = submit(&mut host, "req-1", "build");
+        ok(&mut host, ControlCommand::Tick { steps: Some(1) });
+        let stop = host
+            .shutdown(ShutdownKind::Graceful)
+            .expect("graceful stop");
+        assert_eq!(stop.paused, vec![run_id.clone()]);
+    }
+    let (host, _) = harness.open_orchestrated(Vec::new());
+    let report = host.startup_report();
+    assert_eq!(report.recovery.resumable, vec![run_id.clone()]);
+    assert!(
+        report.recovery.indeterminate_dispatch.is_empty(),
+        "a dispatch that settled before the stop is not unproven"
+    );
+    drop(host);
+
+    // Immediate: the run is interrupted, but its settled dispatch is still not
+    // in question. Only one caught mid-flight is.
+    let harness = Harness::new();
+    let run_id;
+    {
+        let (mut host, _) = harness.open_orchestrated(vec![FakeTurn::dispatched(
+            progress("planning"),
+            DispatchDisposition::Resolved,
+            Some("attempt-1"),
+            None,
+        )]);
+        run_id = submit(&mut host, "req-1", "build");
+        ok(&mut host, ControlCommand::Tick { steps: Some(1) });
+        host.shutdown(ShutdownKind::Immediate)
+            .expect("immediate stop");
+    }
+    let (mut host, _) = harness.open_orchestrated(Vec::new());
+    let report = host.startup_report();
+    assert_eq!(report.recovery.interrupted, vec![run_id.clone()]);
+    assert!(report.recovery.indeterminate_dispatch.is_empty());
+
+    let status = common::status(&mut host, &run_id);
+    assert_eq!(status["phase"], "interrupted");
+    assert_eq!(status["stopReason"], "restart_recovery");
+    assert!(
+        status["attention"].is_null(),
+        "a settled dispatch raises no reconciliation escalation"
+    );
+}
+
+#[test]
+fn a_handle_that_is_not_opaque_is_dropped_and_settles_unproven() {
+    let harness = Harness::new();
+    let smuggled = "../../etc/passwd";
+    let (mut host, _) = harness.open_orchestrated(vec![FakeTurn::smuggled_handle(smuggled)]);
+
+    let run_id = submit(&mut host, "req-1", "build");
+    ok(&mut host, ControlCommand::Tick { steps: Some(1) });
+
+    // The orchestrator claimed the turn resolved. Its reference cannot be used
+    // to reconcile anything, so the claim is downgraded rather than trusted.
+    let dispatch = record_on_disk(&harness, &run_id)["dispatch"].clone();
+    assert_eq!(dispatch["settled"]["disposition"], "indeterminate");
+    assert!(dispatch["settled"]["attempt"].is_null());
+    assert_eq!(phase(&mut host, &run_id), "needs_attention");
+
+    let events = ok(
+        &mut host,
+        ControlCommand::Events {
+            run_id: run_id.clone(),
+            after_seq: None,
+            limit: Some(64),
+        },
+    );
+    for surface in [
+        events.to_string(),
+        common::status(&mut host, &run_id).to_string(),
+        record_on_disk(&harness, &run_id).to_string(),
+    ] {
+        assert!(
+            !surface.contains(smuggled),
+            "a rejected handle must not be echoed anywhere"
+        );
+    }
+}
+
+#[test]
+fn public_projections_carry_no_host_path_and_no_raw_prompt() {
+    let harness = Harness::new();
+    let (mut host, _) = harness.open_orchestrated(vec![
+        FakeTurn::dispatched(
+            progress("planning"),
+            DispatchDisposition::Resolved,
+            Some("attempt-1"),
+            None,
+        ),
+        FakeTurn::dispatched(
+            completed(),
+            DispatchDisposition::Resolved,
+            Some("attempt-2"),
+            None,
+        ),
+    ]);
+
+    // A prompt longer than the preview bound, carrying a host path, a
+    // credential, and a sentinel far past where any preview could reach.
+    let workspace = harness.workspace_path().display().to_string();
+    let home = harness.home.path().display().to_string();
+    let secret = "xai-abcdefghijklmnopqrstuvwxyz012345";
+    let sentinel = "SENTINEL-PROMPT-TAIL-9f2c";
+    let prompt = format!(
+        "build in {workspace} with XAI_API_KEY={secret} {} {sentinel}",
+        "filler ".repeat(120)
+    );
+
+    let run_id = submit(&mut host, "req-1", &prompt);
+    ok(&mut host, ControlCommand::Tick { steps: Some(2) });
+    assert_eq!(phase(&mut host, &run_id), "completed");
+
+    let surfaces = [
+        common::status(&mut host, &run_id).to_string(),
+        ok(
+            &mut host,
+            ControlCommand::Events {
+                run_id: run_id.clone(),
+                after_seq: None,
+                limit: Some(64),
+            },
+        )
+        .to_string(),
+        ok(
+            &mut host,
+            ControlCommand::Receipt {
+                run_id: run_id.clone(),
+            },
+        )
+        .to_string(),
+        ok(&mut host, ControlCommand::Health).to_string(),
+        record_on_disk(&harness, &run_id).to_string(),
+    ];
+    for surface in surfaces {
+        assert!(!surface.contains(&workspace), "leaked the workspace path");
+        assert!(!surface.contains(&home), "leaked the host home path");
+        assert!(!surface.contains(secret), "leaked the credential");
+        assert!(!surface.contains(sentinel), "leaked the raw prompt");
+    }
+
+    // The identity in the record is the host's own, not anything the
+    // orchestrator supplied.
+    let durable = common::status(&mut host, &run_id)["durable"].clone();
+    assert_eq!(durable["sessionId"], "session-fixture");
+    assert_eq!(durable["workspace"], common::WORKSPACE_NAME);
+}
+
+#[test]
+fn a_completion_naming_a_path_outside_the_workspace_is_refused_through_the_adapter() {
+    let harness = Harness::new();
+    let (mut host, _) = harness.open_orchestrated(vec![FakeTurn::dispatched(
+        EngineOutcome::Completed {
+            changed_files: vec![grokptah_headless_host::engine::EngineChangedFile {
+                path: "/etc/shadow".into(),
+                summary: "x".into(),
+            }],
+            diff: String::new(),
+            fingerprint: "fingerprint-escape".into(),
+        },
+        DispatchDisposition::Resolved,
+        Some("attempt-1"),
+        None,
+    )]);
+
+    let run_id = submit(&mut host, "req-1", "build");
+    ok(&mut host, ControlCommand::Tick { steps: Some(1) });
+
+    let status = common::status(&mut host, &run_id);
+    assert_eq!(status["phase"], "failed");
+    assert_eq!(status["stopReason"], "completion_path_rejected");
+    assert_eq!(status["receiptAvailable"], false);
+    assert_eq!(
+        refused(
+            &mut host,
+            ControlCommand::Receipt {
+                run_id: run_id.clone()
+            }
+        ),
+        "receipt_absent"
+    );
+    assert!(
+        !record_on_disk(&harness, &run_id)
+            .to_string()
+            .contains("/etc/shadow"),
+        "a refused path is not recorded"
+    );
+}

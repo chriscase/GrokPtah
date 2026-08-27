@@ -77,6 +77,10 @@ Absence is never permission:
 - a projection the public contract would reject never leaves the host;
 - a completion naming an absolute or traversing path fails the run instead of
   publishing it;
+- a `completed` outcome on a dispatch that was never proven is **not** a
+  completion: no evidence is recorded and no receipt is published;
+- a reference that is not a bounded opaque handle is dropped, never echoed, and
+  settles its dispatch as unproven;
 - a journal record that is unreadable anywhere but the torn tail fails the open.
 
 ## Run lifecycle
@@ -189,14 +193,32 @@ rather than repeat it. To continue, reconcile the attempt with the orchestrator
 and submit a **new run** with a fresh `requestId`. The host will not pretend to
 know whether the previous attempt ran.
 
-### Cancellation
+### Cancellation and stopping a long turn
 
 Every step receives a `CancelSignal`. The host core is synchronous, so while a
 step is running the control loop is inside it — a long turn cannot be
 interrupted by an operator command, only by this channel, which the OS signal
-watcher trips on an immediate stop. Cancellation observed *before* dispatch
-halts the run as recoverable rather than failing it: nothing went out, so there
-is nothing to reconcile and nothing to throw away.
+watcher trips on an immediate stop. No runtime is started to deliver it: the
+signal is a plain atomic, and the watcher thread is the same one that escalates
+shutdown.
+
+Where the stop lands decides what the host may say afterwards:
+
+| Stop observed | Disposition | Run |
+| --- | --- | --- |
+| Before the request goes out | `not_dispatched` | Halts, recoverable, still allowable |
+| After the request goes out | `indeterminate` | Halts, never retried, needs reconciling |
+| Between turns (graceful) | already settled | Checkpointed to `paused` |
+| Between turns (immediate) | already settled | `interrupted`, but not in question |
+
+The distinction in the last two rows matters: a stop that lands *between* turns
+leaves a settled dispatch, so the run is interrupted without any reconciliation
+question. Only a dispatch caught in flight is unproven.
+
+These are exercised deterministically. The fake orchestrator trips the shared
+cancel signal from inside a turn, which is how a stop arriving *during* a turn
+is modelled without sleeping, threads, or a second runtime — and it is exactly
+what the signal watcher does to the same channel in production.
 
 ### Integrating a real orchestrator
 
@@ -296,11 +318,12 @@ scripted fixture engine. No provider credential, no network, no wall-clock sleep
   implementation in tree, the deterministic offline fake. The adapter is ready;
   binding it to the real agent loop is the owning lane's step, and the
   credential, sandbox, and approval questions come with it.
-- **A long turn blocks the control loop.** The port is synchronous by design, so
-  while a turn runs the host processes no operator command. Cancellation reaches
-  it through the step's `CancelSignal`; everything else waits. Making turns
-  concurrent would mean more than one run in flight per host, which is a
-  different authority question.
+- **A long turn still blocks operator commands.** The port is synchronous by
+  design, so while a turn runs the host processes no command; only cancellation
+  reaches it, through the step's `CancelSignal`. That delivery is now proven
+  deterministically for both the before-send and after-send cases, but
+  everything else still waits. Making turns concurrent would mean more than one
+  run in flight per host, which is a different authority question.
 - **No Computer Use.** The control lease deliberately grants none, and no
   Computer Use surface is implemented here.
 - **Single session and workspace per host.** Multi-workspace hosting would need

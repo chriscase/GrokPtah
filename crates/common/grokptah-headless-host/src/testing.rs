@@ -226,6 +226,27 @@ pub enum FakeTurn {
         /// Opaque attempt reference the orchestrator managed to record.
         attempt: String,
     },
+    /// A turn long enough for a stop to arrive after the request went out.
+    ///
+    /// The turn trips the shared cancel signal itself. The host is
+    /// single-threaded, so that is how a stop arriving *during* a turn is
+    /// modelled without sleeping, threads, or a second runtime — and it is
+    /// exactly what the OS signal watcher does to the same channel in
+    /// production.
+    CancelledAfterDispatch {
+        /// Attempt reference recorded before the answer was abandoned.
+        attempt: String,
+    },
+    /// A long turn that notices the stop at a checkpoint before sending.
+    CancelledBeforeSend,
+    /// An orchestrator that hands back a reference which is not opaque.
+    ///
+    /// Built by decoding the raw value, so it bypasses the constructor exactly
+    /// the way a record read back from disk or a carelessly built type would.
+    SmuggledHandle {
+        /// The raw value to hand back as an attempt reference.
+        raw: String,
+    },
 }
 
 impl FakeTurn {
@@ -253,6 +274,20 @@ impl FakeTurn {
     pub fn lost(attempt: &str) -> Self {
         Self::LostAfterDispatch {
             attempt: attempt.to_owned(),
+        }
+    }
+
+    /// A long turn interrupted by a stop after the request went out.
+    pub fn cancelled_after_dispatch(attempt: &str) -> Self {
+        Self::CancelledAfterDispatch {
+            attempt: attempt.to_owned(),
+        }
+    }
+
+    /// A turn handing back a reference that is not a bounded opaque handle.
+    pub fn smuggled_handle(raw: &str) -> Self {
+        Self::SmuggledHandle {
+            raw: raw.to_owned(),
         }
     }
 }
@@ -332,6 +367,41 @@ impl TurnOrchestrator for FakeOrchestrator {
                 },
                 DispatchDisposition::Indeterminate,
                 ExternalRef::new(&attempt),
+                None,
+            )),
+            FakeTurn::CancelledAfterDispatch { attempt } => {
+                // The stop lands while the request is already out. Whether it
+                // ran is exactly what this orchestrator cannot say.
+                request.cancel.cancel();
+                Ok(TurnReceipt::dispatched(
+                    EngineOutcome::Failed {
+                        reason_code: "cancelled_in_flight".to_owned(),
+                        detail: "the host stopped while the request was outstanding".to_owned(),
+                    },
+                    DispatchDisposition::Indeterminate,
+                    ExternalRef::new(&attempt),
+                    None,
+                ))
+            }
+            FakeTurn::CancelledBeforeSend => {
+                request.cancel.cancel();
+                Ok(TurnReceipt::dispatched(
+                    EngineOutcome::NeedsAttention {
+                        attention: crate::attention::AttentionKind::RecoveryRequired,
+                        reason_code: "cancelled_before_send".to_owned(),
+                        detail: "the host stopped before the request went out".to_owned(),
+                    },
+                    DispatchDisposition::NotDispatched,
+                    None,
+                    None,
+                ))
+            }
+            FakeTurn::SmuggledHandle { raw } => Ok(TurnReceipt::dispatched(
+                EngineOutcome::Progress {
+                    update: serde_json::json!({ "note": "working" }),
+                },
+                DispatchDisposition::Resolved,
+                serde_json::from_value(serde_json::Value::String(raw)).ok(),
                 None,
             )),
         }
