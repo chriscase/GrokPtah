@@ -588,7 +588,19 @@ impl IsolatedVisualHost {
             error_code: None,
         });
         lease.validate()?;
-        self.store.save_lease(&lease)?;
+        // The Prepared record must be durable before a dispatch exists at all.
+        // If it is not, nothing has been promised and nothing was injected, so
+        // the dispatch is refused outright.
+        if let Err(write_error) = self.store.save_lease(&lease) {
+            return Err(IsolatedError::new(
+                IsolatedErrorCode::Internal,
+                format!(
+                    "dispatch refused: the Prepared ledger write is not durable ({}); \
+                     nothing was injected",
+                    write_error.message
+                ),
+            ));
+        }
         Ok(lease)
     }
 
@@ -826,8 +838,10 @@ impl IsolatedVisualHost {
 
         self.simulator.destroy(&guest.guest_id);
 
+        // These prefixes must be the resource names the probe reports under, or
+        // a teardown failure is recorded but never attributed to its resource.
         if let Err(error) = remove_marker(&self.helper_marker_path(&guest.guest_id)) {
-            teardown_errors.push(format!("helper marker: {}", error.message));
+            teardown_errors.push(format!("helper_process: {}", error.message));
         }
         if let Err(error) = remove_marker(&self.overlay_path(&guest.guest_id)) {
             teardown_errors.push(format!("overlay: {}", error.message));

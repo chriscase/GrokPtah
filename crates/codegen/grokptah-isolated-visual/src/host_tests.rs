@@ -442,6 +442,83 @@ fn a_failed_overlay_deletion_is_uncertain_and_the_guest_is_not_cleaned() {
 }
 
 #[test]
+fn a_non_durable_ledger_write_refuses_the_dispatch() {
+    // The atomic write goes through `<lease>.json.tmp`, so a directory in its
+    // place defeats `File::create`. Nothing is stubbed: the real write path
+    // returns a real error, at whichever of the two ledger writes we block.
+    fn block(harness: &Harness, lease_id: &str) -> std::path::PathBuf {
+        let tmp = harness
+            .host
+            .store_root()
+            .join("leases")
+            .join(format!("{lease_id}.json.tmp"));
+        std::fs::create_dir(&tmp).expect("block the temp path");
+        tmp
+    }
+
+    // Case 1: the Prepared write is not durable. No dispatch is created.
+    {
+        let mut harness = harness();
+        let guest_id = running_guest(&mut harness, "a");
+        let lease_id = granted_lease(&mut harness, &guest_id);
+        frame(&mut harness, &guest_id, &lease_id);
+        let event = dispatch_event(&mut harness, &guest_id, &lease_id, "dispatch-1", "a");
+        let tmp = block(&harness, &lease_id);
+
+        let error = harness
+            .host
+            .inject_dispatch(&guest_id, &lease_id, event, false)
+            .unwrap_err();
+        assert_eq!(error.code, IsolatedErrorCode::Internal);
+        assert!(error.message.contains("refused"), "{error}");
+        assert!(error.message.contains("Prepared"), "{error}");
+        assert_eq!(harness.host.simulator().input_len(&guest_id), 0);
+        std::fs::remove_dir(&tmp).expect("unblock");
+    }
+
+    // Case 2: Prepared landed, the Injected write does not. Injection must not
+    // happen, and the dispatch is known-not-injected rather than uncertain.
+    {
+        let mut harness = harness();
+        let guest_id = running_guest(&mut harness, "a");
+        let lease_id = granted_lease(&mut harness, &guest_id);
+        frame(&mut harness, &guest_id, &lease_id);
+        let event = dispatch_event(&mut harness, &guest_id, &lease_id, "dispatch-1", "a");
+        harness
+            .host
+            .prepare_dispatch(&guest_id, &lease_id, event.clone())
+            .expect("prepared write lands");
+        let tmp = block(&harness, &lease_id);
+
+        let error = harness
+            .host
+            .inject_dispatch(&guest_id, &lease_id, event, false)
+            .unwrap_err();
+        assert_eq!(error.code, IsolatedErrorCode::Internal);
+        assert!(error.message.contains("Injected"), "{error}");
+        assert_eq!(
+            harness.host.simulator().input_len(&guest_id),
+            0,
+            "input must not be injected when the Injected write is not durable"
+        );
+        std::fs::remove_dir(&tmp).expect("unblock");
+
+        let lease = harness
+            .host
+            .leases()
+            .unwrap()
+            .into_iter()
+            .find(|lease| lease.lease_id == lease_id)
+            .expect("lease exists");
+        assert_ne!(lease.state, ComputerSurfaceLeaseState::Released);
+        assert_ne!(
+            lease.dispatch.as_ref().map(|dispatch| dispatch.state),
+            Some(ComputerDispatchState::Acknowledged)
+        );
+    }
+}
+
+#[test]
 fn store_lock_rejects_a_second_open() {
     let harness = harness();
     let root = harness.host.store_root().to_path_buf();

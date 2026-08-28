@@ -65,7 +65,9 @@ pub fn resource_key(image_digest: &str, overlay_id: &str, surface_incarnation: &
 
 pub struct OccupancyStore {
     root: PathBuf,
-    locks: std::sync::Mutex<Vec<fs::File>>,
+    /// Advisory locks this process holds, keyed by resource so releasing one
+    /// resource cannot drop another resource's lock.
+    locks: std::sync::Mutex<std::collections::BTreeMap<String, fs::File>>,
 }
 
 impl OccupancyStore {
@@ -80,7 +82,7 @@ impl OccupancyStore {
         let canonical = dunce::canonicalize(&root).map_err(io_err)?;
         Ok(Self {
             root: canonical,
-            locks: std::sync::Mutex::new(Vec::new()),
+            locks: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         })
     }
 
@@ -168,7 +170,7 @@ impl OccupancyStore {
         self.locks
             .lock()
             .map_err(|_| IsolatedError::internal("occupancy lock set is poisoned"))?
-            .push(lock);
+            .insert(live.resource_key.clone(), lock);
         Ok(live)
     }
 
@@ -229,10 +231,10 @@ impl OccupancyStore {
                 )));
             }
         }
-        // Drop this process's advisory lock before unlinking so the lock file
-        // is not removed while still held.
+        // Drop this resource's advisory lock before unlinking, so the lock file
+        // is not removed while still held. Other resources keep theirs.
         if let Ok(mut locks) = self.locks.lock() {
-            locks.clear();
+            locks.remove(resource_key);
         }
         let record_path = self.record_path(resource_key)?;
         if let Err(error) = fs::remove_file(&record_path) {

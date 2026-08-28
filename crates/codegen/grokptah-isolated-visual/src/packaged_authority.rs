@@ -78,12 +78,17 @@ pub struct PackagedHelperObservation {
     pub ignored_self_attestations: Vec<String>,
 }
 
+/// What was observed about the guest image: its bytes and its size.
+///
+/// There is deliberately no `format` field. Format is not inferable from the
+/// bytes here, so an observation could only echo a constant, and comparing a
+/// constant against the trust root would prove nothing. The digest pins the
+/// exact bytes; the trust root declares what those bytes are.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GuestImageObservation {
     pub image_path: String,
     pub digest: String,
-    pub format: String,
     pub size_bytes: u64,
 }
 
@@ -230,11 +235,6 @@ pub fn admit_guest_image(
             "guest-image digest does not match the trust root",
         ));
     }
-    if observation.format != expected.format {
-        return Err(IsolatedError::unauthorized(
-            "guest-image format does not match the trust root",
-        ));
-    }
     validate_provenance(&expected.provenance)?;
     Ok(AdmittedGuestImage {
         digest: expected.digest_sha256.clone(),
@@ -315,9 +315,6 @@ pub fn inspect_guest_image(image_path: &Path) -> IsolatedResult<GuestImageObserv
     Ok(GuestImageObservation {
         image_path: image_path.to_string_lossy().into_owned(),
         digest: hash_file(image_path)?,
-        // Format is not inferable from bytes; the trust root declares it and
-        // the observation simply echoes the declared value for comparison.
-        format: "raw".into(),
         size_bytes: metadata.len(),
     })
 }

@@ -441,20 +441,51 @@ fn a_truncated_lease_record_is_quarantined() {
 
 #[test]
 fn a_stale_lease_is_reaped_on_open() {
+    // Two distinct paths must both retire a lease, and this test separates
+    // them so neither can silently stand in for the other.
     let dir = TempDir::new().unwrap();
     let clock = Arc::new(grokptah_isolated_visual::TestClock::new(Utc::now()));
     let root = dir.path().join("store");
+
+    // Path A: expiry on a *live* host. The grant window lapses while the host
+    // is still running, so this is expiry alone, not restart recovery.
+    let mut harness = Harness::at(&root, &clock);
+    let guest_id = running_guest(&mut harness, "a");
+    let lease_id = granted_lease(&mut harness, &guest_id);
+    let conflict_domain = harness.host.guest(&guest_id).unwrap().conflict_domain_id;
+    clock.jump(Duration::minutes(30));
+    // grant_next reaps expired grants before judging capacity.
+    let _ = harness.host.grant_next(&conflict_domain);
+    let lease = harness
+        .host
+        .leases()
+        .unwrap()
+        .into_iter()
+        .find(|lease| lease.lease_id == lease_id)
+        .expect("lease still recorded");
+    assert!(
+        lease.state.is_terminal(),
+        "an expired grant must be reaped on a live host, got {:?}",
+        lease.state
+    );
+    drop(harness);
+
+    // Path B: restart. A lease that was live when the process died is not
+    // resumable, whether or not it had expired.
+    let dir2 = TempDir::new().unwrap();
+    let clock2 = Arc::new(grokptah_isolated_visual::TestClock::new(Utc::now()));
+    let root2 = dir2.path().join("store");
     {
-        let mut harness = Harness::at(&root, &clock);
-        let guest_id = running_guest(&mut harness, "a");
+        let mut harness = Harness::at(&root2, &clock2);
+        let guest_id = running_guest(&mut harness, "b");
         let _ = granted_lease(&mut harness, &guest_id);
     }
-    clock.jump(Duration::minutes(30));
-    let harness = Harness::at(&root, &clock);
+    clock2.jump(Duration::seconds(1));
+    let harness = Harness::at(&root2, &clock2);
     for lease in harness.host.leases().unwrap() {
         assert!(
             lease.state.is_terminal(),
-            "lease {} survived expiry as {:?}",
+            "lease {} survived a restart as {:?}",
             lease.lease_id,
             lease.state
         );
