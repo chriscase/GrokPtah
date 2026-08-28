@@ -795,6 +795,14 @@ pub struct ReceiptView {
     /// The run this mutation produced or acted on, when it had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
+    /// When the host **claimed** the request id — not when the mutation
+    /// settled.
+    ///
+    /// This is the ordering key a receipt page and its cursor both use, so it
+    /// has to be immutable: a host that moved it on settlement would move a
+    /// receipt past a cursor a caller is already holding and hand it out
+    /// twice. Do not read it as a completion time or subtract it from one to
+    /// get a duration; `status` says whether the mutation settled.
     pub recorded_at: DateTime<Utc>,
 }
 
