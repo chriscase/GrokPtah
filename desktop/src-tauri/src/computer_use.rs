@@ -8,7 +8,7 @@ use grokptah_agent_bridge::{
     ComputerAgentProposal, ComputerCapabilities, ComputerError, ComputerObservation,
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
-    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
+    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer, OrchStore,
     MacOsObservationPlatform, SemanticAction, SimulatorBackend,
 };
 use serde::Serialize;
@@ -67,6 +67,7 @@ pub struct DesktopComputerUse {
     host: AgentHostHandle,
     platform: Option<Arc<dyn ComputerObservationPlatform>>,
     store: Option<grokptah_agent_bridge::ComputerStore>,
+    audit_store: Option<OrchStore>,
     initialization_error: Option<String>,
     operation: Mutex<()>,
     selections: std::sync::Mutex<HashMap<String, grokptah_agent_bridge::ComputerTarget>>,
@@ -89,17 +90,25 @@ impl DesktopComputerUse {
                 Some(format!("Computer Use storage is unavailable: {error}")),
             ),
         };
-        let simulator = store.clone().map(|store| {
-            Arc::new(ComputerUseService::new(
-                Arc::new(SimulatorBackend::new()),
-                store,
-            ))
+        let (audit_store, audit_error) = match host.ensure_orchestration_store() {
+            Ok(store) => (Some(store), None),
+            Err(error) => (
+                None,
+                Some(format!("Audit storage is unavailable: {error}")),
+            ),
+        };
+        let simulator = store.clone().zip(audit_store.clone()).map(|(store, audit)| {
+            Arc::new(
+                ComputerUseService::new(Arc::new(SimulatorBackend::new()), store)
+                    .with_audit_store(audit),
+            )
         });
         Self {
             host: host.clone(),
             platform,
             store,
-            initialization_error: platform_error.or(store_error),
+            audit_store,
+            initialization_error: platform_error.or(store_error).or(audit_error),
             operation: Mutex::new(()),
             selections: std::sync::Mutex::new(HashMap::new()),
             simulator,
@@ -196,7 +205,11 @@ impl DesktopComputerUse {
             .bind_target(selection_token)
             .await
             .map_err(|error| error.to_string())?;
-        let service = ComputerUseService::new(backend, store);
+        let audit_store = self
+            .audit_store
+            .clone()
+            .ok_or_else(|| self.initialization_error())?;
+        let service = ComputerUseService::new(backend, store).with_audit_store(audit_store);
         let limits = ComputerUseLimits {
             max_actions: 1,
             max_duration_secs: 5 * 60,
@@ -387,7 +400,11 @@ impl DesktopComputerUse {
             .store
             .clone()
             .ok_or_else(|| self.initialization_error())?;
-        let service = Arc::new(ComputerUseService::new(backend, store));
+        let audit_store = self
+            .audit_store
+            .clone()
+            .ok_or_else(|| self.initialization_error())?;
+        let service = Arc::new(ComputerUseService::new(backend, store).with_audit_store(audit_store));
         let limits = ComputerUseLimits {
             max_actions: 8,
             max_duration_secs: 10 * 60,

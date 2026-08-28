@@ -67,6 +67,8 @@ pub use export::{
     ExportVerification,
 };
 pub use keys::{AuditKeyCustody, AuditKeyMode, AuditKeys};
+#[cfg(test)]
+pub(crate) use ledger::CrashPoint;
 pub use ledger::{
     AuditEntryInput, AuditLedger, AuditLedgerOptions, AuditStatus, GenerationVerification,
     RecoverySummary,

@@ -172,7 +172,7 @@ pub struct AuditLedger {
     /// intentionally have multiple commit phases.
     pub(crate) operation_lock: Mutex<()>,
     #[cfg(test)]
-    crash_at: Option<CrashPoint>,
+    crash_at: Mutex<Option<CrashPoint>>,
 }
 
 impl std::fmt::Debug for AuditLedger {
@@ -305,24 +305,29 @@ impl AuditLedger {
             }),
             operation_lock: Mutex::new(()),
             #[cfg(test)]
-            crash_at: None,
+            crash_at: Mutex::new(None),
         };
         ledger.recover()?;
         Ok(ledger)
     }
 
     #[cfg(test)]
-    pub(crate) fn with_crash_at(mut self, point: CrashPoint) -> Self {
-        self.crash_at = Some(point);
+    pub(crate) fn with_crash_at(self, point: CrashPoint) -> Self {
+        *self.crash_at.lock() = Some(point);
         self
     }
 
     #[cfg(test)]
     pub(crate) fn cut(&self, point: CrashPoint) -> AuditResult<()> {
-        if self.crash_at == Some(point) {
+        if *self.crash_at.lock() == Some(point) {
             return Err(AuditError::CrashCut);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_crash_at(&self, point: CrashPoint) {
+        *self.crash_at.lock() = Some(point);
     }
 
     #[cfg(not(test))]

@@ -7,6 +7,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::audit::{AuditEntryInput, EntryOutcome, EntryPhase};
+use crate::orchestration::OrchStore;
+
 use super::policy::ComputerPolicy;
 use super::projection::{
     not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
@@ -23,6 +26,7 @@ pub struct ComputerUseService {
     backend: Arc<dyn ComputerBackend>,
     store: ComputerStore,
     policy: ComputerPolicy,
+    audit_store: Option<OrchStore>,
 }
 
 impl ComputerUseService {
@@ -31,7 +35,38 @@ impl ComputerUseService {
             backend,
             store,
             policy: ComputerPolicy,
+            audit_store: None,
         }
+    }
+
+    pub fn with_audit_store(mut self, audit_store: OrchStore) -> Self {
+        self.audit_store = Some(audit_store);
+        self
+    }
+
+    fn append_audit(
+        &self,
+        request_id: &str,
+        operation: &str,
+        phase: EntryPhase,
+        outcome: EntryOutcome,
+        error_code: Option<&str>,
+    ) -> ComputerResult<()> {
+        let Some(store) = self.audit_store.as_ref() else {
+            return Ok(());
+        };
+        let mut input = AuditEntryInput::new(format!("computer_use.{operation}"), phase, outcome)
+            .with_request(request_id)
+            .with_intent_id(request_id);
+        if error_code.is_some() {
+            input = input.with_reason(crate::audit::EntryReason::Internal);
+        }
+        store.append_audit_input(input).map_err(|_| {
+            ComputerError::new(
+                ComputerErrorCode::Internal,
+                "computer-use audit authority is unavailable",
+            )
+        })
     }
 
     pub fn capabilities(&self) -> super::types::ComputerCapabilities {
@@ -188,7 +223,7 @@ impl ComputerUseService {
             self.store.save_run(&run)?;
             Ok(run)
         })();
-        self.finish_mutation(request_id, &result)?;
+        self.finish_mutation(request_id, "create_run", &result)?;
         result
     }
 
@@ -231,7 +266,7 @@ impl ComputerUseService {
         if let Err(error) = &result {
             self.record_denial(run_id, "authorize", None, error);
         }
-        self.finish_mutation(request_id, &result)?;
+        self.finish_mutation(request_id, "authorize", &result)?;
         result
     }
 
@@ -318,7 +353,7 @@ impl ComputerUseService {
                 Err(error)
             }
         };
-        self.finish_mutation(request_id, &result)?;
+        self.finish_mutation(request_id, "observe", &result)?;
         result
     }
 
@@ -420,7 +455,7 @@ impl ComputerUseService {
                 Err(error)
             }
         };
-        self.finish_mutation(request_id, &result)?;
+        self.finish_mutation(request_id, "act", &result)?;
         result
     }
 
@@ -459,7 +494,7 @@ impl ComputerUseService {
                 Err(error)
             }
         };
-        self.finish_mutation(request_id, &result)?;
+        self.finish_mutation(request_id, "pause", &result)?;
         result
     }
 
@@ -495,7 +530,7 @@ impl ComputerUseService {
                 Err(error)
             }
         };
-        self.finish_mutation(request_id, &result)?;
+        self.finish_mutation(request_id, "take_over", &result)?;
         result
     }
 
@@ -524,7 +559,7 @@ impl ComputerUseService {
                 Err(error)
             }
         };
-        self.finish_mutation(request_id, &result)?;
+        self.finish_mutation(request_id, "cancel", &result)?;
         result
     }
 
@@ -552,7 +587,7 @@ impl ComputerUseService {
         if let Err(error) = &result {
             self.record_denial(run_id, "complete", None, error);
         }
-        self.finish_mutation(request_id, &result)?;
+        self.finish_mutation(request_id, "complete", &result)?;
         result
     }
 
@@ -743,7 +778,16 @@ impl ComputerUseService {
     ) -> ComputerResult<Option<ComputerResult<T>>> {
         let hash = crate::orchestration::hash_payload(payload);
         match self.store.claim_mutation(request_id, operation, &hash)? {
-            MutationClaim::Perform => Ok(None),
+            MutationClaim::Perform => {
+                self.append_audit(
+                    request_id,
+                    operation,
+                    EntryPhase::Intent,
+                    EntryOutcome::Accepted,
+                    None,
+                )?;
+                Ok(None)
+            }
             MutationClaim::Pending => Ok(Some(Err(ComputerError::new(
                 ComputerErrorCode::Pending,
                 "an identical computer-use mutation is in progress",
@@ -764,8 +808,23 @@ impl ComputerUseService {
     fn finish_mutation<T: Serialize>(
         &self,
         request_id: &str,
+        operation: &str,
         result: &ComputerResult<T>,
     ) -> ComputerResult<()> {
+        let (outcome, error_code) = match result {
+            Ok(_) => (EntryOutcome::Accepted, None),
+            Err(error) if error.code == ComputerErrorCode::UncertainOutcome => {
+                (EntryOutcome::Uncertain, Some("computer_uncertain"))
+            }
+            Err(_) => (EntryOutcome::Rejected, Some("computer_rejected")),
+        };
+        self.append_audit(
+            request_id,
+            operation,
+            EntryPhase::Outcome,
+            outcome,
+            error_code,
+        )?;
         let encoded = match result {
             Ok(value) => serde_json::to_value(value).map_err(|error| {
                 ComputerError::new(ComputerErrorCode::Internal, error.to_string())

@@ -4944,7 +4944,11 @@ impl OrchStore {
     }
 
     pub fn append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
-        let result = self.inner.audit.append(adapt_audit_entry(entry));
+        self.append_audit_input(adapt_audit_entry(entry))
+    }
+
+    pub fn append_audit_input(&self, input: AuditEntryInput) -> anyhow::Result<()> {
+        let result = self.inner.audit.append(input);
         if let Err(error) = &result {
             *self.inner.last_audit_error.lock() =
                 Some(format!("audit persistence failed: {}", error.code()));
@@ -6184,6 +6188,58 @@ mod tests {
         let reopened = OrchStore::open(d.path()).unwrap();
         assert_eq!(reopened.verify_audit().unwrap(), 2);
         assert_eq!(reopened.audit_status().global_last_seq, 3);
+    }
+
+    #[test]
+    fn real_store_rotation_crash_cuts_converge_without_sequence_loss() {
+        for point in [
+            crate::audit::CrashPoint::R1Frozen,
+            crate::audit::CrashPoint::R2Prepared,
+            crate::audit::CrashPoint::R3Committed,
+        ] {
+            let d = tempdir().unwrap();
+            let store = OrchStore::open(d.path()).unwrap();
+            store
+                .append_audit(&AuditEntry {
+                    ts: Utc::now(),
+                    tool: "crash-cut".into(),
+                    request_id: Some(format!("rotation-{point:?}")),
+                    session_id: None,
+                    workspace: None,
+                    outcome: "accepted".into(),
+                    error_code: None,
+                    detail: "private".into(),
+                })
+                .unwrap();
+            store.inner.audit.set_crash_at(point);
+            assert!(store.rotate_audit().is_err());
+            drop(store);
+            let reopened = OrchStore::open(d.path()).unwrap();
+            assert!(reopened.verify_audit().is_ok());
+            assert!(reopened.audit_status().global_last_seq >= 1);
+        }
+    }
+
+    #[test]
+    fn real_store_retention_crash_cuts_resume_only_authenticated_tombstones() {
+        for point in [
+            crate::audit::CrashPoint::T3Committed,
+            crate::audit::CrashPoint::T4Removed,
+        ] {
+            let d = tempdir().unwrap();
+            let store = OrchStore::open(d.path()).unwrap();
+            store.rotate_audit().unwrap();
+            let export = d.path().join("export");
+            let seal = store.export_audit(&export, ExportFormat::V2).unwrap();
+            store.inner.audit.set_crash_at(point);
+            assert!(store
+                .retain_audit(RetentionRequest::new("g-000001").with_export_seal(seal.seal_id))
+                .is_err());
+            drop(store);
+            let reopened = OrchStore::open(d.path()).unwrap();
+            assert_eq!(reopened.audit_status().tombstones, 1);
+            assert!(reopened.verify_audit().is_ok());
+        }
     }
 
     #[test]

@@ -9,9 +9,12 @@ importantly — the limits it does **not** close.
 
 ## Why it exists
 
-The shipped orchestration audit ledger (`orchestration/store.rs`) appends to
-`audit/audit.jsonl` and, at 4 MiB, deletes `audit.jsonl.1` and renames the
-current file onto it. Three consequences follow:
+The shipped orchestration store now uses this authority for every
+`append_audit`/`enqueue_audit` call. The old v1 files may remain as immutable
+migration inputs, but no runtime path appends to them and there is no second
+active audit ledger. Before this integration, v1 rotation appended to
+`audit/audit.jsonl` and, at 4 MiB, deleted `audit.jsonl.1`; three consequences
+followed:
 
 1. The third-oldest generation is destroyed with no manifest, tombstone, marker
    or audit record. Nothing anywhere states that it existed.
@@ -20,9 +23,9 @@ current file onto it. Three consequences follow:
 3. A crash between the rename and the first append leaves no `audit.jsonl`, so
    "rotated a moment ago" and "never audited anything" are indistinguishable.
 
-Entries carry no sequence and no MAC, so truncation, reordering, deletion and
-wholesale substitution are all undetectable. A dropped entry sets an in-memory
-error that dies with the process.
+Those v1 entries carried no sequence or MAC, and a dropped entry was only an
+in-memory error. The migration preserves that history but never upgrades its
+origin into an authenticated claim.
 
 ## Layout
 
@@ -31,6 +34,9 @@ error that dies with the process.
   manifest.json          authenticated; names the active generation. THE pointer.
   manifest.json.tmp      transient only; a reader never promotes it
   gap.json               authenticated durable dropped-entry evidence
+  export-seals.json      authenticated export authorization index
+  .audit-key             private installation custody key (store parent)
+  .audit-key-epochs/     private retired/current epoch material
   bootstrap.json         present only during an uncommitted first-open import
   generations/
     g-000001/  journal.jsonl  anchor.json
@@ -46,6 +52,7 @@ Files are `0600`, directories `0700`, and a symlinked root is refused.
 | Manifest | `grokptah-audit-manifest.v2` | `K_manifest` | on rotation, retention, recovery convergence |
 | Anchor | `grokptah-audit-anchor.v2` | `K_anchor` | on every append |
 | Gap file | `grokptah-audit-gap.v2` | `K_anchor` | when entries are dropped |
+| Export seal index | `grokptah-audit-seals.v2` | `K_seal` | after a verified export |
 | Export | `grokptah-audit-export.{v1,v2}` | `K_seal` | never (a copy) |
 | Journal line | `v: 2` records | `K_chain` | append-only |
 
@@ -54,10 +61,13 @@ themselves minus that MAC. Canonical JSON sorts object keys explicitly and
 rejects non-integer numbers, so a MAC never depends on `serde_json` feature
 unification elsewhere in the dependency graph.
 
-Keys are derived from one installation key by domain-separated HMAC
-(`chain`, `manifest`, `anchor`, `seal`, `actor`). HMAC-SHA256 is implemented
-over the crate's existing `sha2` dependency, so the bridge lockfile is
-unchanged.
+Keys are derived from one installation key and an authenticated custody epoch
+by domain-separated HMAC (`chain`, `manifest`, `anchor`, `seal`, `actor`).
+Retired epochs stay in a private key ring so old generations remain verifiable.
+Packaged desktop and headless service modes require a private owner/mode/link
+count checked file; external consumers must inject held key material. There is
+no environment-variable, provider-credential, path disclosure, or unsafe-mode
+fallback.
 
 ## Continuity rules
 
@@ -96,21 +106,21 @@ is the sole authority for which generation is active.
 
 ## Single-writer discipline
 
-The ledger relies on the process-wide `InstanceLock` (`src/instance_lock.rs`)
-rather than taking a second lock of its own, and it holds its internal lock
-across a whole append so two in-process appenders cannot be issued the same
-sequence. It also *detects* a violation it cannot prevent: before each append
-it checks that the durable anchor still matches the in-memory tail, and a
-second writer that advanced the anchor poisons with `concurrent_writer` instead
-of interleaving two chains into one journal.
+The orchestration store's process-wide `.store.lock` remains the ownership
+boundary, and the v2 ledger serializes append/rotation/retention transactions
+inside that owner. Before each append it checks the durable anchor's complete
+state, and a second writer that advanced the anchor poisons with
+`concurrent_writer` instead of interleaving chains. A standalone
+`AuditLedger` has no implicit process lock; production callers must use the
+shared `OrchStore` custody boundary.
 
 ## Retention
 
-The only path that deletes bytes. It requires a **sealed, non-current** generation,
-an operator authorization, and either an export seal covering the range or an
-explicit `allow_unexported` override that is itself recorded permanently. The
-target is verified completely first — you may not tombstone evidence you cannot
-currently vouch for.
+The only path that deletes bytes. It requires a **sealed, non-current,
+authenticated** generation, an operator authorization, and either an export
+seal covering the range or an explicit `allow_unexported` override that is
+itself recorded permanently. The target is verified completely first — you may
+not tombstone imported, unverified, or otherwise unverifiable evidence.
 
 `T1 verify → T2 intent → T3 commit tombstone → T4 remove bytes → T5 mark removed → T6 outcome`
 
@@ -162,8 +172,17 @@ real tag.
 
 An import declares its staged directories in an authenticated `bootstrap.json`
 before creating them. A crash before the manifest commit is recovered by
-clearing exactly those declared directories and re-running; the v1 source files
-are read-only inputs and are never moved or truncated, so nothing can be lost.
+clearing exactly those declared directories and re-running; a crash after the
+manifest commit clears only the now-redundant marker. The manifest atomic rename
+is the single switch boundary. The v1 source files are read-only inputs and are
+never moved or truncated, so nothing can be lost.
+
+The store adapter maps producer operations to keyed intent identities and
+outcomes. The same v2 authority is used for orchestration, provider attempts,
+approvals, queue/background work, subagents, cancellation, shutdown, and
+Computer Use service mutations. Free-form legacy `detail` is deliberately not
+adapted; the bounded public projection contains no prompt, credential, path,
+locator, clipboard, frame, HMAC key, or private provider payload.
 
 ## Limits this does not close
 
@@ -179,14 +198,17 @@ are read-only inputs and are never moved or truncated, so nothing can be lost.
   retention, and on explicit `verify_all`, not at every start — so tampering
   with a sealed generation is detected at those points, not necessarily at the
   next boot.
-- **Key loss.** Losing a retired chain key makes old generations unverifiable.
-  It does not delete them, and the ledger reports "unverifiable" rather than
-  anything softer.
+- **Key loss.** Losing a retired epoch makes the affected generation
+  unverifiable. It does not delete it, and the store fails closed rather than
+  reporting a clean ledger.
 - **Filesystem access.** An operator who can delete the audit directory can
   still do so. Only an external append-only sink or a witness makes that
   detectable.
 - **Interrupted intents are closed in aggregate.** Recovery states the exact
-  number of intents left open and marks the outcome uncertain. Per-intent
-  correlation needs producer-supplied intent ids and is not implemented here.
-- **Not yet wired in.** `orchestration/store.rs` still uses the v1 ledger. The
-  integration is a separate, behaviour-changing change.
+  number of intents left open and marks the outcome uncertain. Producer-supplied
+  request IDs receive exact keyed intent continuity; legacy records without one
+  use a deliberately weaker session/tool fallback and make no stronger claim.
+- **Shutdown ownership.** Explicit `OrchStore` drop releases its store lock and
+  the two-process reuse gate proves this store boundary. Full host clone
+  quiescence remains owned by the separate #455 lifecycle work; this change
+  does not claim to implement or qualify that host runtime.

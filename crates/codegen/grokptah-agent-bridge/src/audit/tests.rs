@@ -1123,6 +1123,45 @@ fn uncommitted_bootstrap_import_is_recovered_without_touching_legacy_bytes() {
 }
 
 #[test]
+fn committed_bootstrap_marker_is_removed_without_replaying_import() {
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    let manifest = ledger.manifest_snapshot();
+    let ids = manifest
+        .generations
+        .iter()
+        .map(|generation| generation.generation_id.clone())
+        .collect();
+    drop(ledger);
+
+    let marker = super::import::BootstrapMarker::new(ids, &keys()).unwrap();
+    std::fs::write(
+        super::import::bootstrap_path(dir.path()),
+        serde_json::to_vec(&marker).unwrap(),
+    )
+    .unwrap();
+    let reopened = opened(dir.path());
+    assert!(!super::import::bootstrap_path(dir.path()).exists());
+    assert_eq!(reopened.status().global_last_seq, 5);
+}
+
+#[test]
+fn unterminated_legacy_line_is_counted_without_changing_legacy_bytes() {
+    let dir = TempDir::new().unwrap();
+    let legacy = legacy_v1_dir(dir.path(), "{\"a\":1}", "{\"b\":2}\n");
+    let root = dir.path().join("audit");
+    let ledger = open_with_legacy(&root, &legacy).unwrap();
+    let manifest = ledger.manifest_snapshot();
+    assert_eq!(manifest.generations[0].entry_count, 1);
+    assert_eq!(manifest.generations[0].last_seq, 1);
+    assert_eq!(
+        std::fs::read(legacy.join("audit.jsonl.1")).unwrap(),
+        b"{\"a\":1}"
+    );
+    assert!(ledger.verify_all().is_ok());
+}
+
+#[test]
 fn symlinked_root_is_rejected() {
     #[cfg(unix)]
     {
