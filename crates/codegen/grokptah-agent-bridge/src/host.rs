@@ -12,6 +12,7 @@ use tokio::sync::{oneshot, Notify};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::capability_authority::{CapabilityAuthority, HostCapability};
 use crate::completion::{
     build_evidence, enrich_terminal_handoff, observe_updates, CompletionObservations,
     CompletionUsage,
@@ -156,7 +157,8 @@ struct OrchestrationPendingAdmission {
 
 #[derive(Debug, Clone)]
 struct SessionComputerQualification {
-    route_fingerprint: String,
+    capability: HostCapability,
+    tier: crate::gateway_config::ComputerUseTier,
 }
 
 pub(crate) struct Inner {
@@ -748,6 +750,10 @@ pub struct AgentHostHandle {
     /// children it spawns. A session counter is not a safe run identity.
     run_usage_trackers: Arc<Mutex<HashMap<Uuid, Arc<RunUsageTracker>>>>,
     provider_observation: Option<ProviderObservationSession>,
+    /// One host-issued authority shared by provider, tool, Computer Use, and
+    /// durable mutation boundaries in this process. A process without the
+    /// instance lock is observation-only and cannot issue capabilities.
+    capability_authority: Arc<CapabilityAuthority>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
     /// Selects the durable root for legacy modules that still resolve paths
@@ -933,6 +939,7 @@ impl AgentHost {
             orchestration_wakeup: Arc::new(Notify::new()),
             run_usage_trackers: Arc::new(Mutex::new(HashMap::new())),
             provider_observation: config.provider_observation,
+            capability_authority: Arc::new(CapabilityAuthority::new(instance_lock.is_some())),
             _instance_lock: instance_lock,
             runtime_home,
             _runtime_home_context: runtime_home_context,
@@ -941,6 +948,11 @@ impl AgentHost {
 }
 
 impl AgentHostHandle {
+    /// Return the opaque process-owned authority shared by host adapters.
+    /// Callers cannot construct, deserialize, or inspect its generations.
+    pub fn capability_authority(&self) -> Arc<CapabilityAuthority> {
+        self.capability_authority.clone()
+    }
     /// The validated durable root owned by this host process.
     pub fn runtime_home(&self) -> crate::discover::RuntimeHome {
         self.runtime_home.clone()
@@ -980,7 +992,9 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let resolved = resolve_computer_eligibility(&credentials, &model)?;
+        let (principal, policy_digest) = self.computer_capability_identity(session_id)?;
+        let resolved =
+            resolve_computer_eligibility(&credentials, &model, &principal, &policy_digest)?;
         if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
             return Ok(resolved.eligibility);
         }
@@ -989,7 +1003,17 @@ impl AgentHostHandle {
             .lock()
             .computer_agent_qualifications
             .get(&(session_id, model.clone()))
-            .is_some_and(|record| record.route_fingerprint == resolved.route_fingerprint);
+            .is_some_and(|record| {
+                record.tier >= crate::gateway_config::ComputerUseTier::SemanticAct
+                    && self
+                        .capability_authority
+                        .revalidate(
+                            &record.capability,
+                            &resolved.capability_snapshot,
+                            Utc::now(),
+                        )
+                        .is_ok()
+            });
         if qualified {
             return Ok(ComputerAgentEligibility {
                 model,
@@ -1013,7 +1037,9 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let resolved = resolve_computer_eligibility(&credentials, &model)?;
+        let (principal, policy_digest) = self.computer_capability_identity(session_id)?;
+        let resolved =
+            resolve_computer_eligibility(&credentials, &model, &principal, &policy_digest)?;
         if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
             return Ok(resolved.eligibility);
         }
@@ -1023,7 +1049,16 @@ impl AgentHostHandle {
         if cancel.is_cancelled() {
             bail!("Computer model qualification was cancelled");
         }
-        self.ensure_computer_route_unchanged(session_id, &model, &resolved.route_fingerprint)?;
+        let current = self.ensure_computer_capability_unchanged(
+            session_id,
+            &model,
+            &resolved.capability_snapshot,
+        )?;
+        let capability = self.capability_authority.issue(
+            &current.capability_snapshot,
+            Utc::now(),
+            crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+        )?;
         {
             let mut inner = self.inner.lock();
             if inner
@@ -1036,7 +1071,8 @@ impl AgentHostHandle {
             inner.computer_agent_qualifications.insert(
                 (session_id, model.clone()),
                 SessionComputerQualification {
-                    route_fingerprint: resolved.route_fingerprint,
+                    capability,
+                    tier: crate::gateway_config::ComputerUseTier::SemanticAct,
                 },
             );
         }
@@ -1060,7 +1096,9 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let resolved = resolve_computer_eligibility(&credentials, &model)?;
+        let (principal, policy_digest) = self.computer_capability_identity(session_id)?;
+        let resolved =
+            resolve_computer_eligibility(&credentials, &model, &principal, &policy_digest)?;
         let durable_authority =
             resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct;
         let session_authority = self
@@ -1068,7 +1106,17 @@ impl AgentHostHandle {
             .lock()
             .computer_agent_qualifications
             .get(&(session_id, model.clone()))
-            .is_some_and(|record| record.route_fingerprint == resolved.route_fingerprint);
+            .is_some_and(|record| {
+                record.tier >= crate::gateway_config::ComputerUseTier::SemanticAct
+                    && self
+                        .capability_authority
+                        .revalidate(
+                            &record.capability,
+                            &resolved.capability_snapshot,
+                            Utc::now(),
+                        )
+                        .is_ok()
+            });
         if !durable_authority && !session_authority {
             bail!("selected model is not qualified for semantic Computer actions");
         }
@@ -1085,7 +1133,11 @@ impl AgentHostHandle {
         if cancel.is_cancelled() {
             bail!("Computer model proposal was cancelled");
         }
-        self.ensure_computer_route_unchanged(session_id, &model, &resolved.route_fingerprint)?;
+        self.ensure_computer_capability_unchanged(
+            session_id,
+            &model,
+            &resolved.capability_snapshot,
+        )?;
         Ok(proposal)
     }
 
@@ -1169,12 +1221,65 @@ impl AgentHostHandle {
         Ok((operation_id, cancel, guard))
     }
 
-    fn ensure_computer_route_unchanged(
+    fn computer_capability_identity(&self, session_id: Uuid) -> Result<(String, String)> {
+        let agent_id = {
+            let inner = self.inner.lock();
+            inner
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?
+                .agent_id
+                .clone()
+        };
+        if let Some(agent_id) = agent_id {
+            let store = self
+                .orchestration_store
+                .lock()
+                .clone()
+                .ok_or_else(|| anyhow!("persistent Agent store is unavailable"))?;
+            let agent = store
+                .load_agent(&agent_id)?
+                .ok_or_else(|| anyhow!("persistent Agent record is missing"))?;
+            let spec = agent.current_spec()?;
+            let principal = agent
+                .owner_principal_id
+                .clone()
+                .unwrap_or_else(|| agent.agent_id.clone());
+            let policy_digest = crate::orchestration::hash_payload(
+                &serde_json::to_value(spec).map_err(|error| anyhow!(error.to_string()))?,
+            );
+            return Ok((principal, policy_digest));
+        }
+
+        // Chat/local sessions have no durable Agent owner yet. Their
+        // capability is still explicitly scoped to this session and the
+        // current host policy; it is never a broad process-wide LocalUser
+        // grant.
+        let (permission_mode, always_approve, allow_rules, deny_rules) = {
+            let inner = self.inner.lock();
+            (
+                inner.permission_mode.clone(),
+                inner.always_approve,
+                inner.allow_rules.clone(),
+                inner.deny_rules.clone(),
+            )
+        };
+        let principal = format!("local-session:{session_id}");
+        let policy_digest = crate::orchestration::hash_payload(&serde_json::json!({
+            "permission_mode": permission_mode,
+            "always_approve": always_approve,
+            "allow_rules": allow_rules,
+            "deny_rules": deny_rules,
+        }));
+        Ok((principal, policy_digest))
+    }
+
+    fn ensure_computer_capability_unchanged(
         &self,
         session_id: Uuid,
         expected_model: &str,
-        expected_route: &str,
-    ) -> Result<()> {
+        expected_capability: &crate::capability_authority::CapabilitySnapshot,
+    ) -> Result<crate::computer_agent::ResolvedComputerEligibility> {
         let (current_model, _) = self.selected_computer_model(session_id)?;
         if current_model != expected_model {
             bail!("selected model changed while the Computer request was running");
@@ -1182,11 +1287,13 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&current_model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let current = resolve_computer_eligibility(&credentials, &current_model)?;
-        if current.route_fingerprint != expected_route {
-            bail!("provider route changed while the Computer request was running");
+        let (principal, policy_digest) = self.computer_capability_identity(session_id)?;
+        let current =
+            resolve_computer_eligibility(&credentials, &current_model, &principal, &policy_digest)?;
+        if current.capability_snapshot != *expected_capability {
+            bail!("provider capability changed while the Computer request was running");
         }
-        Ok(())
+        Ok(current)
     }
 
     /// Shared wake-up for every embedded orchestration scheduler.
@@ -11160,7 +11267,21 @@ mod computer_agent_host_tests {
         host.inner.lock().computer_agent_qualifications.insert(
             (first.id, model.clone()),
             SessionComputerQualification {
-                route_fingerprint: "route-a".into(),
+                capability: host
+                    .capability_authority
+                    .issue(
+                        &crate::capability_authority::CapabilitySnapshot::from_parts(
+                            crate::capability_authority::CapabilityKind::ComputerUse,
+                            "test-owner",
+                            "test-run",
+                            ["route-a"],
+                        )
+                        .unwrap(),
+                        Utc::now(),
+                        crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+                    )
+                    .unwrap(),
+                tier: crate::gateway_config::ComputerUseTier::SemanticAct,
             },
         );
 

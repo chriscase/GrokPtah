@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
+use crate::capability_authority::CapabilitySnapshot;
 use crate::computer_use::{
     ComputerAction, ComputerObservation, ComputerUseLimits, SemanticAction, SimulatorBackend,
 };
@@ -58,6 +59,7 @@ impl ComputerAgentProposal {
 pub(crate) struct ResolvedComputerEligibility {
     pub eligibility: ComputerAgentEligibility,
     pub route_fingerprint: String,
+    pub capability_snapshot: CapabilitySnapshot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,8 +90,12 @@ struct ProposalArguments {
 pub(crate) fn resolve_computer_eligibility(
     credentials: &crate::auth_store::WireCredentials,
     model: &str,
+    principal: &str,
+    policy_digest: &str,
 ) -> Result<ResolvedComputerEligibility> {
     let target = resolve_model_target(credentials, model)?;
+    let selection =
+        crate::gateway_config::parse_model_selection(model).map_err(anyhow::Error::msg)?;
     let tier = target.capabilities.effective_computer_use_tier();
     let source = match target.capabilities.computer_capability_source {
         CapabilitySource::Declared => "declared",
@@ -102,6 +108,17 @@ pub(crate) fn resolve_computer_eligibility(
     hasher.update(target.wire_model.as_bytes());
     hasher.update([0]);
     hasher.update(format!("{:?}", target.dialect).as_bytes());
+    let capability_snapshot = CapabilitySnapshot::provider(
+        principal,
+        &selection.provider_id,
+        &selection.model_id,
+        &target.base_url,
+        &target.wire_model,
+        &format!("{:?}", target.dialect),
+        &credentials.qualification_identity_fingerprint(),
+        &target.capabilities,
+        policy_digest,
+    )?;
     Ok(ResolvedComputerEligibility {
         eligibility: ComputerAgentEligibility {
             model: model.to_string(),
@@ -109,6 +126,7 @@ pub(crate) fn resolve_computer_eligibility(
             source: source.into(),
         },
         route_fingerprint: format!("{:x}", hasher.finalize()),
+        capability_snapshot,
     })
 }
 
