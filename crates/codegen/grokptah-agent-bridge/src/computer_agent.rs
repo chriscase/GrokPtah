@@ -358,6 +358,7 @@ fn render_computer_observation_internal(
 
 /// Ask a qualified model for one profile-bounded proposal. It returns provider
 /// usage only when the provider actually supplied it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn propose_semantic_action_with_profile(
     credentials: &crate::auth_store::WireCredentials,
     model: &str,

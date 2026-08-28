@@ -1554,6 +1554,7 @@ impl AgentHostHandle {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn record_computer_adaptive_action_result_using_store(
         &self,
         store: &crate::computer_use::ComputerStore,

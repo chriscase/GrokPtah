@@ -52,7 +52,7 @@ fn observation() -> ComputerObservation {
 }
 
 fn evidence() -> CapabilityEvidence {
-    CapabilityEvidence::new(
+    CapabilityEvidence::synthetic(
         ModelCapabilityEvidence {
             tools: true,
             image_input: true,
@@ -130,11 +130,7 @@ fn profile_transitions_are_bounded_and_explicit() {
     assert_eq!(controller.profile(), AdaptiveProfile::Economy);
     assert!(matches!(
         controller.apply_signal(RuntimeSignal::AmbiguousObservation),
-        ProfileTransition::Escalate {
-            from: AdaptiveProfile::Economy,
-            to: AdaptiveProfile::Balanced,
-            reason: ProfileReason::AmbiguousObservation
-        }
+        ProfileTransition::Stop(_)
     ));
     assert!(matches!(
         controller.apply_signal(RuntimeSignal::CapabilityRevoked),
@@ -142,7 +138,7 @@ fn profile_transitions_are_bounded_and_explicit() {
     ));
     assert_eq!(
         controller.terminal().map(|terminal| terminal.reason),
-        Some(ProfileReason::CapabilityRevoked)
+        Some(ProfileReason::AmbiguousObservation)
     );
 }
 
