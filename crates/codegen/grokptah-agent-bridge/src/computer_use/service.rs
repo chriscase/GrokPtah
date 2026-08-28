@@ -1263,7 +1263,10 @@ mod tests {
                     _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
                 }
             }
-            self.inner.act(run_id, observation, action).await
+            eprintln!("blocking-backend: released");
+            let result = self.inner.act(run_id, observation, action).await;
+            eprintln!("blocking-backend: acted");
+            result
         }
 
         async fn cancel(&self, run_id: &str) -> ComputerResult<()> {
