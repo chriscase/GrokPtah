@@ -1477,6 +1477,58 @@ impl OrchestrationService {
         Err(error)
     }
 
+    /// Wire principal for an authenticated caller.
+    ///
+    /// This is the single definition of the primary-to-`mcp` normalization:
+    /// the compatibility credential keeps emitting the established `mcp` wire
+    /// value, and every other named device credential is its own principal.
+    /// Run stamping and run ownership both go through here so the two can
+    /// never drift apart.
+    fn client_principal(auth: &AuthContext) -> String {
+        if auth.token_id == "primary" {
+            "mcp".into()
+        } else {
+            auth.token_id.clone()
+        }
+    }
+
+    /// Principals whose runs every authenticated caller in scope may read.
+    ///
+    /// `native-executor` is the in-process managed executor: it submits runs on
+    /// behalf of durable work that an authenticated coordinator created, so its
+    /// runs are the coordinator's own work product under a service identity
+    /// rather than another principal's private activity. This is a deliberate,
+    /// operator-authorized exception and the only one; session and workspace
+    /// scope still apply to it in full.
+    const SHARED_RUN_PRINCIPALS: &'static [&'static str] = &["native-executor"];
+
+    /// The denial used for both "no such run" and "someone else's run".
+    ///
+    /// Both must be byte-identical or the read paths become an existence
+    /// oracle: a caller could enumerate run ids and tell which ones exist by
+    /// the shape of the refusal.
+    fn unknown_run() -> OrchError {
+        OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id")
+    }
+
+    /// Enforce that `auth` owns `run`, or that the run belongs to a shared
+    /// service principal.
+    ///
+    /// Callers must already have passed `require_current_auth`; this adds the
+    /// principal dimension on top of the session and workspace scope that the
+    /// surrounding checks keep enforcing.
+    fn require_run_owner(&self, auth: &AuthContext, run: &RunRecord) -> Result<(), OrchError> {
+        let Some(owner) = run.client_id.as_deref() else {
+            // A run with no stamped principal predates client attribution and
+            // is owned by nobody; nobody may read it.
+            return Err(Self::unknown_run());
+        };
+        if owner == Self::client_principal(auth) || Self::SHARED_RUN_PRINCIPALS.contains(&owner) {
+            return Ok(());
+        }
+        Err(Self::unknown_run())
+    }
+
     /// Current epoch counter, for diagnostics only.
     pub fn auth_epoch_counter(&self) -> u64 {
         self.auth_epoch.lock().counter()
@@ -1969,7 +2021,11 @@ impl OrchestrationService {
     }
 
     /// Load run and verify workspace ownership against allowlist + session.
-    fn load_authorized_run(&self, run_id: &str) -> Result<RunRecord, OrchError> {
+    fn load_authorized_run(
+        &self,
+        auth: &AuthContext,
+        run_id: &str,
+    ) -> Result<RunRecord, OrchError> {
         if safe_id_filename(run_id).is_err() {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
@@ -1980,7 +2036,11 @@ impl OrchestrationService {
             .store
             .load_run(run_id)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
-            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"))?;
+            .ok_or_else(Self::unknown_run)?;
+        // Ownership before scope: a run belonging to another principal must be
+        // indistinguishable from one that does not exist, whichever workspace
+        // it happens to sit in.
+        self.require_run_owner(auth, &run)?;
         let allowlist = self.config.lock().allowlist.clone();
         let ws = PathBuf::from(&run.workspace);
         if !allowlist.contains(&ws) {
@@ -2128,6 +2188,10 @@ impl OrchestrationService {
             .filter(|run| {
                 run.session_id == session_id && run.workspace == claimed.display().to_string()
             })
+            // Listing is a read like any other: it must not surface runs the
+            // caller could not fetch individually, or it becomes the oracle the
+            // per-run denial is careful not to be.
+            .filter(|run| self.require_run_owner(auth, run).is_ok())
             .collect::<Vec<_>>();
         Ok(json!({ "runs": runs }))
     }
@@ -3174,7 +3238,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         let response = self
             .work_lease_mutation(
                 "ptah_link_work_run",
@@ -3186,7 +3250,6 @@ impl OrchestrationService {
                 |store| store.link_work_run(work_id, attempt_id, lease_token, &run.run_id),
             )
             .await?;
-        let _ = auth;
         Ok(response)
     }
 
@@ -5159,7 +5222,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.run_value(self.load_authorized_run(run_id)?)
+        self.run_value(self.load_authorized_run(auth, run_id)?)
     }
 
     pub fn get_run_scoped(
@@ -5170,7 +5233,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.run_value(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.run_value(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5185,7 +5248,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.progress_value(self.load_authorized_run(run_id)?)
+        self.progress_value(self.load_authorized_run(auth, run_id)?)
     }
 
     pub fn get_progress_scoped(
@@ -5196,7 +5259,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.progress_value(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.progress_value(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5244,7 +5307,7 @@ impl OrchestrationService {
                 "run_id is required for get_events",
             )
         })?;
-        let run = self.load_authorized_run(rid)?;
+        let run = self.load_authorized_run(auth, rid)?;
         self.events_for_run(run, after_seq, limit)
     }
 
@@ -5259,7 +5322,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         self.events_for_run(
-            self.authorize_run_request(session_id, workspace, run_id)?,
+            self.authorize_run_request(auth, session_id, workspace, run_id)?,
             after_seq,
             limit,
         )
@@ -5277,7 +5340,7 @@ impl OrchestrationService {
         limit: usize,
     ) -> Result<(LiveRunScope, JournalPage), OrchError> {
         self.require_current_auth(auth)?;
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         let Some(start_seq) = run.start_seq else {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -5492,7 +5555,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.changes_for_run(self.load_authorized_run(run_id)?)
+        self.changes_for_run(self.load_authorized_run(auth, run_id)?)
     }
 
     pub fn get_changes_scoped(
@@ -5503,7 +5566,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.changes_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.changes_for_run(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn changes_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5532,7 +5595,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.test_results_for_run(self.load_authorized_run(run_id)?)
+        self.test_results_for_run(self.load_authorized_run(auth, run_id)?)
     }
 
     pub fn get_test_results_scoped(
@@ -5543,7 +5606,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.test_results_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.test_results_for_run(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn test_results_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5618,7 +5681,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.handoff_for_run(self.load_authorized_run(run_id)?)
+        self.handoff_for_run(self.load_authorized_run(auth, run_id)?)
     }
 
     pub fn get_handoff_scoped(
@@ -5629,7 +5692,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.handoff_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.handoff_for_run(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn handoff_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5703,11 +5766,12 @@ impl OrchestrationService {
 
     fn authorize_run_request(
         &self,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<RunRecord, OrchError> {
-        let run = self.load_authorized_run(run_id)?;
+        let run = self.load_authorized_run(auth, run_id)?;
         if run.session_id != session_id {
             return Err(OrchError::new(
                 OrchErrorCode::ForbiddenScope,
@@ -6381,11 +6445,12 @@ impl OrchestrationService {
 
     fn isolated_review(
         &self,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<(RunRecord, crate::run_promotion::RunReview), OrchError> {
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         if run.state != RunState::Completed {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -6427,7 +6492,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        let (run, review) = self.isolated_review(session_id, workspace, run_id)?;
+        let (run, review) = self.isolated_review(auth, session_id, workspace, run_id)?;
         Ok(json!({
             "runId": run.run_id,
             "sessionId": run.session_id,
@@ -6487,7 +6552,7 @@ impl OrchestrationService {
                 ),
             ));
         }
-        let run = match self.authorize_run_request(session_id, workspace, run_id) {
+        let run = match self.authorize_run_request(auth, session_id, workspace, run_id) {
             Ok(run) => run,
             Err(error) => return Err(fail(self, error)),
         };
@@ -6505,7 +6570,7 @@ impl OrchestrationService {
             Ok(IdempotencyStart::Perform(lease)) => lease,
             Err(error) => return Err(error),
         };
-        let (run, review) = match self.isolated_review(session_id, workspace, run_id) {
+        let (run, review) = match self.isolated_review(auth, session_id, workspace, run_id) {
             Ok(value) => value,
             Err(error) => {
                 return Err(self.fail_claim(
@@ -6620,7 +6685,7 @@ impl OrchestrationService {
             "approvalId": approval_id,
         });
         let phash = hash_payload(&payload);
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         let mut lease = match self
             .begin_idempotency(
                 tool,
@@ -6672,7 +6737,7 @@ impl OrchestrationService {
             "runId": run_id,
         });
         let phash = hash_payload(&payload);
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         if !run.state.is_terminal() {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -6808,7 +6873,6 @@ impl OrchestrationService {
         proposal_only: bool,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        let _ = auth;
         let tool = idempotency_tool;
         if proposal_only && allow_queue {
             return Err(OrchError::new(
@@ -6997,15 +7061,11 @@ impl OrchestrationService {
             request_id: request_id.into(),
             // Distinguish coordinator-owned work from desktop turns so the
             // desktop can surface external activity without guessing from
-            // transport timing.
-            client_id: Some(if auth.token_id == "primary" {
-                // Preserve the established wire value for the compatibility
-                // credential; newly named device credentials are emitted by
-                // their stable IDs.
-                "mcp".into()
-            } else {
-                auth.token_id.clone()
-            }),
+            // transport timing. `client_principal` preserves the established
+            // `mcp` wire value for the compatibility credential and is also
+            // what run reads check ownership against, so stamping and
+            // enforcement cannot drift apart.
+            client_id: Some(Self::client_principal(auth)),
             state: if queued {
                 RunState::Queued
             } else {
@@ -7161,7 +7221,7 @@ impl OrchestrationService {
             );
             error
         };
-        let source = match self.authorize_run_request(session_id, workspace, source_run_id) {
+        let source = match self.authorize_run_request(auth, session_id, workspace, source_run_id) {
             Ok(run) => run,
             Err(error) => return Err(fail(self, error)),
         };
@@ -7524,7 +7584,6 @@ impl OrchestrationService {
         priority: bool,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        let _ = auth;
         let tool = "ptah_queue_prompt";
         let payload = json!({
             "sessionId": session_id,
@@ -7625,7 +7684,6 @@ impl OrchestrationService {
         text: String,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        let _ = auth;
         let tool = "ptah_steer";
         let payload = json!({
             "sessionId": session_id,
@@ -7722,7 +7780,6 @@ impl OrchestrationService {
         run_id: Option<&str>,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        let _ = auth;
         let tool = "ptah_cancel";
         let payload = json!({
             "sessionId": session_id,
@@ -7754,13 +7811,15 @@ impl OrchestrationService {
             }
         };
 
+        // `cancel` keeps its own audit-wrapped load rather than going through
+        // `authorize_run_request`, so the ownership check is applied here
+        // explicitly. The refusal is the same `unknown_run` value the shared
+        // path uses, so cancelling a foreign run is indistinguishable from
+        // cancelling one that does not exist.
         let run = match self.store.load_run(rid) {
             Ok(Some(r)) => r,
             Ok(None) => {
-                return Err(fail(
-                    self,
-                    OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"),
-                ));
+                return Err(fail(self, Self::unknown_run()));
             }
             Err(e) => {
                 return Err(fail(
@@ -7769,6 +7828,9 @@ impl OrchestrationService {
                 ));
             }
         };
+        if let Err(error) = self.require_run_owner(auth, &run) {
+            return Err(fail(self, error));
+        }
 
         if run.session_id != session_id {
             return Err(fail(
@@ -8115,11 +8177,35 @@ mod auth_guard_coverage {
     /// Private helpers are exempt: they are reachable only through a guarded
     /// entry point. The exemption list below is explicit so adding a private
     /// `AuthContext` helper is a deliberate, reviewable act.
-    const UNGUARDED_PRIVATE_HELPERS: &[&str] = &[
-        // Shared body of accept_work/decline_work; both guard on entry.
-        "worker_identity_mutation",
-        // Shared body of get_persistent_agent_scoped/resume_persistent_agent.
-        "authorize_persistent_agent_request",
+    const UNGUARDED_PRIVATE_HELPERS: &[(&str, &str)] = &[
+        (
+            "worker_identity_mutation",
+            "shared body of accept_work/decline_work; both guard on entry",
+        ),
+        (
+            "authorize_persistent_agent_request",
+            "shared body of get_persistent_agent_scoped/resume_persistent_agent",
+        ),
+        (
+            "client_principal",
+            "pure normalization of an already-validated context; performs no access",
+        ),
+        (
+            "require_run_owner",
+            "the ownership primitive itself; runs after the epoch guard",
+        ),
+        (
+            "load_authorized_run",
+            "run authorization primitive; every caller is a guarded entry point",
+        ),
+        (
+            "authorize_run_request",
+            "session/workspace-scoped wrapper over load_authorized_run",
+        ),
+        (
+            "isolated_review",
+            "shared body of review_run/approve_run; both guard on entry",
+        ),
     ];
 
     /// This file minus this test module, so the assertions below cannot match
@@ -8232,7 +8318,9 @@ mod auth_guard_coverage {
             .filter(|e| {
                 e.visibility == "private"
                     && !e.guarded
-                    && !UNGUARDED_PRIVATE_HELPERS.contains(&e.name.as_str())
+                    && !UNGUARDED_PRIVATE_HELPERS
+                        .iter()
+                        .any(|(name, _)| *name == e.name)
             })
             .map(|e| format!("{}:{} {}", e.visibility, e.line, e.name))
             .collect();
@@ -8273,6 +8361,123 @@ mod auth_guard_coverage {
                 "internal issuer {issuer} must be declared exactly once"
             );
         }
+    }
+
+    /// Direct `store.load_run` calls bypass `load_authorized_run`, and so
+    /// bypass the ownership check. Each one that exists must be accounted for
+    /// here; a new one fails this test until it is audited and listed.
+    const AUDITED_DIRECT_RUN_LOADS: &[(&str, &str)] = &[
+        (
+            "admission drain",
+            "internal scheduler pass over runs this service already admitted;              no caller context is involved",
+        ),
+        (
+            "spawn_run finalization",
+            "background task reconciling the run it is itself executing",
+        ),
+        (
+            "cancel",
+            "audit-wrapped load; calls require_run_owner explicitly before use",
+        ),
+        (
+            "collect_run_updates",
+            "free function folding journal entries for an already-authorized run",
+        ),
+    ];
+
+    #[test]
+    fn run_reads_cannot_bypass_principal_ownership() {
+        let src = production_source();
+
+        // Both run-authorization primitives take the caller's context.
+        for primitive in ["fn load_authorized_run", "fn authorize_run_request"] {
+            let at = src
+                .find(primitive)
+                .unwrap_or_else(|| panic!("{primitive} must exist"));
+            let head = &src[at..at + 200];
+            assert!(
+                head.contains("auth: &AuthContext"),
+                "{primitive} must take the caller's context so it can enforce ownership"
+            );
+        }
+
+        // The ownership check is actually applied where runs are loaded.
+        let load_at = src.find("fn load_authorized_run").unwrap();
+        let load_body = &src[load_at..];
+        let load_end = load_body.find("\n    }\n").unwrap_or(load_body.len());
+        assert!(
+            load_body[..load_end].contains("self.require_run_owner(auth, &run)?"),
+            "load_authorized_run must enforce principal ownership"
+        );
+
+        // Every direct store read is accounted for.
+        let direct = src.matches("store.load_run(").count();
+        assert_eq!(
+            direct,
+            AUDITED_DIRECT_RUN_LOADS.len(),
+            "a direct store.load_run bypasses load_authorized_run; audit it and add it to              AUDITED_DIRECT_RUN_LOADS with the reason it is safe"
+        );
+        for (site, reason) in AUDITED_DIRECT_RUN_LOADS {
+            assert!(!reason.is_empty(), "{site} must document why it is exempt");
+        }
+
+        // `cancel` is the one entry point that loads directly; it must still
+        // consult ownership.
+        let cancel_at = src.find("pub async fn cancel(").expect("cancel exists");
+        let cancel_body = &src[cancel_at..];
+        let cancel_end = cancel_body.find("\n    }\n").unwrap_or(cancel_body.len());
+        assert!(
+            cancel_body[..cancel_end].contains("self.require_run_owner(auth, &run)"),
+            "cancel loads the run directly and must enforce ownership itself"
+        );
+    }
+
+    #[test]
+    fn foreign_and_unknown_run_denials_cannot_drift_apart() {
+        let src = production_source();
+        assert_eq!(
+            src.matches("\"unknown run_id\"").count(),
+            1,
+            "the unknown-run message must have exactly one definition, or a foreign-run              refusal can drift away from it and become an existence oracle"
+        );
+        let at = src.find("fn unknown_run()").expect("unknown_run exists");
+        let body = &src[at..];
+        let end = body.find("\n    }\n").unwrap_or(body.len());
+        assert!(
+            body[..end].contains("\"unknown run_id\""),
+            "that one definition must live in unknown_run"
+        );
+        assert!(
+            src.contains("Err(Self::unknown_run())"),
+            "require_run_owner must refuse with the shared unknown-run value"
+        );
+    }
+
+    #[test]
+    fn run_stamping_and_ownership_share_one_principal_definition() {
+        let src = production_source();
+        assert_eq!(
+            src.matches("auth.token_id == \"primary\"").count(),
+            1,
+            "the primary-to-mcp normalization must exist only in client_principal"
+        );
+        let at = src
+            .find("fn client_principal")
+            .expect("client_principal exists");
+        let body = &src[at..];
+        let end = body.find("\n    }\n").unwrap_or(body.len());
+        assert!(
+            body[..end].contains("auth.token_id == \"primary\""),
+            "the normalization must live in client_principal"
+        );
+        assert!(
+            src.contains("client_id: Some(Self::client_principal(auth)),"),
+            "runs must be stamped through the same normalization ownership checks against"
+        );
+        assert!(
+            src.contains("SHARED_RUN_PRINCIPALS"),
+            "the shared-principal exception must stay explicit and enumerable"
+        );
     }
 
     #[test]

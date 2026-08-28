@@ -361,3 +361,128 @@ async fn every_rotation_advances_the_epoch_exactly_once() {
         .create_session(&auth, h.workspace.path(), None)
         .unwrap();
 }
+
+/// A live event stream is a read that outlives the call that authorized it.
+/// Rotating credentials must end it rather than keep delivering events issued
+/// under an authority the client no longer holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn credential_rotation_ends_an_open_live_event_stream() {
+    use grokptah_agent_bridge::{
+        start_control_server, LiveNotification, McpControlClient, RunScope, SessionKind,
+    };
+
+    let h = harness();
+    let owner = h.host.session_new_kind(SessionKind::Build).unwrap();
+    h.host
+        .session_set_cwd(owner.id, h.workspace.path())
+        .unwrap();
+
+    // A run that is running and has no end_seq keeps the stream open, so the
+    // per-frame revalidation is what decides when it closes.
+    let start_seq = h.host.event_bus().next_seq();
+    let mut run = seeded_running_run(
+        owner.id,
+        &h.workspace.path().display().to_string(),
+        start_seq,
+    );
+    run.workspace = canonical_workspace(h.workspace.path());
+    h.orch.store().save_run(&run).unwrap();
+
+    let server = start_control_server(h.orch.clone(), 0).await.unwrap();
+    let mut client = McpControlClient::new(format!("http://{}", server.addr), TOKEN_A);
+    client.initialize().await.unwrap();
+    let scope = RunScope {
+        session_id: owner.id,
+        workspace: run.workspace.clone(),
+        run_id: run.run_id.clone(),
+    };
+    let mut stream = client.open_event_stream(scope, None).await.unwrap();
+
+    // Rotate while the stream is open.
+    h.orch
+        .set_auth_credentials(vec![AuthCredential::new("primary", TOKEN_B).unwrap()])
+        .unwrap();
+
+    // The stream must terminate, and its last word must be a recovery frame
+    // naming the stale authentication rather than more events.
+    //
+    // Closure is bounded by the server's keep-alive tick, not immediate: a
+    // stream parked waiting for events notices the rotation when it next wakes.
+    // The budget below is that interval plus margin, so the assertion is about
+    // the stream closing rather than about how fast it does.
+    const CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+    let mut recovery_reason = None;
+    for _ in 0..16 {
+        let frame = tokio::time::timeout(CLOSE_BUDGET, stream.next_notification())
+            .await
+            .expect("stream must not hang after rotation")
+            .expect("stream read");
+        let Some(frame) = frame else { break };
+        if let LiveNotification::Recovery(recovery) = frame.notification {
+            recovery_reason = Some(recovery.reason);
+            break;
+        }
+    }
+    let reason = recovery_reason.expect("rotation must close the stream with a recovery frame");
+    assert!(
+        reason.contains("no longer current"),
+        "recovery must name the stale authentication: {reason}"
+    );
+
+    // The stream is finished; it does not resume on its own.
+    let after = tokio::time::timeout(CLOSE_BUDGET, stream.next_notification())
+        .await
+        .expect("stream must not hang once closed")
+        .expect("stream read");
+    assert!(
+        after.is_none(),
+        "closed stream must not deliver more frames"
+    );
+}
+
+/// The service records workspaces canonicalized through `dunce`; the seeded
+/// run must match that byte-for-byte or the workspace check, not the epoch,
+/// would be what refuses the stream.
+fn canonical_workspace(path: &Path) -> String {
+    dunce::canonicalize(path).unwrap().display().to_string()
+}
+
+fn seeded_running_run(
+    session_id: Uuid,
+    workspace: &str,
+    start_seq: u64,
+) -> grokptah_agent_bridge::RunRecord {
+    grokptah_agent_bridge::RunRecord {
+        run_id: "live-stream-run".into(),
+        session_id,
+        workspace: workspace.to_string(),
+        request_id: "live-stream-request".into(),
+        client_id: Some("mcp".into()),
+        state: grokptah_agent_bridge::RunState::Running,
+        purpose: Default::default(),
+        agent_id: None,
+        retry_of: None,
+        parent_run_id: None,
+        agent_spec_revision: None,
+        checkpoint_id: None,
+        continuation_context_id: None,
+        continuation_context_hash: None,
+        continuation_fidelity: None,
+        queue_position: None,
+        bounds: RunBounds::default(),
+        prompt_preview: "live".into(),
+        start_seq: Some(start_seq),
+        end_seq: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        terminal_result: None,
+        final_response: None,
+        error_code: None,
+        stop_cause: None,
+        aggregates: Default::default(),
+        progress: None,
+        execution: None,
+        approval: None,
+    }
+}
