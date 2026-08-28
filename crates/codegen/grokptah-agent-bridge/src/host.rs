@@ -1010,38 +1010,12 @@ impl AgentHostHandle {
                     .unwrap_or(1),
             )
         };
-        let (principal_incarnation, capability_generation) = if let Some(agent_id) = agent_id {
-            let agent = self
-                .orchestration_store
-                .lock()
-                .clone()
-                .and_then(|store| store.load_agent(&agent_id).ok().flatten());
-            let owner = agent
-                .as_ref()
-                .and_then(|agent| agent.owner_principal_id.clone());
-            let capability_generation = agent
-                .as_ref()
-                .and_then(|agent| agent.spec.as_ref().map(|spec| spec.revision))
-                .unwrap_or(1);
-            (
-                format!(
-                    "agent-{}-{}",
-                    owner.unwrap_or_else(|| "unclaimed".into()),
-                    agent_id
-                ),
-                capability_generation.max(1),
-            )
-        } else {
-            (format!("lane-{session_id}"), turn_generation.max(1))
-        };
-        xai_provider_attempt::CanonicalHostAuthority::from_trusted_host_adapter(
-            principal_incarnation,
-            turn_generation.max(1),
-            capability_generation,
-            format!("effect-lease-{session_id}-{turn_generation}"),
-            format!("effect-scope-{session_id}"),
+        crate::host_authority::assemble(
+            session_id,
+            agent_id.as_deref(),
+            turn_generation,
+            self.orchestration_store.lock().clone(),
         )
-        .map_err(|error| anyhow!("construct provider authority: {error}"))
     }
 
     pub fn take_event_receiver(&self) -> Option<crate::event_bus::EventReceiver> {

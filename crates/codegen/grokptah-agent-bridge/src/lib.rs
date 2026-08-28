@@ -18,6 +18,7 @@ mod exec_risk;
 mod gateway_config;
 mod hooks;
 mod host;
+mod host_authority;
 mod host_helpers;
 mod instance_lock;
 mod isolation;

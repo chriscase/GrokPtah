@@ -1487,6 +1487,64 @@ mod tests {
     }
 
     #[test]
+    fn cloned_or_replayed_effect_lease_cannot_be_used_by_another_attempt() {
+        let temp = tempdir().unwrap();
+        let store = ProviderAttemptStore::open(temp.path()).unwrap();
+        let first_context = AttemptContext::new(
+            store.clone(),
+            "lease-round-one",
+            authority(1),
+            Arc::new(|| Some(authority(1))),
+        )
+        .unwrap();
+        let second_context = AttemptContext::new(
+            store,
+            "lease-round-two",
+            authority(1),
+            Arc::new(|| Some(authority(1))),
+        )
+        .unwrap();
+        let first = first_context.begin("xai", b"round-one", true).unwrap();
+        let second = second_context.prepare("xai", b"round-two", true).unwrap();
+        assert_eq!(
+            second_context.begin_send(&second).unwrap_err(),
+            AttemptError::EffectLeaseAlreadyUsed
+        );
+        assert_eq!(second.state().unwrap(), SendState::Cancelled);
+        assert_eq!(first.state().unwrap(), SendState::Sending);
+    }
+
+    #[test]
+    fn distinct_effect_leases_allow_legitimate_sequential_tool_rounds() {
+        let temp = tempdir().unwrap();
+        let store = ProviderAttemptStore::open(temp.path()).unwrap();
+        let first_context = AttemptContext::new(
+            store.clone(),
+            "tool-round-one",
+            authority(1),
+            Arc::new(|| Some(authority(1))),
+        )
+        .unwrap();
+        let second_context = AttemptContext::new(
+            store,
+            "tool-round-two",
+            authority(2),
+            Arc::new(|| Some(authority(2))),
+        )
+        .unwrap();
+        let mut first = first_context.begin("xai", b"tool-one", true).unwrap();
+        first.mark_response_started().unwrap();
+        first.settle_http_response(200, b"tool-one-result").unwrap();
+        let mut second = second_context.begin("xai", b"tool-two", true).unwrap();
+        second.mark_response_started().unwrap();
+        second
+            .settle_http_response(200, b"tool-two-result")
+            .unwrap();
+        assert_eq!(first.attempt.state().unwrap(), SendState::Settled);
+        assert_eq!(second.attempt.state().unwrap(), SendState::Settled);
+    }
+
+    #[test]
     fn semantic_rejection_is_failure_not_uncertain() {
         let (_temp, _store, attempt) = prepared();
         let binding = authority(1);
