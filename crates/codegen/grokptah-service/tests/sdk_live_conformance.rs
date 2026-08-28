@@ -631,3 +631,165 @@ async fn creating_a_session_twice_under_one_key_yields_one_session() {
 
     service.stop_and_wait().await;
 }
+
+/// Rotating a credential must not turn its history into shared reading.
+///
+/// This is the failure mode an earlier version of the fence had: host
+/// authority was inferred from a `client_id` being absent from the *current*
+/// credential set, so removing or rotating credential A reclassified every run
+/// A had ever created as host-authored — readable by A's replacement.
+///
+/// The sequence is the real one: A creates a run, A is removed from the
+/// service's configured credentials, B authenticates, and B must still be
+/// refused exactly as it would be for a run that never existed.
+#[tokio::test]
+async fn rotating_a_credential_does_not_share_its_history() {
+    const TOKEN_A: &str = "device-a-token-with-enough-entropy-here";
+    const TOKEN_B: &str = "device-b-token-with-enough-entropy-here";
+
+    let env = ServiceEnv::new();
+    let workspace = env.workspace_path();
+
+    let base = ServiceConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TOKEN,
+        vec![workspace.clone()],
+        false,
+        4,
+        std::time::Duration::from_secs(8),
+    )
+    .expect("valid config")
+    .with_runtime_home(env._home.path())
+    .expect("valid runtime home");
+
+    let credential = |id: &str, token: &str| {
+        grokptah_agent_bridge::orchestration::AuthCredential::new(id, token)
+            .expect("valid credential")
+    };
+
+    let service = start_service(ServiceConfig {
+        client_credentials: vec![
+            credential("primary", TOKEN),
+            credential("device-a", TOKEN_A),
+            credential("device-b", TOKEN_B),
+        ],
+        ..base
+    })
+    .await
+    .expect("start service");
+
+    // Device A creates a session and a run under its own credential.
+    let mut seed = McpControlClient::new(format!("http://{}", service.addr), TOKEN_A);
+    seed.initialize().await.expect("initialize as A");
+    create_build_session(&mut seed, &workspace, "owned-by-a").await;
+
+    let plane_a = ServiceControlPlane::read_only(LiveTransport {
+        client: Mutex::new({
+            let mut c = McpControlClient::new(format!("http://{}", service.addr), TOKEN_A);
+            c.initialize().await.expect("initialize A plane");
+            c
+        }),
+    })
+    .with_operator_authority();
+
+    let session_a = plane_a
+        .list_sessions(PageRequest::new())
+        .await
+        .expect("A lists")
+        .items
+        .into_iter()
+        .next()
+        .expect("A sees its session");
+
+    let accepted = plane_a
+        .submit_task(TaskSubmission {
+            request_id: RequestId::new("rotation-run-1").unwrap(),
+            session_id: session_a.session_id.clone(),
+            workspace: session_a.workspace.clone(),
+            prompt: "created under device-a".into(),
+            bounds: None,
+            execution_mode: ExecutionMode::Shared,
+            allow_queue: false,
+        })
+        .await
+        .expect("A submits");
+
+    // Rotate for real: stop the service and bring it back with device A
+    // removed from the configured credentials, against the *same* durable
+    // home so A's run is still there. This is a genuine two-process restart,
+    // not an in-memory reconfiguration.
+    drop(plane_a);
+    drop(seed);
+    service.stop_and_wait().await;
+
+    let rotated = ServiceConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TOKEN,
+        vec![workspace.clone()],
+        false,
+        4,
+        std::time::Duration::from_secs(8),
+    )
+    .expect("valid config")
+    .with_runtime_home(env._home.path())
+    .expect("valid runtime home");
+    let service = start_service(ServiceConfig {
+        client_credentials: vec![
+            credential("primary", TOKEN),
+            credential("device-b", TOKEN_B),
+        ],
+        ..rotated
+    })
+    .await
+    .expect("restart without device-a");
+
+    // Device B authenticates against the restarted service and tries to read
+    // A's now-orphaned run.
+    let plane_b = ServiceControlPlane::read_only(LiveTransport {
+        client: Mutex::new({
+            let mut c = McpControlClient::new(format!("http://{}", service.addr), TOKEN_B);
+            c.initialize().await.expect("initialize B plane");
+            c
+        }),
+    })
+    .with_operator_authority();
+
+    let session_b = plane_b
+        .list_sessions(PageRequest::new())
+        .await
+        .expect("B lists")
+        .items
+        .into_iter()
+        .next()
+        .expect("B sees the session");
+
+    let orphaned = plane_b
+        .observe_run(RunSelector {
+            session_id: session_b.session_id.clone(),
+            workspace: session_b.workspace.clone(),
+            run_id: accepted.run_id.clone(),
+        })
+        .await
+        .expect_err("a rotated-away credential's history must not become shared");
+
+    let unknown = plane_b
+        .observe_run(RunSelector {
+            session_id: session_b.session_id.clone(),
+            workspace: session_b.workspace.clone(),
+            run_id: RunId::new("run-that-never-existed").unwrap(),
+        })
+        .await
+        .expect_err("an unknown run is refused");
+
+    assert_eq!(
+        orphaned.code, unknown.code,
+        "an orphaned run must be refused exactly like one that never existed"
+    );
+    assert_eq!(
+        orphaned.message, unknown.message,
+        "the refusal message must not distinguish them either"
+    );
+    assert_eq!(orphaned.code, SdkErrorCode::ForbiddenScope);
+
+    service.stop_and_wait().await;
+}

@@ -1893,22 +1893,48 @@ impl OrchestrationService {
     /// `auth_header`, so a revoked device cannot reach this at all. It is not
     /// capability-generation revalidation (#458), which does not exist yet.
     fn principal_may_read(&self, auth: &AuthContext, client_id: Option<&str>) -> bool {
-        let Some(client_id) = client_id else {
-            return true;
-        };
-        if client_id == Self::stamped_client_id(auth) {
-            return true;
+        match client_id {
+            // Unattributed. Nobody can be shown to own it, so nobody is shown
+            // it. Treating absence as "host-authored" is the mistake this
+            // function used to make.
+            None => false,
+            // The one explicit host identity. Named, not inferred.
+            Some(Self::HOST_AUTHORED_CLIENT_ID) => true,
+            // Everything else — another device, a removed or rotated
+            // credential, a legacy or unrecognized id — is refused.
+            Some(client_id) => client_id == Self::stamped_client_id(auth),
         }
-        let configured = self.auth_credentials.lock().clone();
-        !configured.iter().any(|credential| {
-            let stamped = if credential.id == "primary" {
-                "mcp"
-            } else {
-                credential.id.as_str()
-            };
-            stamped == client_id
-        })
     }
+
+    /// Load a run and bind it to the caller, for entrypoints that carry no
+    /// session or workspace of their own.
+    ///
+    /// Weaker than [`authorize_run_request`](Self::authorize_run_request),
+    /// which also binds session and workspace — but it closes the part that
+    /// matters most, and it means **no public read accepts an `AuthContext`
+    /// and then ignores it**. Prefer the scoped variants; these exist for
+    /// callers that legitimately have only a run id.
+    fn load_principal_bound_run(
+        &self,
+        auth: &AuthContext,
+        run_id: &str,
+    ) -> Result<RunRecord, OrchError> {
+        let run = self.load_authorized_run(run_id)?;
+        if !self.principal_may_read(auth, run.client_id.as_deref()) {
+            return Err(Self::run_not_available());
+        }
+        Ok(run)
+    }
+
+    /// The single identity the host itself authors work under.
+    ///
+    /// Managed execution submits as this principal (see the native executor's
+    /// synthesized `AuthContext`), and such runs belong to the account rather
+    /// than to any device. It is named explicitly and matched exactly: host
+    /// authority is never *inferred* from an id being absent, unrecognized, or
+    /// missing from the current credential set. Inferring it that way meant
+    /// rotating a credential silently reclassified its history as shared.
+    const HOST_AUTHORED_CLIENT_ID: &'static str = "native-executor";
 
     /// The `client_id` this credential stamps on runs it creates.
     ///
@@ -5134,10 +5160,10 @@ impl OrchestrationService {
 
     pub fn get_run(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.run_value(self.load_authorized_run(run_id)?)
+        self.run_value(self.load_principal_bound_run(auth, run_id)?)
     }
 
     pub fn get_run_scoped(
@@ -5158,10 +5184,10 @@ impl OrchestrationService {
 
     pub fn get_progress(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.progress_value(self.load_authorized_run(run_id)?)
+        self.progress_value(self.load_principal_bound_run(auth, run_id)?)
     }
 
     pub fn get_progress_scoped(
@@ -5206,7 +5232,7 @@ impl OrchestrationService {
 
     pub fn get_events(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: Option<&str>,
         after_seq: u64,
         limit: usize,
@@ -5218,7 +5244,7 @@ impl OrchestrationService {
                 "run_id is required for get_events",
             )
         })?;
-        let run = self.load_authorized_run(rid)?;
+        let run = self.load_principal_bound_run(auth, rid)?;
         self.events_for_run(run, after_seq, limit)
     }
 
@@ -5564,10 +5590,10 @@ impl OrchestrationService {
 
     pub fn get_changes(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.changes_for_run(self.load_authorized_run(run_id)?)
+        self.changes_for_run(self.load_principal_bound_run(auth, run_id)?)
     }
 
     pub fn get_changes_scoped(
@@ -5602,10 +5628,10 @@ impl OrchestrationService {
 
     pub fn get_test_results(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.test_results_for_run(self.load_authorized_run(run_id)?)
+        self.test_results_for_run(self.load_principal_bound_run(auth, run_id)?)
     }
 
     pub fn get_test_results_scoped(
@@ -5686,10 +5712,10 @@ impl OrchestrationService {
 
     pub fn get_handoff(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.handoff_for_run(self.load_authorized_run(run_id)?)
+        self.handoff_for_run(self.load_principal_bound_run(auth, run_id)?)
     }
 
     pub fn get_handoff_scoped(
@@ -5788,7 +5814,9 @@ impl OrchestrationService {
     /// A run with no `client_id` predates attribution and cannot be attributed
     /// to anyone, so it is refused rather than shared. Fail-closed is the only
     /// safe reading: the alternative grants every caller access to exactly the
-    /// runs whose owner is unknown.
+    /// runs whose owner is unknown. The same applies to an id this service does
+    /// not recognize — only the explicit
+    /// [`HOST_AUTHORED_CLIENT_ID`](Self::HOST_AUTHORED_CLIENT_ID) is shared.
     ///
     /// Every refusal is [`run_not_available`](Self::run_not_available).
     /// "Not yours" must be indistinguishable from "does not exist", or the
@@ -8159,5 +8187,115 @@ fn session_id_of(u: &crate::events::SessionUpdate) -> Option<Uuid> {
         | SteeringInjected { session_id, .. }
         | PromptQueueChanged { session_id, .. } => Some(*session_id),
         BackgroundTask { session_id, .. } => *session_id,
+    }
+}
+
+#[cfg(test)]
+mod principal_fence_tests {
+    use super::*;
+
+    /// Every path that loads a run must bind it to a principal first.
+    ///
+    /// A source-level guard rather than a behavioural one, because the failure
+    /// it prevents is *structural*: a future read that calls
+    /// `load_authorized_run` directly would compile, pass every behavioural
+    /// test that does not happen to cover it, and silently reintroduce a read
+    /// that any credential can make. The two wrappers below are the only
+    /// callers permitted, and both bind the principal.
+    #[test]
+    fn no_read_reaches_a_run_without_binding_a_principal() {
+        const ALLOWED: [&str; 2] = ["load_principal_bound_run", "authorize_run_request"];
+
+        // Scan the production body only. This module mentions the symbol in
+        // its own assertions, which would otherwise flag itself.
+        let whole = include_str!("service.rs");
+        let source = whole
+            .split_once("mod principal_fence_tests {")
+            .map(|(before, _)| before)
+            .unwrap_or(whole);
+        let mut enclosing = String::new();
+        let mut offenders: Vec<String> = Vec::new();
+
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            // Track the innermost `fn` declared at method indentation.
+            if let Some(rest) = trimmed.strip_prefix("fn ").or_else(|| {
+                trimmed
+                    .strip_prefix("pub fn ")
+                    .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+            }) {
+                if let Some(name) = rest.split(['(', '<']).next() {
+                    enclosing = name.trim().to_string();
+                }
+            }
+            if line.contains("load_authorized_run(")
+                && !trimmed.starts_with("fn load_authorized_run")
+                && !ALLOWED.contains(&enclosing.as_str())
+            {
+                offenders.push(format!("{enclosing}: {}", trimmed));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these call `load_authorized_run` without binding a principal; \
+             route them through `load_principal_bound_run` or \
+             `authorize_run_request` instead:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// Host authority is named, never inferred.
+    ///
+    /// The cases in order: the caller's own runs; the one explicit host
+    /// identity; a run with no attribution; an id this service does not
+    /// recognize (a legacy record, or a credential that has since been rotated
+    /// or removed); and another configured device. Only the first two are
+    /// readable.
+    ///
+    /// The fourth case is the one that matters most. An earlier version of
+    /// this check treated "not in the current credential set" as host
+    /// authority, which meant rotating credential A silently reclassified all
+    /// of A's history as shared — readable by A's replacement.
+    #[test]
+    fn only_the_named_host_identity_is_shared() {
+        let auth = AuthContext {
+            token_id: "device-a".into(),
+            owner_id: "account".into(),
+        };
+        let stamped = OrchestrationService::stamped_client_id(&auth);
+        assert_eq!(stamped, "device-a");
+
+        // The compatibility credential keeps its established wire value.
+        let primary = AuthContext {
+            token_id: "primary".into(),
+            owner_id: "account".into(),
+        };
+        assert_eq!(OrchestrationService::stamped_client_id(&primary), "mcp");
+
+        // `principal_may_read` needs a service; assert the decision table it
+        // encodes directly, which is what the callers depend on.
+        let decide = |client_id: Option<&str>| match client_id {
+            None => false,
+            Some(OrchestrationService::HOST_AUTHORED_CLIENT_ID) => true,
+            Some(id) => id == stamped,
+        };
+
+        assert!(decide(Some("device-a")), "a caller reads its own runs");
+        assert!(
+            decide(Some("native-executor")),
+            "the explicit host identity is account-scoped"
+        );
+        assert!(!decide(None), "unattributed runs are refused");
+        assert!(
+            !decide(Some("device-a-rotated-away")),
+            "an unrecognized id must not be mistaken for host authority"
+        );
+        assert!(!decide(Some("device-b")), "another device is refused");
+        assert!(!decide(Some("desktop")), "the desktop client is refused");
+        assert!(
+            !decide(Some("mcp")),
+            "a different stamped credential is refused"
+        );
     }
 }

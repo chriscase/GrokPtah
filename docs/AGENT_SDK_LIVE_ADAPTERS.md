@@ -84,16 +84,44 @@ That second half is the point: a principal check that answered "exists but not
 yours" differently from "no such run" would close the read and open an oracle
 for probing other principals' run ids.
 
-**Host-authored runs are account-scoped, not device-scoped.** Managed
-execution authors runs under synthetic identities — the native executor stamps
-`native-executor` — and those belong to the account, not to whichever device
-triggered the manager tick. `principal_may_read` therefore allows a run whose
-`client_id` is not one of *this service's configured device credentials*, and
-refuses one that is but does not match. The set is read from configuration
-rather than a hardcoded name, and both sides are compared in stamped form so
-the `primary` → `mcp` mapping applies consistently. Refusing host-authored runs
-would have broken managed execution without closing any cross-device hole,
-because no device created them.
+**Host authority is named, never inferred.** Managed execution authors runs
+under one explicit identity — `native-executor` — and those belong to the
+account rather than to whichever device triggered the manager tick. That single
+id is matched exactly, as `HOST_AUTHORED_CLIENT_ID`.
+
+An intermediate version of this fence inferred host authority instead: it
+treated any `client_id` *absent from the current credential set* as
+host-authored. That was wrong in a way worth recording, because it looked
+reasonable. Removing or rotating credential A drops A from the set, so every
+run A had ever created would have been reclassified as host-authored — and
+become readable by A's replacement. Legacy and unrecognized ids shared the same
+fate. Authority derived from an absence is authority that appears whenever
+configuration changes.
+
+The decision table is now exactly: the caller's own stamped id, allowed; the
+named host identity, allowed; **everything else refused** — no attribution at
+all, an unrecognized or legacy id, a rotated-away credential, the desktop
+client, and any other configured device.
+
+`rotating_a_credential_does_not_share_its_history` proves it across a real
+two-process restart: A creates a run, the service is stopped and restarted
+against the same durable home with A removed from its credentials, and B is
+refused with the identical code *and message* it gets for a run that never
+existed.
+
+**No public read accepts an `AuthContext` and ignores it.** Six entrypoints —
+`get_run`, `get_progress`, `get_events`, `get_changes`, `get_test_results`,
+`get_handoff` — took `_auth` and called `load_authorized_run` directly. MCP
+dispatch happened to use the scoped variants, so nothing was exploiting it, but
+the public surface was bypassable by any present or future caller. They now go
+through `load_principal_bound_run`, which binds the principal even where no
+session or workspace is supplied.
+
+`load_authorized_run` now has exactly two callers, both binding wrappers, and
+`no_read_reaches_a_run_without_binding_a_principal` is a source-level guard
+that keeps it that way — the failure it prevents is structural, and a future
+read that bypassed the fence would compile and pass every behavioural test that
+did not happen to cover it.
 
 **What this does not do.** It binds the principal and the current credential
 set — `AuthContext` is derived per request, so a revoked credential fails at
