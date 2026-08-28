@@ -1048,7 +1048,7 @@ impl AuditLedger {
             .cloned()
             .collect::<Vec<_>>();
         for (index, generation) in imported.iter().enumerate() {
-            let name = generation.legacy_source.as_deref().unwrap_or_else(|| {
+            let name = generation.legacy_source.as_deref().unwrap_or({
                 if imported.len() == 1 || index > 0 {
                     "audit.jsonl"
                 } else {
