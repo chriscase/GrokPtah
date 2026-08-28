@@ -308,6 +308,7 @@ async fn reusable_client_reconnects_from_last_live_event() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
 async fn post_rotation_event_is_not_delivered_to_an_existing_sse_stream() {
     let guard = home_override_serial();
     let previous_offline = std::env::var_os("GROKPTAH_AGENT_OFFLINE");
