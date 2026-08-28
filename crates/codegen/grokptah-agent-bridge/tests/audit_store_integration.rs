@@ -71,7 +71,7 @@ fn real_store_uses_one_authenticated_authority_and_public_projection_is_redacted
             ))
             .unwrap();
     }
-    assert_eq!(store.audit_status().global_last_seq, 8);
+    assert_eq!(store.audit_status().global_last_seq, 16);
 
     let destination = temp.path().join("public-export");
     let receipt = store
@@ -117,16 +117,24 @@ fn real_store_migrates_legacy_bytes_once_and_labels_them_untrusted() {
     store
         .append_audit(&audit_entry("native", "native-intent", "private"))
         .unwrap();
-    assert_eq!(store.audit_status().global_last_seq, 4);
+    assert_eq!(store.audit_status().global_last_seq, 5);
     store.shutdown().unwrap();
 
     let reopened = OrchStore::open(temp.path()).unwrap();
     assert_eq!(reopened.audit_status().imported_generations, 2);
     assert_eq!(reopened.audit_status().recovery.imported_generations, 0);
-    assert_eq!(reopened.audit_status().global_last_seq, 4);
+    assert_eq!(reopened.audit_status().global_last_seq, 7);
     assert!(reopened
         .export_audit(&temp.path().join("v1"), ExportFormat::V1)
         .is_err());
+    let public_destination = temp.path().join("public");
+    let receipt = reopened
+        .export_audit(&public_destination, ExportFormat::Auto)
+        .unwrap();
+    assert_eq!(receipt.withheld_generations, 2);
+    let public_bytes = all_bytes(&public_destination);
+    assert!(!public_bytes.windows(5).any(|window| window == b"\"old\""));
+    assert!(!public_bytes.windows(5).any(|window| window == b"\"new\""));
 }
 
 #[test]
@@ -213,7 +221,7 @@ fn real_store_concurrent_append_preserves_exact_sequence() {
     for worker in workers {
         worker.join().unwrap();
     }
-    assert_eq!(store.audit_status().global_last_seq, 100);
+    assert_eq!(store.audit_status().global_last_seq, 200);
     assert_eq!(store.verify_audit().unwrap(), 1);
 }
 
@@ -248,7 +256,7 @@ fn two_process_immediate_same_home_reuse_after_explicit_shutdown() {
         String::from_utf8_lossy(&output.stderr)
     );
     let reopened = OrchStore::open(&root).unwrap();
-    assert_eq!(reopened.audit_status().global_last_seq, 2);
+    assert_eq!(reopened.audit_status().global_last_seq, 6);
 }
 
 #[test]

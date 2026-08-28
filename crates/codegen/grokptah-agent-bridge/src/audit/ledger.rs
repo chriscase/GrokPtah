@@ -38,6 +38,7 @@ pub struct AuditEntryInput {
     pub phase: EntryPhase,
     pub outcome: EntryOutcome,
     pub reason: Option<EntryReason>,
+    pub code: Option<String>,
     pub actor: Option<String>,
     pub request: Option<String>,
     pub scope: Option<String>,
@@ -45,6 +46,7 @@ pub struct AuditEntryInput {
     pub cap_rev: Option<u64>,
     pub policy_rev: Option<u64>,
     pub intent_id: Option<String>,
+    pub intent_digest: Option<String>,
 }
 
 impl AuditEntryInput {
@@ -54,6 +56,7 @@ impl AuditEntryInput {
             phase,
             outcome,
             reason: None,
+            code: None,
             actor: None,
             request: None,
             scope: None,
@@ -61,11 +64,17 @@ impl AuditEntryInput {
             cap_rev: None,
             policy_rev: None,
             intent_id: None,
+            intent_digest: None,
         }
     }
 
     pub fn with_reason(mut self, reason: EntryReason) -> Self {
         self.reason = Some(reason);
+        self
+    }
+
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
         self
     }
 
@@ -86,6 +95,11 @@ impl AuditEntryInput {
 
     pub fn with_intent_id(mut self, intent_id: impl Into<String>) -> Self {
         self.intent_id = Some(intent_id.into());
+        self
+    }
+
+    pub(crate) fn with_intent_digest(mut self, digest: impl Into<String>) -> Self {
+        self.intent_digest = Some(digest.into());
         self
     }
 }
@@ -109,6 +123,7 @@ pub struct RecoverySummary {
     pub resumed_removals: Vec<String>,
     pub closed_intents: u64,
     pub durable_gaps: Vec<GapRecord>,
+    pub legacy_divergences: Vec<String>,
     pub initialized: bool,
     pub imported_generations: usize,
 }
@@ -151,7 +166,7 @@ struct LiveTail {
     last_seq: u64,
     last_tag: String,
     journal_bytes: u64,
-    open_intents: u64,
+    open_intent_ids: Vec<String>,
 }
 
 struct Inner {
@@ -164,6 +179,7 @@ struct Inner {
 
 pub struct AuditLedger {
     root: PathBuf,
+    legacy_v1_dir: Option<PathBuf>,
     keys: RwLock<Arc<AuditKeys>>,
     keyring: RwLock<Vec<Arc<AuditKeys>>>,
     witness: Arc<dyn AuditWitness>,
@@ -184,7 +200,7 @@ impl std::fmt::Debug for AuditLedger {
             .field("root", &self.root)
             .field("activeGeneration", &guard.manifest.active_generation_id)
             .field("lastSeq", &guard.live.last_seq)
-            .field("openIntents", &guard.live.open_intents)
+            .field("openIntents", &guard.live.open_intent_ids.len())
             .field("poisoned", &guard.poisoned)
             .finish()
     }
@@ -197,7 +213,7 @@ pub(crate) struct JournalScan {
     pub(crate) complete_len: u64,
     pub(crate) torn: Option<RecoveryEvidence>,
     pub(crate) entry_count: u64,
-    pub(crate) open_intents: u64,
+    pub(crate) open_intent_ids: Vec<String>,
 }
 
 impl AuditLedger {
@@ -288,6 +304,7 @@ impl AuditLedger {
 
         let ledger = Self {
             root,
+            legacy_v1_dir: options.legacy_v1_dir,
             keys: RwLock::new(selected_key),
             keyring: RwLock::new(keys),
             witness,
@@ -297,7 +314,7 @@ impl AuditLedger {
                     last_seq: 0,
                     last_tag: String::new(),
                     journal_bytes: 0,
-                    open_intents: 0,
+                    open_intent_ids: Vec::new(),
                 },
                 manifest,
                 poisoned: None,
@@ -449,7 +466,10 @@ impl AuditLedger {
         manifest: &mut Manifest,
         keys: &AuditKeys,
     ) -> AuditResult<()> {
-        manifest.manifest_epoch = manifest.manifest_epoch.saturating_add(1);
+        manifest.manifest_epoch = manifest
+            .manifest_epoch
+            .checked_add(1)
+            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
         manifest.updated_at = Utc::now();
         manifest.seal(keys)?;
         let bytes = serde_json::to_vec(manifest)
@@ -491,7 +511,7 @@ impl AuditLedger {
             live.last_seq,
             &live.last_tag,
             live.journal_bytes,
-            live.open_intents,
+            &live.open_intent_ids,
         )
     }
 
@@ -504,7 +524,7 @@ impl AuditLedger {
         last_seq: u64,
         last_tag: &str,
         journal_bytes: u64,
-        open_intents: u64,
+        open_intent_ids: &[String],
     ) -> AuditResult<()> {
         let mut anchor = Anchor {
             schema: ANCHOR_SCHEMA.to_string(),
@@ -514,7 +534,7 @@ impl AuditLedger {
             last_seq,
             last_tag: last_tag.to_string(),
             journal_bytes,
-            open_intents,
+            open_intent_ids: open_intent_ids.to_vec(),
             updated_at: Utc::now(),
             mac: String::new(),
         };
@@ -559,7 +579,10 @@ impl AuditLedger {
             write_imported_journal(&Self::journal_path(root, &id), &legacy.bytes)?;
             let final_tag = keys.import_seal_tag(&id, &legacy.sha256);
             let first_seq = next_first_seq;
-            let last_seq = first_seq.saturating_add(legacy.lines).saturating_sub(1);
+            let last_seq = first_seq
+                .checked_add(legacy.lines)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
             Self::write_anchor_at(
                 root,
                 keys,
@@ -568,7 +591,7 @@ impl AuditLedger {
                 last_seq,
                 &final_tag,
                 legacy.bytes.len() as u64,
-                0,
+                &[],
             )?;
             files::fsync_dir(&dir)?;
             generations.push(GenerationDescriptor {
@@ -595,7 +618,9 @@ impl AuditLedger {
             });
             chain_base = final_tag;
             predecessor = Some(id);
-            next_first_seq = last_seq.saturating_add(1);
+            next_first_seq = last_seq
+                .checked_add(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
         }
 
         let active_id = ids[total as usize - 1].clone();
@@ -610,10 +635,12 @@ impl AuditLedger {
             keys,
             &active_id,
             keys.key_epoch(),
-            next_first_seq.saturating_sub(1),
+            next_first_seq
+                .checked_sub(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?,
             &chain_base,
             0,
-            0,
+            &[],
         )?;
         files::fsync_dir(&dir)?;
         generations.push(GenerationDescriptor {
@@ -625,7 +652,9 @@ impl AuditLedger {
             predecessor_id: predecessor,
             chain_base,
             first_seq: next_first_seq,
-            last_seq: next_first_seq.saturating_sub(1),
+            last_seq: next_first_seq
+                .checked_sub(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?,
             entry_count: 0,
             journal_bytes: 0,
             journal_sha256: None,
@@ -653,9 +682,12 @@ impl AuditLedger {
             retention_epoch: 0,
             active_generation_id: active_id,
             global_first_seq: 1,
-            global_last_seq_floor: next_first_seq.saturating_sub(1),
+            global_last_seq_floor: next_first_seq
+                .checked_sub(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?,
             generations,
             tombstones: Vec::new(),
+            legacy_divergence_digests: Vec::new(),
             created_at: now,
             updated_at: now,
             mac: String::new(),
@@ -746,7 +778,11 @@ impl AuditLedger {
                 }
             } else {
                 let previous = &manifest.generations[position - 1];
-                if generation.first_seq != previous.last_seq.saturating_add(1) {
+                let expected_first = previous
+                    .last_seq
+                    .checked_add(1)
+                    .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
+                if generation.first_seq != expected_first {
                     return Err(AuditError::Poisoned(PoisonReason::SequenceDiscontinuity));
                 }
                 let expected_base = previous
@@ -933,9 +969,13 @@ impl AuditLedger {
         let active = guard.manifest.active()?.clone();
         let anchor = self.load_anchor(&active.generation_id)?;
         let active_key = self.key_for_generation(&active)?;
+        let active_journal = Self::journal_path(&self.root, &active.generation_id);
+        if !active_journal.is_file() {
+            return Err(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid));
+        }
         let scan = self.scan_journal(
             &active_key,
-            &Self::journal_path(&self.root, &active.generation_id),
+            &active_journal,
             &active.generation_id,
             &active.chain_base,
             active.first_seq,
@@ -947,7 +987,7 @@ impl AuditLedger {
         if scan.last_seq == anchor.last_seq
             && (scan.last_tag != anchor.last_tag
                 || scan.complete_len != anchor.journal_bytes
-                || scan.open_intents != anchor.open_intents)
+                || scan.open_intent_ids != anchor.open_intent_ids)
         {
             return Err(AuditError::Poisoned(PoisonReason::AnchorStateMismatch));
         }
@@ -970,7 +1010,7 @@ impl AuditLedger {
             last_seq: scan.last_seq,
             last_tag: scan.last_tag,
             journal_bytes: scan.complete_len,
-            open_intents: scan.open_intents,
+            open_intent_ids: scan.open_intent_ids,
         };
         if adopted > 0 || guard.recovery.torn_tail.is_some() {
             let live = guard.live.clone();
@@ -988,7 +1028,97 @@ impl AuditLedger {
         };
 
         drop(guard);
+        self.detect_legacy_v1_divergence()?;
+        self.verify_sealed_generations()?;
         self.close_recovery_evidence()?;
+        Ok(())
+    }
+
+    fn detect_legacy_v1_divergence(&self) -> AuditResult<()> {
+        let Some(legacy_dir) = self.legacy_v1_dir.as_deref() else {
+            return Ok(());
+        };
+        let manifest = self.manifest_snapshot();
+        let imported = manifest
+            .generations
+            .iter()
+            .filter(|generation| !generation.origin_authenticated)
+            .cloned()
+            .collect::<Vec<_>>();
+        for (index, generation) in imported.iter().enumerate() {
+            let name = if index == 0 {
+                "audit.jsonl.1"
+            } else {
+                "audit.jsonl"
+            };
+            let path = legacy_dir.join(name);
+            let (digest, bytes) = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    files::reject_symlink(&path)?;
+                    if !metadata.is_file() {
+                        return Err(AuditError::Poisoned(PoisonReason::SymlinkedPath));
+                    }
+                    let bytes = files::read_bytes(&path)?;
+                    (sha256_hex(&bytes), bytes)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ("missing".to_string(), Vec::new())
+                }
+                Err(error) => {
+                    return Err(AuditError::Io(format!("legacy audit metadata: {error}")))
+                }
+            };
+            let expected = generation.journal_sha256.as_deref().unwrap_or_default();
+            if digest == expected {
+                continue;
+            }
+            let marker = format!("{name}:{digest}");
+            if manifest
+                .legacy_divergence_digests
+                .iter()
+                .any(|known| known == &marker)
+            {
+                continue;
+            }
+            self.append_internal(
+                AuditEntryInput::new(
+                    "audit.legacy_divergence",
+                    EntryPhase::Outcome,
+                    EntryOutcome::Uncertain,
+                )
+                .with_reason(EntryReason::LegacyWrittenAfterCutover),
+                Some(RecoveryEvidence {
+                    bytes: bytes.len() as u64,
+                    sha256: if bytes.is_empty() {
+                        String::new()
+                    } else {
+                        digest.clone()
+                    },
+                    at_offset: 0,
+                    lost_entries: 0,
+                }),
+            )?;
+            let mut updated = self.manifest_snapshot();
+            if !updated
+                .legacy_divergence_digests
+                .iter()
+                .any(|known| known == &marker)
+            {
+                updated.legacy_divergence_digests.push(marker.clone());
+                self.commit_manifest(updated)?;
+            }
+            self.inner.lock().recovery.legacy_divergences.push(marker);
+        }
+        Ok(())
+    }
+
+    fn verify_sealed_generations(&self) -> AuditResult<()> {
+        let generations = self.inner.lock().manifest.generations.clone();
+        for generation in generations {
+            if generation.state == GenerationState::Sealed {
+                self.verify_generation(&generation.generation_id)?;
+            }
+        }
         Ok(())
     }
 
@@ -1006,7 +1136,7 @@ impl AuditLedger {
                 .collect();
             (
                 guard.recovery.torn_tail.clone(),
-                guard.live.open_intents,
+                guard.live.open_intent_ids.clone(),
                 ungapped,
             )
         };
@@ -1042,26 +1172,28 @@ impl AuditLedger {
             self.mark_gaps_journaled()?;
         }
 
-        if open_intents > 0 {
-            // Never fabricate success and never auto-redispatch: the count of
-            // interrupted intents is stated exactly, the outcome is uncertain.
-            self.append_internal(
-                AuditEntryInput::new(
-                    "audit.recovery",
-                    EntryPhase::Outcome,
-                    EntryOutcome::Uncertain,
-                )
-                .with_reason(EntryReason::HostRestartInterrupted),
-                Some(RecoveryEvidence {
-                    bytes: 0,
-                    sha256: String::new(),
-                    at_offset: 0,
-                    lost_entries: open_intents,
-                }),
-            )?;
+        if !open_intents.is_empty() {
+            // Never fabricate success and never auto-redispatch: close each
+            // interrupted producer intent by its own keyed identity.
+            for intent_id in &open_intents {
+                self.append_internal(
+                    AuditEntryInput::new(
+                        "audit.recovery",
+                        EntryPhase::Outcome,
+                        EntryOutcome::Uncertain,
+                    )
+                    .with_reason(EntryReason::HostRestartInterrupted)
+                    .with_intent_digest(intent_id),
+                    Some(RecoveryEvidence {
+                        bytes: 0,
+                        sha256: String::new(),
+                        at_offset: 0,
+                        lost_entries: 1,
+                    }),
+                )?;
+            }
             let mut guard = self.inner.lock();
-            guard.live.open_intents = 0;
-            guard.recovery.closed_intents = open_intents;
+            guard.recovery.closed_intents = open_intents.len() as u64;
             let live = guard.live.clone();
             drop(guard);
             self.write_anchor(&live)?;
@@ -1138,16 +1270,18 @@ pub(crate) fn scan_journal_at(
             // Imported legacy bytes carry no chain. Their *boundary* is
             // authenticated by the import seal; their contents are not, and
             // this code never pretends otherwise.
+            let lines = super::import::count_legacy_lines(&bytes);
             return Ok(JournalScan {
                 last_seq: first_seq
-                    .saturating_add(super::import::count_legacy_lines(&bytes))
-                    .saturating_sub(1),
+                    .checked_add(lines)
+                    .and_then(|value| value.checked_sub(1))
+                    .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?,
                 last_tag: keys.import_seal_tag(generation_id, &sha256_hex(&bytes)),
                 bytes: bytes.len() as u64,
                 complete_len: bytes.len() as u64,
                 torn: None,
-                entry_count: super::import::count_legacy_lines(&bytes),
-                open_intents: 0,
+                entry_count: lines,
+                open_intent_ids: Vec::new(),
             });
         }
 
@@ -1157,7 +1291,7 @@ pub(crate) fn scan_journal_at(
         let mut offset: u64 = 0;
         let mut complete_len: u64 = 0;
         let mut entry_count: u64 = 0;
-        let mut open_intents: u64 = 0;
+        let mut open_intent_ids: Vec<String> = Vec::new();
 
         let mut cursor = 0usize;
         while cursor < bytes.len() {
@@ -1191,12 +1325,35 @@ pub(crate) fn scan_journal_at(
             }
             previous = record.tag;
             last_seq = record.seq;
-            expected_seq = expected_seq.saturating_add(1);
-            entry_count = entry_count.saturating_add(1);
-            open_intents = match record.phase {
-                EntryPhase::Intent => open_intents.saturating_add(1),
-                EntryPhase::Outcome => open_intents.saturating_sub(1),
-            };
+            expected_seq = expected_seq
+                .checked_add(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
+            entry_count = entry_count
+                .checked_add(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
+            match record.phase {
+                EntryPhase::Intent => {
+                    if let Some(intent) = record.intent {
+                        if open_intent_ids.iter().any(|open| open == &intent) {
+                            return Err(AuditError::Poisoned(PoisonReason::EntrySequenceBreak));
+                        }
+                        if open_intent_ids.len() >= MAX_TRACKED_INTENTS {
+                            return Err(AuditError::Poisoned(PoisonReason::PartialPersistence));
+                        }
+                        open_intent_ids.push(intent);
+                    }
+                }
+                EntryPhase::Outcome => {
+                    if let Some(intent) = record.intent {
+                        let Some(position) =
+                            open_intent_ids.iter().position(|open| open == &intent)
+                        else {
+                            return Err(AuditError::Poisoned(PoisonReason::EntrySequenceBreak));
+                        };
+                        open_intent_ids.remove(position);
+                    }
+                }
+            }
             cursor += newline + 1;
             offset = cursor as u64;
             complete_len = offset;
@@ -1224,7 +1381,7 @@ pub(crate) fn scan_journal_at(
             complete_len,
             torn,
             entry_count,
-            open_intents,
+            open_intent_ids,
         })
     }
 }
@@ -1263,7 +1420,7 @@ impl AuditLedger {
             || on_disk.last_seq != guard.live.last_seq
             || on_disk.last_tag != guard.live.last_tag
             || on_disk.journal_bytes != guard.live.journal_bytes
-            || on_disk.open_intents != guard.live.open_intents
+            || on_disk.open_intent_ids != guard.live.open_intent_ids
         {
             guard.poisoned = Some(PoisonReason::ConcurrentWriter);
             return Err(AuditError::Poisoned(PoisonReason::ConcurrentWriter));
@@ -1273,16 +1430,29 @@ impl AuditLedger {
         let mut record = AuditRecord {
             v: RECORD_VERSION,
             generation: live.generation_id.clone(),
-            seq: live.last_seq.saturating_add(1),
+            seq: live
+                .last_seq
+                .checked_add(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?,
             ts: Utc::now(),
             op: bounded(&entry.op, 64),
             phase: entry.phase,
             outcome: entry.outcome,
             reason: entry.reason,
+            code: entry.code.as_deref().and_then(safe_code),
             actor: entry.actor.as_deref().map(|v| keys.opaque_digest(v)),
             request: entry.request.as_deref().map(|v| keys.opaque_digest(v)),
             scope: entry.scope.as_deref().map(|v| keys.opaque_digest(v)),
-            intent: entry.intent_id.as_deref().map(|v| keys.opaque_digest(v)),
+            intent: entry.intent_digest.as_deref().map_or_else(
+                || entry.intent_id.as_deref().map(|v| keys.opaque_digest(v)),
+                |digest| {
+                    Some(if is_opaque_digest(digest) {
+                        digest.to_string()
+                    } else {
+                        keys.opaque_digest(digest)
+                    })
+                },
+            ),
             authz_rev: entry.authz_rev,
             cap_rev: entry.cap_rev,
             policy_rev: entry.policy_rev,
@@ -1297,11 +1467,34 @@ impl AuditLedger {
         if line.len() > MAX_LINE_BYTES {
             return Err(AuditError::Refused(RefuseReason::EntryTooLarge));
         }
+        if record.phase == EntryPhase::Intent && record.intent.is_none() {
+            return Err(AuditError::Refused(RefuseReason::IntentIdentityRequired));
+        }
+        if let Some(intent) = record.intent.as_ref() {
+            match record.phase {
+                EntryPhase::Intent => {
+                    if live.open_intent_ids.len() >= MAX_TRACKED_INTENTS
+                        || live.open_intent_ids.iter().any(|open| open == intent)
+                    {
+                        return Err(AuditError::Refused(RefuseReason::IntentTrackingFull));
+                    }
+                }
+                EntryPhase::Outcome => {
+                    if !live.open_intent_ids.iter().any(|open| open == intent) {
+                        return Err(AuditError::Refused(RefuseReason::IntentNotOpen));
+                    }
+                }
+            }
+        }
 
         // The lock is held across the whole append. Releasing it between the
         // journal write and the anchor update would let a second in-process
         // appender read a stale tail and issue the same sequence twice.
         let path = Self::journal_path(&self.root, &live.generation_id);
+        let new_journal_bytes = live
+            .journal_bytes
+            .checked_add(line.len() as u64)
+            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
         let written = match files::append_line(&path, &line) {
             Ok(written) => written,
             Err(error) => {
@@ -1313,11 +1506,24 @@ impl AuditLedger {
 
         guard.live.last_seq = record.seq;
         guard.live.last_tag = record.tag.clone();
-        guard.live.journal_bytes = guard.live.journal_bytes.saturating_add(written);
-        guard.live.open_intents = match record.phase {
-            EntryPhase::Intent => guard.live.open_intents.saturating_add(1),
-            EntryPhase::Outcome => guard.live.open_intents.saturating_sub(1),
-        };
+        debug_assert_eq!(written, new_journal_bytes - live.journal_bytes);
+        guard.live.journal_bytes = new_journal_bytes;
+        if let Some(intent) = record.intent.clone() {
+            match record.phase {
+                EntryPhase::Intent => {
+                    guard.live.open_intent_ids.push(intent);
+                }
+                EntryPhase::Outcome => {
+                    let position = guard
+                        .live
+                        .open_intent_ids
+                        .iter()
+                        .position(|open| open == &intent)
+                        .expect("intent validated before durable append");
+                    guard.live.open_intent_ids.remove(position);
+                }
+            }
+        }
         let live = guard.live.clone();
         if let Err(error) = self.write_anchor(&live) {
             guard.poisoned = Some(PoisonReason::PartialPersistence);
@@ -1379,7 +1585,7 @@ impl AuditLedger {
             if let Some(poison) = guard.poisoned {
                 return Err(AuditError::Poisoned(poison));
             }
-            if guard.live.open_intents != 0 {
+            if !guard.live.open_intent_ids.is_empty() {
                 return Err(AuditError::Refused(RefuseReason::OpenIntentsPresent));
             }
         }
@@ -1419,10 +1625,13 @@ impl AuditLedger {
         self.cut(CrashPoint::R1Frozen)?;
 
         // R2: prepare the next generation on disk. No manifest change yet.
-        let next_index = outgoing.index.saturating_add(1);
+        let next_index = outgoing
+            .index
+            .checked_add(1)
+            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
         let next_id = generation_id(next_index);
         let next_keys = if reason == RotationReason::KeyRotation {
-            let next = outgoing_key.rotated();
+            let next = outgoing_key.rotated()?;
             next.persist_epoch(self.custody_root())?;
             Arc::new(next)
         } else {
@@ -1441,7 +1650,7 @@ impl AuditLedger {
             last_seq: scan.last_seq,
             last_tag: scan.last_tag.clone(),
             journal_bytes: 0,
-            open_intents: 0,
+            open_intent_ids: Vec::new(),
         };
         Self::write_anchor_at(
             &self.root,
@@ -1451,7 +1660,7 @@ impl AuditLedger {
             next_live.last_seq,
             &next_live.last_tag,
             next_live.journal_bytes,
-            next_live.open_intents,
+            &next_live.open_intent_ids,
         )?;
         files::fsync_dir(&next_dir)?;
         files::fsync_dir(&self.root.join("generations"))?;
@@ -1480,7 +1689,10 @@ impl AuditLedger {
             key_epoch: next_keys.key_epoch(),
             predecessor_id: Some(outgoing.generation_id.clone()),
             chain_base: scan.last_tag.clone(),
-            first_seq: scan.last_seq.saturating_add(1),
+            first_seq: scan
+                .last_seq
+                .checked_add(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?,
             last_seq: scan.last_seq,
             entry_count: 0,
             journal_bytes: 0,
@@ -1605,7 +1817,7 @@ impl AuditLedger {
             global_last_seq: guard.live.last_seq,
             generations: guard.manifest.generations.len(),
             tombstones: guard.manifest.tombstones.len(),
-            open_intents: guard.live.open_intents,
+            open_intents: guard.live.open_intent_ids.len() as u64,
             journal_bytes: guard.live.journal_bytes,
             poisoned: guard.poisoned,
             witness_state: guard.witness_state,
@@ -1624,7 +1836,7 @@ impl AuditLedger {
     }
 
     pub(crate) fn open_intents(&self) -> u64 {
-        self.inner.lock().live.open_intents
+        self.inner.lock().live.open_intent_ids.len() as u64
     }
 
     pub(crate) fn is_poisoned(&self) -> Option<PoisonReason> {
@@ -1676,4 +1888,20 @@ impl AuditLedger {
 
 fn bounded(value: &str, max: usize) -> String {
     crate::textutil::truncate_at_char_boundary(value, max).to_string()
+}
+
+fn is_opaque_digest(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn safe_code(value: &str) -> Option<String> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return None;
+    }
+    Some(value.to_string())
 }

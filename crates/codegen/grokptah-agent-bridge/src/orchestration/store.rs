@@ -248,8 +248,33 @@ impl OrchStore {
         if Arc::strong_count(&self.inner) != 1 {
             return Err(anyhow::anyhow!("orchestration store still has live owners"));
         }
-        drop(self);
-        Ok(())
+        let inner = self.inner;
+        let intent_id = format!("store-shutdown-{}", Uuid::new_v4());
+        let result = inner
+            .audit
+            .append(
+                AuditEntryInput::new(
+                    "orchestration.shutdown",
+                    EntryPhase::Intent,
+                    EntryOutcome::Accepted,
+                )
+                .with_intent_id(&intent_id),
+            )
+            .and_then(|_| {
+                inner.audit.append(
+                    AuditEntryInput::new(
+                        "orchestration.shutdown",
+                        EntryPhase::Outcome,
+                        EntryOutcome::Accepted,
+                    )
+                    .with_reason(EntryReason::HostShutdown)
+                    .with_intent_id(intent_id),
+                )
+            })
+            .map(|_| ())
+            .map_err(|error| anyhow::anyhow!("audit shutdown failed: {}", error.code()));
+        drop(inner);
+        result
     }
 
     fn run_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
@@ -4958,7 +4983,14 @@ impl OrchStore {
     }
 
     pub fn append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
-        self.append_audit_input(adapt_audit_entry(entry))
+        let outcome = adapt_audit_entry(entry);
+        if outcome.intent_id.is_some() {
+            let mut intent = outcome.clone();
+            intent.phase = EntryPhase::Intent;
+            intent.outcome = EntryOutcome::Accepted;
+            self.append_audit_input(intent)?;
+        }
+        self.append_audit_input(outcome)
     }
 
     pub fn append_audit_input(&self, input: AuditEntryInput) -> anyhow::Result<()> {
@@ -5303,6 +5335,9 @@ fn adapt_audit_entry(entry: &AuditEntry) -> AuditEntryInput {
     let mut input = AuditEntryInput::new(entry.tool.clone(), EntryPhase::Outcome, outcome);
     if let Some(reason) = reason {
         input = input.with_reason(reason);
+    }
+    if let Some(code) = entry.error_code.as_deref() {
+        input = input.with_code(code);
     }
     if let Some(actor) = entry.session_id {
         input = input.with_actor(actor.to_string());
@@ -6201,7 +6236,7 @@ mod tests {
 
         let reopened = OrchStore::open(d.path()).unwrap();
         assert_eq!(reopened.verify_audit().unwrap(), 2);
-        assert_eq!(reopened.audit_status().global_last_seq, 3);
+        assert_eq!(reopened.audit_status().global_last_seq, 4);
     }
 
     #[test]

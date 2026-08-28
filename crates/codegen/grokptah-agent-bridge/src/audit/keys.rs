@@ -230,8 +230,12 @@ impl AuditKeys {
     /// Derive the next custody epoch without exposing the installation
     /// material.  Older epochs remain verifiable by a key ring held by the
     /// owner; a new epoch never overwrites the old key's identity.
-    pub(crate) fn rotated(&self) -> Self {
-        Self::derive_for_epoch(&self.root_material, self.epoch.saturating_add(1))
+    pub(crate) fn rotated(&self) -> AuditResult<Self> {
+        let epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
+        Ok(Self::derive_for_epoch(&self.root_material, epoch))
     }
 
     pub(crate) fn persist_epoch(&self, root: &Path) -> AuditResult<()> {

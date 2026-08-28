@@ -489,11 +489,10 @@ fn rotation_is_refused_while_an_intent_is_open() {
     let dir = TempDir::new().unwrap();
     let ledger = fresh(dir.path());
     ledger
-        .append(AuditEntryInput::new(
-            "submit",
-            EntryPhase::Intent,
-            EntryOutcome::Accepted,
-        ))
+        .append(
+            AuditEntryInput::new("submit", EntryPhase::Intent, EntryOutcome::Accepted)
+                .with_intent_id("submit"),
+        )
         .unwrap();
     assert_eq!(
         refusal_of(ledger.rotate(RotationReason::Bytes).unwrap_err()),
@@ -742,6 +741,50 @@ fn export_into_an_existing_directory_is_refused() {
     assert_eq!(
         refusal_of(ledger.export(&dest, ExportFormat::Auto).unwrap_err()),
         RefuseReason::ExportDestinationExists
+    );
+}
+
+#[test]
+fn export_verifier_rejects_extra_files_after_sealing() {
+    let dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    let dest = out.path().join("export");
+    ledger.export(&dest, ExportFormat::Auto).unwrap();
+    std::fs::write(dest.join("secret.txt"), b"not-audit-data").unwrap();
+    assert!(verify_export(&dest, &keys()).is_err());
+}
+
+#[test]
+fn tampered_sealed_generation_fails_store_open_closed() {
+    use std::io::Write;
+
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    ledger.rotate(RotationReason::Bytes).unwrap();
+    drop(ledger);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(journal_of(dir.path(), "g-000001"))
+        .unwrap();
+    file.write_all(b"{}\n").unwrap();
+    file.sync_all().unwrap();
+    assert_eq!(
+        poison_of(open(dir.path()).unwrap_err()),
+        PoisonReason::SealedGenerationChanged
+    );
+}
+
+#[test]
+fn missing_active_journal_fails_store_open_closed() {
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    let generation = ledger.status().active_generation_id;
+    drop(ledger);
+    std::fs::remove_file(journal_of(dir.path(), &generation)).unwrap();
+    assert_eq!(
+        poison_of(open(dir.path()).unwrap_err()),
+        PoisonReason::ActiveGenerationInvalid
     );
 }
 
@@ -1194,6 +1237,27 @@ fn unterminated_legacy_line_is_counted_without_changing_legacy_bytes() {
 }
 
 #[test]
+fn legacy_write_after_cutover_is_persisted_as_uncertain_divergence() {
+    let dir = TempDir::new().unwrap();
+    let legacy = legacy_v1_dir(dir.path(), "{\"old\":1}\n", "{\"new\":2}\n");
+    let root = dir.path().join("audit");
+    drop(open_with_legacy(&root, &legacy).unwrap());
+    std::fs::write(legacy.join("audit.jsonl"), b"{\"new\":3}\n").unwrap();
+
+    let ledger = open_with_legacy(&root, &legacy).unwrap();
+    assert_eq!(ledger.status().recovery.legacy_divergences.len(), 1);
+    assert_eq!(ledger.status().global_last_seq, 3);
+    let active = journal_of(&root, &ledger.status().active_generation_id);
+    let body = std::fs::read_to_string(active).unwrap();
+    assert!(body.contains("\"reason\":\"legacy_written_after_cutover\""));
+    drop(ledger);
+
+    let reopened = open_with_legacy(&root, &legacy).unwrap();
+    assert_eq!(reopened.status().recovery.legacy_divergences.len(), 0);
+    assert_eq!(reopened.status().global_last_seq, 3);
+}
+
+#[test]
 fn intent_and_outcome_share_one_opaque_producer_identity() {
     let dir = TempDir::new().unwrap();
     let ledger = opened(dir.path());
@@ -1261,6 +1325,41 @@ fn retention_refuses_unauthenticated_import_even_with_override() {
         .retain(RetentionRequest::new("g-000001").allow_unexported())
         .unwrap_err();
     assert_eq!(refusal_of(error), RefuseReason::GenerationUnverified);
+}
+
+#[test]
+fn an_outcome_cannot_close_an_unknown_producer_intent() {
+    let dir = TempDir::new().unwrap();
+    let ledger = opened(dir.path());
+    let error = ledger
+        .append(
+            AuditEntryInput::new("outcome", EntryPhase::Outcome, EntryOutcome::Accepted)
+                .with_intent_id("unknown-intent"),
+        )
+        .unwrap_err();
+    assert_eq!(refusal_of(error), RefuseReason::IntentNotOpen);
+}
+
+#[test]
+fn intent_tracking_limit_refuses_before_writing_an_untracked_entry() {
+    let dir = TempDir::new().unwrap();
+    let ledger = opened(dir.path());
+    for index in 0..MAX_TRACKED_INTENTS {
+        ledger
+            .append(
+                AuditEntryInput::new("intent", EntryPhase::Intent, EntryOutcome::Accepted)
+                    .with_intent_id(format!("intent-{index}")),
+            )
+            .unwrap();
+    }
+    let error = ledger
+        .append(
+            AuditEntryInput::new("overflow", EntryPhase::Intent, EntryOutcome::Accepted)
+                .with_intent_id("overflow"),
+        )
+        .unwrap_err();
+    assert_eq!(refusal_of(error), RefuseReason::IntentTrackingFull);
+    assert_eq!(ledger.status().global_last_seq, MAX_TRACKED_INTENTS as u64);
 }
 
 #[test]

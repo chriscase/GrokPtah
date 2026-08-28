@@ -121,10 +121,19 @@ impl AuditLedger {
         let successor = manifest
             .generations
             .iter()
-            .find(|g| g.index == descriptor.index.saturating_add(1))
+            .find(|g| {
+                descriptor
+                    .index
+                    .checked_add(1)
+                    .is_some_and(|index| g.index == index)
+            })
             .ok_or(AuditError::Poisoned(PoisonReason::ChainDiscontinuity))?;
         if successor.chain_base.as_str() != verification.final_tag.as_str()
-            || successor.first_seq != descriptor.last_seq.saturating_add(1)
+            || successor.first_seq
+                != descriptor
+                    .last_seq
+                    .checked_add(1)
+                    .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?
         {
             return Err(AuditError::Poisoned(PoisonReason::ChainDiscontinuity));
         }
@@ -137,13 +146,17 @@ impl AuditLedger {
                 EntryOutcome::Accepted,
             )
             .with_reason(EntryReason::RetentionIntent)
-            .with_scope(&descriptor.generation_id),
+            .with_scope(&descriptor.generation_id)
+            .with_intent_id(format!("retention:{}", descriptor.generation_id)),
             None,
         )?;
 
         // T3: commit the tombstone. Bytes are still on disk after this returns.
         let mut manifest = self.manifest_snapshot();
-        manifest.retention_epoch = manifest.retention_epoch.saturating_add(1);
+        manifest.retention_epoch = manifest
+            .retention_epoch
+            .checked_add(1)
+            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
         let retention_epoch = manifest.retention_epoch;
         let now = Utc::now();
         manifest.tombstones.push(Tombstone {
@@ -202,7 +215,8 @@ impl AuditLedger {
                 EntryOutcome::Accepted,
             )
             .with_reason(EntryReason::RetentionOutcome)
-            .with_scope(&descriptor.generation_id),
+            .with_scope(&descriptor.generation_id)
+            .with_intent_id(format!("retention:{}", descriptor.generation_id)),
             None,
         )?;
 

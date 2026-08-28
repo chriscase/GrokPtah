@@ -39,6 +39,15 @@ pub enum CoverageKind {
     /// A range removed by an authorized retention transaction. The chain is
     /// still stitched across it by `chainBase`/`finalTag`.
     Hole,
+    /// An imported legacy range is acknowledged in the coverage chain but its
+    /// verbatim bytes are withheld from a public export.
+    Withheld,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WithheldReason {
+    UnauthenticatedLegacy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +67,8 @@ pub struct CoverageElement {
     /// `false` for imported legacy bytes: preserved, never vouched for.
     pub origin_authenticated: bool,
     pub preceding_loss_unknown: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub withheld_reason: Option<WithheldReason>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub retention_epoch: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -112,6 +123,7 @@ pub struct ExportReceipt {
     pub global_first_seq: u64,
     pub global_last_seq: u64,
     pub unauthenticated_generations: usize,
+    pub withheld_generations: usize,
     pub witness_state: WitnessState,
 }
 
@@ -125,6 +137,7 @@ pub struct ExportVerification {
     pub global_first_seq: u64,
     pub global_last_seq: u64,
     pub unauthenticated_generations: usize,
+    pub withheld_generations: usize,
     pub witness_state: WitnessState,
 }
 
@@ -194,8 +207,29 @@ impl AuditLedger {
                     key_epoch: descriptor.key_epoch,
                     origin_authenticated: descriptor.origin_authenticated,
                     preceding_loss_unknown: descriptor.preceding_loss_unknown,
+                    withheld_reason: None,
                     retention_epoch: Some(tombstone.retention_epoch),
                     export_seal_id: tombstone.export_seal_id.clone(),
+                }
+            } else if !descriptor.origin_authenticated {
+                let verification = self.verify_generation(&descriptor.generation_id)?;
+                CoverageElement {
+                    kind: CoverageKind::Withheld,
+                    generation_id: descriptor.generation_id.clone(),
+                    first_seq: descriptor.first_seq,
+                    last_seq: verification.last_seq,
+                    chain_base: descriptor.chain_base.clone(),
+                    final_tag: verification.final_tag.clone(),
+                    journal_sha256: verification.journal_sha256.clone(),
+                    journal_bytes: verification.journal_bytes,
+                    entry_count: verification.entry_count,
+                    key_id: descriptor.key_id.clone(),
+                    key_epoch: descriptor.key_epoch,
+                    origin_authenticated: false,
+                    preceding_loss_unknown: descriptor.preceding_loss_unknown,
+                    withheld_reason: Some(WithheldReason::UnauthenticatedLegacy),
+                    retention_epoch: None,
+                    export_seal_id: None,
                 }
             } else {
                 let verification = self.verify_generation(&descriptor.generation_id)?;
@@ -213,11 +247,15 @@ impl AuditLedger {
                     key_epoch: descriptor.key_epoch,
                     origin_authenticated: descriptor.origin_authenticated,
                     preceding_loss_unknown: descriptor.preceding_loss_unknown,
+                    withheld_reason: None,
                     retention_epoch: None,
                     export_seal_id: None,
                 }
             };
-            expected_seq = element.last_seq.saturating_add(1);
+            expected_seq = element
+                .last_seq
+                .checked_add(1)
+                .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
             global_last_seq = element.last_seq;
             coverage.push(element);
         }
@@ -228,7 +266,7 @@ impl AuditLedger {
         // could be mistaken for a sealed one.
         let sealed = (|| -> AuditResult<(ExportManifest, ExportVerification)> {
             for element in &coverage {
-                if element.kind == CoverageKind::Hole {
+                if element.kind != CoverageKind::Generation {
                     continue;
                 }
                 let source = Self::generation_dir(self.root(), &element.generation_id);
@@ -304,6 +342,7 @@ impl AuditLedger {
             global_first_seq: export.global_first_seq,
             global_last_seq: export.global_last_seq,
             unauthenticated_generations: verification.unauthenticated_generations,
+            withheld_generations: verification.withheld_generations,
             witness_state: export.witness_state,
         })
     }
@@ -424,6 +463,7 @@ pub(crate) fn verify_export_with_keyring(
             return Err(AuditError::Poisoned(PoisonReason::ExportCoverageInvalid));
         }
     }
+    reject_export_shape(dir, &export)?;
 
     if export.schema == EXPORT_SCHEMA_V1 {
         if export.coverage.len() != 1 || !export.complete {
@@ -440,6 +480,7 @@ pub(crate) fn verify_export_with_keyring(
     let mut generations_verified = 0usize;
     let mut holes = 0usize;
     let mut unauthenticated = 0usize;
+    let mut withheld = 0usize;
     let mut previous_tag: Option<String> = None;
 
     for element in &export.coverage {
@@ -467,6 +508,14 @@ pub(crate) fn verify_export_with_keyring(
         }
         match element.kind {
             CoverageKind::Hole => holes += 1,
+            CoverageKind::Withheld => {
+                if element.origin_authenticated
+                    || element.withheld_reason != Some(WithheldReason::UnauthenticatedLegacy)
+                {
+                    return Err(AuditError::Poisoned(PoisonReason::ExportCoverageInvalid));
+                }
+                withheld += 1;
+            }
             CoverageKind::Generation => {
                 let generation_dir = if export.schema == EXPORT_SCHEMA_V1 {
                     dir.to_path_buf()
@@ -512,14 +561,17 @@ pub(crate) fn verify_export_with_keyring(
                 generations_verified += 1;
             }
         }
-        expected_seq = element.last_seq.saturating_add(1);
+        expected_seq = element
+            .last_seq
+            .checked_add(1)
+            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
         previous_tag = Some(element.final_tag.clone());
     }
 
     if expected_seq.saturating_sub(1) != export.global_last_seq {
         return Err(AuditError::Poisoned(PoisonReason::ExportCoverageInvalid));
     }
-    if export.complete != (holes == 0) {
+    if export.complete != (holes == 0 && withheld == 0) {
         return Err(AuditError::Poisoned(PoisonReason::ExportCoverageInvalid));
     }
 
@@ -532,6 +584,61 @@ pub(crate) fn verify_export_with_keyring(
         global_first_seq: export.global_first_seq,
         global_last_seq: export.global_last_seq,
         unauthenticated_generations: unauthenticated,
+        withheld_generations: withheld,
         witness_state: export.witness_state,
     })
+}
+
+fn reject_export_shape(dir: &Path, export: &ExportManifest) -> AuditResult<()> {
+    let allowed_top_level: &[&str] = if export.schema == EXPORT_SCHEMA_V1 {
+        &["anchor.json", "export-manifest.json", "journal.jsonl"]
+    } else {
+        &["export-manifest.json", "generations", "manifest.json"]
+    };
+    let entries = std::fs::read_dir(dir)
+        .map_err(|error| AuditError::Io(format!("read export directory: {error}")))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| AuditError::Io(format!("read export entry: {error}")))?;
+        let path = entry.path();
+        files::reject_symlink(&path)?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !allowed_top_level.iter().any(|allowed| *allowed == name) {
+            return Err(AuditError::Poisoned(PoisonReason::ExportCoverageInvalid));
+        }
+        if name == "generations" {
+            files::reject_symlink(&path)?;
+            let generation_entries = std::fs::read_dir(&path)
+                .map_err(|error| AuditError::Io(format!("read exported generations: {error}")))?;
+            for generation_entry in generation_entries {
+                let generation_entry = generation_entry.map_err(|error| {
+                    AuditError::Io(format!("read exported generation: {error}"))
+                })?;
+                let generation_path = generation_entry.path();
+                files::reject_symlink(&generation_path)?;
+                let generation_id = generation_entry.file_name().to_string_lossy().to_string();
+                if !valid_generation_id(&generation_id)
+                    || !export.coverage.iter().any(|element| {
+                        element.kind == CoverageKind::Generation
+                            && element.generation_id == generation_id
+                    })
+                {
+                    return Err(AuditError::Poisoned(PoisonReason::ExportCoverageInvalid));
+                }
+                let files_in_generation = std::fs::read_dir(&generation_path).map_err(|error| {
+                    AuditError::Io(format!("read exported generation files: {error}"))
+                })?;
+                for file_entry in files_in_generation {
+                    let file_entry = file_entry.map_err(|error| {
+                        AuditError::Io(format!("read exported generation file: {error}"))
+                    })?;
+                    files::reject_symlink(&file_entry.path())?;
+                    let file_name = file_entry.file_name().to_string_lossy().to_string();
+                    if file_name != "anchor.json" && file_name != "journal.jsonl" {
+                        return Err(AuditError::Poisoned(PoisonReason::ExportCoverageInvalid));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }

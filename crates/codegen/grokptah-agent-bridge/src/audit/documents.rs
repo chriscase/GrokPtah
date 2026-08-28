@@ -81,6 +81,7 @@ pub enum EntryOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum EntryReason {
     HostRestartInterrupted,
+    HostShutdown,
     GenerationSealing,
     GenerationOpened,
     RecoveryTornTail,
@@ -88,6 +89,7 @@ pub enum EntryReason {
     RetentionIntent,
     RetentionOutcome,
     LegacyImported,
+    LegacyWrittenAfterCutover,
     Unauthenticated,
     ForbiddenScope,
     StaleRevision,
@@ -126,6 +128,8 @@ pub struct AuditRecord {
     pub outcome: EntryOutcome,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reason: Option<EntryReason>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub actor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -238,6 +242,8 @@ pub struct Manifest {
     pub global_last_seq_floor: u64,
     pub generations: Vec<GenerationDescriptor>,
     pub tombstones: Vec<Tombstone>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_divergence_digests: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub mac: String,
@@ -294,10 +300,14 @@ pub struct Anchor {
     pub last_seq: u64,
     pub last_tag: String,
     pub journal_bytes: u64,
-    pub open_intents: u64,
+    /// Keyed producer identities recorded as intent but not yet closed by
+    /// their own outcome.
+    pub open_intent_ids: Vec<String>,
     pub updated_at: DateTime<Utc>,
     pub mac: String,
 }
+
+pub const MAX_TRACKED_INTENTS: usize = 256;
 
 impl Anchor {
     pub(crate) fn seal(&mut self, keys: &AuditKeys) -> AuditResult<()> {

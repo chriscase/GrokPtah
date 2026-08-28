@@ -60,11 +60,11 @@ mod tests;
 pub use documents::{
     Anchor, AuditRecord, EntryOutcome, EntryPhase, EntryReason, GapRecord, GenerationDescriptor,
     GenerationState, Manifest, RecoveryEvidence, RetentionReason, RotationReason, SequenceOrigin,
-    Tombstone, MAX_LINE_BYTES,
+    Tombstone, MAX_LINE_BYTES, MAX_TRACKED_INTENTS,
 };
 pub use export::{
     verify_export, CoverageElement, CoverageKind, ExportFormat, ExportManifest, ExportReceipt,
-    ExportVerification,
+    ExportVerification, WithheldReason,
 };
 pub use keys::{AuditKeyCustody, AuditKeyMode, AuditKeys};
 #[cfg(test)]
@@ -110,6 +110,7 @@ pub enum PoisonReason {
     KeyUnavailable,
     RollbackDetected,
     PartialPersistence,
+    SequenceExhausted,
 }
 
 impl PoisonReason {
@@ -144,6 +145,7 @@ impl PoisonReason {
             Self::KeyUnavailable => "key_unavailable",
             Self::RollbackDetected => "rollback_detected",
             Self::PartialPersistence => "partial_persistence",
+            Self::SequenceExhausted => "sequence_exhausted",
         }
     }
 }
@@ -167,6 +169,9 @@ pub enum RefuseReason {
     ExportSealInvalid,
     ExportV1IncompatibleMultiGeneration,
     EntryTooLarge,
+    IntentTrackingFull,
+    IntentNotOpen,
+    IntentIdentityRequired,
 }
 
 impl RefuseReason {
@@ -182,6 +187,9 @@ impl RefuseReason {
             Self::ExportSealInvalid => "export_seal_invalid",
             Self::ExportV1IncompatibleMultiGeneration => "export_v1_incompatible_multi_generation",
             Self::EntryTooLarge => "entry_too_large",
+            Self::IntentTrackingFull => "intent_tracking_full",
+            Self::IntentNotOpen => "intent_not_open",
+            Self::IntentIdentityRequired => "intent_identity_required",
         }
     }
 }
