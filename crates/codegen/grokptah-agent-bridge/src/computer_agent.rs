@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::computer_profile::{
     AdaptiveObservationAdapter, AdaptiveProfile, SemanticHeadlessAdapter, TurnPermit,
+    VisualGroundingAdapter,
 };
 use crate::computer_use::{
     ActionClass, ComputerAction, ComputerObservation, ComputerUseLimits, SemanticAction,
@@ -38,8 +39,6 @@ pub struct RenderedObservation {
 pub(crate) struct ProposalOutcome {
     pub proposal: ComputerAgentProposal,
     pub rendered: RenderedObservation,
-    pub prompt_tokens: Option<u64>,
-    pub completion_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,18 +281,23 @@ pub fn render_computer_observation(
     observation: &ComputerObservation,
     profile: AdaptiveProfile,
 ) -> (serde_json::Value, RenderedObservation) {
-    let rendered = match SemanticHeadlessAdapter.render(observation, profile.budget(), None) {
-        Ok(rendered) => rendered,
-        Err(error) => {
-            return (
-                serde_json::json!({
-                "error": "observation_unavailable",
-                "code": format!("{:?}", error.code),
-                }),
-                RenderedObservation::default(),
-            );
-        }
-    };
+    let rendered =
+        match if profile.requires_independent_verifier() && observation.screenshot.is_some() {
+            VisualGroundingAdapter.render(observation, profile.budget(), None)
+        } else {
+            SemanticHeadlessAdapter.render(observation, profile.budget(), None)
+        } {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                return (
+                    serde_json::json!({
+                    "error": "observation_unavailable",
+                    "code": format!("{:?}", error.code),
+                    }),
+                    RenderedObservation::default(),
+                );
+            }
+        };
     let bytes = serde_json::to_vec(&rendered.semantic)
         .map(|bytes| bytes.len() as u64)
         .unwrap_or(0);
@@ -368,13 +372,6 @@ pub(crate) async fn propose_semantic_action_with_profile(
         |_| {},
     )
     .await?;
-    let (prompt_tokens, completion_tokens) = match &step {
-        AgentStep::Final { usage, .. } | AgentStep::ToolCalls { usage, .. } => {
-            usage.as_ref().map_or((None, None), |usage| {
-                (Some(usage.prompt_tokens), Some(usage.completion_tokens))
-            })
-        }
-    };
     let call = one_tool_call(step, PROPOSAL_TOOL)?;
     if call.arguments.len() as u64 > permit.budget.max_response_bytes {
         bail!("model response exceeds the active profile response ceiling");
@@ -384,8 +381,6 @@ pub(crate) async fn propose_semantic_action_with_profile(
     Ok(ProposalOutcome {
         proposal,
         rendered: accounting,
-        prompt_tokens,
-        completion_tokens,
     })
 }
 

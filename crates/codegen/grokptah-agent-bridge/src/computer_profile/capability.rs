@@ -145,10 +145,6 @@ impl CapabilityEvidence {
         }
     }
 
-    pub(crate) fn authority(&self) -> Option<&AdaptiveAuthoritySnapshot> {
-        self.authority.as_ref()
-    }
-
     pub(crate) fn bind_authority(&mut self, authority: AdaptiveAuthoritySnapshot) {
         self.authority = Some(authority);
     }

@@ -201,11 +201,13 @@ impl AdaptiveObservationAdapter for VisualGroundingAdapter {
 
 /// Host-issued route marker for a visual adapter. It has no public constructor
 /// because guest isolation is an authority decision, not model metadata.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IsolatedGuestRoute {
     pub(crate) route_generation: u64,
 }
 
+#[allow(dead_code)]
 impl IsolatedGuestRoute {
     pub(crate) const fn new_for_host(route_generation: u64) -> Self {
         Self { route_generation }

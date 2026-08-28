@@ -49,6 +49,7 @@ impl fmt::Debug for PrincipalGenerationRef {
     }
 }
 
+#[allow(dead_code)]
 impl PrincipalGenerationRef {
     pub(crate) fn issued(value: impl Into<String>) -> Result<Self, AuthorityFailure> {
         let value = value.into();
@@ -73,6 +74,7 @@ impl fmt::Debug for CapabilityGenerationRef {
     }
 }
 
+#[allow(dead_code)]
 impl CapabilityGenerationRef {
     pub(crate) fn issued(value: impl Into<String>) -> Result<Self, AuthorityFailure> {
         let value = value.into();
@@ -137,10 +139,6 @@ impl AdaptiveAuthoritySnapshot {
 
     pub(crate) fn capability_reference(&self) -> &str {
         self.capability.as_str()
-    }
-
-    pub(crate) fn principal_reference(&self) -> &str {
-        self.principal.as_str()
     }
 
     pub(crate) fn principal(&self) -> PrincipalGenerationRef {
