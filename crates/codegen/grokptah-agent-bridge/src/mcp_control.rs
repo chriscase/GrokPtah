@@ -131,6 +131,7 @@ struct LiveStreamState {
     end_seq: Option<u64>,
     receiver: EventReceiver,
     last_seq: u64,
+    observed_global_seq: u64,
     replay_cursor: Option<u64>,
     pending: VecDeque<Bytes>,
     heartbeat: tokio::time::Interval,
@@ -276,6 +277,16 @@ impl LiveStreamState {
                         self.done = true;
                         continue;
                     }
+                    let observed_now = self.orch.bus().current_seq();
+                    if observed_now.saturating_sub(self.observed_global_seq)
+                        > LIVE_STREAM_REPLAY_WINDOW
+                    {
+                        self.queue_recovery(
+                            "live event subscriber fell behind the bounded replay window; resynchronize from the durable journal",
+                        );
+                        continue;
+                    }
+                    self.observed_global_seq = observed_now;
                     let Some((seq, update)) = event else {
                         self.done = true;
                         continue;
@@ -774,6 +785,7 @@ async fn streamable_get_handler(
         end_seq: scope.end_seq,
         receiver,
         last_seq,
+        observed_global_seq: state.orch.bus().current_seq(),
         replay_cursor: None,
         pending: VecDeque::new(),
         heartbeat: tokio::time::interval(Duration::from_secs(10)),
