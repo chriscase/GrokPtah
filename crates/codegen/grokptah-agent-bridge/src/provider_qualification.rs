@@ -813,6 +813,13 @@ async fn completion(
         if status == reqwest::StatusCode::UNAUTHORIZED
             && credentials.refresh_after_unauthorized().await?
         {
+            idempotency_key = restart_qualification_attempt_after_body_change(
+                &mut provider_attempt,
+                &mut permit,
+                &qualification_provider_attempt_id(base_url, credentials, false),
+                &serde_json::to_vec(&body)?,
+                status.as_u16(),
+            )?;
             continue;
         }
         if status.as_u16() == 400 && allow_tool_choice_fallback && !removed_tool_choice {
@@ -839,6 +846,13 @@ async fn completion(
                     status.as_u16()
                 );
             }
+            idempotency_key = restart_qualification_attempt_after_body_change(
+                &mut provider_attempt,
+                &mut permit,
+                &qualification_provider_attempt_id(base_url, credentials, false),
+                &serde_json::to_vec(&body)?,
+                status.as_u16(),
+            )?;
             tokio::time::sleep(Duration::from_millis(100 * (1 << transient_retries))).await;
             transient_retries += 1;
             continue;
@@ -886,7 +900,7 @@ async fn streaming_probe(
         "stream": true
     });
     let request_bytes = serde_json::to_vec(&body).context("serialize provider stream request")?;
-    let provider_attempt = provider_attempt
+    let mut provider_attempt = provider_attempt
         .acquire_next_effect_lease()
         .map_err(|error| anyhow!("allocate qualification stream effect lease: {error}"))?;
     let mut permit = Some(
@@ -898,7 +912,7 @@ async fn streaming_probe(
             )
             .map_err(|error| anyhow!("admit provider stream qualification: {error}"))?,
     );
-    let idempotency_key = permit
+    let mut idempotency_key = permit
         .as_ref()
         .map(|permit| permit.idempotency_key().to_owned())
         .ok_or_else(|| anyhow!("provider stream permit is unavailable"))?;
@@ -937,6 +951,13 @@ async fn streaming_probe(
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
             && credentials.refresh_after_unauthorized().await?
         {
+            idempotency_key = restart_qualification_attempt_after_body_change(
+                &mut provider_attempt,
+                &mut permit,
+                &qualification_provider_attempt_id(base_url, credentials, true),
+                &request_bytes,
+                response.status().as_u16(),
+            )?;
             continue;
         }
         break response;
