@@ -271,22 +271,50 @@ impl OrchestrationService {
             auth_registry = AuthRegistry::unavailable(store.root(), error.to_string());
         }
         let allowlist = config.allowlist.clone();
-        let legacy_session_ids = host
-            .list_all_sessions()
-            .into_iter()
+        let existing_sessions = host.list_all_sessions();
+        let allowlisted_session_ids = existing_sessions
+            .iter()
             .filter(|session| {
                 session.kind == SessionKind::Build
                     && !session.cwd.is_empty()
                     && allowlist.contains(Path::new(&session.cwd))
             })
             .map(|session| session.id)
+            .collect::<HashSet<_>>();
+        let mut legacy_resources = allowlisted_session_ids
+            .iter()
+            .map(|session_id| format!("session:{session_id}"))
             .collect::<Vec<_>>();
-        if !legacy_session_ids.is_empty() && !auth_credentials.is_empty() {
+        if let Ok(runs) = store.list_runs() {
+            legacy_resources.extend(
+                runs.into_iter()
+                    .filter(|run| {
+                        allowlisted_session_ids.contains(&run.session_id)
+                            && allowlist.contains(Path::new(&run.workspace))
+                    })
+                    .map(|run| format!("run:{}", run.run_id)),
+            );
+        }
+        if let Ok(agents) = store.list_agents() {
+            legacy_resources.extend(
+                agents
+                    .into_iter()
+                    .filter(|agent| {
+                        allowlist.contains(Path::new(&agent.workspace))
+                            && agent
+                                .known_lane_ids()
+                                .iter()
+                                .any(|session_id| allowlisted_session_ids.contains(session_id))
+                    })
+                    .map(|agent| format!("agent:{}", agent.agent_id)),
+            );
+        }
+        if !legacy_resources.is_empty() && !auth_credentials.is_empty() {
             if let Err(error) =
                 auth_registry
                     .primary_context(&auth_credentials)
                     .and_then(|primary| {
-                        auth_registry.migrate_legacy_session_bindings(&legacy_session_ids, &primary)
+                        auth_registry.claim_resource_bindings(&legacy_resources, &primary)
                     })
             {
                 auth_registry = AuthRegistry::unavailable(store.root(), error.to_string());
@@ -7495,6 +7523,10 @@ impl OrchestrationService {
                 ));
             }
         };
+        if let Err(error) = self.ensure_resource_binding(auth, format!("agent:{}", agent.agent_id))
+        {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
         let agent_bounds = match agent.current_spec() {
             Ok(spec) => &spec.default_run_bounds,
             Err(error) => {

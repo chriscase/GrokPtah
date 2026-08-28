@@ -907,18 +907,6 @@ impl AuthRegistry {
         })
     }
 
-    pub(crate) fn migrate_legacy_session_bindings(
-        &mut self,
-        session_ids: &[Uuid],
-        auth: &AuthContext,
-    ) -> Result<(), OrchError> {
-        let resources = session_ids
-            .iter()
-            .map(|session_id| format!("session:{session_id}"))
-            .collect::<Vec<_>>();
-        self.claim_resource_bindings(&resources, auth)
-    }
-
     pub(crate) fn verify_resource_binding(
         &mut self,
         resource: &str,
@@ -1286,13 +1274,17 @@ fn reconcile_state(
         let fingerprint = credential_fingerprint(credential.token());
         if !record.credential_fingerprint.is_empty() && record.credential_fingerprint != fingerprint
         {
+            let old_owner = ownership_digest_for_record(&record);
             let old_authority = authority_digest_for_record(
                 &record,
                 state.policy_revision,
                 state.capability_generation,
             );
             record.generation = allocate_generation(state)?;
+            record.incarnation = hex_sha256(&Uuid::new_v4().into_bytes());
             invalidate_effect_leases(state, &old_authority);
+            let new_owner = ownership_digest_for_record(&record);
+            migrate_binding_digest(state, &old_owner, &new_owner);
             changed = true;
         }
         if record.credential_fingerprint != fingerprint {
@@ -1562,6 +1554,30 @@ fn authority_digest_for_record(
     bytes.extend_from_slice(&policy_revision.to_be_bytes());
     bytes.extend_from_slice(&capability_generation.to_be_bytes());
     hex_sha256(&bytes)
+}
+
+fn ownership_digest_for_record(record: &StoredCredential) -> String {
+    let Some(principal) = decode_fixed_hex(&record.principal) else {
+        return String::new();
+    };
+    let Some(incarnation) = decode_fixed_hex(&record.incarnation) else {
+        return String::new();
+    };
+    let mut bytes = Vec::with_capacity(32);
+    bytes.extend_from_slice(&principal);
+    bytes.extend_from_slice(&incarnation);
+    hex_sha256(&bytes)
+}
+
+fn migrate_binding_digest(state: &mut StoredAuthority, old: &str, new: &str) {
+    if old.is_empty() || old == new {
+        return;
+    }
+    for digest in state.bindings.values_mut() {
+        if digest == old {
+            *digest = new.to_string();
+        }
+    }
 }
 
 fn invalidate_effect_leases(state: &mut StoredAuthority, authority_digest: &str) {
@@ -1853,6 +1869,12 @@ mod tests {
         let before = registry
             .authenticate(Some("Bearer old-secret"), &[old])
             .unwrap();
+        registry
+            .ensure_resource_binding("run:rotation", &before)
+            .unwrap();
+        let lease = registry
+            .mint_effect_lease(&before, "provider:rotation")
+            .unwrap();
         let rotated = AuthCredential::new("primary", "new-secret").unwrap();
         registry
             .set_credentials(std::slice::from_ref(&rotated), "account-1")
@@ -1860,10 +1882,16 @@ mod tests {
         let after = registry
             .authenticate(Some("Bearer new-secret"), &[rotated])
             .unwrap();
-        assert_eq!(before.actor_handle(), after.actor_handle());
-        assert_eq!(before.binding_digest(), after.binding_digest());
+        assert_ne!(before.actor_handle(), after.actor_handle());
+        assert_ne!(before.binding_digest(), after.binding_digest());
         assert!(registry.require_current(&before).is_err());
         assert!(registry.require_current(&after).is_ok());
+        assert!(registry
+            .ensure_resource_binding("run:rotation", &after)
+            .is_ok());
+        assert!(registry
+            .consume_effect_lease(&after, &lease, "provider:rotation")
+            .is_err());
         let durable = std::fs::read_to_string(root.path().join(AUTHORITY_FILE)).unwrap();
         assert!(!durable.contains("old-secret"));
         assert!(!durable.contains("new-secret"));

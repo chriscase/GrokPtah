@@ -97,10 +97,11 @@ async fn rotation_and_reincarnation_fence_session_work_and_queue_resources() {
         .unwrap();
     let run_id = run["runId"].as_str().unwrap().to_string();
 
-    // Explicit same-incarnation secret rotation is the continuity path.
+    // Credential-material rotation gets a fresh incarnation while an explicit
+    // ownership migration keeps existing resources available to the new auth.
     orch.set_token("rotated-secret-477".into());
     let rotated = orch.auth_header(Some("Bearer rotated-secret-477")).unwrap();
-    assert_eq!(primary.actor_handle(), rotated.actor_handle());
+    assert_ne!(primary.actor_handle(), rotated.actor_handle());
     assert!(orch
         .get_work_scoped(&rotated, session_id, workspace_path, &work_id)
         .is_ok());
