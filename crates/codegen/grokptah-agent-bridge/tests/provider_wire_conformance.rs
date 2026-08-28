@@ -224,6 +224,8 @@ fn physical_provider_tool_and_qualification_boundaries_never_issue() {
         .and_then(|body| body.split("fn sha256_hex").next())
         .expect("provider boundary");
     assert!(!provider_boundary.contains(".issue("));
+    assert!(!provider_boundary.contains("#[cfg(test)]"));
+    assert!(!provider_boundary.contains("install_test_"));
     assert!(!provider_boundary.contains("provider-qualification"));
 
     let qualification_source = std::fs::read_to_string(manifest.join("src/provider_qualification.rs"))
@@ -234,6 +236,8 @@ fn physical_provider_tool_and_qualification_boundaries_never_issue() {
         .and_then(|body| body.split("fn install_test_qualification_envelope").next())
         .expect("qualification boundary");
     assert!(!qualification_boundary.contains(".issue("));
+    assert!(!qualification_boundary.contains("#[cfg(test)]"));
+    assert!(!qualification_boundary.contains("install_test_"));
     assert!(!qualification_boundary.contains("provider-qualification"));
 
     let host_source =
