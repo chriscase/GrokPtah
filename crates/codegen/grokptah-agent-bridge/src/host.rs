@@ -26,15 +26,15 @@ use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
     auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
-    call_xai_agent_step_observed, call_xai_agent_step_observed_with_authority, call_xai_chat,
-    cargo_test_failure_coaching, cargo_test_output_failed, cargo_test_output_passed,
-    cargo_test_reverify_coaching, coding_agent_tools, count_cargo_test_failures, emit_message,
-    emit_thought, filter_tools_batch_edit_only, filter_tools_edit_and_shell,
-    filter_tools_edit_only, is_incomplete_stop_message, is_round_limit_stop_message,
-    is_true_noop_tool_step, multi_failure_partial_edit_coaching, normalize_sandbox_profile,
-    offline_plan_steps, parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model,
-    push_assistant, push_thought, push_tool, recovery_round_limit_stop_message,
-    resolve_turn_max_rounds, round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
+    call_xai_agent_step_observed_with_authority, call_xai_chat, cargo_test_failure_coaching,
+    cargo_test_output_failed, cargo_test_output_passed, cargo_test_reverify_coaching,
+    coding_agent_tools, count_cargo_test_failures, emit_message, emit_thought,
+    filter_tools_batch_edit_only, filter_tools_edit_and_shell, filter_tools_edit_only,
+    is_incomplete_stop_message, is_round_limit_stop_message, is_true_noop_tool_step,
+    multi_failure_partial_edit_coaching, normalize_sandbox_profile, offline_plan_steps,
+    parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model, push_assistant,
+    push_thought, push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
+    round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
     should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
     surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
     IdenticalToolCallRun, McpToolIndex,
@@ -10371,7 +10371,13 @@ impl AgentHostHandle {
                 };
             let provider_observation = self.provider_observation_context(session_id);
             let (capability_principal, capability_policy) =
-                self.computer_capability_identity(session_id)?;
+                match self.computer_capability_identity(session_id) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        last = format!("GP subagent capability admission failed: {error:#}");
+                        break;
+                    }
+                };
             let step = call_xai_agent_step_observed_with_authority(
                 &creds,
                 &model,

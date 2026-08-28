@@ -14,7 +14,8 @@ use crate::computer_use::{
 };
 use crate::gateway_config::{CapabilitySource, ComputerUseTier};
 use crate::host_helpers::{
-    call_xai_agent_step_observed_with_authority, resolve_model_target, AgentStep, AgentToolCall,
+    call_xai_agent_step, call_xai_agent_step_observed_with_authority, resolve_model_target,
+    AgentStep, AgentToolCall,
 };
 use crate::types::EffortLevel;
 
