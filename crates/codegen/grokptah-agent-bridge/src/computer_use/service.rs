@@ -928,7 +928,13 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
+    use crate::computer_profile::capability::{
+        CapabilityAttribution, HostCapabilityEvidence, ModelCapabilityEvidence,
+    };
+    use crate::computer_profile::policy::{PolicyOutcome, TaskPolicy};
+    use crate::computer_profile::{AdaptiveController, AdaptiveProfile, TaskRisk};
     use crate::computer_use::{ActionClass, ComputerCapabilities, EvidenceRef, SimulatorBackend};
+    use crate::gateway_config::ComputerUseTier;
 
     #[derive(Debug, Default)]
     struct BlockingBackend {
@@ -1106,6 +1112,133 @@ mod tests {
             uses_remaining: Some(8),
             revoked_at: None,
         }
+    }
+
+    fn adaptive_state_for_envelope() -> crate::computer_profile::AdaptiveRunState {
+        let evidence = crate::computer_profile::CapabilityEvidence::with_authority(
+            ModelCapabilityEvidence {
+                tools: true,
+                image_input: true,
+                max_image_bytes: Some(4 * 1024 * 1024),
+                tier: ComputerUseTier::VisualFallbackAct,
+                attribution: CapabilityAttribution::Measured,
+                durable_authority: true,
+                session_measured: false,
+                synthetic_only: false,
+            },
+            HostCapabilityEvidence {
+                semantic_observation: true,
+                screenshot_capture: true,
+                independent_verifier: true,
+                isolated_guest: true,
+            },
+            crate::computer_profile::authority_seam::test_binding(),
+        );
+        let PolicyOutcome::Proceed(decision) = crate::computer_profile::AdaptivePolicyEngine
+            .select(
+                &evidence,
+                TaskPolicy {
+                    risk: TaskRisk::Routine,
+                    minimum_profile: Some(AdaptiveProfile::Economy),
+                },
+            )
+        else {
+            panic!("envelope fixture should proceed");
+        };
+        let mut controller = AdaptiveController::new("run", decision);
+        controller.bind_objective_digest("a".repeat(64));
+        controller.bind_effect_authority();
+        let mut state = controller.into_state();
+        // Model the receipt already settled by the canonical transport. The
+        // test only exercises the service's effect-time CAS, not receipt
+        // authoring.
+        state.provider_attempt_reference = Some("attempt-1".into());
+        state.spend.model_calls = 1;
+        state.spend.provider_attempts = 1;
+        assert!(state.validate());
+        state
+    }
+
+    #[tokio::test]
+    async fn adaptive_envelope_rejects_a_risk_change_at_effect_time() {
+        let (_backend, service) = service();
+        let owner = Uuid::new_v4();
+        let run = service
+            .create_run(
+                "create-envelope-risk-cas",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize(
+                "grant-envelope-risk-cas",
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
+            .unwrap();
+        let observation = service
+            .observe("observe-envelope-risk-cas", &run.run_id, run.version)
+            .await
+            .unwrap();
+        let state = adaptive_state_for_envelope();
+        let current = service
+            .store
+            .update_run(&run.run_id, |stored| {
+                stored.adaptive = Some(state.clone());
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        let action = ComputerAction::SetValue {
+            element_id: format!("{}-name", observation.observation_id),
+            text: "Ada".into(),
+        };
+        let envelope = service
+            .issue_execution_envelope(
+                &run.run_id,
+                current.version,
+                &observation.observation_id,
+                &action,
+            )
+            .unwrap();
+
+        let mut elevated = AdaptiveController::from_state(state).unwrap();
+        assert_eq!(
+            elevated.enforce_risk_floor(TaskRisk::Consequential),
+            Some(crate::computer_profile::ProfileTransition::Escalate {
+                from: AdaptiveProfile::Economy,
+                to: AdaptiveProfile::Balanced,
+                reason: crate::computer_profile::ProfileReason::ConsequentialIntent,
+            })
+        );
+        let mut tampered = current.clone();
+        tampered.adaptive = Some(elevated.into_state());
+        let path = service.store.root().join("runs").join(format!(
+            "{}.json",
+            crate::orchestration::safe_id_filename(&run.run_id).unwrap()
+        ));
+        std::fs::write(path, serde_json::to_string(&tampered).unwrap()).unwrap();
+
+        let error = service
+            .act_with_envelope(
+                "act-envelope-risk-cas",
+                &run.run_id,
+                current.version,
+                &observation.observation_id,
+                action,
+                envelope,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::Unauthorized);
+        assert_eq!(
+            service.get_run(&run.run_id).unwrap().unwrap().action_count,
+            0
+        );
     }
 
     #[tokio::test]
