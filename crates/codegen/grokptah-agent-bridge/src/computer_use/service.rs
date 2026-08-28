@@ -1252,7 +1252,6 @@ mod tests {
             }
             let audit =
                 crate::orchestration::OrchStore::open(dir.path().join("orchestration")).unwrap();
-            eprintln!("reconciling create cut {point:?}");
             let service = ComputerUseService::new_with_audit_store(
                 Arc::new(SimulatorBackend::new()),
                 ComputerStore::open(dir.path().join("computer-use")).unwrap(),
@@ -1287,6 +1286,7 @@ mod tests {
         ] {
             let dir = tempdir().unwrap();
             let run_id;
+            let expected_version;
             {
                 let service = audited_service_at(dir.path());
                 let run = service
@@ -1299,6 +1299,7 @@ mod tests {
                     )
                     .unwrap();
                 run_id = run.run_id.clone();
+                expected_version = run.version;
                 let run = service
                     .authorize("backend-authorize", &run.run_id, run.version, grant(&run))
                     .unwrap();
@@ -1316,7 +1317,7 @@ mod tests {
                 audit.clone(),
             );
             let error = service
-                .observe("backend-observe", &run_id, 0)
+                .observe("backend-observe", &run_id, expected_version)
                 .await
                 .unwrap_err();
             assert_eq!(error.code, ComputerErrorCode::UncertainOutcome);
