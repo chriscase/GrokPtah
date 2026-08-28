@@ -124,6 +124,11 @@ pub struct SamplerConfig {
     /// Per-request header injector (e.g. OTel traceparent). Called in `post()`.
     #[serde(skip)]
     pub header_injector: Option<SharedHeaderInjector>,
+
+    /// Host-issued provider-attempt admission. A sampler client without this
+    /// context refuses every credential-bearing provider request.
+    #[serde(skip)]
+    pub provider_attempt: Option<xai_provider_attempt::AttemptContext>,
 }
 
 impl Default for SamplerConfig {
@@ -158,6 +163,7 @@ impl Default for SamplerConfig {
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             header_injector: None,
+            provider_attempt: None,
         }
     }
 }

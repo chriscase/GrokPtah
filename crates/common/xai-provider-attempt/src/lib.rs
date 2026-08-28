@@ -97,6 +97,13 @@ impl AuthorityBinding {
     pub fn same_as(&self, other: &Self) -> bool {
         self == other
     }
+
+    fn same_live_as(&self, other: &Self) -> bool {
+        self.principal_incarnation == other.principal_incarnation
+            && self.auth_generation == other.auth_generation
+            && self.capability_generation == other.capability_generation
+            && self.effect_scope == other.effect_scope
+    }
 }
 
 impl fmt::Debug for AuthorityBinding {
@@ -177,6 +184,40 @@ impl fmt::Debug for AttemptSpec {
     }
 }
 
+/// Durable canonical authority snapshot written by the trusted host authority
+/// assembler. This type is intentionally private: downstream crates can only
+/// obtain an `AttemptContext` by reading the host-owned snapshot from the
+/// attempt store.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HostAuthorityRecord {
+    principal_incarnation: String,
+    auth_generation: u64,
+    capability_generation: u64,
+    effect_lease_id: String,
+    effect_scope: String,
+    #[serde(default)]
+    revoked_effect_lease_ids: Vec<String>,
+}
+
+impl HostAuthorityRecord {
+    fn binding(&self) -> Result<AuthorityBinding, AttemptError> {
+        AuthorityBinding::new(
+            self.principal_incarnation.clone(),
+            self.auth_generation,
+            self.capability_generation,
+            self.effect_lease_id.clone(),
+            self.effect_scope.clone(),
+        )
+    }
+
+    fn lease_revoked(&self, lease_id: &str) -> bool {
+        self.revoked_effect_lease_ids
+            .iter()
+            .any(|revoked| revoked == lease_id)
+    }
+}
+
 /// A safe public projection. No authority values, raw request key, body,
 /// endpoint, credential, or diagnostic is represented here.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -185,61 +226,6 @@ pub struct AttemptProjection {
     pub attempt_id: String,
     pub send_state: SendState,
     pub provider_request_id: String,
-}
-
-/// Snapshot supplied by the canonical host adapter. The adapter must source
-/// these values from the live principal (#477) and capability/effect lease
-/// authorities; the ledger never accepts an `AuthorityBinding` from callers.
-#[derive(Clone, Eq, PartialEq)]
-pub struct CanonicalHostAuthority {
-    principal_incarnation: String,
-    auth_generation: u64,
-    capability_generation: u64,
-    effect_lease_id: String,
-    effect_scope: String,
-}
-
-impl fmt::Debug for CanonicalHostAuthority {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CanonicalHostAuthority")
-            .field("principal_incarnation", &"[redacted]")
-            .field("auth_generation", &"[redacted]")
-            .field("capability_generation", &"[redacted]")
-            .field("effect_lease_id", &"[redacted]")
-            .field("effect_scope", &"[redacted]")
-            .finish()
-    }
-}
-
-impl CanonicalHostAuthority {
-    /// Construct the opaque authority token only at the trusted host-adapter
-    /// boundary. Callers must pass snapshots obtained from the canonical
-    /// #477 principal/incarnation/auth authority and #458 capability/effect
-    /// lease authority; the token's fields cannot be constructed downstream.
-    #[doc(hidden)]
-    #[cfg(feature = "trusted-host-adapter")]
-    pub fn from_trusted_host_adapter(
-        principal_incarnation: impl Into<String>,
-        auth_generation: u64,
-        capability_generation: u64,
-        effect_lease_id: impl Into<String>,
-        effect_scope: impl Into<String>,
-    ) -> Result<Self, AttemptError> {
-        AuthorityBinding::new(
-            principal_incarnation,
-            auth_generation,
-            capability_generation,
-            effect_lease_id,
-            effect_scope,
-        )
-        .map(|binding| Self {
-            principal_incarnation: binding.principal_incarnation,
-            auth_generation: binding.auth_generation,
-            capability_generation: binding.capability_generation,
-            effect_lease_id: binding.effect_lease_id,
-            effect_scope: binding.effect_scope,
-        })
-    }
 }
 
 /// Provider truth supplied by an explicit operator-authorized reconciliation.
@@ -388,7 +374,17 @@ pub struct AttemptContext {
     store: ProviderAttemptStore,
     operation_id: String,
     authority: AuthorityBinding,
-    revalidate: Arc<dyn Fn() -> Option<AuthorityBinding> + Send + Sync>,
+    authority_scope: String,
+}
+
+impl fmt::Debug for AttemptContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AttemptContext")
+            .field("operation_id", &"[redacted]")
+            .field("authority_scope", &"[redacted]")
+            .field("authority", &"[redacted]")
+            .finish()
+    }
 }
 
 impl AttemptContext {
@@ -397,48 +393,32 @@ impl AttemptContext {
         store: ProviderAttemptStore,
         operation_id: impl Into<String>,
         authority: AuthorityBinding,
-        revalidate: Arc<dyn Fn() -> Option<AuthorityBinding> + Send + Sync>,
+        authority_scope: impl Into<String>,
     ) -> Result<Self, AttemptError> {
         let operation_id = operation_id.into();
+        let authority_scope = authority_scope.into();
         validate_id(&operation_id, "operation id")?;
+        validate_id(&authority_scope, "authority scope")?;
         Ok(Self {
             store,
             operation_id,
             authority,
-            revalidate,
+            authority_scope,
         })
     }
 
-    /// Construct the host-owned adapter from a live canonical authority
-    /// snapshot. Raw `AuthorityBinding` construction is crate-private; all
-    /// cross-crate adapters must enter through this boundary and provide the
-    /// same live snapshot callback for the final send check.
-    #[cfg(feature = "trusted-host-adapter")]
-    pub fn from_host_authority(
+    /// Construct an adapter from the durable authority snapshot written by the
+    /// assembled host authority module. No downstream authority value or
+    /// revalidation callback is accepted.
+    pub fn from_host_ledger(
         store: ProviderAttemptStore,
         operation_id: impl Into<String>,
-        authority: CanonicalHostAuthority,
-        revalidate: Arc<dyn Fn() -> Option<CanonicalHostAuthority> + Send + Sync>,
+        authority_scope: impl Into<String>,
     ) -> Result<Self, AttemptError> {
-        let binding = AuthorityBinding::new(
-            authority.principal_incarnation,
-            authority.auth_generation,
-            authority.capability_generation,
-            authority.effect_lease_id,
-            authority.effect_scope,
-        )?;
-        let revalidate = Arc::new(move || {
-            let current = revalidate()?;
-            AuthorityBinding::new(
-                current.principal_incarnation,
-                current.auth_generation,
-                current.capability_generation,
-                current.effect_lease_id,
-                current.effect_scope,
-            )
-            .ok()
-        });
-        Self::new(store, operation_id, binding, revalidate)
+        let authority_scope = authority_scope.into();
+        validate_id(&authority_scope, "authority scope")?;
+        let record = store.read_host_authority(&authority_scope)?;
+        Self::new(store, operation_id, record.binding()?, authority_scope)
     }
 
     pub fn prepare(
@@ -463,26 +443,22 @@ impl AttemptContext {
         &self,
         attempt: &ProviderAttempt,
     ) -> Result<PhysicalSendPermit, AttemptError> {
-        let current = match (self.revalidate)() {
-            Some(current) => current,
-            None => {
-                let _ = attempt.cancel_without_send();
-                return Err(AttemptError::InvalidAuthority);
-            }
-        };
-        let permit = match attempt.begin_send(&current) {
+        let current_record = self.store.read_host_authority(&self.authority_scope)?;
+        if current_record.lease_revoked(&self.authority.effect_lease_id) {
+            let _ = attempt.cancel_without_send();
+            return Err(AttemptError::StaleAuthority);
+        }
+        let current = current_record.binding()?;
+        let permit = match attempt.begin_send_live(&current) {
             Ok(permit) => permit,
             Err(error) => {
-                if matches!(
-                    error,
-                    AttemptError::StaleAuthority | AttemptError::EffectLeaseAlreadyUsed
-                ) {
+                if matches!(error, AttemptError::StaleAuthority | AttemptError::EffectLeaseAlreadyUsed) {
                     let _ = attempt.cancel_without_send();
                 }
                 return Err(error);
             }
         };
-        Ok(permit.with_revalidator(self.revalidate.clone(), self.authority.clone()))
+        Ok(permit)
     }
 
     pub fn begin(
@@ -498,7 +474,6 @@ impl AttemptContext {
     /// Start a new logical provider round with a fresh one-use effect lease.
     /// Principal/auth and capability authority remain sourced from this
     /// adapter; the lease is never cloned or replayed across attempts.
-    #[cfg(feature = "trusted-host-adapter")]
     pub fn fork_effect_lease(&self) -> Result<Self, AttemptError> {
         let effect_lease_id = format!("effect-lease-{}", Uuid::new_v4());
         let authority = AuthorityBinding {
@@ -508,17 +483,11 @@ impl AttemptContext {
             effect_lease_id: effect_lease_id.clone(),
             effect_scope: self.authority.effect_scope.clone(),
         };
-        let source = self.revalidate.clone();
-        let revalidate = Arc::new(move || {
-            let mut current = source()?;
-            current.effect_lease_id = effect_lease_id.clone();
-            Some(current)
-        });
         Self::new(
             self.store.clone(),
             self.operation_id.clone(),
             authority,
-            revalidate,
+            self.authority_scope.clone(),
         )
     }
 
@@ -526,7 +495,11 @@ impl AttemptContext {
         &self,
         permit: &PhysicalSendPermit,
     ) -> Result<(), AttemptError> {
-        permit.revalidate_before_physical_write()
+        let current_record = self.store.read_host_authority(&self.authority_scope)?;
+        if current_record.lease_revoked(&permit.authority.effect_lease_id) {
+            return Err(AttemptError::StaleAuthority);
+        }
+        permit.revalidate_live(&current_record.binding()?)
     }
 
     pub fn mark_response_started(
@@ -690,6 +663,25 @@ impl ProviderAttemptStore {
         Ok(Some(projection(&record)))
     }
 
+    fn read_host_authority(
+        &self,
+        authority_scope: &str,
+    ) -> Result<HostAuthorityRecord, AttemptError> {
+        validate_id(authority_scope, "authority scope")?;
+        let path = self
+            .root
+            .join("canonical-authorities")
+            .join(format!("{authority_scope}.json"));
+        let bytes = fs::read(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                AttemptError::InvalidAuthority
+            } else {
+                AttemptError::Io(error.to_string())
+            }
+        })?;
+        serde_json::from_slice(&bytes).map_err(|error| AttemptError::Serialization(error.to_string()))
+    }
+
     pub fn recover_incomplete(&self) -> Result<usize, AttemptError> {
         let mut recovered = 0;
         let entries = fs::read_dir(&*self.root)?;
@@ -792,6 +784,24 @@ impl ProviderAttemptStore {
             failure,
             settlement,
             false,
+            false,
+        )
+    }
+
+    fn transition_live(
+        &self,
+        attempt_id: &str,
+        expected_authority: &AuthorityBinding,
+        to: SendState,
+    ) -> Result<(), AttemptError> {
+        self.transition_internal(
+            attempt_id,
+            Some(expected_authority),
+            to,
+            None,
+            None,
+            false,
+            true,
         )
     }
 
@@ -802,7 +812,7 @@ impl ProviderAttemptStore {
         failure: Option<String>,
         settlement: Option<&ProviderSettlement>,
     ) -> Result<(), AttemptError> {
-        self.transition_internal(attempt_id, None, to, failure, settlement, true)
+        self.transition_internal(attempt_id, None, to, failure, settlement, true, false)
     }
 
     fn transition_internal(
@@ -813,10 +823,17 @@ impl ProviderAttemptStore {
         failure: Option<String>,
         settlement: Option<&ProviderSettlement>,
         explicit_reconciliation: bool,
+        compare_live_authority: bool,
     ) -> Result<(), AttemptError> {
         self.with_locked_record(attempt_id, |record| {
             let mut record = record.ok_or(AttemptError::MissingAttempt)?;
-            if expected_authority.is_some_and(|expected| !record.authority.same_as(expected)) {
+            if expected_authority.is_some_and(|expected| {
+                if compare_live_authority {
+                    !record.authority.same_live_as(expected)
+                } else {
+                    !record.authority.same_as(expected)
+                }
+            }) {
                 return Err(AttemptError::StaleAuthority);
             }
             let is_explicit_reopen = explicit_reconciliation
@@ -961,7 +978,26 @@ impl ProviderAttempt {
             provider_request_key: record.provider_request_key,
             supports_idempotency: record.supports_idempotency,
             authority: record.authority,
-            revalidate: None,
+            completed: false,
+        })
+    }
+
+    pub(crate) fn begin_send_live(
+        &self,
+        current_authority: &AuthorityBinding,
+    ) -> Result<PhysicalSendPermit, AttemptError> {
+        self.store
+            .transition_live(&self.attempt_id, current_authority, SendState::Sending)?;
+        let record = self
+            .store
+            .read_record(&self.attempt_id)?
+            .ok_or(AttemptError::MissingAttempt)?;
+        Ok(PhysicalSendPermit {
+            attempt: self.clone(),
+            provider_request_id: record.provider_request_id,
+            provider_request_key: record.provider_request_key,
+            supports_idempotency: record.supports_idempotency,
+            authority: record.authority,
             completed: false,
         })
     }
@@ -1022,7 +1058,6 @@ pub struct PhysicalSendPermit {
     provider_request_key: String,
     supports_idempotency: bool,
     authority: AuthorityBinding,
-    revalidate: Option<Arc<dyn Fn() -> Option<AuthorityBinding> + Send + Sync>>,
     completed: bool,
 }
 
@@ -1057,25 +1092,11 @@ impl PhysicalSendPermit {
         self.supports_idempotency
     }
 
-    fn with_revalidator(
-        mut self,
-        revalidate: Arc<dyn Fn() -> Option<AuthorityBinding> + Send + Sync>,
-        authority: AuthorityBinding,
-    ) -> Self {
-        self.revalidate = Some(revalidate);
-        self.authority = authority;
-        self
-    }
-
-    /// Re-read canonical principal/capability authority at the final
-    /// physical-write boundary. A stale result is returned before the caller
-    /// may invoke its HTTP transport.
-    pub(crate) fn revalidate_before_physical_write(&self) -> Result<(), AttemptError> {
-        let Some(revalidate) = self.revalidate.as_ref() else {
-            return Ok(());
-        };
-        let current = revalidate().ok_or(AttemptError::InvalidAuthority)?;
-        if !self.authority.same_as(&current) {
+    pub(crate) fn revalidate_live(
+        &self,
+        current: &AuthorityBinding,
+    ) -> Result<(), AttemptError> {
+        if !self.authority.same_live_as(current) {
             return Err(AttemptError::StaleAuthority);
         }
         if self.attempt.state()? != SendState::Sending {

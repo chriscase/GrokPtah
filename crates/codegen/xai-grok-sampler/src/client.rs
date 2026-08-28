@@ -19,7 +19,6 @@ use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
 use serde::Serialize;
-use std::sync::OnceLock;
 
 use xai_grok_sampling_types::error::{parse_error_bytes, try_parse_stream_error};
 use xai_grok_sampling_types::{
@@ -40,69 +39,6 @@ const DEFAULT_CLIENT_IDENTIFIER: &str = "grok-shell";
 /// Product identifier baked into User-Agent strings.
 const AGENT_PRODUCT: &str = "grok-shell";
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 128_000;
-
-static DEFAULT_PROVIDER_ATTEMPT_STORE: OnceLock<xai_provider_attempt::ProviderAttemptStore> =
-    OnceLock::new();
-
-fn default_provider_attempt_context(
-    config: &SamplerConfig,
-) -> Result<xai_provider_attempt::AttemptContext> {
-    let store = if let Some(store) = DEFAULT_PROVIDER_ATTEMPT_STORE.get() {
-        store.clone()
-    } else {
-        let root = std::env::var_os("GROKPTAH_PROVIDER_ATTEMPT_ROOT")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(std::path::PathBuf::from)
-                    .map(|home| home.join(".grokptah"))
-            })
-            .ok_or_else(|| {
-                SamplingError::Auth(
-                    "provider-attempt durable root is unavailable; refusing provider send".into(),
-                )
-            })?
-            .join("orchestration")
-            .join("provider-attempts");
-        let candidate =
-            xai_provider_attempt::ProviderAttemptStore::open(root).map_err(|error| {
-                SamplingError::Auth(format!("open provider-attempt ledger: {error}"))
-            })?;
-        let _ = DEFAULT_PROVIDER_ATTEMPT_STORE.set(candidate);
-        DEFAULT_PROVIDER_ATTEMPT_STORE
-            .get()
-            .cloned()
-            .ok_or_else(|| {
-                SamplingError::Auth(
-                    "provider-attempt durable store could not be installed; refusing provider send"
-                        .into(),
-                )
-            })?
-    };
-    let principal = xai_provider_attempt::AttemptSpec::fingerprint_bytes(
-        config
-            .client_identifier
-            .as_deref()
-            .unwrap_or(DEFAULT_CLIENT_IDENTIFIER)
-            .as_bytes(),
-    );
-    let authority = xai_provider_attempt::CanonicalHostAuthority::from_trusted_host_adapter(
-        format!("sampler-principal-{principal}"),
-        1,
-        1,
-        format!("sampler-effect-lease-{}", uuid::Uuid::new_v4()),
-        format!("sampler-effect-scope-{}", std::process::id()),
-    )
-    .map_err(|error| SamplingError::Auth(format!("create provider authority: {error}")))?;
-    let revalidate_authority = authority.clone();
-    xai_provider_attempt::AttemptContext::from_host_authority(
-        store,
-        format!("sampler-operation-{}", uuid::Uuid::new_v4()),
-        authority,
-        std::sync::Arc::new(move || Some(revalidate_authority.clone())),
-    )
-    .map_err(|error| SamplingError::Auth(format!("create provider attempt context: {error}")))
-}
 
 /// Per-request `x-grok-*` headers. Optional fields are skipped when empty/`None`.
 struct GrokRequestHeaders<'a> {
@@ -589,7 +525,7 @@ impl SamplingClient {
             has_x_api_key_header = headers.get(HeaderName::from_static("x-api-key")).is_some(),
         );
 
-        let provider_attempt = default_provider_attempt_context(&config)?;
+        let provider_attempt = config.provider_attempt.clone();
         let defaults = ClientDefaults {
             model: config.model,
             max_completion_tokens: config.max_completion_tokens,
@@ -609,7 +545,7 @@ impl SamplingClient {
             attribution_callback: config.attribution_callback,
             bearer_resolver: config.bearer_resolver,
             header_injector: config.header_injector,
-            provider_attempt: Some(provider_attempt),
+            provider_attempt,
         })
     }
 
@@ -692,10 +628,9 @@ impl SamplingClient {
         Option<xai_provider_attempt::PhysicalSendPermit>,
     )> {
         let Some(context) = self.provider_attempt.as_ref() else {
-            // Legacy/unit-test clients do not have a host authority. They are
-            // retained for API compatibility; host-created clients install
-            // the context through `with_provider_attempt_context`.
-            return Ok((builder, None));
+            return Err(SamplingError::Auth(
+                "host provider-attempt admission is required before physical send".into(),
+            ));
         };
         let context = context.fork_effect_lease().map_err(|error| {
             SamplingError::Auth(format!("allocate provider effect lease: {error}"))
@@ -2404,6 +2339,7 @@ mod tests {
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             header_injector: None,
+            provider_attempt: None,
         }
     }
 

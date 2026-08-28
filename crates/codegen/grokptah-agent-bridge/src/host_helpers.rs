@@ -3030,21 +3030,19 @@ pub async fn replay_xai_provider_contract_on_loopback(
         std::env::temp_dir().join(format!("grokptah-provider-contract-{}", Uuid::new_v4()));
     let attempt_store = xai_provider_attempt::ProviderAttemptStore::open(&attempt_root)
         .map_err(|error| anyhow!("open provider contract attempt ledger: {error}"))?;
-    let attempt_authority =
-        xai_provider_attempt::CanonicalHostAuthority::from_trusted_host_adapter(
-            "provider-contract-replay",
-            1,
-            1,
-            "provider-contract-replay-lease",
-            "provider-contract-replay-scope",
-        )
-        .map_err(|error| anyhow!("create provider contract authority: {error}"))?;
-    let revalidate_authority = attempt_authority.clone();
-    let provider_attempt = ProviderAttemptContext::from_host_authority(
+    crate::host_authority::write_snapshot(
+        &attempt_root,
+        "provider-contract-replay-scope",
+        "provider-contract-replay",
+        1,
+        1,
+        "provider-contract-replay-lease",
+    )
+    .map_err(|error| anyhow!("create provider contract authority: {error}"))?;
+    let provider_attempt = ProviderAttemptContext::from_host_ledger(
         attempt_store,
         "provider-contract-replay",
-        attempt_authority,
-        Arc::new(move || Some(revalidate_authority.clone())),
+        "provider-contract-replay-scope",
     )
     .map_err(|error| anyhow!("create provider contract context: {error}"))?;
     let step = call_provider_agent_step(
@@ -3119,21 +3117,20 @@ mod compatible_stream_tests {
 
     fn provider_attempt_context() -> ProviderAttemptContext {
         let root = std::env::temp_dir().join(format!("grokptah-provider-test-{}", Uuid::new_v4()));
-        let store = xai_provider_attempt::ProviderAttemptStore::open(root).unwrap();
-        let authority = xai_provider_attempt::CanonicalHostAuthority::from_trusted_host_adapter(
+        let store = xai_provider_attempt::ProviderAttemptStore::open(&root).unwrap();
+        crate::host_authority::write_snapshot(
+            &root,
+            "provider-test-scope",
             "provider-test",
             1,
             1,
             "provider-test-lease",
-            "provider-test-scope",
         )
         .unwrap();
-        let revalidate_authority = authority.clone();
-        ProviderAttemptContext::from_host_authority(
+        ProviderAttemptContext::from_host_ledger(
             store,
             "provider-test-operation",
-            authority,
-            Arc::new(move || Some(revalidate_authority.clone())),
+            "provider-test-scope",
         )
         .unwrap()
     }

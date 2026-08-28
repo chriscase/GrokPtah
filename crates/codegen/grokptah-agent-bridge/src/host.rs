@@ -966,50 +966,16 @@ impl AgentHostHandle {
         session.context(tracker.run_id(), session_id).ok()
     }
 
-    /// Build a host-owned provider authority context. The principal and
-    /// capability values are snapshots of the canonical Agent/Lane turn; the
-    /// closure re-reads those same host authorities immediately before send.
+    /// Build a host-owned provider authority context from the durable
+    /// assembled #477/#458 authority record. The common adapter re-reads that
+    /// host-owned record at every effect boundary; no caller callback is
+    /// accepted.
     fn provider_attempt_context(&self, session_id: Uuid) -> Result<ProviderAttemptContext> {
         let store = self
             .provider_attempt_store
             .clone()
             .ok_or_else(|| anyhow!("provider-attempt ledger is unavailable"))?;
-        let effect_lease_id = crate::host_authority::fresh_effect_lease_id();
         let effect_scope = format!("effect-scope-{session_id}");
-        let authority = self.current_provider_authority(
-            session_id,
-            effect_lease_id.clone(),
-            effect_scope.clone(),
-        )?;
-        let operation_id = self
-            .run_usage_trackers
-            .lock()
-            .get(&session_id)
-            .map(|tracker| tracker.run_id().to_owned())
-            .unwrap_or_else(|| format!("desktop-chat-{session_id}"));
-        let host = self.clone();
-        ProviderAttemptContext::from_host_authority(
-            store,
-            operation_id,
-            authority,
-            Arc::new(move || {
-                host.current_provider_authority(
-                    session_id,
-                    effect_lease_id.clone(),
-                    effect_scope.clone(),
-                )
-                .ok()
-            }),
-        )
-        .map_err(|error| anyhow!("construct provider attempt context: {error}"))
-    }
-
-    fn current_provider_authority(
-        &self,
-        session_id: Uuid,
-        effect_lease_id: String,
-        effect_scope: String,
-    ) -> Result<xai_provider_attempt::CanonicalHostAuthority> {
         let (agent_id, model, turn_generation) = {
             let inner = self.inner.lock();
             let session = inner
@@ -1032,9 +998,24 @@ impl AgentHostHandle {
             &model,
             turn_generation,
             self.orchestration_store.lock().clone(),
-            effect_lease_id,
+            &self
+                .runtime_home
+                .orchestration_root()
+                .join("provider-attempts"),
+            effect_scope.clone(),
+        )?;
+        let operation_id = self
+            .run_usage_trackers
+            .lock()
+            .get(&session_id)
+            .map(|tracker| tracker.run_id().to_owned())
+            .unwrap_or_else(|| format!("desktop-chat-{session_id}"));
+        ProviderAttemptContext::from_host_ledger(
+            store,
+            operation_id,
             effect_scope,
         )
+        .map_err(|error| anyhow!("construct provider attempt context: {error}"))
     }
 
     pub fn take_event_receiver(&self) -> Option<crate::event_bus::EventReceiver> {

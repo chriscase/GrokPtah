@@ -953,6 +953,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
                 header_injector: None,
+                provider_attempt: None,
             };
             let _ = actor
                 .handle_set_session_model(cfg, false, false, true, 85)

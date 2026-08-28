@@ -5,13 +5,6 @@ edition.workspace = true
 license.workspace = true
 description = "Durable crash-safe authority for provider attempts and physical sends"
 
-[features]
-default = []
-# Only the bridge/SDK adapter crates enable this narrow construction surface.
-# Without it, downstream crates can name the opaque types but cannot create an
-# authority context.
-trusted-host-adapter = []
-
 [dependencies]
 fs2 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
