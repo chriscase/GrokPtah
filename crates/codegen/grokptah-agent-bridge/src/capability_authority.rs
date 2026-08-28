@@ -699,8 +699,13 @@ mod tests {
     const TEST_PRINCIPAL_ID: &str = "host-principal";
 
     fn snapshot(value: &str) -> CapabilitySnapshot {
-        CapabilitySnapshot::from_parts(CapabilityKind::ComputerUse, "agent-owner", "run-1", [value])
-            .unwrap()
+        CapabilitySnapshot::from_parts(
+            CapabilityKind::ComputerUse,
+            TEST_PRINCIPAL_ID,
+            "run-1",
+            [value],
+        )
+        .unwrap()
     }
 
     #[test]
