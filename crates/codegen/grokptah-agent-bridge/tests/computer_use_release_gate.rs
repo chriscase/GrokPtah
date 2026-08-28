@@ -297,7 +297,10 @@ async fn permission_revocation_fails_action_and_clears_authority() {
         )
         .await
         .expect_err("revoked permission must fail closed");
-    assert_eq!(error.code, ComputerErrorCode::PermissionRevoked);
+    // The backend was already invoked and then reported the revoked
+    // permission. That is a post-effect transport/backend outcome, so it is
+    // durable UncertainOutcome rather than a replayable ordinary denial.
+    assert_eq!(error.code, ComputerErrorCode::UncertainOutcome);
     let persisted = service.get_run(&run.run_id).unwrap().unwrap();
     assert_eq!(persisted.state, ComputerRunState::Failed);
     assert!(persisted.current_observation.is_none());
