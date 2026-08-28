@@ -1888,7 +1888,12 @@ mod tests {
                 )
                 .await
         });
-        backend.action_entered.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            backend.action_entered.notified(),
+        )
+        .await
+        .expect("action must reach the backend before cancellation");
 
         let error = service
             .act(
@@ -1953,7 +1958,12 @@ mod tests {
                 )
                 .await
         });
-        backend.action_entered.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            backend.action_entered.notified(),
+        )
+        .await
+        .expect("action must reach the backend before cancellation");
 
         let cancelled = tokio::time::timeout(
             std::time::Duration::from_secs(2),
