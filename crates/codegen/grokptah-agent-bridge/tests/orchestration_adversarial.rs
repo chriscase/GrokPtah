@@ -3,7 +3,6 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -213,13 +212,9 @@ async fn reads_require_run_ownership_no_global_events() {
     assert_eq!(err.code.as_str(), "invalid_request");
     // list_sessions filters allowlist + busy
     let list = orch.list_sessions(&auth).unwrap();
-    let ws_canon = dunce::canonicalize(ws.path()).unwrap();
     assert!(list["sessions"].as_array().unwrap().iter().all(|row| {
         let cwd = row["cwd"].as_str().unwrap_or("");
-        dunce::canonicalize(PathBuf::from(cwd))
-            .ok()
-            .map(|c| c == ws_canon)
-            .unwrap_or(false)
+        cwd.starts_with("workspace_") && !cwd.contains(&ws.path().display().to_string())
     }));
     // Create run then try read with wrong workspace allowlist service
     let resp = orch
