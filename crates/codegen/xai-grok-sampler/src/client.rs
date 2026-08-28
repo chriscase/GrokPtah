@@ -1342,10 +1342,6 @@ impl SamplingClient {
         // old raw_output machinery.
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
         let http_request = grok_headers.apply(self.post(self.endpoint("responses")));
-        let (http_request, mut permit) = self.authorize_request(
-            http_request,
-            &serde_json::to_vec(&request_body).map_err(SamplingError::Serialization)?,
-        )?;
         let request_bytes =
             serde_json::to_vec(&request_body).map_err(SamplingError::Serialization)?;
         let (http_request, mut permit) = self.authorize_request(http_request, &request_bytes)?;
@@ -1519,6 +1515,9 @@ impl SamplingClient {
             // Presence opts in; the server ignores the value.
             http_request = http_request.header(DOOM_LOOP_CHECK_HEADER, "true");
         }
+        let request_bytes =
+            serde_json::to_vec(&request_body).map_err(SamplingError::Serialization)?;
+        let (http_request, mut permit) = self.authorize_request(http_request, &request_bytes)?;
         let http_request = http_request.json(&request_body);
 
         let built_request = http_request.build().map_err(|e| {
