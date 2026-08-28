@@ -159,6 +159,8 @@ impl AdaptiveRunState {
             && self.initial_profile <= self.profile
             && self.initial_risk <= self.risk
             && self.capability_ceiling >= self.profile
+            && (self.terminal.is_some()
+                || self.profile >= AdaptivePolicyEngine::risk_floor(self.risk))
             && self.escalation_chain_is_valid()
             && self.escalations.len() <= MAX_ESCALATIONS
             && self.evidence_events.len() <= MAX_EVIDENCE_EVENTS
@@ -474,14 +476,30 @@ impl AdaptiveController {
         &mut self,
         observed_risk: super::risk::TaskRisk,
     ) -> Option<ProfileTransition> {
-        let prior_risk = self.state.risk;
         self.raise_risk(observed_risk);
         let required = super::policy::AdaptivePolicyEngine::risk_floor(self.state.risk);
-        if observed_risk > prior_risk || self.state.profile < required {
-            Some(self.apply_signal(RuntimeSignal::DestructiveIntentDetected))
-        } else {
-            None
+        if self.state.profile >= required {
+            return None;
         }
+
+        // Each profile transition remains one bounded rung. A risk jump from
+        // Routine directly to Destructive therefore records Economy → Balanced
+        // and Balanced → High Assurance before the caller can obtain a permit;
+        // the durable state never advertises a profile below its risk floor.
+        let mut last_transition = None;
+        while self.state.profile < required {
+            let transition = AdaptivePolicyEngine
+                .reassess_risk_floor(self.state.profile, &self.state.evidence, self.state.risk)
+                .expect("risk floor is above the current profile");
+            let transition = self.apply_transition(transition);
+            match transition {
+                ProfileTransition::Escalate { .. } => {
+                    last_transition = Some(transition);
+                }
+                ProfileTransition::Stop(_) => return Some(transition),
+            }
+        }
+        last_transition
     }
 
     #[allow(dead_code)]
@@ -716,6 +734,10 @@ impl AdaptiveController {
         }
         let evidence = &self.state.evidence;
         let transition = AdaptivePolicyEngine.reassess(self.state.profile, evidence, signal);
+        self.apply_transition(transition)
+    }
+
+    fn apply_transition(&mut self, transition: ProfileTransition) -> ProfileTransition {
         self.state.revision = self.state.revision.saturating_add(1);
         match &transition {
             ProfileTransition::Escalate { from, to, reason } => {
@@ -857,15 +879,23 @@ mod tests {
         CapabilityAttribution, HostCapabilityEvidence, ModelCapabilityEvidence,
     };
     use crate::computer_profile::policy::{PolicyOutcome, TaskPolicy};
+    use crate::computer_profile::risk::TaskRisk;
     use crate::gateway_config::ComputerUseTier;
 
-    fn controller() -> AdaptiveController {
+    fn controller_with_capabilities(
+        image_input: bool,
+        independent_verifier: bool,
+    ) -> AdaptiveController {
         let evidence = CapabilityEvidence::with_authority(
             ModelCapabilityEvidence {
                 tools: true,
-                image_input: true,
-                max_image_bytes: Some(4096),
-                tier: ComputerUseTier::VisualFallbackAct,
+                image_input,
+                max_image_bytes: image_input.then_some(4096),
+                tier: if image_input {
+                    ComputerUseTier::VisualFallbackAct
+                } else {
+                    ComputerUseTier::SemanticAct
+                },
                 attribution: CapabilityAttribution::Measured,
                 durable_authority: true,
                 session_measured: false,
@@ -873,8 +903,8 @@ mod tests {
             },
             HostCapabilityEvidence {
                 semantic_observation: true,
-                screenshot_capture: true,
-                independent_verifier: true,
+                screenshot_capture: image_input,
+                independent_verifier,
                 isolated_guest: true,
             },
             super::super::authority_seam::test_binding(),
@@ -889,6 +919,10 @@ mod tests {
             panic!("fixture should proceed");
         };
         AdaptiveController::new("run", decision)
+    }
+
+    fn controller() -> AdaptiveController {
+        controller_with_capabilities(true, true)
     }
 
     fn observation(value: &str) -> ComputerObservation {
@@ -969,6 +1003,162 @@ mod tests {
             }
         );
         assert_eq!(controller.spend().model_calls, 0);
+    }
+
+    #[test]
+    fn risk_floor_is_monotonic_across_three_tiers() {
+        let mut controller = controller();
+        let cases = [
+            (
+                TaskRisk::Consequential,
+                AdaptiveProfile::Economy,
+                AdaptiveProfile::Balanced,
+                ProfileReason::ConsequentialIntent,
+            ),
+            (
+                TaskRisk::Destructive,
+                AdaptiveProfile::Balanced,
+                AdaptiveProfile::HighAssurance,
+                ProfileReason::DestructiveIntent,
+            ),
+        ];
+
+        for (risk, from, to, reason) in cases {
+            let transition = controller
+                .enforce_risk_floor(risk)
+                .expect("risk increase must transition");
+            assert_eq!(
+                transition,
+                ProfileTransition::Escalate { from, to, reason }
+            );
+            assert_eq!(controller.profile(), to);
+            assert_eq!(controller.risk(), risk);
+            assert!(!controller.state().terminal.is_some());
+        }
+    }
+
+    #[test]
+    fn already_at_risk_floor_is_stationary() {
+        let mut controller = controller();
+        controller
+            .enforce_risk_floor(TaskRisk::Consequential)
+            .expect("consequential floor");
+        let revision = controller.revision();
+        let escalation_count = controller.escalations().len();
+
+        assert!(controller.enforce_risk_floor(TaskRisk::Consequential).is_none());
+        assert_eq!(controller.profile(), AdaptiveProfile::Balanced);
+        assert_eq!(controller.risk(), TaskRisk::Consequential);
+        assert_eq!(controller.revision(), revision);
+        assert_eq!(controller.escalations().len(), escalation_count);
+    }
+
+    #[test]
+    fn unavailable_risk_floor_stops_with_required_profile() {
+        let cases = [
+            (
+                controller_with_capabilities(false, false),
+                TaskRisk::Consequential,
+                ProfileReason::InsufficientCapabilityForRisk,
+                AdaptiveProfile::Balanced,
+            ),
+            (
+                controller_with_capabilities(true, false),
+                TaskRisk::Destructive,
+                ProfileReason::IndependentVerifierUnavailable,
+                AdaptiveProfile::HighAssurance,
+            ),
+        ];
+
+        for (mut controller, risk, reason, required_profile) in cases {
+            let transition = controller
+                .enforce_risk_floor(risk)
+                .expect("unavailable floor must stop");
+            assert_eq!(
+                transition,
+                ProfileTransition::Stop(PolicyStop {
+                    reason,
+                    profile: AdaptiveProfile::Economy,
+                    required_profile: Some(required_profile),
+                    ceiling: controller.state().capability_ceiling,
+                })
+            );
+            assert_eq!(controller.terminal().map(|terminal| terminal.reason), Some(reason));
+            assert_eq!(
+                controller.terminal().and_then(|terminal| terminal.required_profile),
+                Some(required_profile)
+            );
+        }
+    }
+
+    #[test]
+    fn risk_floor_survives_restart_and_replay() {
+        let mut controller = controller();
+        controller.enforce_risk_floor(TaskRisk::Consequential);
+        let state = controller.into_state();
+        let mut restored = AdaptiveController::from_state(state).expect("state must replay");
+        assert_eq!(restored.profile(), AdaptiveProfile::Balanced);
+        assert_eq!(restored.risk(), TaskRisk::Consequential);
+        assert!(restored.enforce_risk_floor(TaskRisk::Routine).is_none());
+
+        let events = vec![
+            super::super::replay::ReplayEvent {
+                sequence: 1,
+                kind: super::super::replay::ReplayEventKind::Decision,
+                observation_id: None,
+                observation_digest: None,
+                profile: AdaptiveProfile::Economy,
+                reason: Some(ProfileReason::RoutineTask),
+                capability_snapshot_reference: None,
+                from_profile: None,
+                to_profile: None,
+                action_digest: None,
+                result_code: None,
+                recovery_code: None,
+                latency_millis: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            super::super::replay::ReplayEvent {
+                sequence: 2,
+                kind: super::super::replay::ReplayEventKind::Transition,
+                observation_id: None,
+                observation_digest: None,
+                profile: AdaptiveProfile::Balanced,
+                reason: Some(ProfileReason::ConsequentialIntent),
+                capability_snapshot_reference: None,
+                from_profile: Some(AdaptiveProfile::Economy),
+                to_profile: Some(AdaptiveProfile::Balanced),
+                action_digest: None,
+                result_code: None,
+                recovery_code: None,
+                latency_millis: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            super::super::replay::ReplayEvent {
+                sequence: 3,
+                kind: super::super::replay::ReplayEventKind::Terminal,
+                observation_id: None,
+                observation_digest: None,
+                profile: AdaptiveProfile::Balanced,
+                reason: Some(ProfileReason::ConsequentialIntent),
+                capability_snapshot_reference: None,
+                from_profile: None,
+                to_profile: None,
+                action_digest: None,
+                result_code: None,
+                recovery_code: Some("restart".into()),
+                latency_millis: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ];
+        assert!(
+            super::super::replay::ReplayVerifier::verify(&events)
+                .expect("risk escalation replay")
+                .terminal
+        );
     }
 
     #[test]

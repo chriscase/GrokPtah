@@ -165,7 +165,6 @@ impl RuntimeSignal {
                 | Self::BudgetExhausted
                 | Self::AuthorityUnavailable
                 | Self::ProviderUncertain
-                | Self::DestructiveIntentDetected
         )
     }
 }
@@ -298,19 +297,80 @@ impl AdaptivePolicyEngine {
                 ceiling,
             });
         }
+        let required = match signal {
+            // A destructive signal is conditional on the capability ceiling.
+            // It is not an unconditional terminal outcome: a qualified
+            // High Assurance path must be allowed to satisfy it.
+            RuntimeSignal::DestructiveIntentDetected => AdaptiveProfile::HighAssurance,
+            _ => current.escalated().unwrap_or(current),
+        };
+        self.transition_toward(current, evidence, required, reason)
+    }
+
+    /// Reassess the monotonic risk floor independently of transient runtime
+    /// signals. Risk classification is host-derived and may rise when the
+    /// objective is unchanged, so it must retain its own reason and required
+    /// profile instead of being represented as destructive intent.
+    pub fn reassess_risk_floor(
+        &self,
+        current: AdaptiveProfile,
+        evidence: &CapabilityEvidence,
+        risk: TaskRisk,
+    ) -> Option<ProfileTransition> {
+        let required = Self::risk_floor(risk);
+        if required <= current {
+            return None;
+        }
+        let reason = match risk {
+            TaskRisk::Routine => ProfileReason::RoutineTask,
+            TaskRisk::Consequential => ProfileReason::ConsequentialIntent,
+            TaskRisk::Destructive => ProfileReason::DestructiveIntent,
+        };
+        Some(self.transition_toward(current, evidence, required, reason))
+    }
+
+    fn transition_toward(
+        &self,
+        current: AdaptiveProfile,
+        evidence: &CapabilityEvidence,
+        required: AdaptiveProfile,
+        reason: ProfileReason,
+    ) -> ProfileTransition {
+        let ceiling = evidence.ceiling();
+        if required > ceiling {
+            let reason = if required == AdaptiveProfile::HighAssurance
+                && !evidence.host.independent_verifier
+            {
+                ProfileReason::IndependentVerifierUnavailable
+            } else {
+                ProfileReason::InsufficientCapabilityForRisk
+            };
+            return ProfileTransition::Stop(PolicyStop {
+                reason,
+                profile: current,
+                required_profile: Some(required),
+                ceiling,
+            });
+        }
         let Some(next) = current.escalated() else {
             return ProfileTransition::Stop(PolicyStop {
                 reason,
                 profile: current,
-                required_profile: None,
+                required_profile: Some(required),
                 ceiling,
             });
         };
         if next > ceiling {
             return ProfileTransition::Stop(PolicyStop {
-                reason,
+                reason: if required == AdaptiveProfile::HighAssurance
+                    && !evidence.host.independent_verifier
+                {
+                    ProfileReason::IndependentVerifierUnavailable
+                } else {
+                    ProfileReason::InsufficientCapabilityForRisk
+                },
                 profile: current,
-                required_profile: Some(next),
+                required_profile: Some(required),
                 ceiling,
             });
         }
