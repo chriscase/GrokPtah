@@ -3078,6 +3078,7 @@ pub async fn replay_xai_provider_contract_on_loopback(
     };
     let mut deltas = Vec::new();
     let mut thought_deltas = Vec::new();
+    let authority = CapabilityAuthority::new(true);
     let step = call_provider_agent_step(
         credentials,
         target,
@@ -3089,9 +3090,9 @@ pub async fn replay_xai_provider_contract_on_loopback(
         &CancellationToken::new(),
         None,
         None,
-        None,
-        None,
-        None,
+        Some(&authority),
+        Some("provider-contract-loopback"),
+        Some("provider-contract-loopback"),
         |delta| deltas.push(delta.to_string()),
         |delta| thought_deltas.push(delta.to_string()),
     )
