@@ -1574,10 +1574,7 @@ impl OrchestrationService {
     /// Advance a credential's authentication generation while preserving its
     /// principal/incarnation. Existing effect leases and resource bindings
     /// then fail closed until the host explicitly rebinds them.
-    pub fn rotate_authentication_generation(
-        &self,
-        credential_id: &str,
-    ) -> Result<(), OrchError> {
+    pub fn rotate_authentication_generation(&self, credential_id: &str) -> Result<(), OrchError> {
         self.auth_registry.lock().rotate_generation(credential_id)
     }
 
@@ -5002,9 +4999,7 @@ impl OrchestrationService {
 
     pub fn get_capacity(&self, auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.auth_registry
-            .lock()
-            .require_current(auth)?;
+        self.auth_registry.lock().require_current(auth)?;
         self.capacity_value()
     }
 
@@ -6705,11 +6700,7 @@ impl OrchestrationService {
         proposal_only: bool,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        auth.require_scope(
-            session_id,
-            workspace,
-            expected_agent_id,
-        )?;
+        auth.require_scope(session_id, workspace, expected_agent_id)?;
         let tool = idempotency_tool;
         if proposal_only && allow_queue {
             return Err(OrchError::new(
@@ -6941,10 +6932,8 @@ impl OrchestrationService {
             execution: None,
             approval: None,
         };
-        let mut effect_lease = self.mint_effect_lease(
-            auth,
-            format!("run:{run_id}:durable-create"),
-        )?;
+        let mut effect_lease =
+            self.mint_effect_lease(auth, format!("run:{run_id}:durable-create"))?;
         if let Err(error) = self.consume_effect_lease(
             auth,
             &mut effect_lease,
@@ -6954,13 +6943,7 @@ impl OrchestrationService {
                 self.host.release_turn_reservation(session_id, &run_id);
                 self.release_capacity(&run_id);
             }
-            return Err(self.fail_claim(
-                &mut lease,
-                Some(run_id),
-                session_id,
-                &claimed,
-                error,
-            ));
+            return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, error));
         }
         let persisted = if queued {
             self.store.save_run(&run)
