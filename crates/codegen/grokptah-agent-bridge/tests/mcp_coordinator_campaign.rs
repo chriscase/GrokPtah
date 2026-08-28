@@ -91,12 +91,10 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
     host.session_set_cwd(discard_session.id, discard_workspace.path())
         .unwrap();
     let interrupted_run_id = "coordinator-interrupted-source";
-    let store = OrchStore::open(home.path().join("orch")).unwrap();
-    service_store_seed(&store, interrupted_run_id, session.id, workspace.path());
     let service = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        store,
+        OrchStore::open(home.path().join("orch")).unwrap(),
         OrchestrationConfig {
             bearer_token: "coordinator-campaign-token".into(),
             allowlist: WorkspaceAllowlist::new([
@@ -106,6 +104,12 @@ async fn reference_coordinator_campaign_is_protocol_complete() {
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
         },
+    );
+    service_store_seed(
+        service.store(),
+        interrupted_run_id,
+        session.id,
+        workspace.path(),
     );
     let server = start_control_server(service, 0).await.unwrap();
     let harness = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

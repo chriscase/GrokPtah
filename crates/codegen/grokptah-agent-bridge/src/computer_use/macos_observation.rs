@@ -115,6 +115,7 @@ pub(crate) struct RawMacObservation {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct RawMacActionRequest {
     pub target_frame: ObservationGeometry,
     pub element_index: Option<usize>,
@@ -163,6 +164,7 @@ pub struct MacOsObservationPlatform {
 }
 
 impl MacOsObservationPlatform {
+    #[allow(dead_code)]
     pub(crate) fn with_source(source: Arc<dyn MacObservationSource>) -> Self {
         Self {
             source,

@@ -787,6 +787,13 @@ impl AgentHost {
                 None
             }
         };
+        if instance_lock.is_some() {
+            if let Err(error) =
+                crate::orchestration::initialize_host_authority(&runtime_home.orchestration_root())
+            {
+                eprintln!("[grokptah] durable auth authority anchor failed: {error}");
+            }
+        }
         let mut event_tx = crate::event_bus::EventBus::new(
             config
                 .event_bus_capacity
@@ -12361,7 +12368,7 @@ mod tests {
             session_id: lane_id,
             workspace: agent.workspace.clone(),
             request_id: "manager-proposal-intent".into(),
-            client_id: Some("native-executor".into()),
+            client_id: Some("actor_native_fixture".into()),
             state: RunState::Running,
             purpose: RunPurpose::ManagerProposal,
             agent_id: Some(agent.agent_id.clone()),

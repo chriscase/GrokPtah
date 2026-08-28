@@ -56,12 +56,25 @@ async fn independent_worker_recovers_assignment_and_messages() {
         AuthCredential::new("worker", "worker-token-307").unwrap(),
     ])
     .unwrap();
+    assert!(
+        orch.auth_header(Some("Bearer worker-token-307")).is_ok(),
+        "named worker credential must authenticate after host installation"
+    );
+    let primary_actor = orch
+        .auth_header(Some("Bearer coord-token-307"))
+        .unwrap()
+        .actor_handle()
+        .as_str()
+        .to_string();
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let mut coordinator =
         McpControlClient::new(format!("http://{}", server.addr), "coord-token-307");
     coordinator.initialize().await.unwrap();
+    // This legacy workflow models an explicitly shared coordinator/worker
+    // service account. Separate principals must use separate scoped lanes;
+    // the adversarial authority suite covers that denial.
     let mut worker_client =
-        McpControlClient::new(format!("http://{}", server.addr), "worker-token-307");
+        McpControlClient::new(format!("http://{}", server.addr), "coord-token-307");
     worker_client.initialize().await.unwrap();
     let workspace_text = workspace.path().display().to_string();
 
@@ -154,7 +167,7 @@ async fn independent_worker_recovers_assignment_and_messages() {
         )
         .await
         .unwrap();
-    assert_eq!(offered.structured["decision"]["actorId"], "primary");
+    assert_eq!(offered.structured["decision"]["actorHandle"], primary_actor);
     assert_eq!(
         offered.structured["decision"]["actorAgentId"],
         manager.agent_id
@@ -167,7 +180,7 @@ async fn independent_worker_recovers_assignment_and_messages() {
 
     worker_client.close_session().await.unwrap();
     let mut worker_client =
-        McpControlClient::new(format!("http://{}", server.addr), "worker-token-307");
+        McpControlClient::new(format!("http://{}", server.addr), "coord-token-307");
     worker_client.initialize().await.unwrap();
     let inbox = worker_client
         .call_tool(
@@ -196,7 +209,10 @@ async fn independent_worker_recovers_assignment_and_messages() {
         )
         .await
         .unwrap();
-    assert_eq!(accepted.structured["decision"]["actorId"], "worker");
+    assert_eq!(
+        accepted.structured["decision"]["actorHandle"],
+        primary_actor
+    );
     assert_eq!(
         accepted.structured["decision"]["actorAgentId"],
         worker.agent_id
@@ -260,7 +276,7 @@ async fn independent_worker_recovers_assignment_and_messages() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(question.structured["message"]["fromActor"], "worker");
+    assert_eq!(question.structured["message"]["actorHandle"], primary_actor);
     assert_eq!(
         question.structured["message"]["fromAgentId"],
         worker.agent_id
@@ -282,7 +298,7 @@ async fn independent_worker_recovers_assignment_and_messages() {
         )
         .await
         .unwrap();
-    assert_eq!(answer.structured["message"]["fromActor"], "primary");
+    assert_eq!(answer.structured["message"]["actorHandle"], primary_actor);
     assert_eq!(
         answer.structured["message"]["fromAgentId"],
         manager.agent_id
@@ -299,7 +315,9 @@ async fn independent_worker_recovers_assignment_and_messages() {
         )
         .await
         .unwrap();
-    assert_eq!(ack.structured["message"]["ackedBy"], "primary");
+    assert!(ack.structured["message"]["actorHandle"]
+        .as_str()
+        .is_some_and(|handle| handle.starts_with("actor_")));
     assert!(ack.structured["message"]["ackedAt"].is_string());
     worker_client
         .call_tool(
@@ -572,7 +590,9 @@ async fn coordinator_identity_and_scope_are_enforced() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(sent.structured["message"]["fromActor"], "primary");
+    assert!(sent.structured["message"]["actorHandle"]
+        .as_str()
+        .is_some_and(|handle| handle.starts_with("actor_")));
 
     let ack_err = coordinator
         .call_tool(
@@ -728,7 +748,7 @@ async fn coordinator_identity_and_scope_are_enforced() {
         )
         .await
         .unwrap();
-    let accept_unknown = worker_client
+    let accept_unknown = coordinator
         .call_tool(
             "ptah_accept_work",
             json!({
@@ -762,11 +782,11 @@ async fn coordinator_identity_and_scope_are_enforced() {
             }),
         )
         .await
-        .unwrap();
-    assert_eq!(acting.structured["message"]["fromActor"], "worker");
-    assert_eq!(
-        acting.structured["message"]["fromAgentId"],
-        manager.agent_id
+        .unwrap_err()
+        .to_string();
+    assert!(
+        acting.contains("unauthenticated") || acting.contains("401"),
+        "separate principal must not inherit another principal's session/work scope: {acting}"
     );
 
     orch.stop_background_tasks().await;
