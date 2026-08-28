@@ -11610,6 +11610,30 @@ mod tests {
         assert_eq!(host.list_sessions().len(), 1);
     }
 
+    #[test]
+    fn cwd_and_rename_failures_restore_the_previous_durable_session() {
+        let (_home, host, session_id) = test_host();
+        let before = host.session_inspect(session_id).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        crate::session_store::set_test_persistence_failure(Some("meta"));
+        assert!(host
+            .session_rename(session_id, "must-not-commit".into())
+            .is_err());
+        crate::session_store::set_test_persistence_failure(None);
+        assert_eq!(
+            host.session_inspect(session_id).unwrap().title,
+            before.title
+        );
+
+        crate::session_store::set_test_persistence_failure(Some("meta"));
+        assert!(host.session_set_cwd(session_id, workspace.path()).is_err());
+        crate::session_store::set_test_persistence_failure(None);
+        let after = host.session_inspect(session_id).unwrap();
+        assert_eq!(after.cwd, before.cwd);
+        assert_eq!(after.title, before.title);
+    }
+
     fn usage_test_run(run_id: &str, max_total_tokens: Option<u64>) -> RunRecord {
         let now = Utc::now();
         RunRecord {

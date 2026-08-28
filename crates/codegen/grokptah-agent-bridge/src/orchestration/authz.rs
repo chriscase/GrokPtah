@@ -417,6 +417,7 @@ impl AuthRegistry {
         let path = root.join(AUTHORITY_FILE);
         let existed = path.is_file();
         let mut state = registry.read_durable_state_locked()?;
+        let previous = state.clone();
         let effective_owner = state
             .owner_id
             .clone()
@@ -429,7 +430,14 @@ impl AuthRegistry {
             .unwrap_or_else(|| owner_id.trim().to_string());
         let changed = reconcile_state(&mut state, credentials, &effective_owner)?;
         if changed || !existed {
-            registry.persist_state_locked(&state)?;
+            if let Err(error) = registry.persist_state_locked(&state) {
+                if existed {
+                    let _ = registry.persist_state_locked(&previous);
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
+                return Err(error);
+            }
         }
         registry.state = state;
         Ok(registry)
@@ -587,9 +595,17 @@ impl AuthRegistry {
     ) -> Result<T, OrchError> {
         let _lock = self.durable_lock()?;
         let mut candidate = self.read_durable_state_locked()?;
+        let previous = candidate.clone();
         let value = update(&mut candidate)?;
         prune_effect_leases(&mut candidate, false)?;
-        self.persist_state_locked(&candidate)?;
+        if let Err(error) = self.persist_state_locked(&candidate) {
+            if let Err(rollback_error) = self.persist_state_locked(&previous) {
+                return Err(internal_error(format!(
+                    "{error}; authority rollback failed: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
         self.state = candidate;
         Ok(value)
     }
@@ -1648,6 +1664,37 @@ mod tests {
             assert!(!registry.state.bindings.contains_key("run:fault"));
             assert_eq!(std::fs::read(&authority).unwrap(), before);
         }
+    }
+
+    #[test]
+    fn expired_effect_leases_are_pruned_without_reopening_replay() {
+        let root = tempdir().unwrap();
+        let credential = AuthCredential::new("primary", "secret").unwrap();
+        let mut registry =
+            AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner").unwrap();
+        let auth = registry
+            .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
+            .unwrap();
+        let lease = registry.mint_effect_lease(&auth, "provider:prune").unwrap();
+        let authority = root.path().join(AUTHORITY_FILE);
+        let mut durable: StoredAuthority =
+            serde_json::from_str(&std::fs::read_to_string(&authority).unwrap()).unwrap();
+        durable
+            .effect_leases
+            .get_mut(&lease.lease_id)
+            .unwrap()
+            .expires_at_unix_ms = 0;
+        std::fs::write(&authority, serde_json::to_vec_pretty(&durable).unwrap()).unwrap();
+
+        registry
+            .ensure_resource_binding("run:prune", &auth)
+            .unwrap();
+        let pruned: StoredAuthority =
+            serde_json::from_str(&std::fs::read_to_string(&authority).unwrap()).unwrap();
+        assert!(pruned.effect_leases.is_empty());
+        assert!(registry
+            .consume_effect_lease(&auth, &lease, "provider:prune")
+            .is_err());
     }
 
     #[test]
