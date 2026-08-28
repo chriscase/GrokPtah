@@ -1,3 +1,9 @@
+error[E0433]: failed to resolve: could not find `ReconciliationEvidence` in `xai_provider_attempt`
+  --> tests/ui/forged_constructors.rs:18:35
+   |
+18 |     let _ = xai_provider_attempt::ReconciliationEvidence::from_verified("operator", "request");
+   |                                   ^^^^^^^^^^^^^^^^^^^^^^ could not find `ReconciliationEvidence` in `xai_provider_attempt`
+
 error[E0624]: associated function `new` is private
  --> tests/ui/forged_constructors.rs:2:53
   |
@@ -65,19 +71,5 @@ error[E0624]: associated function `new` is private
    | /     pub(crate) fn new(
    | |         provider_request_id: impl Into<String>,
    | |         provider_effect_id: impl Into<String>,
-   | |     ) -> Result<Self, AttemptError> {
-   | |___________________________________- private associated function defined here
-
-error[E0624]: associated function `from_verified` is private
-  --> tests/ui/forged_constructors.rs:18:59
-   |
-18 |       let _ = xai_provider_attempt::ReconciliationEvidence::from_verified("operator", "request");
-   |                                                             ^^^^^^^^^^^^^ private associated function
-   |
-  ::: src/lib.rs
-   |
-   | /     pub(crate) fn from_verified(
-   | |         operator_id: impl Into<String>,
-   | |         provider_request_id: impl Into<String>,
    | |     ) -> Result<Self, AttemptError> {
    | |___________________________________- private associated function defined here

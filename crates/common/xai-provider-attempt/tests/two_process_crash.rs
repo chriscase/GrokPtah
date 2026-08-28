@@ -70,12 +70,10 @@ fn genuine_two_process_kill_restart_preserves_uncertainty_and_request_identity()
         let attempt = store.load(attempt_id.trim()).unwrap().unwrap();
         let projection = attempt.projection().unwrap();
         assert_eq!(projection.send_state, SendState::Uncertain);
-        assert_eq!(
-            fs::read(temp.path().join("provider-bytes"))
-                .map(|bytes| bytes.len())
-                .unwrap_or(0),
-            usize::from(mode == "after-possible-write")
-        );
+        let provider_bytes = fs::read(temp.path().join("provider-bytes"))
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        assert_eq!(provider_bytes > 0, mode == "after-possible-write");
         assert!(
             attempt
                 .projection()

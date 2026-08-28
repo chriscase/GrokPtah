@@ -1,14 +1,24 @@
-error[E0599]: no function or associated item named `from_trusted_host_adapter` found for struct `CanonicalHostAuthority` in the current scope
- --> tests/ui/forged_adapter.rs:2:59
+error[E0433]: failed to resolve: could not find `CanonicalHostAuthority` in `xai_provider_attempt`
+ --> tests/ui/forged_adapter.rs:2:35
   |
 2 |     let _ = xai_provider_attempt::CanonicalHostAuthority::from_trusted_host_adapter(
-  |                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^ function or associated item not found in `CanonicalHostAuthority`
+  |                                   ^^^^^^^^^^^^^^^^^^^^^^ could not find `CanonicalHostAuthority` in `xai_provider_attempt`
 
 error[E0599]: no function or associated item named `from_host_authority` found for struct `AttemptContext` in the current scope
  --> tests/ui/forged_adapter.rs:9:51
   |
 9 |     let _ = xai_provider_attempt::AttemptContext::from_host_authority(
   |                                                   ^^^^^^^^^^^^^^^^^^^ function or associated item not found in `AttemptContext`
+  |
+note: if you're trying to build a new `AttemptContext`, consider using `AttemptContext::from_host_ledger` which returns `Result<AttemptContext, AttemptError>`
+ --> src/lib.rs
+  |
+  | /     pub fn from_host_ledger(
+  | |         store: ProviderAttemptStore,
+  | |         operation_id: impl Into<String>,
+  | |         authority_scope: impl Into<String>,
+  | |     ) -> Result<Self, AttemptError> {
+  | |___________________________________^
 
 warning: unreachable expression
   --> tests/ui/forged_adapter.rs:11:9

@@ -27,19 +27,11 @@ warning: unreachable call
   |                     |
   |                     unreachable call
 
-error[E0624]: method `begin_send` is private
+error[E0599]: no method named `begin_send` found for reference `&ProviderAttempt` in the current scope
  --> tests/ui/forged_transitions.rs:4:21
   |
-4 |       let _ = attempt.begin_send(todo!());
-  |                       ^^^^^^^^^^ private method
-  |
- ::: src/lib.rs
-  |
-  | /     pub(crate) fn begin_send(
-  | |         &self,
-  | |         current_authority: &AuthorityBinding,
-  | |     ) -> Result<PhysicalSendPermit, AttemptError> {
-  | |_________________________________________________- private method defined here
+4 |     let _ = attempt.begin_send(todo!());
+  |                     ^^^^^^^^^^ method not found in `&ProviderAttempt`
 
 warning: unreachable call
  --> tests/ui/forged_transitions.rs:4:21
