@@ -832,7 +832,7 @@ impl AgentHost {
         let auth = crate::auth_store::load_auth_state();
         // Construction is the one point that always holds authority: the
         // lifecycle was just created in `Running` with the lock in hand.
-        let startup_write = crate::host_runtime::DurableWriteGuard::for_shutdown_flush(&lifecycle);
+        let startup_write = crate::host_runtime::DurableWriteGuard::owner_uncounted(&lifecycle);
         let (chrome, mut sessions) =
             session_store::load_workspace(&startup_write).unwrap_or_else(|e| {
                 eprintln!("[grokptah] workspace load failed: {e:#}");
@@ -1000,6 +1000,13 @@ impl AgentHostHandle {
         self.lifecycle.ensure_open(operation)
     }
 
+    /// A token that can mint durable-write authority later, for operations
+    /// that do slow work before their write (#455). Holding a guard across
+    /// network I/O would let an ordinary slow request block the shutdown seal.
+    pub(crate) fn write_authority(&self) -> crate::host_runtime::WriteAuthority {
+        crate::host_runtime::WriteAuthority::new(self.lifecycle.clone())
+    }
+
     /// Mint durable-write authority for this home, or fail closed (#455).
     ///
     /// Every durable mutator in this crate takes the returned guard by
@@ -1125,7 +1132,7 @@ impl AgentHostHandle {
         // The flush is this runtime's own last write, and it runs after the
         // durable-write seal. `flush_write` is the one authority that outlives
         // the seal, and it never leaves the runtime.
-        let write = crate::host_runtime::DurableWriteGuard::for_shutdown_flush(&self.lifecycle);
+        let write = crate::host_runtime::DurableWriteGuard::owner_uncounted(&self.lifecycle);
         let chrome = self.workspace_chrome_snapshot();
         if let Err(error) = session_store::save_chrome(&write, &chrome) {
             errors.push(format!("persist workspace chrome: {error:#}"));
@@ -6087,8 +6094,11 @@ impl AgentHostHandle {
     }
 
     pub async fn discover_provider_models(&self, provider_id: &str) -> Result<Vec<ModelInfo>> {
-        let write = self.durable_write("discovering provider models")?;
-        crate::provider_discovery::discover_profile_models(&write, provider_id).await?;
+        // Authority is minted around the save inside, not held across the
+        // network round-trip: a slow provider must not block the shutdown seal.
+        self.ensure_accepting("discovering provider models")?;
+        crate::provider_discovery::discover_profile_models(&self.write_authority(), provider_id)
+            .await?;
         Ok(self
             .models()
             .into_iter()
@@ -6101,8 +6111,14 @@ impl AgentHostHandle {
         provider_id: &str,
         model_id: &str,
     ) -> Result<crate::provider_qualification::ProviderQualificationReport> {
-        let write = self.durable_write("qualifying a provider model")?;
-        crate::provider_qualification::qualify_provider_model(&write, provider_id, model_id).await
+        // As above: mint at the write, not across the qualification probes.
+        self.ensure_accepting("qualifying a provider model")?;
+        crate::provider_qualification::qualify_provider_model(
+            &self.write_authority(),
+            provider_id,
+            model_id,
+        )
+        .await
     }
 
     pub fn delete_provider_profile(&self, provider_id: &str) -> Result<()> {

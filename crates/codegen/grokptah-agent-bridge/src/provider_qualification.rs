@@ -184,7 +184,7 @@ struct ComputerProbeArguments {
 }
 
 pub(crate) async fn qualify_provider_model(
-    write: &crate::host_runtime::DurableWriteGuard,
+    authority: &crate::host_runtime::WriteAuthority,
     provider_id: &str,
     model_id: &str,
 ) -> Result<ProviderQualificationReport> {
@@ -387,8 +387,11 @@ pub(crate) async fn qualify_provider_model(
             .current()
             .map(crate::auth_store::WireCredentials::qualification_identity_fingerprint)
             .unwrap_or_else(|| "anonymous".into());
+        let write = authority
+            .begin("saving managed measured model capabilities")
+            .context("durable-write authority for measured capabilities")?;
         crate::gateway_config::save_managed_profile_capabilities(
-            write,
+            &write,
             &profile,
             &measured_model,
             &credential_fingerprint,
@@ -402,7 +405,11 @@ pub(crate) async fn qualify_provider_model(
             .and_then(|item| item.models.iter_mut().find(|model| model.id == model_id))
             .ok_or_else(|| anyhow!("provider/model disappeared during qualification"))?;
         *stored_model = measured_model;
-        crate::gateway_config::save(write, &updated).context("save measured model capabilities")?;
+        let write = authority
+            .begin("saving measured model capabilities")
+            .context("durable-write authority for measured capabilities")?;
+        crate::gateway_config::save(&write, &updated)
+            .context("save measured model capabilities")?;
     }
 
     Ok(ProviderQualificationReport {
@@ -1207,7 +1214,7 @@ mod tests {
                 unsafe { std::env::set_var("XAI_API_KEY", "must-not-leak") };
 
                 let error = qualify_provider_model(
-                    &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+                    &crate::host_runtime::WriteAuthority::unowned_for_test(),
                     "attacker",
                     "grok-4.5",
                 )
@@ -1316,7 +1323,7 @@ mod tests {
                 install_profile(temp.path(), &base_url, "qualified");
 
                 let report = qualify_provider_model(
-                    &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+                    &crate::host_runtime::WriteAuthority::unowned_for_test(),
                     "qualified",
                     "cheap-code-model",
                 )
@@ -1391,7 +1398,7 @@ mod tests {
                 assert!(unqualified.models[0].capabilities.tools);
 
                 let report = qualify_provider_model(
-                    &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+                    &crate::host_runtime::WriteAuthority::unowned_for_test(),
                     "xai",
                     "grok-4.5",
                 )
@@ -1497,7 +1504,7 @@ mod tests {
                 install_profile(temp.path(), &base_url, "discussion-only");
 
                 let report = qualify_provider_model(
-                    &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+                    &crate::host_runtime::WriteAuthority::unowned_for_test(),
                     "discussion-only",
                     "cheap-code-model",
                 )
