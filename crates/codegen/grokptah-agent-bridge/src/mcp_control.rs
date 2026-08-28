@@ -212,6 +212,25 @@ impl LiveStreamState {
             if self.done {
                 return None;
             }
+            // A live stream is a read that outlives the call that authorized
+            // it. Revalidate the context on every frame so a credential or
+            // workspace-policy rotation ends the stream instead of quietly
+            // continuing to deliver another epoch's events.
+            //
+            // This is a frame-boundary check, not a preemption: a stream parked
+            // in the select below notices the rotation on its next event or
+            // keep-alive tick, so closure is bounded by the keep-alive interval
+            // rather than immediate. No event issued after the rotation is
+            // delivered, because every delivery passes through here first.
+            if let Err(error) = self.orch.require_current_auth(&self.auth) {
+                self.done = true;
+                self.replay_cursor = None;
+                self.queue_recovery(&format!(
+                    "authentication is no longer current: {}; re-authenticate and reopen",
+                    error.message
+                ));
+                continue;
+            }
             if let Some(cursor) = self.replay_cursor.take() {
                 match self.orch.live_run_page(
                     &self.auth,
@@ -555,12 +574,12 @@ struct ReadinessSnapshot {
 }
 
 fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
+    // The probe still reads capacity without a bearer credential, exactly as
+    // before; it now does so through a context the service itself issues so the
+    // context is bound to the current epoch instead of being fabricated here.
     let payload = state
         .orch
-        .get_capacity(&AuthContext {
-            token_id: "health-probe".into(),
-            owner_id: "health-probe".into(),
-        })
+        .get_capacity(&state.orch.health_probe_context())
         .unwrap_or_else(|error| json!({"health": {"serviceError": error.message}}));
     let health = payload.get("health").cloned().unwrap_or_else(|| json!({}));
     let ready = [

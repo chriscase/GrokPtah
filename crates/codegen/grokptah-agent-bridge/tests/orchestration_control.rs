@@ -1849,7 +1849,11 @@ fn run_event_pages_filter_before_limit_across_sessions() {
                 .display()
                 .to_string(),
             request_id: "event-page-test".into(),
-            client_id: None,
+            // The caller reading these pages authenticates with the
+            // primary credential, so the fixture must stamp the run the
+            // way the service stamps a run submitted by that principal.
+            // A principal-less record is owned by nobody and is refused.
+            client_id: Some("mcp".into()),
             state: RunState::Completed,
             purpose: Default::default(),
             agent_id: None,
