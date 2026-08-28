@@ -9792,6 +9792,8 @@ impl AgentHostHandle {
                 if id.is_empty() {
                     return Ok("ERROR: kill_task requires id".into());
                 }
+                let admission = self.admit_tool_effect(session_id, name, &args)?;
+                self.consume_tool_effect_lease(session_id, name, &args, &admission)?;
                 // Prefer background task cancel; also try subagent cancel (#179).
                 let bg = self.cancel_background_task(&id);
                 let sub = self.cancel_subagent(&id);
@@ -9804,6 +9806,8 @@ impl AgentHostHandle {
                 }
             }
             "task_output" | "get_task_output" => {
+                let admission = self.admit_tool_effect(session_id, name, &args)?;
+                self.consume_tool_effect_lease(session_id, name, &args, &admission)?;
                 let id = args
                     .get("id")
                     .or_else(|| args.get("task_id"))
@@ -9861,6 +9865,8 @@ impl AgentHostHandle {
                     .unwrap_or("")
                     .to_string();
                 let address = self.memory_address_from_args(session_id, &args)?;
+                let admission = self.admit_tool_effect(session_id, "memory_read", &args)?;
+                self.consume_tool_effect_lease(session_id, "memory_read", &args, &admission)?;
                 let facts = crate::memory::search(&address, &query)?;
                 let out = if facts.is_empty() {
                     format!("(no matching {} memory)", address.scope().label())
@@ -9963,10 +9969,17 @@ impl AgentHostHandle {
         }
 
         // Deterministic explore: list + glob + optional grep (read-only tools).
+        let list_input = serde_json::json!({ "path": "." });
+        let list_admission = self.admit_tool_effect(session_id, "list_dir", &list_input)?;
+        self.consume_tool_effect_lease(session_id, "list_dir", &list_input, &list_admission)?;
         let listing = local_tools::tool_list_dir(cwd, ".")
             .await
             .map(|t| t.output)
             .unwrap_or_else(|e| format!("list_dir error: {e}"));
+        let glob_input =
+            serde_json::json!({ "pattern": "*.{rs,ts,tsx,js,py,md,toml,json}", "limit": 40 });
+        let glob_admission = self.admit_tool_effect(session_id, "glob_files", &glob_input)?;
+        self.consume_tool_effect_lease(session_id, "glob_files", &glob_input, &glob_admission)?;
         let globs = crate::project_context::glob_files(cwd, "*.{rs,ts,tsx,js,py,md,toml,json}", 40);
         let mut parts = vec![
             format!("## Explore: {query}"),
@@ -9996,6 +10009,9 @@ impl AgentHostHandle {
             if cancel.is_cancelled() {
                 break;
             }
+            let grep_input = serde_json::json!({ "pattern": tok, "path": "." });
+            let grep_admission = self.admit_tool_effect(session_id, "grep", &grep_input)?;
+            self.consume_tool_effect_lease(session_id, "grep", &grep_input, &grep_admission)?;
             if let Ok(tr) = local_tools::tool_grep(cwd, tok, ".").await {
                 parts.push(format!(
                     "### grep `{tok}`\n{}",
@@ -10289,11 +10305,21 @@ impl AgentHostHandle {
                 }
                 parts.push(format!("### slept {ms}ms"));
             }
-            if let Ok(tr) = local_tools::tool_list_dir(cwd, ".").await {
-                parts.push(format!(
-                    "### listing\n{}",
-                    tr.output.chars().take(2_000).collect::<String>()
-                ));
+            let list_input = serde_json::json!({ "path": "." });
+            let list_allowed = self
+                .admit_tool_effect(session_id, "list_dir", &list_input)
+                .and_then(|admission| {
+                    self.consume_tool_effect_lease(session_id, "list_dir", &list_input, &admission)
+                });
+            if list_allowed.is_ok() {
+                if let Ok(tr) = local_tools::tool_list_dir(cwd, ".").await {
+                    parts.push(format!(
+                        "### listing\n{}",
+                        tr.output.chars().take(2_000).collect::<String>()
+                    ));
+                }
+            } else {
+                parts.push("### listing DENIED by capability authority".into());
             }
             if let Some(rest) = prompt.find("write ").map(|i| &prompt[i + "write ".len()..]) {
                 // #161: plan capability blocks mutators offline the same as online.
@@ -10303,18 +10329,42 @@ impl AgentHostHandle {
                          write_file is not allowed for plan/explore children"
                     ));
                 } else if let Some((path, content)) = rest.split_once(':') {
-                    self.snapshot_edit_original_for_session(session_id, cwd, path.trim());
-                    if let Ok(tr) =
-                        local_tools::tool_write_file(cwd, path.trim(), content.trim()).await
-                    {
-                        parts.push(format!("### write\n{}", tr.output));
+                    let write_input = serde_json::json!({
+                        "path": path.trim(),
+                        "content": content.trim(),
+                    });
+                    let write_allowed = self
+                        .admit_tool_effect(session_id, "write_file", &write_input)
+                        .and_then(|admission| {
+                            self.consume_tool_effect_lease(
+                                session_id,
+                                "write_file",
+                                &write_input,
+                                &admission,
+                            )
+                        });
+                    if write_allowed.is_err() {
+                        parts.push("### write DENIED by capability authority".into());
+                    } else {
+                        self.snapshot_edit_original_for_session(session_id, cwd, path.trim());
+                        if let Ok(tr) =
+                            local_tools::tool_write_file(cwd, path.trim(), content.trim()).await
                         {
-                            let mut g = self.inner.lock();
-                            if let Some(s) = g.subagents.iter_mut().find(|s| s.id == sub_id) {
-                                s.last_tool = Some("write_file".into());
+                            parts.push(format!("### write\n{}", tr.output));
+                            {
+                                let mut g = self.inner.lock();
+                                if let Some(s) = g.subagents.iter_mut().find(|s| s.id == sub_id) {
+                                    s.last_tool = Some("write_file".into());
+                                }
                             }
+                            self.emit_file_edit(
+                                session_id,
+                                cwd,
+                                path.trim(),
+                                &tr.output,
+                                &event_tx,
+                            );
                         }
-                        self.emit_file_edit(session_id, cwd, path.trim(), &tr.output, &event_tx);
                     }
                 }
             }

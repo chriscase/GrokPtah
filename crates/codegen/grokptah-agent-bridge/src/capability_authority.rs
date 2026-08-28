@@ -142,6 +142,8 @@ impl CapabilitySnapshot {
     ) -> Result<Self> {
         if principal.trim().is_empty()
             || scope.trim().is_empty()
+            || principal.len() > 256
+            || scope.len() > 256
             || principal.contains('\0')
             || scope.contains('\0')
         {
