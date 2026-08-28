@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use super::package_identity::ComputerExecutorIdentity;
 use super::types::{
     validate_id, ComputerBackend, ComputerError, ComputerErrorCode, ComputerResult, ComputerTarget,
     ObservationGeometry,
@@ -42,6 +43,10 @@ pub struct ComputerPlatformStatus {
     pub screen_recording: ComputerPermissionStatus,
     pub accessibility: ComputerPermissionStatus,
     pub detail: Option<String>,
+    /// The identity Computer Use actually runs under. In-process host identity
+    /// is not packaged-helper qualification, and the field says which it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<ComputerExecutorIdentity>,
 }
 
 impl ComputerPlatformStatus {
@@ -60,6 +65,9 @@ impl ComputerPlatformStatus {
                 ComputerErrorCode::InvalidRequest,
                 "invalid computer-use platform status",
             ));
+        }
+        if let Some(executor) = &self.executor {
+            executor.validate()?;
         }
         Ok(())
     }

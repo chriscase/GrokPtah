@@ -12,7 +12,8 @@
     "test:watch": "vitest",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "qualify:computer-use-package": "node scripts/qualify-computer-use-macos-package.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",

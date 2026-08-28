@@ -38,6 +38,63 @@ impl ComputerUseService {
         self.backend.capabilities()
     }
 
+    /// Packaged Computer Use admission, evaluated against this host right now.
+    ///
+    /// This is the production entry point, and it is deliberately reachable
+    /// from any environment: on a host without an operator trust root, signed
+    /// artifacts, or Virtualization.framework it returns a preflight that
+    /// denies with stated reasons. It never enables an unsupported environment
+    /// and never returns a value that reads as eligible by default, so calling
+    /// it is safe and its answer is honest.
+    pub fn packaged_authority_admission(&self) -> super::isolated_visual::IsolatedPreflight {
+        super::isolated_visual::isolated_visual_admission()
+    }
+
+    /// Whether a packaged helper is admitted for Computer Use on this host.
+    ///
+    /// False everywhere a real signed helper and operator trust root are not
+    /// both present, which includes every CI runner and every developer
+    /// checkout.
+    pub fn packaged_helper_available(&self) -> bool {
+        self.packaged_authority_admission().helper_admitted
+    }
+
+    /// The executor identity Computer Use would actually run under.
+    ///
+    /// When a packaged helper has been admitted, the identity carries the Team
+    /// ID and designated requirement the OS reported and the operator declared.
+    /// Otherwise it is the honest in-process host identity, which is never
+    /// packaged-helper qualification.
+    pub fn executor_identity(&self) -> super::package_identity::ComputerExecutorIdentity {
+        use super::package_identity::{ComputerExecutorIdentity, SigningClass};
+        let preflight = self.packaged_authority_admission();
+        preflight
+            .helper_identity
+            .as_ref()
+            .and_then(|admitted| ComputerExecutorIdentity::from_admitted_helper(admitted).ok())
+            .unwrap_or_else(|| ComputerExecutorIdentity::in_process_host(SigningClass::Uninspected))
+    }
+
+    /// Assemble the packaged-authority verdict for this host.
+    ///
+    /// The verdict stays `Unavailable` or `FailClosed` until real signed
+    /// artifacts exist, and cannot exceed `Partial` without hardware evidence
+    /// this process does not produce.
+    pub fn packaged_authority_evidence(
+        &self,
+        source_head: impl Into<String>,
+        branch: impl Into<String>,
+    ) -> super::qualification::PackageAuthorityEvidence {
+        super::qualification::PackageAuthorityEvidence::assemble(
+            super::qualification::EvidenceAssembly {
+                source_head: source_head.into(),
+                branch: branch.into(),
+                synthetic_oracle: super::qualification::run_synthetic_oracle(),
+                preflight: self.packaged_authority_admission(),
+            },
+        )
+    }
+
     pub fn list_runs(&self) -> ComputerResult<Vec<ComputerRun>> {
         self.store.list_runs()
     }

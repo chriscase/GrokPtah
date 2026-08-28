@@ -29,6 +29,12 @@ dirs = "6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 bytes = "1"
 sha2 = "0.10"
+# Single host-owned authority for isolated Computer Use guests, leases,
+# dispatch, and cleanup. Its own workspace root, so it is compiled here as a
+# dependency but its own suites need a separate `cargo test`.
+grokptah-isolated-visual = { path = "../grokptah-isolated-visual" }
+# Used by the acceptance oracle, which materializes a throwaway durable store.
+tempfile = "3"
 
 keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native"] }
 open = "5"

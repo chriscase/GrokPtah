@@ -108,17 +108,23 @@ pub use completion::{
 };
 pub use computer_agent::{ComputerAgentEligibility, ComputerAgentProposal};
 pub use computer_use::{
-    canonical_workspace_string, project_run_at, ActionClass, ActionGrant, ActionGrantSummary,
-    ActionOutcome, ActionOutcomeSummary, ComputerAction, ComputerAuditEntry, ComputerBackend,
+    canonical_workspace_string, documented_identity_json, isolated_visual_admission,
+    map_isolated_error, project_run_at, run_synthetic_oracle, versions_compatible, ActionClass,
+    ActionGrant, ActionGrantSummary, ActionOutcome, ActionOutcomeSummary, AdmittedGuestImage,
+    AdmittedHelperIdentity, AuthorityVerdict, ComputerAction, ComputerAuditEntry, ComputerBackend,
     ComputerCapabilities, ComputerControlDisposition, ComputerError, ComputerErrorCode,
-    ComputerErrorSummary, ComputerObservation, ComputerObservationPlatform, ComputerPermission,
-    ComputerPermissionStatus, ComputerPlatformStatus, ComputerPolicy, ComputerReadBinding,
-    ComputerRun, ComputerRunCapacity, ComputerRunEventPage, ComputerRunEventRange,
-    ComputerRunProgress, ComputerRunProjection, ComputerRunReads, ComputerRunState,
-    ComputerScopeCapacity, ComputerStore, ComputerTarget, ComputerTargetCandidate,
-    ComputerTargetSummary, ComputerUseLimits, ComputerUseService, GrantIssuer,
-    MacOsObservationPlatform, ObservationSummary, SemanticAction, SimulatorBackend,
-    DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
+    ComputerErrorSummary, ComputerExecutorIdentity, ComputerObservation,
+    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerPlatformStatus, ComputerPolicy, ComputerReadBinding, ComputerRun, ComputerRunCapacity,
+    ComputerRunEventPage, ComputerRunEventRange, ComputerRunProgress, ComputerRunProjection,
+    ComputerRunReads, ComputerRunState, ComputerScopeCapacity, ComputerStore, ComputerSurfaceLease,
+    ComputerTarget, ComputerTargetCandidate, ComputerTargetSummary, ComputerUseLimits,
+    ComputerUseService, DenyReason, EvidenceAssembly, ExecutorKind, GrantIssuer,
+    IsolatedEvidenceClass, IsolatedPreflight, IsolatedVisualHost, IsolatedVisualProjection,
+    MacOsObservationPlatform, ObservationSummary, PackageAuthorityEvidence, PackageIdentity,
+    PackagedTrustRoot, QualificationScenario, ScenarioResult, SemanticAction, SigningClass,
+    SimulatorBackend, SyntheticOracleReport, APP_BUNDLE_ID, DEFAULT_EVENT_PAGE, HELPER_BUNDLE_ID,
+    MAX_EVENT_PAGE, PACKAGE_AUTHORITY_EVIDENCE_SCHEMA, PACKAGE_IDENTITY_SCHEMA,
 };
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,

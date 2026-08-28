@@ -7,13 +7,19 @@ on:
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
+      - "crates/codegen/grokptah-isolated-visual/**"
       - "evals/**"
+      - "scripts/check-adversarial-reachable.sh"
+      - "scripts/check-committed-lockfiles.sh"
       - ".github/workflows/desktop.yml"
   pull_request:
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
+      - "crates/codegen/grokptah-isolated-visual/**"
       - "evals/**"
+      - "scripts/check-adversarial-reachable.sh"
+      - "scripts/check-committed-lockfiles.sh"
       - ".github/workflows/desktop.yml"
 
 permissions:
@@ -48,7 +54,7 @@ jobs:
           components: rustfmt, clippy
       - name: Configure compiler-cache namespace
         env:
-          SCCACHE_NAMESPACE: grokptah-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.92-${{ hashFiles('desktop/src-tauri/Cargo.lock', 'crates/codegen/grokptah-agent-bridge/Cargo.lock', 'evals/certification-lab/Cargo.lock') }}
+          SCCACHE_NAMESPACE: grokptah-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.92-${{ hashFiles('desktop/src-tauri/Cargo.lock', 'crates/codegen/grokptah-agent-bridge/Cargo.lock', 'crates/codegen/grokptah-isolated-visual/Cargo.lock', 'evals/certification-lab/Cargo.lock') }}
         run: echo "SCCACHE_GHA_VERSION=${SCCACHE_NAMESPACE}" >> "$GITHUB_ENV"
       - name: Install compiler cache
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
@@ -75,6 +81,31 @@ jobs:
           cargo fmt --manifest-path test-support/grokptah-test-gateway/Cargo.toml --all -- --check
           cargo clippy --manifest-path test-support/grokptah-test-gateway/Cargo.toml --locked --all-targets -- -D warnings
           cargo test --manifest-path test-support/grokptah-test-gateway/Cargo.toml --locked
+      - name: Computer Use authority (isolated-visual crate)
+        # This crate declares its own [workspace], so the bridge-wide
+        # `cargo test` above compiles its library as a dependency but does NOT
+        # run its unit tests or its adversarial matrix. They only execute when a
+        # step targets this manifest, which is what this step is for.
+        working-directory: crates/codegen/grokptah-isolated-visual
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          # Store tests take advisory file locks and must not overlap.
+          cargo test --locked -- --test-threads=1
+      - name: Computer Use authority gates (repo root)
+        working-directory: .
+        run: |
+          # Every committed lockfile still resolves from this exact tree.
+          scripts/check-committed-lockfiles.sh
+          # Every adversarial suite is actually reachable, and no second
+          # helper-local lease/dispatch authority has reappeared.
+          scripts/check-adversarial-reachable.sh
+      - name: Packaged Computer Use identity inspection (no signing)
+        working-directory: desktop
+        # Inspects source topology only. It never signs, never opens the
+        # Keychain, never prompts TCC, and treats a missing .app as
+        # unavailable rather than as a pass.
+        run: npm run qualify:computer-use-package
       - name: Offline parity oracles (no network)
         # Structured oracle unit tests + fixture selftests; live suite is on-demand.
         working-directory: crates/codegen/grokptah-agent-bridge

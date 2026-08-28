@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "grokptah-computer-use-trust-root.v1",
+  "title": "GrokPtah Computer Use operator trust root",
+  "description": "Operator/release declaration of the packaged identities Computer Use admission compares against. This file must live OUTSIDE the artifact root it authorizes; a trust root found inside that root is refused, because whoever produced the artifact would then also be declaring what it is checked against.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "issuer", "app", "helper", "guestImage"],
+  "properties": {
+    "schema": { "const": "grokptah-computer-use-trust-root.v1" },
+    "issuer": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Operator label (release channel, build id). Advisory only; nothing is admitted on the strength of this string."
+    },
+    "app": { "$ref": "#/$defs/appAnchor" },
+    "helper": { "$ref": "#/$defs/helperAnchor" },
+    "guestImage": { "$ref": "#/$defs/guestImageAnchor" }
+  },
+  "$defs": {
+    "teamId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9]{10}$",
+      "description": "Apple Team ID, exactly 10 alphanumeric characters."
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex SHA-256. A single SHA-256 over the bytes, matching crypto.createHash(\"sha256\")."
+    },
+    "designatedRequirement": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "Verbatim requirement as codesign -d -r- emits it. Compared for exact equality after whitespace normalization; it must bind its own identifier and pin a certificate anchor."
+    },
+    "appAnchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bundleId", "teamId", "designatedRequirement"],
+      "properties": {
+        "bundleId": { "type": "string", "minLength": 1 },
+        "teamId": { "$ref": "#/$defs/teamId" },
+        "designatedRequirement": { "$ref": "#/$defs/designatedRequirement" }
+      }
+    },
+    "helperAnchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bundleId", "teamId", "designatedRequirement", "entitlementsSha256"],
+      "properties": {
+        "bundleId": { "type": "string", "minLength": 1 },
+        "teamId": { "$ref": "#/$defs/teamId" },
+        "designatedRequirement": { "$ref": "#/$defs/designatedRequirement" },
+        "entitlementsSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "guestImageAnchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digestSha256", "format", "provenance", "authorizationSha256"],
+      "properties": {
+        "digestSha256": { "$ref": "#/$defs/sha256" },
+        "format": { "enum": ["raw", "rawdisk", "apple-diskimage"] },
+        "provenance": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Bound identity token. No path separators and no traversal; it names a release, not a location."
+        },
+        "authorizationSha256": {
+          "$ref": "#/$defs/sha256",
+          "description": "Digest of the release-side authorization for this image. Read only from this file; a manifest shipped beside the image cannot supply it."
+        }
+      }
+    }
+  }
+}
