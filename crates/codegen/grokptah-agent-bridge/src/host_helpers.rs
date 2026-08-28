@@ -2022,6 +2022,43 @@ fn mark_permit_semantic_rejection(
     }
 }
 
+fn restart_provider_attempt_after_body_change(
+    provider_attempt: &mut ProviderAttemptContext,
+    physical_permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
+    provider_id: &str,
+    body: &[u8],
+    rejected_status: u16,
+) -> Result<String> {
+    if let Some(mut permit) = physical_permit.take() {
+        provider_attempt
+            .semantic_rejection(&mut permit, rejected_status)
+            .map_err(|error| anyhow!("record changed-body rejection: {error}"))?;
+    }
+    let next = provider_attempt
+        .acquire_next_effect_lease()
+        .map_err(|error| anyhow!("acquire fresh changed-body lease: {error}"))?;
+    let next_permit = next
+        .begin(provider_id, body, true)
+        .map_err(|error| anyhow!("admit changed-body provider attempt: {error}"))?;
+    let key = next_permit.idempotency_key().to_owned();
+    *provider_attempt = next;
+    *physical_permit = Some(next_permit);
+    Ok(key)
+}
+
+fn provider_attempt_provider_id(
+    creds: &crate::auth_store::WireCredentials,
+    target: &ResolvedModelTarget,
+) -> String {
+    format!(
+        "{}-{:?}-{}-{}",
+        creds.provider_id,
+        target.dialect,
+        xai_provider_attempt::AttemptSpec::fingerprint_bytes(target.base_url.as_bytes()),
+        creds.qualification_identity_fingerprint()
+    )
+}
+
 /// Stream one chat/completions step (tools + tokens).
 /// Content → `on_delta`; reasoning_content → `on_thought` (#149).
 /// Cancel aborts the HTTP body read within ~one chunk.
@@ -2158,15 +2195,17 @@ where
         body["stream_options"] = serde_json::json!({ "include_usage": true });
     }
     apply_effort_to_agent_body(&mut body, &target, effort)?;
-    let request_bytes = serde_json::to_vec(&body)
+    let attempt_provider_id = provider_attempt_provider_id(&creds, &target);
+    let mut request_bytes = serde_json::to_vec(&body)
         .map(|body| body.len() as u64)
         .unwrap_or_default();
+    let mut provider_attempt = provider_attempt.clone();
     let mut physical_permit = Some(provider_attempt.begin(
-        &creds.provider_id,
+        &attempt_provider_id,
         &serde_json::to_vec(&body).unwrap_or_default(),
         true,
     )?);
-    let idempotency_key = physical_permit
+    let mut idempotency_key = physical_permit
         .as_ref()
         .map(|permit| permit.idempotency_key().to_owned())
         .ok_or_else(|| anyhow!("provider attempt permit is unavailable"))?;
@@ -2288,6 +2327,16 @@ where
             }
             match crate::auth_store::force_refresh(&creds).await {
                 Ok(fresh) => {
+                    if fresh.qualification_identity_fingerprint()
+                        != creds.qualification_identity_fingerprint()
+                    {
+                        mark_permit_semantic_rejection(
+                            &provider_attempt,
+                            physical_permit.take(),
+                            401,
+                        );
+                        bail!("HTTP 401 (credential principal changed during refresh)");
+                    }
                     creds = fresh;
                     let refreshed_binding = crate::live_attestation::attest_grok_build_oidc(
                         &target.wire_model,
@@ -2453,7 +2502,15 @@ where
                 if let Some(object) = body.as_object_mut() {
                     object.remove("stream_options");
                 }
-                last_err = Some("HTTP 400 (will retry without stream_options)".into());
+                idempotency_key = restart_provider_attempt_after_body_change(
+                    &mut provider_attempt,
+                    &mut physical_permit,
+                    &attempt_provider_id,
+                    &serde_json::to_vec(&body)?,
+                    status.as_u16(),
+                )?;
+                request_bytes = serde_json::to_vec(&body)?.len() as u64;
+                last_err = Some("HTTP 400 (new attempt without stream_options)".into());
                 continue;
             }
             // Some compatible gateways support native tools but reject the
@@ -2466,7 +2523,15 @@ where
                 if let Some(object) = body.as_object_mut() {
                     object.remove("tool_choice");
                 }
-                last_err = Some("HTTP 400 (will retry without tool_choice)".into());
+                idempotency_key = restart_provider_attempt_after_body_change(
+                    &mut provider_attempt,
+                    &mut physical_permit,
+                    &attempt_provider_id,
+                    &serde_json::to_vec(&body)?,
+                    status.as_u16(),
+                )?;
+                request_bytes = serde_json::to_vec(&body)?.len() as u64;
+                last_err = Some("HTTP 400 (new attempt without tool_choice)".into());
                 continue;
             }
             // Some proxies reject stream+tools — fall back to non-stream once.
@@ -2477,8 +2542,16 @@ where
                 if let Some(object) = body.as_object_mut() {
                     object.remove("stream_options");
                 }
+                idempotency_key = restart_provider_attempt_after_body_change(
+                    &mut provider_attempt,
+                    &mut physical_permit,
+                    &attempt_provider_id,
+                    &serde_json::to_vec(&body)?,
+                    status.as_u16(),
+                )?;
+                request_bytes = serde_json::to_vec(&body)?.len() as u64;
                 last_err = Some(format!(
-                    "HTTP {status} (will retry non-stream): {}",
+                    "HTTP {status} (new attempt non-stream): {}",
                     text.chars().take(200).collect::<String>()
                 ));
                 continue;
@@ -3073,7 +3146,7 @@ mod compatible_stream_tests {
 
     use axum::body::{Body, Bytes};
     use axum::extract::Json;
-    use axum::http::{header, Response, StatusCode};
+    use axum::http::{header, HeaderMap, Response, StatusCode};
     use axum::routing::post;
     use axum::Router;
     use futures::StreamExt;
@@ -3376,37 +3449,42 @@ mod compatible_stream_tests {
                 let handler_observed = Arc::clone(&observed);
                 let app = Router::new().route(
                     "/v1/chat/completions",
-                    post(move |Json(body): Json<serde_json::Value>| {
-                        let observed = Arc::clone(&handler_observed);
-                        async move {
-                            observed.lock().unwrap().push(body.clone());
-                            if body.get("stream_options").is_some()
-                                || body.get("tool_choice").is_some()
-                                || body.get("stream").and_then(serde_json::Value::as_bool)
-                                    == Some(true)
-                            {
-                                return Response::builder()
-                                    .status(StatusCode::BAD_REQUEST)
-                                    .body(Body::from("unsupported compatibility field"))
-                                    .unwrap();
+                    post(
+                        move |headers: HeaderMap, Json(mut body): Json<serde_json::Value>| {
+                            let observed = Arc::clone(&handler_observed);
+                            async move {
+                                body["_test_idempotency_key"] = serde_json::json!(headers
+                                    .get(xai_provider_attempt::IDEMPOTENCY_KEY_HEADER)
+                                    .and_then(|value| value.to_str().ok()));
+                                observed.lock().unwrap().push(body.clone());
+                                if body.get("stream_options").is_some()
+                                    || body.get("tool_choice").is_some()
+                                    || body.get("stream").and_then(serde_json::Value::as_bool)
+                                        == Some(true)
+                                {
+                                    return Response::builder()
+                                        .status(StatusCode::BAD_REQUEST)
+                                        .body(Body::from("unsupported compatibility field"))
+                                        .unwrap();
+                                }
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .body(Body::from(
+                                        serde_json::json!({
+                                            "choices": [{"message": {"content": "done"}}],
+                                            "usage": {
+                                                "prompt_tokens": 2,
+                                                "completion_tokens": 1,
+                                                "total_tokens": 3
+                                            }
+                                        })
+                                        .to_string(),
+                                    ))
+                                    .unwrap()
                             }
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .header(header::CONTENT_TYPE, "application/json")
-                                .body(Body::from(
-                                    serde_json::json!({
-                                        "choices": [{"message": {"content": "done"}}],
-                                        "usage": {
-                                            "prompt_tokens": 2,
-                                            "completion_tokens": 1,
-                                            "total_tokens": 3
-                                        }
-                                    })
-                                    .to_string(),
-                                ))
-                                .unwrap()
-                        }
-                    }),
+                        },
+                    ),
                 );
                 let server = tokio::spawn(async move {
                     axum::serve(listener, app).await.unwrap();
@@ -3472,6 +3550,15 @@ mod compatible_stream_tests {
 
                 let requests = observed.lock().unwrap();
                 assert_eq!(requests.len(), 4);
+                let keys = requests
+                    .iter()
+                    .map(|request| request["_test_idempotency_key"].as_str().unwrap())
+                    .collect::<std::collections::HashSet<_>>();
+                assert_eq!(
+                    keys.len(),
+                    4,
+                    "changed qualification bodies need new attempts"
+                );
                 assert!(requests[0].get("stream_options").is_some());
                 assert!(requests[1].get("stream_options").is_none());
                 assert!(requests[1].get("tool_choice").is_some());

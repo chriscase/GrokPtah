@@ -1830,6 +1830,34 @@ mod tests {
     }
 
     #[test]
+    fn changed_body_requires_a_distinct_host_lease_and_request_key() {
+        let temp = tempdir().unwrap();
+        let store = ProviderAttemptStore::open(temp.path()).unwrap();
+        let scope = "changed-body-scope";
+        write_host_snapshot_with_leases(
+            temp.path(),
+            scope,
+            &authority(1),
+            vec!["lease-1".into(), "lease-2".into()],
+        );
+        let context =
+            AttemptContext::from_host_ledger(store.clone(), "changed-body-operation", scope)
+                .unwrap();
+        let mut first = context
+            .begin("xai", b"body-with-tool-choice", true)
+            .unwrap();
+        let first_key = first.idempotency_key().to_owned();
+        context.semantic_rejection(&mut first, 400).unwrap();
+        let next_context = context.acquire_next_effect_lease().unwrap();
+        let second = next_context
+            .begin("xai", b"body-without-tool-choice", true)
+            .unwrap();
+        assert_ne!(first_key, second.idempotency_key());
+        assert_eq!(first.attempt.state().unwrap(), SendState::Failed);
+        assert_eq!(second.attempt.state().unwrap(), SendState::Sending);
+    }
+
+    #[test]
     fn cloned_or_replayed_effect_lease_cannot_be_used_by_another_attempt() {
         let temp = tempdir().unwrap();
         let store = ProviderAttemptStore::open(temp.path()).unwrap();
