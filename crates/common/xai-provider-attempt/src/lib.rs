@@ -515,10 +515,7 @@ impl AttemptContext {
             .authority_scope
             .as_deref()
             .ok_or(AttemptError::InvalidAuthority)?;
-        let record = self.store.read_host_authority(scope)?;
-        let lease_id = record
-            .unclaimed_lease(&self.store.root)
-            .ok_or(AttemptError::EffectLeaseAlreadyUsed)?;
+        let (record, lease_id) = self.store.select_host_lease(scope, &self.operation_id)?;
         let authority = self.authority.with_effect_lease(lease_id)?;
         Self::new(self.store.clone(), self.operation_id.clone(), authority).map(|mut context| {
             context.authority_scope = self.authority_scope.clone();
