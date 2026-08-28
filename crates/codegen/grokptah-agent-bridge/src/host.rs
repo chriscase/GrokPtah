@@ -1510,7 +1510,7 @@ impl AgentHostHandle {
     /// List the product-facing Lane projection, including archived Lanes when
     /// requested. The backing session records remain the source of truth.
     pub fn list_lanes(&self, include_archived: bool) -> Vec<LaneSummary> {
-        let mut g = self.inner.lock();
+        let g = self.inner.lock();
         let mut lanes: Vec<_> = g
             .sessions
             .values()
