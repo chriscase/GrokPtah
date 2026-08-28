@@ -63,6 +63,7 @@ struct PendingRun {
     session_id: Uuid,
     prompt: String,
     execution_mode: RunExecutionMode,
+    authority: AuthContext,
 }
 
 #[derive(Clone)]
@@ -1600,6 +1601,16 @@ impl OrchestrationService {
         self.auth_registry.lock().mint_effect_lease(auth, scope)
     }
 
+    fn consume_one_shot_effect(
+        &self,
+        auth: &AuthContext,
+        scope: impl Into<String>,
+    ) -> Result<(), OrchError> {
+        let scope = scope.into();
+        let mut lease = self.mint_effect_lease(auth, scope.clone())?;
+        self.consume_effect_lease(auth, &mut lease, &scope)
+    }
+
     pub fn consume_effect_lease(
         &self,
         auth: &AuthContext,
@@ -1710,6 +1721,11 @@ impl OrchestrationService {
                                 | "secret"
                                 | "secretkey"
                                 | "leasehash"
+                                | "workspace"
+                                | "cwd"
+                                | "path"
+                                | "sourceworkspace"
+                                | "executionworkspace"
                         ) {
                             continue;
                         }
@@ -1947,7 +1963,9 @@ impl OrchestrationService {
                 start_seq,
             );
             match transitioned {
-                Ok(Some(run)) => self.spawn_run(run, pending.prompt, pending.execution_mode),
+                Ok(Some(run)) => {
+                    self.spawn_run(run, pending.prompt, pending.execution_mode, pending.authority)
+                }
                 Ok(None) | Err(_) => {
                     self.host.release_orchestration_turn(&pending.run_id);
                     if let Err(error) = self
@@ -1970,6 +1988,7 @@ impl OrchestrationService {
     async fn begin_idempotency(
         &self,
         tool: &str,
+        auth: &AuthContext,
         request_id: &str,
         payload_hash: &str,
         session_id: Uuid,
@@ -2317,11 +2336,14 @@ impl OrchestrationService {
     async fn begin_work_mutation(
         &self,
         tool: &str,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
         payload: &serde_json::Value,
     ) -> Result<(PathBuf, IdempotencyStart), OrchError> {
+        self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
         let claimed = match self.authorize_work_mutation_scope(session_id, workspace) {
             Ok(path) => path,
             Err(error) => {
@@ -2501,6 +2523,7 @@ impl OrchestrationService {
         let (claimed, start) = self
             .begin_work_mutation(
                 "ptah_create_manager_plan",
+                auth,
                 request_id,
                 session_id,
                 workspace,
@@ -2559,7 +2582,7 @@ impl OrchestrationService {
             objective.clone(),
             session_id,
             claimed.display().to_string(),
-            auth.credential_id(),
+            auth.actor_handle().as_str(),
             WorkPolicy::default(),
         ) {
             Ok(root) => root,
@@ -2650,6 +2673,7 @@ impl OrchestrationService {
         let (claimed, start) = self
             .begin_work_mutation(
                 "ptah_advance_manager_plan",
+                auth,
                 request_id,
                 session_id,
                 workspace,
@@ -2697,7 +2721,7 @@ impl OrchestrationService {
                 ))
             }
         };
-        let created = match plan.advance(&work_items, auth.credential_id(), Utc::now()) {
+        let created = match plan.advance(&work_items, auth.actor_handle().as_str(), Utc::now()) {
             Ok(created) => created,
             Err(error) => {
                 return Err(self.fail_claim(
@@ -2756,6 +2780,7 @@ impl OrchestrationService {
         let (claimed, start) = self
             .begin_work_mutation(
                 "ptah_tick_manager_plan",
+                auth,
                 request_id,
                 session_id,
                 workspace,
@@ -2805,7 +2830,7 @@ impl OrchestrationService {
         };
         let now = Utc::now();
         let created = if plan.state == super::manager::ManagerPlanState::Active {
-            match plan.advance(&work_items, auth.credential_id(), now) {
+            match plan.advance(&work_items, auth.actor_handle().as_str(), now) {
                 Ok(created) => created,
                 Err(error) => {
                     return Err(self.fail_claim(
@@ -2827,7 +2852,7 @@ impl OrchestrationService {
             let message = match self.persist_manager_notification(
                 &plan,
                 &notification,
-                auth.credential_id(),
+                auth.actor_handle().as_str(),
                 Utc::now(),
             ) {
                 Ok(message) => message,
@@ -2913,6 +2938,7 @@ impl OrchestrationService {
         let (claimed, start) = self
             .begin_work_mutation(
                 "ptah_replan_manager_plan",
+                auth,
                 request_id,
                 session_id,
                 workspace,
@@ -3057,7 +3083,7 @@ impl OrchestrationService {
             "policy": policy,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(tool, auth, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -3068,7 +3094,7 @@ impl OrchestrationService {
             objective,
             session_id,
             claimed.display().to_string(),
-            auth.credential_id(),
+            auth.actor_handle().as_str(),
             policy,
         ) {
             Ok(item) => item,
@@ -3125,6 +3151,8 @@ impl OrchestrationService {
         agent_id: Option<String>,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_work_binding(auth, work_id)?;
         let tool = "ptah_claim_work";
         let payload = json!({
             "sessionId": session_id,
@@ -3134,7 +3162,7 @@ impl OrchestrationService {
             "agentId": agent_id,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(tool, auth, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return self.restore_claim_response(response),
@@ -3156,7 +3184,7 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
             }
         }
-        let claimant = agent_id.unwrap_or_else(|| auth.credential_id().to_string());
+        let claimant = agent_id.unwrap_or_else(|| auth.actor_handle().as_str().to_string());
         let claim = match self.store.claim_work_with_lease_secret(
             work_id,
             &claimant,
@@ -3205,6 +3233,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.work_lease_mutation(
             "ptah_renew_work",
+            auth,
             request_id,
             session_id,
             workspace,
@@ -3219,6 +3248,7 @@ impl OrchestrationService {
     async fn work_lease_mutation<F>(
         &self,
         tool: &str,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3229,6 +3259,9 @@ impl OrchestrationService {
     where
         F: FnOnce(&OrchStore) -> Result<WorkAttempt, OrchError>,
     {
+        self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_work_binding(auth, work_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -3236,7 +3269,7 @@ impl OrchestrationService {
             "details": details,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(tool, auth, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -3245,6 +3278,9 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
+        let effect_scope = format!("work:{work_id}:lease-mutation");
+        let mut effect_lease = self.mint_effect_lease(auth, effect_scope.clone())?;
+        self.consume_effect_lease(auth, &mut effect_lease, &effect_scope)?;
         let attempt = match operation(&self.store) {
             Ok(attempt) => attempt,
             Err(error) => {
@@ -3289,6 +3325,7 @@ impl OrchestrationService {
         let response = self
             .work_lease_mutation(
                 "ptah_link_work_run",
+                auth,
                 request_id,
                 session_id,
                 workspace,
@@ -3314,6 +3351,8 @@ impl OrchestrationService {
         percent: Option<u8>,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_work_binding(auth, work_id)?;
         let progress = WorkProgress {
             summary,
             percent,
@@ -3330,6 +3369,7 @@ impl OrchestrationService {
         let (claimed, start) = self
             .begin_work_mutation(
                 "ptah_report_work_progress",
+                auth,
                 request_id,
                 session_id,
                 workspace,
@@ -3343,6 +3383,9 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
+        let effect_scope = format!("work:{work_id}:progress-mutation");
+        let mut effect_lease = self.mint_effect_lease(auth, effect_scope.clone())?;
+        self.consume_effect_lease(auth, &mut effect_lease, &effect_scope)?;
         let (item, attempt) =
             match self
                 .store
@@ -3384,6 +3427,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.work_item_attempt_mutation(
             "ptah_release_work",
+            auth,
             request_id,
             session_id,
             workspace,
@@ -3409,6 +3453,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.work_item_attempt_mutation(
             "ptah_complete_work",
+            auth,
             request_id,
             session_id,
             workspace,
@@ -3434,6 +3479,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.work_item_attempt_mutation(
             "ptah_fail_work",
+            auth,
             request_id,
             session_id,
             workspace,
@@ -3448,6 +3494,7 @@ impl OrchestrationService {
     async fn work_item_attempt_mutation<F>(
         &self,
         tool: &str,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -3458,6 +3505,9 @@ impl OrchestrationService {
     where
         F: FnOnce(&OrchStore) -> Result<(WorkItem, super::workload::WorkAttempt), OrchError>,
     {
+        self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_work_binding(auth, work_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -3465,7 +3515,7 @@ impl OrchestrationService {
             "details": details,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(tool, auth, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -3474,6 +3524,9 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
+        let effect_scope = format!("work:{work_id}:attempt-mutation");
+        let mut effect_lease = self.mint_effect_lease(auth, effect_scope.clone())?;
+        self.consume_effect_lease(auth, &mut effect_lease, &effect_scope)?;
         let (item, attempt) = match operation(&self.store) {
             Ok(value) => value,
             Err(error) => {
@@ -3507,6 +3560,8 @@ impl OrchestrationService {
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_work_binding(auth, work_id)?;
         let tool = "ptah_cancel_work";
         let payload = json!({
             "sessionId": session_id,
@@ -3516,7 +3571,7 @@ impl OrchestrationService {
             "expectedRevision": expected_revision,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(tool, auth, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -3568,6 +3623,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.work_item_mutation(
             "ptah_assign_work",
+            auth,
             request_id,
             session_id,
             workspace,
@@ -3672,6 +3728,7 @@ impl OrchestrationService {
         let (claimed, start) = self
             .begin_work_mutation(
                 "ptah_heartbeat_worker",
+                auth,
                 request_id,
                 session_id,
                 workspace,
@@ -3684,7 +3741,7 @@ impl OrchestrationService {
         };
         let presence = match self.store.heartbeat_worker_scoped(
             agent_id,
-            auth.credential_id(),
+            auth.actor_handle().as_str(),
             host_kind,
             Utc::now(),
             session_id,
@@ -3735,6 +3792,7 @@ impl OrchestrationService {
         let (claimed, start) = self
             .begin_work_mutation(
                 "ptah_offer_work",
+                auth,
                 request_id,
                 session_id,
                 workspace,
@@ -3767,7 +3825,7 @@ impl OrchestrationService {
         let (item, decision) = match self.store.offer_work(
             work_id,
             &actors.worker.agent_id,
-            auth.credential_id(),
+            auth.actor_handle().as_str(),
             manager_id.as_deref(),
             &reason,
             expected_revision,
@@ -3876,6 +3934,7 @@ impl OrchestrationService {
         let (claimed, start) = self
             .begin_work_mutation(
                 "ptah_reassign_work",
+                auth,
                 request_id,
                 session_id,
                 workspace,
@@ -3908,7 +3967,7 @@ impl OrchestrationService {
         let (item, decision) = match self.store.reassign_work(
             work_id,
             &actors.worker.agent_id,
-            auth.credential_id(),
+            auth.actor_handle().as_str(),
             manager_id.as_deref(),
             &reason,
             expected_revision,
@@ -3949,6 +4008,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.work_item_mutation(
             "ptah_reprioritize_work",
+            auth,
             request_id,
             session_id,
             workspace,
@@ -3959,7 +4019,7 @@ impl OrchestrationService {
                     .reprioritize_work(
                         work_id,
                         priority,
-                        auth.credential_id(),
+                        auth.actor_handle().as_str(),
                         &reason,
                         expected_revision,
                         Utc::now(),
@@ -3984,6 +4044,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.work_item_mutation(
             "ptah_block_work",
+            auth,
             request_id,
             session_id,
             workspace,
@@ -3993,7 +4054,7 @@ impl OrchestrationService {
                 store
                     .block_work(
                         work_id,
-                        auth.credential_id(),
+                        auth.actor_handle().as_str(),
                         &reason,
                         expected_revision,
                         Utc::now(),
@@ -4018,6 +4079,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.work_item_mutation(
             "ptah_request_review",
+            auth,
             request_id,
             session_id,
             workspace,
@@ -4027,7 +4089,7 @@ impl OrchestrationService {
                 store
                     .request_work_review(
                         work_id,
-                        auth.credential_id(),
+                        auth.actor_handle().as_str(),
                         &reason,
                         expected_revision,
                         Utc::now(),
@@ -4083,6 +4145,7 @@ impl OrchestrationService {
         let (claimed, start) = self
             .begin_work_mutation(
                 "ptah_send_message",
+                auth,
                 request_id,
                 session_id,
                 workspace,
@@ -4100,7 +4163,7 @@ impl OrchestrationService {
         }
         let mut message = match WorkMessage::new(
             kind,
-            auth.credential_id().to_string(),
+            auth.actor_handle().as_str().to_string(),
             from_agent_id,
             to_agent_id,
             session_id,
@@ -4171,6 +4234,7 @@ impl OrchestrationService {
         let (claimed, start) = self
             .begin_work_mutation(
                 "ptah_ack_message",
+                auth,
                 request_id,
                 session_id,
                 workspace,
@@ -4183,7 +4247,7 @@ impl OrchestrationService {
         };
         let message = match self.store.ack_message_scoped(
             message_id,
-            auth.credential_id(),
+            auth.actor_handle().as_str(),
             Utc::now(),
             session_id,
             &claimed.display().to_string(),
@@ -4268,6 +4332,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.work_item_mutation(
             "ptah_retry_work",
+            auth,
             request_id,
             session_id,
             workspace,
@@ -4294,6 +4359,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.work_item_attempt_mutation(
             "ptah_approve_work",
+            auth,
             request_id,
             session_id,
             workspace,
@@ -4303,7 +4369,7 @@ impl OrchestrationService {
                 "note": note,
                 "expectedRevision": expected_revision,
             }),
-            |store| store.approve_work(work_id, auth.credential_id(), note, expected_revision),
+            |store| store.approve_work(work_id, auth.actor_handle().as_str(), note, expected_revision),
         )
         .await
     }
@@ -4441,7 +4507,7 @@ impl OrchestrationService {
             "retry": retry,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(tool, auth, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -4506,7 +4572,7 @@ impl OrchestrationService {
             missed_run_policy,
             concurrency,
             retry,
-            auth.credential_id(),
+            auth.actor_handle().as_str(),
             now,
         ) {
             Ok(routine) => routine,
@@ -4570,7 +4636,7 @@ impl OrchestrationService {
             "expectedRevision": expected_revision,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(tool, auth, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -4635,6 +4701,7 @@ impl OrchestrationService {
         let (claimed, start) = self
             .begin_work_mutation(
                 tool,
+                auth,
                 request_id,
                 session_id,
                 workspace,
@@ -4694,6 +4761,7 @@ impl OrchestrationService {
     async fn work_item_mutation<F>(
         &self,
         tool: &str,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -4704,6 +4772,9 @@ impl OrchestrationService {
     where
         F: FnOnce(&OrchStore) -> Result<WorkItem, OrchError>,
     {
+        self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_work_binding(auth, work_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -4711,7 +4782,7 @@ impl OrchestrationService {
             "details": details,
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(tool, auth, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -4720,6 +4791,9 @@ impl OrchestrationService {
         if let Err(error) = self.load_work_scoped(session_id, &claimed, work_id, false) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
+        let effect_scope = format!("work:{work_id}:durable-mutation");
+        let mut effect_lease = self.mint_effect_lease(auth, effect_scope.clone())?;
+        self.consume_effect_lease(auth, &mut effect_lease, &effect_scope)?;
         let item = match operation(&self.store) {
             Ok(item) => item,
             Err(error) => {
@@ -4783,7 +4857,7 @@ impl OrchestrationService {
             },
         });
         let (claimed, start) = self
-            .begin_work_mutation(tool, request_id, session_id, workspace, &payload)
+            .begin_work_mutation(tool, auth, request_id, session_id, workspace, &payload)
             .await?;
         let mut lease = match start {
             IdempotencyStart::Replay(response) => return Ok(response),
@@ -4801,7 +4875,7 @@ impl OrchestrationService {
         let (item, decision) = match operation(
             &self.store,
             agent_id,
-            auth.credential_id(),
+            auth.actor_handle().as_str(),
             &reason,
             expected_revision,
             Utc::now(),
@@ -5001,7 +5075,7 @@ impl OrchestrationService {
         }
         let agent = self
             .store
-            .revise_agent_spec(agent_id, auth.credential_id(), |spec| {
+            .revise_agent_spec(agent_id, auth.actor_handle().as_str(), |spec| {
                 if policy.enabled && spec.authority.computer_use_allowed {
                     anyhow::bail!("managed execution cannot grant Computer Use");
                 }
@@ -5068,6 +5142,7 @@ impl OrchestrationService {
         let (claimed, start) = self
             .begin_work_mutation(
                 "ptah_authorize_work_execution",
+                auth,
                 request_id,
                 session_id,
                 workspace,
@@ -5083,7 +5158,7 @@ impl OrchestrationService {
         }
         let (item, decision) = match self.store.authorize_work_execution(
             work_id,
-            auth.credential_id(),
+            auth.actor_handle().as_str(),
             None,
             &reason,
             expected_revision,
@@ -6099,6 +6174,7 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
+        self.consume_one_shot_effect(auth, format!("queue:{session_id}:{entry_id}:edit"))?;
         let (entries, revision) = match self
             .host
             .session_queue_edit_with_origin(session_id, entry_id, version, text, "mcp")
@@ -6165,6 +6241,7 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
+        self.consume_one_shot_effect(auth, format!("queue:{session_id}:{entry_id}:remove"))?;
         let (entries, changed_entry, revision) = match self
             .host
             .session_queue_remove_with_origin_receipt(session_id, entry_id, "mcp", expected_version)
@@ -6236,6 +6313,7 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
+        self.consume_one_shot_effect(auth, format!("queue:{session_id}:{entry_id}:reorder"))?;
         let (entries, revision) = match self.host.session_queue_move_with_origin_and_revision(
             session_id,
             entry_id,
@@ -6303,6 +6381,7 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
+        self.consume_one_shot_effect(auth, format!("queue:{session_id}:clear"))?;
         let (entries, outcome, revision) = match self
             .host
             .session_queue_clear_with_origin_receipt(session_id, "mcp")
@@ -6426,6 +6505,7 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
+        self.consume_one_shot_effect(auth, format!("queue:{session_id}:{entry_id}:run-next"))?;
         let (result, revision) = match self.host.session_queue_run_next_with_origin(
             session_id,
             entry_id,
@@ -6498,6 +6578,7 @@ impl OrchestrationService {
             IdempotencyStart::Replay(value) => return Ok(value),
             IdempotencyStart::Perform(lease) => lease,
         };
+        self.consume_one_shot_effect(auth, format!("queue:{session_id}:{entry_id}:steer"))?;
         let (receipt, revision) = match self.host.session_queue_steer_entry_with_origin(
             session_id,
             entry_id,
@@ -7156,14 +7237,7 @@ impl OrchestrationService {
             // Distinguish coordinator-owned work from desktop turns so the
             // desktop can surface external activity without guessing from
             // transport timing.
-            client_id: Some(if auth.credential_id() == "primary" {
-                // Preserve the established wire value for the compatibility
-                // credential; newly named device credentials are emitted by
-                // their stable IDs.
-                "mcp".into()
-            } else {
-                auth.credential_id().to_string()
-            }),
+            client_id: Some(auth.actor_handle().as_str().to_string()),
             state: if queued {
                 RunState::Queued
             } else {
@@ -7258,6 +7332,7 @@ impl OrchestrationService {
                 session_id,
                 prompt: prompt.clone(),
                 execution_mode,
+                authority: auth.clone(),
             }) {
                 Ok(position) => Some(position),
                 Err(error) => {
@@ -7320,7 +7395,7 @@ impl OrchestrationService {
             if queued { "run queued" } else { "run started" },
         );
         if !queued {
-            self.spawn_run(run, prompt, execution_mode);
+            self.spawn_run(run, prompt, execution_mode, auth.clone());
         } else {
             // A capacity release can race the enqueue; this also makes an
             // immediately available slot visible without requiring polling.
@@ -7479,7 +7554,13 @@ impl OrchestrationService {
     }
 
     /// Start a run whose host admission has already been reserved.
-    fn spawn_run(&self, run: RunRecord, prompt: String, execution_mode: RunExecutionMode) {
+    fn spawn_run(
+        &self,
+        run: RunRecord,
+        prompt: String,
+        execution_mode: RunExecutionMode,
+        authority: AuthContext,
+    ) {
         let host = self.host.clone();
         let store = self.store.clone();
         let bus = self.bus.clone();
@@ -7505,6 +7586,39 @@ impl OrchestrationService {
                 host: host.clone(),
                 run_id: rid.clone(),
             };
+            let service = service_ref.upgrade();
+            if let Some(service) = service {
+                let mut effect_lease =
+                    match service.mint_effect_lease(&authority, format!("run:{rid}:provider")) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            let _ = store.update_run(&rid, |current| {
+                                current.state = RunState::Failed;
+                                current.terminal_result = Some("failed".into());
+                                current.error_code = Some(error.code.as_str().into());
+                                current.stop_cause = Some(RunStopCause::Failed);
+                                current.updated_at = Utc::now();
+                                Ok(())
+                            });
+                            return;
+                        }
+                    };
+                if let Err(error) =
+                    service.consume_effect_lease(&authority, &mut effect_lease, &format!("run:{rid}:provider"))
+                {
+                    let _ = store.update_run(&rid, |current| {
+                        current.state = RunState::Failed;
+                        current.terminal_result = Some("failed".into());
+                        current.error_code = Some(error.code.as_str().into());
+                        current.stop_cause = Some(RunStopCause::Failed);
+                        current.updated_at = Utc::now();
+                        Ok(())
+                    });
+                    return;
+                }
+            } else {
+                return;
+            }
             let prompt_fut = host.session_prompt_reserved_with_max_rounds_for_run(
                 session_id,
                 prompt,
@@ -7765,6 +7879,7 @@ impl OrchestrationService {
             IdempotencyStart::Perform(lease) => lease,
         };
 
+        self.consume_one_shot_effect(auth, format!("queue:{session_id}:add"))?;
         let (entries, changed_entry, revision) =
             match self.host.session_queue_add_with_source_receipt(
                 session_id,
@@ -7866,6 +7981,7 @@ impl OrchestrationService {
             IdempotencyStart::Perform(lease) => lease,
         };
 
+        self.consume_one_shot_effect(auth, format!("queue:{session_id}:steer"))?;
         let (receipt, revision) =
             match self
                 .host
@@ -8024,6 +8140,7 @@ impl OrchestrationService {
             return Err(self.fail_claim(&mut lease, Some(rid.into()), session_id, &claimed, error));
         }
 
+        self.consume_one_shot_effect(auth, format!("run:{rid}:cancel"))?;
         // Persist cancelled transactionally before signalling. The closure
         // rechecks state so a concurrent completion can never be overwritten.
         let cancel_update = self.store.update_run(rid, |current| {

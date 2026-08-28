@@ -128,10 +128,6 @@ impl AuthContext {
         PublicActorHandle(format!("actor_{}", hex_sha256(&bytes)[..32].to_string()))
     }
 
-    pub(crate) fn credential_id(&self) -> &str {
-        &self.stamp.credential_id
-    }
-
     pub(crate) fn owner_id(&self) -> &str {
         &self.stamp.owner_id
     }
@@ -299,6 +295,12 @@ impl AuthRegistry {
             validate_stored_authority(&state)?;
             (state, true)
         } else {
+            if durable_records_exist(root) {
+                return Err(OrchError::new(
+                    OrchErrorCode::Internal,
+                    "durable auth authority is missing; refusing to resurrect stale resources",
+                ));
+            }
             (StoredAuthority::default(), false)
         };
         let mut registry = Self {
@@ -642,6 +644,25 @@ fn stale_authority() -> OrchError {
     )
 }
 
+fn durable_records_exist(root: &Path) -> bool {
+    [
+        "runs",
+        "work-items",
+        "work-attempts",
+        "messages",
+        "routines",
+        "routine-activations",
+        "manager-plans",
+        "managed-intents",
+    ]
+    .into_iter()
+    .any(|directory| {
+        std::fs::read_dir(root.join(directory))
+            .ok()
+            .is_some_and(|entries| entries.flatten().any(|entry| entry.path().is_file()))
+    })
+}
+
 fn validate_owner(owner_id: &str) -> Result<(), OrchError> {
     if owner_id.trim().is_empty() || owner_id.len() > MAX_AUTH_OWNER_BYTES {
         return Err(OrchError::new(
@@ -928,16 +949,12 @@ mod tests {
                 &[AuthCredential::new("primary", "tok").unwrap()]
             )
             .is_err());
-        assert_eq!(
-            registry
-                .authenticate(
-                    Some("Bearer tok"),
-                    &[AuthCredential::new("primary", "tok").unwrap()]
-                )
-                .unwrap()
-                .credential_id(),
-            "primary"
-        );
+        assert!(registry
+            .authenticate(
+                Some("Bearer tok"),
+                &[AuthCredential::new("primary", "tok").unwrap()]
+            )
+            .is_ok());
     }
 
     #[test]
@@ -951,7 +968,6 @@ mod tests {
         let auth = registry
             .authenticate(Some("Bearer other-tok"), &credentials)
             .unwrap();
-        assert_eq!(auth.credential_id(), "laptop");
         assert_eq!(auth.owner_id(), "account-1");
         assert!(registry
             .authenticate(Some("Bearer unknown"), &credentials)

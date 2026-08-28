@@ -152,6 +152,20 @@ impl LiveStreamState {
     }
 
     fn queue_entry(&mut self, seq: u64, ts: String, update: SessionUpdate) {
+        let terminal = matches!(&update, SessionUpdate::TurnComplete { .. });
+        let update = self.orch.public_projection(
+            serde_json::to_value(update).unwrap_or_else(|_| json!({})),
+        );
+        self.queue_serialized_entry(seq, ts, update, terminal);
+    }
+
+    fn queue_serialized_entry(
+        &mut self,
+        seq: u64,
+        ts: String,
+        update: Value,
+        terminal: bool,
+    ) {
         if seq <= self.last_seq || seq < self.start_seq {
             return;
         }
@@ -161,7 +175,6 @@ impl LiveStreamState {
                 return;
             }
         }
-        let terminal = matches!(&update, SessionUpdate::TurnComplete { .. });
         self.last_seq = seq;
         self.pending.push_back(sse_message(
             Some(seq),
@@ -170,7 +183,6 @@ impl LiveStreamState {
                 "method": "notifications/ptah_event",
                 "params": {
                     "sessionId": self.session_id,
-                    "workspace": self.workspace,
                     "runId": self.run_id,
                     "seq": seq,
                     "ts": ts,
@@ -192,7 +204,6 @@ impl LiveStreamState {
                 "method": "notifications/ptah_recovery",
                 "params": {
                     "sessionId": self.session_id,
-                    "workspace": self.workspace,
                     "runId": self.run_id,
                     "afterSeq": self.last_seq,
                     "reason": reason,
@@ -268,7 +279,19 @@ impl LiveStreamState {
                     if crate::event_bus::session_id_of(&update) != Some(self.session_id) {
                         continue;
                     }
-                    self.queue_entry(seq, chrono::Utc::now().to_rfc3339(), update);
+                    let update = self.orch.public_projection(
+                        serde_json::to_value(update).unwrap_or_else(|_| json!({})),
+                    );
+                    let terminal = matches!(
+                        update.get("type").and_then(Value::as_str),
+                        Some("turnComplete")
+                    );
+                    self.queue_serialized_entry(
+                        seq,
+                        chrono::Utc::now().to_rfc3339(),
+                        update,
+                        terminal,
+                    );
                 }
                 _ = self.heartbeat.tick() => {
                     if !self.orch.auth_is_current(&self.auth) {
