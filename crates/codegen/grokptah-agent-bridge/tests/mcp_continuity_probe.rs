@@ -144,33 +144,10 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
     host.session_set_cwd(gap_session.id, workspace.path())
         .unwrap();
     let gap_start_seq = host.event_bus().current_seq().saturating_add(1);
-    let store = OrchStore::open(home.path().join("orch")).unwrap();
-    let interrupted_run_id = "continuity-interrupted-source";
-    let gap_run_id = "continuity-gap-source";
-    seed_run(
-        &store,
-        interrupted_run_id,
-        session.id,
-        workspace.path(),
-        RunState::Interrupted,
-    );
-    seed_run(
-        &store,
-        gap_run_id,
-        gap_session.id,
-        workspace.path(),
-        RunState::Running,
-    );
-    store
-        .update_run(gap_run_id, |run| {
-            run.start_seq = Some(gap_start_seq);
-            Ok(())
-        })
-        .unwrap();
     let service = OrchestrationService::new(
         host.clone(),
         host.event_bus(),
-        store,
+        OrchStore::open(home.path().join("orch")).unwrap(),
         OrchestrationConfig {
             bearer_token: "continuity-probe-token".into(),
             allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
@@ -178,6 +155,29 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
             bounds: RunBounds::default(),
         },
     );
+    let interrupted_run_id = "continuity-interrupted-source";
+    let gap_run_id = "continuity-gap-source";
+    seed_run(
+        service.store(),
+        interrupted_run_id,
+        session.id,
+        workspace.path(),
+        RunState::Interrupted,
+    );
+    seed_run(
+        service.store(),
+        gap_run_id,
+        gap_session.id,
+        workspace.path(),
+        RunState::Running,
+    );
+    service
+        .store()
+        .update_run(gap_run_id, |run| {
+            run.start_seq = Some(gap_start_seq);
+            Ok(())
+        })
+        .unwrap();
     let server = start_control_server(service, 0).await.unwrap();
     let ready_file = home.path().join("gap-ready");
     let release_file = home.path().join("gap-release");
