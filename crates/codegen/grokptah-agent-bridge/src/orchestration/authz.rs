@@ -50,6 +50,17 @@ impl AuthCredential {
                 "auth credential id must contain only ASCII letters, numbers, '-', '_', or '.'",
             ));
         }
+        // The host stamps runs and scopes receipts with this id. A credential
+        // admitted under a reserved value would *be* that authority.
+        if super::types::RESERVED_CREDENTIAL_IDS
+            .iter()
+            .any(|reserved| reserved.eq_ignore_ascii_case(&id))
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "auth credential id is reserved by this host",
+            ));
+        }
         if token.is_empty() {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
@@ -213,6 +224,35 @@ mod tests {
         assert_eq!(
             require_bearer(Some("Bearer tok"), "tok").unwrap().token_id,
             "primary"
+        );
+    }
+
+    /// A credential cannot be admitted under an identity the host stamps.
+    ///
+    /// `stamped_client_id` maps a credential id straight through, so a device
+    /// admitted as `native-executor` would *be* host authority: it would read
+    /// host-authored runs and claim in the host's receipt namespace. `mcp` is
+    /// the same hazard one step removed — it is the value the compatibility
+    /// credential stamps, so a second credential carrying it lands in
+    /// `primary`'s scope.
+    ///
+    /// This was previously written down as a deployment constraint. A
+    /// constraint that only exists in prose is one an operator can violate by
+    /// typing a name.
+    #[test]
+    fn reserved_credential_ids_are_refused_at_admission() {
+        for reserved in ["native-executor", "mcp", "NATIVE-EXECUTOR", "MCP"] {
+            let error = AuthCredential::new(reserved, "a-token-with-enough-entropy")
+                .expect_err("a reserved credential id must not be admitted");
+            assert_eq!(error.code, OrchErrorCode::InvalidRequest);
+        }
+        assert!(
+            AuthCredential::new("device-a", "a-token-with-enough-entropy").is_ok(),
+            "an ordinary credential must still be admitted"
+        );
+        assert!(
+            AuthCredential::new("primary", "a-token-with-enough-entropy").is_ok(),
+            "the compatibility credential is named `primary`, not `mcp`"
         );
     }
 

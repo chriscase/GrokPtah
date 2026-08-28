@@ -809,7 +809,7 @@ async fn a_killed_service_process_replays_its_receipt_to_a_second_process() {
     // Seed one session through the raw client so the adapter has a workspace
     // to *learn*. It is never told a path.
     let mut seed = mcp_client(first.addr).await;
-    create_build_session(&mut seed, &workspace, "child-process-restart").await;
+    let seeded = create_build_session(&mut seed, &workspace, "child-process-restart").await;
 
     let (faulty, armed) = PostEffectDisconnect::connect(first.addr).await;
     let plane = ServiceControlPlane::read_only(faulty).with_operator_authority();
@@ -868,10 +868,23 @@ async fn a_killed_service_process_replays_its_receipt_to_a_second_process() {
         before + 1,
         "the mutation must have survived a process that was killed mid-flight"
     );
-    let known: Vec<_> = survivors
+
+    // Name the session the lost response created, exactly: the survivor that
+    // is not the seed. Accepting "any known session" would let a broken replay
+    // that returns the *seed* pass, which is the weaker assertion this test
+    // used to make.
+    let seeded_id = seeded.to_string();
+    let created: Vec<_> = survivors
         .iter()
         .map(|session| session.session_id.clone())
+        .filter(|id| id.as_str() != seeded_id)
         .collect();
+    assert_eq!(
+        created.len(),
+        1,
+        "exactly one session should have been created behind the lost response"
+    );
+    let created = created.into_iter().next().expect("checked above");
 
     let recovered = reconnected
         .create_session(CreateSessionRequest {
@@ -881,9 +894,15 @@ async fn a_killed_service_process_replays_its_receipt_to_a_second_process() {
         })
         .await
         .expect("retrying the key in a new process must reconcile, not fail");
-    assert!(
-        known.contains(&recovered.session_id),
-        "the retry minted a new session instead of replaying the durable one"
+    assert_eq!(
+        recovered.session_id, created,
+        "the retry must replay the session the lost response created, not \
+         merely some session this host already knows about"
+    );
+    assert_ne!(
+        recovered.session_id.as_str(),
+        seeded_id,
+        "the retry returned the seed session"
     );
     assert_eq!(
         reconnected

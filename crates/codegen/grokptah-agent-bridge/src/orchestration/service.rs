@@ -5392,7 +5392,7 @@ impl OrchestrationService {
         for receipt in &receipts {
             let attempt_digest = self
                 .store
-                .attempt_digest(&receipt.payload_hash)
+                .attempt_digest(&scope, &receipt.payload_hash)
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
             items.push(PublicReceipt {
                 request_id: receipt.request_id.clone(),

@@ -1346,6 +1346,17 @@ pub(crate) fn stamped_client_id(auth: &AuthContext) -> String {
 /// on it, and a second definition is how the two would drift.
 pub(crate) const HOST_AUTHORED_CLIENT_ID: &str = "native-executor";
 
+/// Credential ids no device may be admitted under.
+///
+/// `stamped_client_id` maps a credential id straight through, so a credential
+/// *named* `native-executor` would stamp the host identity and land in the
+/// host's scope — reading host-authored runs and claiming in the host's
+/// receipt namespace. Documenting that as a deployment constraint left the
+/// door open; refusing it at admission closes it. `mcp` is reserved for the
+/// same reason: it is the wire value the compatibility credential stamps, so
+/// a second credential carrying it would land in `primary`'s scope.
+pub(crate) const RESERVED_CREDENTIAL_IDS: [&str; 2] = [HOST_AUTHORED_CLIENT_ID, "mcp"];
+
 /// A durable receipt, as stored.
 ///
 /// `pub(crate)` with the rest of the receipt surface. It carries the full
@@ -1366,6 +1377,16 @@ pub(crate) struct IdempotencyReceipt {
     /// spanning the upgrade is treated as a new request rather than replayed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// Which derivation rule produced `scope`.
+    ///
+    /// Stored, not merely folded into the digest. Folding the version into the
+    /// hash makes a new rule produce different *values*; it does not let
+    /// anything read a stored receipt and say which rule made it. Without this
+    /// field a migration to canonical identity could only guess, and "every
+    /// receipt records its derivation version" would be a claim about intent
+    /// rather than about data — which is what it was until this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_version: Option<u32>,
     pub payload_hash: String,
     pub run_id: Option<String>,
     pub tool: String,

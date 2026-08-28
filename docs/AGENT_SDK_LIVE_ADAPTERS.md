@@ -225,6 +225,71 @@ child from `Drop`, so a failing assertion cannot leak a process that would hold
 a port, a home and the instance lock and make the *next* test fail for an
 unrelated reason.
 
+### F-11 — Five holes behind the seal, and one claim that was not true (fixed)
+
+An exact-delta review of the sealing commit found that sealing the *type* had
+not by itself produced a verified boundary. Each of these was checked in code
+before acting; each was real.
+
+**The derivation version was not stored.** This one is a correction to my own
+reporting, not just to code. F-9's residual said "every receipt records
+`SCOPE_DERIVATION_VERSION`". It did not: the version was folded into the *hash
+input*, which changes the values a new rule produces but leaves nothing on disk
+saying which rule produced a given receipt. A migration to canonical identity
+could only have guessed. `scope_version` is now a stored field, carried through
+settlement rather than re-stamped, so a receipt records the rule it was
+*claimed* under.
+
+**A credential could be admitted as the host.** `stamped_client_id` maps a
+credential id straight through, so a device named `native-executor` would *be*
+host authority — reading host-authored runs and claiming in the host's receipt
+namespace. F-9 wrote this down as a deployment constraint on credential naming.
+A constraint that exists only in prose is one an operator violates by typing a
+name. `AuthCredential::new` now refuses the reserved ids (`native-executor` and
+`mcp`, the latter because it is the value the compatibility credential stamps),
+case-insensitively, at admission.
+
+**The digest key could be silently reissued.** Provisioning was
+read-or-create with `truncate(true)`. Two processes racing a cold start both
+miss the read and both write, and the second replaces the first's secret —
+invalidating every cursor and digest already issued under it, including ones a
+caller is holding. A torn write leaving fewer than 32 bytes sent the next call
+down the same truncating path, turning one bad write into a permanent reset.
+Provisioning is now `create_new` (`O_EXCL`): one creator wins, everyone else
+reads what the winner wrote, and a short file is an error rather than an
+invitation to overwrite — silently reissuing the key is the failure, not the
+diagnosis.
+
+**The page cursor could skip a receipt permanently.** The key is
+`(created_at_millis, request_id)`, and a wall clock does not order claims. Two
+receipts claimed inside one millisecond order by request id, so a claim
+arriving *later* with a lexically smaller id sorts *before* a cursor already
+handed out — and is then skipped on that page and every page after it. Not
+delayed: lost. The claim clock is now monotonic, seeded from what is already on
+disk so a restart cannot regress into a range it has issued. The cost, stated:
+under a burst inside one millisecond the stamp runs up to a millisecond per
+claim ahead of the wall clock, so `recorded_at` is the claim time to within
+that burst and is not a reading to compare against another host's.
+
+**The attempt digest did not scope.** The host hashed only its salt and the
+payload, so two principals sending identical payloads got identical digests — a
+digest one caller can see confirming what another sent, exactly the correlation
+the salt exists to prevent, and exactly what the SDK's own contract text said
+was not happening. The scope is now in the hash. The contract text is corrected
+too, in both directions it had been wrong: it had also still claimed reads were
+*not* principal-scoped, which F-0 had already made false.
+
+Each has a guard, and each guard was checked against the original behaviour
+rather than assumed to bite. Two are worth naming for how they were built:
+`a_later_claim_is_never_skipped_by_an_earlier_cursor` first *passed* under the
+bug, because two real claims land in one millisecond only when the machine
+happens to be fast enough — a timing-dependent guard is no guard, so it now
+winds the monotonic floor back to force the collision and asserts the invariant
+where no timing can hide it. And the child-process replay test accepted "any
+session this host knows about", which a broken replay returning the seed
+session would have passed; it now names the session the lost response created
+and asserts equality with that one.
+
 ### F-9 — The scope was sealed by convention, not by the type (fixed)
 
 Review's sharpest point, and correct. F-6 scoped the *storage*, but left every
@@ -482,7 +547,9 @@ to guess an owner for a record that has none — but it is a one-time behaviour
 change and a host operator should know it happens rather than discover it.
 
 **R10 — The scope is derived from the stamped credential id, and that is
-provisional.** It is *not* canonical authority: there is no owner identity, no
+provisional.** *(Partly narrowed by F-11: the reserved ids are now refused at
+admission, and the derivation version is stored rather than merely hashed. The
+binding itself is still not canonical.)* It is *not* canonical authority: there is no owner identity, no
 auth generation, and no delegation chain in it, so a renamed credential is a
 different principal and a reused name inherits the old namespace without an
 epoch to separate them. That binding belongs to #460/#458. What is done here is
@@ -493,6 +560,23 @@ widened from 64 to 128 bits — enough is not the same as ample for a value that
 separates principals. `scope_follows_the_credential_and_records_how_it_was_derived`
 pins both consequences so neither is a surprise. **No consumer may read the
 current scope as canonical identity.**
+
+**R11 — `AuthContext` is publicly constructible.** Sealing the receipt store
+does not by itself create a verified principal boundary: `AuthContext` is a
+public struct with public fields, so an in-process or downstream caller can
+construct one and hand it to any authority-taking service method. Every fence
+this branch added is downstream of that. Closing it means the type can only be
+issued by authentication, which is the same change #460 needs for canonical
+identity and is that lane's to make rather than something to approximate here.
+Until then: **the boundary this branch proves is the HTTP surface, not the
+in-process one.**
+
+**R12 — The receipt page key is a monotonic timestamp, not an explicit
+sequence.** F-11's monotonic claim clock makes the existing
+`(millis, request_id)` key lossless without a contract change. An explicit
+`seq` field on the receipt would be the plainer shape, and is the right move
+once R4 gives Rust/JSON/TypeScript one generator — adding a public DTO field
+before then widens the parity gap it would be fixing.
 
 **R9 — Two live fault checks still skip.**
 `faults.lost_connection_is_safely_retryable` and

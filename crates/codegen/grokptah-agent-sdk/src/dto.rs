@@ -658,15 +658,29 @@ open_vocabulary! {
 /// thing this boundary exists to withhold, and unlike a path it is worth
 /// guessing.
 ///
-/// It is worse than it first looks, because reads here are **not**
-/// principal-scoped (see `docs/AGENT_SDK_SEAM.md`): every credential that can
-/// reach a session sees every receipt in it, including receipts written by a
-/// different credential. The oracle would therefore work *across* consumers
-/// sharing a session, not just on one's own traffic.
+/// # What "scoped" has to mean here
+///
+/// This paragraph has been wrong twice, in opposite directions, and both
+/// corrections are worth keeping visible. It first said reads were **not**
+/// principal-scoped — true when written, false once every run, event, artifact
+/// and receipt read began binding the principal. It then implied the *digest*
+/// was principal-scoped while the host hashed only its salt and the payload,
+/// so two principals sending identical payloads got identical digests: a
+/// digest one caller could see confirmed what another had sent, which is the
+/// correlation the salt exists to prevent.
+///
+/// Both are now true rather than asserted. Reads are principal-bound, and the
+/// host folds the caller's scope into the digest, so equality means "the same
+/// payload, from the same principal, on this host" and nothing wider.
+///
+/// What a digest still tells its **owner** is unchanged and intended: which of
+/// its own attempts carried identical payloads. That is the whole point of it.
 ///
 /// # What crosses instead
 ///
-/// `SHA-256(scope_salt ‖ 0x00 ‖ host_payload_hash)`, truncated to 16 bytes.
+/// `SHA-256(scope_salt ‖ 0x00 ‖ host_payload_hash)`, truncated to 16 bytes,
+/// where the host's `scope_salt` covers its per-home secret **and** the
+/// caller's scope.
 /// Within one adapter and one salt this is a bijection on the host's hash, so
 /// the only property a consumer actually needs — *these two receipts are the
 /// same attempt / different attempts* — survives exactly. Everything else does

@@ -7,7 +7,7 @@ use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 
 use anyhow::Context;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
 use parking_lot::Mutex;
 use uuid::Uuid;
@@ -30,7 +30,7 @@ use super::types::{
     constant_time_eq, hex_decode, hex_encode, hex_sha256, hmac_sha256_hex, safe_id_filename,
     AgentRecord, AgentSpec, AgentState, AuditEntry, ContinuationCheckpoint, IdempotencyReceipt,
     IdempotencyScope, OrchError, OrchErrorCode, PromotionState, RunBounds, RunRecord, RunState,
-    RunStopCause,
+    RunStopCause, SCOPE_DERIVATION_VERSION,
 };
 use super::worker::{WorkerHostKind, WorkerPresence, WorkerProjection};
 use super::workload::{
@@ -50,6 +50,15 @@ struct OrchStoreInner {
     _store_lock: fs::File,
     lock: Mutex<()>,
     last_run_error: Mutex<Option<String>>,
+    /// The per-home digest/cursor secret, read once.
+    ///
+    /// Cached so provisioning happens exactly once per store rather than on
+    /// every digest and every cursor, which is also what keeps the create race
+    /// to a single window instead of one per call.
+    receipt_salt: Mutex<Option<Vec<u8>>>,
+    /// The last millisecond a receipt was claimed at, so the next claim is
+    /// strictly after it. `None` until seeded from what is already on disk.
+    last_claim_millis: Mutex<Option<i64>>,
     last_audit_error: Arc<Mutex<Option<String>>>,
     audit_file_lock: Arc<Mutex<()>>,
     audit_writer: AuditWriter,
@@ -223,6 +232,8 @@ impl OrchStore {
                 _store_lock: store_lock,
                 lock: Mutex::new(()),
                 last_run_error: Mutex::new(None),
+                receipt_salt: Mutex::new(None),
+                last_claim_millis: Mutex::new(None),
                 last_audit_error,
                 audit_file_lock,
                 audit_writer: AuditWriter {
@@ -4840,38 +4851,148 @@ impl OrchStore {
     ///
     /// The salt is persisted so digests stay comparable across restarts, and
     /// is created 0600 on first use. It never leaves the host.
+    /// **Create-new-or-read, never truncate.**
+    ///
+    /// The first version was read-or-create with `truncate(true)`, which loses
+    /// in two ways. Two processes racing a cold start both miss the read and
+    /// both write, and the second silently replaces the first's secret —
+    /// invalidating every cursor and digest already issued under it, including
+    /// ones a caller is holding. And a torn write leaving fewer than 32 bytes
+    /// sent the *next* call down the same truncating path, turning one bad
+    /// write into a permanent reset.
+    ///
+    /// `create_new` is `O_EXCL`: exactly one creator wins and everyone else
+    /// reads what the winner wrote. A short file is now an error rather than an
+    /// invitation to overwrite, because silently reissuing the key is the
+    /// failure, not the diagnosis.
     fn receipt_digest_salt(&self) -> anyhow::Result<Vec<u8>> {
+        if let Some(cached) = self.inner.receipt_salt.lock().clone() {
+            return Ok(cached);
+        }
         let path = self.inner.root.join("receipt-digest.key");
-        if let Ok(existing) = fs::read(&path) {
+        let secret = Self::provision_receipt_salt(&path)?;
+        *self.inner.receipt_salt.lock() = Some(secret.clone());
+        Ok(secret)
+    }
+
+    /// The instant to stamp on the next claim: strictly after the last one.
+    ///
+    /// The page order and its cursor are `(created_at_millis, request_id)`, and
+    /// a wall clock does not order claims. Two receipts claimed inside one
+    /// millisecond order by request id, so a claim that arrives *later* with a
+    /// lexically smaller id sorts *before* a cursor already handed out — and is
+    /// then skipped on every subsequent page, permanently. Losing a receipt is
+    /// the one thing a receipt log must not do.
+    ///
+    /// So the claim clock is monotonic: never repeating, never going backwards,
+    /// and seeded from what is already on disk so a restart cannot regress into
+    /// a range already issued. The cost, stated rather than hidden: under a
+    /// burst of claims inside one millisecond the stamp runs up to one
+    /// millisecond per claim ahead of the wall clock. `recorded_at` is still
+    /// the claim time, accurate to within that burst; it is not a wall-clock
+    /// reading to measure against another host's.
+    ///
+    /// Caller must hold `inner.lock`.
+    fn next_claim_instant(&self) -> DateTime<Utc> {
+        let mut last = self.inner.last_claim_millis.lock();
+        if last.is_none() {
+            *last = Some(self.highest_claim_millis_on_disk());
+        }
+        let previous = last.expect("seeded above");
+        let millis = Utc::now().timestamp_millis().max(previous + 1);
+        *last = Some(millis);
+        DateTime::from_timestamp_millis(millis).unwrap_or_else(Utc::now)
+    }
+
+    /// The largest claim millisecond already recorded, or 0.
+    ///
+    /// Read once per store. A restart that began numbering from the wall clock
+    /// again could re-enter a millisecond range it has already issued cursors
+    /// for, which is the same loss one process-lifetime later.
+    fn highest_claim_millis_on_disk(&self) -> i64 {
+        let dir = self.inner.root.join("idempotency");
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("json"))
+            .filter_map(|path| fs::read_to_string(path).ok())
+            .filter_map(|text| serde_json::from_str::<IdempotencyReceipt>(&text).ok())
+            .map(|receipt| receipt.created_at.timestamp_millis())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn provision_receipt_salt(path: &Path) -> anyhow::Result<Vec<u8>> {
+        if let Ok(existing) = fs::read(path) {
             if existing.len() >= 32 {
                 return Ok(existing);
+            }
+            if !existing.is_empty() {
+                anyhow::bail!(
+                    "receipt digest key at {} is truncated; refusing to reissue it, \
+                     because a new key silently invalidates every cursor and digest \
+                     already handed out",
+                    path.display()
+                );
             }
         }
         let mut secret = Vec::with_capacity(32);
         secret.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
         secret.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
         let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&path)?;
-        std::io::Write::write_all(&mut file, &secret)?;
-        Ok(secret)
+        match options.open(path) {
+            Ok(mut file) => {
+                std::io::Write::write_all(&mut file, &secret)?;
+                file.sync_all()?;
+                Ok(secret)
+            }
+            // Another process won the race. Its key is the key.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = fs::read(path)?;
+                anyhow::ensure!(
+                    existing.len() >= 32,
+                    "receipt digest key at {} is short after a creation race",
+                    path.display()
+                );
+                Ok(existing)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Opaque, host-issued attempt digest for a stored receipt.
     ///
-    /// Equal payloads under one home agree; nothing else survives. A caller
-    /// cannot test a guessed prompt without the salt, and two homes never
-    /// agree on the same payload.
-    pub fn attempt_digest(&self, payload_hash: &str) -> anyhow::Result<String> {
+    /// Equal payloads **within one principal's scope** agree; nothing else
+    /// survives. A caller cannot test a guessed prompt without the salt, and
+    /// two homes never agree on the same payload.
+    ///
+    /// The scope is in the hash, and that is the point rather than a detail.
+    /// Without it two principals submitting the same payload get the *same*
+    /// digest, so a digest one caller can see confirms what another caller
+    /// sent — exactly the correlation the salt exists to prevent. The SDK's
+    /// contract already said "principal-scoped" while the host hashed only the
+    /// salt and the payload; the code now matches the contract rather than the
+    /// contract being corrected down to the code.
+    pub(crate) fn attempt_digest(
+        &self,
+        scope: &IdempotencyScope,
+        payload_hash: &str,
+    ) -> anyhow::Result<String> {
         use sha2::{Digest, Sha256};
         let salt = self.receipt_digest_salt()?;
         let mut hasher = Sha256::new();
         hasher.update(&salt);
+        hasher.update([0u8]);
+        hasher.update(scope.as_str().as_bytes());
         hasher.update([0u8]);
         hasher.update(payload_hash.as_bytes());
         Ok(hex_sha256(&hasher.finalize())[..32].to_string())
@@ -5095,13 +5216,14 @@ impl OrchStore {
 
         let pending = IdempotencyReceipt {
             request_id: request_id.into(),
+            created_at: self.next_claim_instant(),
             scope: Some(scope.as_str().to_string()),
+            scope_version: Some(SCOPE_DERIVATION_VERSION),
             payload_hash: payload_hash.into(),
             run_id: None,
             tool: tool.into(),
             response: serde_json::Value::Null,
             error: None,
-            created_at: Utc::now(),
             settled_at: None,
             status: "pending".into(),
         };
@@ -5199,6 +5321,9 @@ impl OrchStore {
         let receipt = IdempotencyReceipt {
             request_id: request_id.into(),
             scope: Some(scope.as_str().to_string()),
+            // Carried, not re-stamped: a receipt records the rule that
+            // produced the scope it was *claimed* under.
+            scope_version: previous.scope_version,
             payload_hash: payload_hash.into(),
             run_id,
             tool: tool.into(),
@@ -5662,6 +5787,7 @@ mod tests {
             store
                 .save_idempotency(&IdempotencyReceipt {
                     scope: Some(scope().as_str().to_string()),
+                    scope_version: Some(SCOPE_DERIVATION_VERSION),
                     request_id: request_id.into(),
                     payload_hash: format!("{request_id}-hash"),
                     run_id: Some("run-precision".into()),
@@ -6290,6 +6416,164 @@ mod tests {
         );
     }
 
+    /// A receipt claimed later must never sort before one already paged past.
+    ///
+    /// The page key is `(created_at_millis, request_id)`. With a wall clock,
+    /// two claims inside one millisecond order by request id — so a claim that
+    /// *arrives later* with a lexically smaller id sorts *before* a cursor
+    /// already handed out, and is skipped on that page and every page after
+    /// it. Not delayed: lost.
+    ///
+    /// The claim clock is monotonic, so the shape below cannot arise. This
+    /// test writes it as a caller would meet it — claim `zzz`, page past it,
+    /// then claim `aaa` — rather than as a property about timestamps.
+    #[test]
+    fn a_later_claim_is_never_skipped_by_an_earlier_cursor() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let scope = scope();
+
+        let settle = |id: &str| {
+            store.claim_idempotency(&scope, "t", id, "h").unwrap();
+            store
+                .complete_idempotency(
+                    &scope,
+                    "t",
+                    id,
+                    "h",
+                    Some("run-order".into()),
+                    serde_json::json!({ "id": id }),
+                )
+                .unwrap();
+        };
+
+        settle("zzz");
+        let (first, _) = store
+            .list_idempotency_for_run(&scope, "run-order", None, 10)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let cursor = (
+            first[0].created_at.timestamp_millis(),
+            first[0].request_id.clone(),
+        );
+
+        // Force the collision rather than hoping for it. Two real claims land
+        // in one millisecond only when the machine is fast enough, so a test
+        // that just claims twice passes under the bug on most runs — as this
+        // one did before it was written this way. Winding the monotonic floor
+        // back to the first claim's millisecond reproduces exactly the state a
+        // same-millisecond pair produces, every time.
+        *store.inner.last_claim_millis.lock() = Some(cursor.0 - 1);
+        settle("aaa");
+
+        let (after, _) = store
+            .list_idempotency_for_run(&scope, "run-order", Some(cursor), 10)
+            .unwrap();
+        let names: Vec<_> = after.iter().map(|r| r.request_id.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["aaa"],
+            "a receipt claimed after the cursor was issued must still be reachable"
+        );
+
+        // The invariant behind it, asserted where no timing can hide it: the
+        // claim clock never repeats and never regresses, whatever the wall
+        // clock says. Wind the floor far ahead and the next claim must still
+        // come after it.
+        let ahead = Utc::now().timestamp_millis() + 10_000;
+        *store.inner.last_claim_millis.lock() = Some(ahead);
+        store
+            .claim_idempotency(&scope, "t", "after-a-jump", "h")
+            .unwrap();
+        let jumped = store
+            .load_idempotency(&scope, "after-a-jump")
+            .unwrap()
+            .expect("claimed");
+        assert!(
+            jumped.created_at.timestamp_millis() > ahead,
+            "the claim clock regressed into a range it had already issued: {} <= {ahead}",
+            jumped.created_at.timestamp_millis()
+        );
+
+        let (all, _) = store
+            .list_idempotency_for_run(&scope, "run-order", None, 10)
+            .unwrap();
+        let stamps: Vec<i64> = all
+            .iter()
+            .map(|r| r.created_at.timestamp_millis())
+            .collect();
+        let mut sorted = stamps.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            stamps.len(),
+            sorted.len(),
+            "claim stamps must be distinct, or the id becomes the tiebreak again"
+        );
+    }
+
+    /// Reissuing the digest key would invalidate every cursor already handed
+    /// out, so provisioning must be create-once and never truncate.
+    #[test]
+    fn the_digest_key_is_provisioned_once_and_never_reissued() {
+        let d = tempdir().unwrap();
+        let key = d.path().join("receipt-digest.key");
+
+        let first = OrchStore::provision_receipt_salt(&key).unwrap();
+        assert_eq!(first.len(), 32);
+        let second = OrchStore::provision_receipt_salt(&key).unwrap();
+        assert_eq!(
+            first, second,
+            "a second provisioning replaced the key; every cursor issued under \
+             the first is now invalid"
+        );
+
+        // A torn write is a diagnosis, not an invitation to overwrite.
+        std::fs::write(&key, b"short").unwrap();
+        assert!(
+            OrchStore::provision_receipt_salt(&key).is_err(),
+            "a truncated key must fail closed rather than be silently reissued"
+        );
+        assert_eq!(
+            std::fs::read(&key).unwrap(),
+            b"short",
+            "the failing path must not have rewritten the key"
+        );
+    }
+
+    /// Two principals sending the same payload must not get the same digest.
+    ///
+    /// The digest is what a caller sees in place of the payload hash, and the
+    /// contract calls it principal-scoped. While the host hashed only the salt
+    /// and the payload, equal digests across principals confirmed that another
+    /// caller had sent an identical payload — the correlation the salt exists
+    /// to prevent.
+    #[test]
+    fn the_attempt_digest_does_not_correlate_across_principals() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let mine = IdempotencyScope::of(&principal("device-a"));
+        let theirs = IdempotencyScope::of(&principal("device-b"));
+        let payload = "a".repeat(64);
+
+        let ours = store.attempt_digest(&mine, &payload).unwrap();
+        assert_ne!(
+            ours,
+            store.attempt_digest(&theirs, &payload).unwrap(),
+            "the same payload produced the same digest for two principals"
+        );
+        assert_eq!(
+            ours,
+            store.attempt_digest(&mine, &payload).unwrap(),
+            "a principal's own equal payloads must still agree"
+        );
+        assert_ne!(
+            ours,
+            store.attempt_digest(&mine, &"b".repeat(64)).unwrap(),
+            "different payloads must differ"
+        );
+    }
+
     /// The receipt surface must stay sealed inside this crate.
     ///
     /// An in-process or out-of-tree caller that could name a scope could read,
@@ -6791,6 +7075,7 @@ mod tests {
         store
             .save_idempotency(&IdempotencyReceipt {
                 scope: Some(scope().as_str().to_string()),
+                scope_version: Some(SCOPE_DERIVATION_VERSION),
                 request_id: "old-receipt".into(),
                 payload_hash: "hash".into(),
                 run_id: None,
@@ -6854,6 +7139,7 @@ mod tests {
         store
             .save_idempotency(&IdempotencyReceipt {
                 scope: Some(scope().as_str().to_string()),
+                scope_version: Some(SCOPE_DERIVATION_VERSION),
                 request_id: "unknown-status".into(),
                 payload_hash: "hash".into(),
                 run_id: None,
