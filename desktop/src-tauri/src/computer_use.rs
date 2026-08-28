@@ -1,21 +1,39 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
 use chrono::{Duration, Utc};
+#[cfg(target_os = "macos")]
+use grokptah_agent_bridge::MacOsObservationPlatform;
 use grokptah_agent_bridge::{
     canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
     ComputerAgentProposal, ComputerCapabilities, ComputerError, ComputerObservation,
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
-    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
-    MacOsObservationPlatform, SemanticAction, SimulatorBackend,
+    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer, SemanticAction,
+    SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 const MAX_LIVE_NATIVE_SERVICES: usize = 32;
+
+#[cfg(test)]
+static DESKTOP_HOME_LOCK: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+struct DesktopHomeGuard;
+
+#[cfg(test)]
+impl Drop for DesktopHomeGuard {
+    fn drop(&mut self) {
+        grokptah_agent_bridge::set_grokptah_home_override(None);
+        DESKTOP_HOME_LOCK.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +92,8 @@ pub struct DesktopComputerUse {
     native_services: std::sync::Mutex<HashMap<String, Arc<ComputerUseService>>>,
     simulator_operation: Mutex<()>,
     pending_approval: std::sync::Mutex<Option<PendingComputerApproval>>,
+    #[cfg(test)]
+    _home_guard: Option<DesktopHomeGuard>,
 }
 
 impl DesktopComputerUse {
@@ -90,9 +110,10 @@ impl DesktopComputerUse {
             ),
         };
         let simulator = store.clone().map(|store| {
-            Arc::new(ComputerUseService::new(
+            Arc::new(ComputerUseService::new_with_authority(
                 Arc::new(SimulatorBackend::new()),
                 store,
+                host.capability_authority(),
             ))
         });
         Self {
@@ -106,6 +127,8 @@ impl DesktopComputerUse {
             native_services: std::sync::Mutex::new(HashMap::new()),
             simulator_operation: Mutex::new(()),
             pending_approval: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            _home_guard: None,
         }
     }
 
@@ -196,7 +219,19 @@ impl DesktopComputerUse {
             .bind_target(selection_token)
             .await
             .map_err(|error| error.to_string())?;
-        let service = ComputerUseService::new(backend, store);
+        let principal = self
+            .host
+            .capability_principal_for_computer(owner_session_id)
+            .map_err(|error| error.to_string())?;
+        let service = ComputerUseService::new_with_authority_and_principal(
+            backend,
+            store,
+            self.host.capability_authority(),
+            principal.clone(),
+        );
+        service
+            .install_host_policy(principal)
+            .map_err(|error| error.to_string())?;
         let limits = ComputerUseLimits {
             max_actions: 1,
             max_duration_secs: 5 * 60,
@@ -329,6 +364,13 @@ impl DesktopComputerUse {
             return Err("This session already has an active Computer Run".into());
         }
         self.clear_pending_for_owner(owner_session_id)?;
+        service
+            .install_host_policy(
+                self.host
+                    .capability_principal_for_computer(owner_session_id)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
         let limits = ComputerUseLimits {
             max_actions: 8,
             max_duration_secs: 10 * 60,
@@ -387,7 +429,19 @@ impl DesktopComputerUse {
             .store
             .clone()
             .ok_or_else(|| self.initialization_error())?;
-        let service = Arc::new(ComputerUseService::new(backend, store));
+        let principal = self
+            .host
+            .capability_principal_for_computer(owner_session_id)
+            .map_err(|error| error.to_string())?;
+        let service = Arc::new(ComputerUseService::new_with_authority_and_principal(
+            backend,
+            store,
+            self.host.capability_authority(),
+            principal.clone(),
+        ));
+        service
+            .install_host_policy(principal)
+            .map_err(|error| error.to_string())?;
         let limits = ComputerUseLimits {
             max_actions: 8,
             max_duration_secs: 10 * 60,
@@ -568,26 +622,11 @@ impl DesktopComputerUse {
                     completed: false,
                 })
             }
-            ComputerAgentProposal::Complete { summary, .. } => {
-                let (service, run) = self.owned_service(owner_session_id, run_id)?;
-                if run.version != expected_version
-                    || run.state != ComputerRunState::Ready
-                    || run
-                        .current_observation
-                        .as_ref()
-                        .map(|observation| observation.observation_id.as_str())
-                        != Some(observation_id)
-                {
-                    return Err("The Computer Run changed while the model was responding".into());
-                }
-                service
-                    .complete(&Uuid::new_v4().to_string(), run_id, expected_version)
-                    .map_err(|error| error.to_string())?;
-                Ok(ComputerAgentProposalResult {
-                    snapshot: self.cockpit_snapshot(owner_session_id)?,
-                    summary,
-                    completed: true,
-                })
+            ComputerAgentProposal::Complete {
+                summary: _,
+                ..
+            } => {
+                Err("model-authored completion is not accepted; only a host-authored execution receipt can settle a Computer Run".into())
             }
         }
     }
@@ -1051,12 +1090,38 @@ mod tests {
     /// Host fixture with its persist directories bound under the disposable
     /// fixture directory. The process-global home override is serialized and
     /// restored so parallel tests never touch the real user home.
-    fn test_host(dir: &std::path::Path) -> AgentHostHandle {
-        let _guard = grokptah_agent_bridge::home_override_serial();
+    fn test_host(dir: &std::path::Path) -> (AgentHostHandle, Uuid, DesktopHomeGuard) {
+        while DESKTOP_HOME_LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::thread::yield_now();
+        }
+        let guard = DesktopHomeGuard;
         grokptah_agent_bridge::set_grokptah_home_override(Some(dir.join(".grokptah")));
         let host = grokptah_agent_bridge::AgentHost::create(Default::default());
-        grokptah_agent_bridge::set_grokptah_home_override(None);
-        host
+        host.start().unwrap();
+        let session = host
+            .session_new_kind(grokptah_agent_bridge::SessionKind::Build)
+            .unwrap();
+        host.set_project_cwd(dir).unwrap();
+        host.session_set_cwd(session.id, dir).unwrap();
+        let store = host.ensure_orchestration_store().unwrap();
+        let _authority_service = grokptah_agent_bridge::OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            store,
+            grokptah_agent_bridge::OrchestrationConfig {
+                bearer_token: "desktop-computer-authority".into(),
+                allowlist: grokptah_agent_bridge::WorkspaceAllowlist::new(
+                    [dir.to_path_buf()],
+                ),
+                max_concurrent_runs: 1,
+                bounds: grokptah_agent_bridge::RunBounds::default(),
+            },
+        );
+        host.ensure_session_agent(session.id).unwrap();
+        (host, session.id, guard)
     }
 
     fn test_desktop() -> (tempfile::TempDir, DesktopComputerUse) {
@@ -1064,12 +1129,17 @@ mod tests {
         // Tests deliberately open an isolated store in the fixture directory;
         // production `new()` must borrow the host's shared handle instead.
         let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
-        let simulator = Arc::new(ComputerUseService::new(
+        // Install policy explicitly from a live host principal; constructing a
+        // service alone must not mint or install any authority.
+        let (host, session_id, home_guard) = test_host(dir.path());
+        let principal = host.capability_principal(session_id).unwrap();
+        let simulator = Arc::new(ComputerUseService::new_with_authority_and_principal(
             Arc::new(SimulatorBackend::new()),
             store.clone(),
+            host.capability_authority(),
+            principal.clone(),
         ));
-        // Build the host before `dir` moves into the returned tuple.
-        let host = test_host(dir.path());
+        simulator.install_host_policy(principal).unwrap();
         (
             dir,
             DesktopComputerUse {
@@ -1083,8 +1153,17 @@ mod tests {
                 native_services: std::sync::Mutex::new(HashMap::new()),
                 simulator_operation: Mutex::new(()),
                 pending_approval: std::sync::Mutex::new(None),
+                _home_guard: Some(home_guard),
             },
         )
+    }
+
+    fn test_owner(desktop: &DesktopComputerUse) -> Uuid {
+        desktop
+            .host
+            .status()
+            .active_session
+            .expect("test host must have an active session")
     }
 
     fn native_test_desktop() -> (tempfile::TempDir, DesktopComputerUse, Arc<AtomicUsize>) {
@@ -1121,7 +1200,7 @@ mod tests {
     #[tokio::test]
     async fn approval_is_exact_one_use_and_requires_reobservation() {
         let (_dir, desktop) = test_desktop();
-        let owner = Uuid::new_v4();
+        let owner = test_owner(&desktop);
         let target = SimulatorBackend::demo_target();
         let started = desktop
             .start_simulator(owner, &target.app_id)
@@ -1175,7 +1254,7 @@ mod tests {
     #[tokio::test]
     async fn model_proposal_is_revalidated_and_staged_without_dispatch() {
         let (_dir, desktop) = test_desktop();
-        let owner = Uuid::new_v4();
+        let owner = test_owner(&desktop);
         let target = SimulatorBackend::demo_target();
         let started = desktop
             .start_simulator(owner, &target.app_id)
@@ -1221,9 +1300,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_completion_only_revokes_authority_on_exact_current_frame() {
+    async fn model_completion_cannot_settle_a_run_without_a_host_receipt() {
         let (_dir, desktop) = test_desktop();
-        let owner = Uuid::new_v4();
+        let owner = test_owner(&desktop);
         let target = SimulatorBackend::demo_target();
         let started = desktop
             .start_simulator(owner, &target.app_id)
@@ -1243,21 +1322,27 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
-        assert!(result.completed);
-        let completed = result.snapshot.run.unwrap();
-        assert_eq!(completed.state, ComputerRunState::Completed);
-        assert!(completed
-            .grant
-            .as_ref()
-            .is_some_and(|grant| grant.revoked_at.is_some()));
-        assert_eq!(completed.action_count, 0);
+            .unwrap_err();
+        assert!(result.contains("host-authored execution receipt"));
+        let unchanged = desktop.cockpit_snapshot(owner).unwrap().run.unwrap();
+        assert_eq!(unchanged.state, ComputerRunState::Ready);
+        assert_eq!(unchanged.action_count, 0);
+    }
+
+    #[tokio::test]
+    async fn missing_session_authority_denies_without_installing_policy() {
+        let (_dir, desktop) = test_desktop();
+        let error = desktop
+            .start_simulator(Uuid::new_v4(), &SimulatorBackend::demo_target().app_id)
+            .await
+            .unwrap_err();
+        assert!(error.contains("unknown session"));
     }
 
     #[tokio::test]
     async fn approval_cannot_cross_sessions_or_survive_takeover() {
         let (_dir, desktop) = test_desktop();
-        let owner = Uuid::new_v4();
+        let owner = test_owner(&desktop);
         let other = Uuid::new_v4();
         let target = SimulatorBackend::demo_target();
         let started = desktop
@@ -1316,7 +1401,7 @@ mod tests {
     #[tokio::test]
     async fn native_run_uses_the_same_exact_one_use_approval_path() {
         let (_dir, desktop, actions) = native_test_desktop();
-        let owner = Uuid::new_v4();
+        let owner = test_owner(&desktop);
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let started = desktop
             .start_native(owner, &candidate.selection_token, NATIVE_TEST_APP_ID)
@@ -1359,7 +1444,7 @@ mod tests {
     #[tokio::test]
     async fn starting_a_native_run_prunes_terminal_native_backends() {
         let (_dir, desktop, _actions) = native_test_desktop();
-        let first_owner = Uuid::new_v4();
+        let first_owner = test_owner(&desktop);
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let first = desktop
             .start_native(first_owner, &candidate.selection_token, NATIVE_TEST_APP_ID)
@@ -1373,7 +1458,7 @@ mod tests {
             .unwrap();
         assert_eq!(desktop.native_services.lock().unwrap().len(), 1);
 
-        let second_owner = Uuid::new_v4();
+        let second_owner = first_owner;
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let second = desktop
             .start_native(second_owner, &candidate.selection_token, NATIVE_TEST_APP_ID)

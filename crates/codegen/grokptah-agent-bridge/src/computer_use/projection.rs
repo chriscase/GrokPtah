@@ -467,6 +467,27 @@ mod tests {
     }
 
     #[test]
+    fn public_projection_omits_capability_authority_material() {
+        let encoded = serde_json::to_string(&project_run_at(&run(), Utc::now())).unwrap();
+        for needle in [
+            format!("{}{}", "capability", "Generation"),
+            format!("{}{}", "capability", "_generation"),
+            format!("{}{}", "owner", "Key"),
+            format!("{}{}", "owner", "_key"),
+            format!("{}{}", "hm", "ac"),
+            format!("{}{}", "providerRequest", "Key"),
+            format!("{}{}", "providerRequest", "_key"),
+            format!("{}{}", "cred", "entials"),
+            format!("{}{}", "raw", "Policy"),
+            format!("{}{}", "raw", "_policy"),
+        ] {
+            assert!(!encoded
+                .to_ascii_lowercase()
+                .contains(&needle.to_ascii_lowercase()));
+        }
+    }
+
+    #[test]
     fn last_outcome_and_last_error_are_summary_types_not_durable_passthrough() {
         let mut run = run();
         run.last_outcome = Some(ActionOutcome::bounded(

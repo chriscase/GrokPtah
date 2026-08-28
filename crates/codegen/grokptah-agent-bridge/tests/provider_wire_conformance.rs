@@ -2,14 +2,17 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use grokptah_agent_bridge::{
-    public_xai_endpoint_fingerprint, replay_xai_provider_contract_on_loopback, ArtifactReference,
-    AttemptDisposition, CampaignActuals, CampaignBudgets, CampaignIdentity, CertificationCheck,
-    CredentialMethodClass, PersistentAgentCapture, ProviderAttemptEvidence, ProviderDialectClass,
-    ProviderIdentity, ProviderRouteClass, StreamFraming, UsageEvidence,
-    PERSISTENT_AGENT_CAPTURE_SCHEMA,
+use grokptah_agent_bridge::orchestration::{
+    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
 };
-use grokptah_test_gateway::{split_at, MockGateway, Response, Step};
+use grokptah_agent_bridge::{
+    public_xai_endpoint_fingerprint, replay_xai_provider_contract_on_loopback, AgentHost,
+    ArtifactReference, AttemptDisposition, CampaignActuals, CampaignBudgets, CampaignIdentity,
+    CertificationCheck, CredentialMethodClass, HostConfig, PersistentAgentCapture,
+    ProviderAttemptEvidence, ProviderDialectClass, ProviderIdentity, ProviderRouteClass,
+    RuntimeHome, SessionKind, StreamFraming, UsageEvidence, PERSISTENT_AGENT_CAPTURE_SCHEMA,
+};
+use grokptah_test_gateway::{split_at, Frame, MockGateway, Response, Step};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -104,6 +107,176 @@ fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn replay_credential_fingerprint() -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"grokptah.provider-qualification-identity.v1\0");
+    fn field(digest: &mut Sha256, label: &str, value: Option<&str>) {
+        digest.update(label.len().to_be_bytes());
+        digest.update(label.as_bytes());
+        match value {
+            Some(value) => {
+                digest.update([1]);
+                digest.update(value.len().to_be_bytes());
+                digest.update(value.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+    }
+    field(&mut digest, "provider", Some("provider-contract-loopback"));
+    field(&mut digest, "mode", Some("oidc"));
+    field(&mut digest, "issuer", None);
+    field(&mut digest, "client", None);
+    field(&mut digest, "principal_type", None);
+    field(&mut digest, "principal_id", None);
+    field(&mut digest, "user", Some("synthetic-user"));
+    field(&mut digest, "team", Some("synthetic-team"));
+    field(&mut digest, "scope", None);
+    format!("v1-sha256:{:x}", digest.finalize())
+}
+
+fn install_replay_provider_envelope(
+    authority: &grokptah_agent_bridge::CapabilityAuthority,
+    principal: &grokptah_agent_bridge::CapabilityPrincipal,
+    base_url: &str,
+) {
+    authority
+        .install_provider_envelope(
+            principal,
+            "provider-contract-loopback",
+            "grok-fixture",
+            base_url,
+            "grok-fixture",
+            "XaiChatCompletions",
+            &replay_credential_fingerprint(),
+            &grokptah_agent_bridge::ModelCapabilities {
+                tools: true,
+                stream: true,
+                parallel_tool_calls: true,
+                source: grokptah_agent_bridge::CapabilitySource::Declared,
+                ..grokptah_agent_bridge::ModelCapabilities::default()
+            },
+        )
+        .expect("install canonical replay envelope");
+}
+
+fn canonical_replay_context() -> (
+    tempfile::TempDir,
+    grokptah_agent_bridge::AgentHostHandle,
+    grokptah_agent_bridge::CapabilityPrincipal,
+) {
+    let runtime_dir = tempfile::tempdir().expect("replay runtime");
+    let runtime =
+        RuntimeHome::from_path(runtime_dir.path().join("grokptah")).expect("runtime home");
+    let host = AgentHost::create_with_runtime_home(HostConfig::default(), runtime);
+    host.start().expect("host start");
+    let workspace = std::env::current_dir().expect("workspace");
+    let session = host
+        .session_new_kind(SessionKind::Build)
+        .expect("replay session");
+    host.set_project_cwd(&workspace).expect("project cwd");
+    host.session_set_cwd(session.id, &workspace)
+        .expect("session cwd");
+    let agent = host
+        .ensure_session_agent(session.id)
+        .expect("canonical Agent");
+    host.ensure_orchestration_store()
+        .expect("orchestration store")
+        .claim_agent_owner(&agent.agent_id, "primary")
+        .expect("canonical Agent owner");
+    let _authority_service = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(runtime_dir.path().join("authority-orch")).expect("authority store"),
+        OrchestrationConfig {
+            bearer_token: "provider-replay-authority".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.clone()]),
+            max_concurrent_runs: 1,
+            bounds: RunBounds::default(),
+        },
+    );
+    let principal = host.capability_principal(session.id).expect("principal");
+    (runtime_dir, host, principal)
+}
+
+#[test]
+fn replay_boundary_has_no_local_authority_root() {
+    let source =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/host_helpers.rs"))
+            .expect("host helper source");
+    let replay = source
+        .split("pub async fn replay_xai_provider_contract_on_loopback")
+        .nth(1)
+        .and_then(|body| body.split("#[cfg(test)]").next())
+        .expect("replay function body");
+    assert!(!replay.contains("CapabilityAuthority::new"));
+    assert!(!replay.contains("CapabilityPrincipal::new"));
+    assert!(!replay.contains("Some(\"provider-contract-loopback\")"));
+}
+
+#[test]
+fn physical_provider_tool_and_qualification_boundaries_never_issue() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let provider_source =
+        std::fs::read_to_string(manifest.join("src/host_helpers.rs")).expect("host helper source");
+    let provider_boundary = provider_source
+        .split("fn consume_provider_send_lease")
+        .nth(1)
+        .and_then(|body| body.split("#[cfg(test)]").next())
+        .expect("provider boundary");
+    assert!(!provider_boundary.contains(".issue("));
+    assert!(!provider_boundary.contains("#[cfg(test)]"));
+    assert!(!provider_boundary.contains("install_test_"));
+    assert!(!provider_boundary.contains("provider-qualification"));
+
+    let qualification_source =
+        std::fs::read_to_string(manifest.join("src/provider_qualification.rs"))
+            .expect("qualification source");
+    let qualification_boundary = qualification_source
+        .split("fn consume_qualification_send_lease")
+        .nth(1)
+        .and_then(|body| body.split("#[cfg(test)]").next())
+        .expect("qualification boundary");
+    assert!(!qualification_boundary.contains(".issue("));
+    assert!(!qualification_boundary.contains("#[cfg(test)]"));
+    assert!(!qualification_boundary.contains("install_test_"));
+    assert!(!qualification_boundary.contains("provider-qualification"));
+
+    let host_source = std::fs::read_to_string(manifest.join("src/host.rs")).expect("host source");
+    let tool_admission = host_source
+        .split("fn admit_tool_effect")
+        .nth(1)
+        .and_then(|body| body.split("fn consume_tool_effect_lease").next())
+        .expect("tool admission boundary");
+    assert!(!tool_admission.contains(".issue("));
+    assert!(!tool_admission.contains("hash_payload(input)"));
+    assert!(!host_source.contains("local-session:"));
+    assert!(!host_source.contains("unwrap_or_else(|| agent.agent_id.clone())"));
+}
+
+#[tokio::test]
+async fn replay_without_an_outer_envelope_has_zero_provider_requests() {
+    let gateway =
+        MockGateway::start_ordered(vec![Step::respond(Response::sse_stream(vec![Frame::new(
+            b"data: [DONE]\n\n",
+        )]))])
+        .await;
+    let (_runtime, host, principal) = canonical_replay_context();
+    let authority = host.capability_authority();
+    let base = format!("{}/v1", gateway.base_url());
+    let error = replay_xai_provider_contract_on_loopback(
+        authority.as_ref(),
+        &principal,
+        &base,
+        "grok-fixture",
+        &[serde_json::json!({"role": "user", "content": "synthetic"})],
+        &serde_json::json!([]),
+    )
+    .await
+    .expect_err("provider replay must require an outer canonical envelope");
+    assert!(error.to_string().contains("capability envelope"));
+    assert!(gateway.requests().is_empty());
+}
+
 #[tokio::test]
 async fn synthetic_xai_fixture_replays_through_the_production_provider_path() {
     let (fixture, response) = load_fixture();
@@ -117,8 +290,14 @@ async fn synthetic_xai_fixture_replays_through_the_production_provider_path() {
         {"role": "user", "content": "Return the fixture marker."}
     ]);
     let tools = serde_json::json!([]);
+    let (_runtime, host, principal) = canonical_replay_context();
+    let authority = host.capability_authority();
+    let replay_base = format!("{}/v1", gateway.base_url());
+    install_replay_provider_envelope(authority.as_ref(), &principal, &replay_base);
     let replay = replay_xai_provider_contract_on_loopback(
-        &format!("{}/v1", gateway.base_url()),
+        authority.as_ref(),
+        &principal,
+        &replay_base,
         "grok-fixture",
         messages.as_array().unwrap(),
         &tools,
@@ -178,8 +357,14 @@ async fn production_provider_path_rejects_a_fixture_without_its_terminal_marker(
         &[1, truncated.len() - 1],
     )))])
     .await;
+    let (_runtime, host, principal) = canonical_replay_context();
+    let authority = host.capability_authority();
+    let replay_base = format!("{}/v1", gateway.base_url());
+    install_replay_provider_envelope(authority.as_ref(), &principal, &replay_base);
     let error = replay_xai_provider_contract_on_loopback(
-        &format!("{}/v1", gateway.base_url()),
+        authority.as_ref(),
+        &principal,
+        &replay_base,
         "grok-fixture",
         &[serde_json::json!({"role": "user", "content": "synthetic"})],
         &serde_json::json!([]),
@@ -191,7 +376,11 @@ async fn production_provider_path_rejects_a_fixture_without_its_terminal_marker(
 
 #[tokio::test]
 async fn provider_contract_replay_refuses_non_loopback_authority() {
+    let (_runtime, host, principal) = canonical_replay_context();
+    let authority = host.capability_authority();
     let error = replay_xai_provider_contract_on_loopback(
+        authority.as_ref(),
+        &principal,
         "https://api.x.ai/v1",
         "grok-fixture",
         &[serde_json::json!({"role": "user", "content": "synthetic"})],

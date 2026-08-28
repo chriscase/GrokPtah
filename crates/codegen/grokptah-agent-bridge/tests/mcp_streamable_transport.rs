@@ -2228,16 +2228,39 @@ async fn live_computer_reads_node_smoke() {
     host.set_project_cwd(ws.path()).unwrap();
     let session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(session.id, ws.path()).unwrap();
+    let agent = host.ensure_session_agent(session.id).unwrap();
+    host.ensure_orchestration_store()
+        .unwrap()
+        .claim_agent_owner(&agent.agent_id, "primary")
+        .unwrap();
     let other_session = host.session_new_kind(SessionKind::Build).unwrap();
     host.session_set_cwd(other_session.id, ws_other.path())
         .unwrap();
+    let _authority_service = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(home.path().join("authority-orch")).unwrap(),
+        OrchestrationConfig {
+            bearer_token: "computer-smoke-authority".into(),
+            allowlist: WorkspaceAllowlist::new([
+                ws.path().to_path_buf(),
+                ws_other.path().to_path_buf(),
+            ]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
 
     let canon = canonical_workspace_string(ws.path()).unwrap();
     let canon_other = canonical_workspace_string(ws_other.path()).unwrap();
-    let computer = ComputerUseService::new(
+    let computer = ComputerUseService::new_with_authority(
         std::sync::Arc::new(SimulatorBackend::new()),
         host.ensure_computer_store().unwrap(),
+        host.capability_authority(),
     );
+    computer
+        .install_host_policy(host.capability_principal(session.id).unwrap())
+        .unwrap();
 
     // Run A: bound, authorized, observed — projection metadata plus journal.
     let run_a = computer

@@ -1,11 +1,13 @@
 //! Explicit, data-free capability qualification for compatible models (#278).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
+use crate::capability_authority::{CapabilityAuthority, CapabilityPrincipal, CapabilitySnapshot};
 use crate::computer_use::{ComputerBackend, ComputerUseLimits, SemanticAction, SimulatorBackend};
 use crate::gateway_config::{CapabilitySource, ComputerUseTier};
 
@@ -86,15 +88,38 @@ struct QualificationCredentials {
     expected_oidc_token_auth: Option<bool>,
     allow_xai_oidc_refresh: bool,
     forced_refresh_used: bool,
+    authority: Arc<CapabilityAuthority>,
+    principal: CapabilityPrincipal,
     #[cfg(test)]
     forced_refresh_override: Option<crate::auth_store::WireCredentials>,
 }
 
 impl QualificationCredentials {
+    #[cfg(test)]
     fn new(
         current: Option<crate::auth_store::WireCredentials>,
         profile: &crate::gateway_config::ProviderProfile,
     ) -> Result<Self> {
+        Self::new_with_authority(
+            current,
+            profile,
+            Arc::new(CapabilityAuthority::new(true)),
+            CapabilityPrincipal::new(
+                "qualification-test".into(),
+                1,
+                "qualification-test-policy".into(),
+            )?,
+        )
+    }
+
+    fn new_with_authority(
+        current: Option<crate::auth_store::WireCredentials>,
+        profile: &crate::gateway_config::ProviderProfile,
+        authority: Arc<CapabilityAuthority>,
+        principal: CapabilityPrincipal,
+    ) -> Result<Self> {
+        #[cfg(test)]
+        let current = current.or_else(|| Some(test_credentials(&profile.id)));
         validate_qualification_credential_binding(profile, current.as_ref())?;
         Ok(Self {
             allow_xai_oidc_refresh: profile.id == crate::gateway_config::XAI_PROVIDER_ID
@@ -108,6 +133,8 @@ impl QualificationCredentials {
                 .map(|credentials| credentials.oidc_token_auth),
             current,
             forced_refresh_used: false,
+            authority,
+            principal,
             #[cfg(test)]
             forced_refresh_override: None,
         })
@@ -153,6 +180,26 @@ impl QualificationCredentials {
     }
 }
 
+#[cfg(test)]
+fn test_credentials(provider_id: &str) -> crate::auth_store::WireCredentials {
+    crate::auth_store::WireCredentials {
+        provider_id: provider_id.to_string(),
+        bearer: "test-qualification-token".into(),
+        oidc_token_auth: false,
+        display_name: "test qualification".into(),
+        method: "test-support".into(),
+        user_id: None,
+        team_id: None,
+        auth_scope: None,
+        refresh_token: None,
+        oidc_issuer: None,
+        oidc_client_id: None,
+        principal_type: None,
+        principal_id: None,
+        expires_at: None,
+    }
+}
+
 fn validate_qualification_credential_binding(
     profile: &crate::gateway_config::ProviderProfile,
     credentials: Option<&crate::auth_store::WireCredentials>,
@@ -186,6 +233,33 @@ struct ComputerProbeArguments {
 pub async fn qualify_provider_model(
     provider_id: &str,
     model_id: &str,
+) -> Result<ProviderQualificationReport> {
+    #[cfg(test)]
+    {
+        qualify_provider_model_with_authority(
+            provider_id,
+            model_id,
+            Arc::new(CapabilityAuthority::new(true)),
+            CapabilityPrincipal::new(
+                "qualification-test".into(),
+                1,
+                "qualification-test-policy".into(),
+            )?,
+        )
+        .await
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (provider_id, model_id);
+        bail!("host capability authority is required for provider qualification");
+    }
+}
+
+pub(crate) async fn qualify_provider_model_with_authority(
+    provider_id: &str,
+    model_id: &str,
+    authority: Arc<CapabilityAuthority>,
+    principal: CapabilityPrincipal,
 ) -> Result<ProviderQualificationReport> {
     if model_id.trim().is_empty() {
         bail!("model id is required");
@@ -226,7 +300,12 @@ pub async fn qualify_provider_model(
         credential_fingerprint.as_deref(),
     )
     .map_err(anyhow::Error::msg)?;
-    let mut credentials = QualificationCredentials::new(resolved_credentials, &profile)?;
+    let mut credentials = QualificationCredentials::new_with_authority(
+        resolved_credentials,
+        &profile,
+        authority.clone(),
+        principal,
+    )?;
     if profile.managed_by_env {
         bail!("environment-managed profiles cannot persist measured capabilities");
     }
@@ -239,6 +318,16 @@ pub async fn qualify_provider_model(
             anyhow!("model `{model_id}` is not registered on provider `{provider_id}`")
         })?;
     let wire_model_id = provider_model.wire_model_id().to_string();
+    #[cfg(test)]
+    install_test_qualification_envelope(
+        &credentials.authority,
+        &credentials.principal,
+        &profile.id,
+        model_id,
+        &profile.base_url,
+        &wire_model_id,
+        credentials.current(),
+    )?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(45))
         .connect_timeout(Duration::from_secs(10))
@@ -688,6 +777,7 @@ async fn completion(
     let mut removed_tool_choice = false;
     let mut transient_retries = 0_u32;
     for _attempt in 0..5 {
+        consume_qualification_send_lease(credentials, base_url, &body)?;
         let mut request = client
             .post(&url)
             .header("Content-Type", "application/json")
@@ -746,6 +836,7 @@ async fn streaming_probe(
         "stream": true
     });
     let response = loop {
+        consume_qualification_send_lease(credentials, base_url, &body)?;
         let mut request = client
             .post(&url)
             .header("Content-Type", "application/json")
@@ -815,6 +906,81 @@ fn apply_stream_probe_line(line: &str, content: &mut String) -> Result<bool> {
         content.push_str(delta);
     }
     Ok(false)
+}
+
+fn consume_qualification_send_lease(
+    credentials: &QualificationCredentials,
+    base_url: &str,
+    body: &serde_json::Value,
+) -> Result<()> {
+    let current = credentials
+        .current()
+        .ok_or_else(|| anyhow!("qualification provider credentials are unavailable"))?;
+    let provider_id = current.provider_id.as_str();
+    let credential_fingerprint = current.qualification_identity_fingerprint();
+    let model_id = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| anyhow!("qualification request has no model"))?;
+    let _ = body;
+    let snapshot = CapabilitySnapshot::provider(
+        &credentials.principal,
+        provider_id,
+        model_id,
+        base_url,
+        model_id,
+        "qualification",
+        &credential_fingerprint,
+        &crate::gateway_config::ModelCapabilities::default(),
+    )?;
+    let lease = credentials.authority.lease_from_preinstalled(
+        &snapshot,
+        "provider.qualification.send",
+        &format!("qualification:{provider_id}:{model_id}"),
+        "provider.qualification.send",
+        chrono::Utc::now(),
+        chrono::Duration::seconds(5),
+    )?;
+    credentials
+        .authority
+        .consume(lease, &snapshot, chrono::Utc::now())?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn install_test_qualification_envelope(
+    authority: &CapabilityAuthority,
+    principal: &CapabilityPrincipal,
+    provider_id: &str,
+    model_id: &str,
+    base_url: &str,
+    wire_model_id: &str,
+    credentials: Option<&crate::auth_store::WireCredentials>,
+) -> Result<()> {
+    let credentials =
+        credentials.ok_or_else(|| anyhow!("qualification test credentials are unavailable"))?;
+    let snapshot = CapabilitySnapshot::provider(
+        principal,
+        provider_id,
+        model_id,
+        base_url,
+        wire_model_id,
+        "qualification",
+        &credentials.qualification_identity_fingerprint(),
+        &crate::gateway_config::ModelCapabilities::default(),
+    )?;
+    authority.install_canonical_envelope(
+        &format!("test-qualification:{provider_id}:{model_id}"),
+        snapshot,
+        principal.id(),
+        principal.auth_generation(),
+        principal.policy_generation(),
+        ["provider.qualification.send"],
+        &format!("qualification:{provider_id}:{model_id}"),
+        chrono::Utc::now(),
+    )?;
+    Ok(())
 }
 
 async fn read_body(response: reqwest::Response) -> Result<String> {
@@ -1230,20 +1396,25 @@ mod tests {
         .unwrap();
         credentials.forced_refresh_override = Some(wire_credentials("xai", "fresh-token", true));
         let client = reqwest::Client::new();
-
-        let value = completion(
-            &client,
+        let body = serde_json::json!({
+            "model": "grok-4.5",
+            "messages": [{"role": "user", "content": "synthetic"}],
+            "stream": false
+        });
+        install_test_qualification_envelope(
+            &credentials.authority,
+            &credentials.principal,
+            "xai",
+            "grok-4.5",
             &base_url,
-            &mut credentials,
-            serde_json::json!({
-                "model": "grok-4.5",
-                "messages": [{"role": "user", "content": "synthetic"}],
-                "stream": false
-            }),
-            false,
+            "grok-4.5",
+            credentials.current(),
         )
-        .await
         .unwrap();
+
+        let value = completion(&client, &base_url, &mut credentials, body, false)
+            .await
+            .unwrap();
         assert_eq!(message_content(&value), Some(GENERATION_MARKER));
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         assert_eq!(credentials.current().unwrap().bearer, "fresh-token");
@@ -1265,13 +1436,59 @@ mod tests {
         refreshed.principal_id = Some("user-b".into());
         let mut credentials = QualificationCredentials::new(Some(initial), &profile).unwrap();
         credentials.forced_refresh_override = Some(refreshed);
+        install_test_qualification_envelope(
+            &credentials.authority,
+            &credentials.principal,
+            "xai",
+            "grok-4.5",
+            &base_url,
+            "grok-4.5",
+            credentials.current(),
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "model": "grok-4.5",
+            "messages": [{"role": "user", "content": "synthetic"}],
+            "stream": false
+        });
 
         let error = completion(
             &reqwest::Client::new(),
             &base_url,
             &mut credentials,
+            body,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("principal or mode changed"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn qualification_without_an_outer_envelope_sends_no_request() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) = start_gateway(GatewayState {
+            prose_tools: false,
+            json_for_stream: false,
+            reject_first_tool_choice: false,
+            tool_choice_rejections: Arc::new(AtomicUsize::new(0)),
+            rate_limits_remaining: Arc::new(AtomicUsize::new(0)),
+            request_count: request_count.clone(),
+        })
+        .await;
+        let profile =
+            crate::gateway_config::ProviderProfile::openai_compatible("test", "Test", &base_url);
+        let mut credentials =
+            QualificationCredentials::new(Some(wire_credentials("test", "token", false)), &profile)
+                .unwrap();
+        let error = completion(
+            &reqwest::Client::new(),
+            &base_url,
+            &mut credentials,
             serde_json::json!({
-                "model": "grok-4.5",
+                "model": "cheap-code-model",
                 "messages": [{"role": "user", "content": "synthetic"}],
                 "stream": false
             }),
@@ -1279,8 +1496,8 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("principal or mode changed"));
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(error.to_string().contains("capability envelope"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
         server.abort();
     }
 
@@ -1514,19 +1731,24 @@ mod tests {
         let profile =
             crate::gateway_config::ProviderProfile::openai_compatible("test", "Test", &base_url);
         let mut credentials = QualificationCredentials::new(None, &profile).unwrap();
-        let value = completion(
-            &client,
+        install_test_qualification_envelope(
+            &credentials.authority,
+            &credentials.principal,
+            "test",
+            "cheap-code-model",
             &base_url,
-            &mut credentials,
-            serde_json::json!({
-                "model": "cheap-code-model",
-                "messages": [{"role": "user", "content": "synthetic"}],
-                "stream": false
-            }),
-            false,
+            "cheap-code-model",
+            credentials.current(),
         )
-        .await
         .unwrap();
+        let body = serde_json::json!({
+            "model": "cheap-code-model",
+            "messages": [{"role": "user", "content": "synthetic"}],
+            "stream": false
+        });
+        let value = completion(&client, &base_url, &mut credentials, body.clone(), false)
+            .await
+            .unwrap();
         assert_eq!(message_content(&value), Some(GENERATION_MARKER));
         assert_eq!(request_count.load(Ordering::SeqCst), 3);
         server.abort();
@@ -1541,19 +1763,19 @@ mod tests {
             request_count: request_count.clone(),
         })
         .await;
-        let error = completion(
-            &client,
+        install_test_qualification_envelope(
+            &credentials.authority,
+            &credentials.principal,
+            "test",
+            "cheap-code-model",
             &base_url,
-            &mut credentials,
-            serde_json::json!({
-                "model": "cheap-code-model",
-                "messages": [{"role": "user", "content": "synthetic"}],
-                "stream": false
-            }),
-            false,
+            "cheap-code-model",
+            credentials.current(),
         )
-        .await
-        .unwrap_err();
+        .unwrap();
+        let error = completion(&client, &base_url, &mut credentials, body, false)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("HTTP 429"));
         assert_eq!(request_count.load(Ordering::SeqCst), 4);
         server.abort();

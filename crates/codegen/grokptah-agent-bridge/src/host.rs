@@ -12,6 +12,9 @@ use tokio::sync::{oneshot, Notify};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::capability_authority::{
+    CapabilityAuthority, CapabilityPrincipal, CapabilitySnapshot, HostCapability,
+};
 use crate::completion::{
     build_evidence, enrich_terminal_handoff, observe_updates, CompletionObservations,
     CompletionUsage,
@@ -25,18 +28,18 @@ use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
     auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
-    call_xai_agent_step_observed, call_xai_chat, cargo_test_failure_coaching,
-    cargo_test_output_failed, cargo_test_output_passed, cargo_test_reverify_coaching,
-    coding_agent_tools, count_cargo_test_failures, emit_message, emit_thought,
-    filter_tools_batch_edit_only, filter_tools_edit_and_shell, filter_tools_edit_only,
-    is_incomplete_stop_message, is_round_limit_stop_message, is_true_noop_tool_step,
-    multi_failure_partial_edit_coaching, normalize_sandbox_profile, offline_plan_steps,
-    parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model, push_assistant,
-    push_thought, push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
-    round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
-    should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
-    surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
-    IdenticalToolCallRun, McpToolIndex,
+    call_xai_agent_step_observed_with_authority, call_xai_chat_with_authority,
+    cargo_test_failure_coaching, cargo_test_output_failed, cargo_test_output_passed,
+    cargo_test_reverify_coaching, coding_agent_tools, count_cargo_test_failures, emit_message,
+    emit_thought, filter_tools_batch_edit_only, filter_tools_edit_and_shell,
+    filter_tools_edit_only, is_incomplete_stop_message, is_round_limit_stop_message,
+    is_true_noop_tool_step, multi_failure_partial_edit_coaching, normalize_sandbox_profile,
+    offline_plan_steps, parse_effort_arg, post_cargo_failure_skip_message,
+    propose_plan_with_authority, provider_effect_resource, push_assistant, push_thought, push_tool,
+    recovery_round_limit_stop_message, resolve_turn_max_rounds, round_limit_stop_message,
+    sandbox_blocks_shell, sandbox_is_readonly, should_auto_cargo_reverify_after_edit,
+    should_skip_tool_after_cargo_failure, surface_rate_limit_or_error, tool_kind,
+    tool_step_signature, tool_web_fetch, AgentStep, IdenticalToolCallRun, McpToolIndex,
 };
 use crate::lane::LaneSummary;
 use crate::local_tools;
@@ -156,7 +159,14 @@ struct OrchestrationPendingAdmission {
 
 #[derive(Debug, Clone)]
 struct SessionComputerQualification {
-    route_fingerprint: String,
+    snapshot: CapabilitySnapshot,
+    capability: HostCapability,
+    tier: crate::gateway_config::ComputerUseTier,
+}
+
+#[derive(Debug, Clone)]
+struct ToolCapabilityAdmission {
+    snapshot: CapabilitySnapshot,
 }
 
 pub(crate) struct Inner {
@@ -748,6 +758,14 @@ pub struct AgentHostHandle {
     /// children it spawns. A session counter is not a safe run identity.
     run_usage_trackers: Arc<Mutex<HashMap<Uuid, Arc<RunUsageTracker>>>>,
     provider_observation: Option<ProviderObservationSession>,
+    /// One host-issued authority shared by provider, tool, Computer Use, and
+    /// durable mutation boundaries in this process. A process without the
+    /// instance lock is observation-only and cannot issue capabilities.
+    capability_authority: Arc<CapabilityAuthority>,
+    /// The canonical #477 authenticated context installed by the durable
+    /// orchestration authority. There is intentionally no local-session or
+    /// provider-credential fallback.
+    canonical_auth_context: Arc<Mutex<Option<crate::orchestration::AuthContext>>>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
     /// Selects the durable root for legacy modules that still resolve paths
@@ -786,6 +804,15 @@ impl AgentHost {
                 eprintln!("[grokptah] {e:#}");
                 None
             }
+        };
+        // Desktop authority is local and durable, but it is still issued by
+        // the canonical #477 registry. A control-plane bearer token is not a
+        // prerequisite for local Computer Use.
+        let local_auth_context = if instance_lock.is_some() {
+            crate::orchestration::local_desktop_auth_context(&runtime_home.orchestration_root())
+                .ok()
+        } else {
+            None
         };
         let mut event_tx = crate::event_bus::EventBus::new(
             config
@@ -933,6 +960,8 @@ impl AgentHost {
             orchestration_wakeup: Arc::new(Notify::new()),
             run_usage_trackers: Arc::new(Mutex::new(HashMap::new())),
             provider_observation: config.provider_observation,
+            capability_authority: Arc::new(CapabilityAuthority::new(instance_lock.is_some())),
+            canonical_auth_context: Arc::new(Mutex::new(local_auth_context)),
             _instance_lock: instance_lock,
             runtime_home,
             _runtime_home_context: runtime_home_context,
@@ -941,6 +970,95 @@ impl AgentHost {
 }
 
 impl AgentHostHandle {
+    /// Return the opaque process-owned authority shared by host adapters.
+    /// Callers cannot construct, deserialize, or inspect its generations.
+    pub fn capability_authority(&self) -> Arc<CapabilityAuthority> {
+        self.capability_authority.clone()
+    }
+
+    /// Install the opaque authenticated context issued by the durable #477
+    /// authority. This is a host lifecycle operation, never a request-derived
+    /// identity conversion.
+    pub(crate) fn install_canonical_auth_context(
+        &self,
+        auth_context: crate::orchestration::AuthContext,
+    ) {
+        self.invalidate_computer_agent_authority();
+        *self.canonical_auth_context.lock() = Some(auth_context);
+    }
+
+    /// Preinstall the exact provider and tool envelopes for one durable Agent.
+    /// Physical requests can only select these envelopes; they cannot issue
+    /// authority from their model, tool, or payload fields.
+    pub(crate) fn preinstall_canonical_capability_policy(&self, session_id: Uuid) -> Result<()> {
+        let principal = self.capability_principal(session_id)?;
+        let (model, _) = self.selected_computer_model(session_id)?;
+        if let Some(credentials) = crate::auth_store::resolve_wire_credentials_for_model(&model)
+            .map_err(anyhow::Error::msg)?
+        {
+            let target = crate::host_helpers::resolve_model_target(&credentials, &model)?;
+            let selection =
+                crate::gateway_config::parse_model_selection(&model).map_err(anyhow::Error::msg)?;
+            let provider_snapshot = CapabilitySnapshot::provider(
+                &principal,
+                &selection.provider_id,
+                &model,
+                &target.base_url,
+                &target.wire_model,
+                &format!("{:?}", target.dialect),
+                &credentials.qualification_identity_fingerprint(),
+                &target.capabilities,
+            )?;
+            self.capability_authority.install_canonical_envelope(
+                &format!("provider-send:{}:{}", principal.id(), selection.model_id),
+                provider_snapshot,
+                principal.id(),
+                principal.auth_generation(),
+                principal.policy_generation(),
+                ["provider.send"],
+                &provider_effect_resource(&credentials, &target),
+                Utc::now(),
+            )?;
+        }
+        for tool_name in DEFAULT_AGENT_TOOL_IDS {
+            let snapshot = CapabilitySnapshot::tool(&principal, tool_name)?;
+            self.capability_authority.install_canonical_envelope(
+                &format!("tool-dispatch:{}:{tool_name}", principal.id()),
+                snapshot,
+                principal.id(),
+                principal.auth_generation(),
+                principal.policy_generation(),
+                ["tool.dispatch"],
+                &format!("tool:{tool_name}"),
+                Utc::now(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Return the opaque principal generation from the canonical Agent seam.
+    /// This object is accepted only by host-owned adapters and is never a wire
+    /// projection.
+    pub fn capability_principal(&self, session_id: Uuid) -> Result<CapabilityPrincipal> {
+        let auth_context = self
+            .canonical_auth_context
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow!("durable #477 authentication authority is unavailable"))?;
+        let policy_generation = self.canonical_policy_generation(session_id)?;
+        CapabilityPrincipal::from_auth_context(auth_context, policy_generation)
+            .map_err(|error| anyhow!("invalid canonical capability principal: {error}"))
+    }
+
+    /// Principal used by an explicitly created Computer Run. Existing local
+    /// sessions use the canonical Agent owner; missing or invalid session
+    /// authority is denied rather than replaced with a local identity.
+    pub fn capability_principal_for_computer(
+        &self,
+        session_id: Uuid,
+    ) -> Result<CapabilityPrincipal> {
+        self.capability_principal(session_id)
+    }
     /// The validated durable root owned by this host process.
     pub fn runtime_home(&self) -> crate::discover::RuntimeHome {
         self.runtime_home.clone()
@@ -980,7 +1098,8 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let resolved = resolve_computer_eligibility(&credentials, &model)?;
+        let principal = self.capability_principal(session_id)?;
+        let resolved = resolve_computer_eligibility(&credentials, &model, &principal)?;
         if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
             return Ok(resolved.eligibility);
         }
@@ -989,7 +1108,17 @@ impl AgentHostHandle {
             .lock()
             .computer_agent_qualifications
             .get(&(session_id, model.clone()))
-            .is_some_and(|record| record.route_fingerprint == resolved.route_fingerprint);
+            .is_some_and(|record| {
+                record.tier >= crate::gateway_config::ComputerUseTier::SemanticAct
+                    && self
+                        .capability_authority
+                        .revalidate(
+                            &record.capability,
+                            &resolved.capability_snapshot,
+                            Utc::now(),
+                        )
+                        .is_ok()
+            });
         if qualified {
             return Ok(ComputerAgentEligibility {
                 model,
@@ -1013,17 +1142,36 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let resolved = resolve_computer_eligibility(&credentials, &model)?;
+        let principal = self.capability_principal(session_id)?;
+        let resolved = resolve_computer_eligibility(&credentials, &model, &principal)?;
         if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
             return Ok(resolved.eligibility);
         }
-        qualify_semantic_model(&credentials, &model, effort, &cancel)
-            .await
-            .context("selected model did not pass bounded Computer qualification")?;
+        self.clear_computer_agent_qualification(session_id, &model);
+        qualify_semantic_model(
+            &credentials,
+            &model,
+            effort,
+            &cancel,
+            self.capability_authority.as_ref(),
+            &principal,
+        )
+        .await
+        .context("selected model did not pass bounded Computer qualification")?;
         if cancel.is_cancelled() {
             bail!("Computer model qualification was cancelled");
         }
-        self.ensure_computer_route_unchanged(session_id, &model, &resolved.route_fingerprint)?;
+        let current = self.ensure_computer_capability_unchanged(
+            session_id,
+            &model,
+            &resolved.capability_snapshot,
+        )?;
+        let capability = self
+            .capability_authority
+            .preinstalled_capability(&current.capability_snapshot)
+            .map_err(|error| {
+                anyhow!("canonical Computer Use capability envelope is unavailable: {error}")
+            })?;
         {
             let mut inner = self.inner.lock();
             if inner
@@ -1036,7 +1184,9 @@ impl AgentHostHandle {
             inner.computer_agent_qualifications.insert(
                 (session_id, model.clone()),
                 SessionComputerQualification {
-                    route_fingerprint: resolved.route_fingerprint,
+                    snapshot: current.capability_snapshot,
+                    capability,
+                    tier: crate::gateway_config::ComputerUseTier::SemanticAct,
                 },
             );
         }
@@ -1060,7 +1210,8 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let resolved = resolve_computer_eligibility(&credentials, &model)?;
+        let principal = self.capability_principal(session_id)?;
+        let resolved = resolve_computer_eligibility(&credentials, &model, &principal)?;
         let durable_authority =
             resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct;
         let session_authority = self
@@ -1068,7 +1219,17 @@ impl AgentHostHandle {
             .lock()
             .computer_agent_qualifications
             .get(&(session_id, model.clone()))
-            .is_some_and(|record| record.route_fingerprint == resolved.route_fingerprint);
+            .is_some_and(|record| {
+                record.tier >= crate::gateway_config::ComputerUseTier::SemanticAct
+                    && self
+                        .capability_authority
+                        .revalidate(
+                            &record.capability,
+                            &resolved.capability_snapshot,
+                            Utc::now(),
+                        )
+                        .is_ok()
+            });
         if !durable_authority && !session_authority {
             bail!("selected model is not qualified for semantic Computer actions");
         }
@@ -1079,13 +1240,19 @@ impl AgentHostHandle {
             objective,
             observation,
             &cancel,
+            &self.capability_authority,
+            &principal,
         )
         .await
         .context("selected model did not return a valid bounded Computer proposal")?;
         if cancel.is_cancelled() {
             bail!("Computer model proposal was cancelled");
         }
-        self.ensure_computer_route_unchanged(session_id, &model, &resolved.route_fingerprint)?;
+        self.ensure_computer_capability_unchanged(
+            session_id,
+            &model,
+            &resolved.capability_snapshot,
+        )?;
         Ok(proposal)
     }
 
@@ -1106,7 +1273,8 @@ impl AgentHostHandle {
         }
     }
 
-    fn invalidate_computer_agent_authority(&self) {
+    pub(crate) fn invalidate_computer_agent_authority(&self) {
+        let _ = self.capability_authority.revoke_all();
         let tokens = {
             let mut inner = self.inner.lock();
             inner.computer_agent_qualifications.clear();
@@ -1118,6 +1286,17 @@ impl AgentHostHandle {
         };
         for token in tokens {
             token.cancel();
+        }
+    }
+
+    fn clear_computer_agent_qualification(&self, session_id: Uuid, model: &str) {
+        let previous = self
+            .inner
+            .lock()
+            .computer_agent_qualifications
+            .remove(&(session_id, model.to_string()));
+        if let Some(previous) = previous {
+            let _ = self.capability_authority.revoke(&previous.snapshot);
         }
     }
 
@@ -1169,12 +1348,48 @@ impl AgentHostHandle {
         Ok((operation_id, cancel, guard))
     }
 
-    fn ensure_computer_route_unchanged(
+    fn canonical_policy_generation(&self, session_id: Uuid) -> Result<String> {
+        let agent_id = {
+            let inner = self.inner.lock();
+            inner
+                .sessions
+                .get(&session_id)
+                .ok_or_else(|| anyhow!("unknown session"))?
+                .agent_id
+                .clone()
+                .ok_or_else(|| anyhow!("canonical Agent principal is unavailable"))?
+        };
+        let store = self
+            .orchestration_store
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow!("canonical Agent store is unavailable"))?;
+        let agent = store
+            .load_agent(&agent_id)?
+            .ok_or_else(|| anyhow!("canonical Agent record is unavailable"))?;
+        let auth_context = self
+            .canonical_auth_context
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow!("durable #477 authentication authority is unavailable"))?;
+        let owner = agent
+            .owner_principal_id
+            .as_deref()
+            .filter(|owner| !owner.trim().is_empty())
+            .ok_or_else(|| anyhow!("canonical Agent principal binding is unavailable"))?;
+        if owner != auth_context.owner_id() {
+            bail!("canonical Agent principal binding is foreign");
+        }
+        let spec = agent.current_spec()?;
+        Ok(spec.revision.to_string())
+    }
+
+    fn ensure_computer_capability_unchanged(
         &self,
         session_id: Uuid,
         expected_model: &str,
-        expected_route: &str,
-    ) -> Result<()> {
+        expected_capability: &crate::capability_authority::CapabilitySnapshot,
+    ) -> Result<crate::computer_agent::ResolvedComputerEligibility> {
         let (current_model, _) = self.selected_computer_model(session_id)?;
         if current_model != expected_model {
             bail!("selected model changed while the Computer request was running");
@@ -1182,10 +1397,67 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&current_model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let current = resolve_computer_eligibility(&credentials, &current_model)?;
-        if current.route_fingerprint != expected_route {
-            bail!("provider route changed while the Computer request was running");
+        let principal = self.capability_principal(session_id)?;
+        let current = resolve_computer_eligibility(&credentials, &current_model, &principal)?;
+        if current.capability_snapshot != *expected_capability {
+            bail!("provider capability changed while the Computer request was running");
         }
+        Ok(current)
+    }
+
+    fn tool_capability_snapshot(
+        &self,
+        session_id: Uuid,
+        tool_name: &str,
+        _input: &serde_json::Value,
+    ) -> Result<CapabilitySnapshot> {
+        let principal = self.capability_principal(session_id)?;
+        CapabilitySnapshot::tool(&principal, tool_name)
+    }
+
+    fn admit_tool_effect(
+        &self,
+        session_id: Uuid,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Result<ToolCapabilityAdmission> {
+        let snapshot = self.tool_capability_snapshot(session_id, tool_name, input)?;
+        self.capability_authority.revalidate_preinstalled(
+            &snapshot,
+            "tool.dispatch",
+            &format!("tool:{tool_name}"),
+            Utc::now(),
+        )?;
+        Ok(ToolCapabilityAdmission { snapshot })
+    }
+
+    fn consume_tool_effect_lease(
+        &self,
+        session_id: Uuid,
+        tool_name: &str,
+        input: &serde_json::Value,
+        admission: &ToolCapabilityAdmission,
+    ) -> Result<()> {
+        let current = self.tool_capability_snapshot(session_id, tool_name, input)?;
+        if admission.snapshot != current {
+            return Err(anyhow!("tool capability changed while waiting to dispatch"));
+        }
+        self.capability_authority.revalidate_preinstalled(
+            &current,
+            "tool.dispatch",
+            &format!("tool:{tool_name}"),
+            Utc::now(),
+        )?;
+        let lease = self.capability_authority.lease_from_preinstalled(
+            &current,
+            "tool.dispatch",
+            &format!("tool:{tool_name}"),
+            "tool.dispatch",
+            Utc::now(),
+            chrono::Duration::seconds(5),
+        )?;
+        self.capability_authority
+            .consume(lease, &current, Utc::now())?;
         Ok(())
     }
 
@@ -1342,6 +1614,19 @@ impl AgentHostHandle {
                 }
             }
         };
+        let mut owner_binding_changed = false;
+        if let Some(auth_context) = self.canonical_auth_context.lock().clone() {
+            match agent.owner_principal_id.as_deref() {
+                None => {
+                    agent.owner_principal_id = Some(auth_context.owner_id().to_string());
+                    owner_binding_changed = true;
+                }
+                Some(owner) if owner != auth_context.owner_id() => {
+                    bail!("canonical Agent principal binding is foreign");
+                }
+                Some(_) => {}
+            }
+        }
         let was_associated = agent.known_lane_ids().contains(&session_id);
         let mut association_changed = false;
         if !agent.lane_ids.contains(&session_id) {
@@ -1359,7 +1644,7 @@ impl AgentHostHandle {
             });
             association_changed = true;
         }
-        if association_changed {
+        if association_changed || owner_binding_changed {
             agent.updated_at = now;
             store.save_agent(&agent)?;
         }
@@ -1379,6 +1664,12 @@ impl AgentHostHandle {
             if let Err(error) = session_store::save_session_meta(&session) {
                 bail!("failed to persist session agent binding: {error:#}");
             }
+        }
+        if owner_binding_changed || existing_id.is_none() {
+            // Agent publication is the explicit host-policy boundary. If a
+            // provider route is unavailable, the tool/provider paths remain
+            // fail-closed rather than issuing from the next request.
+            let _ = self.preinstall_canonical_capability_policy(session_id);
         }
         Ok(agent)
     }
@@ -3914,13 +4205,16 @@ impl AgentHostHandle {
             if !call_allowed {
                 None
             } else {
-                match call_xai_chat(
+                let capability_principal = self.capability_principal(id)?;
+                match call_xai_chat_with_authority(
                     &creds,
                     &model,
                     &[("user".into(), prompt)],
                     None,
                     &cwd,
                     SessionKind::Build,
+                    self.capability_authority.as_ref(),
+                    &capability_principal,
                 )
                 .await
                 {
@@ -5758,7 +6052,19 @@ impl AgentHostHandle {
         provider_id: &str,
         model_id: &str,
     ) -> Result<crate::provider_qualification::ProviderQualificationReport> {
-        crate::provider_qualification::qualify_provider_model(provider_id, model_id).await
+        let session_id = self
+            .inner
+            .lock()
+            .active_session
+            .ok_or_else(|| anyhow!("canonical Agent session is unavailable"))?;
+        let principal = self.capability_principal(session_id)?;
+        crate::provider_qualification::qualify_provider_model_with_authority(
+            provider_id,
+            model_id,
+            self.capability_authority.clone(),
+            principal,
+        )
+        .await
     }
 
     pub fn delete_provider_profile(&self, provider_id: &str) -> Result<()> {
@@ -7567,13 +7873,16 @@ impl AgentHostHandle {
                 crate::auth_store::resolve_wire_credentials_for_model(model)
                     .map_err(anyhow::Error::msg)?
             {
-                match call_xai_chat(
+                let capability_principal = self.capability_principal(session_id)?;
+                match call_xai_chat_with_authority(
                     &creds,
                     model,
                     &wire_messages,
                     compacted_summary.as_deref(),
                     cwd,
                     SessionKind::Chat,
+                    self.capability_authority.as_ref(),
+                    &capability_principal,
                 )
                 .await
                 {
@@ -7625,7 +7934,18 @@ impl AgentHostHandle {
                 if plan_token_stop.is_some() {
                     offline_plan_steps(&goal)
                 } else {
-                    match propose_plan_with_model(&creds, model, cwd, &goal, &cancel).await {
+                    let capability_principal = self.capability_principal(session_id)?;
+                    match propose_plan_with_authority(
+                        &creds,
+                        model,
+                        cwd,
+                        &goal,
+                        &cancel,
+                        self.capability_authority.as_ref(),
+                        &capability_principal,
+                    )
+                    .await
+                    {
                         Ok((steps, usage)) if !steps.is_empty() => {
                             plan_token_stop = self.finish_provider_attempt(
                                 session_id,
@@ -8625,7 +8945,8 @@ impl AgentHostHandle {
                 }
             };
             let provider_observation = self.provider_observation_context(session_id);
-            let step = match call_xai_agent_step_observed(
+            let capability_principal = self.capability_principal(session_id)?;
+            let step = match call_xai_agent_step_observed_with_authority(
                 creds,
                 model,
                 effort,
@@ -8634,6 +8955,8 @@ impl AgentHostHandle {
                 !self.run_tokens_bounded(session_id),
                 cancel,
                 provider_observation.as_ref(),
+                self.capability_authority.as_ref(),
+                &capability_principal,
                 |delta| {
                     emit_message(event_tx, session_id, delta);
                 },
@@ -9293,6 +9616,8 @@ impl AgentHostHandle {
                     .ok_or_else(|| anyhow!("glob_files requires pattern"))?
                     .to_string();
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(80) as usize;
+                let admission = self.admit_tool_effect(session_id, "glob_files", &args)?;
+                self.consume_tool_effect_lease(session_id, "glob_files", &args, &admission)?;
                 let hits = crate::project_context::glob_files(cwd, &pattern, limit);
                 let out = if hits.is_empty() {
                     "(no matches)".into()
@@ -9377,7 +9702,7 @@ impl AgentHostHandle {
                     title: "apply_patch".into(),
                     kind: ToolCallKind::Edit,
                     status: ToolCallStatus::Running,
-                    input,
+                    input: input.clone(),
                 });
                 // Best-effort path hints from patch text for pre-edit snapshots (#146).
                 for line in patch.lines() {
@@ -9390,6 +9715,12 @@ impl AgentHostHandle {
                             self.snapshot_edit_original_for_session(session_id, cwd, path);
                         }
                     }
+                }
+                let admission = self.admit_tool_effect(session_id, "apply_patch", &input)?;
+                if let Err(error) =
+                    self.consume_tool_effect_lease(session_id, "apply_patch", &input, &admission)
+                {
+                    return Ok(format!("DENIED by capability lease: {error}"));
                 }
                 match crate::project_context::apply_patch(cwd, &patch) {
                     Ok(report) => {
@@ -9444,6 +9775,8 @@ impl AgentHostHandle {
                     .and_then(|v| v.as_str())
                     .unwrap_or("explore the codebase")
                     .to_string();
+                let admission = self.admit_tool_effect(session_id, "spawn_explore", &args)?;
+                self.consume_tool_effect_lease(session_id, "spawn_explore", &args, &admission)?;
                 self.run_explore_subagent(session_id, cwd, &query, cancel, event_tx)
                     .await
             }
@@ -9460,10 +9793,14 @@ impl AgentHostHandle {
                     .and_then(|v| v.as_str())
                     .unwrap_or("general-purpose")
                     .to_string();
+                let admission = self.admit_tool_effect(session_id, "spawn_subagent", &args)?;
+                self.consume_tool_effect_lease(session_id, "spawn_subagent", &args, &admission)?;
                 // Fire-and-forget: returns immediately so multiple children run in parallel (#151).
                 self.spawn_gp_subagent_parallel(session_id, cwd, &prompt, &kind, cancel, event_tx)
             }
             "todo_write" => {
+                let admission = self.admit_tool_effect(session_id, "todo_write", &args)?;
+                self.consume_tool_effect_lease(session_id, "todo_write", &args, &admission)?;
                 let (items, merge) =
                     crate::todo_list::TodoList::from_tool_args(&args).map_err(|e| anyhow!(e))?;
                 let rendered = {
@@ -9548,6 +9885,8 @@ impl AgentHostHandle {
                 if id.is_empty() {
                     return Ok("ERROR: kill_task requires id".into());
                 }
+                let admission = self.admit_tool_effect(session_id, name, &args)?;
+                self.consume_tool_effect_lease(session_id, name, &args, &admission)?;
                 // Prefer background task cancel; also try subagent cancel (#179).
                 let bg = self.cancel_background_task(&id);
                 let sub = self.cancel_subagent(&id);
@@ -9560,6 +9899,8 @@ impl AgentHostHandle {
                 }
             }
             "task_output" | "get_task_output" => {
+                let admission = self.admit_tool_effect(session_id, name, &args)?;
+                self.consume_tool_effect_lease(session_id, name, &args, &admission)?;
                 let id = args
                     .get("id")
                     .or_else(|| args.get("task_id"))
@@ -9617,6 +9958,8 @@ impl AgentHostHandle {
                     .unwrap_or("")
                     .to_string();
                 let address = self.memory_address_from_args(session_id, &args)?;
+                let admission = self.admit_tool_effect(session_id, "memory_read", &args)?;
+                self.consume_tool_effect_lease(session_id, "memory_read", &args, &admission)?;
                 let facts = crate::memory::search(&address, &query)?;
                 let out = if facts.is_empty() {
                     format!("(no matching {} memory)", address.scope().label())
@@ -9719,10 +10062,17 @@ impl AgentHostHandle {
         }
 
         // Deterministic explore: list + glob + optional grep (read-only tools).
+        let list_input = serde_json::json!({ "path": "." });
+        let list_admission = self.admit_tool_effect(session_id, "list_dir", &list_input)?;
+        self.consume_tool_effect_lease(session_id, "list_dir", &list_input, &list_admission)?;
         let listing = local_tools::tool_list_dir(cwd, ".")
             .await
             .map(|t| t.output)
             .unwrap_or_else(|e| format!("list_dir error: {e}"));
+        let glob_input =
+            serde_json::json!({ "pattern": "*.{rs,ts,tsx,js,py,md,toml,json}", "limit": 40 });
+        let glob_admission = self.admit_tool_effect(session_id, "glob_files", &glob_input)?;
+        self.consume_tool_effect_lease(session_id, "glob_files", &glob_input, &glob_admission)?;
         let globs = crate::project_context::glob_files(cwd, "*.{rs,ts,tsx,js,py,md,toml,json}", 40);
         let mut parts = vec![
             format!("## Explore: {query}"),
@@ -9752,6 +10102,9 @@ impl AgentHostHandle {
             if cancel.is_cancelled() {
                 break;
             }
+            let grep_input = serde_json::json!({ "pattern": tok, "path": "." });
+            let grep_admission = self.admit_tool_effect(session_id, "grep", &grep_input)?;
+            self.consume_tool_effect_lease(session_id, "grep", &grep_input, &grep_admission)?;
             if let Ok(tr) = local_tools::tool_grep(cwd, tok, ".").await {
                 parts.push(format!(
                     "### grep `{tok}`\n{}",
@@ -9786,13 +10139,16 @@ impl AgentHostHandle {
                 if usage_attempt.is_some()
                     || self.run_token_stop_before_request(session_id).is_none()
                 {
-                    match call_xai_chat(
+                    let capability_principal = self.capability_principal(session_id)?;
+                    match call_xai_chat_with_authority(
                         &creds,
                         &model,
                         &[("user".into(), ask)],
                         None,
                         cwd,
                         SessionKind::Build,
+                        self.capability_authority.as_ref(),
+                        &capability_principal,
                     )
                     .await
                     {
@@ -10040,11 +10396,21 @@ impl AgentHostHandle {
                 }
                 parts.push(format!("### slept {ms}ms"));
             }
-            if let Ok(tr) = local_tools::tool_list_dir(cwd, ".").await {
-                parts.push(format!(
-                    "### listing\n{}",
-                    tr.output.chars().take(2_000).collect::<String>()
-                ));
+            let list_input = serde_json::json!({ "path": "." });
+            let list_allowed = self
+                .admit_tool_effect(session_id, "list_dir", &list_input)
+                .and_then(|admission| {
+                    self.consume_tool_effect_lease(session_id, "list_dir", &list_input, &admission)
+                });
+            if list_allowed.is_ok() {
+                if let Ok(tr) = local_tools::tool_list_dir(cwd, ".").await {
+                    parts.push(format!(
+                        "### listing\n{}",
+                        tr.output.chars().take(2_000).collect::<String>()
+                    ));
+                }
+            } else {
+                parts.push("### listing DENIED by capability authority".into());
             }
             if let Some(rest) = prompt.find("write ").map(|i| &prompt[i + "write ".len()..]) {
                 // #161: plan capability blocks mutators offline the same as online.
@@ -10054,18 +10420,42 @@ impl AgentHostHandle {
                          write_file is not allowed for plan/explore children"
                     ));
                 } else if let Some((path, content)) = rest.split_once(':') {
-                    self.snapshot_edit_original_for_session(session_id, cwd, path.trim());
-                    if let Ok(tr) =
-                        local_tools::tool_write_file(cwd, path.trim(), content.trim()).await
-                    {
-                        parts.push(format!("### write\n{}", tr.output));
+                    let write_input = serde_json::json!({
+                        "path": path.trim(),
+                        "content": content.trim(),
+                    });
+                    let write_allowed = self
+                        .admit_tool_effect(session_id, "write_file", &write_input)
+                        .and_then(|admission| {
+                            self.consume_tool_effect_lease(
+                                session_id,
+                                "write_file",
+                                &write_input,
+                                &admission,
+                            )
+                        });
+                    if write_allowed.is_err() {
+                        parts.push("### write DENIED by capability authority".into());
+                    } else {
+                        self.snapshot_edit_original_for_session(session_id, cwd, path.trim());
+                        if let Ok(tr) =
+                            local_tools::tool_write_file(cwd, path.trim(), content.trim()).await
                         {
-                            let mut g = self.inner.lock();
-                            if let Some(s) = g.subagents.iter_mut().find(|s| s.id == sub_id) {
-                                s.last_tool = Some("write_file".into());
+                            parts.push(format!("### write\n{}", tr.output));
+                            {
+                                let mut g = self.inner.lock();
+                                if let Some(s) = g.subagents.iter_mut().find(|s| s.id == sub_id) {
+                                    s.last_tool = Some("write_file".into());
+                                }
                             }
+                            self.emit_file_edit(
+                                session_id,
+                                cwd,
+                                path.trim(),
+                                &tr.output,
+                                &event_tx,
+                            );
                         }
-                        self.emit_file_edit(session_id, cwd, path.trim(), &tr.output, &event_tx);
                     }
                 }
             }
@@ -10149,7 +10539,14 @@ impl AgentHostHandle {
                     }
                 };
             let provider_observation = self.provider_observation_context(session_id);
-            let step = call_xai_agent_step_observed(
+            let capability_principal = match self.capability_principal(session_id) {
+                Ok(principal) => principal,
+                Err(error) => {
+                    last = format!("GP subagent capability admission failed: {error:#}");
+                    break;
+                }
+            };
+            let step = call_xai_agent_step_observed_with_authority(
                 &creds,
                 &model,
                 effort,
@@ -10160,6 +10557,8 @@ impl AgentHostHandle {
                     .is_some_and(|tracker| tracker.is_bounded()),
                 &cancel,
                 provider_observation.as_ref(),
+                self.capability_authority.as_ref(),
+                &capability_principal,
                 |_d| {},
                 |_t| {},
             )
@@ -10349,6 +10748,10 @@ impl AgentHostHandle {
             return Ok(format!("DENIED by deny rule: MCP `{wire_name}`"));
         }
         let always = matches!(gate, ToolGate::AutoAllow);
+        let admission = match self.admit_tool_effect(session_id, wire_name, args) {
+            Ok(admission) => admission,
+            Err(error) => return Ok(format!("DENIED by capability lease: {error}")),
+        };
         let call_id = Uuid::new_v4().to_string();
         if !always {
             let decision = self
@@ -10384,6 +10787,10 @@ impl AgentHostHandle {
             status: ToolCallStatus::Running,
             input: args.clone(),
         });
+        if let Err(error) = self.consume_tool_effect_lease(session_id, wire_name, args, &admission)
+        {
+            return Ok(format!("DENIED by capability lease: {error}"));
+        }
         let result = tokio::select! {
             r = crate::mcp_runtime::call_mcp_tool(Some(cwd), server, tool, args.clone()) => r,
             _ = cancel.cancelled() => {
@@ -10493,6 +10900,10 @@ impl AgentHostHandle {
             return Ok(format!("DENIED by deny rule: tool `{tool_name}`"));
         }
         let always = matches!(gate, ToolGate::AutoAllow);
+        let admission = match self.admit_tool_effect(session_id, tool_name, input) {
+            Ok(admission) => admission,
+            Err(error) => return Ok(format!("DENIED by capability lease: {error}")),
+        };
 
         if needs_perm && !always {
             let decision = self
@@ -10537,6 +10948,11 @@ impl AgentHostHandle {
             ToolCallStatus::Running,
             None,
         );
+
+        if let Err(error) = self.consume_tool_effect_lease(session_id, tool_name, input, &admission)
+        {
+            return Ok(format!("DENIED by capability lease: {error}"));
+        }
 
         match f().await {
             Ok(tr) => {
@@ -10671,6 +11087,11 @@ impl AgentHostHandle {
             return Ok(msg);
         }
         let always = matches!(gate, ToolGate::AutoAllow);
+        let tool_input = serde_json::json!({ "command": command });
+        let admission = match self.admit_tool_effect(session_id, "run_terminal_cmd", &tool_input) {
+            Ok(admission) => admission,
+            Err(error) => return Ok(format!("DENIED by capability lease: {error}")),
+        };
 
         // Ask-tier risk forces a prompt even under allow-rules (unless YOLO).
         let force_ask = risk.tier == crate::exec_risk::RiskTier::Ask && !yolo;
@@ -10745,6 +11166,11 @@ impl AgentHostHandle {
             ToolCallStatus::Running,
             None,
         );
+        if let Err(error) =
+            self.consume_tool_effect_lease(session_id, "run_terminal_cmd", &tool_input, &admission)
+        {
+            return Ok(format!("DENIED by capability lease: {error}"));
+        }
         let _ = event_tx.send(SessionUpdate::ShellSessionStarted {
             session_id,
             call_id: call_id.clone(),
@@ -11157,10 +11583,33 @@ mod computer_agent_host_tests {
         let first = host.session_new().unwrap();
         let second = host.session_new().unwrap();
         let model = host.inner.lock().model.clone();
+        let principal =
+            CapabilityPrincipal::new("test-owner".into(), 1, "test-policy".into()).unwrap();
+        let snapshot = crate::capability_authority::CapabilitySnapshot::provider(
+            &principal,
+            "xai",
+            "test-run",
+            "https://example.invalid",
+            "test-run",
+            "test-dialect",
+            "test-credential",
+            &crate::gateway_config::ModelCapabilities::default(),
+        )
+        .unwrap();
+        let capability = host
+            .capability_authority
+            .issue(
+                &snapshot,
+                Utc::now(),
+                crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+            )
+            .unwrap();
         host.inner.lock().computer_agent_qualifications.insert(
             (first.id, model.clone()),
             SessionComputerQualification {
-                route_fingerprint: "route-a".into(),
+                snapshot,
+                capability,
+                tier: crate::gateway_config::ComputerUseTier::SemanticAct,
             },
         );
 
@@ -11349,6 +11798,20 @@ mod tests {
         let session = host
             .session_new_kind(SessionKind::Build)
             .expect("create build session");
+        let _authority_service = crate::orchestration::OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            crate::orchestration::OrchStore::open(tmp.path().join("authority-orch"))
+                .expect("open authority store"),
+            crate::orchestration::OrchestrationConfig {
+                bearer_token: "host-test-authority".into(),
+                allowlist: crate::orchestration::WorkspaceAllowlist::new([
+                    std::env::current_dir().expect("current directory")
+                ]),
+                max_concurrent_runs: 1,
+                bounds: RunBounds::default(),
+            },
+        );
         (
             TestHome {
                 _tmp: tmp,
@@ -11357,6 +11820,29 @@ mod tests {
             host,
             session.id,
         )
+    }
+
+    #[test]
+    fn local_desktop_principal_bootstraps_without_control_plane() {
+        let lock = home_override_serial();
+        let tmp = tempfile::tempdir().expect("local authority home");
+        set_grokptah_home_override(Some(tmp.path().join(".grokptah")));
+        let host = AgentHost::create(HostConfig::default());
+        host.start().expect("start host");
+        let session = host
+            .session_new_kind(SessionKind::Build)
+            .expect("create local Build session");
+        host.session_set_cwd(session.id, tmp.path())
+            .expect("bind local workspace");
+        host.ensure_session_agent(session.id)
+            .expect("bind local Agent");
+        assert!(
+            host.capability_principal(session.id).is_ok(),
+            "local Desktop authority must not depend on a control-plane bearer"
+        );
+        host.stop().expect("stop host");
+        set_grokptah_home_override(None);
+        drop(lock);
     }
 
     fn usage_test_run(run_id: &str, max_total_tokens: Option<u64>) -> RunRecord {
@@ -12510,6 +12996,8 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        host.preinstall_canonical_capability_policy(lane_id)
+            .expect("explicit policy revision must rebind tool envelopes");
         let offline = TestEnvOverride::set("GROKPTAH_AGENT_OFFLINE", "1");
         let outcome = host.session_prompt(lane_id, "run sleep 5".into()).await;
         drop(offline);

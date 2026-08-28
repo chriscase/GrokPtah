@@ -5,6 +5,7 @@
 
 mod agents_personas;
 mod auth_store;
+mod capability_authority;
 pub mod certification;
 mod completion;
 mod computer_agent;
@@ -54,6 +55,7 @@ mod worktree_gc;
 pub use agents_personas::{
     discover_agents, discover_personas, resolve_agent, resolve_persona, AgentDef, PersonaDef,
 };
+pub use capability_authority::{CapabilityAuthority, CapabilityPrincipal};
 pub use certification::{
     public_xai_endpoint_fingerprint, scan_value_for_forbidden_data, ArtifactReference,
     AttemptDisposition, CampaignActuals, CampaignBudgets, CampaignIdentity,
@@ -143,16 +145,17 @@ pub use orchestration::{
     ActivationDisposition, ActivationRecord, AgentAuthorityPolicy, AgentContinuationPlan,
     AgentLaneAssociation, AgentMemoryPolicy, AgentModelSpec, AgentRecord, AgentResumePlan,
     AgentRuntimeState, AgentSpec, AgentState, AuthContext, AuthCredential,
-    ContinuationAssemblyFailure, ContinuationCheckpoint, ContinuationContext, ContinuationFidelity,
-    ContinuationInputSnapshot, ContinuationMemoryFact, ContinuationMemoryInput,
-    ContinuationMemoryScope, ContinuationOmission, ContinuationReason, ContinuationReasonCode,
-    ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef, FakeClock,
-    ManagedExecutionPolicy, MissedRunPolicy, NativeExecutorStatus, OrchStore, OrchestrationConfig,
-    OrchestrationService, PromotionState, RetentionPolicy, RetentionReport,
-    RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot,
-    RoutineTrigger, RunApproval, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState,
-    RunStopCause, WorkAttemptView, WorkDecision, WorkItem, WorkItemSnapshot, WorkMessage,
-    WorkPolicy, WorkTemplate, WorkerProjection, WorkloadReconciliationReport, WorkloadSupervisor,
+    AuthenticationGeneration, ContinuationAssemblyFailure, ContinuationCheckpoint,
+    ContinuationContext, ContinuationFidelity, ContinuationInputSnapshot, ContinuationMemoryFact,
+    ContinuationMemoryInput, ContinuationMemoryScope, ContinuationOmission, ContinuationReason,
+    ContinuationReasonCode, ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef,
+    CredentialIncarnation, EffectLease, FakeClock, ManagedExecutionPolicy, MissedRunPolicy,
+    NativeExecutorStatus, OrchStore, OrchestrationConfig, OrchestrationService, PrincipalRef,
+    PromotionState, PublicActorHandle, RetentionPolicy, RetentionReport, RoutineConcurrencyPolicy,
+    RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineSnapshot, RoutineTrigger,
+    RunApproval, RunBounds, RunExecution, RunExecutionMode, RunRecord, RunState, RunStopCause,
+    WorkAttemptView, WorkDecision, WorkItem, WorkItemSnapshot, WorkMessage, WorkPolicy,
+    WorkTemplate, WorkerProjection, WorkloadReconciliationReport, WorkloadSupervisor,
     WorkloadSupervisorStatus, WorkspaceAllowlist, AGENT_SPEC_SCHEMA_VERSION,
     CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION, CONTROL_TOOLS,
     DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS,

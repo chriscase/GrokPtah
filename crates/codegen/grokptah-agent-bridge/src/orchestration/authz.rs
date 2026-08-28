@@ -1,18 +1,807 @@
-//! Bearer auth + workspace allowlist (#196).
+//! Bearer authentication and workspace policy.
+//!
+//! Authentication is deliberately split into two layers:
+//!
+//! * [`AuthContext`] is a host-issued, opaque capability. It has no public
+//!   constructor and cannot be deserialized into authority.
+//! * [`AuthRegistry`] is the host-owned durable authority. It persists the
+//!   credential incarnation and authentication generation, but never persists
+//!   bearer material.
+//!
+//! The registry is intentionally independent from the durable run/work
+//! records. Records store only an opaque binding digest; the host revalidates
+//! that digest against this registry before every effect.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use super::types::{OrchError, OrchErrorCode};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+const AUTHORITY_SCHEMA_VERSION: u32 = 1;
+const AUTHORITY_FILE: &str = "auth-authority.json";
+const MAX_AUTH_ID_BYTES: usize = 128;
+const MAX_AUTH_OWNER_BYTES: usize = 128;
+const EFFECT_LEASE_TTL: Duration = Duration::from_secs(30);
+const LOCAL_DESKTOP_CREDENTIAL_ID: &str = "desktop-local";
+
+/// Host-issued opaque principal identity.
+///
+/// The bytes and constructor are private by design. In particular, this type
+/// intentionally has no `Serialize` or `Deserialize` implementation: JSON
+/// received from a client can never become a principal.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct PrincipalRef([u8; 16]);
+
+impl std::fmt::Debug for PrincipalRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PrincipalRef([redacted])")
+    }
+}
+
+/// Stable identity for one credential incarnation. Replacing a removed
+/// credential creates a new incarnation even when its textual id is reused.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct CredentialIncarnation([u8; 16]);
+
+impl std::fmt::Debug for CredentialIncarnation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CredentialIncarnation([redacted])")
+    }
+}
+
+/// Host authentication generation. Its numeric value never crosses a public
+/// DTO; it is only compared inside the host authority.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AuthenticationGeneration(u64);
+
+impl std::fmt::Debug for AuthenticationGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthenticationGeneration([redacted])")
+    }
+}
+
+impl AuthenticationGeneration {
+    pub(crate) fn value(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct AuthorityStamp {
+    principal: PrincipalRef,
+    incarnation: CredentialIncarnation,
+    generation: AuthenticationGeneration,
+    credential_id: String,
+    owner_id: String,
+}
+
+impl std::fmt::Debug for AuthorityStamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorityStamp")
+            .field("principal", &self.principal)
+            .field("incarnation", &self.incarnation)
+            .field("generation", &self.generation)
+            .field("credential_id", &"[redacted]")
+            .field("owner_id", &"[redacted]")
+            .finish()
+    }
+}
+
+/// A public actor handle is opaque and stable for one credential incarnation.
+/// It is safe to use for display and correlation, but cannot be used to
+/// construct an [`AuthContext`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PublicActorHandle(String);
+
+impl PublicActorHandle {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A host-issued authenticated request capability.
+///
+/// This type intentionally does not implement serde and its identity fields
+/// are private. `Clone` only clones a capability; it cannot change who it is.
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthContext {
-    /// Stable credential identity used for audit and attribution. This is not
-    /// the secret itself and may safely appear in durable records.
-    pub token_id: String,
-    /// Account/Agent owner identity shared by the service's authenticated
-    /// device credentials. A later multi-tenant service can map credentials to
-    /// different owner identities without changing the protocol shape.
-    pub owner_id: String,
+    stamp: AuthorityStamp,
+    delegation: Option<DelegationScope>,
+}
+
+impl std::fmt::Debug for AuthContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthContext")
+            .field("stamp", &self.stamp)
+            .field("delegated", &self.delegation.is_some())
+            .finish()
+    }
+}
+
+impl AuthContext {
+    #[cfg(test)]
+    pub(crate) fn test_context(id: String, generation: u64) -> Self {
+        let principal = PrincipalRef(Uuid::new_v4().into_bytes());
+        let incarnation = CredentialIncarnation(Uuid::new_v4().into_bytes());
+        Self {
+            stamp: AuthorityStamp {
+                principal,
+                incarnation,
+                generation: AuthenticationGeneration(generation.max(1)),
+                credential_id: id.clone(),
+                owner_id: id,
+            },
+            delegation: None,
+        }
+    }
+
+    pub fn principal_ref(&self) -> &PrincipalRef {
+        &self.stamp.principal
+    }
+
+    pub fn actor_handle(&self) -> PublicActorHandle {
+        let mut bytes = Vec::with_capacity(32);
+        bytes.extend_from_slice(&self.stamp.principal.0);
+        bytes.extend_from_slice(&self.stamp.incarnation.0);
+        PublicActorHandle(format!("actor_{}", &hex_sha256(&bytes)[..32]))
+    }
+
+    pub(crate) fn credential_id(&self) -> &str {
+        &self.stamp.credential_id
+    }
+
+    pub(crate) fn owner_id(&self) -> &str {
+        &self.stamp.owner_id
+    }
+
+    pub(crate) fn authentication_generation(&self) -> AuthenticationGeneration {
+        self.stamp.generation
+    }
+
+    /// Stable, secret-free identity for the durable PrincipalRef and
+    /// CredentialIncarnation pair. The authentication generation is kept
+    /// separate so rotation stales capabilities without changing identity.
+    pub(crate) fn capability_identity(&self) -> String {
+        let mut bytes = Vec::with_capacity(32);
+        bytes.extend_from_slice(&self.stamp.principal.0);
+        bytes.extend_from_slice(&self.stamp.incarnation.0);
+        format!("principal_{}", &hex_sha256(&bytes)[..32])
+    }
+
+    /// Opaque digest stored alongside durable resources. It includes the
+    /// incarnation and generation but reveals neither to a client.
+    pub(crate) fn binding_digest(&self) -> String {
+        let mut bytes = Vec::with_capacity(16 + 16 + 8);
+        bytes.extend_from_slice(&self.stamp.principal.0);
+        bytes.extend_from_slice(&self.stamp.incarnation.0);
+        bytes.extend_from_slice(&self.stamp.generation.0.to_be_bytes());
+        hex_sha256(&bytes)
+    }
+
+    fn matches(&self, record: &StoredCredential) -> bool {
+        self.stamp.credential_id == record.credential_id
+            && self.stamp.owner_id == record.owner_id
+            && decode_fixed_hex(&record.principal)
+                .is_some_and(|principal| self.stamp.principal.0 == principal)
+            && decode_fixed_hex(&record.incarnation)
+                .is_some_and(|incarnation| self.stamp.incarnation.0 == incarnation)
+            && self.stamp.generation.0 == record.generation
+    }
+
+    pub(crate) fn require_scope(
+        &self,
+        session_id: Uuid,
+        workspace: &Path,
+        agent_id: Option<&str>,
+    ) -> Result<(), OrchError> {
+        let Some(scope) = &self.delegation else {
+            return Ok(());
+        };
+        if scope.session_id != session_id
+            || scope.workspace != workspace
+            || scope.agent_id.as_deref() != agent_id
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "host delegation is outside its exact scope",
+            ));
+        }
+        Ok(())
+    }
+
+    fn delegated(mut self, scope: DelegationScope) -> Self {
+        self.delegation = Some(scope);
+        self
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DelegationScope {
+    pub session_id: Uuid,
+    pub workspace: PathBuf,
+    pub agent_id: Option<String>,
+}
+
+impl std::fmt::Debug for DelegationScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelegationScope")
+            .field("session_id", &self.session_id)
+            .field("workspace", &"[redacted]")
+            .field("agent_id", &"[redacted]")
+            .finish()
+    }
+}
+
+/// A bounded one-shot permission to cross one physical effect boundary.
+///
+/// The lease is not a replacement for checking the request at admission. It
+/// is an additional fence: consumption revalidates the live authority and
+/// fails if a generation changed after admission.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EffectLease {
+    binding: String,
+    scope: String,
+    expires_at: Instant,
+    consumed: bool,
+}
+
+impl std::fmt::Debug for EffectLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EffectLease")
+            .field("binding", &"[redacted]")
+            .field("scope", &self.scope)
+            .field("expires_at", &self.expires_at)
+            .field("consumed", &self.consumed)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredCredential {
+    credential_id: String,
+    owner_id: String,
+    principal: String,
+    incarnation: String,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredAuthority {
+    schema_version: u32,
+    next_generation: u64,
+    credentials: Vec<StoredCredential>,
+}
+
+impl Default for StoredAuthority {
+    fn default() -> Self {
+        Self {
+            schema_version: AUTHORITY_SCHEMA_VERSION,
+            next_generation: 1,
+            credentials: Vec::new(),
+        }
+    }
+}
+
+/// Host-owned registry loaded from and persisted to the canonical orchestration
+/// store. Bearer secrets are supplied by the caller and never enter this
+/// structure or its JSON representation.
+pub(crate) struct AuthRegistry {
+    root: PathBuf,
+    state: StoredAuthority,
+    durable_error: Option<String>,
+}
+
+impl AuthRegistry {
+    /// Open the same durable #477 authority used by the control plane and
+    /// ensure that the local Desktop has one host-issued credential identity.
+    /// No bearer token is created or persisted for this record.
+    pub(crate) fn open_local_desktop(root: &Path) -> Result<Self, OrchError> {
+        let mut registry = Self::open(root, &[], "primary")?;
+        if !registry
+            .state
+            .credentials
+            .iter()
+            .any(|record| record.credential_id == LOCAL_DESKTOP_CREDENTIAL_ID)
+        {
+            let generation = registry.allocate_generation()?;
+            registry.state.credentials.push(new_stored_credential(
+                LOCAL_DESKTOP_CREDENTIAL_ID,
+                "primary",
+                generation,
+            ));
+            registry.persist()?;
+        }
+        Ok(registry)
+    }
+
+    pub(crate) fn local_desktop_context(&self) -> Result<AuthContext, OrchError> {
+        let record = self
+            .state
+            .credentials
+            .iter()
+            .find(|record| record.credential_id == LOCAL_DESKTOP_CREDENTIAL_ID)
+            .ok_or_else(stale_authority)?;
+        let principal = decode_fixed_hex(&record.principal).ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                "durable local Desktop principal is invalid",
+            )
+        })?;
+        let incarnation = decode_fixed_hex(&record.incarnation).ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                "durable local Desktop incarnation is invalid",
+            )
+        })?;
+        Ok(AuthContext {
+            stamp: AuthorityStamp {
+                principal: PrincipalRef(principal),
+                incarnation: CredentialIncarnation(incarnation),
+                generation: AuthenticationGeneration(record.generation),
+                credential_id: LOCAL_DESKTOP_CREDENTIAL_ID.into(),
+                owner_id: record.owner_id.clone(),
+            },
+            delegation: None,
+        })
+    }
+
+    pub(crate) fn unavailable(root: &Path, error: impl Into<String>) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            state: StoredAuthority::default(),
+            durable_error: Some(error.into()),
+        }
+    }
+
+    pub(crate) fn open(
+        root: &Path,
+        credentials: &[AuthCredential],
+        owner_id: &str,
+    ) -> Result<Self, OrchError> {
+        validate_owner(owner_id)?;
+        let path = root.join(AUTHORITY_FILE);
+        let (state, existed) = if path.is_file() {
+            let text = std::fs::read_to_string(&path).map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    format!("read durable auth authority: {error}"),
+                )
+            })?;
+            let state: StoredAuthority = serde_json::from_str(&text).map_err(|error| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    format!("parse durable auth authority: {error}"),
+                )
+            })?;
+            validate_stored_authority(&state)?;
+            (state, true)
+        } else {
+            (StoredAuthority::default(), false)
+        };
+        let mut registry = Self {
+            root: root.to_path_buf(),
+            state,
+            durable_error: None,
+        };
+        let changed = if credentials.is_empty() && existed {
+            // A Desktop bootstrap has no control-plane bearer material. It
+            // must observe existing durable identities, not revoke them.
+            false
+        } else {
+            registry.reconcile(credentials, owner_id)?
+        };
+        if changed || !existed {
+            registry.persist()?;
+        }
+        Ok(registry)
+    }
+
+    fn persist(&self) -> Result<(), OrchError> {
+        if let Some(error) = &self.durable_error {
+            return Err(OrchError::new(
+                OrchErrorCode::Internal,
+                format!("durable auth authority is unavailable: {error}"),
+            ));
+        }
+        let path = self.root.join(AUTHORITY_FILE);
+        let tmp = self.root.join("auth-authority.json.tmp");
+        let bytes = serde_json::to_vec_pretty(&self.state).map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                format!("serialize durable auth authority: {error}"),
+            )
+        })?;
+        std::fs::write(&tmp, bytes).map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                format!("write durable auth authority: {error}"),
+            )
+        })?;
+        std::fs::rename(&tmp, path).map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                format!("commit durable auth authority: {error}"),
+            )
+        })
+    }
+
+    pub(crate) fn reconcile(
+        &mut self,
+        credentials: &[AuthCredential],
+        owner_id: &str,
+    ) -> Result<bool, OrchError> {
+        validate_owner(owner_id)?;
+        validate_credentials(credentials)?;
+        let mut changed = false;
+        let owner_changed = self
+            .state
+            .credentials
+            .iter()
+            .any(|record| record.owner_id != owner_id);
+        let mut next = Vec::with_capacity(credentials.len().saturating_add(1));
+        for credential in credentials {
+            let existing = if owner_changed {
+                None
+            } else {
+                self.state
+                    .credentials
+                    .iter()
+                    .find(|record| record.credential_id == credential.id)
+            };
+            let record = match existing {
+                Some(record) => record.clone(),
+                None => {
+                    changed = true;
+                    new_stored_credential(&credential.id, owner_id, self.allocate_generation()?)
+                }
+            };
+            next.push(record);
+        }
+        if let Some(local) = self
+            .state
+            .credentials
+            .iter()
+            .find(|record| record.credential_id == LOCAL_DESKTOP_CREDENTIAL_ID)
+        {
+            next.push(local.clone());
+        }
+        if next.len() != self.state.credentials.len()
+            || next != self.state.credentials
+            || owner_changed
+        {
+            changed = true;
+            self.state.credentials = next;
+        }
+        Ok(changed)
+    }
+
+    pub(crate) fn set_credentials(
+        &mut self,
+        credentials: &[AuthCredential],
+        owner_id: &str,
+    ) -> Result<(), OrchError> {
+        self.reconcile(credentials, owner_id)?;
+        self.persist()
+    }
+
+    /// Replace a credential identity rather than rotating its secret. A
+    /// replacement receives a fresh principal and incarnation even when its
+    /// textual credential id is unchanged.
+    pub(crate) fn replace_credential(
+        &mut self,
+        credential_id: &str,
+        owner_id: &str,
+    ) -> Result<(), OrchError> {
+        validate_owner(owner_id)?;
+        let Some(index) = self
+            .state
+            .credentials
+            .iter()
+            .position(|record| record.credential_id == credential_id)
+        else {
+            return Err(stale_authority());
+        };
+        let generation = self.allocate_generation()?;
+        self.state.credentials[index] = new_stored_credential(credential_id, owner_id, generation);
+        self.persist()
+    }
+
+    pub(crate) fn change_owner(&mut self, owner_id: &str) -> Result<(), OrchError> {
+        validate_owner(owner_id)?;
+        if self.state.credentials.is_empty() {
+            return Ok(());
+        }
+        let old = std::mem::take(&mut self.state.credentials);
+        let mut replacement = Vec::with_capacity(old.len());
+        for record in old {
+            let generation = self.allocate_generation()?;
+            replacement.push(new_stored_credential(
+                &record.credential_id,
+                owner_id,
+                generation,
+            ));
+        }
+        self.state.credentials = replacement;
+        self.persist()
+    }
+
+    fn allocate_generation(&mut self) -> Result<u64, OrchError> {
+        let generation = self.state.next_generation;
+        self.state.next_generation = generation.checked_add(1).ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                "authentication generation exhausted",
+            )
+        })?;
+        Ok(generation)
+    }
+
+    pub(crate) fn authenticate(
+        &self,
+        header: Option<&str>,
+        credentials: &[AuthCredential],
+    ) -> Result<AuthContext, OrchError> {
+        if credentials.is_empty() || self.state.credentials.is_empty() {
+            return Err(OrchError::new(
+                OrchErrorCode::Internal,
+                "control plane credentials are not configured",
+            ));
+        }
+        let token = bearer_token(header)?;
+        let Some((credential, record)) = credentials.iter().find_map(|credential| {
+            self.state
+                .credentials
+                .iter()
+                .find(|record| record.credential_id == credential.id)
+                .filter(|_| constant_time_eq(token.as_bytes(), credential.token.as_bytes()))
+                .map(|record| (credential, record))
+        }) else {
+            return Err(OrchError::new(
+                OrchErrorCode::Unauthenticated,
+                "invalid bearer token",
+            ));
+        };
+        let principal = decode_fixed_hex(&record.principal).ok_or_else(|| {
+            OrchError::new(OrchErrorCode::Internal, "durable auth principal is invalid")
+        })?;
+        let incarnation = decode_fixed_hex(&record.incarnation).ok_or_else(|| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                "durable auth incarnation is invalid",
+            )
+        })?;
+        Ok(AuthContext {
+            stamp: AuthorityStamp {
+                principal: PrincipalRef(principal),
+                incarnation: CredentialIncarnation(incarnation),
+                generation: AuthenticationGeneration(record.generation),
+                credential_id: credential.id.clone(),
+                owner_id: record.owner_id.clone(),
+            },
+            delegation: None,
+        })
+    }
+
+    pub(crate) fn require_current(&self, auth: &AuthContext) -> Result<(), OrchError> {
+        let Some(record) = self
+            .state
+            .credentials
+            .iter()
+            .find(|record| record.credential_id == auth.stamp.credential_id)
+        else {
+            return Err(stale_authority());
+        };
+        if auth.matches(record) {
+            Ok(())
+        } else {
+            Err(stale_authority())
+        }
+    }
+
+    pub(crate) fn mint_effect_lease(
+        &self,
+        auth: &AuthContext,
+        scope: impl Into<String>,
+    ) -> Result<EffectLease, OrchError> {
+        self.require_current(auth)?;
+        let scope = scope.into();
+        if scope.is_empty() || scope.len() > 512 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "effect lease scope is empty or exceeds its bound",
+            ));
+        }
+        Ok(EffectLease {
+            binding: auth.binding_digest(),
+            scope,
+            expires_at: Instant::now() + EFFECT_LEASE_TTL,
+            consumed: false,
+        })
+    }
+
+    pub(crate) fn consume_effect_lease(
+        &self,
+        auth: &AuthContext,
+        lease: &mut EffectLease,
+        scope: &str,
+    ) -> Result<(), OrchError> {
+        self.require_current(auth)?;
+        if lease.consumed
+            || lease.scope != scope
+            || lease.binding != auth.binding_digest()
+            || Instant::now() >= lease.expires_at
+        {
+            return Err(stale_authority());
+        }
+        lease.consumed = true;
+        Ok(())
+    }
+
+    pub(crate) fn issue_delegation(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        workspace: PathBuf,
+        agent_id: Option<String>,
+    ) -> Result<AuthContext, OrchError> {
+        self.require_current(auth)?;
+        Ok(auth.clone().delegated(DelegationScope {
+            session_id,
+            workspace,
+            agent_id,
+        }))
+    }
+
+    pub(crate) fn primary_context(
+        &self,
+        credentials: &[AuthCredential],
+    ) -> Result<AuthContext, OrchError> {
+        let primary = credentials
+            .iter()
+            .find(|credential| credential.id == "primary")
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    "primary credential is not configured",
+                )
+            })?;
+        self.authenticate(Some(&format!("Bearer {}", primary.token())), credentials)
+    }
+
+    pub(crate) fn rotate_generation(&mut self, credential_id: &str) -> Result<(), OrchError> {
+        let generation = self.allocate_generation()?;
+        let Some(record) = self
+            .state
+            .credentials
+            .iter_mut()
+            .find(|record| record.credential_id == credential_id)
+        else {
+            return Err(stale_authority());
+        };
+        record.generation = generation;
+        self.persist()
+    }
+
+    pub(crate) fn revoke(&mut self, credential_id: &str) -> Result<(), OrchError> {
+        let old_len = self.state.credentials.len();
+        self.state
+            .credentials
+            .retain(|record| record.credential_id != credential_id);
+        if old_len == self.state.credentials.len() {
+            return Err(stale_authority());
+        }
+        self.persist()
+    }
+}
+
+fn stale_authority() -> OrchError {
+    OrchError::new(
+        OrchErrorCode::Unauthenticated,
+        "authentication authority is stale",
+    )
+}
+
+fn validate_owner(owner_id: &str) -> Result<(), OrchError> {
+    if owner_id.trim().is_empty() || owner_id.len() > MAX_AUTH_OWNER_BYTES {
+        return Err(OrchError::new(
+            OrchErrorCode::InvalidRequest,
+            "Agent owner id must be between 1 and 128 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_credentials(credentials: &[AuthCredential]) -> Result<(), OrchError> {
+    let mut ids = std::collections::HashSet::new();
+    for credential in credentials {
+        if !ids.insert(credential.id.as_str()) {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "auth credential ids must be unique",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_stored_authority(state: &StoredAuthority) -> Result<(), OrchError> {
+    if state.schema_version != AUTHORITY_SCHEMA_VERSION || state.next_generation == 0 {
+        return Err(OrchError::new(
+            OrchErrorCode::Internal,
+            "durable auth authority schema is invalid",
+        ));
+    }
+    let mut ids = std::collections::HashSet::new();
+    for record in &state.credentials {
+        if !ids.insert(record.credential_id.as_str())
+            || record.credential_id.is_empty()
+            || record.credential_id.len() > MAX_AUTH_ID_BYTES
+            || record.owner_id.is_empty()
+            || record.owner_id.len() > MAX_AUTH_OWNER_BYTES
+            || record.generation == 0
+            || decode_fixed_hex(&record.principal).is_none()
+            || decode_fixed_hex(&record.incarnation).is_none()
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Internal,
+                "durable auth authority record is invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn new_stored_credential(id: &str, owner_id: &str, generation: u64) -> StoredCredential {
+    StoredCredential {
+        credential_id: id.to_string(),
+        owner_id: owner_id.to_string(),
+        principal: hex_sha256(&Uuid::new_v4().into_bytes()),
+        incarnation: hex_sha256(&Uuid::new_v4().into_bytes()),
+        generation,
+    }
+}
+
+fn decode_fixed_hex(value: &str) -> Option<[u8; 16]> {
+    if value.len() != 64 {
+        return None;
+    }
+    let digest = (0..32)
+        .map(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    digest[..16].try_into().ok()
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn bearer_token(header: Option<&str>) -> Result<&str, OrchError> {
+    let Some(h) = header else {
+        return Err(OrchError::new(
+            OrchErrorCode::Unauthenticated,
+            "missing Authorization bearer token",
+        ));
+    };
+    let h = h.trim();
+    let token = h
+        .strip_prefix("Bearer ")
+        .or_else(|| h.strip_prefix("bearer "))
+        .unwrap_or("")
+        .trim();
+    if token.is_empty() {
+        return Err(OrchError::new(
+            OrchErrorCode::Unauthenticated,
+            "missing bearer token",
+        ));
+    }
+    Ok(token)
 }
 
 /// One named bearer credential accepted by a service instance.
@@ -121,57 +910,6 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub fn authenticate_bearer(
-    header: Option<&str>,
-    credentials: &[AuthCredential],
-    owner_id: &str,
-) -> Result<AuthContext, OrchError> {
-    if credentials.is_empty() || owner_id.trim().is_empty() {
-        return Err(OrchError::new(
-            OrchErrorCode::Internal,
-            "control plane credentials are not configured",
-        ));
-    }
-    let Some(h) = header else {
-        return Err(OrchError::new(
-            OrchErrorCode::Unauthenticated,
-            "missing Authorization bearer token",
-        ));
-    };
-    let h = h.trim();
-    let token = h
-        .strip_prefix("Bearer ")
-        .or_else(|| h.strip_prefix("bearer "))
-        .unwrap_or("")
-        .trim();
-    if token.is_empty() {
-        return Err(OrchError::new(
-            OrchErrorCode::Unauthenticated,
-            "missing bearer token",
-        ));
-    }
-    let credential = credentials
-        .iter()
-        .find(|credential| constant_time_eq(token.as_bytes(), credential.token.as_bytes()));
-    let Some(credential) = credential else {
-        return Err(OrchError::new(
-            OrchErrorCode::Unauthenticated,
-            "invalid bearer token",
-        ));
-    };
-    Ok(AuthContext {
-        token_id: credential.id.clone(),
-        owner_id: owner_id.trim().to_string(),
-    })
-}
-
-/// Backward-compatible single-credential helper used by pure policy tests and
-/// embedders that have not adopted named credentials yet.
-pub fn require_bearer(header: Option<&str>, expected: &str) -> Result<AuthContext, OrchError> {
-    let credential = AuthCredential::new("primary", expected)?;
-    authenticate_bearer(header, &[credential], "primary")
-}
-
 pub fn require_workspace_match(
     allowlist: &WorkspaceAllowlist,
     session_cwd: Option<&Path>,
@@ -207,11 +945,32 @@ mod tests {
 
     #[test]
     fn bearer_fail_closed() {
-        assert!(require_bearer(None, "tok").is_err());
-        assert!(require_bearer(Some("tok"), "tok").is_err());
-        assert!(require_bearer(Some("Bearer wrong"), "tok").is_err());
+        let root = tempdir().unwrap();
+        let credential = AuthCredential::new("primary", "tok").unwrap();
+        let registry = AuthRegistry::open(root.path(), &[credential], "primary").unwrap();
+        assert!(registry
+            .authenticate(None, &[AuthCredential::new("primary", "tok").unwrap()])
+            .is_err());
+        assert!(registry
+            .authenticate(
+                Some("tok"),
+                &[AuthCredential::new("primary", "tok").unwrap()]
+            )
+            .is_err());
+        assert!(registry
+            .authenticate(
+                Some("Bearer wrong"),
+                &[AuthCredential::new("primary", "tok").unwrap()]
+            )
+            .is_err());
         assert_eq!(
-            require_bearer(Some("Bearer tok"), "tok").unwrap().token_id,
+            registry
+                .authenticate(
+                    Some("Bearer tok"),
+                    &[AuthCredential::new("primary", "tok").unwrap()]
+                )
+                .unwrap()
+                .credential_id(),
             "primary"
         );
     }
@@ -222,11 +981,33 @@ mod tests {
             AuthCredential::new("primary", "tok").unwrap(),
             AuthCredential::new("laptop", "other-tok").unwrap(),
         ];
-        let auth =
-            authenticate_bearer(Some("Bearer other-tok"), &credentials, "account-1").unwrap();
-        assert_eq!(auth.token_id, "laptop");
-        assert_eq!(auth.owner_id, "account-1");
-        assert!(authenticate_bearer(Some("Bearer unknown"), &credentials, "account-1").is_err());
+        let root = tempdir().unwrap();
+        let registry = AuthRegistry::open(root.path(), &credentials, "account-1").unwrap();
+        let auth = registry
+            .authenticate(Some("Bearer other-tok"), &credentials)
+            .unwrap();
+        assert_eq!(auth.credential_id(), "laptop");
+        assert_eq!(auth.owner_id(), "account-1");
+        assert!(registry
+            .authenticate(Some("Bearer unknown"), &credentials)
+            .is_err());
+    }
+
+    #[test]
+    fn local_desktop_context_is_durable_without_a_bearer_token() {
+        let root = tempdir().unwrap();
+        let first = AuthRegistry::open_local_desktop(root.path()).unwrap();
+        let first_context = first.local_desktop_context().unwrap();
+        assert_eq!(first_context.credential_id(), LOCAL_DESKTOP_CREDENTIAL_ID);
+        assert_eq!(first_context.owner_id(), "primary");
+
+        let second = AuthRegistry::open_local_desktop(root.path()).unwrap();
+        let second_context = second.local_desktop_context().unwrap();
+        assert_eq!(first_context, second_context);
+
+        let primary = AuthCredential::new("primary", "control").unwrap();
+        let with_control = AuthRegistry::open(root.path(), &[primary], "primary").unwrap();
+        assert_eq!(with_control.local_desktop_context().unwrap(), first_context);
     }
 
     #[test]

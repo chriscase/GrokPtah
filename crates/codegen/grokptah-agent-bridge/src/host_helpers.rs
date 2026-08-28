@@ -9,6 +9,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::capability_authority::{CapabilityAuthority, CapabilityPrincipal, CapabilitySnapshot};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host::AgentHostHandle;
 use crate::local_tools;
@@ -1172,10 +1173,10 @@ pub(crate) fn sandbox_blocks_shell(profile: &str, command: &str) -> bool {
 /// Per-turn override wins over host-wide config; default 24; hard cap 24.
 pub(crate) fn resolve_turn_max_rounds(
     turn_override: Option<u32>,
-    host_default: Option<u32>,
+    configured_default: Option<u32>,
 ) -> usize {
     turn_override
-        .or(host_default)
+        .or(configured_default)
         .map(|n| n.max(1) as usize)
         .unwrap_or(24)
         .min(24)
@@ -1247,13 +1248,28 @@ pub(crate) fn parse_effort_arg(raw: &str) -> EffortLevel {
     }
 }
 
-/// Ask the model for a short numbered plan (no tools).
-pub(crate) async fn propose_plan_with_model(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn propose_plan_with_authority(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
     cwd: &Path,
     goal: &str,
     cancel: &CancellationToken,
+    authority: &CapabilityAuthority,
+    principal: &CapabilityPrincipal,
+) -> Result<(Vec<String>, Option<crate::completion::CompletionUsage>)> {
+    propose_plan_with_authority_inner(creds, model, cwd, goal, cancel, authority, principal).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn propose_plan_with_authority_inner(
+    creds: &crate::auth_store::WireCredentials,
+    model: &str,
+    cwd: &Path,
+    goal: &str,
+    cancel: &CancellationToken,
+    authority: &CapabilityAuthority,
+    principal: &CapabilityPrincipal,
 ) -> Result<(Vec<String>, Option<crate::completion::CompletionUsage>)> {
     if cancel.is_cancelled() {
         bail!("cancelled");
@@ -1263,13 +1279,15 @@ pub(crate) async fn propose_plan_with_model(
          Return ONLY a numbered list of 3-8 concrete steps (no preamble).\n\nGoal: {goal}\nProject: {}",
         cwd.display()
     );
-    let reply = call_xai_chat(
+    let reply = call_xai_chat_with_authority(
         creds,
         model,
         &[("user".into(), prompt)],
         None,
         cwd,
         SessionKind::Build,
+        authority,
+        principal,
     )
     .await?;
     let steps = parse_numbered_plan(&reply.text);
@@ -1761,6 +1779,93 @@ struct ProviderObservationRoute {
     credential_binding: Option<OpaqueIdentity>,
 }
 
+fn consume_provider_send_lease(
+    authority: &CapabilityAuthority,
+    credentials: &crate::auth_store::WireCredentials,
+    selected_model: &str,
+    target: &ResolvedModelTarget,
+    principal: &CapabilityPrincipal,
+) -> Result<()> {
+    // Re-resolve immediately before every physical send. A profile edit,
+    // provider replacement, credential rotation, or capability downgrade
+    // therefore cannot leave an already-admitted request authorized.
+    let selection = crate::gateway_config::parse_model_selection(selected_model).ok();
+    if selection
+        .as_ref()
+        .is_some_and(|selection| selection.provider_id == credentials.provider_id)
+    {
+        let current = resolve_model_target(credentials, selected_model)?;
+        if current.base_url != target.base_url
+            || current.wire_model != target.wire_model
+            || current.dialect != target.dialect
+            || current.capabilities != target.capabilities
+        {
+            bail!("provider capability changed while the request was waiting to send");
+        }
+    }
+    let snapshot = CapabilitySnapshot::provider(
+        principal,
+        &credentials.provider_id,
+        selected_model,
+        &target.base_url,
+        &target.wire_model,
+        &format!("{:?}", target.dialect),
+        &credentials.qualification_identity_fingerprint(),
+        &target.capabilities,
+    )?;
+    let lease = authority.lease_from_preinstalled(
+        &snapshot,
+        "provider.send",
+        &provider_effect_resource(credentials, target),
+        "provider.send",
+        Utc::now(),
+        chrono::Duration::seconds(5),
+    )?;
+    authority.consume(lease, &snapshot, Utc::now())?;
+    Ok(())
+}
+
+pub(crate) fn provider_effect_resource(
+    credentials: &crate::auth_store::WireCredentials,
+    target: &ResolvedModelTarget,
+) -> String {
+    format!("provider:{}:{}", credentials.provider_id, target.wire_model)
+}
+
+#[cfg(test)]
+fn install_test_provider_envelope(
+    authority: &CapabilityAuthority,
+    principal: &CapabilityPrincipal,
+    credentials: &crate::auth_store::WireCredentials,
+    selected_model: &str,
+    target: &ResolvedModelTarget,
+) -> Result<()> {
+    let provider_id = crate::gateway_config::parse_model_selection(selected_model)
+        .map(|selection| selection.provider_id)
+        .unwrap_or_else(|_| credentials.provider_id.clone());
+    let snapshot = CapabilitySnapshot::provider(
+        principal,
+        &provider_id,
+        selected_model,
+        &target.base_url,
+        &target.wire_model,
+        &format!("{:?}", target.dialect),
+        &credentials.qualification_identity_fingerprint(),
+        &target.capabilities,
+    )?;
+    authority.install_canonical_envelope(
+        &format!("test-provider-send:{}", target.wire_model),
+        snapshot,
+        principal.id(),
+        principal.auth_generation(),
+        principal.policy_generation(),
+        ["provider.send"],
+        &provider_effect_resource(credentials, target),
+        Utc::now(),
+    )?;
+    Ok(())
+}
+
 fn sha256_hex(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
@@ -1962,6 +2067,7 @@ fn record_provider_attempt(
 /// Content → `on_delta`; reasoning_content → `on_thought` (#149).
 /// Cancel aborts the HTTP body read within ~one chunk.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn call_xai_agent_step<F, G>(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
@@ -1992,10 +2098,24 @@ where
     .await
 }
 
+#[cfg(test)]
+fn test_provider_authority(
+    creds: &crate::auth_store::WireCredentials,
+    model: &str,
+) -> Result<(CapabilityAuthority, CapabilityPrincipal)> {
+    let authority = CapabilityAuthority::new(true);
+    let principal =
+        CapabilityPrincipal::new("test-provider".into(), 1, "test-provider-policy".into())?;
+    let target = resolve_model_target(creds, model)?;
+    install_test_provider_envelope(&authority, &principal, creds, model, &target)?;
+    Ok((authority, principal))
+}
+
 /// Execute a provider step with optional bounded structural observation of
 /// every physical HTTP attempt. Observation is deliberately orthogonal to
 /// provider execution and failures in the recorder never affect the result.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) async fn call_xai_agent_step_observed<F, G>(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
@@ -2005,6 +2125,79 @@ pub(crate) async fn call_xai_agent_step_observed<F, G>(
     allow_transient_retries: bool,
     cancel: &CancellationToken,
     observation: Option<&ProviderObservationContext>,
+    on_delta: F,
+    on_thought: G,
+) -> Result<AgentStep>
+where
+    F: FnMut(&str),
+    G: FnMut(&str),
+{
+    let (authority, principal) = test_provider_authority(creds, model)?;
+    call_xai_agent_step_observed_inner(
+        creds,
+        model,
+        effort,
+        messages,
+        tools,
+        allow_transient_retries,
+        cancel,
+        observation,
+        Some(&authority),
+        Some(&principal),
+        on_delta,
+        on_thought,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_xai_agent_step_observed_with_authority<F, G>(
+    creds: &crate::auth_store::WireCredentials,
+    model: &str,
+    effort: EffortLevel,
+    messages: &[serde_json::Value],
+    tools: &serde_json::Value,
+    allow_transient_retries: bool,
+    cancel: &CancellationToken,
+    observation: Option<&ProviderObservationContext>,
+    authority: &CapabilityAuthority,
+    principal: &CapabilityPrincipal,
+    on_delta: F,
+    on_thought: G,
+) -> Result<AgentStep>
+where
+    F: FnMut(&str),
+    G: FnMut(&str),
+{
+    call_xai_agent_step_observed_inner(
+        creds,
+        model,
+        effort,
+        messages,
+        tools,
+        allow_transient_retries,
+        cancel,
+        observation,
+        Some(authority),
+        Some(principal),
+        on_delta,
+        on_thought,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn call_xai_agent_step_observed_inner<F, G>(
+    creds: &crate::auth_store::WireCredentials,
+    model: &str,
+    effort: EffortLevel,
+    messages: &[serde_json::Value],
+    tools: &serde_json::Value,
+    allow_transient_retries: bool,
+    cancel: &CancellationToken,
+    observation: Option<&ProviderObservationContext>,
+    authority: Option<&CapabilityAuthority>,
+    principal: Option<&CapabilityPrincipal>,
     on_delta: F,
     on_thought: G,
 ) -> Result<AgentStep>
@@ -2027,6 +2220,7 @@ where
     call_provider_agent_step(
         creds,
         target,
+        model,
         effort,
         messages,
         tools,
@@ -2034,6 +2228,8 @@ where
         cancel,
         observation,
         observation_route,
+        authority,
+        principal,
         on_delta,
         on_thought,
     )
@@ -2044,6 +2240,7 @@ where
 async fn call_provider_agent_step<F, G>(
     mut creds: crate::auth_store::WireCredentials,
     target: ResolvedModelTarget,
+    selected_model: &str,
     effort: EffortLevel,
     messages: &[serde_json::Value],
     tools: &serde_json::Value,
@@ -2051,6 +2248,8 @@ async fn call_provider_agent_step<F, G>(
     cancel: &CancellationToken,
     observation: Option<&ProviderObservationContext>,
     mut observation_route: Option<ProviderObservationRoute>,
+    authority: Option<&CapabilityAuthority>,
+    principal: Option<&CapabilityPrincipal>,
     mut on_delta: F,
     mut on_thought: G,
 ) -> Result<AgentStep>
@@ -2098,6 +2297,9 @@ where
     const MAX_TRANSIENT_RETRIES: u32 = 3;
     let mut transient_retries = 0u32;
     let mut last_err = None::<String>;
+    let provider_authority =
+        authority.ok_or_else(|| anyhow!("host provider capability authority is unavailable"))?;
+    let principal = principal.ok_or_else(|| anyhow!("host provider principal is unavailable"))?;
     for _request_attempt in 0..MAX_REQUEST_ATTEMPTS {
         if cancel.is_cancelled() {
             bail!("cancelled");
@@ -2124,6 +2326,13 @@ where
                     context.begin_attempt().ok().map(|attempt| (route, attempt))
                 });
 
+        consume_provider_send_lease(
+            provider_authority,
+            &creds,
+            selected_model,
+            &target,
+            principal,
+        )?;
         let resp_result = tokio::select! {
             r = send_once(&creds).send() => r,
             _ = cancel.cancelled() => {
@@ -2221,6 +2430,13 @@ where
                             .and_then(|(route, context)| {
                                 context.begin_attempt().ok().map(|attempt| (route, attempt))
                             });
+                    consume_provider_send_lease(
+                        provider_authority,
+                        &creds,
+                        selected_model,
+                        &target,
+                        principal,
+                    )?;
                     resp = tokio::select! {
                         r = send_once(&creds).send() => match r {
                             Ok(response) => response,
@@ -2810,6 +3026,8 @@ where
 /// credentials this helper can send.
 #[doc(hidden)]
 pub async fn replay_xai_provider_contract_on_loopback(
+    authority: &CapabilityAuthority,
+    principal: &CapabilityPrincipal,
     base_url: &str,
     model: &str,
     messages: &[serde_json::Value],
@@ -2871,6 +3089,7 @@ pub async fn replay_xai_provider_contract_on_loopback(
     let step = call_provider_agent_step(
         credentials,
         target,
+        model,
         EffortLevel::None,
         messages,
         tools,
@@ -2878,6 +3097,8 @@ pub async fn replay_xai_provider_contract_on_loopback(
         &CancellationToken::new(),
         None,
         None,
+        Some(authority),
+        Some(principal),
         |delta| deltas.push(delta.to_string()),
         |delta| thought_deltas.push(delta.to_string()),
     )
@@ -3643,6 +3864,8 @@ pub(crate) fn api_context_messages(session: &Session) -> Vec<(String, String)> {
 /// `history` is already windowed (post-`api_context_start`); last entry is
 /// typically the current user prompt. `compacted_summary` is the extractive
 /// stand-in for local-only prefix that left the context window.
+#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) async fn call_xai_chat(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
@@ -3650,6 +3873,55 @@ pub(crate) async fn call_xai_chat(
     compacted_summary: Option<&str>,
     cwd: &Path,
     kind: SessionKind,
+) -> Result<ChatReply> {
+    let (authority, principal) = test_provider_authority(creds, model)?;
+    call_xai_chat_inner(
+        creds,
+        model,
+        history,
+        compacted_summary,
+        cwd,
+        kind,
+        Some(&authority),
+        Some(&principal),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_xai_chat_with_authority(
+    creds: &crate::auth_store::WireCredentials,
+    model: &str,
+    history: &[(String, String)],
+    compacted_summary: Option<&str>,
+    cwd: &Path,
+    kind: SessionKind,
+    authority: &CapabilityAuthority,
+    principal: &CapabilityPrincipal,
+) -> Result<ChatReply> {
+    call_xai_chat_inner(
+        creds,
+        model,
+        history,
+        compacted_summary,
+        cwd,
+        kind,
+        Some(authority),
+        Some(principal),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn call_xai_chat_inner(
+    creds: &crate::auth_store::WireCredentials,
+    model: &str,
+    history: &[(String, String)],
+    compacted_summary: Option<&str>,
+    cwd: &Path,
+    kind: SessionKind,
+    authority: Option<&CapabilityAuthority>,
+    principal: Option<&CapabilityPrincipal>,
 ) -> Result<ChatReply> {
     // Prefer a non-expired / refreshed OIDC access token before the first call.
     let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
@@ -3659,8 +3931,8 @@ pub(crate) async fn call_xai_chat(
     if !target.capabilities.chat {
         bail!("provider model `{}` is not chat-capable", target.wire_model);
     }
-    let base = target.base_url;
-    let model_id = target.wire_model;
+    let base = target.base_url.clone();
+    let model_id = target.wire_model.clone();
     let request_timeout = target.deadline_class.chat_timeout();
     let is_compatible =
         target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions;
@@ -3727,6 +3999,9 @@ pub(crate) async fn call_xai_chat(
         "stream": false
     });
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+    let provider_authority =
+        authority.ok_or_else(|| anyhow!("host chat capability authority is unavailable"))?;
+    let principal = principal.ok_or_else(|| anyhow!("host chat principal is unavailable"))?;
 
     let send_once = |c: &crate::auth_store::WireCredentials| {
         let req = client.post(&url).header("Content-Type", "application/json");
@@ -3734,6 +4009,7 @@ pub(crate) async fn call_xai_chat(
         req.json(&body)
     };
 
+    consume_provider_send_lease(provider_authority, &creds, model, &target, principal)?;
     let mut resp = send_once(&creds).send().await.map_err(|e| {
         // Surface classify-able transport failures (DNS, TLS, timeout) so the
         // UI is not a vague "error sending request".
@@ -3763,6 +4039,7 @@ pub(crate) async fn call_xai_chat(
         match crate::auth_store::force_refresh(&creds).await {
             Ok(fresh) => {
                 creds = fresh;
+                consume_provider_send_lease(provider_authority, &creds, model, &target, principal)?;
                 resp = send_once(&creds).send().await.map_err(|error| {
                     let class = if error.is_timeout() {
                         "timeout"

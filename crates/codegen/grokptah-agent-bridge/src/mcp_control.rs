@@ -557,10 +557,7 @@ struct ReadinessSnapshot {
 fn readiness_snapshot(state: &AppState) -> ReadinessSnapshot {
     let payload = state
         .orch
-        .get_capacity(&AuthContext {
-            token_id: "health-probe".into(),
-            owner_id: "health-probe".into(),
-        })
+        .capacity_for_health()
         .unwrap_or_else(|error| json!({"health": {"serviceError": error.message}}));
     let health = payload.get("health").cloned().unwrap_or_else(|| json!({}));
     let ready = [
@@ -3924,13 +3921,27 @@ mod tests {
         host.session_set_cwd(session_a.id, ws_a.path()).unwrap();
         let session_b = host.session_new_kind(crate::SessionKind::Build).unwrap();
         host.session_set_cwd(session_b.id, ws_b.path()).unwrap();
+        let agent = host.ensure_session_agent(session_a.id).unwrap();
+        host.ensure_orchestration_store()
+            .unwrap()
+            .claim_agent_owner(&agent.agent_id, "primary")
+            .unwrap();
 
         let canon_a = canonical_workspace_string(ws_a.path()).unwrap();
         let canon_b = canonical_workspace_string(ws_b.path()).unwrap();
-        let computer = ComputerUseService::new(
+        let orch = computer_orch(
+            &host,
+            home.path(),
+            vec![ws_a.path().to_path_buf(), ws_b.path().to_path_buf()],
+        );
+        let computer = ComputerUseService::new_with_authority(
             Arc::new(SimulatorBackend::new()),
             host.ensure_computer_store().unwrap(),
+            host.capability_authority(),
         );
+        computer
+            .install_host_policy(host.capability_principal(session_a.id).unwrap())
+            .unwrap();
         let run_a = computer
             .create_run(
                 "create-a",
@@ -3959,11 +3970,6 @@ mod tests {
             )
             .unwrap();
 
-        let orch = computer_orch(
-            &host,
-            home.path(),
-            vec![ws_a.path().to_path_buf(), ws_b.path().to_path_buf()],
-        );
         let srv = start_control_server(orch, 0).await.unwrap();
         let fixture = ComputerFixture {
             url: format!("http://{}/mcp", srv.addr),
@@ -4274,10 +4280,23 @@ mod tests {
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
         host.session_set_cwd(session.id, ws.path()).unwrap();
+        let agent = host.ensure_session_agent(session.id).unwrap();
+        host.ensure_orchestration_store()
+            .unwrap()
+            .claim_agent_owner(&agent.agent_id, "primary")
+            .unwrap();
 
         let canon = canonical_workspace_string(ws.path()).unwrap();
+        let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
         let store = host.ensure_computer_store().unwrap();
-        let computer = ComputerUseService::new(Arc::new(SimulatorBackend::new()), store.clone());
+        let computer = ComputerUseService::new_with_authority(
+            Arc::new(SimulatorBackend::new()),
+            store.clone(),
+            host.capability_authority(),
+        );
+        computer
+            .install_host_policy(host.capability_principal(session.id).unwrap())
+            .unwrap();
         let run = computer
             .create_run(
                 "create-ring",
@@ -4298,7 +4317,6 @@ mod tests {
             })
             .unwrap();
 
-        let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
         let srv = start_control_server(orch, 0).await.unwrap();
         let fixture = ComputerFixture {
             url: format!("http://{}/mcp", srv.addr),
@@ -4374,7 +4392,13 @@ mod tests {
         host.set_project_cwd(ws.path()).unwrap();
         let session = host.session_new_kind(crate::SessionKind::Build).unwrap();
         host.session_set_cwd(session.id, ws.path()).unwrap();
+        let agent = host.ensure_session_agent(session.id).unwrap();
+        host.ensure_orchestration_store()
+            .unwrap()
+            .claim_agent_owner(&agent.agent_id, "primary")
+            .unwrap();
         let canon = canonical_workspace_string(ws.path()).unwrap();
+        let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
 
         // First lifetime: a live authorized run, then every store handle is
         // dropped, modeling a process exit. The host's lazy slot is untouched
@@ -4383,7 +4407,14 @@ mod tests {
         {
             let store =
                 ComputerStore::open(crate::discover::grokptah_home().join("computer-use")).unwrap();
-            let computer = ComputerUseService::new(Arc::new(SimulatorBackend::new()), store);
+            let computer = ComputerUseService::new_with_authority(
+                Arc::new(SimulatorBackend::new()),
+                store,
+                host.capability_authority(),
+            );
+            computer
+                .install_host_policy(host.capability_principal(session.id).unwrap())
+                .unwrap();
             let run = computer
                 .create_run(
                     "create-restart",
@@ -4415,7 +4446,6 @@ mod tests {
                 .unwrap();
         }
 
-        let orch = computer_orch(&host, home.path(), vec![ws.path().to_path_buf()]);
         let srv = start_control_server(orch, 0).await.unwrap();
         let fixture = ComputerFixture {
             url: format!("http://{}/mcp", srv.addr),

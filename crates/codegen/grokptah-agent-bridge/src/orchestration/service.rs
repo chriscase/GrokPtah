@@ -16,8 +16,8 @@ use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
 use crate::session::{SessionKind, WorkspaceStatus};
 
 use super::authz::{
-    authenticate_bearer, canonical_workspace, require_workspace_match, AuthContext, AuthCredential,
-    WorkspaceAllowlist,
+    canonical_workspace, require_workspace_match, AuthContext, AuthCredential, AuthRegistry,
+    EffectLease, WorkspaceAllowlist,
 };
 use super::managed::{
     assemble_managed_run_input, managed_execution_eligible, select_relevant_managed_messages,
@@ -91,6 +91,10 @@ pub struct OrchestrationService {
     config: Mutex<OrchestrationConfig>,
     auth_credentials: Mutex<Vec<AuthCredential>>,
     agent_owner_id: Mutex<String>,
+    /// The sole host-issued authority for this service. Every request
+    /// capability is revalidated against this registry at the effect
+    /// boundary; a cloned `AuthContext` is never trusted by itself.
+    auth_registry: Mutex<AuthRegistry>,
     self_ref: Weak<OrchestrationService>,
     pending_admissions: Mutex<AdmissionQueueState>,
     scheduler_watcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -255,6 +259,13 @@ impl OrchestrationService {
             vec![AuthCredential::new("primary", config.bearer_token.clone())
                 .expect("non-empty bearer token should form a primary credential")]
         };
+        let auth_registry = AuthRegistry::open(store.root(), &auth_credentials, "primary")
+            .unwrap_or_else(|error| AuthRegistry::unavailable(store.root(), error.to_string()));
+        // The provider/tool/Computer Use authority must consume this durable
+        // #477 context. Do not derive a replacement principal from local
+        // sessions or provider credentials.
+        let canonical_auth_context = auth_registry.primary_context(&auth_credentials).ok();
+        let capability_host = host.clone();
         let workload_supervisor =
             WorkloadSupervisor::start(store.clone(), DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL);
         let routine_supervisor =
@@ -266,6 +277,7 @@ impl OrchestrationService {
             config: Mutex::new(config),
             auth_credentials: Mutex::new(auth_credentials),
             agent_owner_id: Mutex::new("primary".into()),
+            auth_registry: Mutex::new(auth_registry),
             self_ref: self_ref.clone(),
             pending_admissions: Mutex::new(AdmissionQueueState::default()),
             scheduler_watcher: Mutex::new(None),
@@ -281,6 +293,14 @@ impl OrchestrationService {
             native_executor_watcher: Mutex::new(None),
             join_handles: Mutex::new(Vec::new()),
         });
+        if let Some(auth_context) = canonical_auth_context {
+            capability_host.install_canonical_auth_context(auth_context);
+            for session in capability_host.list_all_sessions() {
+                // A missing Agent, credential, or provider route leaves that
+                // session fail-closed. It must not trigger request-time minting.
+                let _ = capability_host.preinstall_canonical_capability_policy(session.id);
+            }
+        }
         service.start_scheduler_watcher();
         service.start_native_executor();
         service.start_manager_supervisor();
@@ -1185,7 +1205,6 @@ impl OrchestrationService {
             .list_work_items()
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         let ceiling = self.config.lock().bounds.clone();
-        let owner = self.agent_owner_id.lock().clone();
         let secret = self.config.lock().bearer_token.clone();
         for work in items {
             if work.state != WorkState::Queued {
@@ -1234,7 +1253,7 @@ impl OrchestrationService {
                 }
             };
             if let Err(error) = self
-                .admit_one_managed_work(&work, &agent, &spec, bounds, &owner, &secret)
+                .admit_one_managed_work(&work, &agent, &spec, bounds, &secret)
                 .await
             {
                 let mut status = self.native_executor.lock();
@@ -1253,7 +1272,6 @@ impl OrchestrationService {
         agent: &super::types::AgentRecord,
         spec: &super::types::AgentSpec,
         bounds: super::types::RunBounds,
-        owner_id: &str,
         secret: &str,
     ) -> Result<(), OrchError> {
         let now = Utc::now();
@@ -1327,9 +1345,19 @@ impl OrchestrationService {
         intent.attempt_id = Some(claim.attempt.attempt_id.clone());
         intent.updated_at = Utc::now();
         self.store.save_managed_intent(&intent)?;
-        let auth = AuthContext {
-            token_id: "native-executor".into(),
-            owner_id: owner_id.to_string(),
+        // Native execution is not a magic shared credential. It receives a
+        // host-issued capability derived from the current primary authority,
+        // narrowed to this exact Lane/workspace/Agent.
+        let credentials = self.auth_credentials.lock().clone();
+        let auth = {
+            let registry = self.auth_registry.lock();
+            let primary = registry.primary_context(&credentials)?;
+            registry.issue_delegation(
+                &primary,
+                work.session_id,
+                PathBuf::from(&work.workspace),
+                Some(agent.agent_id.clone()),
+            )?
         };
         let bounds_json = serde_json::to_value(&bounds)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
@@ -1437,19 +1465,33 @@ impl OrchestrationService {
         if !token.is_empty() {
             self.bus.add_control_secrets([token.clone()]);
         }
-        self.config.lock().bearer_token = token.clone();
         let credentials = if token.is_empty() {
             Vec::new()
         } else {
-            vec![AuthCredential::new("primary", token)
+            vec![AuthCredential::new("primary", token.clone())
                 .expect("non-empty bearer token should form a primary credential")]
         };
+        let owner_id = self.agent_owner_id();
+        if let Err(error) = self
+            .auth_registry
+            .lock()
+            .set_credentials(&credentials, &owner_id)
+        {
+            // Configuration changes are host mutations, but a failed durable
+            // authority write must not make an in-memory credential look
+            // authoritative.
+            self.audit_err("auth", None, None, None, &error);
+            return;
+        }
+        self.config.lock().bearer_token = token.clone();
         *self.auth_credentials.lock() = credentials;
+        self.refresh_host_capability_authority();
     }
 
     /// Install named device/client credentials while retaining the existing
     /// primary-token configuration field for compatibility with embedders.
     pub fn set_auth_credentials(&self, credentials: Vec<AuthCredential>) -> Result<(), OrchError> {
+        let previous = self.auth_credentials.lock().clone();
         if credentials.is_empty() {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
@@ -1475,8 +1517,26 @@ impl OrchestrationService {
             self.bus
                 .add_control_secrets([credential.token().to_string()]);
         }
+        let owner_id = self.agent_owner_id();
+        {
+            let mut registry = self.auth_registry.lock();
+            registry.set_credentials(&credentials, &owner_id)?;
+            // This API replaces credential material supplied by a caller.
+            // Secret rotation with continuity is exposed separately through
+            // `set_token`; changing a named credential here gets a fresh
+            // incarnation and cannot inherit old resources.
+            for credential in &credentials {
+                if previous
+                    .iter()
+                    .any(|old| old.id == credential.id && old.token() != credential.token())
+                {
+                    registry.replace_credential(&credential.id, &owner_id)?;
+                }
+            }
+        }
         self.config.lock().bearer_token = primary_token;
         *self.auth_credentials.lock() = credentials;
+        self.refresh_host_capability_authority();
         Ok(())
     }
 
@@ -1488,12 +1548,27 @@ impl OrchestrationService {
                 "Agent owner id must be between 1 and 128 bytes",
             ));
         }
+        self.auth_registry.lock().change_owner(&owner_id)?;
         *self.agent_owner_id.lock() = owner_id;
+        self.refresh_host_capability_authority();
         Ok(())
     }
 
     fn agent_owner_id(&self) -> String {
         self.agent_owner_id.lock().clone()
+    }
+
+    fn refresh_host_capability_authority(&self) {
+        self.host.invalidate_computer_agent_authority();
+        let credentials = self.auth_credentials.lock().clone();
+        let auth_context = self.auth_registry.lock().primary_context(&credentials).ok();
+        let Some(auth_context) = auth_context else {
+            return;
+        };
+        self.host.install_canonical_auth_context(auth_context);
+        for session in self.host.list_all_sessions() {
+            let _ = self.host.preinstall_canonical_capability_policy(session.id);
+        }
     }
 
     pub fn set_allowlist(&self, allowlist: WorkspaceAllowlist) {
@@ -1518,8 +1593,7 @@ impl OrchestrationService {
 
     pub fn auth_header(&self, header: Option<&str>) -> Result<AuthContext, OrchError> {
         let credentials = self.auth_credentials.lock().clone();
-        let owner_id = self.agent_owner_id();
-        let res = authenticate_bearer(header, &credentials, &owner_id);
+        let res = self.auth_registry.lock().authenticate(header, &credentials);
         if let Err(ref e) = res {
             self.audit(
                 "auth",
@@ -1532,6 +1606,46 @@ impl OrchestrationService {
             );
         }
         res
+    }
+
+    /// Revoke the current credential incarnation. This is host-only control
+    /// plane lifecycle, never a client-provided identity transition.
+    pub fn revoke_authentication(&self, credential_id: &str) -> Result<(), OrchError> {
+        self.auth_registry.lock().revoke(credential_id)?;
+        self.refresh_host_capability_authority();
+        Ok(())
+    }
+
+    /// Advance a credential's authentication generation while preserving its
+    /// principal/incarnation. Existing effect leases and resource bindings
+    /// then fail closed until the host explicitly rebinds them.
+    pub fn rotate_authentication_generation(&self, credential_id: &str) -> Result<(), OrchError> {
+        self.auth_registry.lock().rotate_generation(credential_id)?;
+        self.refresh_host_capability_authority();
+        Ok(())
+    }
+
+    pub fn mint_effect_lease(
+        &self,
+        auth: &AuthContext,
+        scope: impl Into<String>,
+    ) -> Result<EffectLease, OrchError> {
+        self.auth_registry.lock().mint_effect_lease(auth, scope)
+    }
+
+    pub fn consume_effect_lease(
+        &self,
+        auth: &AuthContext,
+        lease: &mut EffectLease,
+        scope: &str,
+    ) -> Result<(), OrchError> {
+        self.auth_registry
+            .lock()
+            .consume_effect_lease(auth, lease, scope)
+    }
+
+    fn require_current_auth(&self, auth: &AuthContext) -> Result<(), OrchError> {
+        self.auth_registry.lock().require_current(auth)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1994,7 +2108,7 @@ impl OrchestrationService {
                     && agent
                         .owner_principal_id
                         .as_deref()
-                        .is_none_or(|owner| owner == auth.owner_id)
+                        .is_none_or(|owner| owner == auth.owner_id())
             })
             .collect::<Vec<_>>();
         Ok(json!({ "agents": agents }))
@@ -2338,7 +2452,7 @@ impl OrchestrationService {
             objective.clone(),
             session_id,
             claimed.display().to_string(),
-            &auth.token_id,
+            auth.credential_id(),
             WorkPolicy::default(),
         ) {
             Ok(root) => root,
@@ -2475,7 +2589,7 @@ impl OrchestrationService {
                 ))
             }
         };
-        let created = match plan.advance(&work_items, &auth.token_id, Utc::now()) {
+        let created = match plan.advance(&work_items, auth.credential_id(), Utc::now()) {
             Ok(created) => created,
             Err(error) => {
                 return Err(self.fail_claim(
@@ -2582,7 +2696,7 @@ impl OrchestrationService {
         };
         let now = Utc::now();
         let created = if plan.state == super::manager::ManagerPlanState::Active {
-            match plan.advance(&work_items, &auth.token_id, now) {
+            match plan.advance(&work_items, auth.credential_id(), now) {
                 Ok(created) => created,
                 Err(error) => {
                     return Err(self.fail_claim(
@@ -2604,7 +2718,7 @@ impl OrchestrationService {
             let message = match self.persist_manager_notification(
                 &plan,
                 &notification,
-                &auth.token_id,
+                auth.credential_id(),
                 Utc::now(),
             ) {
                 Ok(message) => message,
@@ -2843,7 +2957,7 @@ impl OrchestrationService {
             objective,
             session_id,
             claimed.display().to_string(),
-            &auth.token_id,
+            auth.credential_id(),
             policy,
         ) {
             Ok(item) => item,
@@ -2927,7 +3041,7 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
             }
         }
-        let claimant = agent_id.unwrap_or_else(|| auth.token_id.clone());
+        let claimant = agent_id.unwrap_or_else(|| auth.credential_id().to_string());
         let claim = match self.store.claim_work_with_lease_secret(
             work_id,
             &claimant,
@@ -3445,7 +3559,7 @@ impl OrchestrationService {
         };
         let presence = match self.store.heartbeat_worker_scoped(
             agent_id,
-            &auth.token_id,
+            auth.credential_id(),
             host_kind,
             Utc::now(),
             session_id,
@@ -3527,7 +3641,7 @@ impl OrchestrationService {
         let (item, decision) = match self.store.offer_work(
             work_id,
             &actors.worker.agent_id,
-            &auth.token_id,
+            auth.credential_id(),
             manager_id.as_deref(),
             &reason,
             expected_revision,
@@ -3667,7 +3781,7 @@ impl OrchestrationService {
         let (item, decision) = match self.store.reassign_work(
             work_id,
             &actors.worker.agent_id,
-            &auth.token_id,
+            auth.credential_id(),
             manager_id.as_deref(),
             &reason,
             expected_revision,
@@ -3717,7 +3831,7 @@ impl OrchestrationService {
                     .reprioritize_work(
                         work_id,
                         priority,
-                        &auth.token_id,
+                        auth.credential_id(),
                         &reason,
                         expected_revision,
                         Utc::now(),
@@ -3750,7 +3864,7 @@ impl OrchestrationService {
                 store
                     .block_work(
                         work_id,
-                        &auth.token_id,
+                        auth.credential_id(),
                         &reason,
                         expected_revision,
                         Utc::now(),
@@ -3783,7 +3897,7 @@ impl OrchestrationService {
                 store
                     .request_work_review(
                         work_id,
-                        &auth.token_id,
+                        auth.credential_id(),
                         &reason,
                         expected_revision,
                         Utc::now(),
@@ -3854,7 +3968,7 @@ impl OrchestrationService {
         }
         let mut message = match WorkMessage::new(
             kind,
-            auth.token_id.clone(),
+            auth.credential_id().to_string(),
             from_agent_id,
             to_agent_id,
             session_id,
@@ -3936,7 +4050,7 @@ impl OrchestrationService {
         };
         let message = match self.store.ack_message_scoped(
             message_id,
-            &auth.token_id,
+            auth.credential_id(),
             Utc::now(),
             session_id,
             &claimed.display().to_string(),
@@ -4049,11 +4163,11 @@ impl OrchestrationService {
             workspace,
             work_id,
             json!({
-                "reviewerId": auth.token_id,
+                "reviewerId": auth.actor_handle(),
                 "note": note,
                 "expectedRevision": expected_revision,
             }),
-            |store| store.approve_work(work_id, &auth.token_id, note, expected_revision),
+            |store| store.approve_work(work_id, auth.credential_id(), note, expected_revision),
         )
         .await
     }
@@ -4253,7 +4367,7 @@ impl OrchestrationService {
             missed_run_policy,
             concurrency,
             retry,
-            &auth.token_id,
+            auth.credential_id(),
             now,
         ) {
             Ok(routine) => routine,
@@ -4404,7 +4518,7 @@ impl OrchestrationService {
             scheduled_at: now,
             received_at: now,
             payload,
-            created_by: auth.token_id.clone(),
+            created_by: auth.actor_handle().as_str().to_string(),
         };
         let ceiling = self.config.lock().bounds.clone();
         let activation = match self
@@ -4544,7 +4658,7 @@ impl OrchestrationService {
         let (item, decision) = match operation(
             &self.store,
             agent_id,
-            &auth.token_id,
+            auth.credential_id(),
             &reason,
             expected_revision,
             Utc::now(),
@@ -4734,7 +4848,7 @@ impl OrchestrationService {
         }
         let agent = self
             .store
-            .revise_agent_spec(agent_id, &auth.token_id, |spec| {
+            .revise_agent_spec(agent_id, auth.credential_id(), |spec| {
                 if policy.enabled && spec.authority.computer_use_allowed {
                     anyhow::bail!("managed execution cannot grant Computer Use");
                 }
@@ -4812,7 +4926,7 @@ impl OrchestrationService {
         }
         let (item, decision) = match self.store.authorize_work_execution(
             work_id,
-            &auth.token_id,
+            auth.credential_id(),
             None,
             &reason,
             expected_revision,
@@ -4930,7 +5044,20 @@ impl OrchestrationService {
         }))
     }
 
-    pub fn get_capacity(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+    pub fn get_capacity(&self, auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
+        self.auth_registry.lock().require_current(auth)?;
+        self.capacity_value()
+    }
+
+    /// Loopback health/readiness is deliberately transport-authenticated
+    /// separately from tool calls. It exposes only aggregate health and never
+    /// accepts a caller-supplied authority.
+    pub(crate) fn capacity_for_health(&self) -> Result<serde_json::Value, OrchError> {
+        self.capacity_value()
+    }
+
+    fn capacity_value(&self) -> Result<serde_json::Value, OrchError> {
         let max = self.host.orchestration_capacity_limit();
         let active = self.host.orchestration_active_count();
         let queued = self.host.orchestration_pending_count();
@@ -5585,7 +5712,7 @@ impl OrchestrationService {
         if agent
             .owner_principal_id
             .as_deref()
-            .is_some_and(|owner| owner != auth.owner_id)
+            .is_some_and(|owner| owner != auth.owner_id())
         {
             return Err(OrchError::new(
                 OrchErrorCode::ForbiddenScope,
@@ -5594,7 +5721,7 @@ impl OrchestrationService {
         }
         let agent = if claim_owner {
             self.store
-                .claim_agent_owner(&agent.agent_id, &auth.owner_id)
+                .claim_agent_owner(&agent.agent_id, auth.owner_id())
                 .map_err(|error| {
                     OrchError::new(
                         OrchErrorCode::ForbiddenScope,
@@ -6619,7 +6746,8 @@ impl OrchestrationService {
         expected_agent_spec_revision: Option<u64>,
         proposal_only: bool,
     ) -> Result<serde_json::Value, OrchError> {
-        let _ = auth;
+        self.require_current_auth(auth)?;
+        auth.require_scope(session_id, workspace, expected_agent_id)?;
         let tool = idempotency_tool;
         if proposal_only && allow_queue {
             return Err(OrchError::new(
@@ -6724,7 +6852,7 @@ impl OrchestrationService {
         }
         let agent = match self
             .store
-            .claim_agent_owner(&agent.agent_id, &auth.owner_id)
+            .claim_agent_owner(&agent.agent_id, auth.owner_id())
         {
             Ok(Some(agent)) => agent,
             Ok(None) => {
@@ -6809,13 +6937,13 @@ impl OrchestrationService {
             // Distinguish coordinator-owned work from desktop turns so the
             // desktop can surface external activity without guessing from
             // transport timing.
-            client_id: Some(if auth.token_id == "primary" {
+            client_id: Some(if auth.credential_id() == "primary" {
                 // Preserve the established wire value for the compatibility
                 // credential; newly named device credentials are emitted by
                 // their stable IDs.
                 "mcp".into()
             } else {
-                auth.token_id.clone()
+                auth.credential_id().to_string()
             }),
             state: if queued {
                 RunState::Queued
@@ -6851,6 +6979,19 @@ impl OrchestrationService {
             execution: None,
             approval: None,
         };
+        let mut effect_lease =
+            self.mint_effect_lease(auth, format!("run:{run_id}:durable-create"))?;
+        if let Err(error) = self.consume_effect_lease(
+            auth,
+            &mut effect_lease,
+            &format!("run:{run_id}:durable-create"),
+        ) {
+            if !queued {
+                self.host.release_turn_reservation(session_id, &run_id);
+                self.release_capacity(&run_id);
+            }
+            return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, error));
+        }
         let persisted = if queued {
             self.store.save_run(&run)
         } else {

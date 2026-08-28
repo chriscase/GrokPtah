@@ -21,7 +21,10 @@ use grokptah_agent_bridge::computer_use::{
     ComputerStore, ComputerTarget, ComputerUseLimits, GrantIssuer, ObservationGeometry,
     PointerButton, SemanticAction, SemanticElement, Sensitivity,
 };
-use grokptah_agent_bridge::ComputerUseService;
+use grokptah_agent_bridge::orchestration::{
+    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+};
+use grokptah_agent_bridge::{AgentHost, ComputerUseService, HostConfig, RuntimeHome, SessionKind};
 
 #[derive(Debug, Clone, Copy)]
 enum BackendMode {
@@ -169,7 +172,39 @@ fn fixture(
     let directory = tempfile::tempdir().expect("fixture directory");
     let backend = Arc::new(ReleaseGateBackend::new(mode));
     let store = ComputerStore::open(directory.path().join("computer-use")).expect("store");
-    let service = ComputerUseService::new(backend.clone(), store);
+    let runtime =
+        RuntimeHome::from_path(directory.path().join("host-runtime")).expect("host runtime");
+    let host = AgentHost::create_with_runtime_home(HostConfig::default(), runtime);
+    host.start().expect("host start");
+    let session = host
+        .session_new_kind(SessionKind::Build)
+        .expect("host session");
+    host.session_set_cwd(session.id, directory.path())
+        .expect("session workspace");
+    let agent = host
+        .ensure_session_agent(session.id)
+        .expect("canonical Agent principal");
+    host.ensure_orchestration_store()
+        .expect("orchestration store")
+        .claim_agent_owner(&agent.agent_id, "primary")
+        .expect("canonical Agent owner");
+    let _authority_service = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(directory.path().join("authority-orch")).expect("authority store"),
+        OrchestrationConfig {
+            bearer_token: "release-gate-authority".into(),
+            allowlist: WorkspaceAllowlist::new([directory.path().to_path_buf()]),
+            max_concurrent_runs: 1,
+            bounds: RunBounds::default(),
+        },
+    );
+    let principal = host.capability_principal(session.id).expect("principal");
+    let service =
+        ComputerUseService::new_with_authority(backend.clone(), store, host.capability_authority());
+    service
+        .install_host_policy(principal)
+        .expect("explicit host policy");
     let run = service
         .create_run(
             "release-gate-create",
@@ -297,7 +332,10 @@ async fn permission_revocation_fails_action_and_clears_authority() {
         )
         .await
         .expect_err("revoked permission must fail closed");
-    assert_eq!(error.code, ComputerErrorCode::PermissionRevoked);
+    // The backend was already invoked and then reported the revoked
+    // permission. That is a post-effect transport/backend outcome, so it is
+    // durable UncertainOutcome rather than a replayable ordinary denial.
+    assert_eq!(error.code, ComputerErrorCode::UncertainOutcome);
     let persisted = service.get_run(&run.run_id).unwrap().unwrap();
     assert_eq!(persisted.state, ComputerRunState::Failed);
     assert!(persisted.current_observation.is_none());

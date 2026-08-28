@@ -6,14 +6,16 @@
 
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
+use crate::capability_authority::{CapabilityAuthority, CapabilityPrincipal, CapabilitySnapshot};
 use crate::computer_use::{
     ComputerAction, ComputerObservation, ComputerUseLimits, SemanticAction, SimulatorBackend,
 };
 use crate::gateway_config::{CapabilitySource, ComputerUseTier};
-use crate::host_helpers::{call_xai_agent_step, resolve_model_target, AgentStep, AgentToolCall};
+use crate::host_helpers::{
+    call_xai_agent_step_observed_with_authority, resolve_model_target, AgentStep, AgentToolCall,
+};
 use crate::types::EffortLevel;
 
 const QUALIFICATION_TOOL: &str = "ptah_computer_qualification_action";
@@ -57,7 +59,7 @@ impl ComputerAgentProposal {
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedComputerEligibility {
     pub eligibility: ComputerAgentEligibility,
-    pub route_fingerprint: String,
+    pub capability_snapshot: CapabilitySnapshot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,27 +90,34 @@ struct ProposalArguments {
 pub(crate) fn resolve_computer_eligibility(
     credentials: &crate::auth_store::WireCredentials,
     model: &str,
+    principal: &CapabilityPrincipal,
 ) -> Result<ResolvedComputerEligibility> {
     let target = resolve_model_target(credentials, model)?;
+    let selection =
+        crate::gateway_config::parse_model_selection(model).map_err(anyhow::Error::msg)?;
     let tier = target.capabilities.effective_computer_use_tier();
     let source = match target.capabilities.computer_capability_source {
         CapabilitySource::Declared => "declared",
         CapabilitySource::Measured => "measured",
         CapabilitySource::Unknown => "unknown",
     };
-    let mut hasher = Sha256::new();
-    hasher.update(target.base_url.as_bytes());
-    hasher.update([0]);
-    hasher.update(target.wire_model.as_bytes());
-    hasher.update([0]);
-    hasher.update(format!("{:?}", target.dialect).as_bytes());
+    let capability_snapshot = CapabilitySnapshot::provider(
+        principal,
+        &selection.provider_id,
+        model,
+        &target.base_url,
+        &target.wire_model,
+        &format!("{:?}", target.dialect),
+        &credentials.qualification_identity_fingerprint(),
+        &target.capabilities,
+    )?;
     Ok(ResolvedComputerEligibility {
         eligibility: ComputerAgentEligibility {
             model: model.to_string(),
             tier,
             source: source.into(),
         },
-        route_fingerprint: format!("{:x}", hasher.finalize()),
+        capability_snapshot,
     })
 }
 
@@ -117,6 +126,8 @@ pub(crate) async fn qualify_semantic_model(
     model: &str,
     effort: EffortLevel,
     cancel: &CancellationToken,
+    authority: &CapabilityAuthority,
+    principal: &CapabilityPrincipal,
 ) -> Result<()> {
     let simulator = SimulatorBackend::new();
     let target = SimulatorBackend::demo_target();
@@ -138,7 +149,7 @@ pub(crate) async fn qualify_semantic_model(
         }),
     ];
     let first_call = one_tool_call(
-        call_xai_agent_step(
+        call_xai_agent_step_observed_with_authority(
             credentials,
             model,
             effort,
@@ -146,6 +157,9 @@ pub(crate) async fn qualify_semantic_model(
             &qualification_tools(),
             true,
             cancel,
+            None,
+            authority,
+            principal,
             |_| {},
             |_| {},
         )
@@ -187,7 +201,7 @@ pub(crate) async fn qualify_semantic_model(
         }),
     ];
     let recovery_call = one_tool_call(
-        call_xai_agent_step(
+        call_xai_agent_step_observed_with_authority(
             credentials,
             model,
             effort,
@@ -195,6 +209,9 @@ pub(crate) async fn qualify_semantic_model(
             &qualification_tools(),
             true,
             cancel,
+            None,
+            authority,
+            principal,
             |_| {},
             |_| {},
         )
@@ -208,6 +225,7 @@ pub(crate) async fn qualify_semantic_model(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn propose_semantic_action(
     credentials: &crate::auth_store::WireCredentials,
     model: &str,
@@ -215,6 +233,8 @@ pub(crate) async fn propose_semantic_action(
     objective: &str,
     observation: &ComputerObservation,
     cancel: &CancellationToken,
+    authority: &CapabilityAuthority,
+    principal: &CapabilityPrincipal,
 ) -> Result<ComputerAgentProposal> {
     validate_objective(objective)?;
     observation.validate(&ComputerUseLimits::ceiling())?;
@@ -230,7 +250,7 @@ pub(crate) async fn propose_semantic_action(
         }),
     ];
     let call = one_tool_call(
-        call_xai_agent_step(
+        call_xai_agent_step_observed_with_authority(
             credentials,
             model,
             effort,
@@ -238,6 +258,9 @@ pub(crate) async fn propose_semantic_action(
             &proposal_tools(),
             true,
             cancel,
+            None,
+            authority,
+            principal,
             |_| {},
             |_| {},
         )

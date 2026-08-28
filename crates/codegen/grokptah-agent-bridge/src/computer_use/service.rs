@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::json;
@@ -18,20 +18,183 @@ use super::types::{
     ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerObservation,
     ComputerResult, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
 };
+use crate::capability_authority::{
+    CapabilityAuthority, CapabilityPrincipal, CapabilitySnapshot, ConsumedEffect, EffectLease,
+    HostCapability,
+};
+use parking_lot::Mutex;
+
+const SERVICE_ENVELOPE_ID: &str = "computer-service-envelope-v1";
+const RUN_ENVELOPE_PREFIX: &str = "computer-run-envelope:";
+const SETTLEMENT_ENVELOPE_PREFIX: &str = "computer-settlement-envelope:";
+
+const RUN_OPERATIONS: &[&str] = &[
+    "authorize",
+    "observe",
+    "act",
+    "pause",
+    "take_over",
+    "cancel",
+    "complete",
+    "settle_observation",
+    "settle_action",
+    "record_denial",
+];
+const SETTLEMENT_OPERATIONS: &[&str] = &["settle_observation", "settle_action", "record_denial"];
 
 pub struct ComputerUseService {
     backend: Arc<dyn ComputerBackend>,
     store: ComputerStore,
     policy: ComputerPolicy,
+    capability_authority: Arc<CapabilityAuthority>,
+    principal: Mutex<Option<CapabilityPrincipal>>,
+    service_capability: Mutex<Option<RunCapability>>,
+    action_capability: Mutex<Option<RunCapability>>,
+    run_capabilities: Mutex<std::collections::HashMap<String, RunCapability>>,
+    execution_receipts: Mutex<std::collections::HashMap<String, HostExecutionReceipt>>,
+}
+
+#[derive(Debug, Clone)]
+struct RunCapability {
+    envelope_id: String,
+    settlement_envelope_id: String,
+    snapshot: CapabilitySnapshot,
+    capability: HostCapability,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct HostExecutionReceipt {
+    run_id: String,
+    observation_id: String,
+    action_digest: String,
+    effect: ConsumedEffect,
+    outcome: ActionOutcome,
 }
 
 impl ComputerUseService {
     pub fn new(backend: Arc<dyn ComputerBackend>, store: ComputerStore) -> Self {
+        // Legacy construction is deliberately inert. Only an explicit,
+        // host-installed opaque principal policy can enable effects.
+        Self::new_with_authority(backend, store, Arc::new(CapabilityAuthority::new(false)))
+    }
+
+    /// Construct a Computer Use service sharing the host's one authority.
+    /// The authority remains opaque and process-owned; this constructor does
+    /// not accept a caller-provided capability or generation.
+    pub fn new_with_authority(
+        backend: Arc<dyn ComputerBackend>,
+        store: ComputerStore,
+        capability_authority: Arc<CapabilityAuthority>,
+    ) -> Self {
         Self {
             backend,
             store,
             policy: ComputerPolicy,
+            capability_authority,
+            principal: Mutex::new(None),
+            service_capability: Mutex::new(None),
+            action_capability: Mutex::new(None),
+            run_capabilities: Mutex::new(std::collections::HashMap::new()),
+            execution_receipts: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Construct a service bound to the canonical host principal seam.
+    pub fn new_with_authority_and_principal(
+        backend: Arc<dyn ComputerBackend>,
+        store: ComputerStore,
+        capability_authority: Arc<CapabilityAuthority>,
+        principal: CapabilityPrincipal,
+    ) -> Self {
+        let service = Self::new_with_authority(backend, store, capability_authority);
+        *service.principal.lock() = Some(principal);
+        service
+    }
+
+    /// Install a trusted, canonical host policy. This is the only path that
+    /// issues the service/action generations and must run after the caller has
+    /// authenticated the opaque principal through the host seam.
+    pub fn install_host_policy(&self, principal: CapabilityPrincipal) -> ComputerResult<()> {
+        {
+            let installed = self.principal.lock();
+            if installed
+                .as_ref()
+                .is_some_and(|current| current != &principal)
+            {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "canonical Computer Use principal changed",
+                ));
+            }
+        }
+        let service_policy_generation =
+            format!("{}:computer-service", principal.policy_generation());
+        let action_policy_generation = format!("{}:computer-action", principal.policy_generation());
+        let service_snapshot = CapabilitySnapshot::computer_use_service(
+            &principal,
+            &self.backend.capabilities(),
+            &service_policy_generation,
+        )
+        .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error.to_string()))?;
+        let action_snapshot = CapabilitySnapshot::computer_use_service(
+            &principal,
+            &self.backend.capabilities(),
+            &action_policy_generation,
+        )
+        .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error.to_string()))?;
+        let service_capability = self
+            .capability_authority
+            .issue(
+                &service_snapshot,
+                Utc::now(),
+                crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+            )
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string())
+            })?;
+        self.capability_authority
+            .install_envelope(
+                SERVICE_ENVELOPE_ID,
+                service_capability.clone(),
+                service_snapshot.clone(),
+                principal.id(),
+                principal.auth_generation(),
+                &service_policy_generation,
+                RUN_OPERATIONS
+                    .iter()
+                    .copied()
+                    .chain(["create_run", "settle_receipt"]),
+                "computer-host",
+                Utc::now(),
+            )
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string())
+            })?;
+        let action_capability = self
+            .capability_authority
+            .issue(
+                &action_snapshot,
+                Utc::now(),
+                crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+            )
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string())
+            })?;
+        *self.principal.lock() = Some(principal);
+        *self.service_capability.lock() = Some(RunCapability {
+            envelope_id: SERVICE_ENVELOPE_ID.into(),
+            settlement_envelope_id: SERVICE_ENVELOPE_ID.into(),
+            snapshot: service_snapshot,
+            capability: service_capability,
+        });
+        *self.action_capability.lock() = Some(RunCapability {
+            envelope_id: String::new(),
+            settlement_envelope_id: String::new(),
+            snapshot: action_snapshot,
+            capability: action_capability,
+        });
+        Ok(())
     }
 
     pub fn capabilities(&self) -> super::types::ComputerCapabilities {
@@ -130,6 +293,8 @@ impl ComputerUseService {
         validate_id("run_id", run_id)?;
         validate_id("asset_id", asset_id)?;
         let run = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
+        let capability = self.require_run_capability(&run)?;
+        let lease = self.effect_lease(&capability, &run, "computer.capture")?;
         let evidence = run
             .current_observation
             .as_ref()
@@ -140,6 +305,11 @@ impl ComputerUseService {
                     ComputerErrorCode::Unauthorized,
                     "evidence is not attached to the current observation",
                 )
+            })?;
+        self.capability_authority
+            .consume(lease, &capability.snapshot, Utc::now())
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::PermissionRevoked, error.to_string())
             })?;
         let bytes = self
             .backend
@@ -184,8 +354,13 @@ impl ComputerUseService {
         let result = (|| {
             self.store.can_create_run()?;
             let mut run = ComputerRun::new(owner_session_id, workspace, target, limits)?;
+            let capability = self.bind_run_capability(&run)?;
+            self.consume_durable_lease("create_run", &payload)?;
             run.record_audit("create_run", "accepted", None, None, None);
             self.store.save_run(&run)?;
+            self.run_capabilities
+                .lock()
+                .insert(run.run_id.clone(), capability);
             Ok(run)
         })();
         self.finish_mutation(request_id, &result)?;
@@ -213,6 +388,8 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
+                let _capability = self.ensure_run_capability(run)?;
+                self.consume_durable_lease("authorize", &payload)?;
                 if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
                     return Err(ComputerError::new(
                         ComputerErrorCode::InvalidState,
@@ -257,12 +434,14 @@ impl ComputerUseService {
                     let error = run_limit_error();
                     run.last_error = Some(error.clone());
                     run.transition(ComputerRunState::LimitReached)?;
-                    revoke_authority(run);
+                    self.revoke_authority(run);
                     run.record_audit("observe", "limit_reached", None, None, Some(error.code));
                     budget_error = Some(error);
                     return Ok(());
                 }
                 self.policy.authorize_observation(run, now)?;
+                let _capability = self.require_run_capability(run)?;
+                self.consume_durable_lease("observe", &payload)?;
                 run.transition(ComputerRunState::Observing)?;
                 run.record_audit("observe", "started", None, None, None);
                 Ok(())
@@ -277,10 +456,31 @@ impl ComputerUseService {
                 // use the ID to bind its element handles, but may not choose an
                 // identifier that could carry observed document content.
                 let observation_id = format!("observation-{}", Uuid::new_v4());
-                let observed = self
-                    .backend
-                    .observe(run_id, &observation_id, &prepared.target, &prepared.limits)
-                    .await;
+                let capability = self.require_run_capability(&prepared)?;
+                let lease = self.effect_lease(&capability, &prepared, "computer.capture")?;
+                let observed =
+                    match self
+                        .capability_authority
+                        .consume(lease, &capability.snapshot, Utc::now())
+                    {
+                        // The lease is consumed immediately before the backend
+                        // capture. No async wait may occur between this check and
+                        // the effect boundary.
+                        Ok(_) => {
+                            self.backend
+                                .observe(
+                                    run_id,
+                                    &observation_id,
+                                    &prepared.target,
+                                    &prepared.limits,
+                                )
+                                .await
+                        }
+                        Err(error) => Err(ComputerError::new(
+                            ComputerErrorCode::PermissionRevoked,
+                            error.to_string(),
+                        )),
+                    };
                 match observed {
                     Ok(observation) => {
                         let validated = if observation.observation_id != observation_id {
@@ -353,7 +553,7 @@ impl ComputerUseService {
                     let error = run_limit_error();
                     run.last_error = Some(error.clone());
                     run.transition(ComputerRunState::LimitReached)?;
-                    revoke_authority(run);
+                    self.revoke_authority(run);
                     run.record_audit(
                         "act",
                         "limit_reached",
@@ -384,6 +584,8 @@ impl ComputerUseService {
                         "the backend does not support this action class",
                     ));
                 }
+                let _capability = self.require_run_capability(run)?;
+                self.consume_durable_lease("act", &payload)?;
                 run.transition(ComputerRunState::Acting)?;
                 run.record_audit(
                     "act",
@@ -404,14 +606,60 @@ impl ComputerUseService {
                     .clone()
                     .expect("prepared action has an observation");
                 let control_epoch = prepared.control_epoch;
-                let outcome = self.backend.act(run_id, &observation, &action).await;
-                match outcome {
-                    Ok(outcome) => {
-                        self.commit_action(run_id, &action, &observation, control_epoch, outcome)
-                    }
+                let capability = match self.require_run_capability(&prepared) {
+                    Ok(capability) => capability,
                     Err(error) => {
                         self.fail_inflight(run_id, "act", &error)?;
-                        Err(error)
+                        self.finish_mutation::<ActionOutcome>(request_id, &Err(error.clone()))?;
+                        return Err(error);
+                    }
+                };
+                let lease = match self.effect_lease(&capability, &prepared, "computer.input") {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        self.fail_inflight(run_id, "act", &error)?;
+                        self.finish_mutation::<ActionOutcome>(request_id, &Err(error.clone()))?;
+                        return Err(error);
+                    }
+                };
+                let effect =
+                    match self
+                        .capability_authority
+                        .consume(lease, &capability.snapshot, Utc::now())
+                    {
+                        Ok(effect) => effect,
+                        Err(error) => {
+                            self.fail_inflight(
+                                run_id,
+                                "act",
+                                &ComputerError::new(
+                                    ComputerErrorCode::PermissionRevoked,
+                                    error.to_string(),
+                                ),
+                            )?;
+                            return Err(ComputerError::new(
+                                ComputerErrorCode::PermissionRevoked,
+                                error.to_string(),
+                            ));
+                        }
+                    };
+                let outcome = self.backend.act(run_id, &observation, &action).await;
+                match outcome {
+                    Ok(outcome) => self.commit_action(
+                        run_id,
+                        &action,
+                        &observation,
+                        control_epoch,
+                        effect,
+                        outcome,
+                    ),
+                    Err(_error) => {
+                        let uncertain = ComputerError::new(
+                            ComputerErrorCode::UncertainOutcome,
+                            "Computer input may have reached the backend; outcome is uncertain and will not be retried automatically",
+                        );
+                        self.fail_inflight(run_id, "act", &uncertain)?;
+                        Err(uncertain)
                     }
                 }
             }
@@ -420,7 +668,11 @@ impl ComputerUseService {
                 Err(error)
             }
         };
-        self.finish_mutation(request_id, &result)?;
+        if let Err(finish_error) = self.finish_mutation(request_id, &result) {
+            if result.is_ok() {
+                return Err(finish_error);
+            }
+        }
         result
     }
 
@@ -439,6 +691,7 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
+                self.consume_durable_lease("pause", &payload)?;
                 if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
                     return Err(ComputerError::new(
                         ComputerErrorCode::InvalidState,
@@ -453,7 +706,18 @@ impl ComputerUseService {
             })
             .and_then(|run| run.ok_or_else(unknown_run));
         let result = match paused {
-            Ok(run) => self.backend.cancel(run_id).await.map(|()| run),
+            Ok(run) => {
+                let capability = self.require_run_capability(&run)?;
+                let lease = self.effect_lease(&capability, &run, "computer.cancel")?;
+                self.capability_authority
+                    .consume(lease, &capability.snapshot, Utc::now())
+                    .map_err(|error| {
+                        ComputerError::new(ComputerErrorCode::PermissionRevoked, error.to_string())
+                    })?;
+                let result = self.backend.cancel(run_id).await;
+                self.revoke_action_capability(run_id);
+                result.map(|()| run)
+            }
             Err(error) => {
                 self.record_denial(run_id, "pause", None, &error);
                 Err(error)
@@ -481,6 +745,7 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
+                self.consume_durable_lease("take_over", &payload)?;
                 run.transition(ComputerRunState::Paused)?;
                 revoke_authority(run);
                 run.set_control_disposition(ComputerControlDisposition::OperatorTakeover);
@@ -489,7 +754,18 @@ impl ComputerUseService {
             })
             .and_then(|run| run.ok_or_else(unknown_run));
         let result = match taken_over {
-            Ok(run) => self.backend.cancel(run_id).await.map(|()| run),
+            Ok(run) => {
+                let capability = self.require_run_capability(&run)?;
+                let lease = self.effect_lease(&capability, &run, "computer.cancel")?;
+                self.capability_authority
+                    .consume(lease, &capability.snapshot, Utc::now())
+                    .map_err(|error| {
+                        ComputerError::new(ComputerErrorCode::PermissionRevoked, error.to_string())
+                    })?;
+                let result = self.backend.cancel(run_id).await;
+                self.revoke_action_capability(run_id);
+                result.map(|()| run)
+            }
             Err(error) => {
                 self.record_denial(run_id, "take_over", None, &error);
                 Err(error)
@@ -508,6 +784,7 @@ impl ComputerUseService {
         let cancelled = self
             .store
             .update_run(run_id, |run| {
+                self.consume_durable_lease("cancel", &payload)?;
                 if !run.state.is_terminal() {
                     run.transition(ComputerRunState::Cancelled)?;
                     revoke_authority(run);
@@ -518,7 +795,25 @@ impl ComputerUseService {
             })
             .and_then(|run| run.ok_or_else(unknown_run));
         let result = match cancelled {
-            Ok(run) => self.backend.cancel(run_id).await.map(|()| run),
+            Ok(run) => {
+                if run.state.is_terminal() && !self.run_capabilities.lock().contains_key(run_id) {
+                    Ok(run)
+                } else {
+                    let capability = self.require_run_capability(&run)?;
+                    let lease = self.effect_lease(&capability, &run, "computer.cancel")?;
+                    self.capability_authority
+                        .consume(lease, &capability.snapshot, Utc::now())
+                        .map_err(|error| {
+                            ComputerError::new(
+                                ComputerErrorCode::PermissionRevoked,
+                                error.to_string(),
+                            )
+                        })?;
+                    let result = self.backend.cancel(run_id).await;
+                    self.revoke_action_capability(run_id);
+                    result.map(|()| run)
+                }
+            }
             Err(error) => {
                 self.record_denial(run_id, "cancel", None, &error);
                 Err(error)
@@ -528,14 +823,39 @@ impl ComputerUseService {
         result
     }
 
-    pub fn complete(
+    #[allow(dead_code)]
+    pub(crate) fn complete_from_execution_receipt(
         &self,
         request_id: &str,
         run_id: &str,
         expected_version: u64,
     ) -> ComputerResult<ComputerRun> {
         validate_id("run_id", run_id)?;
-        let payload = json!({ "runId": run_id, "expectedVersion": expected_version });
+        let receipt = self
+            .execution_receipts
+            .lock()
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "completion requires a host-authenticated execution receipt",
+                )
+            })?;
+        if receipt.run_id != run_id || receipt.outcome.expected_postcondition_met != Some(true) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "execution receipt does not authorize completion",
+            ));
+        }
+        let payload = json!({
+            "runId": run_id,
+            "expectedVersion": expected_version,
+            "observationId": receipt.observation_id,
+            "actionDigest": receipt.action_digest,
+            "effectLeaseId": receipt.effect.lease_id,
+            "effectGeneration": receipt.effect.generation,
+        });
         if let Some(replayed) = self.begin_mutation(request_id, "complete", &payload)? {
             return replayed;
         }
@@ -543,8 +863,9 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
+                self.consume_durable_lease("complete", &payload)?;
                 run.transition(ComputerRunState::Completed)?;
-                revoke_authority(run);
+                self.revoke_authority(run);
                 run.record_audit("complete", "completed", None, None, None);
                 Ok(())
             })
@@ -553,6 +874,9 @@ impl ComputerUseService {
             self.record_denial(run_id, "complete", None, error);
         }
         self.finish_mutation(request_id, &result)?;
+        if result.is_ok() {
+            self.execution_receipts.lock().remove(run_id);
+        }
         result
     }
 
@@ -566,6 +890,14 @@ impl ComputerUseService {
             .as_ref()
             .map_or(0, |evidence| evidence.byte_len);
         let mut limit_error = None;
+        self.consume_durable_lease(
+            "settle_observation",
+            &json!({
+                "runId": run_id,
+                "observationId": observation.observation_id.clone(),
+                "sequence": observation.sequence,
+            }),
+        )?;
         self.store
             .update_run(run_id, |run| {
                 if run.state != ComputerRunState::Observing {
@@ -598,7 +930,7 @@ impl ComputerUseService {
                     );
                     run.last_error = Some(error.clone());
                     run.transition(ComputerRunState::LimitReached)?;
-                    revoke_authority(run);
+                    self.revoke_authority(run);
                     run.record_audit("observe", "limit_reached", None, None, Some(error.code));
                     limit_error = Some(error);
                     return Ok(());
@@ -629,9 +961,30 @@ impl ComputerUseService {
         action: &ComputerAction,
         observation: &ComputerObservation,
         control_epoch: u64,
+        effect: ConsumedEffect,
         outcome: ActionOutcome,
     ) -> ComputerResult<ActionOutcome> {
         let mut uncertain_error = None;
+        let action_digest =
+            crate::orchestration::hash_payload(&serde_json::to_value(action).map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Internal, error.to_string())
+            })?);
+        let receipt = HostExecutionReceipt {
+            run_id: run_id.to_string(),
+            observation_id: observation.observation_id.clone(),
+            action_digest,
+            effect,
+            outcome: outcome.clone(),
+        };
+        self.consume_durable_lease(
+            "settle_action",
+            &json!({
+                "runId": run_id,
+                "observationId": observation.observation_id,
+                "action": action,
+                "controlEpoch": control_epoch,
+            }),
+        )?;
         self.store
             .update_run(run_id, |run| {
                 if run.state != ComputerRunState::Acting || run.control_epoch != control_epoch {
@@ -665,10 +1018,10 @@ impl ComputerUseService {
                     .is_some_and(|grant| grant.uses_remaining == Some(0));
                 if run.action_count >= run.limits.max_actions {
                     run.transition(ComputerRunState::LimitReached)?;
-                    revoke_authority(run);
+                    self.revoke_authority(run);
                 } else if grant_exhausted {
                     run.transition(ComputerRunState::Paused)?;
-                    revoke_authority(run);
+                    self.revoke_authority(run);
                     run.set_control_disposition(ComputerControlDisposition::Paused);
                 } else {
                     run.transition(ComputerRunState::Ready)?;
@@ -686,6 +1039,9 @@ impl ComputerUseService {
         if let Some(error) = uncertain_error {
             return Err(error);
         }
+        self.execution_receipts
+            .lock()
+            .insert(run_id.to_string(), receipt);
         Ok(outcome)
     }
 
@@ -702,7 +1058,7 @@ impl ComputerUseService {
             ) {
                 run.last_error = Some(error.clone());
                 run.transition(ComputerRunState::Failed)?;
-                revoke_authority(run);
+                self.revoke_authority(run);
                 if error.code == ComputerErrorCode::UncertainOutcome {
                     run.set_control_disposition(ComputerControlDisposition::UncertainOutcome);
                 }
@@ -721,6 +1077,274 @@ impl ComputerUseService {
         Ok(())
     }
 
+    fn snapshot_for_run(&self, run: &ComputerRun) -> ComputerResult<CapabilitySnapshot> {
+        let _ = run;
+        self.action_capability
+            .lock()
+            .as_ref()
+            .map(|binding| binding.snapshot.clone())
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "canonical computer capability envelope is unavailable",
+                )
+            })
+    }
+
+    fn bind_run_capability(&self, run: &ComputerRun) -> ComputerResult<RunCapability> {
+        let principal = self.principal.lock().clone().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "canonical Computer Use principal is unavailable",
+            )
+        })?;
+        let action_policy_generation = format!("{}:computer-action", principal.policy_generation());
+        let action_guard = self.action_capability.lock();
+        let action = action_guard.as_ref().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "canonical computer capability envelope is unavailable",
+            )
+        })?;
+        let envelope_id = format!("{RUN_ENVELOPE_PREFIX}{}", run.run_id);
+        let settlement_envelope_id = format!("{SETTLEMENT_ENVELOPE_PREFIX}{}", run.run_id);
+        self.capability_authority
+            .install_envelope(
+                &envelope_id,
+                action.capability.clone(),
+                action.snapshot.clone(),
+                principal.id(),
+                principal.auth_generation(),
+                &action_policy_generation,
+                RUN_OPERATIONS.iter().copied(),
+                &run.run_id,
+                Utc::now(),
+            )
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string())
+            })?;
+        self.capability_authority
+            .install_envelope(
+                &settlement_envelope_id,
+                action.capability.clone(),
+                action.snapshot.clone(),
+                principal.id(),
+                principal.auth_generation(),
+                &action_policy_generation,
+                SETTLEMENT_OPERATIONS.iter().copied(),
+                &run.run_id,
+                Utc::now(),
+            )
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string())
+            })?;
+        Ok(RunCapability {
+            envelope_id,
+            settlement_envelope_id,
+            snapshot: action.snapshot.clone(),
+            capability: action.capability.clone(),
+        })
+    }
+
+    fn require_run_capability(&self, run: &ComputerRun) -> ComputerResult<RunCapability> {
+        let capability = self
+            .run_capabilities
+            .lock()
+            .get(&run.run_id)
+            .cloned()
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "computer capability is unavailable; explicit reauthorization is required",
+                )
+            })?;
+        let current = self.snapshot_for_run(run)?;
+        self.capability_authority
+            .revalidate_envelope(
+                &capability.envelope_id,
+                &capability.capability,
+                &current,
+                Utc::now(),
+            )
+            .map_err(|error| {
+                ComputerError::new(
+                    ComputerErrorCode::PermissionRevoked,
+                    format!("computer capability is stale or revoked: {error}"),
+                )
+            })?;
+        Ok(capability)
+    }
+
+    fn ensure_run_capability(&self, run: &ComputerRun) -> ComputerResult<RunCapability> {
+        match self.require_run_capability(run) {
+            Ok(capability) => Ok(capability),
+            Err(error)
+                if matches!(
+                    error.code,
+                    ComputerErrorCode::Unauthorized | ComputerErrorCode::PermissionRevoked
+                ) =>
+            {
+                let binding = self.bind_run_capability(run)?;
+                self.run_capabilities
+                    .lock()
+                    .insert(run.run_id.clone(), binding.clone());
+                Ok(binding)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn revoke_run_capability(&self, run_id: &str) {
+        if let Some(binding) = self.run_capabilities.lock().remove(run_id) {
+            let _ = self
+                .capability_authority
+                .remove_derived_envelope(&binding.envelope_id);
+            let _ = self
+                .capability_authority
+                .remove_derived_envelope(&binding.settlement_envelope_id);
+        }
+    }
+
+    fn revoke_action_capability(&self, run_id: &str) {
+        if let Some(binding) = self.run_capabilities.lock().get(run_id).cloned() {
+            let _ = self
+                .capability_authority
+                .remove_derived_envelope(&binding.envelope_id);
+        }
+    }
+
+    fn revoke_authority(&self, run: &mut ComputerRun) {
+        self.revoke_run_capability(&run.run_id);
+        revoke_authority(run);
+    }
+
+    fn effect_lease(
+        &self,
+        capability: &RunCapability,
+        run: &ComputerRun,
+        effect_scope: &str,
+    ) -> ComputerResult<EffectLease> {
+        let current = self.snapshot_for_run(run)?;
+        if current != capability.snapshot {
+            return Err(ComputerError::new(
+                ComputerErrorCode::PermissionRevoked,
+                "computer capability snapshot changed before effect",
+            ));
+        }
+        let operation = match effect_scope {
+            "computer.capture" => "observe",
+            "computer.input" => "act",
+            "computer.cancel" => "cancel",
+            _ => "act",
+        };
+        self.capability_authority
+            .lease_from_envelope(
+                &capability.envelope_id,
+                operation,
+                &run.run_id,
+                effect_scope,
+                Utc::now(),
+                Duration::seconds(5),
+            )
+            .map_err(|error| {
+                ComputerError::new(
+                    ComputerErrorCode::PermissionRevoked,
+                    format!("computer effect lease denied: {error}"),
+                )
+            })
+    }
+
+    fn consume_durable_claim(&self, operation: &str) -> ComputerResult<()> {
+        let snapshot = self
+            .service_capability
+            .lock()
+            .as_ref()
+            .map(|binding| binding.snapshot.clone())
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "canonical durable capability envelope is unavailable",
+                )
+            })?;
+        let lease = self
+            .capability_authority
+            .lease_from_envelope(
+                SERVICE_ENVELOPE_ID,
+                operation,
+                "computer-host",
+                &format!("durable.claim.{operation}"),
+                Utc::now(),
+                Duration::seconds(5),
+            )
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string())
+            })?;
+        self.capability_authority
+            .consume(lease, &snapshot, Utc::now())
+            .map(|_| ())
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::PermissionRevoked, error.to_string())
+            })
+    }
+
+    fn consume_durable_lease(
+        &self,
+        operation: &str,
+        payload: &serde_json::Value,
+    ) -> ComputerResult<()> {
+        let run_id = payload
+            .get("runId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let envelope_id = match run_id.as_deref() {
+            Some(run_id)
+                if matches!(
+                    operation,
+                    "settle_observation" | "settle_action" | "record_denial"
+                ) =>
+            {
+                format!("{SETTLEMENT_ENVELOPE_PREFIX}{run_id}")
+            }
+            Some(run_id) => format!("{RUN_ENVELOPE_PREFIX}{run_id}"),
+            None => SERVICE_ENVELOPE_ID.into(),
+        };
+        let resource = run_id.as_deref().unwrap_or("computer-host");
+        let service_binding = self.service_capability.lock();
+        let action_binding = self.action_capability.lock();
+        let binding = if envelope_id == SERVICE_ENVELOPE_ID {
+            service_binding.as_ref()
+        } else {
+            action_binding.as_ref()
+        };
+        let snapshot = binding
+            .map(|binding| binding.snapshot.clone())
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "canonical durable capability envelope is unavailable",
+                )
+            })?;
+        let lease = self
+            .capability_authority
+            .lease_from_envelope(
+                &envelope_id,
+                operation,
+                resource,
+                &format!("durable.{operation}"),
+                Utc::now(),
+                Duration::seconds(5),
+            )
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string())
+            })?;
+        self.capability_authority
+            .consume(lease, &snapshot, Utc::now())
+            .map(|_| ())
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::PermissionRevoked, error.to_string())
+            })
+    }
+
     fn record_denial(
         &self,
         run_id: &str,
@@ -728,6 +1352,20 @@ impl ComputerUseService {
         action_class: Option<super::types::ActionClass>,
         error: &ComputerError,
     ) {
+        if self
+            .consume_durable_lease(
+                "record_denial",
+                &json!({
+                    "runId": run_id,
+                    "operation": operation,
+                    "actionClass": action_class,
+                    "errorCode": error.code,
+                }),
+            )
+            .is_err()
+        {
+            return;
+        }
         let _ = self.store.update_run(run_id, |run| {
             run.updated_at = Utc::now();
             run.record_audit(operation, "denied", action_class, None, Some(error.code));
@@ -741,6 +1379,9 @@ impl ComputerUseService {
         operation: &str,
         payload: &serde_json::Value,
     ) -> ComputerResult<Option<ComputerResult<T>>> {
+        // Claiming the durable receipt is itself an effect. It has its own
+        // bounded host lease rather than relying on admission alone.
+        self.consume_durable_claim(operation)?;
         let hash = crate::orchestration::hash_payload(payload);
         match self.store.claim_mutation(request_id, operation, &hash)? {
             MutationClaim::Perform => Ok(None),
@@ -766,6 +1407,17 @@ impl ComputerUseService {
         request_id: &str,
         result: &ComputerResult<T>,
     ) -> ComputerResult<()> {
+        let result_kind = match result {
+            Ok(_) => "success".to_string(),
+            Err(error) => format!("{:?}", error.code),
+        };
+        self.consume_durable_lease(
+            "settle_receipt",
+            &json!({
+                "requestId": request_id,
+                "result": result_kind,
+            }),
+        )?;
         let encoded = match result {
             Ok(value) => serde_json::to_value(value).map_err(|error| {
                 ComputerError::new(ComputerErrorCode::Internal, error.to_string())
@@ -837,6 +1489,7 @@ mod tests {
         action_entered: Notify,
         release_action: Notify,
         action_calls: AtomicUsize,
+        action_release_requested: std::sync::atomic::AtomicBool,
     }
 
     #[derive(Debug)]
@@ -939,11 +1592,24 @@ mod tests {
         ) -> ComputerResult<ActionOutcome> {
             self.action_calls.fetch_add(1, Ordering::SeqCst);
             self.action_entered.notify_one();
-            self.release_action.notified().await;
-            self.inner.act(run_id, observation, action).await
+            loop {
+                if self
+                    .action_release_requested
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    break;
+                }
+                tokio::select! {
+                    _ = self.release_action.notified() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+                }
+            }
+            let result = self.inner.act(run_id, observation, action).await;
+            result
         }
 
         async fn cancel(&self, run_id: &str) -> ComputerResult<()> {
+            self.action_release_requested.store(true, Ordering::SeqCst);
             self.release_action.notify_waiters();
             self.inner.cancel(run_id).await
         }
@@ -987,11 +1653,63 @@ mod tests {
     fn service() -> (Arc<SimulatorBackend>, ComputerUseService) {
         let dir = tempdir().unwrap().keep();
         let backend = Arc::new(SimulatorBackend::new());
-        let service = ComputerUseService::new(
+        let service = new_test_service(
             backend.clone(),
             ComputerStore::open(dir.join("computer-use")).unwrap(),
         );
+        install_test_policy(&service);
         (backend, service)
+    }
+
+    fn new_test_service(
+        backend: Arc<dyn ComputerBackend>,
+        store: ComputerStore,
+    ) -> ComputerUseService {
+        ComputerUseService::new_with_authority(
+            backend,
+            store,
+            Arc::new(CapabilityAuthority::new(true)),
+        )
+    }
+
+    fn install_test_policy(service: &ComputerUseService) {
+        service
+            .install_host_policy(
+                CapabilityPrincipal::new("test-agent".into(), 7, "test-policy".into()).unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn service_construction_without_host_policy_denies_local_user() {
+        let dir = tempdir().unwrap();
+        let service = ComputerUseService::new(
+            Arc::new(SimulatorBackend::new()),
+            ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+        );
+        let error = service
+            .create_run(
+                "create-without-policy",
+                Uuid::new_v4(),
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::Unauthorized);
+    }
+
+    #[test]
+    fn durable_lease_source_has_no_request_derived_issuance() {
+        let source = include_str!("service.rs");
+        let body = source
+            .split("fn consume_durable_lease")
+            .nth(1)
+            .and_then(|body| body.split("fn record_denial").next())
+            .expect("durable lease implementation");
+        assert!(body.contains("lease_from_envelope"));
+        assert!(!body.contains(".issue("));
+        assert!(!body.contains("CapabilitySnapshot::durable"));
     }
 
     fn grant(run: &ComputerRun) -> ActionGrant {
@@ -1009,13 +1727,170 @@ mod tests {
         }
     }
 
+    #[test]
+    fn arbitrary_durable_request_data_cannot_issue_authority() {
+        let (_backend, service) = service();
+        let before = service.capability_authority.generation_count_for_test();
+        let error = service
+            .consume_durable_lease("arbitrary_operation", &json!({"untrusted": "payload"}))
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::Unauthorized);
+        assert_eq!(
+            service.capability_authority.generation_count_for_test(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn revoking_the_run_generation_denies_before_backend_input() {
+        let (backend, service) = service();
+        let owner = Uuid::new_v4();
+        let run = service
+            .create_run(
+                "create-generation-revoke",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize(
+                "grant-generation-revoke",
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
+            .unwrap();
+        let observation = service
+            .observe("observe-generation-revoke", &run.run_id, run.version)
+            .await
+            .unwrap();
+        let current = service.get_run(&run.run_id).unwrap().unwrap();
+        let binding = service
+            .run_capabilities
+            .lock()
+            .get(&run.run_id)
+            .cloned()
+            .unwrap();
+        service
+            .capability_authority
+            .revoke(&binding.snapshot)
+            .unwrap();
+
+        let error = service
+            .act(
+                "act-generation-revoke",
+                &run.run_id,
+                current.version,
+                &observation.observation_id,
+                ComputerAction::SetValue {
+                    element_id: format!("{}-name", observation.observation_id),
+                    text: "Ada".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::PermissionRevoked);
+        assert!(!backend.submitted());
+        assert_eq!(
+            service.get_run(&run.run_id).unwrap().unwrap().action_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_host_execution_receipt_can_settle_completion() {
+        let (_backend, service) = service();
+        let owner = Uuid::new_v4();
+        let run = service
+            .create_run(
+                "create-receipt-completion",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize(
+                "grant-receipt-completion",
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
+            .unwrap();
+        let observation = service
+            .observe("observe-receipt-completion", &run.run_id, run.version)
+            .await
+            .unwrap();
+        service
+            .act(
+                "act-receipt-completion",
+                &run.run_id,
+                service.get_run(&run.run_id).unwrap().unwrap().version,
+                &observation.observation_id,
+                ComputerAction::SetValue {
+                    element_id: format!("{}-name", observation.observation_id),
+                    text: "Ada".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let run = service.get_run(&run.run_id).unwrap().unwrap();
+        let completed = service
+            .complete_from_execution_receipt(
+                "complete-receipt-completion",
+                &run.run_id,
+                run.version,
+            )
+            .unwrap();
+        assert_eq!(completed.state, ComputerRunState::Completed);
+    }
+
+    #[tokio::test]
+    async fn a_restarted_service_cannot_reuse_an_old_run_capability() {
+        let dir = tempdir().unwrap();
+        let service = new_test_service(
+            Arc::new(SimulatorBackend::new()),
+            ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+        );
+        install_test_policy(&service);
+        let owner = Uuid::new_v4();
+        let run = service
+            .create_run(
+                "create-generation-restart",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run_id = run.run_id.clone();
+        drop(service);
+
+        let restarted = ComputerUseService::new(
+            Arc::new(SimulatorBackend::new()),
+            ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+        );
+        let recovered = restarted.get_run(&run_id).unwrap().unwrap();
+        let error = restarted
+            .observe("observe-generation-restart", &run_id, recovered.version)
+            .await
+            .unwrap_err();
+        // Restart recovery interrupts the run and the new service has no
+        // installed envelope; both fences deny the observation.
+        assert_eq!(error.code, ComputerErrorCode::Unauthorized);
+    }
+
     #[tokio::test]
     async fn backend_cannot_replace_the_host_minted_observation_identity() {
         let dir = tempdir().unwrap();
-        let service = ComputerUseService::new(
+        let service = new_test_service(
             Arc::new(MismatchedObservationBackend::default()),
             ComputerStore::open(dir.path()).unwrap(),
         );
+        install_test_policy(&service);
         let owner = Uuid::new_v4();
         let run = service
             .create_run(
@@ -1376,10 +2251,11 @@ mod tests {
     #[tokio::test]
     async fn evidence_limit_is_committed_before_returning_the_error() {
         let dir = tempdir().unwrap();
-        let service = ComputerUseService::new(
+        let service = new_test_service(
             Arc::new(EvidenceBackend::default()),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         );
+        install_test_policy(&service);
         let limits = ComputerUseLimits {
             max_evidence_bytes: 1,
             ..Default::default()
@@ -1416,10 +2292,11 @@ mod tests {
     async fn evidence_read_requires_current_asset_and_validates_backend_bytes() {
         let dir = tempdir().unwrap();
         let backend = Arc::new(EvidenceBackend::default());
-        let service = ComputerUseService::new(
+        let service = new_test_service(
             backend.clone(),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         );
+        install_test_policy(&service);
         let run = service
             .create_run(
                 "create-evidence-read",
@@ -1551,10 +2428,11 @@ mod tests {
     async fn concurrent_actions_execute_the_backend_at_most_once() {
         let dir = tempdir().unwrap();
         let backend = Arc::new(BlockingBackend::default());
-        let service = Arc::new(ComputerUseService::new(
+        let service = Arc::new(new_test_service(
             backend.clone(),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         ));
+        install_test_policy(&service);
         let run = service
             .create_run(
                 "create-race",
@@ -1590,7 +2468,12 @@ mod tests {
                 )
                 .await
         });
-        backend.action_entered.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            backend.action_entered.notified(),
+        )
+        .await
+        .expect("action must reach the backend before cancellation");
 
         let error = service
             .act(
@@ -1617,10 +2500,11 @@ mod tests {
     async fn cancellation_wins_over_an_inflight_action_completion() {
         let dir = tempdir().unwrap();
         let backend = Arc::new(BlockingBackend::default());
-        let service = Arc::new(ComputerUseService::new(
+        let service = Arc::new(new_test_service(
             backend.clone(),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         ));
+        install_test_policy(&service);
         let run = service
             .create_run(
                 "create-cancel-race",
@@ -1655,9 +2539,21 @@ mod tests {
                 )
                 .await
         });
-        backend.action_entered.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            backend.action_entered.notified(),
+        )
+        .await
+        .expect("action must reach the backend before cancellation");
+        tokio::task::yield_now().await;
 
-        let cancelled = service.cancel("cancel-race", &run.run_id).await.unwrap();
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            service.cancel("cancel-race", &run.run_id),
+        )
+        .await
+        .expect("cancel must release an in-flight action")
+        .unwrap();
         assert_eq!(cancelled.state, ComputerRunState::Cancelled);
         assert_eq!(
             cancelled.control_disposition,
@@ -1939,10 +2835,11 @@ mod tests {
         let owner = Uuid::new_v4();
         let run_id;
         {
-            let service = ComputerUseService::new(
+            let service = new_test_service(
                 Arc::new(SimulatorBackend::new()),
                 ComputerStore::open(dir.join("computer-use")).unwrap(),
             );
+            install_test_policy(&service);
             let run = service
                 .create_run(
                     "create-restart",

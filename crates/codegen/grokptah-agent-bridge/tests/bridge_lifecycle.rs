@@ -15,11 +15,33 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
+use grokptah_agent_bridge::orchestration::{
+    OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+};
 use grokptah_agent_bridge::{
     desktop_auto_update_enabled, home_override_serial, model_selection_key,
     set_grokptah_home_override, AgentHost, HostConfig, PermissionDecision, RunState, SessionUpdate,
 };
 use tokio::time::timeout;
+
+fn provisioned_host(config: HostConfig) -> grokptah_agent_bridge::AgentHostHandle {
+    let host = AgentHost::create(config);
+    let store = host
+        .ensure_orchestration_store()
+        .expect("open canonical orchestration store");
+    let _authority_service = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store,
+        OrchestrationConfig {
+            bearer_token: "bridge-lifecycle-authority".into(),
+            allowlist: WorkspaceAllowlist::default(),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+    host
+}
 
 /// RAII: point `grokptah_home()` at a temp dir for the duration of a test.
 struct IsolatedHome {
@@ -197,7 +219,7 @@ async fn session_lifecycle_prompt_streams_message() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("hello.txt"), "hello grokptah").unwrap();
 
-    let host = AgentHost::create(HostConfig::default());
+    let host = provisioned_host(HostConfig::default());
     let mut rx = host.take_event_receiver().expect("event rx");
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -303,7 +325,7 @@ async fn compatible_model_completes_a_multi_round_edit_and_test_task() {
     let _iso = CompatibleHome::install(&format!("http://{address}/v1"));
     let workspace = tempfile::tempdir().unwrap();
 
-    let host = AgentHost::create(HostConfig::default());
+    let host = provisioned_host(HostConfig::default());
     let mut events = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(workspace.path()).unwrap();
@@ -346,7 +368,7 @@ async fn compatible_model_completes_a_multi_round_edit_and_test_task() {
 async fn offline_write_emits_file_edit() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
@@ -375,7 +397,7 @@ async fn offline_write_emits_file_edit() {
 async fn permission_request_round_trip_allow() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: false,
         ..HostConfig::default()
     });
@@ -465,7 +487,7 @@ async fn permission_request_round_trip_allow() {
 async fn permission_deny_skips_tool() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig::default());
+    let host = provisioned_host(HostConfig::default());
     let mut rx = host.take_event_receiver().unwrap();
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
@@ -526,7 +548,7 @@ async fn cancel_kills_real_shell_child_not_only_sleep_stub() {
     let dir = tempfile::tempdir().unwrap();
     // Marker file written only if sleep completes — cancel must prevent this.
     let marker = dir.path().join("should_not_exist.txt");
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
@@ -589,7 +611,7 @@ async fn cancel_kills_real_shell_child_not_only_sleep_stub() {
 async fn shell_streams_output_without_reexec_event() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
@@ -629,7 +651,7 @@ async fn shell_streams_output_without_reexec_event() {
 async fn fork_rewind_compact_sessions() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
@@ -724,7 +746,7 @@ async fn session_set_cwd_updates_session_and_host_project() {
 async fn write_tool_records_edit_and_plugins_install_to_disk() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
@@ -873,7 +895,7 @@ async fn explore_slash_spawns_subagent() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("README.md"), "hello explore").unwrap();
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
@@ -955,7 +977,7 @@ async fn isolated_home_does_not_touch_user_sessions_dir() {
 async fn always_allow_scopes_to_tool_not_global() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: false,
         ..HostConfig::default()
     });
@@ -1123,7 +1145,7 @@ async fn multi_turn_wire_includes_prior_tool_output() {
     let secret = "TOOL_AMNESIA_SECRET_9f3c2a1b";
     std::fs::write(dir.path().join("secret_note.txt"), secret).unwrap();
 
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
@@ -1166,7 +1188,7 @@ async fn read_file_truncate_survives_cjk_over_cap() {
     assert!(body.len() > 32_000);
     std::fs::write(dir.path().join("big_cjk.txt"), &body).unwrap();
 
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
@@ -1261,7 +1283,7 @@ async fn deny_rule_blocks_shell_without_prompt() {
 async fn allow_rule_suppresses_shell_prompt() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: false,
         ..HostConfig::default()
     });
@@ -1302,7 +1324,7 @@ async fn allow_rule_suppresses_shell_prompt() {
 async fn shell_exit_code_and_failure_status_reach_session_events() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
@@ -1358,7 +1380,7 @@ async fn shell_exit_code_and_failure_status_reach_session_events() {
 async fn cancelled_shell_is_distinct_from_nonzero_exit() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
@@ -1465,7 +1487,7 @@ async fn bridge_prompt_queue_mutates_reorders_and_drains_authoritatively() {
 async fn steer_now_injects_once_without_cancelling_active_turn() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
@@ -1560,7 +1582,7 @@ async fn steer_now_injects_once_without_cancelling_active_turn() {
 async fn clear_queue_accounts_for_accepted_steering_instead_of_reporting_empty() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
@@ -1649,7 +1671,7 @@ async fn clear_queue_accounts_for_accepted_steering_instead_of_reporting_empty()
 async fn stale_run_next_is_rejected_without_cancelling_the_active_turn() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
@@ -1730,7 +1752,7 @@ async fn stale_run_next_is_rejected_without_cancelling_the_active_turn() {
 async fn run_next_cannot_cancel_a_turn_that_started_after_the_one_it_observed() {
     let _iso = IsolatedHome::install();
     let dir = tempfile::tempdir().unwrap();
-    let host = AgentHost::create(HostConfig {
+    let host = provisioned_host(HostConfig {
         always_approve: true,
         ..HostConfig::default()
     });
