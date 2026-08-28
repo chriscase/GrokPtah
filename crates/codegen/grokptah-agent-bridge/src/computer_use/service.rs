@@ -668,21 +668,14 @@ impl ComputerUseService {
             .and_then(|run| run.ok_or_else(unknown_run));
         let result = match cancelled {
             Ok(run) => {
-                if run.state.is_terminal() {
-                    Ok(run)
-                } else {
-                    let capability = self.require_run_capability(&run)?;
-                    let lease = self.effect_lease(&capability, &run, "computer.cancel")?;
-                    self.capability_authority
-                        .consume(lease, &capability.snapshot, Utc::now())
-                        .map_err(|error| {
-                            ComputerError::new(
-                                ComputerErrorCode::PermissionRevoked,
-                                error.to_string(),
-                            )
-                        })?;
-                    self.backend.cancel(run_id).await.map(|()| run)
-                }
+                let capability = self.require_run_capability(&run)?;
+                let lease = self.effect_lease(&capability, &run, "computer.cancel")?;
+                self.capability_authority
+                    .consume(lease, &capability.snapshot, Utc::now())
+                    .map_err(|error| {
+                        ComputerError::new(ComputerErrorCode::PermissionRevoked, error.to_string())
+                    })?;
+                self.backend.cancel(run_id).await.map(|()| run)
             }
             Err(error) => {
                 self.record_denial(run_id, "cancel", None, &error);
