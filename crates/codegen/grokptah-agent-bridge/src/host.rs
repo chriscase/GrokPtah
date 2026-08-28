@@ -1263,7 +1263,7 @@ impl AgentHostHandle {
         }
     }
 
-    fn invalidate_computer_agent_authority(&self) {
+    pub(crate) fn invalidate_computer_agent_authority(&self) {
         let _ = self.capability_authority.revoke_all();
         let tokens = {
             let mut inner = self.inner.lock();
@@ -6031,6 +6031,12 @@ impl AgentHostHandle {
             .active_session
             .ok_or_else(|| anyhow!("canonical Agent session is unavailable"))?;
         let principal = self.capability_principal(session_id)?;
+        crate::provider_qualification::preinstall_qualification_envelope(
+            provider_id,
+            model_id,
+            self.capability_authority.as_ref(),
+            &principal,
+        )?;
         crate::provider_qualification::qualify_provider_model_with_authority(
             provider_id,
             model_id,

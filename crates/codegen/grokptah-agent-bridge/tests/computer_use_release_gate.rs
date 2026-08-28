@@ -21,6 +21,9 @@ use grokptah_agent_bridge::computer_use::{
     ComputerStore, ComputerTarget, ComputerUseLimits, GrantIssuer, ObservationGeometry,
     PointerButton, SemanticAction, SemanticElement, Sensitivity,
 };
+use grokptah_agent_bridge::orchestration::{
+    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+};
 use grokptah_agent_bridge::{AgentHost, ComputerUseService, HostConfig, RuntimeHome, SessionKind};
 
 #[derive(Debug, Clone, Copy)]
@@ -178,8 +181,24 @@ fn fixture(
         .expect("host session");
     host.session_set_cwd(session.id, directory.path())
         .expect("session workspace");
-    host.ensure_session_agent(session.id)
+    let agent = host
+        .ensure_session_agent(session.id)
         .expect("canonical Agent principal");
+    host.ensure_orchestration_store()
+        .expect("orchestration store")
+        .claim_agent_owner(&agent.agent_id, "primary")
+        .expect("canonical Agent owner");
+    let _authority_service = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(directory.path().join("authority-orch")).expect("authority store"),
+        OrchestrationConfig {
+            bearer_token: "release-gate-authority".into(),
+            allowlist: WorkspaceAllowlist::new([directory.path().to_path_buf()]),
+            max_concurrent_runs: 1,
+            bounds: RunBounds::default(),
+        },
+    );
     let principal = host.capability_principal(session.id).expect("principal");
     let service =
         ComputerUseService::new_with_authority(backend.clone(), store, host.capability_authority());

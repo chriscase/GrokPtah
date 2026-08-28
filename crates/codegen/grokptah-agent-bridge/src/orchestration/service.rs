@@ -1485,6 +1485,7 @@ impl OrchestrationService {
         }
         self.config.lock().bearer_token = token.clone();
         *self.auth_credentials.lock() = credentials;
+        self.refresh_host_capability_authority();
     }
 
     /// Install named device/client credentials while retaining the existing
@@ -1521,6 +1522,7 @@ impl OrchestrationService {
             .set_credentials(&credentials, &owner_id)?;
         self.config.lock().bearer_token = primary_token;
         *self.auth_credentials.lock() = credentials;
+        self.refresh_host_capability_authority();
         Ok(())
     }
 
@@ -1534,11 +1536,27 @@ impl OrchestrationService {
         }
         self.auth_registry.lock().change_owner(&owner_id)?;
         *self.agent_owner_id.lock() = owner_id;
+        self.refresh_host_capability_authority();
         Ok(())
     }
 
     fn agent_owner_id(&self) -> String {
         self.agent_owner_id.lock().clone()
+    }
+
+    fn refresh_host_capability_authority(&self) {
+        self.host.invalidate_computer_agent_authority();
+        let credentials = self.auth_credentials.lock().clone();
+        let auth_context = self.auth_registry.lock().primary_context(&credentials).ok();
+        let Some(auth_context) = auth_context else {
+            return;
+        };
+        self.host.install_canonical_auth_context(auth_context);
+        for session in self.host.list_all_sessions() {
+            let _ = self
+                .host
+                .preinstall_canonical_capability_policy(session.id);
+        }
     }
 
     pub fn set_allowlist(&self, allowlist: WorkspaceAllowlist) {
@@ -1581,7 +1599,9 @@ impl OrchestrationService {
     /// Revoke the current credential incarnation. This is host-only control
     /// plane lifecycle, never a client-provided identity transition.
     pub fn revoke_authentication(&self, credential_id: &str) -> Result<(), OrchError> {
-        self.auth_registry.lock().revoke(credential_id)
+        self.auth_registry.lock().revoke(credential_id)?;
+        self.refresh_host_capability_authority();
+        Ok(())
     }
 
     /// Advance a credential's authentication generation while preserving its
@@ -1591,7 +1611,9 @@ impl OrchestrationService {
         &self,
         credential_id: &str,
     ) -> Result<(), OrchError> {
-        self.auth_registry.lock().rotate_generation(credential_id)
+        self.auth_registry.lock().rotate_generation(credential_id)?;
+        self.refresh_host_capability_authority();
+        Ok(())
     }
 
     pub fn mint_effect_lease(

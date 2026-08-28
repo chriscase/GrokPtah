@@ -9,6 +9,9 @@ use grokptah_agent_bridge::{
     ProviderAttemptEvidence, ProviderDialectClass, ProviderIdentity, ProviderRouteClass,
     RuntimeHome, SessionKind, StreamFraming, UsageEvidence, PERSISTENT_AGENT_CAPTURE_SCHEMA,
 };
+use grokptah_agent_bridge::orchestration::{
+    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+};
 use grokptah_test_gateway::{split_at, MockGateway, Response, Step};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -121,8 +124,24 @@ fn canonical_replay_context() -> (
     host.set_project_cwd(&workspace).expect("project cwd");
     host.session_set_cwd(session.id, &workspace)
         .expect("session cwd");
-    host.ensure_session_agent(session.id)
+    let agent = host
+        .ensure_session_agent(session.id)
         .expect("canonical Agent");
+    host.ensure_orchestration_store()
+        .expect("orchestration store")
+        .claim_agent_owner(&agent.agent_id, "primary")
+        .expect("canonical Agent owner");
+    let _authority_service = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        OrchStore::open(runtime_dir.path().join("authority-orch")).expect("authority store"),
+        OrchestrationConfig {
+            bearer_token: "provider-replay-authority".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.clone()]),
+            max_concurrent_runs: 1,
+            bounds: RunBounds::default(),
+        },
+    );
     let principal = host.capability_principal(session.id).expect("principal");
     (runtime_dir, host, principal)
 }
