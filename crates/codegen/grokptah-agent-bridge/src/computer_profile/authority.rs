@@ -126,6 +126,7 @@ impl fmt::Debug for AdaptiveAuthoritySnapshot {
     }
 }
 
+#[allow(dead_code)]
 impl AdaptiveAuthoritySnapshot {
     pub(crate) fn issued(
         principal: impl Into<String>,
