@@ -7,6 +7,7 @@
 //! mint identifiers, advance generations, create leases, or fabricate receipts.
 //! The host stores no adapter by default and production proposal dispatch stops
 //! when the adapter is absent.
+#![allow(dead_code)]
 
 use std::fmt;
 

@@ -1720,6 +1720,7 @@ impl AgentHostHandle {
     /// is intentionally replace-once: changing the authority underneath an
     /// active run would be a generation race, so the host must restart or
     /// revoke the run before a new authority can be installed.
+    #[allow(dead_code)]
     pub(crate) fn install_adaptive_authority_adapter(
         &self,
         authority: Arc<dyn crate::computer_profile::AdaptiveAuthorityAdapter>,

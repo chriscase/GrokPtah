@@ -530,7 +530,7 @@ impl AdaptiveController {
         }
     }
 
-    pub fn finish_turn(
+    pub(crate) fn finish_turn(
         &mut self,
         rendered_observation_bytes: u64,
         truncated: bool,
