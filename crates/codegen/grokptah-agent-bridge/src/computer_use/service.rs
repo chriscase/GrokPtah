@@ -604,7 +604,11 @@ impl ComputerUseService {
                 Err(error)
             }
         };
-        self.finish_mutation(request_id, &result)?;
+        if let Err(finish_error) = self.finish_mutation(request_id, &result) {
+            if result.is_ok() {
+                return Err(finish_error);
+            }
+        }
         result
     }
 
@@ -647,7 +651,7 @@ impl ComputerUseService {
                         ComputerError::new(ComputerErrorCode::PermissionRevoked, error.to_string())
                     })?;
                 let result = self.backend.cancel(run_id).await;
-                self.revoke_run_capability(run_id);
+                self.revoke_action_capability(run_id);
                 result.map(|()| run)
             }
             Err(error) => {
@@ -695,7 +699,7 @@ impl ComputerUseService {
                         ComputerError::new(ComputerErrorCode::PermissionRevoked, error.to_string())
                     })?;
                 let result = self.backend.cancel(run_id).await;
-                self.revoke_run_capability(run_id);
+                self.revoke_action_capability(run_id);
                 result.map(|()| run)
             }
             Err(error) => {
@@ -742,7 +746,7 @@ impl ComputerUseService {
                             )
                         })?;
                     let result = self.backend.cancel(run_id).await;
-                    self.revoke_run_capability(run_id);
+                    self.revoke_action_capability(run_id);
                     result.map(|()| run)
                 }
             }
@@ -1123,6 +1127,14 @@ impl ComputerUseService {
         }
     }
 
+    fn revoke_action_capability(&self, run_id: &str) {
+        if let Some(binding) = self.run_capabilities.lock().get(run_id).cloned() {
+            let _ = self
+                .capability_authority
+                .remove_envelope(&binding.envelope_id);
+        }
+    }
+
     fn revoke_authority(&self, run: &mut ComputerRun) {
         self.revoke_run_capability(&run.run_id);
         revoke_authority(run);
@@ -1256,15 +1268,20 @@ impl ComputerUseService {
         action_class: Option<super::types::ActionClass>,
         error: &ComputerError,
     ) {
-        let _ = self.consume_durable_lease(
-            "record_denial",
-            &json!({
-                "runId": run_id,
-                "operation": operation,
-                "actionClass": action_class,
-                "errorCode": error.code,
-            }),
-        );
+        if self
+            .consume_durable_lease(
+                "record_denial",
+                &json!({
+                    "runId": run_id,
+                    "operation": operation,
+                    "actionClass": action_class,
+                    "errorCode": error.code,
+                }),
+            )
+            .is_err()
+        {
+            return;
+        }
         let _ = self.store.update_run(run_id, |run| {
             run.updated_at = Utc::now();
             run.record_audit(operation, "denied", action_class, None, Some(error.code));

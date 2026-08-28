@@ -820,6 +820,43 @@ mod tests {
     }
 
     #[test]
+    fn capability_downgrade_replaces_generation_and_stales_old_envelope() {
+        let authority = CapabilityAuthority::new(true);
+        let now = Utc::now();
+        let original = snapshot("semantic-act");
+        let capability = authority
+            .issue(&original, now, DEFAULT_CAPABILITY_TTL)
+            .unwrap();
+        authority
+            .install_envelope(
+                "downgrade-envelope",
+                capability,
+                original.clone(),
+                SERVICE_PRINCIPAL_ID,
+                INITIAL_AUTH_GENERATION,
+                "policy-v1",
+                ["act"],
+                "resource-1",
+                now,
+            )
+            .unwrap();
+        let downgraded = snapshot("observe-only");
+        let _ = authority
+            .issue(&downgraded, now, DEFAULT_CAPABILITY_TTL)
+            .unwrap();
+        assert!(authority
+            .lease_from_envelope(
+                "downgrade-envelope",
+                "act",
+                "resource-1",
+                "computer.input",
+                now,
+                Duration::seconds(5),
+            )
+            .is_err());
+    }
+
+    #[test]
     fn revoked_restart_and_foreign_authority_fail_closed() {
         let authority = CapabilityAuthority::new(true);
         let now = Utc::now();
