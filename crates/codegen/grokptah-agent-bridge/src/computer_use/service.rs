@@ -23,17 +23,38 @@ use crate::capability_authority::{
 };
 use parking_lot::Mutex;
 
+const SERVICE_ENVELOPE_ID: &str = "computer-service-envelope-v1";
+const RUN_ENVELOPE_PREFIX: &str = "computer-run-envelope:";
+const SERVICE_PRINCIPAL_ID: &str = "host-principal";
+const AUTH_GENERATION: u64 = 1;
+const POLICY_GENERATION: &str = "computer-use-policy.v1";
+
+const RUN_OPERATIONS: &[&str] = &[
+    "authorize",
+    "observe",
+    "act",
+    "pause",
+    "take_over",
+    "cancel",
+    "complete",
+    "settle_observation",
+    "settle_action",
+    "record_denial",
+];
+
 pub struct ComputerUseService {
     backend: Arc<dyn ComputerBackend>,
     store: ComputerStore,
     policy: ComputerPolicy,
     capability_authority: Arc<CapabilityAuthority>,
+    service_capability: Option<RunCapability>,
     run_capabilities: Mutex<std::collections::HashMap<String, RunCapability>>,
     execution_receipts: Mutex<std::collections::HashMap<String, HostExecutionReceipt>>,
 }
 
 #[derive(Debug, Clone)]
 struct RunCapability {
+    envelope_id: String,
     snapshot: CapabilitySnapshot,
     capability: HostCapability,
 }
@@ -61,11 +82,45 @@ impl ComputerUseService {
         store: ComputerStore,
         capability_authority: Arc<CapabilityAuthority>,
     ) -> Self {
+        let service_capability = CapabilitySnapshot::computer_use_service(
+            SERVICE_PRINCIPAL_ID,
+            &backend.capabilities(),
+            POLICY_GENERATION,
+        )
+        .ok()
+        .and_then(|snapshot| {
+            let capability = capability_authority
+                .issue(
+                    &snapshot,
+                    Utc::now(),
+                    crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+                )
+                .ok()?;
+            capability_authority
+                .install_envelope(
+                    SERVICE_ENVELOPE_ID,
+                    capability.clone(),
+                    snapshot.clone(),
+                    SERVICE_PRINCIPAL_ID,
+                    AUTH_GENERATION,
+                    POLICY_GENERATION,
+                    ["create_run", "settle_receipt"],
+                    "computer-host",
+                    Utc::now(),
+                )
+                .ok()?;
+            Some(RunCapability {
+                envelope_id: SERVICE_ENVELOPE_ID.into(),
+                snapshot,
+                capability,
+            })
+        });
         Self {
             backend,
             store,
             policy: ComputerPolicy,
             capability_authority,
+            service_capability,
             run_capabilities: Mutex::new(std::collections::HashMap::new()),
             execution_receipts: Mutex::new(std::collections::HashMap::new()),
         }
@@ -228,17 +283,13 @@ impl ComputerUseService {
         let result = (|| {
             self.store.can_create_run()?;
             let mut run = ComputerRun::new(owner_session_id, workspace, target, limits)?;
-            let capability = self.issue_run_capability(&run)?;
+            let capability = self.bind_run_capability(&run)?;
             self.consume_durable_lease("create_run", &payload)?;
             run.record_audit("create_run", "accepted", None, None, None);
             self.store.save_run(&run)?;
-            self.run_capabilities.lock().insert(
-                run.run_id.clone(),
-                RunCapability {
-                    snapshot: self.snapshot_for_run(&run)?,
-                    capability,
-                },
-            );
+            self.run_capabilities
+                .lock()
+                .insert(run.run_id.clone(), capability);
             Ok(run)
         })();
         self.finish_mutation(request_id, &result)?;
@@ -952,29 +1003,46 @@ impl ComputerUseService {
     }
 
     fn snapshot_for_run(&self, run: &ComputerRun) -> ComputerResult<CapabilitySnapshot> {
-        let policy_digest = crate::orchestration::hash_payload(&json!({
-            "workspace": run.workspace.as_deref(),
-            "limits": run.limits,
-        }));
-        CapabilitySnapshot::computer_use(
-            &format!("local-session:{}", run.owner_session_id),
-            &run.target,
-            &self.backend.capabilities(),
-            None,
-            &policy_digest,
-        )
-        .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error.to_string()))
+        let _ = run;
+        self.service_capability
+            .as_ref()
+            .map(|binding| binding.snapshot.clone())
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "canonical computer capability envelope is unavailable",
+                )
+            })
     }
 
-    fn issue_run_capability(&self, run: &ComputerRun) -> ComputerResult<HostCapability> {
-        let snapshot = self.snapshot_for_run(run)?;
-        self.capability_authority
-            .issue(
-                &snapshot,
-                Utc::now(),
-                crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+    fn bind_run_capability(&self, run: &ComputerRun) -> ComputerResult<RunCapability> {
+        let service = self.service_capability.as_ref().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "canonical computer capability envelope is unavailable",
             )
-            .map_err(|error| ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string()))
+        })?;
+        let envelope_id = format!("{RUN_ENVELOPE_PREFIX}{}", run.run_id);
+        self.capability_authority
+            .install_envelope(
+                &envelope_id,
+                service.capability.clone(),
+                service.snapshot.clone(),
+                SERVICE_PRINCIPAL_ID,
+                AUTH_GENERATION,
+                POLICY_GENERATION,
+                RUN_OPERATIONS.iter().copied(),
+                &run.run_id,
+                Utc::now(),
+            )
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string())
+            })?;
+        Ok(RunCapability {
+            envelope_id,
+            snapshot: service.snapshot.clone(),
+            capability: service.capability.clone(),
+        })
     }
 
     fn require_run_capability(&self, run: &ComputerRun) -> ComputerResult<RunCapability> {
@@ -991,7 +1059,12 @@ impl ComputerUseService {
             })?;
         let current = self.snapshot_for_run(run)?;
         self.capability_authority
-            .revalidate(&capability.capability, &current, Utc::now())
+            .revalidate_envelope(
+                &capability.envelope_id,
+                &capability.capability,
+                &current,
+                Utc::now(),
+            )
             .map_err(|error| {
                 ComputerError::new(
                     ComputerErrorCode::PermissionRevoked,
@@ -1005,21 +1078,7 @@ impl ComputerUseService {
         match self.require_run_capability(run) {
             Ok(capability) => Ok(capability),
             Err(error) if error.code == ComputerErrorCode::Unauthorized => {
-                let snapshot = self.snapshot_for_run(run)?;
-                let capability = self
-                    .capability_authority
-                    .issue(
-                        &snapshot,
-                        Utc::now(),
-                        crate::capability_authority::DEFAULT_CAPABILITY_TTL,
-                    )
-                    .map_err(|issue_error| {
-                        ComputerError::new(ComputerErrorCode::Unauthorized, issue_error.to_string())
-                    })?;
-                let binding = RunCapability {
-                    snapshot,
-                    capability,
-                };
+                let binding = self.bind_run_capability(run)?;
                 self.run_capabilities
                     .lock()
                     .insert(run.run_id.clone(), binding.clone());
@@ -1031,7 +1090,9 @@ impl ComputerUseService {
 
     fn revoke_run_capability(&self, run_id: &str) {
         if let Some(binding) = self.run_capabilities.lock().remove(run_id) {
-            let _ = self.capability_authority.revoke(&binding.snapshot);
+            let _ = self
+                .capability_authority
+                .remove_envelope(&binding.envelope_id);
         }
     }
 
@@ -1047,10 +1108,23 @@ impl ComputerUseService {
         effect_scope: &str,
     ) -> ComputerResult<EffectLease> {
         let current = self.snapshot_for_run(run)?;
+        if current != capability.snapshot {
+            return Err(ComputerError::new(
+                ComputerErrorCode::PermissionRevoked,
+                "computer capability snapshot changed before effect",
+            ));
+        }
+        let operation = match effect_scope {
+            "computer.capture" => "observe",
+            "computer.input" => "act",
+            "computer.cancel" => "cancel",
+            _ => "act",
+        };
         self.capability_authority
-            .lease(
-                &capability.capability,
-                &current,
+            .lease_from_envelope(
+                &capability.envelope_id,
+                operation,
+                &run.run_id,
                 effect_scope,
                 Utc::now(),
                 Duration::seconds(5),
@@ -1068,27 +1142,31 @@ impl ComputerUseService {
         operation: &str,
         payload: &serde_json::Value,
     ) -> ComputerResult<()> {
-        let snapshot = CapabilitySnapshot::durable_mutation(
-            "computer-host",
-            operation,
-            &crate::orchestration::hash_payload(payload),
-        )
-        .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error.to_string()))?;
-        let capability = self
-            .capability_authority
-            .issue(
-                &snapshot,
-                Utc::now(),
-                crate::capability_authority::DEFAULT_CAPABILITY_TTL,
-            )
-            .map_err(|error| {
-                ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string())
+        let envelope_id = payload
+            .get("runId")
+            .and_then(serde_json::Value::as_str)
+            .map(|run_id| format!("{RUN_ENVELOPE_PREFIX}{run_id}"))
+            .unwrap_or_else(|| SERVICE_ENVELOPE_ID.into());
+        let resource = payload
+            .get("runId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("computer-host");
+        let snapshot = self
+            .service_capability
+            .as_ref()
+            .map(|binding| binding.snapshot.clone())
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "canonical durable capability envelope is unavailable",
+                )
             })?;
         let lease = self
             .capability_authority
-            .lease(
-                &capability,
-                &snapshot,
+            .lease_from_envelope(
+                &envelope_id,
+                operation,
+                resource,
                 &format!("durable.{operation}"),
                 Utc::now(),
                 Duration::seconds(5),
@@ -1111,6 +1189,15 @@ impl ComputerUseService {
         action_class: Option<super::types::ActionClass>,
         error: &ComputerError,
     ) {
+        let _ = self.consume_durable_lease(
+            "record_denial",
+            &json!({
+                "runId": run_id,
+                "operation": operation,
+                "actionClass": action_class,
+                "errorCode": error.code,
+            }),
+        );
         let _ = self.store.update_run(run_id, |run| {
             run.updated_at = Utc::now();
             run.record_audit(operation, "denied", action_class, None, Some(error.code));
@@ -1418,6 +1505,20 @@ mod tests {
             uses_remaining: Some(8),
             revoked_at: None,
         }
+    }
+
+    #[test]
+    fn arbitrary_durable_request_data_cannot_issue_authority() {
+        let (_backend, service) = service();
+        let before = service.capability_authority.generation_count_for_test();
+        let error = service
+            .consume_durable_lease("arbitrary_operation", &json!({"untrusted": "payload"}))
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::Unauthorized);
+        assert_eq!(
+            service.capability_authority.generation_count_for_test(),
+            before
+        );
     }
 
     #[tokio::test]
