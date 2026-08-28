@@ -6,7 +6,8 @@ use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
     canonical_workspace_string, ActionClass, ActionGrant, AdaptiveProfileProjection,
     AgentHostHandle, ComputerAction, ComputerAgentProposal, ComputerCapabilities, ComputerError,
-    ComputerObservation, ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    ComputerExecutionEnvelope, ComputerObservation, ComputerObservationPlatform, ComputerPermission,
+    ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
     ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer, SemanticAction,
     SimulatorBackend,
@@ -36,6 +37,9 @@ pub struct PendingComputerApproval {
     pub action: ComputerAction,
     pub action_summary: String,
     pub risk: String,
+    /// Opaque host-issued envelope revalidated by ComputerUseService at
+    /// approval time. It serializes only as a capability token.
+    pub execution_envelope: ComputerExecutionEnvelope,
     pub created_at: chrono::DateTime<Utc>,
 }
 
@@ -480,7 +484,7 @@ impl DesktopComputerUse {
         observation_id: &str,
         action: ComputerAction,
     ) -> Result<ComputerCockpitSnapshot, String> {
-        let (_service, run) = self.owned_service(owner_session_id, run_id)?;
+        let (service, run) = self.owned_service(owner_session_id, run_id)?;
         if run.version != expected_version {
             return Err("The proposed action is based on a stale Computer Run".into());
         }
@@ -497,6 +501,9 @@ impl DesktopComputerUse {
             .map_err(|error| error.to_string())?;
 
         let (action_summary, risk) = approval_copy(observation, &action)?;
+        let execution_envelope = service
+            .issue_execution_envelope(run_id, expected_version, observation_id, &action)
+            .map_err(|error| error.to_string())?;
 
         let mut pending = self
             .pending_approval
@@ -515,6 +522,7 @@ impl DesktopComputerUse {
             action,
             action_summary,
             risk,
+            execution_envelope,
             created_at: Utc::now(),
         });
         drop(pending);
@@ -677,12 +685,13 @@ impl DesktopComputerUse {
         let action = pending.action.clone();
         let observation_id = pending.observation_id.clone();
         let result = service
-            .act(
+            .act_with_envelope(
                 request_id,
                 &pending.run_id,
                 pending.run_version,
                 &observation_id,
                 action.clone(),
+                pending.execution_envelope.clone(),
             )
             .await;
         self.clear_pending_for_owner(owner_session_id)?;

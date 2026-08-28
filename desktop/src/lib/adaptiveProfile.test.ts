@@ -24,7 +24,7 @@ function projection(
       hostIndependentVerifier: false,
       hostIsolatedGuest: false,
       ceiling: "economy",
-      capabilitySnapshotReference: null,
+      capabilitySnapshotId: null,
     },
     budget: {
       observationDetail: "semantic_only",

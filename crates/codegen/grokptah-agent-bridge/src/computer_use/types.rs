@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const MAX_ID_BYTES: usize = 256;
@@ -413,6 +414,130 @@ impl ComputerAction {
 pub struct ActionOutcome {
     pub summary: String,
     pub expected_postcondition_met: Option<bool>,
+}
+
+/// Opaque, host-issued approval envelope. It is serialized only as a
+/// capability token for the local cockpit and is not deserializable from any
+/// public request. `ComputerUseService::act_with_envelope` revalidates every
+/// immutable binding before allowing the existing dispatch path to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputerExecutionEnvelope {
+    token: String,
+    run_id: String,
+    run_version: u64,
+    observation_id: String,
+    action_digest: String,
+    adaptive_revision: Option<u64>,
+    profile: Option<crate::computer_profile::AdaptiveProfile>,
+    objective_digest: Option<String>,
+    principal_generation_reference: Option<String>,
+    capability_snapshot_reference: Option<String>,
+    provider_attempt_reference: Option<String>,
+    effect_authority_bound: bool,
+}
+
+impl Serialize for ComputerExecutionEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.token)
+    }
+}
+
+impl ComputerExecutionEnvelope {
+    pub(crate) fn issue(
+        run: &ComputerRun,
+        observation_id: &str,
+        action: &ComputerAction,
+    ) -> ComputerResult<Self> {
+        validate_id("observation_id", observation_id)?;
+        let action_digest = digest_action(action);
+        let (
+            adaptive_revision,
+            profile,
+            objective_digest,
+            principal_generation_reference,
+            capability_snapshot_reference,
+            provider_attempt_reference,
+            effect_authority_bound,
+        ) = match run.adaptive.as_ref() {
+            Some(adaptive) => (
+                Some(adaptive.revision),
+                Some(adaptive.profile),
+                adaptive.objective_digest.clone(),
+                adaptive.principal_generation_reference.clone(),
+                adaptive.capability_snapshot_reference.clone(),
+                adaptive.provider_attempt_reference.clone(),
+                adaptive.effect_authority_bound,
+            ),
+            None => (None, None, None, None, None, None, false),
+        };
+        let token = Uuid::new_v4().to_string();
+        Ok(Self {
+            token,
+            run_id: run.run_id.clone(),
+            run_version: run.version,
+            observation_id: observation_id.into(),
+            action_digest,
+            adaptive_revision,
+            profile,
+            objective_digest,
+            principal_generation_reference,
+            capability_snapshot_reference,
+            provider_attempt_reference,
+            effect_authority_bound,
+        })
+    }
+
+    pub(crate) fn matches(
+        &self,
+        run: &ComputerRun,
+        observation_id: &str,
+        action: &ComputerAction,
+    ) -> bool {
+        self.run_id == run.run_id
+            && self.run_version == run.version
+            && self.observation_id == observation_id
+            && self.action_digest == digest_action(action)
+    }
+
+    pub(crate) fn requires_effect_authority(&self) -> bool {
+        self.adaptive_revision.is_some()
+    }
+
+    pub(crate) fn effect_authority_bound(&self) -> bool {
+        self.effect_authority_bound
+    }
+
+    pub(crate) fn adaptive_revision(&self) -> Option<u64> {
+        self.adaptive_revision
+    }
+
+    pub(crate) fn profile(&self) -> Option<crate::computer_profile::AdaptiveProfile> {
+        self.profile
+    }
+
+    pub(crate) fn objective_digest(&self) -> Option<&str> {
+        self.objective_digest.as_deref()
+    }
+
+    pub(crate) fn principal_generation_reference(&self) -> Option<&str> {
+        self.principal_generation_reference.as_deref()
+    }
+
+    pub(crate) fn capability_snapshot_reference(&self) -> Option<&str> {
+        self.capability_snapshot_reference.as_deref()
+    }
+
+    pub(crate) fn provider_attempt_reference(&self) -> Option<&str> {
+        self.provider_attempt_reference.as_deref()
+    }
+}
+
+pub(crate) fn digest_action(action: &ComputerAction) -> String {
+    let bytes = serde_json::to_vec(action).unwrap_or_default();
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

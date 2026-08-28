@@ -54,7 +54,7 @@ pub use store::ComputerStore;
 pub use types::{
     ActionClass, ActionGrant, ActionOutcome, ComputerAction, ComputerAuditEntry, ComputerBackend,
     ComputerCapabilities, ComputerControlDisposition, ComputerError, ComputerErrorCode,
-    ComputerObservation, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
-    EvidenceRef, GrantIssuer, ObservationGeometry, PointerButton, SemanticAction, SemanticElement,
-    Sensitivity,
+    ComputerExecutionEnvelope, ComputerObservation, ComputerRun, ComputerRunState, ComputerTarget,
+    ComputerUseLimits, EvidenceRef, GrantIssuer, ObservationGeometry, PointerButton,
+    SemanticAction, SemanticElement, Sensitivity,
 };

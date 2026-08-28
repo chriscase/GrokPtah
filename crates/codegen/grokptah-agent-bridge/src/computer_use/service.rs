@@ -15,8 +15,9 @@ use super::projection::{
 use super::store::{ComputerStore, MutationClaim};
 use super::types::{
     validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend,
-    ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerObservation,
-    ComputerResult, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
+    ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerExecutionEnvelope,
+    ComputerObservation, ComputerResult, ComputerRun, ComputerRunState, ComputerTarget,
+    ComputerUseLimits,
 };
 
 pub struct ComputerUseService {
@@ -190,6 +191,90 @@ impl ComputerUseService {
         })();
         self.finish_mutation(request_id, &result)?;
         result
+    }
+
+    pub fn issue_execution_envelope(
+        &self,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action: &ComputerAction,
+    ) -> ComputerResult<ComputerExecutionEnvelope> {
+        let run = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
+        if run.version != expected_version {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "computer approval is based on a stale run version",
+            ));
+        }
+        let observation = run
+            .current_observation
+            .as_ref()
+            .filter(|observation| observation.observation_id == observation_id)
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::StaleObservation,
+                    "computer approval is based on a stale observation",
+                )
+            })?;
+        self.policy
+            .authorize_action(&run, observation, action, Utc::now())?;
+        ComputerExecutionEnvelope::issue(&run, observation_id, action)
+    }
+
+    /// Approval dispatch path. The opaque envelope is checked against the
+    /// current durable run and adaptive state before entering the existing
+    /// action method. Adaptive envelopes require effect-time authority proof;
+    /// this exact base has none and therefore never dispatches them.
+    pub async fn act_with_envelope(
+        &self,
+        request_id: &str,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action: ComputerAction,
+        envelope: ComputerExecutionEnvelope,
+    ) -> ComputerResult<ActionOutcome> {
+        let run = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
+        if !envelope.matches(&run, observation_id, &action) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Conflict,
+                "computer approval envelope does not match the current action",
+            ));
+        }
+        if envelope.requires_effect_authority() {
+            let Some(adaptive) = run.adaptive.as_ref() else {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "adaptive approval has no durable authority binding",
+                ));
+            };
+            if !envelope.effect_authority_bound()
+                || adaptive.revision != envelope.adaptive_revision().unwrap_or_default()
+                || adaptive.profile != envelope.profile().unwrap_or_default()
+                || adaptive.objective_digest.as_deref() != envelope.objective_digest()
+                || adaptive.principal_generation_reference.as_deref()
+                    != envelope.principal_generation_reference()
+                || adaptive.capability_snapshot_reference.as_deref()
+                    != envelope.capability_snapshot_reference()
+                || adaptive.provider_attempt_reference.as_deref()
+                    != envelope.provider_attempt_reference()
+                || adaptive.effect_authority_bound != envelope.effect_authority_bound()
+            {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "adaptive approval authority or policy generation changed",
+                ));
+            }
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "canonical effect-time authority is unavailable",
+            ));
+        }
+        // `act` repeats run, grant, observation, capability, lease, and
+        // version checks immediately before the backend call.
+        self.act(request_id, run_id, expected_version, observation_id, action)
+            .await
     }
 
     pub fn authorize(

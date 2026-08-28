@@ -201,7 +201,7 @@ pub const BALANCED_BUDGET: ProfileBudget = ProfileBudget {
     max_scroll_delta: 10_000,
     max_summary_bytes: 512,
     allows_screenshot_capture: true,
-    allows_pointer_fallback: true,
+    allows_pointer_fallback: false,
     allows_key_chord: false,
 };
 

@@ -180,6 +180,12 @@ impl CapabilityEvidence {
             .map(|authority| authority.principal_reference().to_string())
     }
 
+    pub(crate) fn effect_lease_reference(&self) -> Option<String> {
+        self.authority
+            .as_ref()
+            .map(|authority| authority.effect_lease_reference().to_string())
+    }
+
     /// The highest profile the evidence can honestly support. This is a
     /// ceiling, not a selection.
     pub fn ceiling(&self) -> AdaptiveProfile {

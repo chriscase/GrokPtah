@@ -381,8 +381,12 @@ pub(crate) async fn propose_semantic_action_with_profile(
     if call.arguments.len() as u64 > permit.budget.max_response_bytes {
         bail!("model response exceeds the active profile response ceiling");
     }
-    let proposal =
-        proposal_from_arguments_with_profile(&call.arguments, observation, permit.profile)?;
+    let proposal = proposal_from_arguments_with_profile_and_evidence(
+        &call.arguments,
+        observation,
+        permit.profile,
+        evidence_bytes,
+    )?;
     let confidence_permille =
         serde_json::from_str::<ProposalArguments>(&call.arguments)?.confidence_permille;
     Ok(ProposalOutcome {
@@ -499,6 +503,14 @@ fn proposal_from_arguments(
     raw: &str,
     observation: &ComputerObservation,
 ) -> Result<ComputerAgentProposal> {
+    proposal_from_arguments_with_evidence(raw, observation, None)
+}
+
+fn proposal_from_arguments_with_evidence(
+    raw: &str,
+    observation: &ComputerObservation,
+    visual_evidence_bytes: Option<&[u8]>,
+) -> Result<ComputerAgentProposal> {
     let arguments: ProposalArguments = serde_json::from_str(raw)
         .map_err(|_| anyhow!("model returned malformed Computer proposal arguments"))?;
     if arguments.observation_id != observation.observation_id {
@@ -596,7 +608,7 @@ fn proposal_from_arguments(
         _ => bail!("model proposed an unsupported or incoherent Computer action"),
     };
     action.validate(&ComputerUseLimits::ceiling())?;
-    validate_action_against_observation(&action, observation)?;
+    validate_action_against_observation(&action, observation, visual_evidence_bytes)?;
     Ok(ComputerAgentProposal::Action {
         observation_id: arguments.observation_id,
         action,
@@ -609,7 +621,16 @@ fn proposal_from_arguments_with_profile(
     observation: &ComputerObservation,
     profile: AdaptiveProfile,
 ) -> Result<ComputerAgentProposal> {
-    let proposal = proposal_from_arguments(raw, observation)?;
+    proposal_from_arguments_with_profile_and_evidence(raw, observation, profile, None)
+}
+
+fn proposal_from_arguments_with_profile_and_evidence(
+    raw: &str,
+    observation: &ComputerObservation,
+    profile: AdaptiveProfile,
+    visual_evidence_bytes: Option<&[u8]>,
+) -> Result<ComputerAgentProposal> {
+    let proposal = proposal_from_arguments_with_evidence(raw, observation, visual_evidence_bytes)?;
     let budget = profile.budget();
     let summary = match &proposal {
         ComputerAgentProposal::Action { summary, .. }
@@ -661,9 +682,19 @@ fn only_element(arguments: &ProposalArguments) -> bool {
 fn validate_action_against_observation(
     action: &ComputerAction,
     observation: &ComputerObservation,
+    visual_evidence_bytes: Option<&[u8]>,
 ) -> Result<()> {
     if let ComputerAction::PointerClick { x, y, .. } = action {
-        if observation.screenshot.is_none()
+        let Some(evidence) = observation.screenshot.as_ref() else {
+            bail!("visual action requires a current authenticated screenshot");
+        };
+        let Some(bytes) = visual_evidence_bytes else {
+            bail!("visual action requires private authenticated evidence bytes");
+        };
+        if !evidence.redacted
+            || bytes.len() as u64 != evidence.byte_len
+            || format!("{:x}", Sha256::digest(bytes)) != evidence.content_sha256
+            || bytes.len() as u64 > evidence.byte_len
             || !x.is_finite()
             || !y.is_finite()
             || *x < 0.0
@@ -671,7 +702,7 @@ fn validate_action_against_observation(
             || *x >= observation.geometry.width
             || *y >= observation.geometry.height
         {
-            bail!("visual action is not grounded in a current bounded screenshot");
+            bail!("visual action is not grounded in current authenticated evidence");
         }
         return Ok(());
     }

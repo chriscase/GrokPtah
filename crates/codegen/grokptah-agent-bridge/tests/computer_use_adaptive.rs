@@ -10,9 +10,9 @@ use grokptah_agent_bridge::{
     render_computer_observation, validate_computer_proposal,
     validate_computer_proposal_safety_only, AdaptiveController, AdaptiveProfile,
     CapabilityAttribution, CapabilityEvidence, ComputerAction, ComputerAgentProposal,
-    ComputerObservation, ComputerTarget, HostCapabilityEvidence, ModelCapabilityEvidence,
-    ObservationGeometry, ProfileReason, ProfileTransition, RuntimeSignal, SafetyFloor,
-    SemanticAction, SemanticElement, Sensitivity,
+    ComputerObservation, ComputerTarget, EvidenceRef, HostCapabilityEvidence,
+    ModelCapabilityEvidence, ObservationGeometry, ProfileReason, ProfileTransition, RuntimeSignal,
+    SafetyFloor, SemanticAction, SemanticElement, Sensitivity,
 };
 
 fn observation() -> ComputerObservation {
@@ -197,7 +197,16 @@ fn recovery_crash_cut_is_terminal_and_cost_is_truthful() {
 
 #[test]
 fn visual_pointer_actions_require_current_grounded_visual_evidence() {
-    let current = observation();
+    let mut current = observation();
+    current.screenshot = Some(EvidenceRef {
+        content_sha256: "a".repeat(64),
+        media_type: "image/png".into(),
+        byte_len: 4,
+        width: 800,
+        height: 600,
+        redacted: true,
+        asset_id: "opaque".into(),
+    });
     let raw = serde_json::json!({
         "observation_id": current.observation_id,
         "action_type": "pointer_click",
@@ -209,6 +218,7 @@ fn visual_pointer_actions_require_current_grounded_visual_evidence() {
     .to_string();
     assert!(validate_computer_proposal(&raw, &current, AdaptiveProfile::HighAssurance).is_err());
     assert!(validate_computer_proposal_safety_only(&raw, &current).is_err());
+    assert!(!AdaptiveProfile::Balanced.budget().allows_pointer_fallback);
     // Ensure the typed grammar does not accidentally acquire an unbound raw
     // action through a public enum conversion.
     let _ = ComputerAction::ActivateTarget;

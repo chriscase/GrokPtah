@@ -98,6 +98,10 @@ impl HostIssuedBinding {
         &self.principal_generation
     }
 
+    pub(crate) fn effect_lease_reference(&self) -> &str {
+        &self.effect_lease
+    }
+
     pub(crate) fn principal_for_request(&self) -> OpaqueAuthorityToken {
         OpaqueAuthorityToken(self.principal_generation.clone())
     }
@@ -213,6 +217,10 @@ impl ProviderAttemptUsage {
 
     pub(crate) fn prompt_tokens(&self) -> Option<u64> {
         self.prompt_tokens
+    }
+
+    pub(crate) fn attempt_reference(&self) -> &str {
+        &self.attempt_reference
     }
 
     pub(crate) fn completion_tokens(&self) -> Option<u64> {

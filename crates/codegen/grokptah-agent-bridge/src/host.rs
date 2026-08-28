@@ -772,6 +772,13 @@ pub(crate) struct ExternalRunContext {
     pub execution_mode: RunExecutionMode,
 }
 
+fn adaptive_objective_digest(objective: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"grokptah.computer-use.objective.v1\0");
+    hasher.update(objective.trim().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 pub struct AgentHost;
 
 impl AgentHost {
@@ -1152,6 +1159,7 @@ impl AgentHostHandle {
             risk: crate::computer_profile::classify_task(objective, observation),
             minimum_profile: None,
         };
+        let objective_digest = adaptive_objective_digest(objective);
 
         let mut controller = match stored.adaptive.clone() {
             Some(state) => {
@@ -1174,18 +1182,56 @@ impl AgentHostHandle {
                     return Err(anyhow!(format!("{transition:?}")));
                 }
                 controller.bind_authority(snapshot.clone());
+                let previous_risk = controller.risk();
+                let objective_changed =
+                    controller.objective_digest() != Some(objective_digest.as_str());
+                if objective_changed {
+                    controller.bind_objective_digest(objective_digest.clone());
+                    if task_policy.risk > previous_risk {
+                        controller.raise_risk(task_policy.risk);
+                        if task_policy.risk == crate::computer_profile::TaskRisk::Destructive {
+                            let transition =
+                                controller.apply_signal(RuntimeSignal::DestructiveIntentDetected);
+                            self.persist_adaptive_state(
+                                &store,
+                                session_id,
+                                run_id,
+                                expected_version,
+                                &controller,
+                                "destructive_objective",
+                            )?;
+                            return Err(anyhow!(match transition {
+                                crate::computer_profile::ProfileTransition::Stop(stop) => {
+                                    stop.operator_message()
+                                }
+                                crate::computer_profile::ProfileTransition::Escalate { .. } => {
+                                    "destructive objective requires High Assurance"
+                                }
+                            }));
+                        }
+                        if controller.profile() < AdaptivePolicyEngine::risk_floor(task_policy.risk)
+                        {
+                            controller.apply_signal(RuntimeSignal::ConsequentialIntentDetected);
+                        }
+                    }
+                }
                 controller
             }
             None => match AdaptivePolicyEngine.select(&evidence, task_policy) {
-                PolicyOutcome::Proceed(decision) => AdaptiveController::new(run_id, decision),
+                PolicyOutcome::Proceed(decision) => {
+                    let mut controller = AdaptiveController::new(run_id, decision);
+                    controller.bind_objective_digest(objective_digest.clone());
+                    controller
+                }
                 PolicyOutcome::Stop(stop) => {
                     let message = stop.operator_message();
-                    let controller = AdaptiveController::stopped(
+                    let mut controller = AdaptiveController::stopped(
                         run_id,
                         evidence.clone(),
                         task_policy,
                         stop.clone(),
                     );
+                    controller.bind_objective_digest(objective_digest.clone());
                     self.persist_adaptive_state(
                         &store,
                         session_id,

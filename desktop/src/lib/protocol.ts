@@ -1017,6 +1017,8 @@ export interface PendingComputerApproval {
   action: ComputerAction;
   actionSummary: string;
   risk: string;
+  /** Opaque service-issued approval capability; never client-authored. */
+  executionEnvelope: string;
   createdAt: string;
 }
 
@@ -1160,7 +1162,7 @@ export interface AdaptiveProfileProjection {
     hostIndependentVerifier: boolean;
     hostIsolatedGuest: boolean;
     ceiling: AdaptiveProfile;
-    capabilitySnapshotReference?: string | null;
+    capabilitySnapshotId?: string | null;
   };
   budget: {
     observationDetail:

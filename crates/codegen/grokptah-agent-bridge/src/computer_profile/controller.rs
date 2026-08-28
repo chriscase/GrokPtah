@@ -20,6 +20,7 @@ pub const ADAPTIVE_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_ESCALATIONS: usize = 32;
 const MAX_OBSERVATION_DIGESTS: usize = 4;
 const MAX_EVIDENCE_EVENTS: usize = 512;
+const MAX_ADAPTIVE_OBSERVATION_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -116,14 +117,26 @@ pub struct AdaptiveEvidenceEvent {
 pub struct AdaptiveRunState {
     pub schema_version: u32,
     pub revision: u64,
+    #[serde(default)]
+    pub initial_profile: AdaptiveProfile,
     pub profile: AdaptiveProfile,
     pub decision_reason: ProfileReason,
+    #[serde(default)]
+    pub initial_risk: super::risk::TaskRisk,
     pub risk: super::risk::TaskRisk,
     pub capability_ceiling: AdaptiveProfile,
     #[serde(default)]
     pub principal_generation_reference: Option<String>,
     #[serde(default)]
     pub capability_snapshot_reference: Option<String>,
+    #[serde(default)]
+    pub effect_lease_reference: Option<String>,
+    #[serde(default)]
+    pub objective_digest: Option<String>,
+    #[serde(default)]
+    pub provider_attempt_reference: Option<String>,
+    #[serde(default)]
+    pub effect_authority_bound: bool,
     pub evidence: CapabilityEvidence,
     pub escalations: Vec<EscalationRecord>,
     #[serde(default)]
@@ -143,7 +156,10 @@ pub struct AdaptiveRunState {
 impl AdaptiveRunState {
     pub fn validate(&self) -> bool {
         self.schema_version == ADAPTIVE_STATE_SCHEMA_VERSION
+            && self.initial_profile <= self.profile
+            && self.initial_risk <= self.risk
             && self.capability_ceiling >= self.profile
+            && self.escalation_chain_is_valid()
             && self.escalations.len() <= MAX_ESCALATIONS
             && self.evidence_events.len() <= MAX_EVIDENCE_EVENTS
             && self.observation_digests.len() <= MAX_OBSERVATION_DIGESTS
@@ -159,6 +175,40 @@ impl AdaptiveRunState {
                 .as_deref()
                 .is_none_or(valid_reference)
             && self
+                .effect_lease_reference
+                .as_deref()
+                .is_none_or(valid_reference)
+            && self.objective_digest.as_deref().is_none_or(valid_digest)
+            && self
+                .provider_attempt_reference
+                .as_deref()
+                .is_none_or(valid_reference)
+            && self.spend.model_calls <= self.profile.budget().max_model_calls
+            && self.spend.observation_bytes <= MAX_ADAPTIVE_OBSERVATION_BYTES
+            && self.spend.provider_attempts <= self.spend.model_calls
+            && (!self.turn_in_flight || self.terminal.is_none())
+            && self.terminal.as_ref().is_none_or(|terminal| {
+                !self.turn_in_flight
+                    && terminal.profile == self.profile
+                    && (terminal
+                        .required_profile
+                        .is_none_or(|required| required > terminal.profile))
+            })
+            && (!self.effect_authority_bound
+                || (self.effect_lease_reference.is_some()
+                    && self.principal_generation_reference.is_some()
+                    && self.capability_snapshot_reference.is_some()))
+            && (!self.evidence.model.synthetic_only
+                || (!self.evidence.model.durable_authority
+                    && self.principal_generation_reference.is_none()
+                    && self.capability_snapshot_reference.is_none()))
+            && (self.evidence.model.synthetic_only
+                || (self.evidence.model.durable_authority
+                    && self.evidence.model.attribution
+                        == super::capability::CapabilityAttribution::Measured
+                    && self.principal_generation_reference.is_some()
+                    && self.capability_snapshot_reference.is_some()))
+            && self
                 .evidence_events
                 .windows(2)
                 .all(|events| events[0].sequence < events[1].sequence)
@@ -171,6 +221,24 @@ impl AdaptiveRunState {
                     && event
                         .latency_millis
                         .is_none_or(|latency| latency <= 60 * 60 * 1_000)
+            })
+    }
+
+    fn escalation_chain_is_valid(&self) -> bool {
+        self.escalations
+            .windows(2)
+            .all(|pair| pair[0].to == pair[1].from)
+            && (self.escalations.is_empty() && self.profile == self.initial_profile
+                || self
+                    .escalations
+                    .last()
+                    .is_some_and(|record| record.to == self.profile))
+            && self
+                .escalations
+                .last()
+                .is_none_or(|record| record.to == self.profile)
+            && self.escalations.iter().all(|record| {
+                record.from.escalated() == Some(record.to) && record.to <= self.capability_ceiling
             })
     }
 }
@@ -273,12 +341,18 @@ impl AdaptiveController {
             state: AdaptiveRunState {
                 schema_version: ADAPTIVE_STATE_SCHEMA_VERSION,
                 revision: 0,
+                initial_profile: decision.profile,
                 profile: decision.profile,
                 decision_reason: decision.reason,
+                initial_risk: decision.risk,
                 risk: decision.risk,
                 capability_ceiling: decision.ceiling,
                 principal_generation_reference: decision.evidence.principal_generation_reference(),
                 capability_snapshot_reference: decision.capability_snapshot_reference,
+                effect_lease_reference: decision.evidence.effect_lease_reference(),
+                objective_digest: None,
+                provider_attempt_reference: None,
+                effect_authority_bound: false,
                 evidence: decision.evidence,
                 escalations: Vec::new(),
                 evidence_events: Vec::new(),
@@ -376,6 +450,27 @@ impl AdaptiveController {
 
     pub(crate) fn bind_authority(&mut self, authority: super::authority_seam::HostIssuedBinding) {
         self.state.evidence.bind_authority(authority);
+        self.state.principal_generation_reference =
+            self.state.evidence.principal_generation_reference();
+        self.state.capability_snapshot_reference =
+            self.state.evidence.capability_snapshot_reference();
+        self.state.effect_lease_reference = self.state.evidence.effect_lease_reference();
+    }
+
+    pub(crate) fn bind_objective_digest(&mut self, digest: String) {
+        self.state.objective_digest = Some(digest);
+    }
+
+    pub(crate) fn raise_risk(&mut self, risk: super::risk::TaskRisk) {
+        self.state.risk = self.state.risk.max(risk);
+    }
+
+    pub(crate) fn objective_digest(&self) -> Option<&str> {
+        self.state.objective_digest.as_deref()
+    }
+
+    pub(crate) fn bind_effect_authority(&mut self) {
+        self.state.effect_authority_bound = true;
     }
 
     pub fn record_observation(
@@ -550,6 +645,7 @@ impl AdaptiveController {
                 receipt.completion_tokens(),
                 receipt.latency_millis(),
             );
+            self.state.provider_attempt_reference = Some(receipt.attempt_reference().to_string());
         }
         self.state.revision = self.state.revision.saturating_add(1);
     }
@@ -880,5 +976,55 @@ mod tests {
             AdaptiveController::from_state(state).unwrap_err(),
             ControllerError::InvalidState
         );
+    }
+
+    #[test]
+    fn persisted_state_rejects_profile_spend_terminal_and_authority_tampering() {
+        let baseline = controller().into_state();
+
+        let mut profile = baseline.clone();
+        profile.profile = AdaptiveProfile::Balanced;
+        assert_eq!(
+            AdaptiveController::from_state(profile).unwrap_err(),
+            ControllerError::InvalidState
+        );
+
+        let mut spend = baseline.clone();
+        spend.spend.model_calls = spend.profile.budget().max_model_calls + 1;
+        assert_eq!(
+            AdaptiveController::from_state(spend).unwrap_err(),
+            ControllerError::InvalidState
+        );
+
+        let mut terminal = baseline.clone();
+        terminal.turn_in_flight = true;
+        terminal.terminal = Some(TerminalOutcome {
+            kind: TerminalKind::Completed,
+            reason: ProfileReason::RoutineTask,
+            profile: terminal.profile,
+            required_profile: None,
+        });
+        assert_eq!(
+            AdaptiveController::from_state(terminal).unwrap_err(),
+            ControllerError::InvalidState
+        );
+
+        let mut authority = baseline;
+        authority.evidence.model.synthetic_only = true;
+        authority.evidence.model.durable_authority = false;
+        authority.principal_generation_reference = Some("test-principal".into());
+        assert_eq!(
+            AdaptiveController::from_state(authority).unwrap_err(),
+            ControllerError::InvalidState
+        );
+    }
+
+    #[test]
+    fn public_projection_hashes_capability_references() {
+        let controller = controller();
+        let projection = super::super::projection::project_adaptive(&controller);
+        let wire = serde_json::to_string(&projection).unwrap();
+        assert!(!wire.contains("test-capability-generation"));
+        assert!(wire.contains("capabilitySnapshotId"));
     }
 }
