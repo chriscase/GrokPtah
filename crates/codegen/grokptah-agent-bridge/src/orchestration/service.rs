@@ -1491,6 +1491,7 @@ impl OrchestrationService {
     /// Install named device/client credentials while retaining the existing
     /// primary-token configuration field for compatibility with embedders.
     pub fn set_auth_credentials(&self, credentials: Vec<AuthCredential>) -> Result<(), OrchError> {
+        let previous = self.auth_credentials.lock().clone();
         if credentials.is_empty() {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
@@ -1517,9 +1518,22 @@ impl OrchestrationService {
                 .add_control_secrets([credential.token().to_string()]);
         }
         let owner_id = self.agent_owner_id();
-        self.auth_registry
-            .lock()
-            .set_credentials(&credentials, &owner_id)?;
+        {
+            let mut registry = self.auth_registry.lock();
+            registry.set_credentials(&credentials, &owner_id)?;
+            // This API replaces credential material supplied by a caller.
+            // Secret rotation with continuity is exposed separately through
+            // `set_token`; changing a named credential here gets a fresh
+            // incarnation and cannot inherit old resources.
+            for credential in &credentials {
+                if previous
+                    .iter()
+                    .any(|old| old.id == credential.id && old.token() != credential.token())
+                {
+                    registry.replace_credential(&credential.id, &owner_id)?;
+                }
+            }
+        }
         self.config.lock().bearer_token = primary_token;
         *self.auth_credentials.lock() = credentials;
         self.refresh_host_capability_authority();
