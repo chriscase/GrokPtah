@@ -35,6 +35,7 @@ pub fn test_provider_attempt_context() -> xai_provider_attempt::AttemptContext {
     .unwrap()
 }
 
+#[allow(dead_code)]
 pub fn test_config(base_url: &str, api_key: &str) -> SamplerConfig {
     let mut config = SamplerConfig {
         api_key: Some(api_key.to_string()),
@@ -48,6 +49,7 @@ pub fn test_config(base_url: &str, api_key: &str) -> SamplerConfig {
 
 /// Drive one POST through the client; the canned `{}` body is not a valid
 /// completion, but only the wire-level request matters here.
+#[allow(dead_code)]
 pub async fn send_one(client: &SamplingClient) {
     let request = ConversationRequest {
         items: vec![ConversationItem::User(UserItem {
