@@ -2046,6 +2046,30 @@ fn restart_provider_attempt_after_body_change(
     Ok(key)
 }
 
+fn restart_provider_attempt_after_retryable_response(
+    provider_attempt: &mut ProviderAttemptContext,
+    physical_permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
+    provider_id: &str,
+    body: &[u8],
+    rejected_status: u16,
+) -> Result<String> {
+    if let Some(mut permit) = physical_permit.take() {
+        provider_attempt
+            .semantic_rejection(&mut permit, rejected_status)
+            .map_err(|error| anyhow!("record retryable response: {error}"))?;
+    }
+    let next = provider_attempt
+        .acquire_next_effect_lease()
+        .map_err(|error| anyhow!("acquire fresh retry effect lease: {error}"))?;
+    let next_permit = next
+        .begin(provider_id, body, true)
+        .map_err(|error| anyhow!("admit retry provider attempt: {error}"))?;
+    let key = next_permit.idempotency_key().to_owned();
+    *provider_attempt = next;
+    *physical_permit = Some(next_permit);
+    Ok(key)
+}
+
 fn provider_attempt_provider_id(
     creds: &crate::auth_store::WireCredentials,
     target: &ResolvedModelTarget,
@@ -2337,6 +2361,13 @@ where
                         );
                         bail!("HTTP 401 (credential principal changed during refresh)");
                     }
+                    idempotency_key = restart_provider_attempt_after_retryable_response(
+                        &mut provider_attempt,
+                        &mut physical_permit,
+                        &attempt_provider_id,
+                        &serde_json::to_vec(&body)?,
+                        401,
+                    )?;
                     creds = fresh;
                     let refreshed_binding = crate::live_attestation::attest_grok_build_oidc(
                         &target.wire_model,
@@ -2458,6 +2489,13 @@ where
                 && allow_transient_retries
                 && transient_retries < MAX_TRANSIENT_RETRIES
             {
+                idempotency_key = restart_provider_attempt_after_retryable_response(
+                    &mut provider_attempt,
+                    &mut physical_permit,
+                    &attempt_provider_id,
+                    &serde_json::to_vec(&body)?,
+                    status.as_u16(),
+                )?;
                 let delay = 600 * (1 << transient_retries);
                 transient_retries += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
