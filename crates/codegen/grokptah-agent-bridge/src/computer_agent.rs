@@ -6,7 +6,6 @@
 
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::capability_authority::CapabilitySnapshot;
@@ -58,7 +57,6 @@ impl ComputerAgentProposal {
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedComputerEligibility {
     pub eligibility: ComputerAgentEligibility,
-    pub route_fingerprint: String,
     pub capability_snapshot: CapabilitySnapshot,
 }
 
@@ -102,12 +100,6 @@ pub(crate) fn resolve_computer_eligibility(
         CapabilitySource::Measured => "measured",
         CapabilitySource::Unknown => "unknown",
     };
-    let mut hasher = Sha256::new();
-    hasher.update(target.base_url.as_bytes());
-    hasher.update([0]);
-    hasher.update(target.wire_model.as_bytes());
-    hasher.update([0]);
-    hasher.update(format!("{:?}", target.dialect).as_bytes());
     let capability_snapshot = CapabilitySnapshot::provider(
         principal,
         &selection.provider_id,
@@ -125,7 +117,6 @@ pub(crate) fn resolve_computer_eligibility(
             tier,
             source: source.into(),
         },
-        route_fingerprint: format!("{:x}", hasher.finalize()),
         capability_snapshot,
     })
 }

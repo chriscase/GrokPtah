@@ -1343,6 +1343,9 @@ impl AgentHostHandle {
         admission: &ToolCapabilityAdmission,
     ) -> Result<()> {
         let current = self.tool_capability_snapshot(session_id, tool_name, input)?;
+        if admission.snapshot != current {
+            return Err(anyhow!("tool capability changed while waiting to dispatch"));
+        }
         self.capability_authority
             .revalidate(&admission.capability, &current, Utc::now())?;
         let lease = self.capability_authority.lease(
