@@ -146,7 +146,6 @@ pub(crate) fn refresh(
 }
 
 pub(crate) fn revoke_scope(attempt_root: &Path, effect_scope: &str) -> Result<()> {
-    let path = authority_path(attempt_root, effect_scope);
     let mut current = read_authority(attempt_root, effect_scope)?;
     let issued = current.issued_effect_lease_ids.clone();
     for lease in issued.into_iter().chain([current.effect_lease_id.clone()]) {

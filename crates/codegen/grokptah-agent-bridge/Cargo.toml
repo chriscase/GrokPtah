@@ -39,6 +39,7 @@ dunce = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 tower = "0.5"
 http-body-util = "0.1"
+ed25519-dalek = "3.0.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
