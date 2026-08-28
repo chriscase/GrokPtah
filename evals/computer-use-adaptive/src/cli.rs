@@ -15,6 +15,7 @@ pub fn main(args: impl IntoIterator<Item = String>) -> i32 {
     match run(args) {
         Ok(code) => code,
         Err((verdict, message)) => {
+            println!("terminal={} ok=false errors=1", verdict.as_str());
             eprintln!("{message}");
             verdict.exit_code()
         }

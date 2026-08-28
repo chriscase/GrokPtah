@@ -170,4 +170,68 @@ mod tests {
             assert_eq!(parsed.expected.cells.len(), scenario.expected.cells.len());
         }
     }
+
+    #[test]
+    fn world_and_surface_schema_required_match_rust_fields() {
+        let schema: serde_json::Value = serde_json::from_str(SCENARIO_SCHEMA_JSON).unwrap();
+        let world_required: Vec<&str> = schema["$defs"]["world"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for field in [
+            "runId",
+            "surfaces",
+            "grant",
+            "agents",
+            "axPixelContradiction",
+            "consequential",
+            "successFlag",
+        ] {
+            assert!(
+                world_required.contains(&field),
+                "world required missing {field}: {world_required:?}"
+            );
+        }
+        let surface_required: Vec<&str> = schema["$defs"]["surface"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for field in [
+            "surfaceId",
+            "conflictDomain",
+            "isolated",
+            "appId",
+            "windowId",
+            "generation",
+            "displayName",
+            "geometry",
+            "sensitivity",
+            "elements",
+            "frameRegions",
+        ] {
+            assert!(
+                surface_required.contains(&field),
+                "surface required missing {field}: {surface_required:?}"
+            );
+        }
+        let world_json = to_canonical_json(&crate::catalog::catalog()[0].world).unwrap();
+        let world_value: serde_json::Value = serde_json::from_str(&world_json).unwrap();
+        for field in &world_required {
+            assert!(
+                world_value.get(field).is_some(),
+                "catalog world omitted required {field}"
+            );
+        }
+        let surface_value = &world_value["surfaces"][0];
+        for field in &surface_required {
+            assert!(
+                surface_value.get(field).is_some(),
+                "catalog surface omitted required {field}"
+            );
+        }
+    }
 }
