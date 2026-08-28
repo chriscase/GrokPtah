@@ -7,12 +7,14 @@ on:
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
+      - "crates/codegen/grokptah-isolated-visual/**"
       - "evals/**"
       - ".github/workflows/desktop.yml"
   pull_request:
     paths:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
+      - "crates/codegen/grokptah-isolated-visual/**"
       - "evals/**"
       - ".github/workflows/desktop.yml"
 
@@ -48,7 +50,7 @@ jobs:
           components: rustfmt, clippy
       - name: Configure compiler-cache namespace
         env:
-          SCCACHE_NAMESPACE: grokptah-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.92-${{ hashFiles('desktop/src-tauri/Cargo.lock', 'crates/codegen/grokptah-agent-bridge/Cargo.lock', 'evals/certification-lab/Cargo.lock') }}
+          SCCACHE_NAMESPACE: grokptah-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.92-${{ hashFiles('desktop/src-tauri/Cargo.lock', 'crates/codegen/grokptah-agent-bridge/Cargo.lock', 'crates/codegen/grokptah-isolated-visual/Cargo.lock', 'crates/codegen/grokptah-service/Cargo.lock', 'evals/certification-lab/Cargo.lock') }}
         run: echo "SCCACHE_GHA_VERSION=${SCCACHE_NAMESPACE}" >> "$GITHUB_ENV"
       - name: Install compiler cache
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
