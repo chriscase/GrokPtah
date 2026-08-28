@@ -1394,7 +1394,7 @@ pub fn safe_id_filename(id: &str) -> Result<String, OrchError> {
     Ok(hex_sha256(&Sha256::digest(id.as_bytes())))
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         use std::fmt::Write;
@@ -1437,6 +1437,55 @@ pub fn is_recognized_test_command(command: &str) -> bool {
 }
 
 /// Tools exposed by the control plane (schema snapshot source of truth).
+/// What an external observer may learn about a durable mutation attempt.
+///
+/// The stored [`IdempotencyReceipt`] is not safe to publish: `response` is the
+/// full replayed body (prompts, absolute workspace paths, queue entries),
+/// `error` carries a message that formats absolute paths verbatim, and `tool`
+/// is host vocabulary that changes whenever a tool is added. None of them
+/// exist on this type, so no projection bug can leak one.
+///
+/// What remains is enough to answer the only question an observer has a right
+/// to ask: *did this request happen, did it settle, and if it failed, what
+/// class of failure was it?*
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicReceipt {
+    pub request_id: String,
+    /// Stable classification, never the raw tool name.
+    pub operation: String,
+    /// `pending` | `complete` | `failed`. `pending` is the uncertain-send
+    /// fence in durable form and must never be read as an outcome.
+    pub status: String,
+    /// Typed failure code only, present on `failed`. The message is withheld.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// Host-issued opaque attempt digest. Equal payloads under this home
+    /// agree; the unkeyed payload hash never crosses.
+    pub attempt_digest: String,
+    pub run_id: Option<String>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+impl PublicReceipt {
+    /// Classify a host tool into the contract's fixed vocabulary.
+    ///
+    /// Closed on purpose: a tool this build does not know becomes `other`
+    /// rather than putting an arbitrary host string in front of a consumer
+    /// that believes it is reading a classification.
+    pub fn classify(tool: &str) -> &'static str {
+        match tool {
+            "ptah_create_session" => "create_session",
+            "ptah_submit_task" | "ptah_resume_persistent_agent" => "submit_task",
+            "ptah_steer" => "follow_up",
+            "ptah_cancel_run" => "cancel",
+            "ptah_claim_work" => "acquire_lease",
+            "ptah_release_work" => "release_lease",
+            _ => "other",
+        }
+    }
+}
+
 pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_list_sessions",
     "ptah_create_session",
@@ -1447,6 +1496,7 @@ pub const CONTROL_TOOLS: &[&str] = &[
     "ptah_get_run",
     "ptah_get_progress",
     "ptah_get_events",
+    "ptah_list_receipts",
     "ptah_get_changes",
     "ptah_get_test_results",
     "ptah_get_handoff",

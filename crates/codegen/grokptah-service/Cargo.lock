@@ -518,13 +518,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "grokptah-agent-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "grokptah-service"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "dunce",
  "grokptah-agent-bridge",
+ "grokptah-agent-sdk",
  "reqwest",
  "serde_json",
  "tempfile",

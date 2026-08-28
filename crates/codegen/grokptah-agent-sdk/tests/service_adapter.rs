@@ -39,11 +39,15 @@ fn advertised_schema(tool: &str) -> ToolSchema {
         },
         "ptah_create_session" => ToolSchema {
             required: &["workspace"],
-            allowed: &["workspace", "title"],
+            allowed: &["workspace", "title", "request_id"],
         },
         "ptah_get_run" | "ptah_get_test_results" => ToolSchema {
             required: &["session_id", "workspace", "run_id"],
             allowed: &["session_id", "workspace", "run_id"],
+        },
+        "ptah_list_receipts" => ToolSchema {
+            required: &["session_id", "workspace", "run_id"],
+            allowed: &["session_id", "workspace", "run_id", "after", "limit"],
         },
         "ptah_get_events" => ToolSchema {
             required: &["session_id", "workspace", "run_id"],
@@ -104,11 +108,19 @@ fn advertised_schema(tool: &str) -> ToolSchema {
     }
 }
 
-/// The advertised `bounds` sub-schema. Note the absence of `maxTotalTokens`:
-/// `merge_bounds` (`src/orchestration/types.rs`) accepts it and
-/// `docs/MCP_CONTROL_COORDINATOR.md` documents it, but `tool_input_schema`
-/// does not list it.
-const ADVERTISED_BOUNDS_KEYS: &[&str] = &["maxPromptBytes", "maxRounds", "maxDurationMs"];
+/// The advertised `bounds` sub-schema, mirroring the host.
+///
+/// `maxTotalTokens` is present now. It was not before this branch: the runtime
+/// accepted it in `merge_bounds` and the coordinator docs documented it, but
+/// `tool_input_schema` omitted it while declaring `additionalProperties:
+/// false` — so a schema-validating client was refused the one ceiling it most
+/// needed. The host schema and this mirror were fixed together.
+const ADVERTISED_BOUNDS_KEYS: &[&str] = &[
+    "maxPromptBytes",
+    "maxRounds",
+    "maxDurationMs",
+    "maxTotalTokens",
+];
 
 fn assert_schema_conformant(tool: &str, args: &Value) {
     let schema = advertised_schema(tool);
@@ -252,7 +264,7 @@ impl McpTransport for BridgeDouble {
         if let Some(bounds) = arguments.get("bounds").and_then(Value::as_object) {
             for key in bounds.keys() {
                 assert!(
-                    ADVERTISED_BOUNDS_KEYS.contains(&key.as_str()) || key == "maxTotalTokens",
+                    ADVERTISED_BOUNDS_KEYS.contains(&key.as_str()),
                     "unexpected bounds key {key}"
                 );
             }
@@ -739,9 +751,9 @@ async fn a_token_ceiling_travels_outside_the_advertised_bounds_schema() {
         !bounds.contains_key("maxDurationMs"),
         "unset bounds stay unset"
     );
-    // Documented divergence: the runtime accepts this key, the advertised
-    // schema does not list it. See docs/AGENT_SDK_SEAM.md.
-    assert!(!ADVERTISED_BOUNDS_KEYS.contains(&"maxTotalTokens"));
+    // Previously a documented divergence: the runtime accepted this key while
+    // the advertised schema omitted it. Both now agree.
+    assert!(ADVERTISED_BOUNDS_KEYS.contains(&"maxTotalTokens"));
 }
 
 // ── Redaction ─────────────────────────────────────────────────────────────
@@ -1245,7 +1257,7 @@ async fn a_lease_credential_reaches_the_host_but_not_the_wire_projection() {
 // ── Receipts are not reachable over this boundary ─────────────────────────
 
 #[tokio::test]
-async fn the_service_adapter_reports_receipts_absent_rather_than_empty() {
+async fn an_older_host_reports_receipts_absent_rather_than_empty() {
     let plane = operator(BridgeDouble::new());
     let session = seeded(&plane).await;
     let accepted = plane
@@ -1264,7 +1276,7 @@ async fn the_service_adapter_reports_receipts_absent_rather_than_empty() {
             PageRequest::new(),
         )
         .await
-        .expect_err("the control plane exposes no receipt read");
+        .expect_err("this double models a host predating the receipt read");
 
     // Unsupported, not an empty page: a consumer would read emptiness as
     // "no mutations happened", which is the one thing this must never say.

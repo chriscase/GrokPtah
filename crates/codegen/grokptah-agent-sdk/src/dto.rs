@@ -701,6 +701,30 @@ impl AttemptDigest {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Accept a digest the **host** already salted.
+    ///
+    /// Preferred over [`derive`](Self::derive) when the host issues opaque
+    /// digests itself: the unkeyed payload hash then never leaves the host at
+    /// all, rather than travelling the wire to be salted here. Validated on
+    /// the way in so a host cannot smuggle a longer string, mixed case, or
+    /// non-hex through a field consumers treat as an opaque token.
+    pub fn from_host(raw: impl AsRef<str>) -> SdkResult<Self> {
+        let raw = raw.as_ref();
+        if raw.len() != Self::BYTES * 2 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(SdkError::new(
+                SdkErrorCode::Internal,
+                "host attempt digest was not the advertised width of lowercase hex",
+            ));
+        }
+        if raw.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Err(SdkError::new(
+                SdkErrorCode::Internal,
+                "host attempt digest must be lowercase",
+            ));
+        }
+        Ok(Self(raw.to_string()))
+    }
 }
 
 impl std::fmt::Display for AttemptDigest {

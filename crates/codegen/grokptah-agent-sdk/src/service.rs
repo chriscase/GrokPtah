@@ -313,6 +313,7 @@ mod tools {
     pub const SUBMIT_TASK: &str = "ptah_submit_task";
     pub const GET_RUN: &str = "ptah_get_run";
     pub const GET_EVENTS: &str = "ptah_get_events";
+    pub const LIST_RECEIPTS: &str = "ptah_list_receipts";
     pub const GET_TEST_RESULTS: &str = "ptah_get_test_results";
     pub const STEER: &str = "ptah_steer";
     pub const CANCEL: &str = "ptah_cancel";
@@ -325,6 +326,7 @@ mod tools {
         SUBMIT_TASK,
         GET_RUN,
         GET_EVENTS,
+        LIST_RECEIPTS,
         GET_TEST_RESULTS,
         STEER,
         CANCEL,
@@ -389,6 +391,30 @@ impl<T: McpTransport> ServiceControlPlane<T> {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .len()
+    }
+
+    /// Refuse locally when the host never advertised the tool a capability
+    /// needs.
+    ///
+    /// An older host simply does not list it, and calling anyway would turn a
+    /// clean "this host cannot do that" into an unmapped-tool error from the
+    /// far side. The refusal costs no `tools/call`, so a consumer can probe a
+    /// capability without spending a round trip against every host that lacks
+    /// it.
+    async fn require_tool(&self, tool: &str, capability: CapabilityId) -> SdkResult<()> {
+        let advertised = self
+            .transport
+            .list_tools()
+            .await
+            .map_err(TransportFault::into_sdk_error)?;
+        if advertised.iter().any(|name| name == tool) {
+            return Ok(());
+        }
+        Err(SdkError::new(
+            SdkErrorCode::Unsupported,
+            format!("this host does not advertise `{tool}`"),
+        )
+        .with_detail("capability", capability.as_wire()))
     }
 
     fn resolve_workspace(&self, reference: &WorkspaceRef) -> SdkResult<String> {
@@ -505,6 +531,72 @@ fn tool_kind_from(raw: &str) -> ToolKind {
 
 fn tool_status_from(raw: &str) -> Option<ToolStatus> {
     serde_json::from_value(Value::String(raw.to_string())).ok()
+}
+
+/// Project one host receipt.
+///
+/// Every field the host could have sent that this contract withholds — the
+/// response body, the failure message, the raw tool name, the unkeyed payload
+/// hash — is simply never read here, so adding one host-side cannot leak it by
+/// accident.
+fn project_receipt(raw: &Value) -> SdkResult<ReceiptView> {
+    let request_id = RequestId::new(
+        str_field(raw, "request_id", "requestId").ok_or_else(|| malformed("receipt.requestId"))?,
+    )?;
+    let operation = OperationClass::from_wire(
+        &str_field(raw, "operation", "operation").ok_or_else(|| malformed("receipt.operation"))?,
+    );
+    let status = ReceiptStatus::from_wire(
+        &str_field(raw, "status", "status").ok_or_else(|| malformed("receipt.status"))?,
+    );
+    let outcome = str_field(raw, "outcome", "outcome").map(|code| SdkErrorCode::from_wire(&code));
+    let payload_digest = AttemptDigest::from_host(
+        str_field(raw, "attempt_digest", "attemptDigest")
+            .ok_or_else(|| malformed("receipt.attemptDigest"))?,
+    )?;
+    let run_id = str_field(raw, "run_id", "runId")
+        .map(RunId::new)
+        .transpose()?;
+    let recorded_at = timestamp(raw, "recorded_at", "recordedAt")
+        .ok_or_else(|| malformed("receipt.recordedAt"))?;
+    Ok(ReceiptView {
+        request_id,
+        operation,
+        status,
+        outcome,
+        payload_digest,
+        run_id,
+        recorded_at,
+    })
+}
+
+/// Project the retention window a listing came from.
+fn project_retention(raw: &Value) -> SdkResult<ReceiptRetention> {
+    let max_receipts = u32_field(raw, "max_receipts", "maxReceipts")
+        .ok_or_else(|| malformed("retention.maxReceipts"))?;
+    let max_age_days = u32_field(raw, "max_age_days", "maxAgeDays")
+        .ok_or_else(|| malformed("retention.maxAgeDays"))?;
+    let exemptions = field(raw, "exemptions", "exemptions");
+    // A missing exemption flag defaults to *exempt*. The opposite default is
+    // the dangerous one: it would let a consumer conclude that an old receipt
+    // must already be gone.
+    let flag = |snake: &str, camel: &str| -> bool {
+        exemptions
+            .and_then(|value| field(value, snake, camel))
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    };
+    Ok(ReceiptRetention {
+        max_receipts,
+        max_age_days,
+        budget_scope: RetentionBudgetScope::from_wire(
+            &str_field(raw, "budget_scope", "budgetScope").unwrap_or_else(|| "host".into()),
+        ),
+        exemptions: RetentionExemptions {
+            unsettled_retained: flag("unsettled_retained", "unsettledRetained"),
+            active_run_retained: flag("active_run_retained", "activeRunRetained"),
+        },
+    })
 }
 
 /// Project the durable Run record onto the public view.
@@ -807,15 +899,7 @@ impl<T: McpTransport> AgentControlPlane for ServiceControlPlane<T> {
             true,
         );
 
-        // The durable receipts exist on the host, but no tool reads them.
-        offered.push(CapabilityDescriptor {
-            id: CapabilityId::ReceiptRead,
-            since: ContractVersion::new(CONTRACT_VERSION.major, 1),
-            availability: Availability::Unsupported {
-                reason: Label::new("the control plane exposes no receipt read tool")
-                    .expect("static label"),
-            },
-        });
+        declare(CapabilityId::ReceiptRead, &[tools::LIST_RECEIPTS], false);
 
         // Read-only Computer Run projections exist on the host but are not
         // mapped by this adapter build. Saying so is better than silence: a
@@ -1235,14 +1319,45 @@ impl<T: McpTransport> AgentControlPlane for ServiceControlPlane<T> {
     /// page would read as "no mutations happened".
     async fn list_receipts(
         &self,
-        _selector: RunSelector,
-        _page: PageRequest,
+        selector: RunSelector,
+        page: PageRequest,
     ) -> SdkResult<ReceiptPage> {
-        Err(SdkError::new(
-            SdkErrorCode::Unsupported,
-            "the control plane exposes no receipt read; see docs/AGENT_SDK_SEAM.md",
-        )
-        .with_detail("capability", CapabilityId::ReceiptRead.as_wire()))
+        self.require_tool(tools::LIST_RECEIPTS, CapabilityId::ReceiptRead)
+            .await?;
+        let workspace = self.resolve_workspace(&selector.workspace)?;
+        let limit = page.resolve_limit(self.limits.max_event_page)?;
+        let mut arguments = json!({
+            "session_id": selector.session_id.as_str(),
+            "workspace": workspace,
+            "run_id": selector.run_id.as_str(),
+            "limit": limit,
+        });
+        if let Some(cursor) = page.after.as_ref() {
+            arguments["after"] = json!(cursor.as_str());
+        }
+        let body = self.call(tools::LIST_RECEIPTS, arguments).await?;
+
+        let items = body
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| malformed("receipts.items"))?
+            .iter()
+            .map(project_receipt)
+            .collect::<SdkResult<Vec<ReceiptView>>>()?;
+
+        // The window is not optional. A page without it would let a consumer
+        // read absence as proof that a mutation never happened.
+        let retention = project_retention(
+            body.get("retention")
+                .ok_or_else(|| malformed("receipts.retention"))?,
+        )?;
+
+        let next_cursor = body
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(Cursor::from_opaque);
+
+        Ok(ReceiptPage::new(items, next_cursor, retention))
     }
 
     /// Fetch one bounded, digest-verified artifact.

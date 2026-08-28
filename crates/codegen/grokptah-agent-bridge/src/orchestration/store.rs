@@ -27,7 +27,7 @@ use super::routine::{
     ROUTINE_SCHEMA_VERSION,
 };
 use super::types::{
-    safe_id_filename, AgentRecord, AgentSpec, AgentState, AuditEntry, ContinuationCheckpoint,
+    hex_sha256, safe_id_filename, AgentRecord, AgentSpec, AgentState, AuditEntry, ContinuationCheckpoint,
     IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunBounds, RunRecord, RunState,
     RunStopCause,
 };
@@ -4794,6 +4794,109 @@ impl OrchStore {
             .idemp_path(&receipt.request_id)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         atomic_write_json(&path, receipt)
+    }
+
+    /// Per-home secret used to derive opaque attempt digests.
+    ///
+    /// The stored `payload_hash` is an unkeyed `SHA-256` of the serialized
+    /// request, and for `ptah_submit_task` that request contains the prompt.
+    /// Publishing it — even to a bearer holder — would hand out a
+    /// prompt-confirmation oracle: guess the text, hash it, compare. Reads on
+    /// this control plane are scoped by session and workspace rather than by
+    /// principal, so that oracle would work across credentials sharing a
+    /// session, not only on the caller's own traffic.
+    ///
+    /// The salt is persisted so digests stay comparable across restarts, and
+    /// is created 0600 on first use. It never leaves the host.
+    fn receipt_digest_salt(&self) -> anyhow::Result<Vec<u8>> {
+        let path = self.inner.root.join("receipt-digest.key");
+        if let Ok(existing) = fs::read(&path) {
+            if existing.len() >= 32 {
+                return Ok(existing);
+            }
+        }
+        let mut secret = Vec::with_capacity(32);
+        secret.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        secret.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        std::io::Write::write_all(&mut file, &secret)?;
+        Ok(secret)
+    }
+
+    /// Opaque, host-issued attempt digest for a stored receipt.
+    ///
+    /// Equal payloads under one home agree; nothing else survives. A caller
+    /// cannot test a guessed prompt without the salt, and two homes never
+    /// agree on the same payload.
+    pub fn attempt_digest(&self, payload_hash: &str) -> anyhow::Result<String> {
+        use sha2::{Digest, Sha256};
+        let salt = self.receipt_digest_salt()?;
+        let mut hasher = Sha256::new();
+        hasher.update(&salt);
+        hasher.update([0u8]);
+        hasher.update(payload_hash.as_bytes());
+        Ok(hex_sha256(&hasher.finalize())[..32].to_string())
+    }
+
+    /// Receipts belonging to one run, ordered `(created_at, request_id)`.
+    ///
+    /// Ordering is total and deterministic so a paged walk yields exactly the
+    /// unpaged order; the request id breaks ties inside a single millisecond
+    /// so no receipt is dropped or repeated at a page boundary. `after` is the
+    /// last `(created_at_millis, request_id)` the caller saw.
+    ///
+    /// Reads only. Receipt *writers* stay private to the idempotency path.
+    pub fn list_idempotency_for_run(
+        &self,
+        run_id: &str,
+        after: Option<(i64, String)>,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<IdempotencyReceipt>, bool)> {
+        let dir = self.inner.root.join("idempotency");
+        let mut found: Vec<IdempotencyReceipt> = Vec::new();
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // A home that has never recorded a receipt is empty, not broken.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((found, false)),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(receipt) = serde_json::from_str::<IdempotencyReceipt>(&text) else {
+                continue;
+            };
+            if receipt.run_id.as_deref() != Some(run_id) {
+                continue;
+            }
+            found.push(receipt);
+        }
+        found.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.request_id.cmp(&b.request_id))
+        });
+        if let Some((millis, request_id)) = after {
+            found.retain(|r| {
+                let key = (r.created_at.timestamp_millis(), r.request_id.clone());
+                key > (millis, request_id.clone())
+            });
+        }
+        let has_more = found.len() > limit;
+        found.truncate(limit);
+        Ok((found, has_more))
     }
 
     pub fn load_idempotency(&self, request_id: &str) -> anyhow::Result<Option<IdempotencyReceipt>> {

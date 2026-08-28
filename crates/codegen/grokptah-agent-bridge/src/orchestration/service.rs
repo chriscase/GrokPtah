@@ -35,7 +35,10 @@ use super::routine::{
     RoutineConcurrencyPolicy, RoutineLifecycle, RoutineRecord, RoutineRetryPolicy, RoutineTrigger,
     WorkTemplate,
 };
-use super::store::{IdempotencyClaim, OrchStore};
+use super::store::{
+    IdempotencyClaim, OrchStore, DEFAULT_IDEMPOTENCY_RECEIPT_AGE,
+    DEFAULT_MAX_IDEMPOTENCY_RECEIPTS,
+};
 use super::supervisor::{
     ManagerSupervisorReport, ManagerSupervisorStatus, RoutineSupervisor, RoutineSupervisorStatus,
     WorkloadSupervisor, WorkloadSupervisorStatus, DEFAULT_MANAGER_TICK_INTERVAL,
@@ -1865,6 +1868,24 @@ impl OrchestrationService {
     }
 
     /// Load run and verify workspace ownership against allowlist + session.
+    /// The single denial for every "this run is not yours to touch" case.
+    ///
+    /// Unknown, outside the workspace allowlist, and belonging to another
+    /// session must be **indistinguishable**. A caller that can tell them
+    /// apart can probe run ids for existence, which turns every read endpoint
+    /// into an existence oracle over other principals' runs — and reads here
+    /// are scoped by session and workspace, not by principal, so the ids being
+    /// probed are not necessarily the caller's own.
+    ///
+    /// A *malformed* id keeps `invalid_request`: that is a format error about
+    /// the caller's own input and discloses nothing about what exists.
+    fn run_not_available() -> OrchError {
+        OrchError::new(
+            OrchErrorCode::ForbiddenScope,
+            "run is not available in the requested scope",
+        )
+    }
+
     fn load_authorized_run(&self, run_id: &str) -> Result<RunRecord, OrchError> {
         if safe_id_filename(run_id).is_err() {
             return Err(OrchError::new(
@@ -1876,25 +1897,17 @@ impl OrchestrationService {
             .store
             .load_run(run_id)
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))?
-            .ok_or_else(|| OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"))?;
+            .ok_or_else(Self::run_not_available)?;
         let allowlist = self.config.lock().allowlist.clone();
         let ws = PathBuf::from(&run.workspace);
         if !allowlist.contains(&ws) {
-            return Err(OrchError::new(
-                OrchErrorCode::ForbiddenScope,
-                "run workspace not authorized",
-            ));
+            return Err(Self::run_not_available());
         }
         // Session must still match claimed workspace when present.
         if let Ok(session) = self.host.session_inspect(run.session_id) {
             if !session.cwd.is_empty() {
                 let _ = require_workspace_match(&allowlist, Some(Path::new(&session.cwd)), &ws)
-                    .map_err(|_| {
-                        OrchError::new(
-                            OrchErrorCode::ForbiddenScope,
-                            "run session workspace mismatch",
-                        )
-                    })?;
+                    .map_err(|_| Self::run_not_available())?;
             }
         }
         Ok(run)
@@ -1974,6 +1987,70 @@ impl OrchestrationService {
             "updatedAt": summary.updated_at,
             "busy": false,
         }))
+    }
+
+    /// Create a session under a caller-supplied idempotency key.
+    ///
+    /// Session creation was the one mutation on this control plane with no
+    /// request identity: a client that timed out could not tell whether its
+    /// session existed, and retrying made a second one. With a `request_id`
+    /// the outcome is durable — an exact retry replays the original response
+    /// byte-for-byte, and the same key with a different payload is a
+    /// `conflict` rather than a silent second session.
+    ///
+    /// `request_id` stays optional so existing callers keep working unchanged;
+    /// when it is absent this is exactly [`create_session`](Self::create_session).
+    ///
+    /// Authorization precedes the claim on purpose: an unauthorized request
+    /// must not burn an idempotency key, and a replay whose workspace has
+    /// since left the allowlist must be refused rather than replayed.
+    pub async fn create_session_idempotent(
+        &self,
+        auth: &AuthContext,
+        workspace: &Path,
+        title: Option<String>,
+        request_id: Option<String>,
+    ) -> Result<serde_json::Value, OrchError> {
+        let Some(request_id) = request_id.map(|id| id.trim().to_string()).filter(|id| !id.is_empty())
+        else {
+            return self.create_session(auth, workspace, title);
+        };
+        if safe_id_filename(&request_id).is_err() {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "malformed request_id",
+            ));
+        }
+        let claimed = canonical_workspace(workspace)?;
+        if !self.config.lock().allowlist.contains(&claimed) {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "workspace is not allowlisted by this service",
+            ));
+        }
+        // The hash covers exactly what the caller asked for, so reusing a key
+        // with a different workspace or title is a conflict rather than a
+        // replay of the wrong session.
+        let payload_hash = hash_payload(&json!({
+            "workspace": claimed.display().to_string(),
+            "title": title,
+        }));
+        let tool = "ptah_create_session";
+        match self
+            .begin_idempotency(tool, &request_id, &payload_hash, Uuid::nil(), &claimed)
+            .await?
+        {
+            IdempotencyStart::Replay(value) => Ok(value),
+            IdempotencyStart::Perform(mut lease) => {
+                match self.create_session(auth, &claimed, title) {
+                    Ok(response) => {
+                        lease.complete(None, response.clone())?;
+                        Ok(response)
+                    }
+                    Err(error) => Err(lease.fail(None, error)),
+                }
+            }
+        }
     }
 
     /// List durable agent identities whose workspaces are visible to this
@@ -5102,6 +5179,90 @@ impl OrchestrationService {
         )
     }
 
+    /// Durable receipts for one run, redacted and bounded.
+    ///
+    /// Gated by exactly the same `authorize_run_request` fence every other
+    /// scoped read uses, so an unknown run, a run in another session, and a
+    /// run outside the allowlist all give one indistinguishable denial.
+    ///
+    /// The page carries its retention window because a listing is only
+    /// interpretable next to one: a receipt that aged out and a receipt that
+    /// never existed look identical, and a consumer that reads absence as
+    /// proof of "it never happened" will be wrong. Retention here is a
+    /// *host-wide* budget that also exempts unsettled receipts and receipts
+    /// belonging to non-terminal runs, so the window is reported with those
+    /// exemptions rather than as a bare count.
+    pub fn list_receipts_scoped(
+        &self,
+        _auth: &AuthContext,
+        session_id: Uuid,
+        workspace: &Path,
+        run_id: &str,
+        after: Option<String>,
+        limit: usize,
+    ) -> Result<serde_json::Value, OrchError> {
+        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let cursor = match after.as_deref().filter(|value| !value.is_empty()) {
+            None => None,
+            Some(raw) => {
+                // A cursor this host did not issue is a malformed request, not
+                // a silent restart from the beginning: restarting would hand
+                // the caller a page it has already seen and call it new.
+                let (millis, request_id) = raw.split_once(':').ok_or_else(|| {
+                    OrchError::new(OrchErrorCode::InvalidRequest, "malformed receipt cursor")
+                })?;
+                let millis: i64 = millis.parse().map_err(|_| {
+                    OrchError::new(OrchErrorCode::InvalidRequest, "malformed receipt cursor")
+                })?;
+                Some((millis, request_id.to_string()))
+            }
+        };
+        let (receipts, has_more) = self
+            .store
+            .list_idempotency_for_run(&run.run_id, cursor, limit)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+
+        let mut items = Vec::with_capacity(receipts.len());
+        for receipt in &receipts {
+            let attempt_digest = self
+                .store
+                .attempt_digest(&receipt.payload_hash)
+                .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+            items.push(PublicReceipt {
+                request_id: receipt.request_id.clone(),
+                operation: PublicReceipt::classify(&receipt.tool).to_string(),
+                status: receipt.status.clone(),
+                // Only the typed code. The message is withheld because runtime
+                // messages format absolute paths verbatim.
+                outcome: receipt
+                    .error
+                    .as_ref()
+                    .map(|error| error.code.as_str().to_string()),
+                attempt_digest,
+                run_id: receipt.run_id.clone(),
+                recorded_at: receipt.created_at,
+            });
+        }
+        let next_cursor = has_more
+            .then(|| items.last())
+            .flatten()
+            .map(|last| format!("{}:{}", last.recorded_at.timestamp_millis(), last.request_id));
+
+        Ok(json!({
+            "items": items,
+            "nextCursor": next_cursor,
+            "retention": {
+                "maxReceipts": DEFAULT_MAX_IDEMPOTENCY_RECEIPTS,
+                "maxAgeDays": DEFAULT_IDEMPOTENCY_RECEIPT_AGE.num_days(),
+                "budgetScope": "host",
+                "exemptions": {
+                    "unsettledRetained": true,
+                    "activeRunRetained": true,
+                },
+            },
+        }))
+    }
+
     /// Authorize a run and return its current journal bounds plus an initial
     /// durable page for the optional Streamable HTTP live channel.
     pub(crate) fn live_run_page(
@@ -5535,10 +5696,7 @@ impl OrchestrationService {
     ) -> Result<RunRecord, OrchError> {
         let run = self.load_authorized_run(run_id)?;
         if run.session_id != session_id {
-            return Err(OrchError::new(
-                OrchErrorCode::ForbiddenScope,
-                "run does not belong to the requested session",
-            ));
+            return Err(Self::run_not_available());
         }
         let session = self.require_build_session(session_id)?;
         let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
@@ -7564,10 +7722,7 @@ impl OrchestrationService {
         let run = match self.store.load_run(rid) {
             Ok(Some(r)) => r,
             Ok(None) => {
-                return Err(fail(
-                    self,
-                    OrchError::new(OrchErrorCode::InvalidRequest, "unknown run_id"),
-                ));
+                return Err(fail(self, Self::run_not_available()));
             }
             Err(e) => {
                 return Err(fail(
@@ -7578,13 +7733,7 @@ impl OrchestrationService {
         };
 
         if run.session_id != session_id {
-            return Err(fail(
-                self,
-                OrchError::new(
-                    OrchErrorCode::ForbiddenScope,
-                    "run_id does not belong to session",
-                ),
-            ));
+            return Err(fail(self, Self::run_not_available()));
         }
         let session = match self.host.session_inspect(session_id) {
             Ok(s) => s,

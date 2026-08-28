@@ -682,18 +682,32 @@ pub async fn run_battery<H: Harness>(harness: &H) -> ConformanceReport {
             request_id: harness.next_request_id(),
             selector: selector.clone(),
         };
-        match plane.cancel_run(request.clone()).await {
-            Err(error) => CheckOutcome::Failed(format!("cancel failed: {error}")),
-            Ok(first) => match plane.cancel_run(request).await {
-                Err(error) => CheckOutcome::Failed(format!("cancel replay failed: {error}")),
-                Ok(second) if second.lifecycle != first.lifecycle => {
-                    CheckOutcome::Failed("cancel replay changed the lifecycle".into())
-                }
-                Ok(second) if second.replayed == Some(false) => {
-                    CheckOutcome::Failed("cancel replay reported itself as fresh work".into())
-                }
-                Ok(_) => CheckOutcome::Passed,
-            },
+        // Idempotence is *agreement between the two calls*, not "the first one
+        // succeeds". A host is entitled to refuse cancelling a run that has
+        // already reached a terminal state — the live runtime does exactly
+        // that. What it may never do is answer differently the second time,
+        // because that would mean the first call changed something.
+        let first = plane.cancel_run(request.clone()).await;
+        let second = plane.cancel_run(request).await;
+        match (first, second) {
+            (Ok(first), Ok(second)) if second.lifecycle != first.lifecycle => {
+                CheckOutcome::Failed("cancel replay changed the lifecycle".into())
+            }
+            (Ok(_), Ok(second)) if second.replayed == Some(false) => {
+                CheckOutcome::Failed("cancel replay reported itself as fresh work".into())
+            }
+            (Ok(_), Ok(_)) => CheckOutcome::Passed,
+            (Err(first), Err(second)) if first.code == second.code => CheckOutcome::Passed,
+            (Err(first), Err(second)) => CheckOutcome::Failed(format!(
+                "cancel refused differently on replay: {} then {}",
+                first.code, second.code
+            )),
+            (Ok(_), Err(error)) => CheckOutcome::Failed(format!(
+                "cancel succeeded then failed on replay, so the first call mutated: {error}"
+            )),
+            (Err(error), Ok(_)) => CheckOutcome::Failed(format!(
+                "cancel failed then succeeded on replay, so the refusal was not stable: {error}"
+            )),
         }
     });
 
