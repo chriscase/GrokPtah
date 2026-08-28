@@ -643,6 +643,11 @@ pub struct ComputerRun {
     pub current_observation: Option<ComputerObservation>,
     pub grant: Option<ActionGrant>,
     pub last_outcome: Option<ActionOutcome>,
+    /// Durable adaptive profile state for this Computer Run. The state is
+    /// redacted when projected to a coordinator and is never shared between
+    /// runs or stored only in session memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive: Option<crate::computer_profile::AdaptiveRunState>,
     pub audit: Vec<ComputerAuditEntry>,
     pub last_error: Option<ComputerError>,
 }
@@ -679,6 +684,7 @@ impl ComputerRun {
             current_observation: None,
             grant: None,
             last_outcome: None,
+            adaptive: None,
             audit: Vec::new(),
             last_error: None,
         })

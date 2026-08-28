@@ -5,8 +5,6 @@
 //! terminal truth inside the existing Computer Run record. Each turn is
 //! compare-and-swap admitted and restart recovery never replays work.
 
-use std::collections::VecDeque;
-
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -199,7 +197,7 @@ impl ObservationFingerprint {
     }
 
     fn hex(self) -> String {
-        format!("{:x}", self.0)
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 }
 

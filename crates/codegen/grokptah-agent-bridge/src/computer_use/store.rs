@@ -284,6 +284,16 @@ impl ComputerStore {
                 ComputerErrorCode::Interrupted,
                 "computer run interrupted by process restart; explicit reauthorization required",
             ));
+            if let Some(adaptive) = &mut run.adaptive {
+                if let Ok(mut controller) =
+                    crate::computer_profile::AdaptiveController::from_state(adaptive.clone())
+                {
+                    controller.recover_interrupted();
+                    *adaptive = controller.into_state();
+                } else {
+                    run.adaptive = None;
+                }
+            }
             // The interruption must be visible in the durable journal itself,
             // not only on the run record, so a coordinator replaying events
             // sees why the run ended (#286).
@@ -404,6 +414,13 @@ fn validate_run_record(run: &ComputerRun) -> ComputerResult<()> {
         return Err(invalid_record());
     }
     if run.state.is_terminal() != run.ended_at.is_some() {
+        return Err(invalid_record());
+    }
+    if run
+        .adaptive
+        .as_ref()
+        .is_some_and(|adaptive| !adaptive.validate())
+    {
         return Err(invalid_record());
     }
     if (run.control_disposition == ComputerControlDisposition::OperatorTakeover

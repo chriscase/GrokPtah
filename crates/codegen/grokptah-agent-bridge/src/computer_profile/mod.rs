@@ -17,8 +17,7 @@ pub mod replay;
 pub mod risk;
 
 pub(crate) use adapters::{
-    AdaptiveObservationAdapter, ObservationAdapterOutput, ProviderImageInput,
-    SemanticHeadlessAdapter, VisualGroundingAdapter,
+    AdaptiveObservationAdapter, SemanticHeadlessAdapter, VisualGroundingAdapter,
 };
 pub use authority::{
     AdaptiveAuthoritySnapshot, AuthorityFailure, CanonicalAuthority, ProviderAttemptReceipt,

@@ -8,7 +8,7 @@
 
 use sha2::{Digest, Sha256};
 
-use super::profile::{AdaptiveProfile, ObservationDetail, ProfileBudget};
+use super::profile::{ObservationDetail, ProfileBudget};
 use crate::computer_use::{ComputerError, ComputerErrorCode, ComputerObservation};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
