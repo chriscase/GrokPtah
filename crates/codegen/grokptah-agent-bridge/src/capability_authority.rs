@@ -78,6 +78,7 @@ impl CapabilitySnapshot {
             principal,
             model_id,
             [
+                provider_id,
                 base_url,
                 wire_model_id,
                 dialect,

@@ -477,7 +477,7 @@ impl ComputerUseService {
                     Ok(lease) => lease,
                     Err(error) => {
                         self.fail_inflight(run_id, "act", &error)?;
-                        self.finish_mutation(request_id, &Err(error.clone()))?;
+                        self.finish_mutation::<ActionOutcome>(request_id, &Err(error.clone()))?;
                         return Err(error);
                     }
                 };
