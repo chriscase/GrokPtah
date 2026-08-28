@@ -979,8 +979,17 @@ impl AgentHostHandle {
         &self,
         session_id: Uuid,
     ) -> Result<CapabilityPrincipal> {
-        self.capability_principal(session_id)
-            .or_else(|_| Ok(CapabilityPrincipal::host_default()))
+        match self.capability_principal(session_id) {
+            Ok(principal) => Ok(principal),
+            Err(error) => {
+                let known_session = self.inner.lock().sessions.contains_key(&session_id);
+                if known_session {
+                    Err(error)
+                } else {
+                    Ok(CapabilityPrincipal::host_default())
+                }
+            }
+        }
     }
     /// The validated durable root owned by this host process.
     pub fn runtime_home(&self) -> crate::discover::RuntimeHome {
