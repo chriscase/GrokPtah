@@ -184,6 +184,27 @@ Computer Use service mutations. Free-form legacy `detail` is deliberately not
 adapted; the bounded public projection contains no prompt, credential, path,
 locator, clipboard, frame, HMAC key, or private provider payload.
 
+## Operator recovery
+
+1. Stop every owner of the orchestration home and take a byte-preserving copy
+   before inspection. Use the explicit store shutdown boundary; do not delete a
+   lock file to force a restart.
+2. Reopen with the same custody mode and key ring. Inspect `audit_status`,
+   then run `verify_audit` or a fresh export. A `poisoned`/unavailable result is
+   an incident state, not a prompt to edit JSON.
+3. Preserve `manifest.json`, generation directories, tombstones, gap evidence,
+   legacy v1 inputs, and key epochs. Restore a trusted backup or supply the
+   missing authorized key material; do not renumber, rewrite, reseal, or delete
+   poisoned evidence.
+4. Retention is the only deletion path and requires a fully verified,
+   authenticated, non-current generation plus an authenticated export seal or
+   explicit operator override. A committed tombstone may resume its already
+   authorized byte removal after restart; this is convergence, not repair.
+
+There is no automatic destructive repair, no silent gap filling, and no
+rollback guarantee without a configured witness. Escalate uncertain provider,
+queue, Computer Use, or shutdown outcomes for explicit reconciliation.
+
 ## Limits this does not close
 
 - **Joint rollback.** Restoring the manifest, every anchor and every journal to
