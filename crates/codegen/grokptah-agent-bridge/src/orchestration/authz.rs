@@ -610,10 +610,15 @@ impl AuthRegistry {
         Ok(value)
     }
 
-    fn refresh_durable_state(&mut self) -> Result<(), OrchError> {
+    fn with_latest_state<T>(
+        &mut self,
+        operation: impl FnOnce(&StoredAuthority) -> Result<T, OrchError>,
+    ) -> Result<T, OrchError> {
         let _lock = self.durable_lock()?;
-        self.state = self.read_durable_state_locked()?;
-        Ok(())
+        let state = self.read_durable_state_locked()?;
+        let result = operation(&state);
+        self.state = state;
+        result
     }
 
     pub(crate) fn set_credentials(
@@ -677,51 +682,51 @@ impl AuthRegistry {
         header: Option<&str>,
         credentials: &[AuthCredential],
     ) -> Result<AuthContext, OrchError> {
-        self.refresh_durable_state()?;
-        if credentials.is_empty() || self.state.credentials.is_empty() {
-            return Err(OrchError::new(
-                OrchErrorCode::Internal,
-                "control plane credentials are not configured",
-            ));
-        }
-        let token = bearer_token(header)?;
-        let Some((credential, record)) = credentials.iter().find_map(|credential| {
-            self.state
-                .credentials
-                .iter()
-                .find(|record| record.credential_id == credential.id)
-                .filter(|_| constant_time_eq(token.as_bytes(), credential.token.as_bytes()))
-                .map(|record| (credential, record))
-        }) else {
-            return Err(OrchError::new(
-                OrchErrorCode::Unauthenticated,
-                "invalid bearer token",
-            ));
-        };
-        let principal = decode_fixed_hex(&record.principal).ok_or_else(|| {
-            OrchError::new(OrchErrorCode::Internal, "durable auth principal is invalid")
-        })?;
-        let incarnation = decode_fixed_hex(&record.incarnation).ok_or_else(|| {
-            OrchError::new(
-                OrchErrorCode::Internal,
-                "durable auth incarnation is invalid",
-            )
-        })?;
-        Ok(AuthContext {
-            stamp: AuthorityStamp {
-                principal: PrincipalRef(principal),
-                incarnation: CredentialIncarnation(incarnation),
-                generation: AuthenticationGeneration(record.generation),
-                credential_id: credential.id.clone(),
-                owner_id: record.owner_id.clone(),
-            },
-            delegation: None,
+        self.with_latest_state(|state| {
+            if credentials.is_empty() || state.credentials.is_empty() {
+                return Err(OrchError::new(
+                    OrchErrorCode::Internal,
+                    "control plane credentials are not configured",
+                ));
+            }
+            let token = bearer_token(header)?;
+            let Some((credential, record)) = credentials.iter().find_map(|credential| {
+                state
+                    .credentials
+                    .iter()
+                    .find(|record| record.credential_id == credential.id)
+                    .filter(|_| constant_time_eq(token.as_bytes(), credential.token.as_bytes()))
+                    .map(|record| (credential, record))
+            }) else {
+                return Err(OrchError::new(
+                    OrchErrorCode::Unauthenticated,
+                    "invalid bearer token",
+                ));
+            };
+            let principal = decode_fixed_hex(&record.principal).ok_or_else(|| {
+                OrchError::new(OrchErrorCode::Internal, "durable auth principal is invalid")
+            })?;
+            let incarnation = decode_fixed_hex(&record.incarnation).ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::Internal,
+                    "durable auth incarnation is invalid",
+                )
+            })?;
+            Ok(AuthContext {
+                stamp: AuthorityStamp {
+                    principal: PrincipalRef(principal),
+                    incarnation: CredentialIncarnation(incarnation),
+                    generation: AuthenticationGeneration(record.generation),
+                    credential_id: credential.id.clone(),
+                    owner_id: record.owner_id.clone(),
+                },
+                delegation: None,
+            })
         })
     }
 
     pub(crate) fn require_current(&mut self, auth: &AuthContext) -> Result<(), OrchError> {
-        self.refresh_durable_state()?;
-        require_current_state(&self.state, auth)
+        self.with_latest_state(|state| require_current_state(state, auth))
     }
 
     pub(crate) fn public_actor_handle(&self, credential_id: &str) -> Option<PublicActorHandle> {
