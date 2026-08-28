@@ -1,0 +1,83 @@
+error[E0624]: associated function `new` is private
+ --> tests/ui/forged_constructors.rs:2:53
+  |
+2 |       let _ = xai_provider_attempt::AuthorityBinding::new(
+  |                                                       ^^^ private associated function
+  |
+ ::: src/lib.rs
+  |
+  | /     pub(crate) fn new(
+  | |         principal_incarnation: impl Into<String>,
+  | |         auth_generation: u64,
+  | |         capability_generation: u64,
+  | |         effect_lease_id: impl Into<String>,
+  | |         effect_scope: impl Into<String>,
+  | |     ) -> Result<Self, AttemptError> {
+  | |___________________________________- private associated function defined here
+
+error[E0624]: associated function `new` is private
+ --> tests/ui/forged_constructors.rs:9:48
+  |
+9 |       let _ = xai_provider_attempt::AttemptSpec::new(
+  |                                                  ^^^ private associated function
+  |
+ ::: src/lib.rs
+  |
+  | /     pub(crate) fn new(
+  | |         operation_id: impl Into<String>,
+  | |         provider_id: impl Into<String>,
+  | |         request_fingerprint: impl Into<String>,
+  | |         supports_idempotency: bool,
+  | |         authority: AuthorityBinding,
+  | |     ) -> Result<Self, AttemptError> {
+  | |___________________________________- private associated function defined here
+
+warning: unreachable call
+  --> tests/ui/forged_constructors.rs:9:13
+   |
+ 9 |     let _ = xai_provider_attempt::AttemptSpec::new(
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable call
+...
+14 |         todo!(),
+   |         ------- any code following this expression is unreachable
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0624]: associated function `new` is private
+  --> tests/ui/forged_constructors.rs:16:64
+   |
+16 |     let _ = xai_provider_attempt::ReconciliationAuthorization::new("forged-operator");
+   |                                                                ^^^ private associated function
+   |
+  ::: src/lib.rs
+   |
+   |     fn new(operator_id: impl Into<String>) -> Result<Self, AttemptError> {
+   |     -------------------------------------------------------------------- private associated function defined here
+
+error[E0624]: associated function `new` is private
+  --> tests/ui/forged_constructors.rs:17:55
+   |
+17 |       let _ = xai_provider_attempt::ProviderSettlement::new("request", "effect");
+   |                                                         ^^^ private associated function
+   |
+  ::: src/lib.rs
+   |
+   | /     pub(crate) fn new(
+   | |         provider_request_id: impl Into<String>,
+   | |         provider_effect_id: impl Into<String>,
+   | |     ) -> Result<Self, AttemptError> {
+   | |___________________________________- private associated function defined here
+
+error[E0624]: associated function `from_verified` is private
+  --> tests/ui/forged_constructors.rs:18:59
+   |
+18 |       let _ = xai_provider_attempt::ReconciliationEvidence::from_verified("operator", "request");
+   |                                                             ^^^^^^^^^^^^^ private associated function
+   |
+  ::: src/lib.rs
+   |
+   | /     pub(crate) fn from_verified(
+   | |         operator_id: impl Into<String>,
+   | |         provider_request_id: impl Into<String>,
+   | |     ) -> Result<Self, AttemptError> {
+   | |___________________________________- private associated function defined here

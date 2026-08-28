@@ -1,0 +1,21 @@
+error[E0599]: no function or associated item named `from_trusted_host_adapter` found for struct `CanonicalHostAuthority` in the current scope
+ --> tests/ui/forged_adapter.rs:2:59
+  |
+2 |     let _ = xai_provider_attempt::CanonicalHostAuthority::from_trusted_host_adapter(
+  |                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^ function or associated item not found in `CanonicalHostAuthority`
+
+error[E0599]: no function or associated item named `from_host_authority` found for struct `AttemptContext` in the current scope
+ --> tests/ui/forged_adapter.rs:9:51
+  |
+9 |     let _ = xai_provider_attempt::AttemptContext::from_host_authority(
+  |                                                   ^^^^^^^^^^^^^^^^^^^ function or associated item not found in `AttemptContext`
+
+warning: unreachable expression
+  --> tests/ui/forged_adapter.rs:11:9
+   |
+10 |         todo!(),
+   |         ------- any code following this expression is unreachable
+11 |         "forged-operation",
+   |         ^^^^^^^^^^^^^^^^^^ unreachable expression
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default

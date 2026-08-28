@@ -1,0 +1,15 @@
+error[E0451]: fields `principal_incarnation`, `auth_generation`, `capability_generation`, `effect_lease_id` and `effect_scope` of struct `CanonicalHostAuthority` are private
+ --> tests/ui/forged_struct_literal.rs:3:9
+  |
+2 |     let _ = xai_provider_attempt::CanonicalHostAuthority {
+  |             -------------------------------------------- in this type
+3 |         principal_incarnation: "forged".into(),
+  |         ^^^^^^^^^^^^^^^^^^^^^ private field
+4 |         auth_generation: 1,
+  |         ^^^^^^^^^^^^^^^ private field
+5 |         capability_generation: 1,
+  |         ^^^^^^^^^^^^^^^^^^^^^ private field
+6 |         effect_lease_id: "forged-lease".into(),
+  |         ^^^^^^^^^^^^^^^ private field
+7 |         effect_scope: "forged-scope".into(),
+  |         ^^^^^^^^^^^^ private field
