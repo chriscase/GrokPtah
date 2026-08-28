@@ -33,6 +33,8 @@ pub struct ReplayEvent {
     pub profile: AdaptiveProfile,
     pub reason: Option<ProfileReason>,
     pub capability_snapshot_reference: Option<String>,
+    pub from_profile: Option<AdaptiveProfile>,
+    pub to_profile: Option<AdaptiveProfile>,
     pub action_digest: Option<String>,
     pub result_code: Option<String>,
     pub recovery_code: Option<String>,
@@ -62,6 +64,7 @@ pub enum ReplayError {
     InvalidLatency,
     TerminalNotLast,
     MissingTerminal,
+    Malformed,
 }
 
 impl std::fmt::Display for ReplayError {
@@ -76,6 +79,7 @@ impl std::fmt::Display for ReplayError {
             Self::InvalidLatency => "provider latency is outside the bounded range",
             Self::TerminalNotLast => "terminal evidence has trailing events",
             Self::MissingTerminal => "replay has no terminal recovery/result event",
+            Self::Malformed => "replay has malformed evidence fields",
         })
     }
 }
@@ -118,6 +122,14 @@ impl ReplayVerifier {
                     .action_digest
                     .as_deref()
                     .is_some_and(|digest| !valid_digest(Some(digest)))
+                || event
+                    .result_code
+                    .as_deref()
+                    .is_some_and(|value| !valid_reference(value))
+                || event
+                    .recovery_code
+                    .as_deref()
+                    .is_some_and(|value| !valid_reference(value))
             {
                 return Err(ReplayError::InvalidDigest);
             }
@@ -145,11 +157,13 @@ impl ReplayVerifier {
                     let Some(from) = previous_profile else {
                         return Err(ReplayError::InvalidTransition);
                     };
-                    if event.profile != from || event.reason.is_none() {
+                    if event.from_profile != Some(from)
+                        || event.to_profile != Some(event.profile)
+                        || from.escalated() != Some(event.profile)
+                        || event.reason.is_none()
+                    {
                         return Err(ReplayError::InvalidTransition);
                     }
-                    // The next profile is represented by the following
-                    // decision event; it must be one rung above this one.
                     transitions += 1;
                 }
                 ReplayEventKind::Terminal | ReplayEventKind::Recovery => {
@@ -177,7 +191,7 @@ impl ReplayVerifier {
 
     pub fn verify_json(raw: &str) -> Result<ReplaySummary, ReplayError> {
         let events: Vec<ReplayEvent> =
-            serde_json::from_str(raw).map_err(|_| ReplayError::MissingObservationEvidence)?;
+            serde_json::from_str(raw).map_err(|_| ReplayError::Malformed)?;
         Self::verify(&events)
     }
 
@@ -221,6 +235,8 @@ mod tests {
             profile: AdaptiveProfile::Economy,
             reason: Some(ProfileReason::RoutineTask),
             capability_snapshot_reference: Some("capability-generation-1".into()),
+            from_profile: None,
+            to_profile: None,
             action_digest: Some("b".repeat(64)),
             result_code: None,
             recovery_code: None,

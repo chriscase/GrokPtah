@@ -38,6 +38,7 @@ dunce = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 tower = "0.5"
 http-body-util = "0.1"
+base64 = "0.23.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
