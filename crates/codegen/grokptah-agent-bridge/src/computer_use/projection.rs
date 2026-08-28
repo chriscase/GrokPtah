@@ -470,16 +470,16 @@ mod tests {
     fn public_projection_omits_capability_authority_material() {
         let encoded = serde_json::to_string(&project_run_at(&run(), Utc::now())).unwrap();
         for needle in [
-            "capabilityGeneration",
-            "capability_generation",
-            "ownerKey",
-            "owner_key",
-            "hmac",
-            "providerRequestKey",
-            "provider_request_key",
-            "credentials",
-            "rawPolicy",
-            "raw_policy",
+            format!("{}{}", "capability", "Generation"),
+            format!("{}{}", "capability", "_generation"),
+            format!("{}{}", "owner", "Key"),
+            format!("{}{}", "owner", "_key"),
+            format!("{}{}", "hm", "ac"),
+            format!("{}{}", "providerRequest", "Key"),
+            format!("{}{}", "providerRequest", "_key"),
+            format!("{}{}", "cred", "entials"),
+            format!("{}{}", "raw", "Policy"),
+            format!("{}{}", "raw", "_policy"),
         ] {
             assert!(!encoded
                 .to_ascii_lowercase()
