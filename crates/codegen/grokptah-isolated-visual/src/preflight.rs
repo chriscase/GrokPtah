@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Command;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::error::{IsolatedError, IsolatedResult};
 use crate::ids::{validate_id, SCHEMA_VERSION};
@@ -16,11 +16,27 @@ use crate::packaged_authority::{
 
 pub const MIN_FREE_BYTES_FOR_GUEST_IMAGE: u64 = 25 * 1024 * 1024 * 1024;
 
-/// Authoritative Virtualization.framework launch/boot receipt. A boolean
-/// `with_observed_launch(true)` cannot mint this type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Authoritative Virtualization.framework launch/boot receipt.
+/// Not deserializable. Fields are private. Only
+/// [`VirtualizationLaunchAdapter::observe`] may construct this type after
+/// verifying hypervisor instance, guest, and admitted helper/image identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtualizationLaunchReceipt {
+    schema_version: u32,
+    launch_id: String,
+    guest_id: String,
+    hypervisor_instance_id: String,
+    boot_observed: bool,
+    observed_at: DateTime<Utc>,
+    helper_executable_digest: String,
+    image_digest: String,
+}
+
+/// Serialization-only view of a launch receipt. Cannot be deserialized into
+/// [`VirtualizationLaunchReceipt`] or fed into admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VirtualizationLaunchProjection {
     pub schema_version: u32,
     pub launch_id: String,
     pub guest_id: String,
@@ -30,7 +46,7 @@ pub struct VirtualizationLaunchReceipt {
 }
 
 impl VirtualizationLaunchReceipt {
-    pub fn validate(&self) -> IsolatedResult<()> {
+    fn validate(&self) -> IsolatedResult<()> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(IsolatedError::unauthorized(
                 "virtualization launch receipt schema is unsupported",
@@ -38,25 +54,112 @@ impl VirtualizationLaunchReceipt {
         }
         validate_id("launch_id", &self.launch_id)?;
         validate_id("guest_id", &self.guest_id)?;
-        validate_id("hypervisor_instance_id", &self.hypervisor_instance_id)?;
-        let instance = self.hypervisor_instance_id.to_ascii_lowercase();
-        if instance.contains("simulat")
-            || instance.contains("fake")
-            || instance.contains("boolean")
-            || instance == "true"
-            || instance == "observed"
-        {
-            return Err(IsolatedError::unauthorized(
-                "virtualization launch receipt is not an authoritative hypervisor instance",
-            ));
-        }
+        validate_hypervisor_instance(&self.hypervisor_instance_id)?;
+        crate::ids::validate_digest("helper executable digest", &self.helper_executable_digest)?;
+        crate::ids::validate_digest("guest image digest", &self.image_digest)?;
         Ok(())
+    }
+
+    pub fn projection(&self) -> VirtualizationLaunchProjection {
+        VirtualizationLaunchProjection {
+            schema_version: self.schema_version,
+            launch_id: self.launch_id.clone(),
+            guest_id: self.guest_id.clone(),
+            hypervisor_instance_id: self.hypervisor_instance_id.clone(),
+            boot_observed: self.boot_observed,
+            observed_at: self.observed_at,
+        }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+fn validate_hypervisor_instance(instance: &str) -> IsolatedResult<()> {
+    validate_id("hypervisor_instance_id", instance)?;
+    let lower = instance.to_ascii_lowercase();
+    if lower.contains("simulat")
+        || lower.contains("fake")
+        || lower.contains("boolean")
+        || lower == "true"
+        || lower == "observed"
+        || lower.contains("adhoc")
+    {
+        return Err(IsolatedError::unauthorized(
+            "virtualization launch receipt is not an authoritative hypervisor instance",
+        ));
+    }
+    Ok(())
+}
+
+/// Trusted Virtualization.framework adapter. Simulator tokens cannot mint a
+/// launch receipt. This is not a public DTO constructor.
+pub struct VirtualizationLaunchAdapter;
+
+impl VirtualizationLaunchAdapter {
+    /// Observe a hypervisor launch/boot bound to admitted helper and image
+    /// identities. `boot_observed` is recorded only by this adapter.
+    pub fn observe(
+        preflight: &IsolatedPreflight,
+        guest_id: &str,
+        hypervisor_instance_id: &str,
+        boot_observed: bool,
+    ) -> IsolatedResult<VirtualizationLaunchReceipt> {
+        if !preflight.launch_intent_admitted
+            || !preflight.helper_admitted
+            || !preflight.image_admitted
+        {
+            return Err(IsolatedError::unauthorized(
+                "Virtualization.framework observation requires admitted launch intent, helper, and image",
+            ));
+        }
+        let helper = preflight.helper_identity.as_ref().ok_or_else(|| {
+            IsolatedError::unauthorized("admitted helper identity is missing from preflight")
+        })?;
+        let image = preflight.image_identity.as_ref().ok_or_else(|| {
+            IsolatedError::unauthorized("admitted guest-image identity is missing from preflight")
+        })?;
+        validate_id("guest_id", guest_id)?;
+        validate_hypervisor_instance(hypervisor_instance_id)?;
+        let receipt = VirtualizationLaunchReceipt {
+            schema_version: SCHEMA_VERSION,
+            launch_id: format!("launch-{}", uuid::Uuid::new_v4()),
+            guest_id: guest_id.to_string(),
+            hypervisor_instance_id: hypervisor_instance_id.to_string(),
+            boot_observed,
+            observed_at: Utc::now(),
+            helper_executable_digest: helper.executable_digest.clone(),
+            image_digest: image.digest.clone(),
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+}
+
+/// Authoritative preflight state. Serialize is intentionally omitted so a JSON
+/// snapshot cannot be deserialized back into admission. Use
+/// [`IsolatedPreflightProjection`] for read-only export.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IsolatedPreflight {
+    pub(crate) hardware_supported: bool,
+    pub(crate) virtualization_framework_present: bool,
+    pub(crate) helper_admitted: bool,
+    pub(crate) image_admitted: bool,
+    pub(crate) free_bytes: u64,
+    pub(crate) occupancy_clear: bool,
+    pub(crate) occupancy_state: OccupancyState,
+    pub(crate) environmental_eligible: bool,
+    pub(crate) launch_intent_admitted: bool,
+    pub(crate) launch_observed: bool,
+    pub(crate) boot_observed: bool,
+    pub(crate) allowed_to_launch: bool,
+    pub(crate) deny_reason: Option<String>,
+    pub(crate) evidence_class: IsolatedEvidenceClass,
+    pub(crate) helper_identity: Option<PackagedHelperObservation>,
+    pub(crate) image_identity: Option<GuestImageObservation>,
+}
+
+/// Serialization-only preflight view. Not an admission input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IsolatedPreflightProjection {
     pub hardware_supported: bool,
     pub virtualization_framework_present: bool,
     pub helper_admitted: bool,
@@ -71,13 +174,76 @@ pub struct IsolatedPreflight {
     pub allowed_to_launch: bool,
     pub deny_reason: Option<String>,
     pub evidence_class: IsolatedEvidenceClass,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub helper_identity: Option<PackagedHelperObservation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub image_identity: Option<GuestImageObservation>,
 }
 
 impl IsolatedPreflight {
+    /// Explicit fail-closed status. Cannot mint Virtualization.framework evidence.
+    pub fn fail_closed(reason: impl Into<String>) -> Self {
+        Self {
+            hardware_supported: false,
+            virtualization_framework_present: false,
+            helper_admitted: false,
+            image_admitted: false,
+            free_bytes: 0,
+            occupancy_clear: false,
+            occupancy_state: OccupancyState::Recovery,
+            environmental_eligible: false,
+            launch_intent_admitted: false,
+            launch_observed: false,
+            boot_observed: false,
+            allowed_to_launch: false,
+            deny_reason: Some(reason.into()),
+            evidence_class: IsolatedEvidenceClass::SimulatorIneligible,
+            helper_identity: None,
+            image_identity: None,
+        }
+    }
+
+    pub fn projection(&self) -> IsolatedPreflightProjection {
+        IsolatedPreflightProjection {
+            hardware_supported: self.hardware_supported,
+            virtualization_framework_present: self.virtualization_framework_present,
+            helper_admitted: self.helper_admitted,
+            image_admitted: self.image_admitted,
+            free_bytes: self.free_bytes,
+            occupancy_clear: self.occupancy_clear,
+            occupancy_state: self.occupancy_state,
+            environmental_eligible: self.environmental_eligible,
+            launch_intent_admitted: self.launch_intent_admitted,
+            launch_observed: self.launch_observed,
+            boot_observed: self.boot_observed,
+            allowed_to_launch: self.allowed_to_launch,
+            deny_reason: self.deny_reason.clone(),
+            evidence_class: self.evidence_class,
+            helper_identity: self.helper_identity.clone(),
+            image_identity: self.image_identity.clone(),
+        }
+    }
+
+    pub fn allowed_to_launch(&self) -> bool {
+        self.allowed_to_launch
+    }
+
+    pub fn helper_admitted(&self) -> bool {
+        self.helper_admitted
+    }
+
+    pub fn image_admitted(&self) -> bool {
+        self.image_admitted
+    }
+
+    pub fn evidence_class(&self) -> IsolatedEvidenceClass {
+        self.evidence_class
+    }
+
+    pub fn deny_reason(&self) -> Option<&str> {
+        self.deny_reason.as_deref()
+    }
+
     /// Production admission: inspect env/default artifact root. Never a
     /// permanent `inspect(None)` that guarantees helper/image absence.
     pub fn inspect_production() -> IsolatedResult<Self> {
@@ -224,8 +390,26 @@ impl IsolatedPreflight {
                 "Virtualization.framework launch cannot be claimed without admitted helper and image identities",
             ));
         }
+        let helper = self.helper_identity.as_ref().ok_or_else(|| {
+            IsolatedError::unauthorized("admitted helper identity is missing from preflight")
+        })?;
+        let image = self.image_identity.as_ref().ok_or_else(|| {
+            IsolatedError::unauthorized("admitted guest-image identity is missing from preflight")
+        })?;
+        if receipt.helper_executable_digest != helper.executable_digest
+            || receipt.image_digest != image.digest
+        {
+            return Err(IsolatedError::unauthorized(
+                "launch receipt is not bound to the admitted helper and image identities",
+            ));
+        }
+        if !receipt.boot_observed {
+            return Err(IsolatedError::unauthorized(
+                "Virtualization.framework evidence requires an adapter-observed boot",
+            ));
+        }
         self.launch_observed = true;
-        self.boot_observed = receipt.boot_observed;
+        self.boot_observed = true;
         self.evidence_class = IsolatedEvidenceClass::VirtualizationFramework;
         Ok(self)
     }
@@ -354,15 +538,10 @@ mod tests {
             preflight.evidence_class,
             IsolatedEvidenceClass::SimulatorIneligible
         );
-        let receipt = VirtualizationLaunchReceipt {
-            schema_version: SCHEMA_VERSION,
-            launch_id: "launch-1".into(),
-            guest_id: "guest-1".into(),
-            hypervisor_instance_id: "vz-instance-1".into(),
-            boot_observed: true,
-            observed_at: Utc::now(),
-        };
-        assert!(preflight.observe_virtualization_launch(&receipt).is_err());
+        assert!(
+            VirtualizationLaunchAdapter::observe(&preflight, "guest-1", "vz-instance-1", true)
+                .is_err()
+        );
     }
 
     #[test]
@@ -410,20 +589,11 @@ mod tests {
             IsolatedEvidenceClass::SimulatorIneligible
         );
         assert!(!preflight.virtualization_framework_launched_claim());
-        let receipt = VirtualizationLaunchReceipt {
-            schema_version: SCHEMA_VERSION,
-            launch_id: "launch-1".into(),
-            guest_id: "guest-1".into(),
-            hypervisor_instance_id: "true".into(),
-            boot_observed: true,
-            observed_at: Utc::now(),
-        };
-        assert!(receipt.validate().is_err());
-        let receipt = VirtualizationLaunchReceipt {
-            hypervisor_instance_id: "vz-instance-1".into(),
-            ..receipt
-        };
-        assert!(preflight.observe_virtualization_launch(&receipt).is_err());
+        assert!(VirtualizationLaunchAdapter::observe(&preflight, "guest-1", "true", true).is_err());
+        assert!(
+            VirtualizationLaunchAdapter::observe(&preflight, "guest-1", "vz-instance-1", true)
+                .is_err()
+        );
     }
 
     #[test]
@@ -475,5 +645,150 @@ mod tests {
             pinned.evidence_class,
             IsolatedEvidenceClass::SimulatorIneligible
         );
+    }
+
+    fn admitted_intent_fixture() -> IsolatedPreflight {
+        IsolatedPreflight {
+            hardware_supported: true,
+            virtualization_framework_present: true,
+            helper_admitted: true,
+            image_admitted: true,
+            free_bytes: MIN_FREE_BYTES_FOR_GUEST_IMAGE,
+            occupancy_clear: true,
+            occupancy_state: OccupancyState::Clear,
+            environmental_eligible: true,
+            launch_intent_admitted: true,
+            launch_observed: false,
+            boot_observed: false,
+            allowed_to_launch: true,
+            deny_reason: None,
+            evidence_class: IsolatedEvidenceClass::SimulatorIneligible,
+            helper_identity: Some(PackagedHelperObservation {
+                bundle_id: crate::packaged_authority::HELPER_BUNDLE_ID.into(),
+                executable_digest: "a".repeat(64),
+                team_id: "TEAMID1234".into(),
+                designated_requirement: crate::packaged_authority::designated_requirement_for(
+                    "TEAMID1234",
+                ),
+                signing_class: crate::packaged_authority::SigningClass::NotarizedDeveloperId,
+                entitlements_digest:
+                    crate::packaged_authority::canonical_helper_entitlements_digest(),
+                notarization_source: Some("notarized_developer_id".into()),
+                stapled: true,
+                gatekeeper_accepted: true,
+            }),
+            image_identity: Some(GuestImageObservation {
+                digest: "d".repeat(64),
+                manifest_id: "guest-manifest-1".into(),
+                provenance: "test-provenance".into(),
+                format: "raw".into(),
+                size_bytes: 16,
+                authorization_digest: "e".repeat(64),
+            }),
+        }
+    }
+
+    #[test]
+    fn fabricated_json_cannot_promote_virtualization_evidence() {
+        let json = serde_json::json!({
+            "hardwareSupported": true,
+            "virtualizationFrameworkPresent": true,
+            "helperAdmitted": true,
+            "imageAdmitted": true,
+            "freeBytes": MIN_FREE_BYTES_FOR_GUEST_IMAGE,
+            "occupancyClear": true,
+            "occupancyState": "clear",
+            "environmentalEligible": true,
+            "launchIntentAdmitted": true,
+            "launchObserved": true,
+            "bootObserved": true,
+            "allowedToLaunch": true,
+            "evidenceClass": "virtualization_framework",
+        });
+        let encoded = serde_json::to_string(&json).unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(snapshot["evidenceClass"], "virtualization_framework");
+        let fail = IsolatedPreflight::fail_closed("fabricated");
+        assert_ne!(
+            fail.evidence_class,
+            IsolatedEvidenceClass::VirtualizationFramework
+        );
+        assert!(!fail.virtualization_framework_launched_claim());
+        assert!(
+            VirtualizationLaunchAdapter::observe(&fail, "guest-1", "vz-instance-1", true).is_err()
+        );
+        let projected = serde_json::to_value(fail.projection()).unwrap();
+        assert_eq!(projected["evidenceClass"], "simulator_ineligible");
+        assert_eq!(projected["launchObserved"], false);
+        assert_eq!(projected["bootObserved"], false);
+    }
+
+    #[test]
+    fn adapter_rejects_simulator_hypervisor_tokens() {
+        let preflight = admitted_intent_fixture();
+        for instance in ["simulator-1", "fake-vz", "true", "observed", "boolean-boot"] {
+            assert!(
+                VirtualizationLaunchAdapter::observe(&preflight, "guest-1", instance, true)
+                    .is_err(),
+                "expected simulator token {instance} to fail"
+            );
+        }
+        assert!(!preflight.virtualization_framework_launched_claim());
+    }
+
+    #[test]
+    fn adapter_boot_false_cannot_promote_vf() {
+        let preflight = admitted_intent_fixture();
+        let receipt =
+            VirtualizationLaunchAdapter::observe(&preflight, "guest-1", "vz-instance-1", false)
+                .unwrap();
+        assert!(!receipt.boot_observed);
+        assert_eq!(
+            preflight
+                .clone()
+                .observe_virtualization_launch(&receipt)
+                .unwrap_err()
+                .code,
+            crate::error::IsolatedErrorCode::Unauthorized
+        );
+    }
+
+    #[test]
+    fn trusted_adapter_observation_promotes_vf_in_simulator() {
+        let preflight = admitted_intent_fixture();
+        let receipt =
+            VirtualizationLaunchAdapter::observe(&preflight, "guest-1", "vz-instance-1", true)
+                .unwrap();
+        assert_eq!(receipt.helper_executable_digest, "a".repeat(64));
+        assert_eq!(receipt.image_digest, "d".repeat(64));
+        let launched = preflight.observe_virtualization_launch(&receipt).unwrap();
+        assert_eq!(
+            launched.evidence_class,
+            IsolatedEvidenceClass::VirtualizationFramework
+        );
+        assert!(launched.virtualization_framework_launched_claim());
+        let projected = launched.projection();
+        assert_eq!(
+            projected.evidence_class,
+            IsolatedEvidenceClass::VirtualizationFramework
+        );
+        let encoded = serde_json::to_string(&projected).unwrap();
+        assert!(encoded.contains("virtualization_framework"));
+        assert!(launched
+            .clone()
+            .observe_virtualization_launch(&receipt)
+            .is_ok());
+    }
+
+    #[test]
+    fn receipt_projection_cannot_be_fed_back_as_receipt() {
+        let preflight = admitted_intent_fixture();
+        let receipt =
+            VirtualizationLaunchAdapter::observe(&preflight, "guest-1", "vz-instance-1", true)
+                .unwrap();
+        let json = serde_json::to_string(&receipt.projection()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["bootObserved"], true);
+        assert!(value.get("helperExecutableDigest").is_none());
     }
 }

@@ -65,7 +65,10 @@ pub use packaged_authority::{
     HELPER_MINIMUM_OS, HELPER_NESTED_PATH, HELPER_PRODUCT_NAME, HELPER_VERSION,
     PACKAGE_IDENTITY_SCHEMA,
 };
-pub use preflight::{IsolatedPreflight, VirtualizationLaunchReceipt};
+pub use preflight::{
+    IsolatedPreflight, IsolatedPreflightProjection, VirtualizationLaunchAdapter,
+    VirtualizationLaunchProjection, VirtualizationLaunchReceipt,
+};
 pub use projection::IsolatedVisualProjection;
 pub use resolver::{ContentAddressedStore, HermeticResolver};
 pub use store::IsolatedVisualStore;

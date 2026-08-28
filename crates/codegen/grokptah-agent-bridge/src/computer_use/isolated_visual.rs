@@ -40,22 +40,7 @@ pub fn map_isolated_error(error: grokptah_isolated_visual::IsolatedError) -> Com
 /// Production admission inspects `GROKPTAH_ISOLATED_VISUAL_ARTIFACT_ROOT` when
 /// set. It does not hard-code `inspect(None)`.
 pub fn isolated_visual_admission() -> IsolatedPreflight {
-    IsolatedPreflight::inspect_production().unwrap_or_else(|_| IsolatedPreflight {
-        hardware_supported: false,
-        virtualization_framework_present: false,
-        helper_admitted: false,
-        image_admitted: false,
-        free_bytes: 0,
-        occupancy_clear: false,
-        occupancy_state: grokptah_isolated_visual::OccupancyState::Recovery,
-        environmental_eligible: false,
-        launch_intent_admitted: false,
-        launch_observed: false,
-        boot_observed: false,
-        allowed_to_launch: false,
-        deny_reason: Some("isolated visual preflight failed closed".into()),
-        evidence_class: IsolatedEvidenceClass::SimulatorIneligible,
-        helper_identity: None,
-        image_identity: None,
+    IsolatedPreflight::inspect_production().unwrap_or_else(|_| {
+        IsolatedPreflight::fail_closed("isolated visual preflight failed closed")
     })
 }

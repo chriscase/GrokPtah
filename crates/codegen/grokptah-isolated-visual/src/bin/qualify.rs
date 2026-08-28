@@ -16,17 +16,17 @@ fn main() {
     });
 
     let preflight = IsolatedPreflight::inspect_production().expect("preflight");
-    evidence["preflight"] = serde_json::to_value(&preflight).expect("preflight json");
-    evidence["eligibility"] = if preflight.allowed_to_launch {
+    evidence["preflight"] = serde_json::to_value(preflight.projection()).expect("preflight json");
+    evidence["eligibility"] = if preflight.allowed_to_launch() {
         serde_json::json!("partial")
     } else {
         serde_json::json!("fail_closed")
     };
-    evidence["evidenceClass"] = serde_json::to_value(preflight.evidence_class).expect("class");
+    evidence["evidenceClass"] = serde_json::to_value(preflight.evidence_class()).expect("class");
     evidence["virtualizationFrameworkLaunched"] =
         serde_json::json!(preflight.virtualization_framework_launched_claim());
     evidence["continuation"] = serde_json::json!({
-        "blockedOn": preflight.deny_reason,
+        "blockedOn": preflight.deny_reason(),
         "command": "CARGO_TARGET_DIR=/tmp/grokptah-isolated-visual-target cargo test --locked --manifest-path crates/codegen/grokptah-isolated-visual/Cargo.toml && cargo run --locked --manifest-path crates/codegen/grokptah-isolated-visual/Cargo.toml --bin grokptah-isolated-visual-qualify -- --allow-virtualization"
     });
 
