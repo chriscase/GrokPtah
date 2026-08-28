@@ -383,9 +383,12 @@ pub(crate) async fn propose_semantic_action_with_profile(
     }
     let proposal =
         proposal_from_arguments_with_profile(&call.arguments, observation, permit.profile)?;
+    let confidence_permille =
+        serde_json::from_str::<ProposalArguments>(&call.arguments)?.confidence_permille;
     Ok(ProposalOutcome {
         proposal,
         rendered: accounting,
+        confidence_permille,
     })
 }
 

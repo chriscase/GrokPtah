@@ -7,6 +7,7 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const MAX_REFERENCE_BYTES: usize = 128;
