@@ -49,6 +49,10 @@ struct OrchStoreInner {
     _store_lock: fs::File,
     lock: Mutex<()>,
     last_run_error: Mutex<Option<String>>,
+    /// Run records omitted from listings because they failed semantic
+    /// validation. Silence here would let a Run disappear with nothing
+    /// reporting it, so the count is observable.
+    malformed_run_records: Mutex<usize>,
     last_audit_error: Arc<Mutex<Option<String>>>,
     audit_file_lock: Arc<Mutex<()>>,
     audit_writer: AuditWriter,
@@ -222,6 +226,7 @@ impl OrchStore {
                 _store_lock: store_lock,
                 lock: Mutex::new(()),
                 last_run_error: Mutex::new(None),
+                malformed_run_records: Mutex::new(0),
                 last_audit_error,
                 audit_file_lock,
                 audit_writer: AuditWriter {
@@ -725,8 +730,26 @@ impl OrchStore {
                 if let Ok(r) = serde_json::from_str::<RunRecord>(&text) {
                     // Same rule as the single-record read: a record carrying a
                     // malformed stop detail is omitted, never listed as fact.
-                    if r.validate_stop_detail().is_ok() {
-                        out.push(r);
+                    // Omission is reported rather than silent — a Run vanishing
+                    // from a listing with nothing to show for it is how a
+                    // durable defect stays invisible.
+                    match r.validate_stop_detail() {
+                        Ok(()) => out.push(r),
+                        Err(error) => {
+                            *self.inner.malformed_run_records.lock() += 1;
+                            *self.inner.last_run_error.lock() =
+                                Some(format!("run {} omitted: {error}", r.run_id));
+                            let _ = self.enqueue_audit(AuditEntry {
+                                ts: Utc::now(),
+                                tool: "store_health".into(),
+                                request_id: None,
+                                session_id: Some(r.session_id),
+                                workspace: Some(r.workspace.clone()),
+                                outcome: "malformed_run_omitted".into(),
+                                error_code: Some("invalid_stop_detail".into()),
+                                detail: format!("run {} failed semantic validation", r.run_id),
+                            });
+                        }
                     }
                 }
             }
@@ -5016,6 +5039,13 @@ impl OrchStore {
 
     pub fn last_audit_error(&self) -> Option<String> {
         self.inner.last_audit_error.lock().clone()
+    }
+
+    /// Number of Run records omitted from listings for failing semantic
+    /// validation since this store was opened. Non-zero means durable data is
+    /// inconsistent and something is not being shown.
+    pub fn malformed_run_records(&self) -> usize {
+        *self.inner.malformed_run_records.lock()
     }
 
     pub fn last_run_error(&self) -> Option<String> {

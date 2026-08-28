@@ -199,19 +199,69 @@ impl RunStopTool {
 /// Every field is a counter, an enum, a bounded tool *name*, or a digest. It
 /// carries no prompt, model response, tool arguments, path, credential, or raw
 /// payload, so it is safe on a redacted read surface.
+/// Smallest repeat count each detector can legitimately report.
+///
+/// These mirror the turn-loop ceilings. A detail claiming fewer repeats than
+/// its own detector could have counted did not come from that detector, so the
+/// numbers are part of the contract rather than free-form metadata.
+pub const MIN_REPEATS_IDENTICAL_CALLS: u32 = 16;
+pub const MIN_REPEATS_TRUE_NOOP: u32 = 4;
+pub const MIN_REPEATS_INERT_REPEAT: u32 = 4;
+
+/// Durable, operator-readable qualifier for a host-decided stop.
+///
+/// A stop detail asserts that the host's own detector fired, and
+/// `ptah_get_progress` and the desktop inspector present it as exactly that, so
+/// authorship is constrained on three axes:
+///
+/// - fields and constructors are private, so no out-of-crate caller can mint
+///   one through the Rust API;
+/// - [`RunRecord::set_stop_observation`], the terminal-observation transition,
+///   is crate-private, so the cause/code/detail triple moves only inside the
+///   host;
+/// - [`RunStopDetail::validate`] binds the detail to its detector: the repeat
+///   count must be one that detector could have produced, and a true no-op can
+///   only be attributed to `run_terminal_cmd`.
+///
+/// What this does **not** close: `Deserialize` is derived because records are
+/// loaded from disk, so a caller holding store write access can still craft a
+/// semantically *consistent* detail as JSON. Closing that needs a
+/// host-authenticated terminal-observation receipt on the authority spine; it
+/// is tracked as a residual, not claimed here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunStopDetail {
-    pub kind: RunStopDetailKind,
+    kind: RunStopDetailKind,
     /// Consecutive repeats observed when the stop fired.
-    pub repeats: u32,
+    repeats: u32,
     /// Host-resolved tool identity. Never a model-supplied string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool: Option<RunStopTool>,
+    tool: Option<RunStopTool>,
 }
 
 impl RunStopDetail {
-    pub fn new(kind: RunStopDetailKind, repeats: u32) -> Self {
+    pub fn kind(&self) -> RunStopDetailKind {
+        self.kind
+    }
+
+    pub fn repeats(&self) -> u32 {
+        self.repeats
+    }
+
+    pub fn tool(&self) -> Option<RunStopTool> {
+        self.tool
+    }
+
+    /// The minimum repeat count this kind's detector could have reported.
+    pub fn min_repeats_for(kind: RunStopDetailKind) -> u32 {
+        match kind {
+            RunStopDetailKind::IdenticalCalls => MIN_REPEATS_IDENTICAL_CALLS,
+            RunStopDetailKind::TrueNoop => MIN_REPEATS_TRUE_NOOP,
+            RunStopDetailKind::InertRepeat => MIN_REPEATS_INERT_REPEAT,
+        }
+    }
+
+    pub(crate) fn new(kind: RunStopDetailKind, repeats: u32) -> Self {
         Self {
             kind,
             repeats,
@@ -221,24 +271,35 @@ impl RunStopDetail {
 
     /// Attach the tool the repeats were observed on, resolving the
     /// model-supplied name to a host identity first.
-    pub fn with_tool(mut self, tool: &str) -> Self {
+    pub(crate) fn with_tool(mut self, tool: &str) -> Self {
         self.tool = Some(RunStopTool::resolve(tool));
         self
     }
 
     /// Attach an already-resolved identity.
-    pub fn with_resolved_tool(mut self, tool: RunStopTool) -> Self {
-        self.tool = Some(tool);
-        self
-    }
-
     /// Reject anything that could smuggle content onto the read surface, or
     /// assert a repeat count that never happened.
     pub fn validate(&self) -> Result<(), OrchError> {
-        if self.repeats == 0 {
+        let minimum = Self::min_repeats_for(self.kind);
+        if self.repeats < minimum {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
-                "stop detail repeats must be greater than zero",
+                format!(
+                    "{} stop reports {} repeats but its detector fires at {minimum}",
+                    self.kind.as_str(),
+                    self.repeats
+                ),
+            ));
+        }
+        // A true no-op is only ever detected for a single `run_terminal_cmd`
+        // whose command is `true`. Any other tool under that kind describes a
+        // detection that cannot have happened.
+        if self.kind == RunStopDetailKind::TrueNoop
+            && self.tool != Some(RunStopTool::RunTerminalCmd)
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "a true no-op stop can only be attributed to run_terminal_cmd",
             ));
         }
         Ok(())
@@ -647,6 +708,11 @@ pub struct RunRecord {
     pub stop_cause: Option<RunStopCause>,
     /// Structured qualifier for `stop_cause`. Optional so records written
     /// before this field existed still load unchanged.
+    ///
+    /// The field stays public so `RunRecord` remains constructible, but a
+    /// `RunStopDetail` cannot be *minted* outside this crate: its fields and
+    /// constructors are private. See the struct docs for what that does and
+    /// does not close.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_detail: Option<RunStopDetail>,
     /// Durable per-run aggregates for journal rollover (#196 residual).
@@ -703,7 +769,7 @@ impl RunRecord {
     /// `TokenAccountingUnavailable` while the stationarity detail stayed
     /// attached — a record that installed cleanly and was then refused by
     /// `load_run` and silently dropped from `list_runs`.
-    pub fn set_stop_observation(
+    pub(crate) fn set_stop_observation(
         &mut self,
         cause: RunStopCause,
         code: Option<&str>,
@@ -726,6 +792,11 @@ impl RunRecord {
     pub fn prepare_for_persist(&mut self) -> Result<(), OrchError> {
         self.normalize_stop_detail();
         self.validate_stop_detail()
+    }
+
+    /// Read the structured qualifier, if the host attached one.
+    pub fn stop_detail(&self) -> Option<&RunStopDetail> {
+        self.stop_detail.as_ref()
     }
 
     /// Restore the cross-field invariant by construction.

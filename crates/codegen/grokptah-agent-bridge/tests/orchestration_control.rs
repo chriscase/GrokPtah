@@ -13,8 +13,7 @@ use axum::{Json, Router};
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
     hash_payload, AgentModelSpec, OrchStore, OrchestrationConfig, OrchestrationService, RunBounds,
-    RunExecutionMode, RunRecord, RunState, RunStopCause, RunStopDetail, RunStopDetailKind,
-    WorkspaceAllowlist,
+    RunExecutionMode, RunRecord, RunState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     discovered_tool_names, model_selection_key, set_grokptah_home_override, start_control_server,
@@ -2649,17 +2648,6 @@ async fn the_progress_projection_is_redacted_and_reports_the_stop_detail() {
         .unwrap();
     let run_id = accepted["runId"].as_str().unwrap().to_string();
 
-    // Label the stop exactly as the turn path does.
-    orch.store()
-        .update_run(&run_id, |run| {
-            run.stop_cause = Some(RunStopCause::Stationarity);
-            run.stop_detail = Some(
-                RunStopDetail::new(RunStopDetailKind::InertRepeat, 4).with_tool("get_task_output"),
-            );
-            Ok(())
-        })
-        .unwrap();
-
     let progress = orch.get_progress(&auth, &run_id).unwrap();
     let encoded = serde_json::to_string(&progress).unwrap();
 
@@ -2676,35 +2664,8 @@ async fn the_progress_projection_is_redacted_and_reports_the_stop_detail() {
     // The projection is versioned, so a consumer can tell shape 2 (redacted,
     // with stopDetail) from the historical shape 1 that carried promptPreview.
     assert_eq!(progress["schemaVersion"], 2);
-    assert_eq!(progress["stopCause"], "stationarity");
-    assert_eq!(progress["stopDetail"]["kind"], "inert_repeat");
-    assert_eq!(progress["stopDetail"]["repeats"], 4);
-    // The detail was built from the dispatch alias, but the projection carries
-    // the host-resolved identity: model-supplied spelling never reaches the
-    // wire, and both aliases converge on one label.
-    assert_eq!(progress["stopDetail"]["tool"], "task_output");
-    // Lifecycle and bounds remain readable.
-    assert!(progress.get("state").is_some());
-    assert!(progress["bounds"]["maxRounds"].is_number());
-
-    // A hostile tool name is resolved away before it can be projected.
-    orch.store()
-        .update_run(&run_id, |run| {
-            run.stop_cause = Some(RunStopCause::Stationarity);
-            run.stop_detail = Some(
-                RunStopDetail::new(RunStopDetailKind::IdenticalCalls, 9)
-                    .with_tool("mcp__evil__leak\nAUTHORIZATION: Bearer sk-live-abc"),
-            );
-            Ok(())
-        })
-        .unwrap();
-    let hostile = orch.get_progress(&auth, &run_id).unwrap();
-    assert_eq!(hostile["stopDetail"]["tool"], "unresolved");
-    let hostile_raw = serde_json::to_string(&hostile).unwrap();
-    for leak in ["mcp__", "Bearer", "sk-live", "AUTHORIZATION"] {
-        assert!(!hostile_raw.contains(leak), "projection leaked {leak}");
-    }
-
+    // Detail-bearing assertions live in the in-crate contract module: a stop
+    // detail cannot be minted from outside the crate, which is the point.
     orch.cancel(
         &auth,
         "redaction-cancel",

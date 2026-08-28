@@ -440,6 +440,16 @@ const _: () = assert!(MAX_CONSECUTIVE_TRUE_NOOPS < NUDGE_AFTER_IDENTICAL_TOOL_CA
 // compile time so the relation cannot be edited away silently.
 const _: () = assert!(MAX_CONSECUTIVE_INERT_REPEATS <= MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS);
 const _: () = assert!(MAX_CONSECUTIVE_INERT_REPEATS <= MAX_CONSECUTIVE_TRUE_NOOPS);
+// The durable contract states the smallest repeat count each detector can
+// report. If a ceiling here moved without the contract moving with it, a
+// genuine stop would be rejected as unattributable, so the two are pinned
+// together at compile time.
+const _: () = assert!(
+    MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS == crate::orchestration::MIN_REPEATS_IDENTICAL_CALLS
+);
+const _: () = assert!(MAX_CONSECUTIVE_TRUE_NOOPS == crate::orchestration::MIN_REPEATS_TRUE_NOOP);
+const _: () =
+    assert!(MAX_CONSECUTIVE_INERT_REPEATS == crate::orchestration::MIN_REPEATS_INERT_REPEAT);
 
 /// Tracks action stationarity within one model turn (#209).
 ///

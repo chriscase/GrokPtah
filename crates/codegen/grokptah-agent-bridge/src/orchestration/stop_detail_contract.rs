@@ -1,16 +1,26 @@
-//! Adversarial tests for the durable stationarity stop detail.
+//! Contract tests for the durable stationarity stop detail.
 //!
-//! Synthetic fixtures only: no provider, no VM, no Computer Use. These drive the
-//! shipped store and types, not a reimplementation.
+//! These live inside the crate on purpose. Issuing a stop detail is a host
+//! decision, so its constructors and the terminal-observation transition are
+//! crate-private; a test that exercises them has to be crate-private too. An
+//! out-of-crate test would prove only what an out-of-crate forger can reach,
+//! which is exactly what this contract is meant to prevent.
+//!
+//! Synthetic fixtures only: no provider, no VM, no Computer Use.
+
+#![cfg(test)]
 
 use chrono::Utc;
-use grokptah_agent_bridge::orchestration::{
-    safe_id_filename, OrchStore, RunBounds, RunRecord, RunState, RunStopCause, RunStopDetail,
-    RunStopDetailKind, RunStopTool, WorkItem, WorkPolicy, WorkResult, WorkState,
-    PROGRESS_PROJECTION_SCHEMA_VERSION,
-};
 use tempfile::tempdir;
 use uuid::Uuid;
+
+use super::store::OrchStore;
+use super::types::{
+    safe_id_filename, RunBounds, RunRecord, RunState, RunStopCause, RunStopDetail,
+    RunStopDetailKind, RunStopTool, MIN_REPEATS_IDENTICAL_CALLS, MIN_REPEATS_INERT_REPEAT,
+    MIN_REPEATS_TRUE_NOOP, PROGRESS_PROJECTION_SCHEMA_VERSION,
+};
+use super::workload::{WorkItem, WorkPolicy, WorkResult, WorkState};
 
 fn run_with(run_id: &str, stop: Option<(RunStopCause, RunStopDetail)>) -> RunRecord {
     let (stop_cause, stop_detail) = match stop {
@@ -111,13 +121,19 @@ fn each_stop_detail_kind_round_trips_distinctly() {
         (RunStopDetailKind::TrueNoop, "true_noop"),
         (RunStopDetailKind::InertRepeat, "inert_repeat"),
     ] {
-        let detail = RunStopDetail::new(kind, 7).with_tool("read_file");
+        let detail = RunStopDetail::new(kind, RunStopDetail::min_repeats_for(kind)).with_tool(
+            if kind == RunStopDetailKind::TrueNoop {
+                "run_terminal_cmd"
+            } else {
+                "read_file"
+            },
+        );
         let encoded = serde_json::to_string(&detail).unwrap();
         assert!(encoded.contains(wire), "{wire} missing from {encoded}");
         let decoded: RunStopDetail = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, detail);
-        assert_eq!(decoded.kind.as_str(), wire);
-        assert_eq!(decoded.repeats, 7);
+        assert_eq!(decoded.kind().as_str(), wire);
+        assert_eq!(decoded.repeats(), RunStopDetail::min_repeats_for(kind));
     }
 }
 
@@ -174,9 +190,13 @@ fn a_hostile_tool_name_collapses_to_a_closed_category() {
         "",
     ];
     for name in hostile {
-        let detail = RunStopDetail::new(RunStopDetailKind::IdenticalCalls, 1).with_tool(name);
+        let detail = RunStopDetail::new(
+            RunStopDetailKind::IdenticalCalls,
+            MIN_REPEATS_IDENTICAL_CALLS,
+        )
+        .with_tool(name);
         assert_eq!(
-            detail.tool,
+            detail.tool(),
             Some(RunStopTool::Unresolved),
             "{name:?} must not resolve to a host tool"
         );
@@ -532,8 +552,8 @@ fn a_finalization_intent_survives_a_crash_cut_and_installs_a_readable_record() {
 
     {
         let store = OrchStore::open(&root).unwrap();
-        let detail =
-            RunStopDetail::new(RunStopDetailKind::TrueNoop, 4).with_tool("run_terminal_cmd");
+        let detail = RunStopDetail::new(RunStopDetailKind::TrueNoop, MIN_REPEATS_TRUE_NOOP)
+            .with_tool("run_terminal_cmd");
         store
             .save_run(&run_with(
                 run_id,
@@ -559,7 +579,7 @@ fn a_finalization_intent_survives_a_crash_cut_and_installs_a_readable_record() {
     let recovered = store.load_run(run_id).unwrap().expect("present");
     assert_eq!(recovered.stop_cause, Some(RunStopCause::Stationarity));
     assert_eq!(
-        recovered.stop_detail.as_ref().map(|d| d.repeats),
+        recovered.stop_detail().map(|d| d.repeats()),
         Some(6),
         "the intent must be the record that won"
     );
@@ -687,4 +707,111 @@ fn wire_fixtures_match_rust_serialization() {
     // And the unresolved tool must be the fixed category, not the MCP name.
     assert!(encoded.contains("\"tool\":\"unresolved\""));
     assert!(!encoded.contains("mcp__"));
+}
+
+/// The redacted projection, exercised without a host so the wire shape itself
+/// is the subject rather than the service plumbing around it.
+mod projection {
+    use super::*;
+    use crate::orchestration::service::project_progress;
+
+    fn stationary_run(detail: RunStopDetail) -> RunRecord {
+        let mut run = run_with("run-projection", Some((RunStopCause::Stationarity, detail)));
+        run.prompt_preview = "SENSITIVE-PROMPT /home/someone/.ssh/id_ed25519 hunter2".into();
+        run
+    }
+
+    #[test]
+    fn the_projection_is_versioned_redacted_and_reports_the_detail() {
+        let detail = RunStopDetail::new(RunStopDetailKind::InertRepeat, MIN_REPEATS_INERT_REPEAT)
+            .with_tool("get_task_output");
+        let projected = project_progress(&stationary_run(detail), None, false).unwrap();
+        let encoded = serde_json::to_string(&projected).unwrap();
+
+        assert_eq!(
+            projected["schemaVersion"],
+            PROGRESS_PROJECTION_SCHEMA_VERSION
+        );
+        assert!(projected.get("promptPreview").is_none());
+        for leak in ["SENSITIVE-PROMPT", "/home/someone", "id_ed25519", "hunter2"] {
+            assert!(!encoded.contains(leak), "projection leaked {leak}");
+        }
+        assert_eq!(projected["stopCause"], "stationarity");
+        assert_eq!(projected["stopDetail"]["kind"], "inert_repeat");
+        assert_eq!(projected["stopDetail"]["repeats"], MIN_REPEATS_INERT_REPEAT);
+        // The dispatch alias was resolved to one host identity before it could
+        // reach the wire.
+        assert_eq!(projected["stopDetail"]["tool"], "task_output");
+    }
+
+    #[test]
+    fn a_hostile_tool_name_never_reaches_the_projection() {
+        let detail = RunStopDetail::new(
+            RunStopDetailKind::IdenticalCalls,
+            MIN_REPEATS_IDENTICAL_CALLS,
+        )
+        .with_tool("mcp__evil__leak\nAUTHORIZATION: Bearer sk-live-abc");
+        let projected = project_progress(&stationary_run(detail), None, false).unwrap();
+        let encoded = serde_json::to_string(&projected).unwrap();
+        assert_eq!(projected["stopDetail"]["tool"], "unresolved");
+        for leak in ["mcp__", "Bearer", "sk-live", "AUTHORIZATION"] {
+            assert!(!encoded.contains(leak), "projection leaked {leak}");
+        }
+    }
+
+    #[test]
+    fn the_projection_refuses_a_semantically_impossible_detail() {
+        // A detail whose repeat count its detector could not have produced, or
+        // whose kind and tool contradict each other, is refused at the read
+        // surface rather than rendered as a host decision.
+        let understated = RunStopDetail::new(
+            RunStopDetailKind::IdenticalCalls,
+            MIN_REPEATS_IDENTICAL_CALLS - 1,
+        )
+        .with_tool("read_file");
+        assert!(project_progress(&stationary_run(understated), None, false).is_err());
+
+        let impossible = RunStopDetail::new(RunStopDetailKind::TrueNoop, MIN_REPEATS_TRUE_NOOP)
+            .with_tool("read_file");
+        assert!(project_progress(&stationary_run(impossible), None, false).is_err());
+
+        let inert_of_one = RunStopDetail::new(RunStopDetailKind::InertRepeat, 1).with_tool("grep");
+        assert!(project_progress(&stationary_run(inert_of_one), None, false).is_err());
+    }
+}
+
+/// A record omitted from a listing must leave evidence. A Run disappearing with
+/// nothing reporting it is how a durable defect stays invisible.
+#[test]
+fn an_omitted_malformed_record_raises_store_health_evidence() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("orch");
+    let store = OrchStore::open(&root).unwrap();
+
+    let detail = RunStopDetail::new(RunStopDetailKind::InertRepeat, MIN_REPEATS_INERT_REPEAT)
+        .with_tool("task_output");
+    store
+        .save_run(&run_with(
+            "run-health",
+            Some((RunStopCause::Stationarity, detail)),
+        ))
+        .unwrap();
+    assert_eq!(store.list_runs().unwrap().len(), 1);
+    assert_eq!(store.malformed_run_records(), 0);
+
+    // Tamper the cause so the detail no longer belongs to it.
+    let path = root
+        .join("runs")
+        .join(format!("{}.json", safe_id_filename("run-health").unwrap()));
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.replace("\"stationarity\"", "\"round_limit\"")).unwrap();
+
+    assert!(store.list_runs().unwrap().is_empty(), "must not be listed");
+    assert!(
+        store.malformed_run_records() >= 1,
+        "omission must be counted, not silent"
+    );
+    assert!(store
+        .last_run_error()
+        .is_some_and(|error| error.contains("run-health")));
 }

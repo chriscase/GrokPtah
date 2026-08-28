@@ -5052,18 +5052,32 @@ impl OrchestrationService {
     /// is host-authored template text (`"Model step 3/24"`, `` "Tool `x`" ``),
     /// never model prose or tool output.
     fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
-        // The projection is a read surface, so it re-checks the contract rather
-        // than trusting whatever reached it. A malformed detail is refused here
-        // too, not rendered.
-        run.validate_stop_detail()?;
         self.refresh_queue_position(&mut run);
         let busy = self.host.session_busy(run.session_id);
+        project_progress(&run, run.queue_position, busy)
+    }
+}
+
+/// Build the redacted lifecycle/status projection.
+///
+/// Split from the service so the wire shape can be exercised without standing
+/// up a host: what this returns is the whole of what an untrusted reader sees.
+pub(crate) fn project_progress(
+    run: &RunRecord,
+    queue_position: Option<usize>,
+    busy: bool,
+) -> Result<serde_json::Value, OrchError> {
+    // The projection is a read surface, so it re-checks the contract rather
+    // than trusting whatever reached it. A malformed detail is refused here
+    // too, not rendered.
+    run.validate_stop_detail()?;
+    {
         Ok(json!({
             "schemaVersion": PROGRESS_PROJECTION_SCHEMA_VERSION,
             "runId": run.run_id,
             "sessionId": run.session_id,
             "state": run.state,
-            "queuePosition": run.queue_position,
+            "queuePosition": queue_position,
             "busy": busy,
             "startSeq": run.start_seq,
             "endSeq": run.end_seq,
@@ -5077,7 +5091,9 @@ impl OrchestrationService {
             "errorCode": run.error_code,
         }))
     }
+}
 
+impl OrchestrationService {
     fn refresh_queue_position(&self, run: &mut RunRecord) {
         run.queue_position = if run.state == RunState::Queued {
             self.host.orchestration_pending_position(&run.run_id)

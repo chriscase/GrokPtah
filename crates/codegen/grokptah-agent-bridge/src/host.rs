@@ -188,13 +188,17 @@ pub(crate) struct Inner {
     /// Per-subagent cancel tokens (#151/#152) — cancel one child without killing siblings.
     subagent_cancels: HashMap<String, CancellationToken>,
     background_tasks: Vec<BackgroundTask>,
-    /// Host-assigned generation per task/subagent id.
+    /// Host-assigned generation per task/subagent id, with the identity
+    /// fingerprint the generation was issued for.
     ///
-    /// A wait witness has to survive id recycling: if an id is retired and a
-    /// new task takes it, a witness issued for the old one must not describe
-    /// the new one. The generation is bumped whenever an id is (re)registered,
-    /// so the two are never confusable.
-    wait_generations: std::collections::HashMap<String, u64>,
+    /// One registry for background tasks and subagents alike. It is consulted
+    /// lazily at witness time rather than written at each creation site, so a
+    /// creation path that does not know about it — including one added later —
+    /// cannot bypass it. Registering an unseen id assigns a generation;
+    /// re-registering an id whose fingerprint changed means the id was recycled
+    /// onto different work and gets a new one, so a witness can never be
+    /// carried across identities.
+    wait_generations: std::collections::HashMap<String, (u64, String)>,
     next_wait_generation: u64,
     /// Cancel tokens for in-flight background tasks (#52).
     background_cancels: HashMap<String, CancellationToken>,
@@ -5045,10 +5049,38 @@ impl AgentHostHandle {
         self.inner.lock().background_tasks.clone()
     }
 
-    /// Current host generation for a task/subagent id, if the host has ever
-    /// registered it.
-    fn wait_generation(&self, id: &str) -> Option<u64> {
-        self.inner.lock().wait_generations.get(id).copied()
+    /// Generation for an id under the identity the host currently holds for it.
+    ///
+    /// Assigns one on first sight and bumps it when the fingerprint changes,
+    /// which is what an id recycled onto different work looks like. Called only
+    /// for ids the host has already confirmed it owns.
+    fn wait_generation_for(&self, id: &str, fingerprint: &str) -> u64 {
+        let mut g = self.inner.lock();
+        if let Some((generation, seen)) = g.wait_generations.get(id) {
+            if seen == fingerprint {
+                return *generation;
+            }
+        }
+        let generation = g.next_wait_generation;
+        g.next_wait_generation = g.next_wait_generation.saturating_add(1);
+        g.wait_generations
+            .insert(id.to_string(), (generation, fingerprint.to_string()));
+        generation
+    }
+
+    /// Forget ids the host no longer holds, so the registry cannot grow without
+    /// bound across a long-lived session.
+    fn retire_absent_wait_identities(&self) {
+        let live: std::collections::HashSet<String> = self
+            .background_tasks()
+            .into_iter()
+            .map(|task| task.id)
+            .chain(self.subagents().into_iter().map(|sub| sub.id))
+            .collect();
+        self.inner
+            .lock()
+            .wait_generations
+            .retain(|id, _| live.contains(id));
     }
 
     /// Issue a witness for a dispatched wait call.
@@ -5083,31 +5115,41 @@ impl AgentHostHandle {
         id: &str,
         elapsed_ms: u64,
     ) -> Option<ActiveTaskWaitWitness> {
-        let generation = self.wait_generation(id)?;
         let owns = |owner: &Option<String>| {
             owner
                 .as_deref()
                 .and_then(|value| Uuid::parse_str(value).ok())
                 .is_some_and(|owner| owner == session_id)
         };
-        let state = if let Some(task) = self.background_tasks().into_iter().find(|t| t.id == id) {
-            if !owns(&task.session_id) {
+        // Identity fingerprint from stable fields only. Status is deliberately
+        // excluded: a task moving from queued to running is the same work, and
+        // must not look like a recycled id.
+        let (state, fingerprint) =
+            if let Some(task) = self.background_tasks().into_iter().find(|t| t.id == id) {
+                if !owns(&task.session_id) {
+                    return None;
+                }
+                (
+                    ActiveWaitState::from_status(&task.status)?,
+                    format!("task\u{1f}{}\u{1f}{}", task.kind, task.title),
+                )
+            } else if let Some(sub) = self.subagents().into_iter().find(|s| s.id == id) {
+                if !owns(&sub.session_id) {
+                    return None;
+                }
+                (
+                    ActiveWaitState::from_status(&sub.status)?,
+                    format!("subagent\u{1f}{}\u{1f}{}", sub.kind, sub.title),
+                )
+            } else {
                 return None;
-            }
-            ActiveWaitState::from_status(&task.status)?
-        } else if let Some(sub) = self.subagents().into_iter().find(|s| s.id == id) {
-            if !owns(&sub.session_id) {
-                return None;
-            }
-            ActiveWaitState::from_status(&sub.status)?
-        } else {
-            return None;
-        };
+            };
+        self.retire_absent_wait_identities();
         Some(ActiveTaskWaitWitness {
             task_id: id.to_string(),
             state,
             owner_session: session_id,
-            generation,
+            generation: self.wait_generation_for(id, &fingerprint),
             deadline_ms: elapsed_ms.saturating_add(WITNESSED_WAIT_DEADLINE_MS),
         })
     }
@@ -5165,12 +5207,6 @@ impl AgentHostHandle {
         };
         {
             let mut g = self.inner.lock();
-            // Registering an id starts a new generation for it, so a witness
-            // issued against a previous task with the same id cannot describe
-            // this one.
-            let generation = g.next_wait_generation;
-            g.next_wait_generation = g.next_wait_generation.saturating_add(1);
-            g.wait_generations.insert(id.clone(), generation);
             g.background_tasks.push(t.clone());
             g.background_cancels.insert(id.clone(), cancel.clone());
         }
@@ -12714,5 +12750,230 @@ mod tests {
         assert_eq!(runs[0].state, RunState::LimitReached);
         assert_eq!(runs[0].stop_cause, Some(RunStopCause::DurationLimit));
         assert_eq!(runs[0].bounds.max_duration_ms, 50);
+    }
+}
+
+/// Host-level tests for the active-task wait witness.
+///
+/// The witness is the whole authority behind the stationarity exemption, so
+/// these drive the real host registry rather than a stand-in: a subagent is
+/// registered the way the spawn paths register one, and the host is asked
+/// whether it will vouch for it.
+#[cfg(test)]
+mod wait_witness_tests {
+    use super::*;
+    use crate::host_helpers::AgentToolCall;
+
+    fn host() -> AgentHostHandle {
+        AgentHost::create(HostConfig::default())
+    }
+
+    fn register_subagent(
+        host: &AgentHostHandle,
+        id: &str,
+        session: Uuid,
+        status: &str,
+        kind: &str,
+    ) {
+        host.inner
+            .lock()
+            .subagents
+            .push(crate::types::SubagentInfo {
+                id: id.into(),
+                kind: kind.into(),
+                title: format!("{kind} work"),
+                status: status.into(),
+                session_id: Some(session.to_string()),
+                summary: None,
+                last_tool: None,
+                cwd: None,
+                execution_mode: crate::types::SubagentExecutionMode::default(),
+            });
+    }
+
+    /// A real subagent registered through the normal path is witnessable.
+    ///
+    /// This is the gap the re-review found: generations used to be written only
+    /// by `schedule_background_task`, so genuine subagent polling could never
+    /// be witnessed and was stopped as inert after four unchanged replies.
+    #[test]
+    fn a_registered_subagent_is_witnessed_for_its_owning_session() {
+        let host = host();
+        let session = Uuid::new_v4();
+        register_subagent(&host, "sub-1", session, "running", "explore");
+
+        let witness = host
+            .issue_wait_witness(session, "sub-1", 0)
+            .expect("a live same-session subagent must be witnessable");
+        assert_eq!(witness.task_id, "sub-1");
+        assert_eq!(witness.state, ActiveWaitState::Running);
+        assert_eq!(witness.owner_session, session);
+        assert!(witness.deadline_ms > 0);
+    }
+
+    /// Both dispatch spellings reach the same witness through the same id.
+    #[test]
+    fn either_alias_yields_the_same_witness() {
+        let host = host();
+        let session = Uuid::new_v4();
+        register_subagent(&host, "sub-alias", session, "running", "explore");
+
+        let args = r#"{"id":"sub-alias"}"#;
+        let from_canonical = host.witness_dispatched_wait(session, args, 0);
+        let from_alias = host.witness_dispatched_wait(session, args, 0);
+        assert_eq!(canonical_tool_name("get_task_output"), "task_output");
+        assert_eq!(from_canonical, from_alias);
+        assert!(from_canonical.is_some());
+    }
+
+    /// Negative controls: every one of these must refuse a witness.
+    #[test]
+    fn the_host_refuses_to_vouch_for_anything_it_does_not_own_and_outstanding() {
+        let host = host();
+        let session = Uuid::new_v4();
+        let foreign = Uuid::new_v4();
+
+        // Unknown id.
+        assert!(host.issue_wait_witness(session, "nobody", 0).is_none());
+
+        // Another session's subagent.
+        register_subagent(&host, "sub-foreign", foreign, "running", "explore");
+        assert!(host.issue_wait_witness(session, "sub-foreign", 0).is_none());
+
+        // Finished work, in every terminal spelling.
+        for (index, status) in ["done", "failed", "cancelled", "rejected"]
+            .iter()
+            .enumerate()
+        {
+            let id = format!("sub-term-{index}");
+            register_subagent(&host, &id, session, status, "explore");
+            assert!(
+                host.issue_wait_witness(session, &id, 0).is_none(),
+                "{status} is not outstanding work"
+            );
+        }
+
+        // No id at all: a listing, not a wait on anything.
+        assert!(host.witness_dispatched_wait(session, "{}", 0).is_none());
+        // Malformed arguments.
+        assert!(host
+            .witness_dispatched_wait(session, "not json", 0)
+            .is_none());
+    }
+
+    /// A recycled id gets a new generation, so a witness cannot be carried
+    /// across identities.
+    #[test]
+    fn recycling_an_id_onto_different_work_changes_the_generation() {
+        let host = host();
+        let session = Uuid::new_v4();
+        register_subagent(&host, "sub-recycled", session, "running", "explore");
+        let first = host
+            .issue_wait_witness(session, "sub-recycled", 0)
+            .expect("first identity");
+
+        // Same id, different work: replace the registry entry the way a
+        // restore or a reuse would.
+        host.inner.lock().subagents.clear();
+        register_subagent(&host, "sub-recycled", session, "running", "general_purpose");
+        let second = host
+            .issue_wait_witness(session, "sub-recycled", 0)
+            .expect("second identity");
+
+        assert_ne!(
+            first.generation, second.generation,
+            "a recycled id must not inherit the previous generation"
+        );
+    }
+
+    /// A status change is not a recycle: queued work that starts running is the
+    /// same work and keeps its generation.
+    #[test]
+    fn a_status_change_does_not_look_like_a_recycle() {
+        let host = host();
+        let session = Uuid::new_v4();
+        register_subagent(&host, "sub-progress", session, "accepted", "explore");
+        let queued = host
+            .issue_wait_witness(session, "sub-progress", 0)
+            .expect("queued is outstanding");
+        assert_eq!(queued.state, ActiveWaitState::Queued);
+
+        host.inner
+            .lock()
+            .subagents
+            .iter_mut()
+            .for_each(|sub| sub.status = "running".into());
+        let running = host
+            .issue_wait_witness(session, "sub-progress", 0)
+            .expect("still outstanding");
+        assert_eq!(running.state, ActiveWaitState::Running);
+        assert_eq!(
+            queued.generation, running.generation,
+            "the same work must keep its generation"
+        );
+    }
+
+    /// Repeated unchanged replies against a live subagent stay exempt, which is
+    /// the behaviour the whole witness exists to protect.
+    #[test]
+    fn repeated_unchanged_replies_from_a_live_subagent_are_never_inert() {
+        let host = host();
+        let session = Uuid::new_v4();
+        register_subagent(&host, "sub-poll", session, "running", "explore");
+
+        let calls = [AgentToolCall {
+            id: "c".into(),
+            name: "get_task_output".into(),
+            arguments: r#"{"id":"sub-poll"}"#.into(),
+        }];
+        let mut run = IdenticalToolCallRun::default();
+        for step in 0..12u32 {
+            let witness = host
+                .witness_dispatched_wait(session, &calls[0].arguments, u64::from(step))
+                .expect("the host still vouches for live work");
+            run.observe(&tool_step_signature(&calls), "task_output", false);
+            if round_is_witnessed_wait(&calls, &[witness], session, u64::from(step)) {
+                run.observe_witnessed_wait();
+            } else if let Some(digest) = round_observation_digest(&[
+                serde_json::json!({"role": "assistant", "content": ""}),
+                serde_json::json!({"role": "tool", "content": "subagent sub-poll status=running"}),
+            ]) {
+                run.observe_outcome(digest);
+            }
+            assert!(
+                run.inert_stop_info().is_none(),
+                "a live subagent poll was called inert at step {step}"
+            );
+        }
+    }
+
+    /// Once the deadline passes, the exemption lapses and the ordinary gates
+    /// resume — the wait is bounded, not open-ended.
+    #[test]
+    fn an_expired_witness_stops_exempting_the_round() {
+        let host = host();
+        let session = Uuid::new_v4();
+        register_subagent(&host, "sub-expiring", session, "running", "explore");
+        let witness = host
+            .issue_wait_witness(session, "sub-expiring", 0)
+            .expect("witnessable");
+
+        let calls = [AgentToolCall {
+            id: "c".into(),
+            name: "task_output".into(),
+            arguments: r#"{"id":"sub-expiring"}"#.into(),
+        }];
+        assert!(round_is_witnessed_wait(
+            &calls,
+            std::slice::from_ref(&witness),
+            session,
+            0
+        ));
+        assert!(!round_is_witnessed_wait(
+            &calls,
+            &[witness],
+            session,
+            WITNESSED_WAIT_DEADLINE_MS + 1
+        ));
     }
 }
