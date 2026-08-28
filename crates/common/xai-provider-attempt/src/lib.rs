@@ -11,6 +11,7 @@
 //! reopened by retry code. Reopening requires an explicit
 //! `ReconciliationAuthorization` and provider truth.
 
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+const AUTHORITY_PUBLIC_KEY_FILE: &str = ".authority-public-key";
 pub const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
 pub const REQUEST_KEY_PREFIX: &str = "grokptah-";
 const SCHEMA_VERSION: u32 = 1;
@@ -102,7 +104,18 @@ impl AuthorityBinding {
         self.principal_incarnation == other.principal_incarnation
             && self.auth_generation == other.auth_generation
             && self.capability_generation == other.capability_generation
+            && self.effect_lease_id == other.effect_lease_id
             && self.effect_scope == other.effect_scope
+    }
+
+    fn with_effect_lease(&self, effect_lease_id: impl Into<String>) -> Result<Self, AttemptError> {
+        Self::new(
+            self.principal_incarnation.clone(),
+            self.auth_generation,
+            self.capability_generation,
+            effect_lease_id,
+            self.effect_scope.clone(),
+        )
     }
 }
 
@@ -184,13 +197,9 @@ impl fmt::Debug for AttemptSpec {
     }
 }
 
-/// Durable canonical authority snapshot written by the trusted host authority
-/// assembler. This type is intentionally private: downstream crates can only
-/// obtain an `AttemptContext` by reading the host-owned snapshot from the
-/// attempt store.
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HostAuthorityRecord {
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HostAuthorityPayload {
     principal_incarnation: String,
     auth_generation: u64,
     capability_generation: u64,
@@ -198,23 +207,60 @@ struct HostAuthorityRecord {
     effect_scope: String,
     #[serde(default)]
     revoked_effect_lease_ids: Vec<String>,
+    #[serde(default)]
+    issued_effect_lease_ids: Vec<String>,
+}
+
+/// Durable canonical authority record written by the trusted host authority
+/// assembler. Its signature is verified before any authority value is used.
+/// This type is intentionally private: downstream crates can only obtain an
+/// `AttemptContext` by reading a valid host-owned record.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HostAuthorityRecord {
+    #[serde(flatten)]
+    payload: HostAuthorityPayload,
+    signature: String,
 }
 
 impl HostAuthorityRecord {
-    fn binding(&self) -> Result<AuthorityBinding, AttemptError> {
+    fn binding_for_lease(&self, lease_id: &str) -> Result<AuthorityBinding, AttemptError> {
+        if !self
+            .payload
+            .issued_effect_lease_ids
+            .iter()
+            .any(|issued| issued == lease_id)
+        {
+            return Err(AttemptError::InvalidAuthority);
+        }
         AuthorityBinding::new(
-            self.principal_incarnation.clone(),
-            self.auth_generation,
-            self.capability_generation,
-            self.effect_lease_id.clone(),
-            self.effect_scope.clone(),
+            self.payload.principal_incarnation.clone(),
+            self.payload.auth_generation,
+            self.payload.capability_generation,
+            lease_id.to_owned(),
+            self.payload.effect_scope.clone(),
         )
     }
 
     fn lease_revoked(&self, lease_id: &str) -> bool {
-        self.revoked_effect_lease_ids
+        self.payload
+            .revoked_effect_lease_ids
             .iter()
             .any(|revoked| revoked == lease_id)
+    }
+
+    fn unclaimed_lease(&self, root: &Path) -> Option<String> {
+        self.payload
+            .issued_effect_lease_ids
+            .iter()
+            .find(|lease_id| {
+                !self.lease_revoked(lease_id)
+                    && !root
+                        .join("lease-claims")
+                        .join(format!("{lease_id}.claim"))
+                        .is_file()
+            })
+            .cloned()
     }
 }
 
@@ -387,10 +433,12 @@ impl AttemptContext {
         operation_id: impl Into<String>,
         authority_scope: impl Into<String>,
     ) -> Result<Self, AttemptError> {
+        let operation_id = operation_id.into();
+        validate_id(&operation_id, "operation id")?;
         let authority_scope = authority_scope.into();
         validate_id(&authority_scope, "authority scope")?;
-        let record = store.read_host_authority(&authority_scope)?;
-        let mut context = Self::new(store, operation_id, record.binding()?)?;
+        let (record, lease_id) = store.select_host_lease(&authority_scope, &operation_id)?;
+        let mut context = Self::new(store, operation_id, record.binding_for_lease(&lease_id)?)?;
         context.authority_scope = Some(authority_scope);
         Ok(context)
     }
@@ -431,7 +479,7 @@ impl AttemptContext {
         }
         let current = current_record
             .as_ref()
-            .map(HostAuthorityRecord::binding)
+            .map(|record| record.binding_for_lease(&self.authority.effect_lease_id))
             .transpose()?
             .unwrap_or_else(|| self.authority.clone());
         let permit = match attempt.begin_send_live(&current) {
@@ -459,18 +507,19 @@ impl AttemptContext {
         self.begin_send(&attempt)
     }
 
-    /// Start a new logical provider round with a fresh one-use effect lease.
-    /// Principal/auth and capability authority remain sourced from this
-    /// adapter; the lease is never cloned or replayed across attempts.
-    pub fn fork_effect_lease(&self) -> Result<Self, AttemptError> {
-        let effect_lease_id = format!("effect-lease-{}", Uuid::new_v4());
-        let authority = AuthorityBinding {
-            principal_incarnation: self.authority.principal_incarnation.clone(),
-            auth_generation: self.authority.auth_generation,
-            capability_generation: self.authority.capability_generation,
-            effect_lease_id: effect_lease_id.clone(),
-            effect_scope: self.authority.effect_scope.clone(),
-        };
+    /// Acquire a distinct lease issued by the host authority. The lease is
+    /// selected from the signed host record and is consumed atomically when
+    /// the resulting attempt is created.
+    pub fn acquire_next_effect_lease(&self) -> Result<Self, AttemptError> {
+        let scope = self
+            .authority_scope
+            .as_deref()
+            .ok_or(AttemptError::InvalidAuthority)?;
+        let record = self.store.read_host_authority(scope)?;
+        let lease_id = record
+            .unclaimed_lease(&self.store.root)
+            .ok_or(AttemptError::EffectLeaseAlreadyUsed)?;
+        let authority = self.authority.with_effect_lease(lease_id)?;
         Self::new(self.store.clone(), self.operation_id.clone(), authority).map(|mut context| {
             context.authority_scope = self.authority_scope.clone();
             context
@@ -494,7 +543,7 @@ impl AttemptContext {
         }
         let current = current_record
             .as_ref()
-            .map(HostAuthorityRecord::binding)
+            .map(|record| record.binding_for_lease(&permit.authority.effect_lease_id))
             .transpose()?
             .unwrap_or_else(|| self.authority.clone());
         permit.revalidate_live(&current)
@@ -657,6 +706,12 @@ impl ProviderAttemptStore {
                     "attempt identifier collision".into(),
                 ));
             }
+            self.claim_lease_locked(
+                &record.authority.effect_scope,
+                &record.authority.effect_lease_id,
+                &record.operation_id,
+                &record.attempt_id,
+            )?;
             Ok((Some(record), ()))
         })?;
         Ok(ProviderAttempt {
@@ -685,19 +740,149 @@ impl ProviderAttemptStore {
         authority_scope: &str,
     ) -> Result<HostAuthorityRecord, AttemptError> {
         validate_id(authority_scope, "authority scope")?;
-        let path = self
-            .root
-            .join("canonical-authorities")
-            .join(format!("{authority_scope}.json"));
-        let bytes = fs::read(path).map_err(|error| {
+        let path = self.authority_path(authority_scope);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 AttemptError::InvalidAuthority
             } else {
                 AttemptError::Io(error.to_string())
             }
         })?;
-        serde_json::from_slice(&bytes)
-            .map_err(|error| AttemptError::Serialization(error.to_string()))
+        if metadata.file_type().is_symlink() {
+            return Err(AttemptError::InvalidAuthority);
+        }
+        #[cfg(unix)]
+        if std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o077 != 0 {
+            return Err(AttemptError::InvalidAuthority);
+        }
+        let bytes = fs::read(&path)?;
+        let record: HostAuthorityRecord = serde_json::from_slice(&bytes)
+            .map_err(|error| AttemptError::Serialization(error.to_string()))?;
+        let public_key_path = self
+            .root
+            .join("canonical-authorities")
+            .join(AUTHORITY_PUBLIC_KEY_FILE);
+        let public_key_metadata =
+            fs::symlink_metadata(&public_key_path).map_err(|_| AttemptError::InvalidAuthority)?;
+        if public_key_metadata.file_type().is_symlink() {
+            return Err(AttemptError::InvalidAuthority);
+        }
+        #[cfg(unix)]
+        if std::os::unix::fs::PermissionsExt::mode(&public_key_metadata.permissions()) & 0o077 != 0
+        {
+            return Err(AttemptError::InvalidAuthority);
+        }
+        let public_key_bytes = fs::read(public_key_path)?;
+        let public_key_array: [u8; 32] = public_key_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| AttemptError::InvalidAuthority)?;
+        let public_key = VerifyingKey::from_bytes(&public_key_array)
+            .map_err(|_| AttemptError::InvalidAuthority)?;
+        let signature_bytes = unhex(&record.signature).ok_or(AttemptError::InvalidAuthority)?;
+        let signature =
+            Signature::from_slice(&signature_bytes).map_err(|_| AttemptError::InvalidAuthority)?;
+        let payload = serde_json::to_vec(&record.payload)
+            .map_err(|error| AttemptError::Serialization(error.to_string()))?;
+        public_key
+            .verify(&payload, &signature)
+            .map_err(|_| AttemptError::InvalidAuthority)?;
+        Ok(record)
+    }
+
+    fn authority_path(&self, authority_scope: &str) -> PathBuf {
+        self.root
+            .join("canonical-authorities")
+            .join(format!("{authority_scope}.json"))
+    }
+
+    fn lease_claim_path(&self, lease_id: &str) -> PathBuf {
+        self.root
+            .join("lease-claims")
+            .join(format!("{lease_id}.claim"))
+    }
+
+    fn select_host_lease(
+        &self,
+        authority_scope: &str,
+        operation_id: &str,
+    ) -> Result<(HostAuthorityRecord, String), AttemptError> {
+        validate_id(operation_id, "operation id")?;
+        let lock_path = self.root.join(".provider-attempts.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        lock.lock_exclusive()?;
+        let record = self.read_host_authority(authority_scope)?;
+        let Some(lease_id) = record.unclaimed_lease(&self.root) else {
+            let _ = lock.unlock();
+            return Err(AttemptError::EffectLeaseAlreadyUsed);
+        };
+        let directory = self.root.join("lease-claims");
+        fs::create_dir_all(&directory)?;
+        let claim_path = self.lease_claim_path(&lease_id);
+        let mut claim = match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&claim_path)
+        {
+            Ok(claim) => claim,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = lock.unlock();
+                return Err(AttemptError::EffectLeaseAlreadyUsed);
+            }
+            Err(error) => {
+                let _ = lock.unlock();
+                return Err(error.into());
+            }
+        };
+        std::io::Write::write_all(&mut claim, operation_id.as_bytes())?;
+        claim.sync_all()?;
+        let _ = lock.unlock();
+        Ok((record, lease_id))
+    }
+
+    fn claim_lease_locked(
+        &self,
+        authority_scope: &str,
+        lease_id: &str,
+        operation_id: &str,
+        attempt_id: &str,
+    ) -> Result<(), AttemptError> {
+        let authority_path = self.authority_path(authority_scope);
+        if !authority_path.is_file() {
+            // Private in-crate tests exercise the state machine without a
+            // host adapter. Production contexts always carry a signed record.
+            return Ok(());
+        }
+        let record = self.read_host_authority(authority_scope)?;
+        if record.lease_revoked(lease_id)
+            || !record
+                .payload
+                .issued_effect_lease_ids
+                .iter()
+                .any(|issued| issued == lease_id)
+        {
+            return Err(AttemptError::StaleAuthority);
+        }
+        let claim_path = self.lease_claim_path(lease_id);
+        let owner =
+            fs::read_to_string(&claim_path).map_err(|_| AttemptError::EffectLeaseAlreadyUsed)?;
+        if owner != operation_id {
+            return Err(AttemptError::EffectLeaseAlreadyUsed);
+        }
+        let temporary = self
+            .root
+            .join(format!(".lease-claim-{}.{}.tmp", lease_id, Uuid::new_v4()));
+        let mut claim = File::create(&temporary)?;
+        std::io::Write::write_all(&mut claim, attempt_id.as_bytes())?;
+        claim.sync_all()?;
+        drop(claim);
+        fs::rename(temporary, claim_path)?;
+        Ok(())
     }
 
     pub fn recover_incomplete(&self) -> Result<usize, AttemptError> {
@@ -864,6 +1049,11 @@ impl ProviderAttemptStore {
                 });
             }
             if to == SendState::Sending && !record.lease_claimed {
+                if let Some(owner) = self.lease_claim_owner(&record.authority.effect_lease_id)? {
+                    if owner != record.attempt_id {
+                        return Err(AttemptError::EffectLeaseAlreadyUsed);
+                    }
+                }
                 if self.lease_claimed_by_other(
                     &record.attempt_id,
                     &record.authority.effect_lease_id,
@@ -887,6 +1077,15 @@ impl ProviderAttemptStore {
             record.updated_at_ms = now_ms();
             Ok((Some(record), ()))
         })
+    }
+
+    fn lease_claim_owner(&self, lease_id: &str) -> Result<Option<String>, AttemptError> {
+        let path = self.lease_claim_path(lease_id);
+        match fs::read_to_string(path) {
+            Ok(owner) => Ok(Some(owner)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn lease_claimed_by_other(
@@ -1328,9 +1527,25 @@ fn hex(bytes: &[u8]) -> String {
     result
 }
 
+fn unhex(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    let mut chars = value.bytes();
+    while let (Some(high), Some(low)) = (chars.next(), chars.next()) {
+        let high = (high as char).to_digit(16)? as u8;
+        let low = (low as char).to_digit(16)? as u8;
+        bytes.push((high << 4) | low);
+    }
+    Some(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
     fn authority(generation: u64) -> AuthorityBinding {
@@ -1363,19 +1578,47 @@ mod tests {
     }
 
     fn write_host_snapshot(root: &Path, scope: &str, binding: &AuthorityBinding) {
+        use ed25519_dalek::{Signer, SigningKey};
         fs::create_dir_all(root.join("canonical-authorities")).unwrap();
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        fs::write(
+            root.join("canonical-authorities")
+                .join(AUTHORITY_PUBLIC_KEY_FILE),
+            signing_key.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(
+            root.join("canonical-authorities")
+                .join(AUTHORITY_PUBLIC_KEY_FILE),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let payload = HostAuthorityPayload {
+            principal_incarnation: binding.principal_incarnation.clone(),
+            auth_generation: binding.auth_generation,
+            capability_generation: binding.capability_generation,
+            effect_lease_id: binding.effect_lease_id.clone(),
+            effect_scope: binding.effect_scope.clone(),
+            revoked_effect_lease_ids: Vec::new(),
+            issued_effect_lease_ids: vec![binding.effect_lease_id.clone(), "lease-1".into()],
+        };
+        let signature = signing_key.sign(&serde_json::to_vec(&payload).unwrap());
         fs::write(
             root.join("canonical-authorities")
                 .join(format!("{scope}.json")),
-            serde_json::json!({
-                "principalIncarnation": binding.principal_incarnation,
-                "authGeneration": binding.auth_generation,
-                "capabilityGeneration": binding.capability_generation,
-                "effectLeaseId": binding.effect_lease_id,
-                "effectScope": binding.effect_scope,
-                "revokedEffectLeaseIds": [],
+            serde_json::to_vec(&HostAuthorityRecord {
+                payload,
+                signature: hex(signature.to_bytes().as_slice()),
             })
-            .to_string(),
+            .unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(
+            root.join("canonical-authorities")
+                .join(format!("{scope}.json")),
+            std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
     }
@@ -1510,10 +1753,10 @@ mod tests {
         let store = ProviderAttemptStore::open(temp.path()).unwrap();
         let scope = "revoke-scope";
         write_host_snapshot(temp.path(), scope, &authority(1));
-        let context = AttemptContext::new(store.clone(), "revoke-operation", authority(1)).unwrap();
+        let context =
+            AttemptContext::from_host_ledger(store.clone(), "revoke-operation", scope).unwrap();
         let attempt = context.prepare("xai", b"request", true).unwrap();
         write_host_snapshot(temp.path(), scope, &authority(2));
-        let context = AttemptContext::from_host_ledger(store, "revoke-operation", scope).unwrap();
         assert_eq!(
             context.begin_send(&attempt).unwrap_err(),
             AttemptError::StaleAuthority

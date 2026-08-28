@@ -6,6 +6,7 @@ license.workspace = true
 description = "Durable crash-safe authority for provider attempts and physical sends"
 
 [dependencies]
+ed25519-dalek = "3.0.0"
 fs2 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

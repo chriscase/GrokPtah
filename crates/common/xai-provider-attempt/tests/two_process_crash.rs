@@ -1,27 +1,75 @@
 use std::fs;
 use std::process::Command;
 
+use ed25519_dalek::{Signer, SigningKey};
+use serde::Serialize;
 use tempfile::tempdir;
 use uuid::Uuid;
 
 use xai_provider_attempt::{AttemptContext, ProviderAttemptStore, SendState};
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityPayload {
+    principal_incarnation: String,
+    auth_generation: u64,
+    capability_generation: u64,
+    effect_lease_id: String,
+    effect_scope: String,
+    revoked_effect_lease_ids: Vec<String>,
+    issued_effect_lease_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SignedAuthorityRecord {
+    #[serde(flatten)]
+    payload: AuthorityPayload,
+    signature: String,
+}
+
 fn install_host_snapshot(root: &std::path::Path, scope: &str) {
     fs::create_dir_all(root.join("canonical-authorities")).unwrap();
+    let signing_key = SigningKey::from_bytes(&[7; 32]);
+    let public_key = root
+        .join("canonical-authorities")
+        .join(".authority-public-key");
+    fs::write(&public_key, signing_key.verifying_key().to_bytes()).unwrap();
+    let lease_id = format!("two-process-lease-{}", Uuid::new_v4());
+    let payload = AuthorityPayload {
+        principal_incarnation: "two-process-principal".into(),
+        auth_generation: 1,
+        capability_generation: 1,
+        effect_lease_id: lease_id.clone(),
+        effect_scope: scope.into(),
+        revoked_effect_lease_ids: Vec::new(),
+        issued_effect_lease_ids: vec![lease_id],
+    };
+    let signature = signing_key.sign(&serde_json::to_vec(&payload).unwrap());
     fs::write(
         root.join("canonical-authorities")
             .join(format!("{scope}.json")),
-        serde_json::json!({
-            "principalIncarnation": "two-process-principal",
-            "authGeneration": 1,
-            "capabilityGeneration": 1,
-            "effectLeaseId": format!("two-process-lease-{}", Uuid::new_v4()),
-            "effectScope": scope,
-            "revokedEffectLeaseIds": [],
+        serde_json::to_vec(&SignedAuthorityRecord {
+            payload,
+            signature: signature
+                .to_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
         })
-        .to_string(),
+        .unwrap(),
     )
     .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&public_key, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(
+            root.join("canonical-authorities")
+                .join(format!("{scope}.json")),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
 }
 
 #[test]

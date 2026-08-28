@@ -50,3 +50,4 @@ cc = "1"
 grokptah-test-gateway = { path = "test-support/grokptah-test-gateway" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process", "test-util"] }
 tempfile = "3"
+ed25519-dalek = "3.0.0"

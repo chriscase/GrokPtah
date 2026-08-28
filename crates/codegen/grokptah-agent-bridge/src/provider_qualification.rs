@@ -718,7 +718,7 @@ async fn completion(
     let request_bytes =
         serde_json::to_vec(&body).context("serialize provider qualification request")?;
     let provider_attempt = provider_attempt
-        .fork_effect_lease()
+        .acquire_next_effect_lease()
         .map_err(|error| anyhow!("allocate qualification effect lease: {error}"))?;
     let mut permit = Some(
         provider_attempt
@@ -840,7 +840,7 @@ async fn streaming_probe(
     });
     let request_bytes = serde_json::to_vec(&body).context("serialize provider stream request")?;
     let provider_attempt = provider_attempt
-        .fork_effect_lease()
+        .acquire_next_effect_lease()
         .map_err(|error| anyhow!("allocate qualification stream effect lease: {error}"))?;
     let mut permit = Some(
         provider_attempt
@@ -1243,19 +1243,13 @@ mod tests {
     fn qualification_attempt_context() -> xai_provider_attempt::AttemptContext {
         let scope = format!("qualification-scope-{}", Uuid::new_v4());
         let root = std::env::temp_dir().join(format!("grokptah-qualification-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(root.join("canonical-authorities")).unwrap();
-        std::fs::write(
-            root.join("canonical-authorities")
-                .join(format!("{scope}.json")),
-            serde_json::json!({
-                "principalIncarnation": "qualification-principal",
-                "authGeneration": 1,
-                "capabilityGeneration": 1,
-                "effectLeaseId": format!("qualification-lease-{}", Uuid::new_v4()),
-                "effectScope": scope,
-                "revokedEffectLeaseIds": [],
-            })
-            .to_string(),
+        crate::host_authority::write_test_snapshot(
+            &root,
+            &scope,
+            "qualification-principal",
+            1,
+            1,
+            &format!("qualification-lease-{}", Uuid::new_v4()),
         )
         .unwrap();
         let store = xai_provider_attempt::ProviderAttemptStore::open(root).unwrap();

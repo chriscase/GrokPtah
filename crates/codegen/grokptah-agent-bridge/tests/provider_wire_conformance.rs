@@ -2,6 +2,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use ed25519_dalek::{Signer, SigningKey};
 use grokptah_agent_bridge::{
     public_xai_endpoint_fingerprint, replay_xai_provider_contract_on_loopback, ArtifactReference,
     AttemptDisposition, CampaignActuals, CampaignBudgets, CampaignIdentity, CertificationCheck,
@@ -10,11 +11,89 @@ use grokptah_agent_bridge::{
     PERSISTENT_AGENT_CAPTURE_SCHEMA,
 };
 use grokptah_test_gateway::{split_at, MockGateway, Response, Step};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 const FIXTURE_SCHEMA: &str = "grokptah.provider_contract_fixture.v1";
 const MAX_FIXTURE_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorityPayload {
+    principal_incarnation: String,
+    auth_generation: u64,
+    capability_generation: u64,
+    effect_lease_id: String,
+    effect_scope: String,
+    revoked_effect_lease_ids: Vec<String>,
+    issued_effect_lease_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SignedAuthorityRecord {
+    #[serde(flatten)]
+    payload: AuthorityPayload,
+    signature: String,
+}
+
+fn test_provider_attempt_context() -> xai_provider_attempt::AttemptContext {
+    let root = std::env::temp_dir().join(format!("grokptah-wire-attempt-{}", Uuid::new_v4()));
+    let scope = format!("wire-scope-{}", Uuid::new_v4());
+    std::fs::create_dir_all(root.join("canonical-authorities")).unwrap();
+    let signing_key = SigningKey::from_bytes(&[7; 32]);
+    let public_key = root
+        .join("canonical-authorities")
+        .join(".authority-public-key");
+    std::fs::write(&public_key, signing_key.verifying_key().to_bytes()).unwrap();
+    let lease_id = format!("wire-lease-{}", Uuid::new_v4());
+    let payload = AuthorityPayload {
+        principal_incarnation: "wire-principal".into(),
+        auth_generation: 1,
+        capability_generation: 1,
+        effect_lease_id: lease_id.clone(),
+        effect_scope: scope.clone(),
+        revoked_effect_lease_ids: Vec::new(),
+        issued_effect_lease_ids: {
+            let mut leases = vec![lease_id];
+            leases.extend((1..64).map(|_| format!("wire-lease-{}", Uuid::new_v4())));
+            leases
+        },
+    };
+    let signature = signing_key.sign(&serde_json::to_vec(&payload).unwrap());
+    std::fs::write(
+        root.join("canonical-authorities")
+            .join(format!("{scope}.json")),
+        serde_json::to_vec(&SignedAuthorityRecord {
+            payload,
+            signature: signature
+                .to_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&public_key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(
+            root.join("canonical-authorities")
+                .join(format!("{scope}.json")),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let store = xai_provider_attempt::ProviderAttemptStore::open(root).unwrap();
+    xai_provider_attempt::AttemptContext::from_host_ledger(
+        store,
+        format!("wire-operation-{}", Uuid::new_v4()),
+        scope,
+    )
+    .unwrap()
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -122,6 +201,7 @@ async fn synthetic_xai_fixture_replays_through_the_production_provider_path() {
         "grok-fixture",
         messages.as_array().unwrap(),
         &tools,
+        test_provider_attempt_context(),
     )
     .await
     .expect("production xAI provider path must accept the fixture");
@@ -183,6 +263,7 @@ async fn production_provider_path_rejects_a_fixture_without_its_terminal_marker(
         "grok-fixture",
         &[serde_json::json!({"role": "user", "content": "synthetic"})],
         &serde_json::json!([]),
+        test_provider_attempt_context(),
     )
     .await
     .expect_err("production SSE handling must require the completion marker");
@@ -196,6 +277,7 @@ async fn provider_contract_replay_refuses_non_loopback_authority() {
         "grok-fixture",
         &[serde_json::json!({"role": "user", "content": "synthetic"})],
         &serde_json::json!([]),
+        test_provider_attempt_context(),
     )
     .await
     .expect_err("test-support replay must never target remote authority");

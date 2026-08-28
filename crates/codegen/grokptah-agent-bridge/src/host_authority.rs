@@ -5,6 +5,7 @@
 //! by `xai-provider-attempt`.
 
 use anyhow::{anyhow, Result};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -12,6 +13,9 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::orchestration::{AuthContext, OrchStore};
+
+const AUTHORITY_PUBLIC_KEY_FILE: &str = ".authority-public-key";
+const LEASE_BATCH_SIZE: usize = 64;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +29,14 @@ struct AuthorityRecord {
     revoked_effect_lease_ids: Vec<String>,
     #[serde(default)]
     issued_effect_lease_ids: Vec<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SignedAuthorityRecord {
+    #[serde(flatten)]
+    payload: AuthorityRecord,
+    signature: String,
 }
 
 struct PrincipalRef {
@@ -70,19 +82,18 @@ pub(crate) fn assemble(
     let principal = principal_ref(agent_id, &identity, store.clone())?;
     let capability = capability_lease(agent_id, store, effect_scope.clone(), turn_generation)?;
     let (revoked_effect_lease_ids, mut issued_effect_lease_ids) =
-        match fs::read(authority_path(attempt_root, &effect_scope)) {
-            Ok(bytes) => {
-                let record = serde_json::from_slice::<AuthorityRecord>(&bytes)?;
-                (
-                    record.revoked_effect_lease_ids,
-                    record.issued_effect_lease_ids,
-                )
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Vec::new(), Vec::new()),
-            Err(error) => return Err(error.into()),
+        match read_authority(attempt_root, &effect_scope) {
+            Ok(record) => (
+                record.revoked_effect_lease_ids,
+                record.issued_effect_lease_ids,
+            ),
+            Err(error) if is_not_found(&error) => (Vec::new(), Vec::new()),
+            Err(error) => return Err(error),
         };
     let lease_id = capability.lease_id;
     issued_effect_lease_ids.push(lease_id.clone());
+    issued_effect_lease_ids
+        .extend((1..LEASE_BATCH_SIZE).map(|_| format!("effect-lease-{}", Uuid::new_v4())));
     write_authority(
         attempt_root,
         &AuthorityRecord {
@@ -112,13 +123,11 @@ pub(crate) fn refresh(
     effect_scope: &str,
     rotate_capability: bool,
 ) -> Result<()> {
-    let path = authority_path(attempt_root, effect_scope);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
+    let mut current = match read_authority(attempt_root, effect_scope) {
+        Ok(record) => record,
+        Err(error) if is_not_found(&error) => return Ok(()),
+        Err(error) => return Err(error),
     };
-    let mut current: AuthorityRecord = serde_json::from_slice(&bytes)?;
     let credentials = crate::auth_store::resolve_wire_credentials_for_model(model)
         .map_err(|error| anyhow!("canonical auth authority unavailable: {error}"))?
         .ok_or_else(|| anyhow!("canonical auth authority is unavailable"))?;
@@ -138,8 +147,7 @@ pub(crate) fn refresh(
 
 pub(crate) fn revoke_scope(attempt_root: &Path, effect_scope: &str) -> Result<()> {
     let path = authority_path(attempt_root, effect_scope);
-    let bytes = fs::read(path)?;
-    let mut current: AuthorityRecord = serde_json::from_slice(&bytes)?;
+    let mut current = read_authority(attempt_root, effect_scope)?;
     let issued = current.issued_effect_lease_ids.clone();
     for lease in issued.into_iter().chain([current.effect_lease_id.clone()]) {
         if !current
@@ -248,15 +256,28 @@ fn authority_path(root: &Path, scope: &str) -> PathBuf {
         .join(format!("{scope}.json"))
 }
 
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn write_authority(root: &Path, record: &AuthorityRecord, scope: &str) -> Result<()> {
     let directory = root.join("canonical-authorities");
     fs::create_dir_all(&directory)?;
+    let signing_key = signing_key(root)?;
+    let payload = serde_json::to_vec(record)?;
+    let signature = signing_key.sign(&payload);
     let temporary = directory.join(format!(".{scope}.{}.tmp", Uuid::new_v4()));
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(&temporary)?;
-    file.write_all(&serde_json::to_vec(record)?)?;
+    file.write_all(&serde_json::to_vec(&SignedAuthorityRecord {
+        payload: record.clone(),
+        signature: hex(signature.to_bytes().as_slice()),
+    })?)?;
+    set_private_permissions(&file)?;
     file.sync_all()?;
     drop(file);
     fs::rename(temporary, authority_path(root, scope))?;
@@ -266,7 +287,133 @@ fn write_authority(root: &Path, record: &AuthorityRecord, scope: &str) -> Result
     Ok(())
 }
 
-pub(crate) fn write_snapshot(
+fn read_authority(root: &Path, scope: &str) -> Result<AuthorityRecord> {
+    let path = authority_path(root, scope);
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!("canonical authority record is a symlink"));
+    }
+    #[cfg(unix)]
+    if std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o077 != 0 {
+        return Err(anyhow!(
+            "canonical authority record permissions are too broad"
+        ));
+    }
+    let signed: SignedAuthorityRecord = serde_json::from_slice(&fs::read(path)?)?;
+    let public_key = read_public_key(root)?;
+    let signature_bytes =
+        decode_hex(&signed.signature).ok_or_else(|| anyhow!("canonical authority signature"))?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|_| anyhow!("canonical authority signature"))?;
+    let payload = serde_json::to_vec(&signed.payload)?;
+    public_key
+        .verify(&payload, &signature)
+        .map_err(|_| anyhow!("canonical authority signature verification failed"))?;
+    Ok(signed.payload)
+}
+
+fn signing_key(root: &Path) -> Result<SigningKey> {
+    let directory = root.join("canonical-authorities");
+    fs::create_dir_all(&directory)?;
+    let key_path = directory.join(".authority-signing-key");
+    let key = match fs::read(&key_path) {
+        Ok(bytes) => {
+            let seed: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("canonical authority signing key is invalid"))?;
+            SigningKey::from_bytes(&seed)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if key_path.exists() || directory.join(AUTHORITY_PUBLIC_KEY_FILE).exists() {
+                return Err(anyhow!("canonical authority signing key is unavailable"));
+            }
+            let mut seed = [0u8; 32];
+            seed[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+            seed[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&key_path)?;
+            file.write_all(&seed)?;
+            set_private_permissions(&file)?;
+            file.sync_all()?;
+            SigningKey::from_bytes(&seed)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let public_key_path = directory.join(AUTHORITY_PUBLIC_KEY_FILE);
+    let public_key = key.verifying_key().to_bytes();
+    match fs::read(&public_key_path) {
+        Ok(existing) if existing == public_key => {}
+        Ok(_) => return Err(anyhow!("canonical authority public key mismatch")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(public_key_path)?;
+            file.write_all(&public_key)?;
+            set_private_permissions(&file)?;
+            file.sync_all()?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(key)
+}
+
+fn read_public_key(root: &Path) -> Result<ed25519_dalek::VerifyingKey> {
+    let path = root
+        .join("canonical-authorities")
+        .join(AUTHORITY_PUBLIC_KEY_FILE);
+    let metadata = fs::symlink_metadata(&path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!("canonical authority public key is a symlink"));
+    }
+    #[cfg(unix)]
+    if std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o077 != 0 {
+        return Err(anyhow!(
+            "canonical authority public key permissions are too broad"
+        ));
+    }
+    let bytes = fs::read(path)?;
+    let bytes: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("canonical authority public key is invalid"))?;
+    ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+        .map_err(|_| anyhow!("canonical authority public key is invalid").into())
+}
+
+fn set_private_permissions(file: &File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let high = (chunk[0] as char).to_digit(16)? as u8;
+            let low = (chunk[1] as char).to_digit(16)? as u8;
+            Some((high << 4) | low)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn write_test_snapshot(
     root: &Path,
     scope: &str,
     principal_incarnation: &str,
@@ -274,6 +421,9 @@ pub(crate) fn write_snapshot(
     capability_generation: u64,
     effect_lease_id: &str,
 ) -> Result<()> {
+    let mut issued_effect_lease_ids = vec![effect_lease_id.into()];
+    issued_effect_lease_ids
+        .extend((1..LEASE_BATCH_SIZE).map(|_| format!("test-effect-lease-{}", Uuid::new_v4())));
     write_authority(
         root,
         &AuthorityRecord {
@@ -283,7 +433,7 @@ pub(crate) fn write_snapshot(
             effect_lease_id: effect_lease_id.into(),
             effect_scope: scope.into(),
             revoked_effect_lease_ids: Vec::new(),
-            issued_effect_lease_ids: vec![effect_lease_id.into()],
+            issued_effect_lease_ids,
         },
         scope,
     )

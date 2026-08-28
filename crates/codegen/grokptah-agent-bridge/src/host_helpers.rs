@@ -2974,6 +2974,7 @@ pub async fn replay_xai_provider_contract_on_loopback(
     model: &str,
     messages: &[serde_json::Value],
     tools: &serde_json::Value,
+    provider_attempt: ProviderAttemptContext,
 ) -> Result<ProviderContractReplay> {
     let parsed = reqwest::Url::parse(base_url)
         .map_err(|error| anyhow!("invalid provider contract loopback URL: {error}"))?;
@@ -3028,25 +3029,6 @@ pub async fn replay_xai_provider_contract_on_loopback(
     };
     let mut deltas = Vec::new();
     let mut thought_deltas = Vec::new();
-    let attempt_root =
-        std::env::temp_dir().join(format!("grokptah-provider-contract-{}", Uuid::new_v4()));
-    let attempt_store = xai_provider_attempt::ProviderAttemptStore::open(&attempt_root)
-        .map_err(|error| anyhow!("open provider contract attempt ledger: {error}"))?;
-    crate::host_authority::write_snapshot(
-        &attempt_root,
-        "provider-contract-replay-scope",
-        "provider-contract-replay",
-        1,
-        1,
-        "provider-contract-replay-lease",
-    )
-    .map_err(|error| anyhow!("create provider contract authority: {error}"))?;
-    let provider_attempt = ProviderAttemptContext::from_host_ledger(
-        attempt_store,
-        "provider-contract-replay",
-        "provider-contract-replay-scope",
-    )
-    .map_err(|error| anyhow!("create provider contract context: {error}"))?;
     let step = call_provider_agent_step(
         credentials,
         target,
@@ -3120,7 +3102,7 @@ mod compatible_stream_tests {
     fn provider_attempt_context() -> ProviderAttemptContext {
         let root = std::env::temp_dir().join(format!("grokptah-provider-test-{}", Uuid::new_v4()));
         let store = xai_provider_attempt::ProviderAttemptStore::open(&root).unwrap();
-        crate::host_authority::write_snapshot(
+        crate::host_authority::write_test_snapshot(
             &root,
             "provider-test-scope",
             "provider-test",

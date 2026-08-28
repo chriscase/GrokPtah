@@ -631,7 +631,7 @@ impl SamplingClient {
                 "host provider-attempt admission is required before physical send".into(),
             ));
         };
-        let context = context.fork_effect_lease().map_err(|error| {
+        let context = context.acquire_next_effect_lease().map_err(|error| {
             SamplingError::Auth(format!("allocate provider effect lease: {error}"))
         })?;
         let mut permit = context
