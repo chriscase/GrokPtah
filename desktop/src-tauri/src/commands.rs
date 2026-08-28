@@ -908,13 +908,7 @@ pub async fn computer_use_cockpit_propose_agent_action(
     )?;
     let proposal = state
         .host
-        .propose_computer_action_for_run(
-            owner,
-            &run_id,
-            expected_version,
-            &objective,
-            &observation,
-        )
+        .propose_computer_action_for_run(owner, &run_id, expected_version, &objective, &observation)
         .await
         .map_err(map_err)?;
     state

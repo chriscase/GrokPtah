@@ -1202,8 +1202,13 @@ impl AgentHostHandle {
             None => match AdaptivePolicyEngine.select(&evidence, task_policy) {
                 PolicyOutcome::Proceed(decision) => AdaptiveController::new(run_id, decision),
                 PolicyOutcome::Stop(stop) => {
-                    let controller =
-                        AdaptiveController::stopped(run_id, evidence.clone(), task_policy, stop);
+                    let message = stop.operator_message();
+                    let controller = AdaptiveController::stopped(
+                        run_id,
+                        evidence.clone(),
+                        task_policy,
+                        stop.clone(),
+                    );
                     self.persist_adaptive_state(
                         &store,
                         session_id,
@@ -1212,7 +1217,7 @@ impl AgentHostHandle {
                         &controller,
                         "selection_stopped",
                     )?;
-                    return Err(anyhow!(stop.operator_message()));
+                    return Err(anyhow!(message));
                 }
             },
         };
@@ -1326,7 +1331,10 @@ impl AgentHostHandle {
         let state = controller.state().clone();
         let updated = store.update_run(run_id, |run| {
             if run.owner_session_id != session_id || run.version != expected_version {
-                bail!("Computer Run changed while adaptive state was being recorded");
+                return Err(crate::computer_use::ComputerError::new(
+                    crate::computer_use::ComputerErrorCode::Conflict,
+                    "Computer Run changed while adaptive state was being recorded",
+                ));
             }
             run.adaptive = Some(state);
             run.record_audit("adaptive", disposition, None, None, None);

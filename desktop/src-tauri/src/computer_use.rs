@@ -5,9 +5,8 @@ use base64::Engine;
 use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
     canonical_workspace_string, ActionClass, ActionGrant, AdaptiveProfileProjection,
-    AgentHostHandle, ComputerAction,
-    ComputerAgentProposal, ComputerCapabilities, ComputerError, ComputerObservation,
-    ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
+    AgentHostHandle, ComputerAction, ComputerAgentProposal, ComputerCapabilities, ComputerError,
+    ComputerObservation, ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
     ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
     MacOsObservationPlatform, SemanticAction, SimulatorBackend,
@@ -310,7 +309,9 @@ impl DesktopComputerUse {
         let projection = run
             .as_ref()
             .map(|run| grokptah_agent_bridge::project_run_at(run, Utc::now()));
-        let adaptive = projection.as_ref().and_then(|projection| projection.adaptive.clone());
+        let adaptive = projection
+            .as_ref()
+            .and_then(|projection| projection.adaptive.clone());
         Ok(ComputerCockpitSnapshot {
             backend,
             origin: "desktop".into(),
@@ -836,7 +837,10 @@ fn approval_copy(
         ));
     }
     if matches!(action, ComputerAction::KeyChord { .. }) {
-        return Ok(("Apply the bounded key chord".into(), "Keyboard action".into()));
+        return Ok((
+            "Apply the bounded key chord".into(),
+            "Keyboard action".into(),
+        ));
     }
     let element_id = action
         .referenced_element()

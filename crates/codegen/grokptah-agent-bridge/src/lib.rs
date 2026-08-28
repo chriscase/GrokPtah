@@ -107,7 +107,11 @@ pub use completion::{
     enrich_terminal_handoff, CompletionClaims, CompletionEvidence, CompletionObservations,
     CompletionUsage,
 };
-pub use computer_agent::{ComputerAgentEligibility, ComputerAgentProposal};
+pub use computer_agent::{
+    render_computer_observation, validate_computer_proposal,
+    validate_computer_proposal_safety_only, ComputerAgentEligibility, ComputerAgentProposal,
+    RenderedObservation,
+};
 pub use computer_profile::{
     classify_objective, classify_task, project_adaptive, AdaptiveController, AdaptiveProfile,
     AdaptiveProfileProjection, AdaptiveRunState, CapabilityEvidence, ProfileReason, ReplayError,
