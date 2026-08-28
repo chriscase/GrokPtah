@@ -417,6 +417,7 @@ mod tests {
             RuntimeSignal::BudgetExhausted,
             RuntimeSignal::DestructiveIntentDetected,
             RuntimeSignal::AuthorityUnavailable,
+            RuntimeSignal::ProviderUncertain,
         ];
         for signal in signals {
             match AdaptivePolicyEngine.reassess(AdaptiveProfile::Economy, &evidence, signal) {

@@ -12,7 +12,7 @@ use grokptah_agent_bridge::{
     CapabilityAttribution, CapabilityEvidence, ComputerAction, ComputerAgentProposal,
     ComputerObservation, ComputerTarget, HostCapabilityEvidence, ModelCapabilityEvidence,
     ObservationGeometry, ProfileReason, ProfileTransition, RuntimeSignal, SafetyFloor,
-    SemanticAction, SemanticElement, Sensitivity, TaskPolicy, TaskRisk,
+    SemanticAction, SemanticElement, Sensitivity,
 };
 
 fn observation() -> ComputerObservation {
@@ -72,6 +72,17 @@ fn evidence() -> CapabilityEvidence {
     )
 }
 
+fn offline_decision() -> grokptah_agent_bridge::computer_profile::ProfileDecision {
+    grokptah_agent_bridge::computer_profile::ProfileDecision {
+        profile: AdaptiveProfile::Economy,
+        reason: ProfileReason::RoutineTask,
+        risk: grokptah_agent_bridge::TaskRisk::Routine,
+        ceiling: AdaptiveProfile::Economy,
+        capability_snapshot_reference: None,
+        evidence: evidence(),
+    }
+}
+
 #[test]
 fn economy_does_not_change_universal_safety_verdicts() {
     let current = observation();
@@ -116,17 +127,7 @@ fn economy_does_not_change_universal_safety_verdicts() {
 
 #[test]
 fn profile_transitions_are_bounded_and_explicit() {
-    let decision = match grokptah_agent_bridge::AdaptivePolicyEngine.select(
-        &evidence(),
-        TaskPolicy {
-            risk: TaskRisk::Routine,
-            minimum_profile: None,
-        },
-    ) {
-        grokptah_agent_bridge::PolicyOutcome::Proceed(decision) => decision,
-        other => panic!("unexpected policy result: {other:?}"),
-    };
-    let mut controller = AdaptiveController::new("run-1", decision);
+    let mut controller = AdaptiveController::new("run-1", offline_decision());
     assert_eq!(controller.profile(), AdaptiveProfile::Economy);
     assert!(matches!(
         controller.apply_signal(RuntimeSignal::AmbiguousObservation),
@@ -166,14 +167,7 @@ fn rendered_projection_has_no_sensitive_observation_or_frame_digest() {
     // Model rendering may contain semantic labels by design; public projection
     // is the redaction boundary. The rendered packet is never public.
     assert!(rendered.to_string().contains("SECRET-CONTROL"));
-    let mut controller = AdaptiveController::new(
-        "run-1",
-        match grokptah_agent_bridge::AdaptivePolicyEngine.select(&evidence(), TaskPolicy::default())
-        {
-            grokptah_agent_bridge::PolicyOutcome::Proceed(decision) => decision,
-            other => panic!("unexpected policy result: {other:?}"),
-        },
-    );
+    let mut controller = AdaptiveController::new("run-1", offline_decision());
     controller.observe_frame(grokptah_agent_bridge::ObservationFingerprint::of(&current));
     let projection = grokptah_agent_bridge::project_adaptive(&controller);
     let wire = serde_json::to_string(&projection).unwrap();
@@ -190,13 +184,7 @@ fn rendered_projection_has_no_sensitive_observation_or_frame_digest() {
 
 #[test]
 fn recovery_crash_cut_is_terminal_and_cost_is_truthful() {
-    let decision = match grokptah_agent_bridge::AdaptivePolicyEngine
-        .select(&evidence(), TaskPolicy::default())
-    {
-        grokptah_agent_bridge::PolicyOutcome::Proceed(decision) => decision,
-        other => panic!("unexpected policy result: {other:?}"),
-    };
-    let mut controller = AdaptiveController::new("run-1", decision);
+    let mut controller = AdaptiveController::new("run-1", offline_decision());
     controller.begin_turn(0).unwrap();
     controller.recover_interrupted();
     assert_eq!(
