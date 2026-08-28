@@ -760,6 +760,7 @@ impl CapabilityAuthority {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_envelope(&self, envelope_id: &str) -> Result<()> {
         let mut state = self
             .state
