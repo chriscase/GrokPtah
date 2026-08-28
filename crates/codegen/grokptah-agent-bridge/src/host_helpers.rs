@@ -3834,6 +3834,7 @@ pub(crate) fn api_context_messages(session: &Session) -> Vec<(String, String)> {
 /// `history` is already windowed (post-`api_context_start`); last entry is
 /// typically the current user prompt. `compacted_summary` is the extractive
 /// stand-in for local-only prefix that left the context window.
+#[allow(dead_code)]
 pub(crate) async fn call_xai_chat(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
