@@ -1046,14 +1046,15 @@ impl ComputerUseService {
         request_id: &str,
         result: &ComputerResult<T>,
     ) -> ComputerResult<()> {
+        let result_kind = match result {
+            Ok(_) => "success".to_string(),
+            Err(error) => format!("{:?}", error.code),
+        };
         self.consume_durable_lease(
             "settle_receipt",
             &json!({
                 "requestId": request_id,
-                "result": match result {
-                    Ok(_) => "success",
-                    Err(error) => &format!("{:?}", error.code),
-                },
+                "result": result_kind,
             }),
         )?;
         let encoded = match result {
