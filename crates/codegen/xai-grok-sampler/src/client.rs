@@ -90,7 +90,7 @@ fn default_provider_attempt_context(
         format!("sampler-principal-{principal}"),
         1,
         1,
-        format!("sampler-effect-lease-{}", std::process::id()),
+        format!("sampler-effect-lease-{}", uuid::Uuid::new_v4()),
         format!("sampler-effect-scope-{}", std::process::id()),
     )
     .map_err(|error| SamplingError::Auth(format!("create provider authority: {error}")))?;

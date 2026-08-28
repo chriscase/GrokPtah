@@ -974,7 +974,13 @@ impl AgentHostHandle {
             .provider_attempt_store
             .clone()
             .ok_or_else(|| anyhow!("provider-attempt ledger is unavailable"))?;
-        let authority = self.current_provider_authority(session_id)?;
+        let effect_lease_id = crate::host_authority::fresh_effect_lease_id();
+        let effect_scope = format!("effect-scope-{session_id}");
+        let authority = self.current_provider_authority(
+            session_id,
+            effect_lease_id.clone(),
+            effect_scope.clone(),
+        )?;
         let operation_id = self
             .run_usage_trackers
             .lock()
@@ -986,7 +992,14 @@ impl AgentHostHandle {
             store,
             operation_id,
             authority,
-            Arc::new(move || host.current_provider_authority(session_id).ok()),
+            Arc::new(move || {
+                host.current_provider_authority(
+                    session_id,
+                    effect_lease_id.clone(),
+                    effect_scope.clone(),
+                )
+                .ok()
+            }),
         )
         .map_err(|error| anyhow!("construct provider attempt context: {error}"))
     }
@@ -994,6 +1007,8 @@ impl AgentHostHandle {
     fn current_provider_authority(
         &self,
         session_id: Uuid,
+        effect_lease_id: String,
+        effect_scope: String,
     ) -> Result<xai_provider_attempt::CanonicalHostAuthority> {
         let (agent_id, turn_generation) = {
             let inner = self.inner.lock();
@@ -1015,6 +1030,8 @@ impl AgentHostHandle {
             agent_id.as_deref(),
             turn_generation,
             self.orchestration_store.lock().clone(),
+            effect_lease_id,
+            effect_scope,
         )
     }
 

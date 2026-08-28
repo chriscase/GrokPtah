@@ -14,6 +14,8 @@ pub(crate) fn assemble(
     agent_id: Option<&str>,
     turn_generation: u64,
     store: Option<OrchStore>,
+    effect_lease_id: String,
+    effect_scope: String,
 ) -> Result<xai_provider_attempt::CanonicalHostAuthority> {
     let (principal_incarnation, capability_generation) = if let Some(agent_id) = agent_id {
         let agent = store
@@ -42,8 +44,12 @@ pub(crate) fn assemble(
         principal_incarnation,
         turn_generation.max(1),
         capability_generation,
-        format!("effect-lease-{session_id}-{turn_generation}"),
-        format!("effect-scope-{session_id}"),
+        effect_lease_id,
+        effect_scope,
     )
     .map_err(|error| anyhow!("construct canonical host authority: {error}"))
+}
+
+pub(crate) fn fresh_effect_lease_id() -> String {
+    format!("effect-lease-{}", Uuid::new_v4())
 }
