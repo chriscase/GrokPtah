@@ -51,6 +51,7 @@ pub struct ComputerUseService {
     policy: ComputerPolicy,
     capability_authority: Arc<CapabilityAuthority>,
     service_capability: Option<RunCapability>,
+    action_capability: Option<RunCapability>,
     run_capabilities: Mutex<std::collections::HashMap<String, RunCapability>>,
     execution_receipts: Mutex<std::collections::HashMap<String, HostExecutionReceipt>>,
 }
