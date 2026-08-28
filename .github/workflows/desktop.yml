@@ -8,6 +8,8 @@ on:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
       - "crates/codegen/grokptah-agent-sdk/**"
+      - "crates/codegen/grokptah-service/**"
+      - "crates/codegen/grokptah-sdk-reference-consumer/**"
       - "evals/**"
       - ".github/workflows/desktop.yml"
   pull_request:
@@ -15,6 +17,8 @@ on:
       - "desktop/**"
       - "crates/codegen/grokptah-agent-bridge/**"
       - "crates/codegen/grokptah-agent-sdk/**"
+      - "crates/codegen/grokptah-service/**"
+      - "crates/codegen/grokptah-sdk-reference-consumer/**"
       - "evals/**"
       - ".github/workflows/desktop.yml"
 
@@ -50,7 +54,7 @@ jobs:
           components: rustfmt, clippy
       - name: Configure compiler-cache namespace
         env:
-          SCCACHE_NAMESPACE: grokptah-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.92-${{ hashFiles('desktop/src-tauri/Cargo.lock', 'crates/codegen/grokptah-agent-bridge/Cargo.lock', 'crates/codegen/grokptah-agent-sdk/Cargo.lock', 'evals/certification-lab/Cargo.lock') }}
+          SCCACHE_NAMESPACE: grokptah-v1-${{ runner.os }}-${{ runner.arch }}-rust-1.92-${{ hashFiles('desktop/src-tauri/Cargo.lock', 'crates/codegen/grokptah-agent-bridge/Cargo.lock', 'crates/codegen/grokptah-agent-sdk/Cargo.lock', 'crates/codegen/grokptah-service/Cargo.lock', 'crates/codegen/grokptah-sdk-reference-consumer/Cargo.lock', 'evals/certification-lab/Cargo.lock') }}
         run: echo "SCCACHE_GHA_VERSION=${SCCACHE_NAMESPACE}" >> "$GITHUB_ENV"
       - name: Install compiler cache
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
@@ -88,6 +92,22 @@ jobs:
           # The contract must still compile for a consumer that wants neither
           # the deterministic fake nor the conformance battery.
           cargo build --locked --no-default-features
+      - name: Agent SDK live adapters (real service + Desktop control server)
+        # The batteries that make the contract more than a wire shape: the same
+        # versioned checks against a real grokptah-service process and against
+        # the control server the Desktop embeds. Only this target is run — the
+        # rest of the service crate's suite is out of this lane's scope.
+        # Serial: these drive real hosts behind a process-wide home override.
+        working-directory: crates/codegen/grokptah-service
+        run: cargo test --locked --test sdk_live_conformance -- --test-threads=1
+      - name: Reference consumer isolation
+        # Asserts, against its own lockfile, that a consumer of the public seam
+        # cannot reach the bridge, the service, or their transitive runtime.
+        working-directory: crates/codegen/grokptah-sdk-reference-consumer
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
       - name: Offline parity oracles (no network)
         # Structured oracle unit tests + fixture selftests; live suite is on-demand.
         working-directory: crates/codegen/grokptah-agent-bridge

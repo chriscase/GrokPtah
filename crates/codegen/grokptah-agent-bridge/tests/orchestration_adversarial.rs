@@ -209,8 +209,20 @@ async fn reads_require_run_ownership_no_global_events() {
     // Global feed forbidden
     let err = orch.get_events(&auth, None, 0, 10).unwrap_err();
     assert_eq!(err.code.as_str(), "invalid_request");
-    let err = orch.get_run(&auth, "no-such-run").unwrap_err();
-    assert_eq!(err.code.as_str(), "invalid_request");
+    // An unknown run is refused with the *same* code as a run the caller may
+    // not reach. This assertion used to require `invalid_request`, which made
+    // the two distinguishable and turned every read into an existence oracle
+    // over run ids — and reads here are scoped by session and workspace, not
+    // by principal, so those ids need not be the caller's own. The equality
+    // against the foreign-allowlist read at the end of this test is the real
+    // property; the literal below just pins which side both landed on.
+    let unknown_run_code = orch
+        .get_run(&auth, "no-such-run")
+        .unwrap_err()
+        .code
+        .as_str()
+        .to_string();
+    assert_eq!(unknown_run_code, "forbidden_scope");
     // list_sessions filters allowlist + busy
     let list = orch.list_sessions(&auth).unwrap();
     let ws_canon = dunce::canonicalize(ws.path()).unwrap();
@@ -250,7 +262,19 @@ async fn reads_require_run_ownership_no_global_events() {
     let auth2 = foreign
         .auth_header(Some("Bearer secret-token-adversarial-196"))
         .unwrap();
-    assert!(foreign.get_run(&auth2, &run_id).is_err());
+    // A real run behind a foreign allowlist must be indistinguishable from a
+    // run that never existed. If these two codes ever diverge again, the
+    // oracle is back.
+    let foreign_run_code = foreign
+        .get_run(&auth2, &run_id)
+        .unwrap_err()
+        .code
+        .as_str()
+        .to_string();
+    assert_eq!(
+        foreign_run_code, unknown_run_code,
+        "an out-of-scope run must be refused exactly like an unknown one"
+    );
     assert!(foreign.get_handoff(&auth2, &run_id).is_err());
     set_grokptah_home_override(None);
 }
