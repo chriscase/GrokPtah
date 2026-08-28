@@ -460,51 +460,6 @@ fn set_private_permissions(file: &File) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn signed_reconciliation_record_is_private_after_atomic_write() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = tempfile::tempdir().unwrap();
-        initialize(root.path()).unwrap();
-        let operator = AuthContext {
-            token_id: "operator-1".into(),
-            owner_id: "owner-1".into(),
-        };
-        let receipt = crate::host::VerifiedProviderReceipt::from_provider_response(
-            "request-1",
-            None::<String>,
-        )
-        .unwrap();
-
-        write_verified_reconciliation(root.path(), "attempt-1", &operator, &receipt).unwrap();
-
-        let path = root.path().join("reconciliation/attempt-1.json");
-        let metadata = fs::symlink_metadata(path).unwrap();
-        assert_eq!(metadata.permissions().mode() & 0o077, 0);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn initialize_rejects_a_world_readable_signing_key() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = tempfile::tempdir().unwrap();
-        initialize(root.path()).unwrap();
-        let key_path = root
-            .path()
-            .join("canonical-authorities/.authority-signing-key");
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
-
-        let error = initialize(root.path()).unwrap_err();
-        assert!(error.to_string().contains("signing key permissions"));
-    }
-}
-
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -550,4 +505,49 @@ pub(crate) fn write_test_snapshot(
         },
         scope,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_reconciliation_record_is_private_after_atomic_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        initialize(root.path()).unwrap();
+        let operator = AuthContext {
+            token_id: "operator-1".into(),
+            owner_id: "owner-1".into(),
+        };
+        let receipt = crate::host::VerifiedProviderReceipt::from_provider_response(
+            "request-1",
+            None::<String>,
+        )
+        .unwrap();
+
+        write_verified_reconciliation(root.path(), "attempt-1", &operator, &receipt).unwrap();
+
+        let path = root.path().join("reconciliation/attempt-1.json");
+        let metadata = fs::symlink_metadata(path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o077, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialize_rejects_a_world_readable_signing_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        initialize(root.path()).unwrap();
+        let key_path = root
+            .path()
+            .join("canonical-authorities/.authority-signing-key");
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = initialize(root.path()).unwrap_err();
+        assert!(error.to_string().contains("signing key permissions"));
+    }
 }
