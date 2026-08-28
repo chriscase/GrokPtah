@@ -8,8 +8,8 @@ use grokptah_agent_bridge::{
     ComputerAgentProposal, ComputerCapabilities, ComputerError, ComputerObservation,
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
-    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer,
-    MacOsObservationPlatform, SemanticAction, SimulatorBackend,
+    ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer, SemanticAction,
+    SimulatorBackend,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -197,8 +197,11 @@ impl DesktopComputerUse {
             .bind_target(selection_token)
             .await
             .map_err(|error| error.to_string())?;
-        let service =
-            ComputerUseService::new_with_authority(backend, store, self.host.capability_authority());
+        let service = ComputerUseService::new_with_authority(
+            backend,
+            store,
+            self.host.capability_authority(),
+        );
         let limits = ComputerUseLimits {
             max_actions: 1,
             max_duration_secs: 5 * 60,

@@ -329,6 +329,7 @@ impl CapabilityAuthority {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn revoke(&self, snapshot: &CapabilitySnapshot) -> Result<()> {
         let mut state = self
             .state

@@ -38,6 +38,7 @@ struct RunCapability {
     capability: HostCapability,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct HostExecutionReceipt {
     run_id: String,
@@ -683,6 +684,7 @@ impl ComputerUseService {
         result
     }
 
+    #[allow(dead_code)]
     pub(crate) fn complete_from_execution_receipt(
         &self,
         request_id: &str,
