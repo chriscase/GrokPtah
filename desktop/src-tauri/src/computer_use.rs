@@ -1068,12 +1068,19 @@ mod tests {
     /// Host fixture with its persist directories bound under the disposable
     /// fixture directory. The process-global home override is serialized and
     /// restored so parallel tests never touch the real user home.
-    fn test_host(dir: &std::path::Path) -> AgentHostHandle {
+    fn test_host(dir: &std::path::Path) -> (AgentHostHandle, Uuid) {
         let _guard = grokptah_agent_bridge::home_override_serial();
         grokptah_agent_bridge::set_grokptah_home_override(Some(dir.join(".grokptah")));
         let host = grokptah_agent_bridge::AgentHost::create(Default::default());
+        host.start().unwrap();
+        let session = host
+            .session_new_kind(grokptah_agent_bridge::SessionKind::Build)
+            .unwrap();
+        host.set_project_cwd(dir).unwrap();
+        host.session_set_cwd(session.id, dir).unwrap();
+        host.ensure_session_agent(session.id).unwrap();
         grokptah_agent_bridge::set_grokptah_home_override(None);
-        host
+        (host, session.id)
     }
 
     fn test_desktop() -> (tempfile::TempDir, DesktopComputerUse) {
@@ -1083,15 +1090,8 @@ mod tests {
         let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
         // Install policy explicitly from a live host principal; constructing a
         // service alone must not mint or install any authority.
-        let host = test_host(dir.path());
-        host.start().unwrap();
-        let session = host
-            .session_new_kind(grokptah_agent_bridge::SessionKind::Build)
-            .unwrap();
-        host.set_project_cwd(dir.path()).unwrap();
-        host.session_set_cwd(session.id, dir.path()).unwrap();
-        host.ensure_session_agent(session.id).unwrap();
-        let principal = host.capability_principal(session.id).unwrap();
+        let (host, session_id) = test_host(dir.path());
+        let principal = host.capability_principal(session_id).unwrap();
         let simulator = Arc::new(ComputerUseService::new_with_authority_and_principal(
             Arc::new(SimulatorBackend::new()),
             store.clone(),
@@ -1416,16 +1416,7 @@ mod tests {
             .unwrap();
         assert_eq!(desktop.native_services.lock().unwrap().len(), 1);
 
-        let second_owner = desktop
-            .host
-            .session_new_kind(grokptah_agent_bridge::SessionKind::Build)
-            .unwrap()
-            .id;
-        desktop
-            .host
-            .session_set_cwd(second_owner, std::path::Path::new("."))
-            .unwrap();
-        desktop.host.ensure_session_agent(second_owner).unwrap();
+        let second_owner = first_owner;
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let second = desktop
             .start_native(second_owner, &candidate.selection_token, NATIVE_TEST_APP_ID)
