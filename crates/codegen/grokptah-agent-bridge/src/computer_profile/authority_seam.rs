@@ -18,6 +18,10 @@ use uuid::Uuid;
 
 const MAX_OPAQUE_REFERENCE_BYTES: usize = 128;
 
+mod sealed {
+    pub trait CanonicalAssemblyOnly {}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthorityFailure {
     Unavailable,
@@ -66,7 +70,7 @@ impl fmt::Debug for HostIssuedBinding {
 impl HostIssuedBinding {
     /// Wrap values issued by the eventual #477/#458 authority. This function
     /// validates shape only; it never creates a value for a production caller.
-    pub(crate) fn from_host_issued(
+    fn from_host_issued(
         principal_generation: String,
         capability_generation: String,
         effect_lease: String,
@@ -135,7 +139,7 @@ impl fmt::Debug for ProviderAttemptHandle {
 }
 
 impl ProviderAttemptHandle {
-    pub(crate) fn from_authority(token: String) -> Result<Self, AuthorityFailure> {
+    fn from_authority(token: String) -> Result<Self, AuthorityFailure> {
         if token.trim().is_empty()
             || token.len() > MAX_OPAQUE_REFERENCE_BYTES
             || token.contains(['\0', '/', '\\'])
@@ -174,7 +178,7 @@ impl fmt::Debug for ProviderAttemptUsage {
 }
 
 impl ProviderAttemptUsage {
-    pub(crate) fn from_transport(
+    fn from_transport(
         attempt_reference: String,
         provider_acknowledged: bool,
         prompt_tokens: Option<u64>,
@@ -261,7 +265,9 @@ pub(crate) type ProviderInvocation<'a> = Pin<
 /// acknowledgment, and latency only after that call. There is intentionally no
 /// synthetic implementation in production.
 #[async_trait]
-pub(crate) trait AdaptiveAuthorityAdapter: Send + Sync + fmt::Debug {
+pub(crate) trait AdaptiveAuthorityAdapter:
+    sealed::CanonicalAssemblyOnly + Send + Sync + fmt::Debug
+{
     fn current_binding(
         &self,
         session_id: Uuid,
