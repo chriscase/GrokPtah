@@ -1158,6 +1158,10 @@ impl AgentHostHandle {
             &model,
             &resolved.capability_snapshot,
         )?;
+        let capability = self
+            .capability_authority
+            .preinstalled_capability(&current.capability_snapshot)
+            .map_err(|error| anyhow!("canonical Computer Use capability envelope is unavailable: {error}"))?;
         {
             let mut inner = self.inner.lock();
             if inner
@@ -1171,9 +1175,7 @@ impl AgentHostHandle {
                 (session_id, model.clone()),
                 SessionComputerQualification {
                     snapshot: current.capability_snapshot,
-                    capability: return Err(anyhow!(
-                        "canonical Computer Use capability envelope is not installed"
-                    )),
+                    capability,
                     tier: crate::gateway_config::ComputerUseTier::SemanticAct,
                 },
             );

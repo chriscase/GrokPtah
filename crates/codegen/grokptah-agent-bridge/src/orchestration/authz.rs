@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::types::{OrchError, OrchErrorCode};
@@ -695,6 +696,10 @@ fn decode_fixed_hex(value: &str) -> Option<[u8; 16]> {
         .map(|index| u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).ok())
         .collect::<Option<Vec<_>>>()?;
     digest[..16].try_into().ok()
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn bearer_token(header: Option<&str>) -> Result<&str, OrchError> {

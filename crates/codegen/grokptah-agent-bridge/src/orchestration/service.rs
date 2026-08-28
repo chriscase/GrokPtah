@@ -1468,7 +1468,7 @@ impl OrchestrationService {
         let credentials = if token.is_empty() {
             Vec::new()
         } else {
-            vec![AuthCredential::new("primary", token)
+            vec![AuthCredential::new("primary", token.clone())
                 .expect("non-empty bearer token should form a primary credential")]
         };
         let owner_id = self.agent_owner_id();

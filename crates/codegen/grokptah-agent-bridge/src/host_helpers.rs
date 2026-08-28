@@ -3095,8 +3095,7 @@ pub async fn replay_xai_provider_contract_on_loopback(
         None,
         None,
         Some(authority),
-        Some(principal.id()),
-        Some(principal.policy_generation()),
+        Some(principal),
         |delta| deltas.push(delta.to_string()),
         |delta| thought_deltas.push(delta.to_string()),
     )
