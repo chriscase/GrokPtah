@@ -11643,7 +11643,10 @@ mod tests {
         let session_id = created["sessionId"].as_str().unwrap().parse().unwrap();
         let session = host.session_inspect(session_id).unwrap();
         assert_eq!(session.title, "final service title");
-        assert_eq!(session.cwd, workspace.path().display().to_string());
+        assert_eq!(
+            dunce::canonicalize(&session.cwd).unwrap(),
+            dunce::canonicalize(workspace.path()).unwrap()
+        );
         assert_eq!(host.list_sessions().len(), 1);
 
         let unbound = host.session_new_kind(SessionKind::Build).unwrap();
