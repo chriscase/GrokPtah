@@ -27,7 +27,10 @@ use crate::manifest::{
     ComputerSurfaceBinding, HelperIdentity, IsolatedSourceManifest, IsolatedVisualResourceLimits,
     MAX_CONCURRENT_GUESTS, MAX_SURFACE_LEASES,
 };
-use crate::occupancy::{resource_key, OccupancyRecord, OccupancyState, OccupancyStore};
+use crate::occupancy::{
+    resource_key, OccupancyRecord, OccupancyState, OccupancyStore, PRIMARY_OVERLAY_ID,
+    PRIMARY_SURFACE_ID,
+};
 use crate::preflight::IsolatedPreflight;
 use crate::projection::{project_guest, IsolatedVisualProjection};
 use crate::protocol::{
@@ -47,9 +50,7 @@ pub struct IsolatedVisualHost {
     preflight: IsolatedPreflight,
     next_queue_sequence: u64,
     occupancy: OccupancyStore,
-    occupancy_keys: BTreeMap<String, String>,
-    overlays: BTreeMap<String, PathBuf>,
-    helper_alive: BTreeMap<String, bool>,
+    artifact_root: Option<PathBuf>,
 }
 
 pub struct CreateGuestRequest {
@@ -97,9 +98,7 @@ impl IsolatedVisualHost {
             preflight: IsolatedPreflight::inspect(artifact_root)?,
             next_queue_sequence: 1,
             occupancy,
-            occupancy_keys: BTreeMap::new(),
-            overlays: BTreeMap::new(),
-            helper_alive: BTreeMap::new(),
+            artifact_root: artifact_root.map(Path::to_path_buf),
         };
         host.next_queue_sequence = host
             .store
@@ -128,10 +127,41 @@ impl IsolatedVisualHost {
         self.resolver.resolve(manifest, staging)
     }
 
+    /// Simulator guests may be created without packaged admission. Evidence
+    /// class remains ineligible for VM qualification.
     pub fn create_guest(
         &mut self,
         request: CreateGuestRequest,
     ) -> IsolatedResult<IsolatedGuestRecord> {
+        self.create_guest_with_class(request, IsolatedEvidenceClass::SimulatorIneligible)
+    }
+
+    /// Packaged / Virtualization.framework guests require admitted helper and
+    /// image identities. Evidence class stays ineligible until an
+    /// authoritative launch receipt is observed.
+    pub fn create_packaged_guest(
+        &mut self,
+        request: CreateGuestRequest,
+    ) -> IsolatedResult<IsolatedGuestRecord> {
+        self.preflight.fail_closed_launch()?;
+        if !self.preflight.helper_admitted || !self.preflight.image_admitted {
+            return Err(IsolatedError::unauthorized(
+                "packaged guest create requires admitted helper and image identities",
+            ));
+        }
+        self.create_guest_with_class(request, IsolatedEvidenceClass::SimulatorIneligible)
+    }
+
+    fn create_guest_with_class(
+        &mut self,
+        request: CreateGuestRequest,
+        evidence_class: IsolatedEvidenceClass,
+    ) -> IsolatedResult<IsolatedGuestRecord> {
+        if evidence_class == IsolatedEvidenceClass::VirtualizationFramework {
+            return Err(IsolatedError::unauthorized(
+                "create cannot mint Virtualization.framework evidence without a launch receipt",
+            ));
+        }
         request.source.validate()?;
         request.limits.validate()?;
         request.helper.validate()?;
@@ -162,6 +192,13 @@ impl IsolatedVisualHost {
         }
         let now = self.clock.now();
         let guest_id = Uuid::new_v4().to_string();
+        let image_digest = request
+            .source
+            .guest_image_sha256
+            .clone()
+            .unwrap_or_else(|| request.helper.content_sha256.clone());
+        let occupancy_resource_key =
+            resource_key(&image_digest, PRIMARY_OVERLAY_ID, PRIMARY_SURFACE_ID);
         let guest = IsolatedGuestRecord {
             schema_version: SCHEMA_VERSION,
             guest_id: guest_id.clone(),
@@ -179,7 +216,8 @@ impl IsolatedVisualHost {
             phase: IsolatedGuestPhase::Create,
             terminal: None,
             cleaned: false,
-            evidence_class: IsolatedEvidenceClass::SimulatorIneligible,
+            occupancy_resource_key: occupancy_resource_key.clone(),
+            evidence_class,
             limits: request.limits,
             frame_epoch: 0,
             frames_seen: 0,
@@ -193,37 +231,25 @@ impl IsolatedVisualHost {
             disposition: None,
         };
         guest.validate()?;
-        let key = resource_key(
-            &guest.helper.content_sha256,
-            &guest.guest_id,
-            &guest.surface.incarnation,
-        );
         self.occupancy.try_acquire(OccupancyRecord {
             schema_version: SCHEMA_VERSION,
-            resource_key: key.clone(),
+            resource_key: occupancy_resource_key,
             owner_id: guest.agent_id.clone(),
             guest_id: guest.guest_id.clone(),
             surface_incarnation: guest.surface.incarnation.clone(),
-            image_digest: guest.helper.content_sha256.clone(),
-            overlay_id: guest.guest_id.clone(),
+            image_digest,
+            overlay_id: PRIMARY_OVERLAY_ID.to_string(),
             vm_instance_id: None,
             state: OccupancyState::Clear,
             updated_at: now,
         })?;
-        let overlay = self.store.root().join("overlays");
-        fs::create_dir_all(&overlay).map_err(|error| IsolatedError::internal(error.to_string()))?;
-        let overlay_path = overlay.join(format!("{}.overlay", guest.guest_id));
-        fs::write(&overlay_path, guest.guest_id.as_bytes())
-            .map_err(|error| IsolatedError::internal(error.to_string()))?;
+        self.write_guest_presence(&guest)?;
         self.store.save_guest(&guest)?;
         self.simulator.attach(&guest.guest_id);
         self.secrets.insert(
             guest.surface.incarnation.clone(),
             fresh_secret(&guest.guest_id, now),
         );
-        self.occupancy_keys.insert(guest.guest_id.clone(), key);
-        self.overlays.insert(guest.guest_id.clone(), overlay_path);
-        self.helper_alive.insert(guest.guest_id.clone(), true);
         Ok(guest)
     }
 
@@ -676,41 +702,35 @@ impl IsolatedVisualHost {
 
     pub fn observe_cleanup(&self, guest_id: &str) -> IsolatedResult<IsolatedCleanupObservation> {
         let guest = self.require_guest(guest_id)?;
+        let occupancy_held = self.occupancy_held(&guest).unwrap_or(true);
         Ok(IsolatedCleanupObservation {
             guest_id: guest.guest_id.clone(),
             surface: guest.surface.clone(),
             helper_exit: Some(HelperExitObservation {
                 guest_id: guest.guest_id.clone(),
                 surface_incarnation: guest.surface.incarnation.clone(),
-                helper_alive: self
-                    .helper_alive
-                    .get(&guest.guest_id)
-                    .copied()
-                    .unwrap_or(true),
+                helper_alive: self.helper_alive_path(&guest.guest_id).exists(),
                 audit_identity: guest.helper.helper_id.clone(),
             }),
             vm_stop: Some(VmStopObservation {
                 guest_id: guest.guest_id.clone(),
                 surface_incarnation: guest.surface.incarnation.clone(),
-                vm_present: self.simulator.attached(&guest.guest_id),
+                vm_present: self.vm_present_path(&guest.guest_id).exists(),
             }),
             overlay_removed: Some(OverlayRemovalObservation {
                 guest_id: guest.guest_id.clone(),
                 surface_incarnation: guest.surface.incarnation.clone(),
-                overlay_present: self
-                    .overlays
-                    .get(&guest.guest_id)
-                    .is_some_and(|path| path.exists()),
+                overlay_present: self.overlay_path(&guest.guest_id).exists(),
             }),
             channel_revoked: Some(ChannelRevocationObservation {
                 guest_id: guest.guest_id.clone(),
                 surface_incarnation: guest.surface.incarnation.clone(),
-                channel_present: self.secrets.contains_key(&guest.surface.incarnation),
+                channel_present: self.channel_path(&guest.guest_id).exists(),
             }),
             occupancy_released: Some(OccupancyReleaseObservation {
                 guest_id: guest.guest_id.clone(),
                 surface_incarnation: guest.surface.incarnation.clone(),
-                occupancy_held: self.occupancy_keys.contains_key(&guest.guest_id),
+                occupancy_held,
             }),
             resident_bytes: Some(self.simulator.resident_bytes(&guest.guest_id)),
         })
@@ -724,13 +744,17 @@ impl IsolatedVisualHost {
             ));
         }
         self.simulator.destroy(&guest.guest_id);
-        self.helper_alive.insert(guest.guest_id.clone(), false);
-        if let Some(path) = self.overlays.remove(&guest.guest_id) {
-            let _ = fs::remove_file(path);
-        }
+        let _ = fs::remove_file(self.helper_alive_path(&guest.guest_id));
+        let _ = fs::remove_file(self.overlay_path(&guest.guest_id));
+        let _ = fs::remove_file(self.channel_path(&guest.guest_id));
+        let _ = fs::remove_file(self.vm_present_path(&guest.guest_id));
         self.secrets.remove(&guest.surface.incarnation);
-        if let Some(key) = self.occupancy_keys.remove(&guest.guest_id) {
-            self.occupancy.release(&key, &guest.agent_id)?;
+        if !guest.occupancy_resource_key.is_empty() {
+            self.occupancy
+                .release(&guest.occupancy_resource_key, &guest.agent_id)?;
+        } else if let Some(record) = self.occupancy.find_for_guest(&guest.guest_id)? {
+            self.occupancy
+                .release(&record.resource_key, &guest.agent_id)?;
         }
         let evidence = IsolatedCleanupEvidence::from_observations(
             self.observe_cleanup(guest_id)?,
@@ -799,8 +823,69 @@ impl IsolatedVisualHost {
         let root = self.store.root().to_path_buf();
         let clock = Arc::clone(&self.clock);
         let resolver = HermeticResolver::new(self.resolver.store().clone());
+        let artifact_root = self.artifact_root.clone();
         drop(self);
-        IsolatedVisualHost::open(root, clock, resolver)
+        IsolatedVisualHost::open_with_artifacts(root, clock, resolver, artifact_root.as_deref())
+    }
+
+    fn overlay_path(&self, guest_id: &str) -> PathBuf {
+        self.store
+            .root()
+            .join("overlays")
+            .join(format!("{guest_id}.overlay"))
+    }
+
+    fn helper_alive_path(&self, guest_id: &str) -> PathBuf {
+        self.store
+            .root()
+            .join("helpers")
+            .join(format!("{guest_id}.alive"))
+    }
+
+    fn vm_present_path(&self, guest_id: &str) -> PathBuf {
+        self.store
+            .root()
+            .join("vms")
+            .join(format!("{guest_id}.present"))
+    }
+
+    fn channel_path(&self, guest_id: &str) -> PathBuf {
+        self.store
+            .root()
+            .join("channels")
+            .join(format!("{guest_id}.channel"))
+    }
+
+    fn write_guest_presence(&self, guest: &IsolatedGuestRecord) -> IsolatedResult<()> {
+        for dir in ["overlays", "helpers", "vms", "channels"] {
+            fs::create_dir_all(self.store.root().join(dir))
+                .map_err(|error| IsolatedError::internal(error.to_string()))?;
+        }
+        fs::write(
+            self.overlay_path(&guest.guest_id),
+            guest.guest_id.as_bytes(),
+        )
+        .map_err(|error| IsolatedError::internal(error.to_string()))?;
+        fs::write(self.helper_alive_path(&guest.guest_id), b"alive")
+            .map_err(|error| IsolatedError::internal(error.to_string()))?;
+        fs::write(self.vm_present_path(&guest.guest_id), b"present")
+            .map_err(|error| IsolatedError::internal(error.to_string()))?;
+        fs::write(self.channel_path(&guest.guest_id), b"channel")
+            .map_err(|error| IsolatedError::internal(error.to_string()))?;
+        Ok(())
+    }
+
+    fn occupancy_held(&self, guest: &IsolatedGuestRecord) -> IsolatedResult<bool> {
+        if !guest.occupancy_resource_key.is_empty() {
+            return Ok(self
+                .occupancy
+                .inspect(&guest.occupancy_resource_key)?
+                .is_held());
+        }
+        Ok(self
+            .occupancy
+            .find_for_guest(&guest.guest_id)?
+            .is_some_and(|record| record.state.is_held()))
     }
 
     fn require_guest(&self, guest_id: &str) -> IsolatedResult<IsolatedGuestRecord> {

@@ -57,6 +57,8 @@ pub struct IsolatedGuestRecord {
     pub phase: IsolatedGuestPhase,
     pub terminal: Option<IsolatedGuestTerminal>,
     pub cleaned: bool,
+    #[serde(default)]
+    pub occupancy_resource_key: String,
     pub evidence_class: IsolatedEvidenceClass,
     pub limits: IsolatedVisualResourceLimits,
     pub frame_epoch: u64,
@@ -89,6 +91,9 @@ impl IsolatedGuestRecord {
         self.surface.validate()?;
         self.source.validate()?;
         self.limits.validate()?;
+        if !self.occupancy_resource_key.is_empty() {
+            validate_id("occupancy_resource_key", &self.occupancy_resource_key)?;
+        }
         if self.agent_spec_revision == 0 {
             return Err(IsolatedError::invalid(
                 "agent_spec_revision must be greater than zero",
@@ -214,6 +219,7 @@ mod tests {
             phase: IsolatedGuestPhase::Create,
             terminal: None,
             cleaned: false,
+            occupancy_resource_key: String::new(),
             evidence_class: IsolatedEvidenceClass::SimulatorIneligible,
             limits: IsolatedVisualResourceLimits::proof_defaults(),
             frame_epoch: 0,

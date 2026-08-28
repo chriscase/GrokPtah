@@ -50,17 +50,22 @@ pub use manifest::{
     ComputerSurfaceBinding, HelperIdentity, IsolatedSourceManifest, IsolatedVisualManifest,
     IsolatedVisualResourceLimits, IsolatedVisualSecurityProfile,
 };
-pub use occupancy::{resource_key, OccupancyRecord, OccupancyState, OccupancyStore};
-pub use packaged_authority::{
-    admit_guest_image, admit_packaged_helper, documented_identity_json, hash_bundle_manifest,
-    hash_file, inspect_artifact_root, inspect_codesign_fields, parse_semver, versions_compatible,
-    write_admitted_fixture, ExpectedGuestImage, ExpectedHelper, GuestImageObservation,
-    PackagedHelperObservation, SigningClass, APP_BUNDLE_ID, APP_EXECUTABLE, APP_MINIMUM_OS,
-    APP_PRODUCT_NAME, APP_VERSION, COMPUTER_USE_MINIMUM_OS, DEMO_TARGET_BUNDLE_ID,
-    HELPER_BUNDLE_ID, HELPER_EXECUTABLE, HELPER_MINIMUM_OS, HELPER_NESTED_PATH,
-    HELPER_PRODUCT_NAME, HELPER_VERSION, PACKAGE_IDENTITY_SCHEMA,
+pub use occupancy::{
+    resource_key, OccupancyRecord, OccupancyState, OccupancyStore, PRIMARY_OVERLAY_ID,
+    PRIMARY_SURFACE_ID,
 };
-pub use preflight::IsolatedPreflight;
+pub use packaged_authority::{
+    admit_guest_image, admit_packaged_helper, canonical_helper_entitlements_digest,
+    designated_requirement_for, documented_identity_json, hash_bundle_manifest, hash_file,
+    inspect_artifact_root, inspect_codesign_fields, parse_semver, versions_compatible,
+    write_guest_image_claim, write_planted_codesign_display, write_unsigned_helper_bundle,
+    ExpectedGuestImage, ExpectedHelper, GuestImageObservation, PackagedHelperObservation,
+    SigningClass, APP_BUNDLE_ID, APP_EXECUTABLE, APP_MINIMUM_OS, APP_PRODUCT_NAME, APP_VERSION,
+    COMPUTER_USE_MINIMUM_OS, DEMO_TARGET_BUNDLE_ID, HELPER_BUNDLE_ID, HELPER_EXECUTABLE,
+    HELPER_MINIMUM_OS, HELPER_NESTED_PATH, HELPER_PRODUCT_NAME, HELPER_VERSION,
+    PACKAGE_IDENTITY_SCHEMA,
+};
+pub use preflight::{IsolatedPreflight, VirtualizationLaunchReceipt};
 pub use projection::IsolatedVisualProjection;
 pub use resolver::{ContentAddressedStore, HermeticResolver};
 pub use store::IsolatedVisualStore;

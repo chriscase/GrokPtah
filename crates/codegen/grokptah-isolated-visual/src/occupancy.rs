@@ -54,8 +54,37 @@ impl OccupancyRecord {
     }
 }
 
-pub fn resource_key(image_digest: &str, overlay_id: &str, surface_incarnation: &str) -> String {
-    sha256_hex(format!("v1|{image_digest}|{overlay_id}|{surface_incarnation}").as_bytes())
+/// Exclusive occupancy of one guest image, overlay slot, and surface.
+/// Do not include a per-guest UUID: that makes exclusivity a no-op.
+pub const PRIMARY_OVERLAY_ID: &str = "isolated-visual-primary-overlay";
+pub const PRIMARY_SURFACE_ID: &str = "isolated-visual-primary-surface";
+
+pub fn resource_key(image_digest: &str, overlay_id: &str, surface_id: &str) -> String {
+    sha256_hex(format!("v1|{image_digest}|{overlay_id}|{surface_id}").as_bytes())
+}
+
+impl OccupancyState {
+    fn severity(self) -> u8 {
+        match self {
+            Self::Clear => 0,
+            Self::Stale => 1,
+            Self::Recovery => 2,
+            Self::Live => 3,
+            Self::Conflicting => 4,
+        }
+    }
+
+    pub fn merge(self, other: Self) -> Self {
+        if other.severity() > self.severity() {
+            other
+        } else {
+            self
+        }
+    }
+
+    pub fn is_held(self) -> bool {
+        self != Self::Clear
+    }
 }
 
 pub struct OccupancyStore {
@@ -86,21 +115,50 @@ impl OccupancyStore {
         }
     }
 
+    /// Inspect every occupancy record. Corrupt records fail closed instead of
+    /// reporting Clear.
+    pub fn inspect_any(&self) -> IsolatedResult<OccupancyState> {
+        let mut worst = OccupancyState::Clear;
+        for record in self.list()? {
+            worst = worst.merge(record.state);
+        }
+        Ok(worst)
+    }
+
+    pub fn list(&self) -> IsolatedResult<Vec<OccupancyRecord>> {
+        let mut records = Vec::new();
+        for entry in fs::read_dir(&self.root).map_err(io_err)? {
+            let entry = entry.map_err(io_err)?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(key) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if let Some(record) = self.load(key)? {
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    pub fn find_for_guest(&self, guest_id: &str) -> IsolatedResult<Option<OccupancyRecord>> {
+        for record in self.list()? {
+            if record.guest_id == guest_id {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn try_acquire(&self, record: OccupancyRecord) -> IsolatedResult<OccupancyRecord> {
         record.validate()?;
         let path = self.record_path(&record.resource_key)?;
         let lock_path = self.lock_path(&record.resource_key)?;
         if let Some(existing) = self.load(&record.resource_key)? {
-            if existing.state == OccupancyState::Live && existing.owner_id != record.owner_id {
-                return Err(IsolatedError::conflict(
-                    "occupancy resource is held by a live owner",
-                ));
-            }
-            if existing.state == OccupancyState::Conflicting {
-                return Err(IsolatedError::conflict(
-                    "occupancy resource is in conflict and cannot be acquired",
-                ));
-            }
+            return Err(IsolatedError::conflict(format!(
+                "occupancy resource is not clear ({:?})",
+                existing.state
+            )));
         }
         let lock = OpenOptions::new()
             .create(true)
@@ -288,5 +346,41 @@ mod tests {
             store.inspect(&rec.resource_key).unwrap(),
             OccupancyState::Clear
         );
+    }
+
+    #[test]
+    fn inspect_any_fails_closed_on_corrupt_records() {
+        let dir = tempdir().unwrap();
+        let store = OccupancyStore::open(dir.path()).unwrap();
+        let rec = store.try_acquire(record("owner-a")).unwrap();
+        fs::write(
+            dir.path().join(format!("{}.json", rec.resource_key)),
+            b"{not-json",
+        )
+        .unwrap();
+        assert_eq!(
+            store.inspect_any().unwrap_err().code,
+            crate::error::IsolatedErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn same_owner_cannot_reacquire_a_live_resource() {
+        let dir = tempdir().unwrap();
+        let store = OccupancyStore::open(dir.path()).unwrap();
+        store.try_acquire(record("owner-a")).unwrap();
+        assert_eq!(
+            store.try_acquire(record("owner-a")).unwrap_err().code,
+            crate::error::IsolatedErrorCode::Conflict
+        );
+    }
+
+    #[test]
+    fn resource_key_does_not_include_a_guest_uuid() {
+        let first = resource_key(&"a".repeat(64), PRIMARY_OVERLAY_ID, PRIMARY_SURFACE_ID);
+        let second = resource_key(&"a".repeat(64), PRIMARY_OVERLAY_ID, PRIMARY_SURFACE_ID);
+        assert_eq!(first, second);
+        let other_image = resource_key(&"b".repeat(64), PRIMARY_OVERLAY_ID, PRIMARY_SURFACE_ID);
+        assert_ne!(first, other_image);
     }
 }

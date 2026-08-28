@@ -2,17 +2,57 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{IsolatedError, IsolatedResult};
+use crate::ids::{validate_id, SCHEMA_VERSION};
 use crate::lifecycle::IsolatedEvidenceClass;
 use crate::occupancy::{OccupancyState, OccupancyStore};
 use crate::packaged_authority::{
-    admit_guest_image, admit_packaged_helper, inspect_artifact_root, ExpectedHelper,
-    GuestImageObservation, PackagedHelperObservation,
+    admit_guest_image, admit_packaged_helper, inspect_artifact_root, ExpectedGuestImage,
+    ExpectedHelper, GuestImageObservation, PackagedHelperObservation,
 };
 
 pub const MIN_FREE_BYTES_FOR_GUEST_IMAGE: u64 = 25 * 1024 * 1024 * 1024;
+
+/// Authoritative Virtualization.framework launch/boot receipt. A boolean
+/// `with_observed_launch(true)` cannot mint this type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VirtualizationLaunchReceipt {
+    pub schema_version: u32,
+    pub launch_id: String,
+    pub guest_id: String,
+    pub hypervisor_instance_id: String,
+    pub boot_observed: bool,
+    pub observed_at: DateTime<Utc>,
+}
+
+impl VirtualizationLaunchReceipt {
+    pub fn validate(&self) -> IsolatedResult<()> {
+        if self.schema_version != SCHEMA_VERSION {
+            return Err(IsolatedError::unauthorized(
+                "virtualization launch receipt schema is unsupported",
+            ));
+        }
+        validate_id("launch_id", &self.launch_id)?;
+        validate_id("guest_id", &self.guest_id)?;
+        validate_id("hypervisor_instance_id", &self.hypervisor_instance_id)?;
+        let instance = self.hypervisor_instance_id.to_ascii_lowercase();
+        if instance.contains("simulat")
+            || instance.contains("fake")
+            || instance.contains("boolean")
+            || instance == "true"
+            || instance == "observed"
+        {
+            return Err(IsolatedError::unauthorized(
+                "virtualization launch receipt is not an authoritative hypervisor instance",
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,22 +83,32 @@ impl IsolatedPreflight {
     pub fn inspect_production() -> IsolatedResult<Self> {
         let root = std::env::var_os("GROKPTAH_ISOLATED_VISUAL_ARTIFACT_ROOT")
             .map(std::path::PathBuf::from);
-        Self::inspect(root.as_deref())
+        let expected_helper = ExpectedHelper::from_canonical_contract(None).ok();
+        let expected_image = ExpectedGuestImage::from_canonical_contract().ok();
+        Self::inspect_with_expected(
+            root.as_deref(),
+            expected_helper.as_ref(),
+            expected_image.as_ref(),
+        )
     }
 
     pub fn inspect(artifact_root: Option<&Path>) -> IsolatedResult<Self> {
-        Self::inspect_with_team(artifact_root, None)
+        Self::inspect_with_expected(artifact_root, None, None)
     }
 
-    pub fn inspect_with_team(
+    pub fn inspect_with_expected(
         artifact_root: Option<&Path>,
-        expected_team_id: Option<&str>,
+        expected_helper: Option<&ExpectedHelper>,
+        expected_image: Option<&ExpectedGuestImage>,
     ) -> IsolatedResult<Self> {
         let free_bytes = free_bytes().unwrap_or(0);
         let hardware_supported = hypervisor_supported();
         let virtualization_framework_present = virtualization_framework_present();
-        let occupancy_state = occupancy_state(artifact_root);
-        let occupancy_clear = occupancy_state == OccupancyState::Clear;
+        let (occupancy_state, occupancy_error) = match occupancy_state(artifact_root) {
+            Ok(state) => (state, None),
+            Err(error) => (OccupancyState::Recovery, Some(error.to_string())),
+        };
+        let occupancy_clear = occupancy_error.is_none() && occupancy_state == OccupancyState::Clear;
 
         let mut helper_identity = None;
         let mut image_identity = None;
@@ -67,32 +117,37 @@ impl IsolatedPreflight {
         let mut artifact_errors = Vec::new();
         if let Some(root) = artifact_root {
             match inspect_artifact_root(root) {
-                Ok((helper, image, expected_image)) => {
+                Ok((helper, image)) => {
                     if let Some(helper) = helper {
-                        if let Some(team) = expected_team_id
-                            .or(Some(helper.team_id.as_str()))
-                            .filter(|team| !team.is_empty())
-                        {
-                            match admit_packaged_helper(&helper, &ExpectedHelper::canonical(team)) {
-                                Ok(()) => {
-                                    helper_admitted = true;
-                                    helper_identity = Some(helper);
+                        match expected_helper {
+                            Some(expected) => {
+                                match admit_packaged_helper(&helper, expected) {
+                                    Ok(()) => {
+                                        helper_admitted = true;
+                                        helper_identity = Some(helper);
+                                    }
+                                    Err(error) => artifact_errors.push(error.to_string()),
                                 }
-                                Err(error) => artifact_errors.push(error.to_string()),
                             }
-                        } else {
-                            artifact_errors.push(
-                                "helper Team ID is missing from cryptographic inspection".into(),
-                            );
+                            None => artifact_errors.push(
+                                "canonical helper identity is not pinned; artifact self-description cannot admit"
+                                    .into(),
+                            ),
                         }
                     }
-                    if let (Some(image), Some(expected)) = (image, expected_image) {
-                        match admit_guest_image(&image, &expected) {
-                            Ok(()) => {
-                                image_admitted = true;
-                                image_identity = Some(image);
-                            }
-                            Err(error) => artifact_errors.push(error.to_string()),
+                    if let Some(image) = image {
+                        match expected_image {
+                            Some(expected) => match admit_guest_image(&image, expected) {
+                                Ok(()) => {
+                                    image_admitted = true;
+                                    image_identity = Some(image);
+                                }
+                                Err(error) => artifact_errors.push(error.to_string()),
+                            },
+                            None => artifact_errors.push(
+                                "canonical guest-image identity is not pinned; sidecar manifest cannot admit"
+                                    .into(),
+                            ),
                         }
                     }
                 }
@@ -114,6 +169,9 @@ impl IsolatedPreflight {
         }
         if !occupancy_clear {
             env_deny.push("a durable occupancy lease is not clear".into());
+        }
+        if let Some(error) = occupancy_error {
+            env_deny.push(error);
         }
         let environmental_eligible = env_deny.is_empty();
         if !helper_admitted || !image_admitted {
@@ -149,14 +207,23 @@ impl IsolatedPreflight {
         })
     }
 
-    pub fn with_observed_launch(mut self, boot_ready: bool) -> IsolatedResult<Self> {
+    pub fn observe_virtualization_launch(
+        mut self,
+        receipt: &VirtualizationLaunchReceipt,
+    ) -> IsolatedResult<Self> {
+        receipt.validate()?;
         if !self.launch_intent_admitted {
             return Err(IsolatedError::unauthorized(
                 "Virtualization.framework launch cannot be claimed without admitted launch intent",
             ));
         }
+        if !self.helper_admitted || !self.image_admitted {
+            return Err(IsolatedError::unauthorized(
+                "Virtualization.framework launch cannot be claimed without admitted helper and image identities",
+            ));
+        }
         self.launch_observed = true;
-        self.boot_observed = boot_ready;
+        self.boot_observed = receipt.boot_observed;
         self.evidence_class = IsolatedEvidenceClass::VirtualizationFramework;
         Ok(self)
     }
@@ -175,37 +242,34 @@ impl IsolatedPreflight {
 
     pub fn virtualization_framework_launched_claim(&self) -> bool {
         self.launch_observed
+            && self.boot_observed
             && self.evidence_class == IsolatedEvidenceClass::VirtualizationFramework
     }
 }
 
-fn occupancy_state(artifact_root: Option<&Path>) -> OccupancyState {
+fn occupancy_state(artifact_root: Option<&Path>) -> IsolatedResult<OccupancyState> {
     let Some(root) = artifact_root else {
-        return OccupancyState::Clear;
+        return Ok(OccupancyState::Clear);
     };
     let occupancy_root = root.join("occupancy");
     if !occupancy_root.exists() {
-        return OccupancyState::Clear;
+        return Ok(OccupancyState::Clear);
     }
-    OccupancyStore::open(occupancy_root)
-        .ok()
-        .and_then(|store| {
-            fs::read_dir(root.join("occupancy")).ok().map(|entries| {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    if let Some(key) = name.strip_suffix(".json") {
-                        if let Ok(state) = store.inspect(key) {
-                            if state != OccupancyState::Clear {
-                                return state;
-                            }
-                        }
-                    }
-                }
-                OccupancyState::Clear
-            })
-        })
-        .unwrap_or(OccupancyState::Clear)
+    let metadata = fs::symlink_metadata(&occupancy_root).map_err(|error| {
+        IsolatedError::uncertain(format!("occupancy root cannot be inspected ({error})"))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(IsolatedError::unauthorized(
+            "occupancy root must not be a symlink",
+        ));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(IsolatedError::uncertain(
+            "occupancy root exists but is not a directory",
+        ));
+    }
+    let store = OccupancyStore::open(&occupancy_root)?;
+    store.inspect_any()
 }
 
 fn free_bytes() -> IsolatedResult<u64> {
@@ -257,7 +321,9 @@ fn virtualization_framework_present() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packaged_authority::write_admitted_fixture;
+    use crate::packaged_authority::{
+        write_guest_image_claim, write_planted_codesign_display, write_unsigned_helper_bundle,
+    };
     use tempfile::tempdir;
 
     #[test]
@@ -286,25 +352,75 @@ mod tests {
             preflight.evidence_class,
             IsolatedEvidenceClass::SimulatorIneligible
         );
-        assert!(preflight.with_observed_launch(true).is_err());
+        let receipt = VirtualizationLaunchReceipt {
+            schema_version: SCHEMA_VERSION,
+            launch_id: "launch-1".into(),
+            guest_id: "guest-1".into(),
+            hypervisor_instance_id: "vz-instance-1".into(),
+            boot_observed: true,
+            observed_at: Utc::now(),
+        };
+        assert!(preflight.observe_virtualization_launch(&receipt).is_err());
+    }
+
+    #[test]
+    fn planted_display_and_unsigned_bundle_do_not_admit() {
+        let planted = tempdir().unwrap();
+        write_planted_codesign_display(planted.path(), "TEAMID1234").unwrap();
+        write_guest_image_claim(planted.path(), b"guest-bytes").unwrap();
+        let preflight = IsolatedPreflight::inspect(Some(planted.path())).unwrap();
+        assert!(!preflight.helper_admitted);
+        assert!(!preflight.allowed_to_launch);
+        assert_eq!(
+            preflight.evidence_class,
+            IsolatedEvidenceClass::SimulatorIneligible
+        );
+
+        let unsigned = tempdir().unwrap();
+        write_unsigned_helper_bundle(unsigned.path()).unwrap();
+        write_guest_image_claim(unsigned.path(), b"guest-bytes").unwrap();
+        let preflight = IsolatedPreflight::inspect(Some(unsigned.path())).unwrap();
+        assert!(!preflight.helper_admitted);
+        assert!(!preflight.launch_intent_admitted);
+        assert!(preflight.fail_closed_launch().is_err());
+    }
+
+    #[test]
+    fn occupancy_inspect_errors_are_not_clear() {
+        let dir = tempdir().unwrap();
+        let occupancy = dir.path().join("occupancy");
+        std::fs::create_dir_all(&occupancy).unwrap();
+        std::fs::write(occupancy.join("not-a-key.json"), b"{corrupt").unwrap();
+        let preflight = IsolatedPreflight::inspect(Some(dir.path())).unwrap();
+        assert!(!preflight.occupancy_clear);
+        assert_ne!(preflight.occupancy_state, OccupancyState::Clear);
+        assert!(!preflight.allowed_to_launch);
     }
 
     #[test]
     fn eligibility_without_launch_cannot_claim_vf() {
         let dir = tempdir().unwrap();
-        write_admitted_fixture(dir.path(), "TEAMID1234", b"guest-bytes").unwrap();
-        let preflight =
-            IsolatedPreflight::inspect_with_team(Some(dir.path()), Some("TEAMID1234")).unwrap();
-        assert!(preflight.helper_admitted);
-        assert!(preflight.image_admitted);
+        write_unsigned_helper_bundle(dir.path()).unwrap();
+        write_guest_image_claim(dir.path(), b"guest-bytes").unwrap();
+        let preflight = IsolatedPreflight::inspect(Some(dir.path())).unwrap();
         assert_eq!(
             preflight.evidence_class,
             IsolatedEvidenceClass::SimulatorIneligible
         );
         assert!(!preflight.virtualization_framework_launched_claim());
-        if preflight.launch_intent_admitted {
-            let launched = preflight.clone().with_observed_launch(true).unwrap();
-            assert!(launched.virtualization_framework_launched_claim());
-        }
+        let receipt = VirtualizationLaunchReceipt {
+            schema_version: SCHEMA_VERSION,
+            launch_id: "launch-1".into(),
+            guest_id: "guest-1".into(),
+            hypervisor_instance_id: "true".into(),
+            boot_observed: true,
+            observed_at: Utc::now(),
+        };
+        assert!(receipt.validate().is_err());
+        let receipt = VirtualizationLaunchReceipt {
+            hypervisor_instance_id: "vz-instance-1".into(),
+            ..receipt
+        };
+        assert!(preflight.observe_virtualization_launch(&receipt).is_err());
     }
 }

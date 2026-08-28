@@ -4,7 +4,7 @@ use chrono::{Duration, TimeZone, Utc};
 use serde_json::json;
 use tempfile::tempdir;
 
-use crate::cleanup::IsolatedCleanupReason;
+use crate::cleanup::{IsolatedCleanupEvidence, IsolatedCleanupReason};
 use crate::clock::TestClock;
 use crate::error::IsolatedErrorCode;
 use crate::host::{CreateGuestRequest, IsolatedVisualHost};
@@ -15,6 +15,7 @@ use crate::manifest::{
     HelperIdentity, IsolatedSourceEntry, IsolatedSourceManifest, IsolatedVisualResourceLimits,
     SourceObject, SourceObjectKind,
 };
+use crate::packaged_authority::{write_guest_image_claim, write_planted_codesign_display};
 use crate::projection::redact_public_value;
 use crate::protocol::{IsolatedInputEvent, IsolatedInputKind};
 use crate::resolver::{ContentAddressedStore, HermeticResolver};
@@ -162,7 +163,7 @@ fn two_isolated_domains_dispatch_in_parallel() {
             agent_spec_revision: 1,
             helper: HelperIdentity {
                 helper_id: "helper-2".into(),
-                content_sha256: "a".repeat(64),
+                content_sha256: "d".repeat(64),
                 signing_requirement_sha256: "b".repeat(64),
             },
             source: manifest,
@@ -535,4 +536,201 @@ fn old_incarnation_cannot_accept_input() {
         IsolatedErrorCode::Unauthorized
     );
     assert_eq!(host.simulator().input_len(&guest.guest_id), 0);
+}
+
+#[test]
+fn restart_after_prepared_is_known_not_injected() {
+    let (dir, mut host, clock) = open_host();
+    let (guest, lease) = create_running(&mut host);
+    host.ingest_frame(&guest.guest_id, &lease.lease_id, 2, 2, &[1, 2, 3, 4])
+        .unwrap();
+    let guest = host.guest(&guest.guest_id).unwrap();
+    let lease = host
+        .leases()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.lease_id == lease.lease_id)
+        .unwrap();
+    let mut event = pointer(&guest, &lease);
+    event.frame_epoch = guest.frame_epoch;
+    event.lease_revision = lease.revision;
+    host.prepare_dispatch(&guest.guest_id, &lease.lease_id, event)
+        .unwrap();
+    assert_eq!(host.simulator().input_len(&guest.guest_id), 0);
+    let root = dir.path().to_path_buf();
+    drop(host);
+    let mut store = ContentAddressedStore::new();
+    let _ = source(&mut store);
+    let mut host = IsolatedVisualHost::open(root, clock, HermeticResolver::new(store)).unwrap();
+    let recovered_lease = host
+        .leases()
+        .unwrap()
+        .into_iter()
+        .find(|item| item.lease_id == lease.lease_id)
+        .unwrap();
+    assert_eq!(
+        recovered_lease.dispatch.as_ref().unwrap().state,
+        ComputerDispatchState::KnownNotInjected
+    );
+    assert_eq!(recovered_lease.state, ComputerSurfaceLeaseState::Revoked);
+    assert_eq!(host.simulator().input_len(&guest.guest_id), 0);
+    assert_eq!(
+        host.enqueue_lease(&guest.guest_id).unwrap_err().code,
+        IsolatedErrorCode::InvalidState
+    );
+}
+
+#[test]
+fn leftover_overlay_and_occupancy_after_reopen_cannot_mark_cleaned() {
+    let (dir, mut host, clock) = open_host();
+    let (guest, lease) = create_running(&mut host);
+    host.ingest_frame(&guest.guest_id, &lease.lease_id, 2, 2, &[1, 2, 3, 4])
+        .unwrap();
+    host.terminate(&guest.guest_id, IsolatedCleanupReason::Cancel)
+        .unwrap();
+    let before = host.observe_cleanup(&guest.guest_id).unwrap();
+    assert!(before.overlay_removed.unwrap().overlay_present);
+    assert!(before.occupancy_released.unwrap().occupancy_held);
+    let root = dir.path().to_path_buf();
+    let guest_id = guest.guest_id.clone();
+    drop(host);
+    let mut store = ContentAddressedStore::new();
+    let _ = source(&mut store);
+    let host = IsolatedVisualHost::open(root, clock, HermeticResolver::new(store)).unwrap();
+    let observation = host.observe_cleanup(&guest_id).unwrap();
+    assert!(
+        observation
+            .overlay_removed
+            .as_ref()
+            .unwrap()
+            .overlay_present
+    );
+    assert!(
+        observation
+            .occupancy_released
+            .as_ref()
+            .unwrap()
+            .occupancy_held
+    );
+    assert!(observation.helper_exit.as_ref().unwrap().helper_alive);
+    assert_eq!(
+        IsolatedCleanupEvidence::from_observations(observation, Utc::now())
+            .unwrap_err()
+            .code,
+        IsolatedErrorCode::UncertainOutcome
+    );
+    assert!(!host.guest(&guest_id).unwrap().cleaned);
+}
+
+#[test]
+fn same_image_occupancy_is_exclusive() {
+    let (_dir, mut host, _clock) = open_host();
+    let (_guest, _lease) = create_running(&mut host);
+    let mut store = ContentAddressedStore::new();
+    let manifest = source(&mut store);
+    *host.resolver_mut() = HermeticResolver::new(store);
+    assert_eq!(
+        host.create_guest(CreateGuestRequest {
+            run_id: "run-2".into(),
+            work_id: "work-2".into(),
+            work_attempt_id: "attempt-2".into(),
+            agent_id: "agent-2".into(),
+            agent_spec_revision: 1,
+            helper: HelperIdentity {
+                helper_id: "helper-2".into(),
+                content_sha256: "a".repeat(64),
+                signing_requirement_sha256: "b".repeat(64),
+            },
+            source: manifest,
+            limits: IsolatedVisualResourceLimits::proof_defaults(),
+        })
+        .unwrap_err()
+        .code,
+        IsolatedErrorCode::Conflict
+    );
+}
+
+#[test]
+fn create_packaged_guest_requires_admitted_identity() {
+    let (_dir, mut host, _clock) = open_host();
+    let mut store = ContentAddressedStore::new();
+    let manifest = source(&mut store);
+    *host.resolver_mut() = HermeticResolver::new(store);
+    assert!(host
+        .create_packaged_guest(CreateGuestRequest {
+            run_id: "run-1".into(),
+            work_id: "work-1".into(),
+            work_attempt_id: "attempt-1".into(),
+            agent_id: "agent-1".into(),
+            agent_spec_revision: 1,
+            helper: HelperIdentity {
+                helper_id: "helper-1".into(),
+                content_sha256: "a".repeat(64),
+                signing_requirement_sha256: "b".repeat(64),
+            },
+            source: manifest,
+            limits: IsolatedVisualResourceLimits::proof_defaults(),
+        })
+        .is_err());
+}
+
+#[test]
+fn planted_codesign_display_cannot_create_packaged_guest() {
+    let dir = tempdir().unwrap();
+    write_planted_codesign_display(dir.path(), "TEAMID1234").unwrap();
+    write_guest_image_claim(dir.path(), b"guest-bytes").unwrap();
+    let clock = clock();
+    let mut store = ContentAddressedStore::new();
+    let manifest = source(&mut store);
+    let mut host = IsolatedVisualHost::open_with_artifacts(
+        dir.path().join("host"),
+        clock,
+        HermeticResolver::new(store),
+        Some(dir.path()),
+    )
+    .unwrap();
+    assert!(!host.preflight().helper_admitted);
+    assert!(host.preflight().fail_closed_launch().is_err());
+    assert!(host
+        .create_packaged_guest(CreateGuestRequest {
+            run_id: "run-1".into(),
+            work_id: "work-1".into(),
+            work_attempt_id: "attempt-1".into(),
+            agent_id: "agent-1".into(),
+            agent_spec_revision: 1,
+            helper: HelperIdentity {
+                helper_id: "helper-1".into(),
+                content_sha256: "a".repeat(64),
+                signing_requirement_sha256: "b".repeat(64),
+            },
+            source: manifest,
+            limits: IsolatedVisualResourceLimits::proof_defaults(),
+        })
+        .is_err());
+}
+
+#[test]
+fn two_isolated_domains_use_distinct_image_occupancy() {
+    let (_dir, mut host, _clock) = open_host();
+    let (a, _) = create_running(&mut host);
+    let mut store = ContentAddressedStore::new();
+    let manifest = source(&mut store);
+    *host.resolver_mut() = HermeticResolver::new(store);
+    let b = host
+        .create_guest(CreateGuestRequest {
+            run_id: "run-2".into(),
+            work_id: "work-2".into(),
+            work_attempt_id: "attempt-2".into(),
+            agent_id: "agent-2".into(),
+            agent_spec_revision: 1,
+            helper: HelperIdentity {
+                helper_id: "helper-2".into(),
+                content_sha256: "d".repeat(64),
+                signing_requirement_sha256: "b".repeat(64),
+            },
+            source: manifest,
+            limits: IsolatedVisualResourceLimits::proof_defaults(),
+        })
+        .unwrap();
+    assert_ne!(a.occupancy_resource_key, b.occupancy_resource_key);
 }

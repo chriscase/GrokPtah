@@ -1,12 +1,15 @@
 //! Canonical packaged-helper and guest-image authority (#444/#288).
 //!
 //! Marker files such as `helper.signed` / `guest.img.signed` cannot authorize
-//! launch. Admission binds inspected cryptographic identity. Eligibility is
-//! not a launch receipt.
+//! launch. Sidecar `codesign-display.txt` files are not identity. Admission
+//! binds inspected cryptographic identity to a host-pinned expected contract.
+//! Eligibility is not a launch receipt.
 
+use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -31,9 +34,19 @@ pub const COMPUTER_USE_MINIMUM_OS: &str = "14.0";
 pub const MAX_GUEST_IMAGE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const MAX_BUNDLE_FILES: usize = 4_096;
 pub const MAX_HASHED_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const PACKAGED_HELPER_TEAM_ID_ENV: &str = "GROKPTAH_PACKAGED_HELPER_TEAM_ID";
+pub const PACKAGED_HELPER_EXECUTABLE_DIGEST_ENV: &str =
+    "GROKPTAH_PACKAGED_HELPER_EXECUTABLE_DIGEST";
+pub const ISOLATED_GUEST_IMAGE_DIGEST_ENV: &str = "GROKPTAH_ISOLATED_GUEST_IMAGE_DIGEST";
+pub const ISOLATED_GUEST_IMAGE_FORMAT_ENV: &str = "GROKPTAH_ISOLATED_GUEST_IMAGE_FORMAT";
+pub const ISOLATED_GUEST_IMAGE_PROVENANCE_ENV: &str = "GROKPTAH_ISOLATED_GUEST_IMAGE_PROVENANCE";
+pub const ISOLATED_GUEST_IMAGE_AUTHORIZATION_ENV: &str =
+    "GROKPTAH_ISOLATED_GUEST_IMAGE_AUTHORIZATION_DIGEST";
 
 const DOCUMENTED_IDENTITY_JSON: &str =
     include_str!("../../../../docs/schemas/grokptah-computer-use-package-identity.v1.json");
+const CANONICAL_HELPER_ENTITLEMENTS: &str =
+    include_str!("../../../../desktop/src-tauri/macos/ComputerUseHelper.entitlements");
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,21 +120,53 @@ pub struct GuestImageObservation {
     pub authorization_digest: String,
 }
 
+/// Host-pinned helper identity. Never copied from the inspected artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedHelper {
     pub bundle_id: String,
     pub team_id: String,
+    pub executable_digest: String,
+    pub designated_requirement: String,
+    pub entitlements_digest: String,
 }
 
 impl ExpectedHelper {
-    pub fn canonical(team_id: impl Into<String>) -> Self {
-        Self {
+    pub fn pinned(
+        team_id: impl Into<String>,
+        executable_digest: impl Into<String>,
+    ) -> IsolatedResult<Self> {
+        let team_id = team_id.into();
+        let executable_digest = executable_digest.into();
+        validate_id("team_id", &team_id)?;
+        validate_digest("helper executable digest", &executable_digest)?;
+        Ok(Self {
             bundle_id: HELPER_BUNDLE_ID.to_string(),
-            team_id: team_id.into(),
-        }
+            designated_requirement: designated_requirement_for(&team_id),
+            entitlements_digest: canonical_helper_entitlements_digest(),
+            team_id,
+            executable_digest,
+        })
+    }
+
+    /// Pins from the canonical contract and operator-supplied env values.
+    /// Missing pins fail closed; the inspected artifact cannot supply them.
+    pub fn from_canonical_contract(team_id: Option<&str>) -> IsolatedResult<Self> {
+        let team = team_id
+            .map(str::to_string)
+            .or_else(|| env::var(PACKAGED_HELPER_TEAM_ID_ENV).ok())
+            .filter(|team| !team.is_empty())
+            .ok_or_else(|| IsolatedError::unauthorized("canonical helper Team ID is not pinned"))?;
+        let executable_digest = env::var(PACKAGED_HELPER_EXECUTABLE_DIGEST_ENV)
+            .ok()
+            .filter(|digest| !digest.is_empty())
+            .ok_or_else(|| {
+                IsolatedError::unauthorized("canonical helper executable digest is not pinned")
+            })?;
+        Self::pinned(team, executable_digest)
     }
 }
 
+/// Host-pinned guest-image identity. Never copied from the image sidecar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedGuestImage {
     pub digest: String,
@@ -130,8 +175,63 @@ pub struct ExpectedGuestImage {
     pub authorization_digest: String,
 }
 
+impl ExpectedGuestImage {
+    pub fn pinned(
+        digest: impl Into<String>,
+        format: impl Into<String>,
+        provenance: impl Into<String>,
+        authorization_digest: impl Into<String>,
+    ) -> IsolatedResult<Self> {
+        let expected = Self {
+            digest: digest.into(),
+            format: format.into(),
+            provenance: provenance.into(),
+            authorization_digest: authorization_digest.into(),
+        };
+        validate_digest("guest image digest", &expected.digest)?;
+        validate_digest("guest authorization digest", &expected.authorization_digest)?;
+        Ok(expected)
+    }
+
+    pub fn from_canonical_contract() -> IsolatedResult<Self> {
+        let digest = env::var(ISOLATED_GUEST_IMAGE_DIGEST_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                IsolatedError::unauthorized("canonical guest-image digest is not pinned")
+            })?;
+        let format = env::var(ISOLATED_GUEST_IMAGE_FORMAT_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "raw".to_string());
+        let provenance = env::var(ISOLATED_GUEST_IMAGE_PROVENANCE_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                IsolatedError::unauthorized("canonical guest-image provenance is not pinned")
+            })?;
+        let authorization_digest = env::var(ISOLATED_GUEST_IMAGE_AUTHORIZATION_ENV)
+            .ok()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                IsolatedError::unauthorized(
+                    "canonical guest-image authorization digest is not pinned",
+                )
+            })?;
+        Self::pinned(digest, format, provenance, authorization_digest)
+    }
+}
+
 pub fn documented_identity_json() -> &'static str {
     DOCUMENTED_IDENTITY_JSON
+}
+
+pub fn canonical_helper_entitlements_digest() -> String {
+    sha256_hex(CANONICAL_HELPER_ENTITLEMENTS.as_bytes())
+}
+
+pub fn designated_requirement_for(team_id: &str) -> String {
+    format!("identifier \"{HELPER_BUNDLE_ID}\" and certificate leaf[subject.OU] = {team_id}")
 }
 
 pub fn versions_compatible(app_version: &str, helper_version: &str) -> IsolatedResult<()> {
@@ -200,12 +300,23 @@ pub fn admit_packaged_helper(
             "helper Team ID does not match the packaged helper identity",
         ));
     }
+    if observation.executable_digest != expected.executable_digest {
+        return Err(IsolatedError::unauthorized(
+            "helper executable digest does not match the pinned helper identity",
+        ));
+    }
+    if observation.entitlements_digest != expected.entitlements_digest {
+        return Err(IsolatedError::unauthorized(
+            "helper entitlements digest does not match the canonical helper entitlements",
+        ));
+    }
     if !observation
         .designated_requirement
-        .contains(&format!("identifier \"{}\"", expected.bundle_id))
+        .contains(&expected.designated_requirement)
+        && observation.designated_requirement != expected.designated_requirement
     {
         return Err(IsolatedError::unauthorized(
-            "helper designated requirement does not bind the packaged helper identifier",
+            "helper designated requirement does not match the pinned helper identity",
         ));
     }
     if !observation.signing_class.counts_as_packaged_release() {
@@ -412,18 +523,19 @@ pub fn inspect_codesign_fields(output: &str) -> (SigningClass, Option<String>, O
     let team_id = output.lines().find_map(|line| {
         line.strip_prefix("TeamIdentifier=")
             .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty() && value != "not set")
     });
     (signing_class, identifier, team_id)
 }
 
 /// Inspect an artifact root. Empty `helper.signed` / `guest.img.signed` files
-/// are ignored and cannot admit launch.
+/// are ignored and cannot admit launch. Expected identity is never returned
+/// from the artifact; callers must pin it separately.
 pub fn inspect_artifact_root(
     root: &Path,
 ) -> IsolatedResult<(
     Option<PackagedHelperObservation>,
     Option<GuestImageObservation>,
-    Option<ExpectedGuestImage>,
 )> {
     if root.is_symlink() {
         return Err(IsolatedError::unauthorized(
@@ -432,10 +544,7 @@ pub fn inspect_artifact_root(
     }
     let helper = inspect_helper_bundle(root)?;
     let image = inspect_guest_image(root)?;
-    Ok(match image {
-        Some((observation, expected)) => (helper, Some(observation), Some(expected)),
-        None => (helper, None, None),
-    })
+    Ok((helper, image))
 }
 
 fn inspect_helper_bundle(root: &Path) -> IsolatedResult<Option<PackagedHelperObservation>> {
@@ -448,8 +557,13 @@ fn inspect_helper_bundle(root: &Path) -> IsolatedResult<Option<PackagedHelperObs
     if !helper_root.exists() {
         return Ok(None);
     }
-    let display = fs::read_to_string(helper_root.join("codesign-display.txt")).unwrap_or_default();
-    let (signing_class, identifier, team_id) = inspect_codesign_fields(&display);
+    if helper_root.join("codesign-display.txt").exists()
+        || helper_root.join("Contents/codesign-display.txt").exists()
+    {
+        return Err(IsolatedError::unauthorized(
+            "sidecar codesign-display.txt is not helper identity",
+        ));
+    }
     let executable = helper_root.join("Contents/MacOS").join(HELPER_EXECUTABLE);
     if !executable.is_file() {
         return Err(IsolatedError::unauthorized(
@@ -462,32 +576,126 @@ fn inspect_helper_bundle(root: &Path) -> IsolatedResult<Option<PackagedHelperObs
             "helper Info.plist does not declare the packaged helper bundle id",
         ));
     }
+    let probe = probe_helper_codesign(&helper_root)?;
+    let combined = format!("{}\n{}", probe.display, probe.requirement);
+    let (signing_class, identifier, team_id) = inspect_codesign_fields(&combined);
+    let bundle_id = identifier.unwrap_or_default();
+    if bundle_id != HELPER_BUNDLE_ID {
+        return Err(IsolatedError::unauthorized(
+            "codesign identifier does not match the packaged helper bundle id",
+        ));
+    }
+    let designated_requirement =
+        parse_designated_requirement(&probe.requirement).ok_or_else(|| {
+            IsolatedError::unauthorized("helper designated requirement was not observed")
+        })?;
+    let entitlements_digest = if probe.entitlements.trim().is_empty() {
+        sha256_hex(b"")
+    } else {
+        sha256_hex(probe.entitlements.trim().as_bytes())
+    };
+    let stapled = probe.stapled;
     let observation = PackagedHelperObservation {
-        bundle_id: identifier.unwrap_or_else(|| HELPER_BUNDLE_ID.to_string()),
+        bundle_id,
         executable_digest: hash_file(&executable)?,
         team_id: team_id.unwrap_or_default(),
-        designated_requirement: format!(
-            "identifier \"{HELPER_BUNDLE_ID}\" and certificate leaf[subject.OU] = TEAMID"
-        ),
+        designated_requirement,
         signing_class,
-        entitlements_digest: hash_file(&helper_root.join("Contents/entitlements.plist"))
-            .or_else(|_| Ok(sha256_hex(b"<dict></dict>")))?,
-        notarization_source: display.lines().find_map(|line| {
-            line.to_ascii_lowercase()
-                .contains("notarized")
-                .then(|| "notarized_developer_id".to_string())
-        }),
-        stapled: display.to_ascii_lowercase().contains("stapled")
-            || display.to_ascii_lowercase().contains("ticket"),
-        gatekeeper_accepted: display.to_ascii_lowercase().contains("accepted"),
+        entitlements_digest,
+        notarization_source: combined
+            .to_ascii_lowercase()
+            .contains("notarized")
+            .then(|| "notarized_developer_id".to_string()),
+        stapled,
+        gatekeeper_accepted: stapled && signing_class.counts_as_packaged_release(),
     };
     let _ = hash_bundle_manifest(&helper_root)?;
     Ok(Some(observation))
 }
 
-fn inspect_guest_image(
-    root: &Path,
-) -> IsolatedResult<Option<(GuestImageObservation, ExpectedGuestImage)>> {
+struct CodesignProbe {
+    display: String,
+    requirement: String,
+    entitlements: String,
+    stapled: bool,
+}
+
+fn probe_helper_codesign(helper_root: &Path) -> IsolatedResult<CodesignProbe> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = helper_root;
+        return Err(IsolatedError::unavailable(
+            "codesign inspection requires macOS",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let codesign = Path::new("/usr/bin/codesign");
+        if !codesign.is_file() {
+            return Err(IsolatedError::unavailable(
+                "codesign is required for packaged helper inspection",
+            ));
+        }
+        let helper_path = helper_root.to_string_lossy().into_owned();
+        let display = run_readonly(codesign, &["--display", "--verbose=4", &helper_path])?;
+        let requirement = run_readonly(codesign, &["-d", "-r", "-", &helper_path])?;
+        let entitlements = run_readonly(
+            codesign,
+            &["--display", "--entitlements", ":-", &helper_path],
+        )?;
+        let stapled = stapler_ticket_present(helper_root);
+        Ok(CodesignProbe {
+            display,
+            requirement,
+            entitlements,
+            stapled,
+        })
+    }
+}
+
+fn stapler_ticket_present(helper_root: &Path) -> bool {
+    let stapler = Path::new("/usr/bin/stapler");
+    if !stapler.is_file() {
+        return false;
+    }
+    let helper_path = helper_root.to_string_lossy().into_owned();
+    run_readonly(stapler, &["validate", &helper_path])
+        .map(|output| {
+            let lower = output.to_ascii_lowercase();
+            lower.contains("the validate action worked") || lower.contains("ticket")
+        })
+        .unwrap_or(false)
+}
+
+fn run_readonly(binary: &Path, args: &[&str]) -> IsolatedResult<String> {
+    if args.iter().any(|arg| {
+        *arg == "--sign"
+            || *arg == "-s"
+            || *arg == "--remove-signature"
+            || arg.starts_with("--sign=")
+    }) {
+        return Err(IsolatedError::forbidden(
+            "codesign mutation is not permitted during inspection",
+        ));
+    }
+    let output = Command::new(binary).args(args).output().map_err(|error| {
+        IsolatedError::unavailable(format!("{} cannot be executed ({error})", binary.display()))
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(format!("{stdout}{stderr}"))
+}
+
+fn parse_designated_requirement(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("designated =>")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn inspect_guest_image(root: &Path) -> IsolatedResult<Option<GuestImageObservation>> {
     let image = root.join("guest.img");
     if !image.exists() {
         return Ok(None);
@@ -496,6 +704,7 @@ fn inspect_guest_image(
     let size_bytes = fs::metadata(&image)
         .map_err(|error| IsolatedError::invalid(format!("guest image metadata failed ({error})")))?
         .len();
+    let format = infer_guest_format(&image)?;
     let manifest_path = root.join("guest.img.manifest.json");
     if !manifest_path.is_file() {
         return Err(IsolatedError::unauthorized(
@@ -507,21 +716,34 @@ fn inspect_guest_image(
     })?;
     let manifest: GuestImageManifest = serde_json::from_str(&raw)
         .map_err(|_| IsolatedError::invalid("guest-image manifest is not valid JSON"))?;
-    let observation = GuestImageObservation {
-        digest: digest.clone(),
-        manifest_id: manifest.manifest_id.clone(),
-        provenance: manifest.provenance.clone(),
-        format: manifest.format.clone(),
-        size_bytes,
-        authorization_digest: manifest.authorization_digest.clone(),
-    };
-    let expected = ExpectedGuestImage {
-        digest: manifest.digest,
-        format: manifest.format,
+    if manifest.digest != digest {
+        return Err(IsolatedError::unauthorized(
+            "guest-image sidecar digest does not match the hashed image",
+        ));
+    }
+    if manifest.format != format {
+        return Err(IsolatedError::unauthorized(
+            "guest-image sidecar format does not match the inferred image format",
+        ));
+    }
+    Ok(Some(GuestImageObservation {
+        digest,
+        manifest_id: manifest.manifest_id,
         provenance: manifest.provenance,
+        format,
+        size_bytes,
         authorization_digest: manifest.authorization_digest,
-    };
-    Ok(Some((observation, expected)))
+    }))
+}
+
+fn infer_guest_format(path: &Path) -> IsolatedResult<String> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("img") | Some("raw") => Ok("raw".into()),
+        Some("dmg") => Ok("apple-diskimage".into()),
+        _ => Err(IsolatedError::unauthorized(
+            "guest-image format cannot be inferred from the artifact",
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -534,16 +756,7 @@ struct GuestImageManifest {
     authorization_digest: String,
 }
 
-pub fn write_admitted_fixture(
-    root: &Path,
-    team_id: &str,
-    image_bytes: &[u8],
-) -> IsolatedResult<(
-    PackagedHelperObservation,
-    GuestImageObservation,
-    ExpectedHelper,
-    ExpectedGuestImage,
-)> {
+pub fn write_unsigned_helper_bundle(root: &Path) -> IsolatedResult<std::path::PathBuf> {
     let helper_root = root.join("GrokPtah Computer Use Helper.app");
     fs::create_dir_all(helper_root.join("Contents/MacOS")).map_err(|error| {
         IsolatedError::internal(format!("fixture helper cannot be created ({error})"))
@@ -558,11 +771,11 @@ pub fn write_admitted_fixture(
         b"helper-executable-bytes",
     )
     .map_err(|error| IsolatedError::internal(error.to_string()))?;
-    fs::write(
-        helper_root.join("Contents/entitlements.plist"),
-        b"<?xml version=\"1.0\"?><plist><dict></dict></plist>",
-    )
-    .map_err(|error| IsolatedError::internal(error.to_string()))?;
+    Ok(helper_root)
+}
+
+pub fn write_planted_codesign_display(root: &Path, team_id: &str) -> IsolatedResult<()> {
+    let helper_root = write_unsigned_helper_bundle(root)?;
     fs::write(
         helper_root.join("codesign-display.txt"),
         format!(
@@ -570,6 +783,13 @@ pub fn write_admitted_fixture(
         ),
     )
     .map_err(|error| IsolatedError::internal(error.to_string()))?;
+    Ok(())
+}
+
+pub fn write_guest_image_claim(
+    root: &Path,
+    image_bytes: &[u8],
+) -> IsolatedResult<GuestImageObservation> {
     fs::write(root.join("guest.img"), image_bytes)
         .map_err(|error| IsolatedError::internal(error.to_string()))?;
     let digest = hash_file(&root.join("guest.img"))?;
@@ -586,13 +806,7 @@ pub fn write_admitted_fixture(
         serde_json::to_vec(&manifest).unwrap(),
     )
     .map_err(|error| IsolatedError::internal(error.to_string()))?;
-    let (helper, image, expected_image) = inspect_artifact_root(root)?;
-    let helper = helper.ok_or_else(|| IsolatedError::internal("fixture helper missing"))?;
-    let image = image.ok_or_else(|| IsolatedError::internal("fixture image missing"))?;
-    let expected_image =
-        expected_image.ok_or_else(|| IsolatedError::internal("fixture image expected missing"))?;
-    let expected_helper = ExpectedHelper::canonical(team_id);
-    Ok((helper, image, expected_helper, expected_image))
+    inspect_guest_image(root)?.ok_or_else(|| IsolatedError::internal("fixture image missing"))
 }
 
 #[cfg(test)]
@@ -600,20 +814,21 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn admitted_helper(team: &str) -> PackagedHelperObservation {
-        PackagedHelperObservation {
+    fn admitted_pair(team: &str) -> (PackagedHelperObservation, ExpectedHelper) {
+        let executable_digest = "a".repeat(64);
+        let expected = ExpectedHelper::pinned(team, executable_digest.clone()).unwrap();
+        let observation = PackagedHelperObservation {
             bundle_id: HELPER_BUNDLE_ID.into(),
-            executable_digest: "a".repeat(64),
+            executable_digest,
             team_id: team.into(),
-            designated_requirement: format!(
-                "identifier \"{HELPER_BUNDLE_ID}\" and certificate leaf[subject.OU] = {team}"
-            ),
+            designated_requirement: expected.designated_requirement.clone(),
             signing_class: SigningClass::NotarizedDeveloperId,
-            entitlements_digest: "b".repeat(64),
+            entitlements_digest: expected.entitlements_digest.clone(),
             notarization_source: Some("notarized_developer_id".into()),
             stapled: true,
             gatekeeper_accepted: true,
-        }
+        };
+        (observation, expected)
     }
 
     #[test]
@@ -621,42 +836,48 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("helper.signed"), b"").unwrap();
         fs::write(dir.path().join("guest.img.signed"), b"").unwrap();
-        let (helper, image, _) = inspect_artifact_root(dir.path()).unwrap();
+        let (helper, image) = inspect_artifact_root(dir.path()).unwrap();
         assert!(helper.is_none());
         assert!(image.is_none());
     }
 
     #[test]
+    fn planted_codesign_display_is_rejected() {
+        let dir = tempdir().unwrap();
+        write_planted_codesign_display(dir.path(), "TEAMID1234").unwrap();
+        let error = inspect_artifact_root(dir.path()).unwrap_err();
+        assert_eq!(error.code, crate::error::IsolatedErrorCode::Unauthorized);
+        assert!(error.message.contains("codesign-display.txt"));
+    }
+
+    #[test]
     fn wrong_team_bundle_digest_requirement_and_entitlements_fail_closed() {
-        let expected = ExpectedHelper::canonical("TEAMID1234");
-        let mut helper = admitted_helper("TEAMID1234");
+        let (mut helper, expected) = admitted_pair("TEAMID1234");
         helper.team_id = "OTHERTEAM".into();
         assert!(admit_packaged_helper(&helper, &expected).is_err());
-        helper = admitted_helper("TEAMID1234");
+        let (mut helper, expected) = admitted_pair("TEAMID1234");
         helper.bundle_id = APP_BUNDLE_ID.into();
         assert!(admit_packaged_helper(&helper, &expected).is_err());
-        helper = admitted_helper("TEAMID1234");
+        let (mut helper, expected) = admitted_pair("TEAMID1234");
         helper.executable_digest = "c".repeat(64);
-        // digest still valid hex; expected does not pin executable digest except via observation
-        admit_packaged_helper(&helper, &expected).unwrap();
+        assert!(admit_packaged_helper(&helper, &expected).is_err());
+        helper.executable_digest = expected.executable_digest.clone();
         helper.designated_requirement = "identifier \"com.example.other\"".into();
         assert!(admit_packaged_helper(&helper, &expected).is_err());
-        helper = admitted_helper("TEAMID1234");
-        helper.entitlements_digest = "not-a-digest".into();
+        let (mut helper, expected) = admitted_pair("TEAMID1234");
+        helper.entitlements_digest = "b".repeat(64);
         assert!(admit_packaged_helper(&helper, &expected).is_err());
-        helper = admitted_helper("TEAMID1234");
+        let (mut helper, expected) = admitted_pair("TEAMID1234");
         helper.signing_class = SigningClass::AdHoc;
         assert!(admit_packaged_helper(&helper, &expected).is_err());
+        admit_packaged_helper(&admitted_pair("TEAMID1234").0, &expected).unwrap();
     }
 
     #[test]
     fn guest_image_wrong_digest_or_provenance_fails_closed() {
-        let expected = ExpectedGuestImage {
-            digest: "d".repeat(64),
-            format: "raw".into(),
-            provenance: "test-provenance".into(),
-            authorization_digest: "e".repeat(64),
-        };
+        let expected =
+            ExpectedGuestImage::pinned("d".repeat(64), "raw", "test-provenance", "e".repeat(64))
+                .unwrap();
         let mut image = GuestImageObservation {
             digest: "d".repeat(64),
             manifest_id: "guest-manifest-1".into(),
@@ -673,6 +894,22 @@ mod tests {
         assert!(admit_guest_image(&image, &expected).is_err());
         image.provenance = "/tmp/escape".into();
         assert!(admit_guest_image(&image, &expected).is_err());
+    }
+
+    #[test]
+    fn guest_sidecar_cannot_pin_its_own_expected_identity() {
+        let dir = tempdir().unwrap();
+        let observation = write_guest_image_claim(dir.path(), b"guest-bytes").unwrap();
+        let expected = ExpectedGuestImage::from_canonical_contract();
+        assert!(expected.is_err());
+        let pinned = ExpectedGuestImage::pinned(
+            "0".repeat(64),
+            "raw",
+            "test-provenance",
+            observation.authorization_digest.clone(),
+        )
+        .unwrap();
+        assert!(admit_guest_image(&observation, &pinned).is_err());
     }
 
     #[test]
@@ -700,20 +937,45 @@ mod tests {
     }
 
     #[test]
-    fn fixture_root_admits_only_after_cryptographic_inspection() {
+    fn unsigned_or_planted_fixture_cannot_admit() {
         let dir = tempdir().unwrap();
-        let (helper, image, expected_helper, expected_image) =
-            write_admitted_fixture(dir.path(), "TEAMID1234", b"guest-bytes").unwrap();
-        admit_packaged_helper(&helper, &expected_helper).unwrap();
-        admit_guest_image(&image, &expected_image).unwrap();
-        fs::write(dir.path().join("helper.signed"), b"").unwrap();
-        let (again, _, _) = inspect_artifact_root(dir.path()).unwrap();
-        admit_packaged_helper(&again.unwrap(), &expected_helper).unwrap();
+        write_unsigned_helper_bundle(dir.path()).unwrap();
+        write_guest_image_claim(dir.path(), b"guest-bytes").unwrap();
+        match inspect_artifact_root(dir.path()) {
+            Ok((helper, image)) => {
+                assert!(image.is_some());
+                if let Some(helper) = helper {
+                    let expected =
+                        ExpectedHelper::pinned("TEAMID1234", helper.executable_digest.clone())
+                            .unwrap();
+                    assert!(admit_packaged_helper(&helper, &expected).is_err());
+                    assert!(!helper.signing_class.counts_as_packaged_release());
+                }
+            }
+            Err(error) => {
+                assert!(
+                    error.code == crate::error::IsolatedErrorCode::Unauthorized
+                        || error.code == crate::error::IsolatedErrorCode::BackendUnavailable
+                );
+            }
+        }
+        let planted = tempdir().unwrap();
+        write_planted_codesign_display(planted.path(), "TEAMID1234").unwrap();
+        assert!(inspect_artifact_root(planted.path()).is_err());
     }
 
     #[test]
     fn documented_identity_json_matches_constants() {
         assert!(DOCUMENTED_IDENTITY_JSON.contains(HELPER_BUNDLE_ID));
         assert!(DOCUMENTED_IDENTITY_JSON.contains(APP_BUNDLE_ID));
+        assert!(!canonical_helper_entitlements_digest().is_empty());
+    }
+
+    #[test]
+    fn canonical_contract_does_not_read_the_artifact() {
+        let dir = tempdir().unwrap();
+        write_planted_codesign_display(dir.path(), "TEAMID1234").unwrap();
+        assert!(ExpectedHelper::from_canonical_contract(None).is_err());
+        assert!(ExpectedGuestImage::from_canonical_contract().is_err());
     }
 }

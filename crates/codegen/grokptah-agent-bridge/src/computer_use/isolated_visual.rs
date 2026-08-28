@@ -47,7 +47,7 @@ pub fn isolated_visual_admission() -> IsolatedPreflight {
         image_admitted: false,
         free_bytes: 0,
         occupancy_clear: false,
-        occupancy_state: grokptah_isolated_visual::OccupancyState::Clear,
+        occupancy_state: grokptah_isolated_visual::OccupancyState::Recovery,
         environmental_eligible: false,
         launch_intent_admitted: false,
         launch_observed: false,
