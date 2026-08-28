@@ -152,14 +152,15 @@ impl AuditKeyCustody {
         if mode == AuditKeyMode::ExternalConsumer {
             return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
         }
-        let path = root.join(".audit-key");
-        super::files::reject_symlink_components(root)?;
+        let custody_root = canonical_custody_root(root)?;
+        let path = custody_root.join(".audit-key");
+        super::files::reject_symlink_components(&custody_root)?;
         if path.exists() {
             super::files::reject_symlink(&path)?;
         }
         let keys = Arc::new(AuditKeys::load_or_create_file(&path)?);
         let mut keyring = vec![Arc::clone(&keys)];
-        let epochs = root.join(".audit-key-epochs");
+        let epochs = custody_root.join(".audit-key-epochs");
         if epochs.exists() {
             super::files::reject_symlink(&epochs)?;
             let mut paths: Vec<PathBuf> = std::fs::read_dir(&epochs)
@@ -192,11 +193,29 @@ impl AuditKeyCustody {
         Ok(Self {
             mode,
             provider: Arc::new(FileAuditKeyProvider {
-                root: root.to_path_buf(),
+                root: custody_root,
                 root_key: Arc::clone(&keys),
                 keys: parking_lot::Mutex::new(keyring),
             }),
         })
+    }
+}
+
+fn canonical_custody_root(root: &Path) -> AuditResult<PathBuf> {
+    if root.exists() {
+        super::files::reject_symlink(root)?;
+        dunce::canonicalize(root)
+            .map_err(|error| AuditError::Io(format!("canonicalize audit custody: {error}")))
+    } else {
+        let parent = root
+            .parent()
+            .ok_or_else(|| AuditError::Io("audit custody has no parent".into()))?;
+        let name = root
+            .file_name()
+            .ok_or_else(|| AuditError::Io("audit custody has no name".into()))?;
+        let canonical_parent = dunce::canonicalize(parent)
+            .map_err(|error| AuditError::Io(format!("canonicalize audit parent: {error}")))?;
+        Ok(canonical_parent.join(name))
     }
 }
 
