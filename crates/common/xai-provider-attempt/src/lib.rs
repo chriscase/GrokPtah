@@ -2,9 +2,10 @@
 //!
 //! This crate intentionally does not know about a provider SDK, bearer
 //! credentials, request bodies, or host policy implementations. The host gives
-//! it one immutable authority binding and one request fingerprint; this crate
-//! persists the resulting attempt before any possible I/O and is the only
-//! place from which a physical send permit can be obtained.
+//! it a signed authority record and one request fingerprint; this crate
+//! verifies the record, consumes an issued effect lease, persists the
+//! resulting attempt before any possible I/O, and is the only place from which
+//! a physical send permit can be obtained.
 //!
 //! A `Sending` or `Responding` record recovered after a process restart is
 //! conservatively changed to `Uncertain`. Uncertain attempts are never

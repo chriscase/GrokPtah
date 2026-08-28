@@ -28,10 +28,14 @@ idempotency.
 
 ## Authority binding
 
-Each attempt stores the host snapshot of principal incarnation/generation,
-capability generation, and effect lease. The host re-reads those canonical
-authorities after waits and immediately before the physical request. A stale
-snapshot is terminally rejected before socket I/O.
+The trusted host adapter writes the principal incarnation, authentication epoch,
+capability generation, and a pool of host-issued one-use effect leases into a
+0600 record authenticated by the host signing key. The common ledger verifies
+that record before admission. Lease selection and transfer to an attempt happen
+under the same cross-process ledger lock used by `Sending`; a lease is never
+minted or cloned by the SDK. The host record is re-read after waits and
+immediately before the physical request, including an exact lease check. A
+tampered, revoked, replayed, or stale record is rejected before socket I/O.
 
 Public projections contain only `attemptId`, `sendState`, and
 `providerRequestId`. Raw request keys, authority values, credentials,
