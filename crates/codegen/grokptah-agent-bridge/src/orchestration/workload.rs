@@ -10,7 +10,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::graph::{ReviewReceipt, WorkReviewPolicy, MAX_QUORUM_REVIEWERS};
+use super::graph::{BlockProvenance, ReviewReceipt, WorkReviewPolicy, MAX_QUORUM_REVIEWERS};
 use super::types::{hash_payload, OrchError, OrchErrorCode, RunBounds};
 
 pub const WORKLOAD_SCHEMA_VERSION: u32 = 1;
@@ -411,6 +411,10 @@ pub struct WorkItem {
     /// are retained rather than deleted so the trail stays complete.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub review_receipts: Vec<ReviewReceipt>,
+    /// Why this item is blocked, when it is. Typed and durable, so
+    /// reconciliation never infers provenance from a free-form reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_provenance: Option<BlockProvenance>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -474,6 +478,7 @@ impl WorkItem {
             last_decision_id: None,
             review: None,
             review_receipts: Vec::new(),
+            block_provenance: None,
             created_at: now,
             updated_at: now,
         };

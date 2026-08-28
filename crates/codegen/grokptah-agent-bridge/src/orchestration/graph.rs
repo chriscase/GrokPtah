@@ -105,8 +105,13 @@ impl GraphScope<'_> {
 /// generations and delegation, is being built in #460. Until it assembles,
 /// every path that needs a verified principal fails closed for external
 /// callers rather than trusting a string.
+///
+/// It is deliberately **not** part of this crate's public surface: freezing a
+/// provisional principal type would create a contract that #460 then has to
+/// break. Callers reach the verdict path through the orchestration service,
+/// which takes an authenticated context and mints this internally.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VerifiedPrincipal {
+pub(crate) struct VerifiedPrincipal {
     owner_id: String,
     token_id: String,
 }
@@ -366,15 +371,56 @@ pub struct WorkReviewPolicy {
     pub policy_revision: u64,
 }
 
+/// Why a work item is in the `Blocked` state.
+///
+/// Durable and typed, so reconciliation never has to infer provenance from the
+/// shape of a free-form string. A record written before this existed
+/// deserializes to `None`, which is treated as derived — the behavior those
+/// records already had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockProvenance {
+    /// Reconciliation blocked it because a dependency was not satisfied. It is
+    /// lifted automatically when the dependency is.
+    Derived,
+    /// A human or coordinator blocked it explicitly. Reconciliation never
+    /// lifts it and never overwrites its reason.
+    Manual,
+}
+
+impl BlockProvenance {
+    pub fn is_manual(self) -> bool {
+        matches!(self, Self::Manual)
+    }
+}
+
+/// The exact executing authority a review is bound to.
+///
+/// A quorum approves *a specific agent running a specific specification*. If
+/// the assignment, the agent's specification revision, or its selected model
+/// changes, the thing that will execute is not the thing that was approved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionIdentity {
+    pub agent_id: String,
+    pub agent_spec_revision: u64,
+    pub model_selection_key: String,
+}
+
 /// Digest of everything a reviewer is actually agreeing to.
 ///
 /// The Work item's ordinary `revision` cannot serve as the review subject:
 /// recording a receipt bumps it, so every verdict would invalidate the one
-/// before it. This digest covers only the fields that define *what is being
-/// reviewed* — never the revision, the state, the receipts, or any
-/// reconciliation-derived field — so it is stable while verdicts accumulate
-/// and changes the moment the subject itself is edited.
-pub fn review_subject_digest(item: &WorkItem) -> String {
+/// before it. This digest instead covers exactly what defines *what is being
+/// reviewed and what will run it* — never the revision, the state, the
+/// receipts, or any reconciliation-derived field — so it is stable while
+/// verdicts accumulate and changes the moment the subject or its executing
+/// authority does.
+///
+/// `execution` is the resolved identity of the assigned agent. Passing `None`
+/// means no agent is assigned; it is not a way to omit the binding, because a
+/// later assignment changes the digest and retires prior approvals.
+pub fn review_subject_digest(item: &WorkItem, execution: Option<&ExecutionIdentity>) -> String {
     let dependencies: Vec<serde_json::Value> = item
         .dependencies
         .iter()
@@ -398,6 +444,19 @@ pub fn review_subject_digest(item: &WorkItem) -> String {
         "dependencies": dependencies,
         "policy": item.policy,
         "review": item.review,
+        // Who will execute it, and under what authority. Reassignment, an
+        // agent-specification bump, or a model change all land here.
+        "assignedAgentId": item.assigned_agent_id,
+        "assignmentStatus": item.assignment_status,
+        "execution": execution,
+        // Where the work came from. A manager step id such as
+        // `__manager_decision__` changes submission behavior, and routine and
+        // activation lineage changes what a run is permitted to do, so all of
+        // it is part of what a reviewer agreed to.
+        "sourceRoutineId": item.source_routine_id,
+        "sourceActivationId": item.source_activation_id,
+        "sourceManagerPlanId": item.source_manager_plan_id,
+        "sourceManagerStepId": item.source_manager_step_id,
     }))
 }
 
@@ -663,42 +722,6 @@ impl AdmissionBlock {
     }
 }
 
-/// Every reason string this module writes.
-///
-/// Reconciliation must be able to tell a reason it wrote itself from one a
-/// human supplied, because it may overwrite the former and must never touch
-/// the latter.
-const DERIVED_REASONS: &[&str] = &[
-    "admissible",
-    "dependencies_pending",
-    "dependency_unsatisfiable",
-    "dependency_unresolved",
-    "review_pending",
-    "review_unreachable",
-    "attempt_active",
-    "awaiting_input",
-    "awaiting_approval",
-    "attempts_exhausted",
-    "deadline_exceeded",
-    "succeeded",
-    "failed",
-    "cancelled",
-    "container",
-    "manually_blocked",
-];
-
-/// True when `reason` is absent or was written by this module.
-///
-/// A reason that is neither is a human or coordinator explanation: it is the
-/// evidence that a `Blocked` state was chosen deliberately rather than derived
-/// from dependencies, so it is never overwritten and never auto-cleared.
-pub fn is_derived_reason(reason: Option<&str>) -> bool {
-    match reason {
-        None => true,
-        Some(reason) => DERIVED_REASONS.contains(&reason),
-    }
-}
-
 /// Resolved state of one dependency, from the depending item's scope.
 ///
 /// `None` means unresolvable — unknown, or outside the scope. The two are not
@@ -714,13 +737,15 @@ pub fn evaluate_admission(
     item: &WorkItem,
     dependency_states: &DependencyStates,
     receipts: &[ReviewReceipt],
+    execution: Option<&ExecutionIdentity>,
     now: DateTime<Utc>,
 ) -> AdmissionBlock {
     // An explicit block outranks everything except a settled outcome: a human
     // who stopped this item is not overruled by dependencies becoming ready.
     if item.state == WorkState::Blocked
-        && !is_derived_reason(item.blocked_reason.as_deref())
-        && !item.state.is_terminal()
+        && item
+            .block_provenance
+            .is_some_and(BlockProvenance::is_manual)
     {
         return AdmissionBlock::ManuallyBlocked;
     }
@@ -772,7 +797,7 @@ pub fn evaluate_admission(
     }
 
     if let Some(policy) = item.review.as_ref() {
-        let subject = review_subject_digest(item);
+        let subject = review_subject_digest(item, execution);
         return match evaluate_quorum(policy, receipts, &subject) {
             Ok(QuorumOutcome::Met) => AdmissionBlock::Admissible,
             Ok(QuorumOutcome::Pending) => AdmissionBlock::ReviewPending,

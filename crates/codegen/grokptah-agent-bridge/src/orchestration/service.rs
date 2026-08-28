@@ -1309,6 +1309,18 @@ impl OrchestrationService {
             created_at: now,
             updated_at: now,
         };
+        // Prove admission before anything durable exists. A review-gated or
+        // dependency-blocked item must leave *no* trace of an execution
+        // attempt: no managed intent, no lease, no attempt, no run. Checking
+        // after persisting the intent would mean a denied item still wrote a
+        // `Claiming` record that then had to be abandoned.
+        let block = self.store.admission_block_at(&work.work_id, Utc::now())?;
+        if !block.is_admissible() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                format!("work item is not admissible: {}", block.as_str()),
+            ));
+        }
         self.store.save_managed_intent(&intent)?;
         let claim = match self.store.claim_work_with_lease_secret(
             &work.work_id,

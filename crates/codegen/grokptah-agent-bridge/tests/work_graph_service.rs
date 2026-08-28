@@ -8,7 +8,7 @@
 mod common;
 
 use grokptah_agent_bridge::orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkState, WorkspaceAllowlist,
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, McpControlClient,
@@ -164,5 +164,231 @@ async fn dependency_declaration_is_scope_bound_and_reveals_nothing_foreign() {
     assert_eq!(dependent.structured["admission"], "dependencies_pending");
 
     server.stop();
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn two_principals_cannot_cast_each_others_review_verdicts() {
+    use grokptah_agent_bridge::orchestration::{
+        AdmissionBlock, AuthContext, ReviewVerdict, WorkItem, WorkPolicy, WorkReviewPolicy,
+    };
+
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+
+    let store = OrchStore::open(home.path().join("orchestration")).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store.clone(),
+        OrchestrationConfig {
+            bearer_token: "two-principal-token".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+
+    let mut work = WorkItem::new(
+        "verification",
+        "gated work",
+        lane.id,
+        workspace.path().display().to_string(),
+        "creator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    work.review = Some(WorkReviewPolicy {
+        reviewers: vec!["alice".into(), "bob".into()],
+        required_approvals: 2,
+        policy_revision: 1,
+    });
+    store.save_work_item(&work).unwrap();
+
+    let alice = AuthContext {
+        token_id: "token-alice".into(),
+        owner_id: "alice".into(),
+    };
+    let bob = AuthContext {
+        token_id: "token-bob".into(),
+        owner_id: "bob".into(),
+    };
+
+    // Impersonation through the service surface is refused: the reviewer
+    // identity comes from the authenticated context, not the argument.
+    let error = orch
+        .record_work_review_verdict_scoped(
+            &alice,
+            lane.id,
+            workspace.path(),
+            &work.work_id,
+            "bob",
+            ReviewVerdict::Approve,
+            None,
+        )
+        .expect_err("alice must not cast bob's verdict");
+    assert!(error.to_string().contains("only record its own"), "{error}");
+
+    // Each principal casting its own verdict is accepted, and the gate opens
+    // only once both have.
+    let first = orch
+        .record_work_review_verdict_scoped(
+            &alice,
+            lane.id,
+            workspace.path(),
+            &work.work_id,
+            "alice",
+            ReviewVerdict::Approve,
+            None,
+        )
+        .expect("alice records her own verdict");
+    assert_eq!(first["admission"], AdmissionBlock::ReviewPending.as_str());
+
+    let second = orch
+        .record_work_review_verdict_scoped(
+            &bob,
+            lane.id,
+            workspace.path(),
+            &work.work_id,
+            "bob",
+            ReviewVerdict::Approve,
+            None,
+        )
+        .expect("bob records his own verdict");
+    assert_eq!(second["admission"], AdmissionBlock::Admissible.as_str());
+
+    // A principal the gate does not name is refused even when self-attested.
+    let intruder = AuthContext {
+        token_id: "token-mallory".into(),
+        owner_id: "mallory".into(),
+    };
+    assert!(
+        orch.record_work_review_verdict_scoped(
+            &intruder,
+            lane.id,
+            workspace.path(),
+            &work.work_id,
+            "mallory",
+            ReviewVerdict::Approve,
+            None,
+        )
+        .is_err(),
+        "an unnamed principal must be refused"
+    );
+
+    // And only the owning principal may revoke its own verdict.
+    assert!(
+        orch.revoke_work_review_verdict_scoped(
+            &alice,
+            lane.id,
+            workspace.path(),
+            &work.work_id,
+            "bob",
+            None,
+        )
+        .is_err(),
+        "alice must not revoke bob's verdict"
+    );
+
+    set_grokptah_home_override(None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn managed_execution_of_a_gated_item_leaves_no_intent_lease_or_run() {
+    use grokptah_agent_bridge::orchestration::{
+        AdmissionBlock, WorkItem, WorkPolicy, WorkReviewPolicy,
+    };
+
+    let mut env = ProcessEnvGuard::new();
+    let home = tempdir().unwrap();
+    set_grokptah_home_override(Some(home.path().join(".grokptah")));
+    env.set("GROKPTAH_AGENT_OFFLINE", "1");
+    let workspace = tempdir().unwrap();
+    let host = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    host.start().unwrap();
+    let lane = host.session_new_kind(SessionKind::Build).unwrap();
+    host.session_set_cwd(lane.id, workspace.path()).unwrap();
+
+    let store = OrchStore::open(home.path().join("orchestration")).unwrap();
+    let orch = OrchestrationService::new(
+        host.clone(),
+        host.event_bus(),
+        store.clone(),
+        OrchestrationConfig {
+            bearer_token: "managed-gate-token".into(),
+            allowlist: WorkspaceAllowlist::new([workspace.path().to_path_buf()]),
+            max_concurrent_runs: 2,
+            bounds: RunBounds::default(),
+        },
+    );
+
+    let mut work = WorkItem::new(
+        "verification",
+        "gated work the executor must not touch",
+        lane.id,
+        workspace.path().display().to_string(),
+        "creator",
+        WorkPolicy::default(),
+    )
+    .unwrap();
+    work.review = Some(WorkReviewPolicy {
+        reviewers: vec!["alice".into()],
+        required_approvals: 1,
+        policy_revision: 1,
+    });
+    store.save_work_item(&work).unwrap();
+    assert_eq!(
+        store
+            .admission_block_at(&work.work_id, chrono::Utc::now())
+            .unwrap(),
+        AdmissionBlock::ReviewPending
+    );
+
+    // Drive the native executor repeatedly. A gated item must leave no trace:
+    // no managed intent (not even a Claiming one that is later abandoned), no
+    // attempt, no lease, and no run.
+    for _ in 0..3 {
+        orch.drive_native_executor_once().await;
+    }
+
+    assert!(
+        store
+            .list_managed_intents()
+            .unwrap()
+            .iter()
+            .all(|intent| intent.work_id != work.work_id),
+        "a denied item must not leave a managed intent behind"
+    );
+    assert!(
+        store
+            .list_work_attempts(Some(&work.work_id))
+            .unwrap()
+            .is_empty(),
+        "a denied item must not leave an attempt or lease behind"
+    );
+    let stored = store.load_work_item(&work.work_id).unwrap().unwrap();
+    assert_eq!(stored.state, WorkState::Queued);
+    assert_eq!(
+        store
+            .admission_block_at(&work.work_id, chrono::Utc::now())
+            .unwrap(),
+        AdmissionBlock::ReviewPending
+    );
+
     set_grokptah_home_override(None);
 }

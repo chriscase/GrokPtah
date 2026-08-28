@@ -28,9 +28,9 @@ pub use continuation::{
     CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION,
 };
 pub use graph::{
-    evaluate_admission, evaluate_quorum, is_derived_reason, review_subject_digest,
-    validate_scoped_dependency_graph, AdmissionBlock, DependencyStates, GraphScope, QuorumOutcome,
-    ReviewReceipt, ReviewVerdict, VerifiedPrincipal, WorkReviewPolicy, MAX_GRAPH_EDGES,
+    evaluate_admission, evaluate_quorum, review_subject_digest, validate_scoped_dependency_graph,
+    AdmissionBlock, BlockProvenance, DependencyStates, ExecutionIdentity, GraphScope,
+    QuorumOutcome, ReviewReceipt, ReviewVerdict, WorkReviewPolicy, MAX_GRAPH_EDGES,
     MAX_GRAPH_SCAN_FILES, MAX_GRAPH_SCOPE_ITEMS, MAX_QUORUM_REVIEWERS, MAX_REVIEW_IDENTITY_BYTES,
 };
 pub use managed::{

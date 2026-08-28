@@ -333,6 +333,7 @@ fn a_reconciled_dependency_wait_reports_the_wait_not_merely_unclaimable() {
         &item,
         &states(&[("dep", Some(WorkState::Running))]),
         &[],
+        None,
         Utc::now(),
     );
     assert_eq!(block, AdmissionBlock::DependenciesPending);
@@ -349,7 +350,7 @@ fn a_deadline_failure_reports_the_deadline_not_a_generic_failure() {
     item.state = WorkState::Failed;
     item.deadline = Some(now - Duration::seconds(1));
     assert_eq!(
-        evaluate_admission(&item, &DependencyStates::new(), &[], now),
+        evaluate_admission(&item, &DependencyStates::new(), &[], None, now),
         AdmissionBlock::DeadlineExceeded
     );
 
@@ -357,7 +358,7 @@ fn a_deadline_failure_reports_the_deadline_not_a_generic_failure() {
     let mut plain = scope.item(&[]);
     plain.state = WorkState::Failed;
     assert_eq!(
-        evaluate_admission(&plain, &DependencyStates::new(), &[], now),
+        evaluate_admission(&plain, &DependencyStates::new(), &[], None, now),
         AdmissionBlock::Failed
     );
 }
@@ -384,7 +385,7 @@ fn every_canonical_state_maps_to_a_distinct_reason() {
         let mut item = scope.item(&[]);
         item.state = state;
         assert_eq!(
-            evaluate_admission(&item, &DependencyStates::new(), &[], now),
+            evaluate_admission(&item, &DependencyStates::new(), &[], None, now),
             expected,
             "state {state:?}"
         );
@@ -398,11 +399,11 @@ fn an_unresolvable_dependency_is_reported_and_never_assumed_satisfied() {
     let item = scope.item(&["ghost"]);
     // Absent from the map, and present-but-unresolved, are the same answer.
     assert_eq!(
-        evaluate_admission(&item, &DependencyStates::new(), &[], Utc::now()),
+        evaluate_admission(&item, &DependencyStates::new(), &[], None, Utc::now()),
         AdmissionBlock::DependencyUnresolved
     );
     assert_eq!(
-        evaluate_admission(&item, &states(&[("ghost", None)]), &[], Utc::now()),
+        evaluate_admission(&item, &states(&[("ghost", None)]), &[], None, Utc::now()),
         AdmissionBlock::DependencyUnresolved
     );
     assert!(AdmissionBlock::DependencyUnresolved.needs_operator_attention());
@@ -415,7 +416,13 @@ fn a_terminally_failed_dependency_is_unsatisfiable_not_pending() {
     let item = scope.item(&["dep"]);
     for terminal in [WorkState::Failed, WorkState::Cancelled] {
         assert_eq!(
-            evaluate_admission(&item, &states(&[("dep", Some(terminal))]), &[], Utc::now()),
+            evaluate_admission(
+                &item,
+                &states(&[("dep", Some(terminal))]),
+                &[],
+                None,
+                Utc::now()
+            ),
             AdmissionBlock::DependencyUnsatisfiable
         );
     }
@@ -547,7 +554,7 @@ fn the_review_gate_cannot_be_changed_through_a_generic_save() {
         principal_token_id: "t".into(),
         principal_owner_id: "r1".into(),
         verdict: ReviewVerdict::Approve,
-        subject_digest: review_subject_digest(&item),
+        subject_digest: review_subject_digest(&item, None),
         work_revision: item.revision,
         policy_revision: 1,
         recorded_at: Utc::now(),
@@ -587,7 +594,7 @@ fn a_new_item_cannot_be_created_carrying_receipts() {
         principal_token_id: "t".into(),
         principal_owner_id: "r1".into(),
         verdict: ReviewVerdict::Approve,
-        subject_digest: review_subject_digest(&item),
+        subject_digest: review_subject_digest(&item, None),
         work_revision: 1,
         policy_revision: 1,
         recorded_at: Utc::now(),
@@ -607,7 +614,7 @@ fn a_receipt_stops_counting_when_the_review_subject_changes() {
     let scope = Scope::new(dir.path(), "subject");
     let mut item = scope.item(&[]);
     item.review = Some(policy(&["r1"], 1));
-    let original = review_subject_digest(&item);
+    let original = review_subject_digest(&item, None);
 
     let receipt = ReviewReceipt {
         reviewer_id: "r1".into(),
@@ -630,7 +637,7 @@ fn a_receipt_stops_counting_when_the_review_subject_changes() {
     let mut bumped = item.clone();
     bumped.bump();
     assert_eq!(
-        review_subject_digest(&bumped),
+        review_subject_digest(&bumped, None),
         original,
         "the revision is not the review subject"
     );
@@ -643,7 +650,7 @@ fn a_receipt_stops_counting_when_the_review_subject_changes() {
     ] {
         let mut edited = item.clone();
         mutate(&mut edited);
-        let changed = review_subject_digest(&edited);
+        let changed = review_subject_digest(&edited, None);
         assert_ne!(
             changed, original,
             "editing the subject must change its digest"
@@ -662,7 +669,7 @@ fn a_receipt_from_a_superseded_policy_revision_does_not_count() {
     let scope = Scope::new(dir.path(), "policyrev");
     let mut item = scope.item(&[]);
     item.review = Some(policy(&["r1", "r2"], 2));
-    let subject = review_subject_digest(&item);
+    let subject = review_subject_digest(&item, None);
     let gate = item.review.clone().expect("gate");
     let stale = ReviewReceipt {
         reviewer_id: "r1".into(),

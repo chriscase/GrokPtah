@@ -231,6 +231,10 @@ impl OrchStore {
             }),
         };
         store.recover_agent_activation_intents()?;
+        // Any review intent whose outcome never landed is closed out as
+        // unresolved, so an interrupted verdict is never silently
+        // indistinguishable from one that never started.
+        store.reconcile_review_audit_unlocked();
         store.recover_finalization_intents()?;
         store.recover_routine_intents()?;
         store.recover_managed_finalization_intents()?;
@@ -1974,7 +1978,9 @@ impl OrchStore {
         // module did not write. Reconciliation never lifts it and never
         // overwrites its explanation; only an explicit decision can.
         let manually_blocked = item.state == WorkState::Blocked
-            && !super::graph::is_derived_reason(item.blocked_reason.as_deref());
+            && item
+                .block_provenance
+                .is_some_and(super::graph::BlockProvenance::is_manual);
         if !dependencies_ready && matches!(item.state, WorkState::Queued) {
             item.state = WorkState::Blocked;
             item.bump();
@@ -1999,12 +2005,15 @@ impl OrchStore {
         // Record the canonical typed reason alongside the reconciled state, so
         // the free-form `blocked_reason` and the typed evaluator can never
         // disagree about why an item is where it is.
-        let block =
-            super::graph::evaluate_admission(item, &dependency_states, &item.review_receipts, now);
+        let block = super::graph::evaluate_admission(
+            item,
+            &dependency_states,
+            &item.review_receipts,
+            self.execution_identity_unlocked(item).as_ref(),
+            now,
+        );
         let reason = Some(block.as_str().to_string());
-        if item.blocked_reason != reason
-            && super::graph::is_derived_reason(item.blocked_reason.as_deref())
-        {
+        if item.blocked_reason != reason && !manually_blocked {
             // Deliberately no `bump()`: the reason is a derived projection of
             // the state that was just reconciled, not an independently
             // versioned fact. Bumping for it would invalidate a caller's
@@ -2041,6 +2050,25 @@ impl OrchStore {
         Ok(self.admission_block_for_unlocked(&item, now))
     }
 
+    /// Resolve the exact executing authority an assigned agent represents.
+    ///
+    /// Returns `None` when nothing is assigned. A missing or specification-less
+    /// agent record also yields `None`, so an assignment that cannot be
+    /// resolved never silently reuses a previously approved identity.
+    fn execution_identity_unlocked(
+        &self,
+        item: &WorkItem,
+    ) -> Option<super::graph::ExecutionIdentity> {
+        let agent_id = item.assigned_agent_id.as_deref()?;
+        let agent = self.load_agent_unlocked(agent_id).ok().flatten()?;
+        let spec = agent.spec.as_ref()?;
+        Some(super::graph::ExecutionIdentity {
+            agent_id: agent_id.to_string(),
+            agent_spec_revision: spec.revision,
+            model_selection_key: spec.model.selection_key.clone(),
+        })
+    }
+
     fn admission_block_for_unlocked(
         &self,
         item: &WorkItem,
@@ -2057,7 +2085,14 @@ impl OrchStore {
                 .map(|candidate| candidate.state);
             dependency_states.insert(dependency.work_id.clone(), resolved);
         }
-        super::graph::evaluate_admission(item, &dependency_states, &item.review_receipts, now)
+        let execution = self.execution_identity_unlocked(item);
+        super::graph::evaluate_admission(
+            item,
+            &dependency_states,
+            &item.review_receipts,
+            execution.as_ref(),
+            now,
+        )
     }
 
     /// Reconcile every durable workload at a caller-supplied instant.
@@ -2194,7 +2229,7 @@ impl OrchStore {
     /// durable outcome is recorded once persistence has actually succeeded or
     /// failed. A crash between the two leaves a recorded intent with no
     /// outcome, which is the honest description of what happened.
-    pub fn record_review_verdict(
+    pub(crate) fn record_review_verdict(
         &self,
         work_id: &str,
         principal: &super::graph::VerifiedPrincipal,
@@ -2231,7 +2266,10 @@ impl OrchStore {
                 "a principal may only record its own review verdict",
             ));
         }
-        let subject = super::graph::review_subject_digest(&item);
+        let subject = super::graph::review_subject_digest(
+            &item,
+            self.execution_identity_unlocked(&item).as_ref(),
+        );
         if item.review_receipts.iter().any(|receipt| {
             receipt.reviewer_id == reviewer_id
                 && receipt.policy_revision == policy.policy_revision
@@ -2261,12 +2299,20 @@ impl OrchStore {
             "work {} revision {} reviewer {} verdict {:?} policy revision {} subject {}",
             item.work_id, item.revision, reviewer_id, verdict, policy.policy_revision, subject
         );
-        self.audit_review_intent(&item, "record", &detail, now)?;
+        let intent_id = Uuid::new_v4().to_string();
+        self.audit_review_intent(&item, "record", &intent_id, &detail, now)?;
 
         item.review_receipts.push(receipt);
         item.bump_at(now);
         let outcome = self.write_work_item_unlocked(&item);
-        self.audit_review_outcome(&item, "record", &detail, outcome.as_ref().err(), now);
+        self.audit_review_outcome(
+            &item,
+            "record",
+            &intent_id,
+            &detail,
+            outcome.as_ref().err(),
+            now,
+        );
         outcome.map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
 
         let block = self.admission_block_for_unlocked(&item, now);
@@ -2277,7 +2323,7 @@ impl OrchStore {
     ///
     /// The receipt is retained and marked revoked rather than deleted, so the
     /// gate's history remains complete and a revocation is itself auditable.
-    pub fn revoke_review_verdict(
+    pub(crate) fn revoke_review_verdict(
         &self,
         work_id: &str,
         principal: &super::graph::VerifiedPrincipal,
@@ -2304,7 +2350,10 @@ impl OrchStore {
             .ok_or_else(|| {
                 OrchError::new(OrchErrorCode::Conflict, "work item has no review gate")
             })?;
-        let subject = super::graph::review_subject_digest(&item);
+        let subject = super::graph::review_subject_digest(
+            &item,
+            self.execution_identity_unlocked(&item).as_ref(),
+        );
         let detail = format!(
             "work {} revision {} reviewer {} policy revision {} subject {}",
             item.work_id, item.revision, reviewer_id, policy_revision, subject
@@ -2328,14 +2377,84 @@ impl OrchStore {
             target.revoked_at = Some(now);
         }
 
-        self.audit_review_intent(&item, "revoke", &detail, now)?;
+        let intent_id = Uuid::new_v4().to_string();
+        self.audit_review_intent(&item, "revoke", &intent_id, &detail, now)?;
         item.bump_at(now);
         let outcome = self.write_work_item_unlocked(&item);
-        self.audit_review_outcome(&item, "revoke", &detail, outcome.as_ref().err(), now);
+        self.audit_review_outcome(
+            &item,
+            "revoke",
+            &intent_id,
+            &detail,
+            outcome.as_ref().err(),
+            now,
+        );
         outcome.map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
 
         let block = self.admission_block_for_unlocked(&item, now);
         Ok((item, block))
+    }
+
+    /// Close out review intents whose outcome never reached the audit log.
+    ///
+    /// The intent is written before the effect and the outcome after it, so a
+    /// crash in between leaves an intent with no resolution. Reporting those as
+    /// `*_unresolved` on restart is the honest description: the effect may or
+    /// may not have landed, and the durable Work record is the authority on
+    /// which. Silence would make an interrupted mutation indistinguishable from
+    /// one that never started.
+    ///
+    /// Best effort and bounded by the audit log's own rotation ceiling; a
+    /// failure here never blocks opening the store.
+    fn reconcile_review_audit_unlocked(&self) -> usize {
+        let path = self.inner.root.join("audit").join("audit.jsonl");
+        let Ok(text) = fs::read_to_string(&path) else {
+            return 0;
+        };
+        let mut pending: std::collections::BTreeMap<String, AuditEntry> =
+            std::collections::BTreeMap::new();
+        for line in text.lines() {
+            let Ok(entry) = serde_json::from_str::<AuditEntry>(line) else {
+                continue;
+            };
+            if entry.tool != "work_review_verdict" {
+                continue;
+            }
+            let Some(intent_id) = entry.request_id.clone() else {
+                continue;
+            };
+            if entry.outcome.ends_with("_intent") {
+                pending.insert(intent_id, entry);
+            } else {
+                pending.remove(&intent_id);
+            }
+        }
+        let unresolved = pending.len();
+        for (intent_id, entry) in pending {
+            let operation = entry
+                .outcome
+                .strip_suffix("_intent")
+                .unwrap_or("review")
+                .to_string();
+            let _ = append_audit_entry(
+                &self.inner.root,
+                &AuditEntry {
+                    ts: Utc::now(),
+                    tool: "work_review_verdict".into(),
+                    request_id: Some(intent_id),
+                    session_id: entry.session_id,
+                    workspace: entry.workspace.clone(),
+                    outcome: format!("{operation}_unresolved"),
+                    error_code: Some("interrupted".into()),
+                    detail: format!(
+                        "{}: interrupted before its outcome was recorded; \
+                         the durable work record is authoritative",
+                        entry.detail
+                    ),
+                },
+            );
+        }
+        unresolved
     }
 
     /// Declare what is about to be attempted. Its failure fails the call, so a
@@ -2344,13 +2463,14 @@ impl OrchStore {
         &self,
         item: &WorkItem,
         operation: &str,
+        intent_id: &str,
         detail: &str,
         now: chrono::DateTime<Utc>,
     ) -> Result<(), OrchError> {
         self.append_audit(&AuditEntry {
             ts: now,
             tool: "work_review_verdict".into(),
-            request_id: None,
+            request_id: Some(intent_id.to_string()),
             session_id: Some(item.session_id),
             workspace: Some(item.workspace.clone()),
             outcome: format!("{operation}_intent"),
@@ -2373,6 +2493,7 @@ impl OrchStore {
         &self,
         item: &WorkItem,
         operation: &str,
+        intent_id: &str,
         detail: &str,
         failure: Option<&anyhow::Error>,
         now: chrono::DateTime<Utc>,
@@ -2388,7 +2509,7 @@ impl OrchStore {
         let _ = self.append_audit(&AuditEntry {
             ts: now,
             tool: "work_review_verdict".into(),
-            request_id: None,
+            request_id: Some(intent_id.to_string()),
             session_id: Some(item.session_id),
             workspace: Some(item.workspace.clone()),
             outcome,
@@ -2647,6 +2768,7 @@ impl OrchStore {
                 }
                 item.state = WorkState::Blocked;
                 item.blocked_reason = Some(reason.to_string());
+                item.block_provenance = Some(super::graph::BlockProvenance::Manual);
                 Ok(())
             },
         )
@@ -6906,7 +7028,7 @@ mod review_authority_tests {
         let dir = tempdir().unwrap();
         let store = OrchStore::open(dir.path()).unwrap();
         let item = gated_item(&store, dir.path(), &["r1"], 1);
-        let subject = review_subject_digest(&item);
+        let subject = review_subject_digest(&item, None);
 
         let (updated, block) = store
             .record_review_verdict(
@@ -6939,7 +7061,7 @@ mod review_authority_tests {
         edited.objective = "a materially different objective".into();
         edited.bump();
         store.save_work_item(&edited).expect("subject edit");
-        assert_ne!(review_subject_digest(&edited), subject);
+        assert_ne!(review_subject_digest(&edited, None), subject);
         assert_eq!(
             store
                 .admission_block_at(&item.work_id, Utc::now())
@@ -7093,6 +7215,415 @@ mod review_authority_tests {
         assert!(
             stored.review_receipts.is_empty(),
             "no receipt may become durable when its intent could not be audited"
+        );
+    }
+
+    fn assign_agent(
+        store: &OrchStore,
+        item: &WorkItem,
+        agent_id: &str,
+        spec_revision: u64,
+        selection_key: &str,
+    ) -> WorkItem {
+        use crate::orchestration::types::{
+            AgentAuthorityPolicy, AgentMemoryPolicy, AgentModelSpec, AgentSpec, AgentState,
+            AGENT_SPEC_SCHEMA_VERSION,
+        };
+        let now = Utc::now();
+        let agent = AgentRecord {
+            agent_id: agent_id.to_string(),
+            owner_principal_id: None,
+            session_id: item.session_id,
+            lane_ids: vec![item.session_id],
+            lane_associations: Vec::new(),
+            workspace: item.workspace.clone(),
+            model: selection_key.to_string(),
+            spec: Some(AgentSpec {
+                schema_version: AGENT_SPEC_SCHEMA_VERSION,
+                revision: spec_revision,
+                previous_revision: spec_revision.checked_sub(1).filter(|prev| *prev > 0),
+                display_name: agent_id.to_string(),
+                role: "worker".into(),
+                source_workspace: item.workspace.clone(),
+                model: AgentModelSpec::from_selection_key(selection_key).expect("model"),
+                default_run_bounds: RunBounds::default(),
+                authority: AgentAuthorityPolicy::default(),
+                memory: AgentMemoryPolicy::default(),
+                managed_execution: Default::default(),
+                created_at: now,
+                created_by: "tester".into(),
+            }),
+            state: AgentState::Waiting,
+            current_run_id: None,
+            last_run_id: None,
+            last_lane_id: Some(item.session_id),
+            latest_checkpoint_id: None,
+            continuation_ordinal: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        store.save_agent(&agent).expect("agent");
+        let stored = store
+            .load_work_item(&item.work_id)
+            .expect("load")
+            .expect("item");
+        store
+            .assign_work(
+                &stored.work_id,
+                Some(agent_id.to_string()),
+                Some(stored.revision),
+            )
+            .expect("assign")
+    }
+
+    #[test]
+    fn reassignment_retires_prior_approvals() {
+        // A quorum approves a specific agent running a specific specification.
+        // Reassigning is not the thing that was approved.
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let item = gated_item(&store, dir.path(), &["r1"], 1);
+        let assigned = assign_agent(&store, &item, "agent-a", 1, "xai/grok-4");
+
+        store
+            .record_review_verdict(
+                &assigned.work_id,
+                &principal("r1"),
+                "r1",
+                ReviewVerdict::Approve,
+                None,
+                Utc::now(),
+            )
+            .expect("approve the assigned authority");
+        assert_eq!(
+            store
+                .admission_block_at(&item.work_id, Utc::now())
+                .expect("admission"),
+            AdmissionBlock::Admissible
+        );
+
+        // Reassign to a different agent through the ordinary assignment path.
+        assign_agent(&store, &item, "agent-b", 1, "xai/grok-4");
+        assert_eq!(
+            store
+                .admission_block_at(&item.work_id, Utc::now())
+                .expect("admission"),
+            AdmissionBlock::ReviewPending,
+            "reassignment must require a fresh quorum"
+        );
+        assert!(
+            store.claim_work(&item.work_id, "agent-b", None).is_err(),
+            "and the reassigned item must not be claimable"
+        );
+    }
+
+    #[test]
+    fn an_agent_specification_or_model_change_retires_prior_approvals() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let item = gated_item(&store, dir.path(), &["r1"], 1);
+        assign_agent(&store, &item, "agent-a", 1, "xai/grok-4");
+        store
+            .record_review_verdict(
+                &item.work_id,
+                &principal("r1"),
+                "r1",
+                ReviewVerdict::Approve,
+                None,
+                Utc::now(),
+            )
+            .expect("approve");
+        assert_eq!(
+            store
+                .admission_block_at(&item.work_id, Utc::now())
+                .expect("admission"),
+            AdmissionBlock::Admissible
+        );
+
+        // Same agent, newer specification revision, through the attributable
+        // revision operation the ledger requires.
+        store
+            .revise_agent_spec("agent-a", "operator", |spec| {
+                spec.model = crate::orchestration::types::AgentModelSpec::from_selection_key(
+                    "xai/grok-4-fast",
+                )
+                .expect("model");
+                Ok(())
+            })
+            .expect("revise the specification");
+        assert_eq!(
+            store
+                .admission_block_at(&item.work_id, Utc::now())
+                .expect("admission"),
+            AdmissionBlock::ReviewPending,
+            "an agent-specification bump must require a fresh quorum"
+        );
+    }
+
+    #[test]
+    fn a_manager_or_routine_source_change_retires_prior_approvals() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let item = gated_item(&store, dir.path(), &["r1"], 1);
+        store
+            .record_review_verdict(
+                &item.work_id,
+                &principal("r1"),
+                "r1",
+                ReviewVerdict::Approve,
+                None,
+                Utc::now(),
+            )
+            .expect("approve");
+        assert_eq!(
+            store
+                .admission_block_at(&item.work_id, Utc::now())
+                .expect("admission"),
+            AdmissionBlock::Admissible
+        );
+
+        // `__manager_decision__` changes submission behavior; routine and
+        // activation lineage change what a run may do. Each must retire the
+        // approval on its own.
+        for mutate in [
+            (|w: &mut WorkItem| {
+                w.source_manager_plan_id = Some("plan-1".into());
+                w.source_manager_step_id = Some("__manager_decision__".into());
+            }) as fn(&mut WorkItem),
+            |w: &mut WorkItem| w.source_routine_id = Some("routine-1".into()),
+            |w: &mut WorkItem| w.source_activation_id = Some("activation-1".into()),
+        ] {
+            let mut edited = store
+                .load_work_item(&item.work_id)
+                .expect("load")
+                .expect("item");
+            // Reset to the approved shape, then apply one change.
+            edited.source_manager_plan_id = None;
+            edited.source_manager_step_id = None;
+            edited.source_routine_id = None;
+            edited.source_activation_id = None;
+            store.save_work_item(&edited).expect("reset");
+            assert_eq!(
+                store
+                    .admission_block_at(&item.work_id, Utc::now())
+                    .expect("admission"),
+                AdmissionBlock::Admissible,
+                "the approved shape is still admissible"
+            );
+            mutate(&mut edited);
+            edited.bump();
+            store.save_work_item(&edited).expect("source change");
+            assert_eq!(
+                store
+                    .admission_block_at(&item.work_id, Utc::now())
+                    .expect("admission"),
+                AdmissionBlock::ReviewPending,
+                "a source/manager change must require a fresh quorum"
+            );
+        }
+    }
+
+    #[test]
+    fn the_subject_digest_is_deterministic_across_a_restart() {
+        let dir = tempdir().unwrap();
+        let item_id;
+        let before;
+        {
+            let store = OrchStore::open(dir.path()).unwrap();
+            let item = gated_item(&store, dir.path(), &["r1"], 1);
+            item_id = item.work_id.clone();
+            assign_agent(&store, &item, "agent-a", 1, "xai/grok-4");
+            store
+                .record_review_verdict(
+                    &item_id,
+                    &principal("r1"),
+                    "r1",
+                    ReviewVerdict::Approve,
+                    None,
+                    Utc::now(),
+                )
+                .expect("approve");
+            let stored = store.load_work_item(&item_id).unwrap().unwrap();
+            before = stored.review_receipts[0].subject_digest.clone();
+            assert_eq!(
+                store.admission_block_at(&item_id, Utc::now()).unwrap(),
+                AdmissionBlock::Admissible
+            );
+        }
+        // Reopening the ledger must recompute the identical subject, or a
+        // restart would silently retire every standing approval.
+        let store = OrchStore::open(dir.path()).unwrap();
+        let stored = store.load_work_item(&item_id).unwrap().unwrap();
+        let execution = store.execution_identity_unlocked(&stored);
+        assert_eq!(
+            crate::orchestration::graph::review_subject_digest(&stored, execution.as_ref()),
+            before,
+            "the subject must be stable across a restart"
+        );
+        assert_eq!(
+            store.admission_block_at(&item_id, Utc::now()).unwrap(),
+            AdmissionBlock::Admissible,
+            "and a standing approval must survive it"
+        );
+    }
+
+    #[test]
+    fn only_one_racing_claimant_wins_an_approved_item() {
+        use std::sync::{Arc, Barrier};
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let item = gated_item(&store, dir.path(), &["r1"], 1);
+        store
+            .record_review_verdict(
+                &item.work_id,
+                &principal("r1"),
+                "r1",
+                ReviewVerdict::Approve,
+                None,
+                Utc::now(),
+            )
+            .expect("approve");
+
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::new();
+        for worker in 0..4 {
+            let store = store.clone();
+            let work_id = item.work_id.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .claim_work(&work_id, &format!("worker-{worker}"), None)
+                    .is_ok()
+            }));
+        }
+        let winners = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread joins"))
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            winners, 1,
+            "an approved item still has exactly one claimant"
+        );
+        assert_eq!(
+            store.list_work_attempts(Some(&item.work_id)).unwrap().len(),
+            1,
+            "and exactly one attempt exists"
+        );
+    }
+
+    #[test]
+    fn a_manual_block_is_typed_and_survives_reconciliation() {
+        let dir = tempdir().unwrap();
+        let store = OrchStore::open(dir.path()).unwrap();
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let item = WorkItem::new(
+            "hold",
+            "synthetic",
+            Uuid::new_v4(),
+            workspace.display().to_string(),
+            "creator",
+            WorkPolicy::default(),
+        )
+        .unwrap();
+        store.save_work_item(&item).unwrap();
+        let (blocked, _) = store
+            .block_work(
+                &item.work_id,
+                "operator",
+                "held pending a decision",
+                None,
+                Utc::now(),
+            )
+            .expect("manual block");
+        assert_eq!(
+            blocked.block_provenance,
+            Some(crate::orchestration::graph::BlockProvenance::Manual),
+            "the hold is typed, not inferred from its wording"
+        );
+
+        for _ in 0..3 {
+            store.reconcile_workloads().unwrap();
+        }
+        let after = store.load_work_item(&item.work_id).unwrap().unwrap();
+        assert_eq!(after.state, WorkState::Blocked);
+        assert_eq!(
+            after.blocked_reason.as_deref(),
+            Some("held pending a decision")
+        );
+        assert_eq!(
+            store.admission_block_at(&item.work_id, Utc::now()).unwrap(),
+            AdmissionBlock::ManuallyBlocked
+        );
+
+        // A hold whose wording happens to match a derived reason is still a
+        // hold, because provenance is typed rather than parsed.
+        let dir2 = tempdir().unwrap();
+        let store2 = OrchStore::open(dir2.path()).unwrap();
+        let ws2 = dir2.path().join("ws");
+        std::fs::create_dir_all(&ws2).unwrap();
+        let item2 = WorkItem::new(
+            "hold",
+            "synthetic",
+            Uuid::new_v4(),
+            ws2.display().to_string(),
+            "creator",
+            WorkPolicy::default(),
+        )
+        .unwrap();
+        store2.save_work_item(&item2).unwrap();
+        store2
+            .block_work(&item2.work_id, "operator", "admissible", None, Utc::now())
+            .expect("manual block with a colliding reason");
+        store2.reconcile_workloads().unwrap();
+        assert_eq!(
+            store2
+                .admission_block_at(&item2.work_id, Utc::now())
+                .unwrap(),
+            AdmissionBlock::ManuallyBlocked,
+            "provenance, not wording, decides"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_review_intent_is_closed_out_on_restart() {
+        let dir = tempdir().unwrap();
+        let intent_id = "intent-interrupted";
+        {
+            let store = OrchStore::open(dir.path()).unwrap();
+            let item = gated_item(&store, dir.path(), &["r1"], 1);
+            // Simulate a crash between the effect and its outcome: the intent
+            // is on the log, the outcome never arrived.
+            store
+                .append_audit(&AuditEntry {
+                    ts: Utc::now(),
+                    tool: "work_review_verdict".into(),
+                    request_id: Some(intent_id.into()),
+                    session_id: Some(item.session_id),
+                    workspace: Some(item.workspace.clone()),
+                    outcome: "record_intent".into(),
+                    error_code: None,
+                    detail: "work under review".into(),
+                })
+                .unwrap();
+        }
+        drop(OrchStore::open(dir.path()).unwrap());
+        let audit = std::fs::read_to_string(dir.path().join("audit").join("audit.jsonl")).unwrap();
+        assert!(
+            audit.contains("record_unresolved"),
+            "an intent with no outcome must be closed out on restart"
+        );
+        assert!(audit.contains(intent_id));
+
+        // Reopening again must not duplicate the resolution.
+        drop(OrchStore::open(dir.path()).unwrap());
+        let audit = std::fs::read_to_string(dir.path().join("audit").join("audit.jsonl")).unwrap();
+        assert_eq!(
+            audit.matches("record_unresolved").count(),
+            1,
+            "resolution is idempotent across restarts"
         );
     }
 
