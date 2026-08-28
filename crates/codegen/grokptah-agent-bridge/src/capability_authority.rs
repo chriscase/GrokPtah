@@ -51,13 +51,6 @@ impl CapabilityPrincipal {
         })
     }
 
-    pub(crate) fn host_default() -> Self {
-        Self {
-            id: "host-principal".into(),
-            auth_generation: 1,
-        }
-    }
-
     pub(crate) fn id(&self) -> &str {
         &self.id
     }

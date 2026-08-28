@@ -973,23 +973,13 @@ impl AgentHostHandle {
     }
 
     /// Principal used by an explicitly created Computer Run. Existing local
-    /// sessions use the canonical Agent owner; direct library users without a
-    /// session receive only the host principal, never a session-wide grant.
+    /// sessions use the canonical Agent owner; missing or invalid session
+    /// authority is denied rather than replaced with a local identity.
     pub fn capability_principal_for_computer(
         &self,
         session_id: Uuid,
     ) -> Result<CapabilityPrincipal> {
-        match self.capability_principal(session_id) {
-            Ok(principal) => Ok(principal),
-            Err(error) => {
-                let known_session = self.inner.lock().sessions.contains_key(&session_id);
-                if known_session {
-                    Err(error)
-                } else {
-                    Ok(CapabilityPrincipal::host_default())
-                }
-            }
-        }
+        self.capability_principal(session_id)
     }
     /// The validated durable root owned by this host process.
     pub fn runtime_home(&self) -> crate::discover::RuntimeHome {

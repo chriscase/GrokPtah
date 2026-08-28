@@ -205,8 +205,11 @@ impl DesktopComputerUse {
             backend,
             store,
             self.host.capability_authority(),
-            principal,
+            principal.clone(),
         );
+        service
+            .install_host_policy(principal)
+            .map_err(|error| error.to_string())?;
         let limits = ComputerUseLimits {
             max_actions: 1,
             max_duration_secs: 5 * 60,
@@ -339,6 +342,13 @@ impl DesktopComputerUse {
             return Err("This session already has an active Computer Run".into());
         }
         self.clear_pending_for_owner(owner_session_id)?;
+        service
+            .install_host_policy(
+                self.host
+                    .capability_principal_for_computer(owner_session_id)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
         let limits = ComputerUseLimits {
             max_actions: 8,
             max_duration_secs: 10 * 60,
@@ -405,8 +415,11 @@ impl DesktopComputerUse {
             backend,
             store,
             self.host.capability_authority(),
-            principal,
+            principal.clone(),
         ));
+        service
+            .install_host_policy(principal)
+            .map_err(|error| error.to_string())?;
         let limits = ComputerUseLimits {
             max_actions: 8,
             max_duration_secs: 10 * 60,
@@ -1068,12 +1081,21 @@ mod tests {
         // Tests deliberately open an isolated store in the fixture directory;
         // production `new()` must borrow the host's shared handle instead.
         let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
-        let simulator = Arc::new(ComputerUseService::new(
+        // Install policy explicitly from a live host principal; constructing a
+        // service alone must not mint or install any authority.
+        let host = test_host(dir.path());
+        host.start().unwrap();
+        let session = host
+            .session_new_kind(grokptah_agent_bridge::SessionKind::Build)
+            .unwrap();
+        let principal = host.capability_principal(session.id).unwrap();
+        let simulator = Arc::new(ComputerUseService::new_with_authority_and_principal(
             Arc::new(SimulatorBackend::new()),
             store.clone(),
+            host.capability_authority(),
+            principal.clone(),
         ));
-        // Build the host before `dir` moves into the returned tuple.
-        let host = test_host(dir.path());
+        simulator.install_host_policy(principal).unwrap();
         (
             dir,
             DesktopComputerUse {
@@ -1089,6 +1111,14 @@ mod tests {
                 pending_approval: std::sync::Mutex::new(None),
             },
         )
+    }
+
+    fn test_owner(desktop: &DesktopComputerUse) -> Uuid {
+        desktop
+            .host
+            .status()
+            .active_session
+            .expect("test host must have an active session")
     }
 
     fn native_test_desktop() -> (tempfile::TempDir, DesktopComputerUse, Arc<AtomicUsize>) {
@@ -1125,7 +1155,7 @@ mod tests {
     #[tokio::test]
     async fn approval_is_exact_one_use_and_requires_reobservation() {
         let (_dir, desktop) = test_desktop();
-        let owner = Uuid::new_v4();
+        let owner = test_owner(&desktop);
         let target = SimulatorBackend::demo_target();
         let started = desktop
             .start_simulator(owner, &target.app_id)
@@ -1179,7 +1209,7 @@ mod tests {
     #[tokio::test]
     async fn model_proposal_is_revalidated_and_staged_without_dispatch() {
         let (_dir, desktop) = test_desktop();
-        let owner = Uuid::new_v4();
+        let owner = test_owner(&desktop);
         let target = SimulatorBackend::demo_target();
         let started = desktop
             .start_simulator(owner, &target.app_id)
@@ -1227,7 +1257,7 @@ mod tests {
     #[tokio::test]
     async fn model_completion_cannot_settle_a_run_without_a_host_receipt() {
         let (_dir, desktop) = test_desktop();
-        let owner = Uuid::new_v4();
+        let owner = test_owner(&desktop);
         let target = SimulatorBackend::demo_target();
         let started = desktop
             .start_simulator(owner, &target.app_id)
@@ -1257,7 +1287,7 @@ mod tests {
     #[tokio::test]
     async fn approval_cannot_cross_sessions_or_survive_takeover() {
         let (_dir, desktop) = test_desktop();
-        let owner = Uuid::new_v4();
+        let owner = test_owner(&desktop);
         let other = Uuid::new_v4();
         let target = SimulatorBackend::demo_target();
         let started = desktop
@@ -1316,7 +1346,7 @@ mod tests {
     #[tokio::test]
     async fn native_run_uses_the_same_exact_one_use_approval_path() {
         let (_dir, desktop, actions) = native_test_desktop();
-        let owner = Uuid::new_v4();
+        let owner = test_owner(&desktop);
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let started = desktop
             .start_native(owner, &candidate.selection_token, NATIVE_TEST_APP_ID)

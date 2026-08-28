@@ -21,7 +21,7 @@ use grokptah_agent_bridge::computer_use::{
     ComputerStore, ComputerTarget, ComputerUseLimits, GrantIssuer, ObservationGeometry,
     PointerButton, SemanticAction, SemanticElement, Sensitivity,
 };
-use grokptah_agent_bridge::ComputerUseService;
+use grokptah_agent_bridge::{AgentHost, ComputerUseService, HostConfig, RuntimeHome, SessionKind};
 
 #[derive(Debug, Clone, Copy)]
 enum BackendMode {
@@ -169,7 +169,23 @@ fn fixture(
     let directory = tempfile::tempdir().expect("fixture directory");
     let backend = Arc::new(ReleaseGateBackend::new(mode));
     let store = ComputerStore::open(directory.path().join("computer-use")).expect("store");
-    let service = ComputerUseService::new(backend.clone(), store);
+    let runtime =
+        RuntimeHome::from_path(directory.path().join("host-runtime")).expect("host runtime");
+    let host = AgentHost::create_with_runtime_home(HostConfig::default(), runtime);
+    host.start().expect("host start");
+    let session = host
+        .session_new_kind(SessionKind::Build)
+        .expect("host session");
+    host.session_set_cwd(session.id, directory.path())
+        .expect("session workspace");
+    host.ensure_session_agent(session.id)
+        .expect("canonical Agent principal");
+    let principal = host.capability_principal(session.id).expect("principal");
+    let service =
+        ComputerUseService::new_with_authority(backend.clone(), store, host.capability_authority());
+    service
+        .install_host_policy(principal)
+        .expect("explicit host policy");
     let run = service
         .create_run(
             "release-gate-create",

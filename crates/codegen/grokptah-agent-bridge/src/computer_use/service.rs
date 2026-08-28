@@ -49,9 +49,9 @@ pub struct ComputerUseService {
     store: ComputerStore,
     policy: ComputerPolicy,
     capability_authority: Arc<CapabilityAuthority>,
-    principal: CapabilityPrincipal,
-    service_capability: Option<RunCapability>,
-    action_capability: Option<RunCapability>,
+    principal: Mutex<Option<CapabilityPrincipal>>,
+    service_capability: Mutex<Option<RunCapability>>,
+    action_capability: Mutex<Option<RunCapability>>,
     run_capabilities: Mutex<std::collections::HashMap<String, RunCapability>>,
     execution_receipts: Mutex<std::collections::HashMap<String, HostExecutionReceipt>>,
 }
@@ -76,7 +76,9 @@ struct HostExecutionReceipt {
 
 impl ComputerUseService {
     pub fn new(backend: Arc<dyn ComputerBackend>, store: ComputerStore) -> Self {
-        Self::new_with_authority(backend, store, Arc::new(CapabilityAuthority::new(true)))
+        // Legacy construction is deliberately inert. Only an explicit,
+        // host-installed opaque principal policy can enable effects.
+        Self::new_with_authority(backend, store, Arc::new(CapabilityAuthority::new(false)))
     }
 
     /// Construct a Computer Use service sharing the host's one authority.
@@ -87,12 +89,17 @@ impl ComputerUseService {
         store: ComputerStore,
         capability_authority: Arc<CapabilityAuthority>,
     ) -> Self {
-        Self::new_with_authority_and_principal(
+        Self {
             backend,
             store,
+            policy: ComputerPolicy,
             capability_authority,
-            CapabilityPrincipal::host_default(),
-        )
+            principal: Mutex::new(None),
+            service_capability: Mutex::new(None),
+            action_capability: Mutex::new(None),
+            run_capabilities: Mutex::new(std::collections::HashMap::new()),
+            execution_receipts: Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     /// Construct a service bound to the canonical host principal seam.
@@ -102,75 +109,91 @@ impl ComputerUseService {
         capability_authority: Arc<CapabilityAuthority>,
         principal: CapabilityPrincipal,
     ) -> Self {
-        let service_capability = CapabilitySnapshot::computer_use_service(
+        let service = Self::new_with_authority(backend, store, capability_authority);
+        *service.principal.lock() = Some(principal);
+        service
+    }
+
+    /// Install a trusted, canonical host policy. This is the only path that
+    /// issues the service/action generations and must run after the caller has
+    /// authenticated the opaque principal through the host seam.
+    pub fn install_host_policy(&self, principal: CapabilityPrincipal) -> ComputerResult<()> {
+        {
+            let installed = self.principal.lock();
+            if installed
+                .as_ref()
+                .is_some_and(|current| current != &principal)
+            {
+                return Err(ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "canonical Computer Use principal changed",
+                ));
+            }
+        }
+        let service_snapshot = CapabilitySnapshot::computer_use_service(
             principal.id(),
-            &backend.capabilities(),
+            &self.backend.capabilities(),
             POLICY_GENERATION,
         )
-        .ok()
-        .and_then(|snapshot| {
-            let capability = capability_authority
-                .issue(
-                    &snapshot,
-                    Utc::now(),
-                    crate::capability_authority::DEFAULT_CAPABILITY_TTL,
-                )
-                .ok()?;
-            capability_authority
-                .install_envelope(
-                    SERVICE_ENVELOPE_ID,
-                    capability.clone(),
-                    snapshot.clone(),
-                    principal.id(),
-                    principal.auth_generation(),
-                    POLICY_GENERATION,
-                    RUN_OPERATIONS
-                        .iter()
-                        .copied()
-                        .chain(["create_run", "settle_receipt"]),
-                    "computer-host",
-                    Utc::now(),
-                )
-                .ok()?;
-            Some(RunCapability {
-                envelope_id: SERVICE_ENVELOPE_ID.into(),
-                settlement_envelope_id: SERVICE_ENVELOPE_ID.into(),
-                snapshot,
-                capability,
-            })
-        });
-        let action_capability = CapabilitySnapshot::computer_use_service(
+        .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error.to_string()))?;
+        let action_snapshot = CapabilitySnapshot::computer_use_service(
             principal.id(),
-            &backend.capabilities(),
-            "computer-use-action-policy.v1",
+            &self.backend.capabilities(),
+            ACTION_POLICY_GENERATION,
         )
-        .ok()
-        .and_then(|snapshot| {
-            let capability = capability_authority
-                .issue(
-                    &snapshot,
-                    Utc::now(),
-                    crate::capability_authority::DEFAULT_CAPABILITY_TTL,
-                )
-                .ok()?;
-            Some(RunCapability {
-                envelope_id: String::new(),
-                settlement_envelope_id: String::new(),
-                snapshot,
-                capability,
-            })
+        .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error.to_string()))?;
+        let service_capability = self
+            .capability_authority
+            .issue(
+                &service_snapshot,
+                Utc::now(),
+                crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+            )
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string())
+            })?;
+        self.capability_authority
+            .install_envelope(
+                SERVICE_ENVELOPE_ID,
+                service_capability.clone(),
+                service_snapshot.clone(),
+                principal.id(),
+                principal.auth_generation(),
+                POLICY_GENERATION,
+                RUN_OPERATIONS
+                    .iter()
+                    .copied()
+                    .chain(["create_run", "settle_receipt"]),
+                "computer-host",
+                Utc::now(),
+            )
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string())
+            })?;
+        let action_capability = self
+            .capability_authority
+            .issue(
+                &action_snapshot,
+                Utc::now(),
+                crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+            )
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string())
+            })?;
+        *self.principal.lock() = Some(principal);
+        *self.service_capability.lock() = Some(RunCapability {
+            envelope_id: SERVICE_ENVELOPE_ID.into(),
+            settlement_envelope_id: SERVICE_ENVELOPE_ID.into(),
+            snapshot: service_snapshot,
+            capability: service_capability,
         });
-        Self {
-            backend,
-            store,
-            policy: ComputerPolicy,
-            capability_authority,
-            principal,
-            service_capability,
-            action_capability,
-            run_capabilities: Mutex::new(std::collections::HashMap::new()),
-            execution_receipts: Mutex::new(std::collections::HashMap::new()),
-        }
+        *self.action_capability.lock() = Some(RunCapability {
+            envelope_id: String::new(),
+            settlement_envelope_id: String::new(),
+            snapshot: action_snapshot,
+            capability: action_capability,
+        });
+        Ok(())
     }
 
     pub fn capabilities(&self) -> super::types::ComputerCapabilities {
@@ -1056,6 +1079,7 @@ impl ComputerUseService {
     fn snapshot_for_run(&self, run: &ComputerRun) -> ComputerResult<CapabilitySnapshot> {
         let _ = run;
         self.action_capability
+            .lock()
             .as_ref()
             .map(|binding| binding.snapshot.clone())
             .ok_or_else(|| {
@@ -1067,7 +1091,14 @@ impl ComputerUseService {
     }
 
     fn bind_run_capability(&self, run: &ComputerRun) -> ComputerResult<RunCapability> {
-        let action = self.action_capability.as_ref().ok_or_else(|| {
+        let principal = self.principal.lock().clone().ok_or_else(|| {
+            ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "canonical Computer Use principal is unavailable",
+            )
+        })?;
+        let action_guard = self.action_capability.lock();
+        let action = action_guard.as_ref().ok_or_else(|| {
             ComputerError::new(
                 ComputerErrorCode::Unauthorized,
                 "canonical computer capability envelope is unavailable",
@@ -1080,8 +1111,8 @@ impl ComputerUseService {
                 &envelope_id,
                 action.capability.clone(),
                 action.snapshot.clone(),
-                self.principal.id(),
-                self.principal.auth_generation(),
+                principal.id(),
+                principal.auth_generation(),
                 ACTION_POLICY_GENERATION,
                 RUN_OPERATIONS.iter().copied(),
                 &run.run_id,
@@ -1095,8 +1126,8 @@ impl ComputerUseService {
                 &settlement_envelope_id,
                 action.capability.clone(),
                 action.snapshot.clone(),
-                self.principal.id(),
-                self.principal.auth_generation(),
+                principal.id(),
+                principal.auth_generation(),
                 ACTION_POLICY_GENERATION,
                 SETTLEMENT_OPERATIONS.iter().copied(),
                 &run.run_id,
@@ -1224,6 +1255,7 @@ impl ComputerUseService {
     fn consume_durable_claim(&self, operation: &str) -> ComputerResult<()> {
         let snapshot = self
             .service_capability
+            .lock()
             .as_ref()
             .map(|binding| binding.snapshot.clone())
             .ok_or_else(|| {
@@ -1275,10 +1307,12 @@ impl ComputerUseService {
             None => SERVICE_ENVELOPE_ID.into(),
         };
         let resource = run_id.as_deref().unwrap_or("computer-host");
+        let service_binding = self.service_capability.lock();
+        let action_binding = self.action_capability.lock();
         let binding = if envelope_id == SERVICE_ENVELOPE_ID {
-            self.service_capability.as_ref()
+            service_binding.as_ref()
         } else {
-            self.action_capability.as_ref()
+            action_binding.as_ref()
         };
         let snapshot = binding
             .map(|binding| binding.snapshot.clone())
@@ -1617,11 +1651,29 @@ mod tests {
     fn service() -> (Arc<SimulatorBackend>, ComputerUseService) {
         let dir = tempdir().unwrap().keep();
         let backend = Arc::new(SimulatorBackend::new());
-        let service = ComputerUseService::new(
+        let service = new_test_service(
             backend.clone(),
             ComputerStore::open(dir.join("computer-use")).unwrap(),
         );
+        install_test_policy(&service);
         (backend, service)
+    }
+
+    fn new_test_service(
+        backend: Arc<dyn ComputerBackend>,
+        store: ComputerStore,
+    ) -> ComputerUseService {
+        ComputerUseService::new_with_authority(
+            backend,
+            store,
+            Arc::new(CapabilityAuthority::new(true)),
+        )
+    }
+
+    fn install_test_policy(service: &ComputerUseService) {
+        service
+            .install_host_policy(CapabilityPrincipal::new("test-agent".into(), 1).unwrap())
+            .unwrap();
     }
 
     fn grant(run: &ComputerRun) -> ActionGrant {
@@ -1763,10 +1815,11 @@ mod tests {
     #[tokio::test]
     async fn a_restarted_service_cannot_reuse_an_old_run_capability() {
         let dir = tempdir().unwrap();
-        let service = ComputerUseService::new(
+        let service = new_test_service(
             Arc::new(SimulatorBackend::new()),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         );
+        install_test_policy(&service);
         let owner = Uuid::new_v4();
         let run = service
             .create_run(
@@ -1797,10 +1850,11 @@ mod tests {
     #[tokio::test]
     async fn backend_cannot_replace_the_host_minted_observation_identity() {
         let dir = tempdir().unwrap();
-        let service = ComputerUseService::new(
+        let service = new_test_service(
             Arc::new(MismatchedObservationBackend::default()),
             ComputerStore::open(dir.path()).unwrap(),
         );
+        install_test_policy(&service);
         let owner = Uuid::new_v4();
         let run = service
             .create_run(
@@ -2161,10 +2215,11 @@ mod tests {
     #[tokio::test]
     async fn evidence_limit_is_committed_before_returning_the_error() {
         let dir = tempdir().unwrap();
-        let service = ComputerUseService::new(
+        let service = new_test_service(
             Arc::new(EvidenceBackend::default()),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         );
+        install_test_policy(&service);
         let limits = ComputerUseLimits {
             max_evidence_bytes: 1,
             ..Default::default()
@@ -2201,10 +2256,11 @@ mod tests {
     async fn evidence_read_requires_current_asset_and_validates_backend_bytes() {
         let dir = tempdir().unwrap();
         let backend = Arc::new(EvidenceBackend::default());
-        let service = ComputerUseService::new(
+        let service = new_test_service(
             backend.clone(),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         );
+        install_test_policy(&service);
         let run = service
             .create_run(
                 "create-evidence-read",
@@ -2336,10 +2392,11 @@ mod tests {
     async fn concurrent_actions_execute_the_backend_at_most_once() {
         let dir = tempdir().unwrap();
         let backend = Arc::new(BlockingBackend::default());
-        let service = Arc::new(ComputerUseService::new(
+        let service = Arc::new(new_test_service(
             backend.clone(),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         ));
+        install_test_policy(&service);
         let run = service
             .create_run(
                 "create-race",
@@ -2407,10 +2464,11 @@ mod tests {
     async fn cancellation_wins_over_an_inflight_action_completion() {
         let dir = tempdir().unwrap();
         let backend = Arc::new(BlockingBackend::default());
-        let service = Arc::new(ComputerUseService::new(
+        let service = Arc::new(new_test_service(
             backend.clone(),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         ));
+        install_test_policy(&service);
         let run = service
             .create_run(
                 "create-cancel-race",
@@ -2741,10 +2799,11 @@ mod tests {
         let owner = Uuid::new_v4();
         let run_id;
         {
-            let service = ComputerUseService::new(
+            let service = new_test_service(
                 Arc::new(SimulatorBackend::new()),
                 ComputerStore::open(dir.join("computer-use")).unwrap(),
             );
+            install_test_policy(&service);
             let run = service
                 .create_run(
                     "create-restart",
