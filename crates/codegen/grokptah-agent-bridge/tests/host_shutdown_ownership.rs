@@ -21,7 +21,7 @@ use grokptah_agent_bridge::orchestration::{
 };
 use grokptah_agent_bridge::{
     set_grokptah_home_override, start_control_server, AgentHost, HostConfig, HostPhase,
-    HostRuntime, McpControlClient, SessionKind,
+    HostRuntime, McpControlClient, MemoryScope, SessionKind,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -158,20 +158,97 @@ fn restart_same_home_now(lane: &Lane) -> HostRuntime {
 
 fn assert_clean_shutdown(report: &grokptah_agent_bridge::HostShutdownReport) {
     assert!(!report.already_complete);
-    assert_eq!(
-        report.supervised_tasks_remaining, 0,
-        "ordered shutdown must join every supervised task before returning"
+    assert!(
+        report.is_clean(),
+        "ordered shutdown must meet every guarantee: {}",
+        report.operator_summary()
     );
     assert!(
         report.process_lock_released,
         "ordered shutdown must be the call that releases the advisory lock"
     );
-    assert!(!report.process_lock_held_after);
+    assert!(
+        report.durable_writes_sealed,
+        "the lock is never released without the durable-write seal"
+    );
+    assert_eq!(report.supervised_tasks_remaining, 0);
+    assert!(report.flush_errors.is_empty(), "{:?}", report.flush_errors);
     assert!(
         report.lock_file_present,
         "the lock file must not be deleted"
     );
     assert_eq!(report.phase, HostPhase::Closed);
+}
+
+/// Every durable mutator a stale `AgentHostHandle` can still reach must refuse
+/// once the runtime closed — otherwise a replacement process owns the home
+/// while an old handle is still writing it.
+fn assert_every_durable_mutator_refuses(
+    handle: &grokptah_agent_bridge::AgentHostHandle,
+    session_id: Uuid,
+    workspace: &Path,
+) {
+    let mut refused: Vec<&str> = Vec::new();
+    let mut accepted: Vec<&str> = Vec::new();
+    macro_rules! check {
+        ($name:literal, $call:expr) => {
+            if $call.is_err() {
+                refused.push($name);
+            } else {
+                accepted.push($name);
+            }
+        };
+    }
+    check!("start", handle.start());
+    check!(
+        "session_new_kind",
+        handle.session_new_kind(SessionKind::Build)
+    );
+    check!(
+        "session_rename",
+        handle.session_rename(session_id, "renamed by a stale handle".into())
+    );
+    check!("session_archive", handle.session_archive(session_id, true));
+    check!(
+        "session_set_cwd",
+        handle.session_set_cwd(session_id, workspace)
+    );
+    check!("session_delete", handle.session_delete(session_id));
+    check!("set_project_cwd", handle.set_project_cwd(workspace));
+    check!(
+        "session_queue_add",
+        handle.session_queue_add(session_id, "stale queue write".into(), false)
+    );
+    check!(
+        "memory_remember",
+        handle.memory_remember(session_id, MemoryScope::Project, "stale memory fact")
+    );
+    check!(
+        "set_api_key",
+        handle.set_api_key("sk-stale".into(), "stale".into())
+    );
+    check!(
+        "delete_provider_profile",
+        handle.delete_provider_profile("stale-profile")
+    );
+    check!(
+        "ensure_orchestration_store",
+        handle.ensure_orchestration_store()
+    );
+    check!("ensure_computer_store", handle.ensure_computer_store());
+    check!(
+        "ensure_session_accepts_new_work",
+        handle.ensure_session_accepts_new_work(session_id)
+    );
+    check!(
+        "hold_durable_write",
+        handle.hold_durable_write_for_test("stale write")
+    );
+    assert!(
+        accepted.is_empty(),
+        "these durable mutators were still reachable from a stale handle: {accepted:?}"
+    );
+    assert!(refused.len() >= 15, "expected the full mutator surface");
 }
 
 /// Regression shaped like the two hosted desktop soak failures
@@ -187,7 +264,9 @@ async fn completed_mcp_campaign_then_immediate_same_home_restart() {
     let auth = orch.auth_header(Some(&format!("Bearer {TOKEN}"))).unwrap();
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let addr = server.addr;
-    runtime.attach_control_server(server);
+    runtime
+        .attach_control_server(server)
+        .unwrap_or_else(|_| panic!("a running runtime must accept its control server"));
 
     // Drive the campaign over the real loopback MCP transport, like the soak.
     let mut client = McpControlClient::new(format!("http://{addr}"), TOKEN);
@@ -332,7 +411,9 @@ async fn live_sse_stream_does_not_block_shutdown() {
     let auth = orch.auth_header(Some(&format!("Bearer {TOKEN}"))).unwrap();
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let addr = server.addr;
-    runtime.attach_control_server(server);
+    runtime
+        .attach_control_server(server)
+        .unwrap_or_else(|_| panic!("a running runtime must accept its control server"));
 
     let mut client = McpControlClient::new(format!("http://{addr}"), TOKEN);
     client.initialize().await.unwrap();
@@ -393,22 +474,269 @@ async fn repeated_shutdown_is_idempotent_and_stale_handles_fail_closed() {
     // Stale request handles observe the closed phase and refuse authority.
     assert_eq!(stale.lifecycle_phase(), HostPhase::Closed);
     assert!(!stale.is_accepting_work());
-    assert!(
-        stale.start().is_err(),
-        "a stale handle must not restart a closed host"
-    );
-    assert!(
-        stale.ensure_session_accepts_new_work(session_id).is_err(),
-        "a stale handle must not admit new work"
-    );
-    assert!(
-        stale.ensure_orchestration_store().is_err(),
-        "a stale handle must not reopen the durable ledger"
-    );
+    assert_every_durable_mutator_refuses(&stale, session_id, lane.ws());
 
     // The replacement process owns the home now; the stale handle still fails.
     let replacement = restart_same_home_now(&lane);
-    assert!(stale.start().is_err());
+    assert_every_durable_mutator_refuses(&stale, session_id, lane.ws());
+    drop(replacement);
+}
+
+/// P0 from independent review: a stale handle must not be able to mutate
+/// durable state after the lock is released, and specifically not while a
+/// replacement process owns the same home.
+///
+/// The assertion is on the bytes: the replacement's own session title must
+/// survive everything the stale handle tries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn stale_handle_cannot_write_the_home_a_replacement_owns() {
+    let lane = Lane::new();
+    let (runtime, session_id) = lane.boot();
+    let stale = runtime.handle();
+    runtime
+        .session_rename(session_id, "owned by the first runtime".into())
+        .unwrap();
+    assert_clean_shutdown(&runtime.shutdown().await);
+
+    let replacement = restart_same_home_now(&lane);
+    replacement
+        .session_rename(session_id, "owned by the replacement".into())
+        .expect("the live owner may rename");
+
+    // Every durable mutator on the stale handle is refused...
+    assert_every_durable_mutator_refuses(&stale, session_id, lane.ws());
+    // ...and nothing it attempted reached disk.
+    let observed = replacement
+        .session_load(session_id)
+        .expect("session still loads")
+        .title;
+    assert_eq!(
+        observed, "owned by the replacement",
+        "a stale handle overwrote a home owned by a replacement process"
+    );
+    drop(replacement);
+}
+
+/// P0 from independent review: a direct desktop command future already in
+/// flight when shutdown starts must not write afterwards.
+///
+/// The command task is intentionally **unsupervised** — Tauri command futures
+/// are not this crate's to spawn — so the only thing standing between it and
+/// the durable state is the write authority itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
+async fn in_flight_desktop_command_cannot_write_after_shutdown() {
+    let lane = Lane::new();
+    let (runtime, session_id) = lane.boot();
+    runtime
+        .session_rename(session_id, "before shutdown".into())
+        .unwrap();
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let outcome = Arc::new(std::sync::Mutex::new(None::<Result<(), String>>));
+
+    let command_host = runtime.handle();
+    let entered_tx = entered.clone();
+    let release_rx = release.clone();
+    let outcome_tx = outcome.clone();
+    // Deliberately a raw spawn: this models a Tauri command future.
+    let command = tokio::spawn(async move {
+        entered_tx.notify_one();
+        release_rx.notified().await;
+        let result = command_host
+            .session_rename(session_id, "written by an in-flight command".into())
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        *outcome_tx.lock().unwrap() = Some(result);
+    });
+
+    // The command is running and has not yet written.
+    entered.notified().await;
+    let report = runtime.shutdown().await;
+    assert_clean_shutdown(&report);
+
+    // Now let it try, after the lock is gone.
+    release.notify_one();
+    command.await.unwrap();
+    let result = outcome.lock().unwrap().clone().expect("command settled");
+    let error = result.expect_err("an in-flight command must not write after shutdown");
+    assert!(
+        error.contains("durable-write authority") || error.contains("closed"),
+        "unexpected refusal: {error}"
+    );
+
+    let replacement = restart_same_home_now(&lane);
+    assert_eq!(
+        replacement.session_load(session_id).unwrap().title,
+        "before shutdown",
+        "an in-flight command wrote a home it no longer owned"
+    );
+    drop(replacement);
+}
+
+/// P0 from independent review: a control-plane bootstrap that finishes *after*
+/// shutdown drained the attached servers must be refused, and must be handed
+/// its server back so the listener is stopped rather than left serving a
+/// closed runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
+async fn late_control_server_attach_is_refused_and_handed_back() {
+    let lane = Lane::new();
+    let (runtime, session_id) = lane.boot();
+    let orch = lane.orchestration(&runtime);
+
+    // A bootstrap that is still binding when shutdown begins.
+    let bind_now = Arc::new(tokio::sync::Notify::new());
+    let bootstrap_orch = orch.clone();
+    let bind_rx = bind_now.clone();
+    let bootstrap = tokio::spawn(async move {
+        bind_rx.notified().await;
+        start_control_server(bootstrap_orch, 0).await.unwrap()
+    });
+
+    let report = runtime.shutdown().await;
+    assert_clean_shutdown(&report);
+    assert_eq!(report.control_servers_stopped, 0);
+
+    // The bootstrap finishes late and tries to publish its listener.
+    bind_now.notify_one();
+    let late = bootstrap.await.unwrap();
+    let addr = late.addr;
+    let rejected = runtime
+        .attach_control_server(late)
+        .expect_err("a closed runtime must refuse a late control server");
+    assert_eq!(rejected.phase, HostPhase::Closed);
+    // The caller still owns the listener and must stop it.
+    rejected.server.stop_and_wait().await;
+
+    // Nothing is serving that address any more, and the home is free.
+    let probe = reqwest::Client::new()
+        .get(format!("http://{addr}/health"))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await;
+    assert!(
+        probe.is_err(),
+        "a refused control server must not still be serving"
+    );
+    let replacement = restart_same_home_now(&lane);
+    assert!(replacement.session_load(session_id).is_ok());
+    drop(orch);
+    drop(replacement);
+}
+
+/// P0 from independent review: `Drop` must not create a split brain. With a
+/// durable write genuinely in progress, dropping the runtime must **retain**
+/// the process lock, and a replacement must be refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
+async fn drop_with_a_running_writer_retains_the_lock_and_refuses_a_replacement() {
+    let lane = Lane::new();
+    let (mut runtime, session_id) = lane.boot();
+    // Bound the drop-time wait so the test is fast; the production default is
+    // seconds, and the behaviour under test is identical.
+    runtime.set_durable_write_seal_timeout(Duration::from_millis(200));
+    let stale = runtime.handle();
+
+    // A writer that is genuinely holding durable-write authority right now.
+    let writer = stale
+        .hold_durable_write_for_test("a long durable write")
+        .expect("a running host issues write authority");
+    assert_eq!(runtime.in_flight_durable_writes(), 1);
+
+    drop(runtime);
+
+    // Fail closed: the lock was kept because a writer was still live.
+    assert_eq!(stale.lifecycle_phase(), HostPhase::Closed);
+    let refused = AgentHost::create(HostConfig {
+        always_approve: true,
+        ..HostConfig::default()
+    });
+    assert!(
+        refused.start().is_err(),
+        "dropping a runtime with a live writer must not hand the home to a replacement"
+    );
+    assert!(!refused.holds_process_lock());
+    drop(refused);
+
+    // The stale handle is still closed, so the writer cannot start new work.
+    assert_every_durable_mutator_refuses(&stale, session_id, lane.ws());
+    drop(writer);
+    assert!(lane.instance_lock().is_file());
+}
+
+/// The same `Drop`, with no writer in flight: the seal succeeds immediately and
+/// the lock is released, so an immediate replacement works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn drop_without_a_running_writer_releases_the_lock() {
+    let lane = Lane::new();
+    let (runtime, _session_id) = lane.boot();
+    assert_eq!(runtime.in_flight_durable_writes(), 0);
+    drop(runtime);
+    let replacement = restart_same_home_now(&lane);
+    drop(replacement);
+}
+
+/// P1 from independent review: a failing shutdown hook must be reported, and
+/// must make the report unclean rather than being swallowed under a clean
+/// lock-release claim. This is the seam the durable audit ledger uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn shutdown_hook_failures_are_reported_not_swallowed() {
+    let lane = Lane::new();
+    let (runtime, _session_id) = lane.boot();
+    let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let ok_ran = ran.clone();
+    runtime
+        .register_shutdown_hook(
+            "audit-ledger-close",
+            Box::new(move || {
+                ok_ran.fetch_add(1, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    let bad_ran = ran.clone();
+    runtime
+        .register_shutdown_hook(
+            "audit-ledger-seal",
+            Box::new(move || {
+                bad_ran.fetch_add(1, std::sync::atomic::Ordering::Release);
+                anyhow::bail!("ledger seal could not be committed")
+            }),
+        )
+        .unwrap();
+
+    let report = runtime.shutdown().await;
+    assert_eq!(ran.load(std::sync::atomic::Ordering::Acquire), 2);
+    assert_eq!(report.hooks_run, 2);
+    assert!(
+        !report.is_clean(),
+        "a failed hook must not report a clean shutdown"
+    );
+    assert!(
+        report
+            .flush_errors
+            .iter()
+            .any(|error| error.contains("audit-ledger-seal")),
+        "{:?}",
+        report.flush_errors
+    );
+    // The durable-write seal still held, so the lock release itself was safe.
+    assert!(report.durable_writes_sealed);
+    assert!(report.process_lock_released);
+    assert!(report.lock_file_present);
+
+    // Registration after shutdown is refused.
+    assert!(runtime
+        .register_shutdown_hook("late", Box::new(|| Ok(())))
+        .is_err());
+
+    let replacement = restart_same_home_now(&lane);
     drop(replacement);
 }
 

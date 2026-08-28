@@ -741,6 +741,7 @@ fn synthesized_xai_profile(
 }
 
 pub(crate) fn save_managed_profile_capabilities(
+    _write: &crate::host_runtime::DurableWriteGuard,
     profile: &ProviderProfile,
     model: &ProviderModel,
     credential_fingerprint: &str,
@@ -1028,7 +1029,10 @@ fn load_from_path(path: &Path) -> io::Result<GatewayConfig> {
     Ok(config)
 }
 
-pub fn save(config: &GatewayConfig) -> io::Result<()> {
+pub(crate) fn save(
+    _write: &crate::host_runtime::DurableWriteGuard,
+    config: &GatewayConfig,
+) -> io::Result<()> {
     let config_path = path();
     if config_path.exists() {
         load_from_path(&config_path)?;
@@ -1138,7 +1142,11 @@ mod tests {
             "https://gw.example/v1"
         );
         assert!(config.has_pending_legacy_secret());
-        let error = save(&config).unwrap_err();
+        let error = save(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &config,
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         set_grokptah_home_override(None);
@@ -1158,7 +1166,11 @@ mod tests {
         profile.credential_ref = Some("keychain:provider/corp/api-key".into());
         profile.upsert_model(ProviderModel::unqualified("cheap/code-model"));
         config.upsert_profile(profile).unwrap();
-        save(&config).unwrap();
+        save(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &config,
+        )
+        .unwrap();
 
         let raw = fs::read_to_string(home.join("gateway.json")).unwrap();
         assert!(raw.contains("keychain:provider/corp/api-key"));
@@ -1226,7 +1238,11 @@ mod tests {
         profile.upsert_model(ProviderModel::unqualified(opaque_id));
         let mut config = GatewayConfig::default();
         config.upsert_profile(profile).unwrap();
-        save(&config).unwrap();
+        save(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &config,
+        )
+        .unwrap();
 
         let loaded = load_for_update().unwrap();
         assert_eq!(loaded.profile("corp").unwrap().models[0].id, opaque_id);
@@ -1359,8 +1375,13 @@ mod tests {
             false,
             false,
         );
-        save_managed_profile_capabilities(&api_profile, &failed_api, TEST_CREDENTIAL_FINGERPRINT)
-            .unwrap();
+        save_managed_profile_capabilities(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &api_profile,
+            &failed_api,
+            TEST_CREDENTIAL_FINGERPRINT,
+        )
+        .unwrap();
         let (oidc_profile, oidc) = measured_managed_profile(
             "grok-route",
             "https://cli-chat-proxy.grok.com/v1",
@@ -1368,8 +1389,13 @@ mod tests {
             true,
             true,
         );
-        save_managed_profile_capabilities(&oidc_profile, &oidc, TEST_CREDENTIAL_FINGERPRINT)
-            .unwrap();
+        save_managed_profile_capabilities(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &oidc_profile,
+            &oidc,
+            TEST_CREDENTIAL_FINGERPRINT,
+        )
+        .unwrap();
         let (alternate_profile, alternate) = measured_managed_profile(
             "grok-route",
             "https://alternate.x.ai/v1",
@@ -1378,6 +1404,7 @@ mod tests {
             true,
         );
         save_managed_profile_capabilities(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
             &alternate_profile,
             &alternate,
             TEST_CREDENTIAL_FINGERPRINT,
@@ -1387,6 +1414,7 @@ mod tests {
         let mut updated_oidc = oidc.clone();
         updated_oidc.capabilities.tools = false;
         save_managed_profile_capabilities(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
             &oidc_profile,
             &updated_oidc,
             TEST_CREDENTIAL_FINGERPRINT,
@@ -1481,6 +1509,7 @@ mod tests {
                         index % 3 != 0,
                     );
                     save_managed_profile_capabilities(
+                        &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
                         &profile,
                         &model,
                         TEST_CREDENTIAL_FINGERPRINT,
@@ -1563,9 +1592,14 @@ mod tests {
             true,
         );
         assert_eq!(
-            save_managed_profile_capabilities(&profile, &model, TEST_CREDENTIAL_FINGERPRINT,)
-                .unwrap_err()
-                .kind(),
+            save_managed_profile_capabilities(
+                &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+                &profile,
+                &model,
+                TEST_CREDENTIAL_FINGERPRINT,
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::InvalidData
         );
         let resolution = resolve_profile_for_selection(
@@ -1599,7 +1633,12 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         assert_eq!(
-            save(&GatewayConfig::default()).unwrap_err().kind(),
+            save(
+                &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+                &GatewayConfig::default()
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::InvalidData
         );
         assert_eq!(
@@ -1901,7 +1940,11 @@ mod tests {
             .contains("reserved"));
 
         config.profiles.push(managed);
-        save(&config).unwrap();
+        save(
+            &crate::host_runtime::DurableWriteGuard::unowned_for_test(),
+            &config,
+        )
+        .unwrap();
         let persisted = fs::read_to_string(home.join("gateway.json")).unwrap();
         assert!(!persisted.contains("mutated"));
         assert!(load().profile(XAI_PROVIDER_ID).is_none());

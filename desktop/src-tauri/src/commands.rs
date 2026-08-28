@@ -29,17 +29,12 @@ fn desktop_mcp_orchestration(
     ),
     String,
 > {
-    let control = state
-        .control
-        .lock()
-        .map_err(|_| "MCP control state is unavailable".to_string())?;
-    let server = control
-        .as_ref()
-        .ok_or_else(|| "MCP control plane is not running".to_string())?;
-    if server.token.is_empty() {
-        return Err("MCP control authentication is unavailable".into());
-    }
-    Ok((server.orchestration_service(), server.token.clone()))
+    // The host runtime owns the control plane, and reports none once shutdown
+    // has begun — so a command can never be handed a stopping server (#455).
+    state
+        .runtime
+        .control_plane()
+        .ok_or_else(|| "MCP control plane is not running".to_string())
 }
 
 /// Run a blocking host/FS/git call off the UI thread (#137).
