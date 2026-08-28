@@ -206,6 +206,9 @@ pub(crate) fn write_verified_reconciliation(
     file.sync_all()?;
     drop(file);
     fs::rename(temporary, directory.join(format!("{attempt_id}.json")))?;
+    if let Ok(directory) = File::open(directory) {
+        let _ = directory.sync_all();
+    }
     Ok(())
 }
 
