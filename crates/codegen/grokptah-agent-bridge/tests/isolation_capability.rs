@@ -107,6 +107,8 @@ async fn default_isolation_keeps_two_mutating_children_from_colliding() {
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
+    host.ensure_session_agent(session.id)
+        .expect("bind canonical Agent authority");
 
     let a = host
         .spawn_subagent_public(
@@ -192,6 +194,8 @@ async fn plan_kind_denies_write_offline() {
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
+    host.ensure_session_agent(session.id)
+        .expect("bind canonical Agent authority");
 
     // Real mutator request — must be denied for plan kind (same gate as online).
     let msg = host
@@ -262,6 +266,8 @@ async fn failed_isolation_requires_explicit_shared_cwd_opt_in() {
     host.start().unwrap();
     host.set_project_cwd(dir.path()).unwrap();
     let session = host.session_new().unwrap();
+    host.ensure_session_agent(session.id)
+        .expect("bind canonical Agent authority");
 
     let denied = host
         .spawn_subagent_public(
