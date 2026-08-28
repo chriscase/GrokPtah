@@ -1182,38 +1182,24 @@ impl AgentHostHandle {
                     return Err(anyhow!(format!("{transition:?}")));
                 }
                 controller.bind_authority(snapshot.clone());
-                let previous_risk = controller.risk();
-                let objective_changed =
-                    controller.objective_digest() != Some(objective_digest.as_str());
-                if objective_changed {
-                    controller.bind_objective_digest(objective_digest.clone());
-                    if task_policy.risk > previous_risk {
-                        controller.raise_risk(task_policy.risk);
-                        if task_policy.risk == crate::computer_profile::TaskRisk::Destructive {
-                            let transition =
-                                controller.apply_signal(RuntimeSignal::DestructiveIntentDetected);
-                            self.persist_adaptive_state(
-                                &store,
-                                session_id,
-                                run_id,
-                                expected_version,
-                                &controller,
-                                "destructive_objective",
-                            )?;
-                            return Err(anyhow!(match transition {
-                                crate::computer_profile::ProfileTransition::Stop(stop) => {
-                                    stop.operator_message()
-                                }
-                                crate::computer_profile::ProfileTransition::Escalate { .. } => {
-                                    "destructive objective requires High Assurance"
-                                }
-                            }));
+                controller.bind_objective_digest(objective_digest.clone());
+                if let Some(transition) = controller.enforce_risk_floor(task_policy.risk) {
+                    self.persist_adaptive_state(
+                        &store,
+                        session_id,
+                        run_id,
+                        expected_version,
+                        &controller,
+                        "risk_floor_changed",
+                    )?;
+                    return Err(anyhow!(match transition {
+                        crate::computer_profile::ProfileTransition::Stop(stop) => {
+                            stop.operator_message()
                         }
-                        if controller.profile() < AdaptivePolicyEngine::risk_floor(task_policy.risk)
-                        {
-                            controller.apply_signal(RuntimeSignal::DestructiveIntentDetected);
+                        crate::computer_profile::ProfileTransition::Escalate { .. } => {
+                            "the observed risk exceeded the current adaptive profile"
                         }
-                    }
+                    }));
                 }
                 controller
             }

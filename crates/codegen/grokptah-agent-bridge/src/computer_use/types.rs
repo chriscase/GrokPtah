@@ -485,6 +485,7 @@ impl ComputerExecutionEnvelope {
             action_digest,
             adaptive_revision,
             profile,
+            risk,
             objective_digest,
             principal_generation_reference,
             capability_snapshot_reference,
