@@ -537,7 +537,11 @@ impl ComputerStore {
 
     fn read_receipt_path(&self, path: &Path) -> ComputerResult<MutationReceipt> {
         let receipt: MutationReceipt = read_json(path).map_err(internal_error)?;
-        validate_receipt(&receipt)?;
+        if let Err(error) = validate_receipt(&receipt) {
+            #[cfg(test)]
+            eprintln!("invalid receipt {:?}: {:?} ({})", path, receipt, error.message);
+            return Err(error);
+        }
         if self.receipt_path(&receipt.request_id)? != path {
             return Err(ComputerError::new(
                 ComputerErrorCode::Internal,

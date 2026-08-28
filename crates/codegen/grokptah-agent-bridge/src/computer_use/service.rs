@@ -1252,6 +1252,7 @@ mod tests {
             }
             let audit =
                 crate::orchestration::OrchStore::open(dir.path().join("orchestration")).unwrap();
+            eprintln!("reconciling create cut {point:?}");
             let service = ComputerUseService::new_with_audit_store(
                 Arc::new(SimulatorBackend::new()),
                 ComputerStore::open(dir.path().join("computer-use")).unwrap(),
