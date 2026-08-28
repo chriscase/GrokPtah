@@ -46,6 +46,7 @@ const MAX_CONCURRENT_REQUESTS: usize = 32;
 const MAX_SESSIONS: usize = 256;
 /// Bound long-lived coordinator event streams independently of request floods.
 const MAX_LIVE_STREAMS: usize = 32;
+const LIVE_STREAM_REPLAY_WINDOW: u64 = 256;
 /// Hard wall-clock bound per request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Supported MCP protocol versions (initialize + header validation).
@@ -253,6 +254,19 @@ impl LiveStreamState {
                         continue;
                     }
                 }
+            }
+
+            // A fast producer can fill the transport/kernel buffer before
+            // `broadcast::Receiver` observes `Lagged`. Keep the bounded
+            // stream contract deterministic by converting an unread gap into
+            // the same durable-replay recovery signal.
+            if self.orch.bus().current_seq().saturating_sub(self.last_seq)
+                > LIVE_STREAM_REPLAY_WINDOW
+            {
+                self.queue_recovery(
+                    "live event subscriber fell behind the bounded replay window; resynchronize from the durable journal",
+                );
+                continue;
             }
 
             tokio::select! {
