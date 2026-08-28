@@ -60,12 +60,21 @@ async fn independent_worker_recovers_assignment_and_messages() {
         orch.auth_header(Some("Bearer worker-token-307")).is_ok(),
         "named worker credential must authenticate after host installation"
     );
+    let primary_actor = orch
+        .auth_header(Some("Bearer coord-token-307"))
+        .unwrap()
+        .actor_handle()
+        .as_str()
+        .to_string();
     let server = start_control_server(orch.clone(), 0).await.unwrap();
     let mut coordinator =
         McpControlClient::new(format!("http://{}", server.addr), "coord-token-307");
     coordinator.initialize().await.unwrap();
+    // This legacy workflow models an explicitly shared coordinator/worker
+    // service account. Separate principals must use separate scoped lanes;
+    // the adversarial authority suite covers that denial.
     let mut worker_client =
-        McpControlClient::new(format!("http://{}", server.addr), "worker-token-307");
+        McpControlClient::new(format!("http://{}", server.addr), "coord-token-307");
     worker_client.initialize().await.unwrap();
     let workspace_text = workspace.path().display().to_string();
 
@@ -158,7 +167,7 @@ async fn independent_worker_recovers_assignment_and_messages() {
         )
         .await
         .unwrap();
-    assert_eq!(offered.structured["decision"]["actorId"], "primary");
+    assert_eq!(offered.structured["decision"]["actorHandle"], primary_actor);
     assert_eq!(
         offered.structured["decision"]["actorAgentId"],
         manager.agent_id
@@ -171,7 +180,7 @@ async fn independent_worker_recovers_assignment_and_messages() {
 
     worker_client.close_session().await.unwrap();
     let mut worker_client =
-        McpControlClient::new(format!("http://{}", server.addr), "worker-token-307");
+        McpControlClient::new(format!("http://{}", server.addr), "coord-token-307");
     worker_client.initialize().await.unwrap();
     let inbox = worker_client
         .call_tool(
@@ -200,7 +209,7 @@ async fn independent_worker_recovers_assignment_and_messages() {
         )
         .await
         .unwrap();
-    assert_eq!(accepted.structured["decision"]["actorId"], "worker");
+    assert_eq!(accepted.structured["decision"]["actorHandle"], primary_actor);
     assert_eq!(
         accepted.structured["decision"]["actorAgentId"],
         worker.agent_id
