@@ -547,6 +547,41 @@ impl DesktopComputerUse {
             })
     }
 
+    /// Read the current redacted evidence only for the private visual adapter.
+    /// The bytes never enter a Tauri response, durable projection, or replay
+    /// record; they are consumed by the host's authenticated provider route.
+    pub async fn model_proposal_evidence(
+        &self,
+        owner_session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let (service, run) = self.owned_service(owner_session_id, run_id)?;
+        if run.version != expected_version
+            || run.state != ComputerRunState::Ready
+            || run
+                .current_observation
+                .as_ref()
+                .map(|observation| observation.observation_id.as_str())
+                != Some(observation_id)
+        {
+            return Err("The Computer Run changed before visual evidence was read".into());
+        }
+        let Some(evidence) = run
+            .current_observation
+            .as_ref()
+            .and_then(|observation| observation.screenshot.as_ref())
+        else {
+            return Ok(None);
+        };
+        service
+            .read_current_evidence(run_id, &evidence.asset_id)
+            .await
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
     pub async fn apply_model_proposal(
         &self,
         owner_session_id: Uuid,
@@ -639,16 +674,43 @@ impl DesktopComputerUse {
             self.clear_pending_for_owner(owner_session_id)?;
             return Err("This Computer Use approval no longer matches the live run".into());
         }
+        let action = pending.action.clone();
+        let observation_id = pending.observation_id.clone();
         let result = service
             .act(
                 request_id,
                 &pending.run_id,
                 pending.run_version,
-                &pending.observation_id,
-                pending.action,
+                &observation_id,
+                action.clone(),
             )
             .await;
         self.clear_pending_for_owner(owner_session_id)?;
+        let current_version = service
+            .get_run(&pending.run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Computer Run disappeared after action".to_string())?
+            .version;
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| self.initialization_error())?;
+        let (result_code, postcondition) = match &result {
+            Ok(outcome) => ("completed".to_string(), outcome.expected_postcondition_met),
+            Err(error) => (format!("{:?}", error.code), None),
+        };
+        self.host
+            .record_computer_adaptive_action_result_using_store(
+                store,
+                owner_session_id,
+                &pending.run_id,
+                current_version,
+                &observation_id,
+                &action,
+                &result_code,
+                postcondition,
+            )
+            .map_err(|error| error.to_string())?;
         result.map_err(|error| error.to_string())?;
         self.cockpit_snapshot(owner_session_id)
     }

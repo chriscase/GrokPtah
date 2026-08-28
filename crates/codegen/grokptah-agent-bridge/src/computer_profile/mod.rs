@@ -17,7 +17,7 @@ pub mod replay;
 pub mod risk;
 
 pub(crate) use adapters::{
-    AdaptiveObservationAdapter, SemanticHeadlessAdapter, VisualGroundingAdapter,
+    AdaptiveObservationAdapter, ProviderImageInput, SemanticHeadlessAdapter, VisualGroundingAdapter,
 };
 pub use authority::{
     AdaptiveAuthoritySnapshot, AuthorityFailure, CanonicalAuthority, ProviderAttemptReceipt,
@@ -27,8 +27,9 @@ pub use capability::{
     CapabilityAttribution, CapabilityEvidence, HostCapabilityEvidence, ModelCapabilityEvidence,
 };
 pub use controller::{
-    AdaptiveController, AdaptiveRunState, AdaptiveSpend, ControllerError, EscalationRecord,
-    ObservationFingerprint, TerminalKind, TerminalOutcome, TurnPermit,
+    AdaptiveController, AdaptiveEvidenceEvent, AdaptiveEvidenceKind, AdaptiveRunState,
+    AdaptiveSpend, ControllerError, EscalationRecord, ObservationFingerprint, TerminalKind,
+    TerminalOutcome, TurnPermit,
 };
 pub use policy::{
     AdaptivePolicyEngine, PolicyOutcome, PolicyStop, ProfileDecision, ProfileReason,

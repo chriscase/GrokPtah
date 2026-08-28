@@ -14,11 +14,12 @@ use super::policy::{
     RuntimeSignal,
 };
 use super::profile::{AdaptiveProfile, ProfileBudget, SafetyFloor};
-use crate::computer_use::ComputerObservation;
+use crate::computer_use::{ActionClass, ComputerAction, ComputerObservation};
 
 pub const ADAPTIVE_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_ESCALATIONS: usize = 32;
 const MAX_OBSERVATION_DIGESTS: usize = 4;
+const MAX_EVIDENCE_EVENTS: usize = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -78,6 +79,38 @@ pub struct TerminalOutcome {
     pub required_profile: Option<AdaptiveProfile>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveEvidenceKind {
+    Decision,
+    Observation,
+    Transition,
+    ActionProposal,
+    ActionResult,
+    Recovery,
+    Terminal,
+}
+
+/// Independently replayable, bounded evidence. Payloads are represented by
+/// IDs, digests, closed enums, and provider-reported counters only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdaptiveEvidenceEvent {
+    pub sequence: u64,
+    pub kind: AdaptiveEvidenceKind,
+    pub observation_id: Option<String>,
+    pub observation_digest: Option<String>,
+    pub profile: AdaptiveProfile,
+    pub reason: Option<ProfileReason>,
+    pub action_class: Option<ActionClass>,
+    pub action_digest: Option<String>,
+    pub result_code: Option<String>,
+    pub recovery_code: Option<String>,
+    pub latency_millis: Option<u64>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdaptiveRunState {
@@ -87,10 +120,14 @@ pub struct AdaptiveRunState {
     pub decision_reason: ProfileReason,
     pub risk: super::risk::TaskRisk,
     pub capability_ceiling: AdaptiveProfile,
+    #[serde(default)]
     pub principal_generation_reference: Option<String>,
+    #[serde(default)]
     pub capability_snapshot_reference: Option<String>,
     pub evidence: CapabilityEvidence,
     pub escalations: Vec<EscalationRecord>,
+    #[serde(default)]
+    pub evidence_events: Vec<AdaptiveEvidenceEvent>,
     pub terminal: Option<TerminalOutcome>,
     pub spend: AdaptiveSpend,
     pub stationary_repeats: u32,
@@ -108,11 +145,47 @@ impl AdaptiveRunState {
         self.schema_version == ADAPTIVE_STATE_SCHEMA_VERSION
             && self.capability_ceiling >= self.profile
             && self.escalations.len() <= MAX_ESCALATIONS
+            && self.evidence_events.len() <= MAX_EVIDENCE_EVENTS
             && self.observation_digests.len() <= MAX_OBSERVATION_DIGESTS
             && self.observation_digests.iter().all(|digest| {
                 digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
             })
+            && self
+                .principal_generation_reference
+                .as_deref()
+                .is_none_or(valid_reference)
+            && self
+                .capability_snapshot_reference
+                .as_deref()
+                .is_none_or(valid_reference)
+            && self
+                .evidence_events
+                .windows(2)
+                .all(|events| events[0].sequence < events[1].sequence)
+            && self.evidence_events.iter().all(|event| {
+                event.observation_id.as_deref().is_none_or(valid_reference)
+                    && event.observation_digest.as_deref().is_none_or(valid_digest)
+                    && event.action_digest.as_deref().is_none_or(valid_digest)
+                    && event.result_code.as_deref().is_none_or(valid_reference)
+                    && event.recovery_code.as_deref().is_none_or(valid_reference)
+                    && event
+                        .latency_millis
+                        .is_none_or(|latency| latency <= 60 * 60 * 1_000)
+            })
     }
+}
+
+fn valid_reference(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 128 && !value.contains(['\0', '/', '\\'])
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn digest_json<T: Serialize>(value: &T) -> String {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,7 +269,7 @@ pub struct AdaptiveController {
 impl AdaptiveController {
     pub fn new(run_id: &str, decision: ProfileDecision) -> Self {
         let _ = run_id;
-        Self {
+        let mut controller = Self {
             state: AdaptiveRunState {
                 schema_version: ADAPTIVE_STATE_SCHEMA_VERSION,
                 revision: 0,
@@ -208,6 +281,7 @@ impl AdaptiveController {
                 capability_snapshot_reference: decision.capability_snapshot_reference,
                 evidence: decision.evidence,
                 escalations: Vec::new(),
+                evidence_events: Vec::new(),
                 terminal: None,
                 spend: AdaptiveSpend::default(),
                 stationary_repeats: 0,
@@ -217,7 +291,23 @@ impl AdaptiveController {
                 observation_digests: Vec::new(),
                 turn_in_flight: false,
             },
-        }
+        };
+        controller.record_event(AdaptiveEvidenceEvent {
+            sequence: 0,
+            kind: AdaptiveEvidenceKind::Decision,
+            observation_id: None,
+            observation_digest: None,
+            profile: controller.profile(),
+            reason: Some(controller.decision_reason()),
+            action_class: None,
+            action_digest: None,
+            result_code: None,
+            recovery_code: None,
+            latency_millis: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+        });
+        controller
     }
 
     pub fn stopped(
@@ -289,6 +379,102 @@ impl AdaptiveController {
         authority: super::authority::AdaptiveAuthoritySnapshot,
     ) {
         self.state.evidence.bind_authority(authority);
+    }
+
+    pub fn record_observation(
+        &mut self,
+        observation: &ComputerObservation,
+    ) -> Option<RuntimeSignal> {
+        let fingerprint = ObservationFingerprint::of(observation);
+        let digest = fingerprint.hex();
+        let signal = self.observe_frame(fingerprint);
+        self.record_event(AdaptiveEvidenceEvent {
+            sequence: 0,
+            kind: AdaptiveEvidenceKind::Observation,
+            observation_id: Some(observation.observation_id.clone()),
+            observation_digest: Some(digest),
+            profile: self.profile(),
+            reason: None,
+            action_class: None,
+            action_digest: None,
+            result_code: None,
+            recovery_code: None,
+            latency_millis: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+        });
+        signal
+    }
+
+    pub fn record_proposal(
+        &mut self,
+        observation_id: &str,
+        proposal: &crate::computer_agent::ComputerAgentProposal,
+    ) {
+        let (action_class, action_digest) = match proposal {
+            crate::computer_agent::ComputerAgentProposal::Action { action, .. } => {
+                (Some(action.class()), Some(digest_json(action)))
+            }
+            crate::computer_agent::ComputerAgentProposal::Complete { .. } => (None, None),
+        };
+        self.record_event(AdaptiveEvidenceEvent {
+            sequence: 0,
+            kind: AdaptiveEvidenceKind::ActionProposal,
+            observation_id: Some(observation_id.to_string()),
+            observation_digest: None,
+            profile: self.profile(),
+            reason: None,
+            action_class,
+            action_digest,
+            result_code: Some("staged_for_host_review".into()),
+            recovery_code: None,
+            latency_millis: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+        });
+    }
+
+    pub fn record_action_result(
+        &mut self,
+        observation_id: &str,
+        action: &ComputerAction,
+        result_code: &str,
+        expected_postcondition_met: Option<bool>,
+    ) {
+        let result_code = match result_code {
+            "completed" | "failed" | "uncertain" | "staged_for_host_review" => result_code,
+            _ => "unknown",
+        };
+        self.record_event(AdaptiveEvidenceEvent {
+            sequence: 0,
+            kind: AdaptiveEvidenceKind::ActionResult,
+            observation_id: Some(observation_id.to_string()),
+            observation_digest: None,
+            profile: self.profile(),
+            reason: None,
+            action_class: Some(action.class()),
+            action_digest: Some(digest_json(action)),
+            result_code: Some(expected_postcondition_met.map_or_else(
+                || result_code.to_string(),
+                |met| format!("{result_code}:{met}"),
+            )),
+            recovery_code: None,
+            latency_millis: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+        });
+    }
+
+    fn record_event(&mut self, mut event: AdaptiveEvidenceEvent) {
+        if self.state.evidence_events.len() >= MAX_EVIDENCE_EVENTS {
+            self.state.evidence_events.remove(0);
+        }
+        event.sequence = self
+            .state
+            .evidence_events
+            .last()
+            .map_or(1, |previous| previous.sequence.saturating_add(1));
+        self.state.evidence_events.push(event);
     }
 
     pub fn revision(&self) -> u64 {
@@ -450,6 +636,46 @@ impl AdaptiveController {
                 });
             }
         }
+        match &transition {
+            ProfileTransition::Escalate { from, to, reason } => {
+                self.record_event(AdaptiveEvidenceEvent {
+                    sequence: 0,
+                    kind: AdaptiveEvidenceKind::Transition,
+                    observation_id: None,
+                    observation_digest: None,
+                    profile: *to,
+                    reason: Some(*reason),
+                    action_class: None,
+                    action_digest: None,
+                    result_code: None,
+                    recovery_code: None,
+                    latency_millis: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                });
+                // The from/to pair is represented by the bounded escalation
+                // record. Keeping the evidence event closed prevents raw
+                // decision text from entering the durable record.
+                let _ = from;
+            }
+            ProfileTransition::Stop(stop) => {
+                self.record_event(AdaptiveEvidenceEvent {
+                    sequence: 0,
+                    kind: AdaptiveEvidenceKind::Terminal,
+                    observation_id: None,
+                    observation_digest: None,
+                    profile: stop.profile,
+                    reason: Some(stop.reason),
+                    action_class: None,
+                    action_digest: None,
+                    result_code: None,
+                    recovery_code: None,
+                    latency_millis: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                });
+            }
+        }
         transition
     }
 
@@ -467,6 +693,21 @@ impl AdaptiveController {
             profile: self.state.profile,
             required_profile: None,
         });
+        self.record_event(AdaptiveEvidenceEvent {
+            sequence: 0,
+            kind: AdaptiveEvidenceKind::Terminal,
+            observation_id: None,
+            observation_digest: None,
+            profile: self.state.profile,
+            reason: Some(self.state.decision_reason),
+            action_class: None,
+            action_digest: None,
+            result_code: Some("completed".into()),
+            recovery_code: None,
+            latency_millis: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+        });
         Ok(())
     }
 
@@ -480,6 +721,21 @@ impl AdaptiveController {
                 reason: ProfileReason::CapabilityRevoked,
                 profile: self.state.profile,
                 required_profile: None,
+            });
+            self.record_event(AdaptiveEvidenceEvent {
+                sequence: 0,
+                kind: AdaptiveEvidenceKind::Recovery,
+                observation_id: None,
+                observation_digest: None,
+                profile: self.state.profile,
+                reason: Some(ProfileReason::CapabilityRevoked),
+                action_class: None,
+                action_digest: None,
+                result_code: None,
+                recovery_code: Some("restart".into()),
+                latency_millis: None,
+                prompt_tokens: None,
+                completion_tokens: None,
             });
         }
     }
@@ -495,7 +751,7 @@ mod tests {
     use crate::gateway_config::ComputerUseTier;
 
     fn controller() -> AdaptiveController {
-        let evidence = CapabilityEvidence::new(
+        let evidence = CapabilityEvidence::with_authority(
             ModelCapabilityEvidence {
                 tools: true,
                 image_input: true,
@@ -512,6 +768,11 @@ mod tests {
                 independent_verifier: true,
                 isolated_guest: true,
             },
+            super::super::authority::AdaptiveAuthoritySnapshot::issued(
+                "test-principal-generation",
+                "test-capability-generation",
+            )
+            .unwrap(),
         );
         let PolicyOutcome::Proceed(decision) = AdaptivePolicyEngine.select(
             &evidence,

@@ -1112,6 +1112,7 @@ impl AgentHostHandle {
         expected_version: u64,
         objective: &str,
         observation: &crate::computer_use::ComputerObservation,
+        evidence_bytes: Option<&[u8]>,
     ) -> Result<ComputerAgentProposal> {
         let authority = self
             .adaptive_authority
@@ -1224,9 +1225,7 @@ impl AgentHostHandle {
             },
         };
 
-        if let Some(signal) = controller.observe_frame(
-            crate::computer_profile::ObservationFingerprint::of(observation),
-        ) {
+        if let Some(signal) = controller.record_observation(observation) {
             let transition = controller.apply_signal(signal);
             self.persist_adaptive_state(
                 &store,
@@ -1326,6 +1325,7 @@ impl AgentHostHandle {
             objective,
             observation,
             &permit,
+            evidence_bytes,
             &cancel,
         )
         .await;
@@ -1398,6 +1398,7 @@ impl AgentHostHandle {
                     }));
                 }
                 controller.record_usable_answer();
+                controller.record_proposal(&observation.observation_id, &outcome.proposal);
                 self.persist_adaptive_state(
                     &store,
                     session_id,
@@ -1550,6 +1551,44 @@ impl AgentHostHandle {
             expected_version,
             &controller,
             "stopped",
+        )
+    }
+
+    pub fn record_computer_adaptive_action_result_using_store(
+        &self,
+        store: &crate::computer_use::ComputerStore,
+        session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+        observation_id: &str,
+        action: &crate::computer_use::ComputerAction,
+        result_code: &str,
+        expected_postcondition_met: Option<bool>,
+    ) -> Result<()> {
+        let Some(run) = store
+            .load_run(run_id)?
+            .filter(|run| run.owner_session_id == session_id && run.version == expected_version)
+        else {
+            bail!("Computer Run is not available to this session");
+        };
+        let Some(state) = run.adaptive else {
+            return Ok(());
+        };
+        let mut controller =
+            AdaptiveController::from_state(state).map_err(|error| anyhow!(error.to_string()))?;
+        controller.record_action_result(
+            observation_id,
+            action,
+            result_code,
+            expected_postcondition_met,
+        );
+        self.persist_adaptive_state(
+            store,
+            session_id,
+            run_id,
+            expected_version,
+            &controller,
+            "action_result",
         )
     }
 

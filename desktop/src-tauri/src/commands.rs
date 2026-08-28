@@ -906,9 +906,20 @@ pub async fn computer_use_cockpit_propose_agent_action(
         expected_version,
         &observation_id,
     )?;
+    let evidence = state
+        .computer_use
+        .model_proposal_evidence(owner, &run_id, expected_version, &observation_id)
+        .await?;
     let proposal = state
         .host
-        .propose_computer_action_for_run(owner, &run_id, expected_version, &objective, &observation)
+        .propose_computer_action_for_run(
+            owner,
+            &run_id,
+            expected_version,
+            &objective,
+            &observation,
+            evidence.as_deref(),
+        )
         .await
         .map_err(map_err)?;
     state
