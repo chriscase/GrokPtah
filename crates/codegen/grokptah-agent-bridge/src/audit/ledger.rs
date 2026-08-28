@@ -1492,6 +1492,7 @@ impl AuditLedger {
         self.append_internal(entry, recovery, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn append_housekeeping(
         &self,
         input: AuditHousekeepingInput,

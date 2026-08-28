@@ -34,6 +34,7 @@ pub(crate) struct OperatorSeal {
 }
 
 impl OperatorSeal {
+    #[cfg(test)]
     fn issue(keys: &super::keys::AuditKeys, generation_id: &str) -> Self {
         Self {
             generation_id: generation_id.to_string(),
@@ -65,6 +66,7 @@ impl RetentionRequest {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_operator_seal(mut self, seal: OperatorSeal) -> Self {
         self.operator_seal = Some(seal);
         self
@@ -263,6 +265,7 @@ impl AuditLedger {
 }
 
 impl AuditLedger {
+    #[cfg(test)]
     pub(crate) fn operator_seal(&self, generation_id: &str) -> OperatorSeal {
         OperatorSeal::issue(&self.keys(), generation_id)
     }
