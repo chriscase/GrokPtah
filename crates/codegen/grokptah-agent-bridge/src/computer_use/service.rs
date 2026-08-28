@@ -731,10 +731,11 @@ impl ComputerUseService {
             .and_then(|run| run.ok_or_else(unknown_run));
         if let Err(error) = &result {
             self.record_denial(run_id, "complete", None, error);
-        } else {
-            self.execution_receipts.lock().remove(run_id);
         }
         self.finish_mutation(request_id, &result)?;
+        if result.is_ok() {
+            self.execution_receipts.lock().remove(run_id);
+        }
         result
     }
 
@@ -1421,6 +1422,55 @@ mod tests {
             service.get_run(&run.run_id).unwrap().unwrap().action_count,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn only_a_host_execution_receipt_can_settle_completion() {
+        let (_backend, service) = service();
+        let owner = Uuid::new_v4();
+        let run = service
+            .create_run(
+                "create-receipt-completion",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize(
+                "grant-receipt-completion",
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
+            .unwrap();
+        let observation = service
+            .observe("observe-receipt-completion", &run.run_id, run.version)
+            .await
+            .unwrap();
+        service
+            .act(
+                "act-receipt-completion",
+                &run.run_id,
+                service.get_run(&run.run_id).unwrap().unwrap().version,
+                &observation.observation_id,
+                ComputerAction::SetValue {
+                    element_id: format!("{}-name", observation.observation_id),
+                    text: "Ada".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let run = service.get_run(&run.run_id).unwrap().unwrap();
+        let completed = service
+            .complete_from_execution_receipt(
+                "complete-receipt-completion",
+                &run.run_id,
+                run.version,
+            )
+            .unwrap();
+        assert_eq!(completed.state, ComputerRunState::Completed);
     }
 
     #[tokio::test]
