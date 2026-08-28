@@ -1679,6 +1679,7 @@ mod tests {
         signed: bool,
     ) {
         use ed25519_dalek::{Signer, SigningKey};
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
         let payload = ReconciliationPayload {
             attempt_id: attempt_id.into(),
             operator_id: operator_id.into(),
@@ -1692,9 +1693,16 @@ mod tests {
             "providerEffectId": payload.provider_effect_id,
         });
         if signed {
-            let signing_key = SigningKey::from_bytes(&[7; 32]);
             let signature = signing_key.sign(&serde_json::to_vec(&payload).unwrap());
             record["signature"] = serde_json::Value::String(hex(signature.to_bytes().as_slice()));
+        }
+        let authority_directory = root.join("canonical-authorities");
+        fs::create_dir_all(&authority_directory).unwrap();
+        let public_key_path = authority_directory.join(AUTHORITY_PUBLIC_KEY_FILE);
+        if !public_key_path.exists() {
+            fs::write(&public_key_path, signing_key.verifying_key().to_bytes()).unwrap();
+            #[cfg(unix)]
+            fs::set_permissions(&public_key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         let path = root
             .join("reconciliation")
