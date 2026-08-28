@@ -1086,6 +1086,9 @@ impl AuditLedger {
             return Err(AuditError::Refused(RefuseReason::EntryTooLarge));
         }
 
+        // The lock is held across the whole append. Releasing it between the
+        // journal write and the anchor update would let a second in-process
+        // appender read a stale tail and issue the same sequence twice.
         let path = Self::journal_path(&self.root, &live.generation_id);
         let written = match files::append_line(&path, &line) {
             Ok(written) => written,
@@ -1094,10 +1097,8 @@ impl AuditLedger {
                 return Err(error);
             }
         };
-        drop(guard);
         self.cut(CrashPoint::JournalAppendedBeforeAnchor)?;
 
-        let mut guard = self.inner.lock();
         guard.live.last_seq = record.seq;
         guard.live.last_tag = record.tag.clone();
         guard.live.journal_bytes = guard.live.journal_bytes.saturating_add(written);
@@ -1106,9 +1107,8 @@ impl AuditLedger {
             EntryPhase::Outcome => guard.live.open_intents.saturating_sub(1),
         };
         let live = guard.live.clone();
-        drop(guard);
         if let Err(error) = self.write_anchor(&live) {
-            self.inner.lock().poisoned = Some(PoisonReason::PartialPersistence);
+            guard.poisoned = Some(PoisonReason::PartialPersistence);
             return Err(error);
         }
         Ok(record.seq)

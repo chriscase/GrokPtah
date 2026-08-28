@@ -1238,3 +1238,29 @@ fn a_failed_export_leaves_no_partial_destination() {
         "a refused export must not leave a directory that could pass for a sealed one"
     );
 }
+
+#[test]
+fn concurrent_appends_never_issue_a_sequence_twice() {
+    let dir = TempDir::new().unwrap();
+    let ledger = Arc::new(opened(dir.path()));
+    let mut handles = Vec::new();
+    for worker in 0..4 {
+        let ledger = Arc::clone(&ledger);
+        handles.push(std::thread::spawn(move || {
+            for index in 0..25 {
+                ledger.append(entry(&format!("w{worker}.{index}"))).unwrap();
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    assert_eq!(ledger.status().global_last_seq, 100);
+    drop(ledger);
+
+    // Replaying the chain proves no sequence was issued twice: a duplicate
+    // would break the strict +1 expectation during the scan.
+    let ledger = opened(dir.path());
+    assert_eq!(ledger.status().global_last_seq, 100);
+    assert_eq!(ledger.verify_all().unwrap()[0].entry_count, 100);
+}
