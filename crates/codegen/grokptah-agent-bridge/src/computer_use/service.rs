@@ -1198,10 +1198,10 @@ impl ComputerUseService {
         if let Some(binding) = self.run_capabilities.lock().remove(run_id) {
             let _ = self
                 .capability_authority
-                .remove_envelope(&binding.envelope_id);
+                .remove_derived_envelope(&binding.envelope_id);
             let _ = self
                 .capability_authority
-                .remove_envelope(&binding.settlement_envelope_id);
+                .remove_derived_envelope(&binding.settlement_envelope_id);
         }
     }
 
@@ -1209,7 +1209,7 @@ impl ComputerUseService {
         if let Some(binding) = self.run_capabilities.lock().get(run_id).cloned() {
             let _ = self
                 .capability_authority
-                .remove_envelope(&binding.envelope_id);
+                .remove_derived_envelope(&binding.envelope_id);
         }
     }
 

@@ -778,6 +778,18 @@ impl CapabilityAuthority {
         Ok(())
     }
 
+    /// Remove a run-derived envelope while retaining the canonical policy
+    /// generation. The caller must separately revoke the canonical envelope
+    /// when the host policy itself is withdrawn.
+    pub(crate) fn remove_derived_envelope(&self, envelope_id: &str) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability authority is unavailable"))?;
+        state.envelopes.remove(envelope_id);
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn revoke(&self, snapshot: &CapabilitySnapshot) -> Result<()> {
         let mut state = self
