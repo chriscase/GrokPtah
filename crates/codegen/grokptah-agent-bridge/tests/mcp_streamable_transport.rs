@@ -1056,10 +1056,12 @@ async fn http_submit_durable_run_events_handoff_and_cancel() {
             .await
             .unwrap();
         assert!(!run.is_error);
-        assert_eq!(
-            run.structured.get("clientId").and_then(|v| v.as_str()),
-            Some("mcp"),
-            "MCP-submitted runs must retain their origin for desktop visibility"
+        assert!(
+            run.structured
+                .get("actorHandle")
+                .and_then(|v| v.as_str())
+                .is_some_and(|handle| handle.starts_with("actor_")),
+            "MCP-submitted runs must expose only an opaque actor handle"
         );
         state = run
             .structured
@@ -1389,7 +1391,9 @@ async fn mcp_isolated_run_review_approval_and_restart_promotion() {
             .unwrap();
         state = run.structured["state"].as_str().unwrap_or_default().into();
         if state == "completed" || state == "failed" {
-            assert_eq!(run.structured["clientId"], "mcp");
+            assert!(run.structured["actorHandle"]
+                .as_str()
+                .is_some_and(|handle| handle.starts_with("actor_")));
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
