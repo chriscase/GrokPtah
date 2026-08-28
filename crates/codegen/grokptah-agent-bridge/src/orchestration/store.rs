@@ -4988,6 +4988,21 @@ impl OrchStore {
             .map_err(|error| anyhow::anyhow!("audit retention failed: {}", error.code()))
     }
 
+    pub fn rotate_audit_key(&self) -> anyhow::Result<String> {
+        self.inner
+            .audit
+            .rotate_key()
+            .map_err(|error| anyhow::anyhow!("audit key rotation failed: {}", error.code()))
+    }
+
+    pub fn verify_audit(&self) -> anyhow::Result<usize> {
+        self.inner
+            .audit
+            .verify_all()
+            .map(|generations| generations.len())
+            .map_err(|error| anyhow::anyhow!("audit verification failed: {}", error.code()))
+    }
+
     pub fn last_run_error(&self) -> Option<String> {
         self.inner.last_run_error.lock().clone()
     }
@@ -6132,6 +6147,34 @@ mod tests {
         drop(store);
         let body = fs::read_to_string(path).unwrap();
         assert!(body.contains("\"op\":\"auth\""));
+    }
+
+    #[test]
+    fn store_key_rotation_keeps_old_generation_verifiable_after_restart() {
+        let d = tempdir().unwrap();
+        let store = OrchStore::open(d.path()).unwrap();
+        let old_key_id = store.audit_status().key_id;
+        let next_generation = store.rotate_audit_key().unwrap();
+        assert_eq!(next_generation, "g-000002");
+        assert_ne!(store.audit_status().key_id, old_key_id);
+        store
+            .append_audit(&AuditEntry {
+                ts: Utc::now(),
+                tool: "provider_attempt".into(),
+                request_id: Some("request-rotation".into()),
+                session_id: None,
+                workspace: None,
+                outcome: "accepted".into(),
+                error_code: None,
+                detail: "must not be retained".into(),
+            })
+            .unwrap();
+        assert_eq!(store.verify_audit().unwrap(), 2);
+        drop(store);
+
+        let reopened = OrchStore::open(d.path()).unwrap();
+        assert_eq!(reopened.verify_audit().unwrap(), 2);
+        assert_eq!(reopened.audit_status().global_last_seq, 3);
     }
 
     #[test]
