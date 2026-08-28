@@ -20,6 +20,7 @@ use grokptah_agent_bridge::{
     SessionKind, SessionUpdate,
 };
 use tempfile::tempdir;
+use tokio::io::AsyncReadExt;
 
 fn git(args: &[&str], cwd: &Path) {
     let status = Command::new("git")
@@ -185,7 +186,7 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
         .join("tests/mcp_sdk_interop/run_continuity_probe.mjs");
     assert!(harness.is_file(), "continuity probe harness missing");
 
-    let child = tokio::process::Command::new("node")
+    let mut child = tokio::process::Command::new("node")
         .arg(harness)
         .env("GROKPTAH_MCP_URL", format!("http://{}/mcp", server.addr))
         .env("GROKPTAH_MCP_TOKEN", "continuity-probe-token")
@@ -227,14 +228,38 @@ async fn continuity_probe_is_evidence_first_and_recoverable() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     std::fs::write(&release_file, "release").unwrap();
 
-    let output = tokio::time::timeout(Duration::from_secs(90), child.wait_with_output())
-        .await
-        .expect("continuity probe harness timed out")
-        .expect("wait for continuity probe harness");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let status = match tokio::time::timeout(Duration::from_secs(90), child.wait()).await {
+        Ok(status) => status.expect("wait for continuity probe harness"),
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                let _ = pipe.read_to_end(&mut stdout).await;
+            }
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_end(&mut stderr).await;
+            }
+            panic!(
+                "continuity probe harness timed out\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_end(&mut stdout).await;
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_end(&mut stderr).await;
+    }
+    let stdout = String::from_utf8_lossy(&stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
     assert!(
-        output.status.success(),
+        status.success(),
         "continuity probe failed\nstdout={stdout}\nstderr={stderr}"
     );
     let report: serde_json::Value = serde_json::from_str(stdout.trim())
