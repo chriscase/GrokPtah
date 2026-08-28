@@ -731,10 +731,61 @@ impl OrchStore {
     fn save_work_item_unlocked(&self, item: &WorkItem) -> anyhow::Result<()> {
         item.validate()
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        // The dependency-graph invariant is enforced here, inside the single
+        // lock that also performs the write, so it cannot be raced between a
+        // separate validation read and the commit. Every path that persists a
+        // Work item — create, manager plan expansion, routine activation,
+        // recovery, and every compare-and-swap mutation — passes through this
+        // function, so none of them can bypass it.
+        //
+        // Only a *change* to the dependency set is validated. State-only saves
+        // (which reconciliation performs for every item on every pass) skip
+        // the scope read entirely, so the invariant costs nothing on the hot
+        // path.
+        if !item.dependencies.is_empty() {
+            let previous = self.load_work_item_unlocked(&item.work_id)?;
+            let changed = previous
+                .as_ref()
+                .map(|stored| stored.dependencies != item.dependencies)
+                .unwrap_or(true);
+            if changed {
+                self.enforce_dependency_graph_unlocked(item)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            }
+        }
         let path = self
             .work_item_path(&item.work_id)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         atomic_write_json(&path, item)
+    }
+
+    /// Validate `item`'s dependency graph within its own scope.
+    ///
+    /// The scope is the item's session and workspace. Work belonging to any
+    /// other principal, workspace, or session is not read, so a dependency
+    /// declaration cannot report on work the caller may not observe, and a
+    /// malformed graph in one scope cannot block writers in another.
+    fn enforce_dependency_graph_unlocked(&self, item: &WorkItem) -> Result<(), OrchError> {
+        let scope = super::graph::GraphScope {
+            session_id: item.session_id,
+            workspace: item.workspace.as_str(),
+        };
+        let mut scoped = Vec::new();
+        let all = self
+            .list_work_items_unlocked()
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        for candidate in all {
+            if scope.contains(&candidate) {
+                scoped.push(candidate);
+                if scoped.len() > super::graph::MAX_GRAPH_SCOPE_ITEMS {
+                    return Err(OrchError::new(
+                        OrchErrorCode::CapacityExhausted,
+                        "scope holds too many work items for dependency validation",
+                    ));
+                }
+            }
+        }
+        super::graph::validate_scoped_dependency_graph(&scoped, item, scope)
     }
 
     fn load_work_attempt_unlocked(&self, attempt_id: &str) -> anyhow::Result<Option<WorkAttempt>> {
@@ -1819,11 +1870,30 @@ impl OrchStore {
         if item.state.is_terminal() || item.is_container {
             return Ok(());
         }
-        let dependencies_ready = item.dependencies.iter().all(|dependency| {
-            self.load_work_item_unlocked(&dependency.work_id)
+        // Dependencies resolve inside the item's own scope. A dependency owned
+        // by another session or workspace is treated exactly as one that does
+        // not exist, so cross-scope work can neither satisfy nor reveal itself
+        // through this path.
+        let scope = super::graph::GraphScope {
+            session_id: item.session_id,
+            workspace: item.workspace.as_str(),
+        };
+        let mut dependency_states = super::graph::DependencyStates::new();
+        for dependency in &item.dependencies {
+            let resolved = self
+                .load_work_item_unlocked(&dependency.work_id)
                 .ok()
                 .flatten()
-                .is_some_and(|dependency_item| dependency_item.state == dependency.required_state)
+                .filter(|candidate| scope.contains(candidate))
+                .map(|candidate| candidate.state);
+            dependency_states.insert(dependency.work_id.clone(), resolved);
+        }
+        let dependencies_ready = item.dependencies.iter().all(|dependency| {
+            dependency_states
+                .get(&dependency.work_id)
+                .copied()
+                .flatten()
+                .is_some_and(|state| state == dependency.required_state)
         });
         if !dependencies_ready && matches!(item.state, WorkState::Queued) {
             item.state = WorkState::Blocked;
@@ -1843,7 +1913,69 @@ impl OrchStore {
             item.bump();
             self.save_work_item_unlocked(item)?;
         }
+        // Record the canonical typed reason alongside the reconciled state, so
+        // the free-form `blocked_reason` and the typed evaluator can never
+        // disagree about why an item is where it is.
+        let block =
+            super::graph::evaluate_admission(item, &dependency_states, &item.review_receipts, now);
+        let reason = Some(block.as_str().to_string());
+        if item.blocked_reason != reason {
+            // Deliberately no `bump()`: the reason is a derived projection of
+            // the state that was just reconciled, not an independently
+            // versioned fact. Bumping for it would invalidate a caller's
+            // compare-and-swap expectation without any decision having changed.
+            item.blocked_reason = reason;
+            self.save_work_item_unlocked(item)?;
+        }
         Ok(())
+    }
+
+    /// The canonical admission decision for one persisted item.
+    ///
+    /// Reconciliation, the claim path, managed execution, and the public
+    /// projection all resolve through this, so none of them can drift into a
+    /// private answer.
+    pub fn admission_block_at(
+        &self,
+        work_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<super::graph::AdmissionBlock, OrchError> {
+        let _guard = self.inner.lock.lock();
+        self.admission_block_at_unlocked(work_id, now)
+    }
+
+    fn admission_block_at_unlocked(
+        &self,
+        work_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<super::graph::AdmissionBlock, OrchError> {
+        let item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        Ok(self.admission_block_for_unlocked(&item, now))
+    }
+
+    fn admission_block_for_unlocked(
+        &self,
+        item: &WorkItem,
+        now: chrono::DateTime<Utc>,
+    ) -> super::graph::AdmissionBlock {
+        let scope = super::graph::GraphScope {
+            session_id: item.session_id,
+            workspace: item.workspace.as_str(),
+        };
+        let mut dependency_states = super::graph::DependencyStates::new();
+        for dependency in &item.dependencies {
+            let resolved = self
+                .load_work_item_unlocked(&dependency.work_id)
+                .ok()
+                .flatten()
+                .filter(|candidate| scope.contains(candidate))
+                .map(|candidate| candidate.state);
+            dependency_states.insert(dependency.work_id.clone(), resolved);
+        }
+        super::graph::evaluate_admission(item, &dependency_states, &item.review_receipts, now)
     }
 
     /// Reconcile every durable workload at a caller-supplied instant.
@@ -1959,6 +2091,185 @@ impl OrchStore {
             }
         }
         Ok(())
+    }
+
+    /// Record one reviewer's durable verdict against a Work item's review gate.
+    ///
+    /// The receipt is attributable by construction: the authenticated
+    /// principal must *be* the reviewer the policy names, so no caller can
+    /// cast another reviewer's verdict. It binds the exact Work revision it
+    /// was cast against and the review policy revision in force, so a verdict
+    /// cannot be replayed against a later revision of either.
+    ///
+    /// The audit entry is written **before** the receipt becomes durable and
+    /// its failure fails the whole call. A verdict that cannot be audited is
+    /// not recorded: over-auditing a mutation that then fails to persist is
+    /// safe, silently admitting an unauditable one is not.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_review_verdict(
+        &self,
+        work_id: &str,
+        reviewer_id: &str,
+        verdict: super::graph::ReviewVerdict,
+        principal_token_id: &str,
+        principal_owner_id: &str,
+        expected_revision: Option<u64>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<WorkItem, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        Self::require_work_revision(&item, expected_revision)?;
+        if item.state.is_terminal() {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "terminal work items do not accept review verdicts",
+            ));
+        }
+        let policy = item.review.clone().ok_or_else(|| {
+            OrchError::new(OrchErrorCode::Conflict, "work item has no review gate")
+        })?;
+        policy.validate()?;
+        if !policy.names(reviewer_id) {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "the review gate does not name this reviewer",
+            ));
+        }
+        // Self-attestation: a principal may only cast its own verdict.
+        if reviewer_id != principal_owner_id && reviewer_id != principal_token_id {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "a principal may only record its own review verdict",
+            ));
+        }
+        // A verdict is immutable once cast. Changing one means revoking it
+        // first, which leaves both facts in the trail.
+        if item.review_receipts.iter().any(|receipt| {
+            receipt.reviewer_id == reviewer_id
+                && receipt.policy_revision == policy.policy_revision
+                && receipt.revoked_at.is_none()
+        }) {
+            return Err(OrchError::new(
+                OrchErrorCode::Conflict,
+                "this reviewer already has an active verdict; revoke it first",
+            ));
+        }
+
+        let receipt = super::graph::ReviewReceipt {
+            reviewer_id: reviewer_id.to_string(),
+            principal_token_id: principal_token_id.to_string(),
+            principal_owner_id: principal_owner_id.to_string(),
+            verdict,
+            work_revision: item.revision,
+            policy_revision: policy.policy_revision,
+            recorded_at: now,
+            revoked_at: None,
+        };
+        receipt.validate()?;
+
+        self.append_audit(&AuditEntry {
+            ts: now,
+            tool: "work_review_verdict".into(),
+            request_id: None,
+            session_id: Some(item.session_id),
+            workspace: Some(item.workspace.clone()),
+            outcome: "recorded".into(),
+            error_code: None,
+            detail: format!(
+                "work {} revision {} reviewer {} verdict {:?} policy revision {}",
+                item.work_id, item.revision, reviewer_id, verdict, policy.policy_revision
+            ),
+        })
+        .map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                format!("review verdict refused: audit failed: {error}"),
+            )
+        })?;
+
+        item.review_receipts.push(receipt);
+        item.bump_at(now);
+        self.save_work_item_unlocked(&item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(item)
+    }
+
+    /// Withdraw a reviewer's active verdict.
+    ///
+    /// The receipt is retained and marked revoked rather than deleted, so the
+    /// gate's history remains complete and a revocation is itself auditable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn revoke_review_verdict(
+        &self,
+        work_id: &str,
+        reviewer_id: &str,
+        principal_token_id: &str,
+        principal_owner_id: &str,
+        expected_revision: Option<u64>,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<WorkItem, OrchError> {
+        let _guard = self.inner.lock.lock();
+        let mut item = self
+            .load_work_item_unlocked(work_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| OrchError::new(OrchErrorCode::Conflict, "work item not found"))?;
+        Self::require_work_revision(&item, expected_revision)?;
+        if reviewer_id != principal_owner_id && reviewer_id != principal_token_id {
+            return Err(OrchError::new(
+                OrchErrorCode::ForbiddenScope,
+                "a principal may only revoke its own review verdict",
+            ));
+        }
+        let policy_revision = item
+            .review
+            .as_ref()
+            .map(|policy| policy.policy_revision)
+            .ok_or_else(|| {
+                OrchError::new(OrchErrorCode::Conflict, "work item has no review gate")
+            })?;
+        let target = item
+            .review_receipts
+            .iter_mut()
+            .rfind(|receipt| {
+                receipt.reviewer_id == reviewer_id
+                    && receipt.policy_revision == policy_revision
+                    && receipt.revoked_at.is_none()
+            })
+            .ok_or_else(|| {
+                OrchError::new(
+                    OrchErrorCode::Conflict,
+                    "this reviewer has no active verdict to revoke",
+                )
+            })?;
+        target.revoked_at = Some(now);
+
+        self.append_audit(&AuditEntry {
+            ts: now,
+            tool: "work_review_verdict".into(),
+            request_id: None,
+            session_id: Some(item.session_id),
+            workspace: Some(item.workspace.clone()),
+            outcome: "revoked".into(),
+            error_code: None,
+            detail: format!(
+                "work {} revision {} reviewer {} policy revision {}",
+                item.work_id, item.revision, reviewer_id, policy_revision
+            ),
+        })
+        .map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                format!("review revocation refused: audit failed: {error}"),
+            )
+        })?;
+
+        item.bump_at(now);
+        self.save_work_item_unlocked(&item)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
+        Ok(item)
     }
 
     /// Change the durable owner without claiming a lease. Assignment is a
