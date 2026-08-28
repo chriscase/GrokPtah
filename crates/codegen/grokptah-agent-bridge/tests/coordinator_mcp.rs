@@ -276,7 +276,7 @@ async fn independent_worker_recovers_assignment_and_messages() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_eq!(question.structured["message"]["fromActor"], "worker");
+    assert_eq!(question.structured["message"]["actorHandle"], primary_actor);
     assert_eq!(
         question.structured["message"]["fromAgentId"],
         worker.agent_id
@@ -298,7 +298,7 @@ async fn independent_worker_recovers_assignment_and_messages() {
         )
         .await
         .unwrap();
-    assert_eq!(answer.structured["message"]["fromActor"], "primary");
+    assert_eq!(answer.structured["message"]["actorHandle"], primary_actor);
     assert_eq!(
         answer.structured["message"]["fromAgentId"],
         manager.agent_id
@@ -315,7 +315,9 @@ async fn independent_worker_recovers_assignment_and_messages() {
         )
         .await
         .unwrap();
-    assert_eq!(ack.structured["message"]["ackedBy"], "primary");
+    assert!(ack.structured["message"]["actorHandle"]
+        .as_str()
+        .is_some_and(|handle| handle.starts_with("actor_")));
     assert!(ack.structured["message"]["ackedAt"].is_string());
     worker_client
         .call_tool(
@@ -746,7 +748,7 @@ async fn coordinator_identity_and_scope_are_enforced() {
         )
         .await
         .unwrap();
-    let accept_unknown = worker_client
+    let accept_unknown = coordinator
         .call_tool(
             "ptah_accept_work",
             json!({
@@ -780,11 +782,11 @@ async fn coordinator_identity_and_scope_are_enforced() {
             }),
         )
         .await
-        .unwrap();
-    assert_eq!(acting.structured["message"]["fromActor"], "worker");
-    assert_eq!(
-        acting.structured["message"]["fromAgentId"],
-        manager.agent_id
+        .unwrap_err()
+        .to_string();
+    assert!(
+        acting.contains("unauthenticated") || acting.contains("401"),
+        "separate principal must not inherit another principal's session/work scope: {acting}"
     );
 
     orch.stop_background_tasks().await;
