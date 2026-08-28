@@ -14,7 +14,7 @@ use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::computer_use::{ComputerCapabilities, ComputerTarget};
+use crate::computer_use::ComputerCapabilities;
 use crate::gateway_config::ModelCapabilities;
 
 pub(crate) const CAPABILITY_GENERATION_SCHEMA: &str = "grokptah.capability-generation.v1";
@@ -28,7 +28,6 @@ pub(crate) enum CapabilityKind {
     Provider,
     Tool,
     ComputerUse,
-    DurableMutation,
 }
 
 impl CapabilityKind {
@@ -37,7 +36,6 @@ impl CapabilityKind {
             Self::Provider => "provider",
             Self::Tool => "tool",
             Self::ComputerUse => "computer_use",
-            Self::DurableMutation => "durable_mutation",
         }
     }
 }
@@ -90,28 +88,6 @@ impl CapabilitySnapshot {
         )
     }
 
-    pub(crate) fn computer_use(
-        principal: &str,
-        target: &ComputerTarget,
-        backend: &ComputerCapabilities,
-        provider_generation_digest: Option<&str>,
-        policy_digest: &str,
-    ) -> Result<Self> {
-        let target = serde_json::to_vec(target)?;
-        let backend = serde_json::to_vec(backend)?;
-        Self::from_parts(
-            CapabilityKind::ComputerUse,
-            principal,
-            "computer-use",
-            [
-                std::str::from_utf8(&target).unwrap_or_default(),
-                std::str::from_utf8(&backend).unwrap_or_default(),
-                provider_generation_digest.unwrap_or("none"),
-                policy_digest,
-            ],
-        )
-    }
-
     pub(crate) fn computer_use_service(
         principal: &str,
         backend: &ComputerCapabilities,
@@ -135,19 +111,6 @@ impl CapabilitySnapshot {
             principal,
             tool_name,
             [tool_name, tool_policy_digest],
-        )
-    }
-
-    pub(crate) fn durable_mutation(
-        principal: &str,
-        mutation_name: &str,
-        mutation_digest: &str,
-    ) -> Result<Self> {
-        Self::from_parts(
-            CapabilityKind::DurableMutation,
-            principal,
-            mutation_name,
-            [mutation_name, mutation_digest],
         )
     }
 
@@ -359,6 +322,7 @@ impl CapabilityAuthority {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn install_envelope(
         &self,
         envelope_id: &str,
@@ -583,6 +547,7 @@ impl CapabilityAuthority {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn rotate_auth_generation(&self, auth_generation: u64) -> Result<()> {
         if auth_generation == 0 {
             bail!("auth generation must be positive");
@@ -676,6 +641,7 @@ fn validate_envelope_locked(
         || envelope.incarnation != state.process_nonce
         || envelope.auth_generation != state.auth_generation
         || envelope.capability_generation != envelope.capability.generation
+        || envelope.policy_generation.trim().is_empty()
         || now >= envelope.expires_at
     {
         bail!("canonical capability envelope is stale, expired, or foreign");

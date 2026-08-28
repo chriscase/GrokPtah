@@ -25,6 +25,7 @@ use parking_lot::Mutex;
 
 const SERVICE_ENVELOPE_ID: &str = "computer-service-envelope-v1";
 const RUN_ENVELOPE_PREFIX: &str = "computer-run-envelope:";
+const SETTLEMENT_ENVELOPE_PREFIX: &str = "computer-settlement-envelope:";
 const SERVICE_PRINCIPAL_ID: &str = "host-principal";
 const AUTH_GENERATION: u64 = 1;
 const POLICY_GENERATION: &str = "computer-use-policy.v1";
@@ -41,6 +42,7 @@ const RUN_OPERATIONS: &[&str] = &[
     "settle_action",
     "record_denial",
 ];
+const SETTLEMENT_OPERATIONS: &[&str] = &["settle_observation", "settle_action", "record_denial"];
 
 pub struct ComputerUseService {
     backend: Arc<dyn ComputerBackend>,
@@ -55,6 +57,7 @@ pub struct ComputerUseService {
 #[derive(Debug, Clone)]
 struct RunCapability {
     envelope_id: String,
+    settlement_envelope_id: String,
     snapshot: CapabilitySnapshot,
     capability: HostCapability,
 }
@@ -1026,6 +1029,7 @@ impl ComputerUseService {
             )
         })?;
         let envelope_id = format!("{RUN_ENVELOPE_PREFIX}{}", run.run_id);
+        let settlement_envelope_id = format!("{SETTLEMENT_ENVELOPE_PREFIX}{}", run.run_id);
         self.capability_authority
             .install_envelope(
                 &envelope_id,
@@ -1041,8 +1045,24 @@ impl ComputerUseService {
             .map_err(|error| {
                 ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string())
             })?;
+        self.capability_authority
+            .install_envelope(
+                &settlement_envelope_id,
+                service.capability.clone(),
+                service.snapshot.clone(),
+                SERVICE_PRINCIPAL_ID,
+                AUTH_GENERATION,
+                POLICY_GENERATION,
+                SETTLEMENT_OPERATIONS.iter().copied(),
+                &run.run_id,
+                Utc::now(),
+            )
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string())
+            })?;
         Ok(RunCapability {
             envelope_id,
+            settlement_envelope_id,
             snapshot: service.snapshot.clone(),
             capability: service.capability.clone(),
         })
@@ -1096,6 +1116,9 @@ impl ComputerUseService {
             let _ = self
                 .capability_authority
                 .remove_envelope(&binding.envelope_id);
+            let _ = self
+                .capability_authority
+                .remove_envelope(&binding.settlement_envelope_id);
         }
     }
 
@@ -1177,15 +1200,23 @@ impl ComputerUseService {
         operation: &str,
         payload: &serde_json::Value,
     ) -> ComputerResult<()> {
-        let envelope_id = payload
+        let run_id = payload
             .get("runId")
             .and_then(serde_json::Value::as_str)
-            .map(|run_id| format!("{RUN_ENVELOPE_PREFIX}{run_id}"))
-            .unwrap_or_else(|| SERVICE_ENVELOPE_ID.into());
-        let resource = payload
-            .get("runId")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("computer-host");
+            .map(str::to_string);
+        let envelope_id = match run_id.as_deref() {
+            Some(run_id)
+                if matches!(
+                    operation,
+                    "settle_observation" | "settle_action" | "record_denial"
+                ) =>
+            {
+                format!("{SETTLEMENT_ENVELOPE_PREFIX}{run_id}")
+            }
+            Some(run_id) => format!("{RUN_ENVELOPE_PREFIX}{run_id}"),
+            None => SERVICE_ENVELOPE_ID.into(),
+        };
+        let resource = run_id.as_deref().unwrap_or("computer-host");
         let snapshot = self
             .service_capability
             .as_ref()
