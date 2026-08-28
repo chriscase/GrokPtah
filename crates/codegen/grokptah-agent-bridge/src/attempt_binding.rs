@@ -19,6 +19,17 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::launch_truth::AdmissionFacts;
+use crate::orchestration::OrchStore;
+use crate::physical_send::PhysicalSendBinding;
+
+/// Refusal text for a run whose earlier attempt is still unreconciled.
+///
+/// One string, shared by every caller, because it is the sentence an operator
+/// reads when a send is refused: it must name the action (reconcile against
+/// the recorded key) rather than describing an internal state.
+pub(crate) const UNRECONCILED_REFUSAL: &str =
+    "an earlier provider attempt for this run is still unreconciled; reconcile it against its \
+     idempotency key before issuing an equivalent request";
 
 /// Everything the host knows about *who* a run acts for, before binding.
 ///
@@ -165,16 +176,6 @@ pub(crate) fn with_selection(
     attempt
 }
 
-/// The receipts for a turn that came back with a complete, parseable reply.
-pub(crate) fn replied(usage: Option<UsageReceipt>) -> ProviderReceipts {
-    ProviderReceipts {
-        request: None,
-        run: None,
-        usage,
-        provider_replied: true,
-    }
-}
-
 /// Whether a run may issue a new equivalent provider request.
 ///
 /// The durable form of the auto-retry rule: false while any recorded attempt
@@ -233,5 +234,131 @@ pub(crate) const fn initial_authority() -> AuthorityRevisions {
         policy: Revision(0),
         capability: Revision(0),
         credential: Revision(0),
+    }
+}
+
+/// Fold a completed turn's evidence into an attempt's receipts.
+///
+/// Merges rather than replaces. A request or run identifier published by the
+/// provider is the strongest evidence the record holds, and it is written
+/// while the response is still on the wire; overwriting it at turn end with a
+/// receipt derived from local counters would discard the only proof of *which*
+/// provider-side request this attempt became.
+pub(crate) fn record_reply(receipts: &mut ProviderReceipts, usage: Option<UsageReceipt>) {
+    receipts.provider_replied = true;
+    if usage.is_some() {
+        receipts.usage = usage;
+    }
+}
+
+/// Admit a run to attempt a physical send.
+///
+/// Refuses while any recorded attempt still needs provider-side
+/// reconciliation. This is the *decision*, not the crossing: the boundary
+/// itself is crossed by the transport, at the instant it has a request to put
+/// on a socket (see [`crate::physical_send::mark_sending`]).
+///
+/// Separating them is what keeps the record truthful. A turn is not
+/// necessarily a send — a slash command, a session with no resolvable
+/// credential, and an offline stub all complete without reaching a provider —
+/// so marking `sending` when the turn *starts* would record a request that
+/// never existed, and the lattice cannot rewind that.
+///
+/// The desktop turn runner and the orchestration spawn path share this
+/// deliberately: a second implementation would be a second answer to "was this
+/// sent?", and the two would drift exactly where it is most expensive.
+pub fn admit_send(store: &OrchStore, run_id: &str) -> Result<(), String> {
+    let attempts = store
+        .list_attempts_for_run(run_id)
+        .map_err(|error| error.to_string())?;
+    if permits_new_request(&attempts) {
+        Ok(())
+    } else {
+        Err(UNRECONCILED_REFUSAL.into())
+    }
+}
+
+/// The physical-send binding for this run's prepared attempt.
+///
+/// Selects the attempt that has provably not been sent, because that is the
+/// one the transport is about to send and the one it must move forward.
+/// `None` when there is no prepared attempt, which is also the honest binding
+/// for an offline host: nothing to carry a key for, nothing to advance.
+pub fn send_binding(store: &OrchStore, run_id: &str) -> Option<PhysicalSendBinding> {
+    store
+        .list_attempts_for_run(run_id)
+        .ok()
+        .and_then(|attempts| {
+            attempts.into_iter().rev().find_map(|attempt| {
+                (attempt.send_state == SendState::KnownNotSent).then(|| {
+                    PhysicalSendBinding::new(
+                        store.clone(),
+                        attempt.attempt_id.as_str().to_string(),
+                        attempt.intent.provider_idempotency_key.as_str().to_string(),
+                        attempt.route.dialect,
+                    )
+                })
+            })
+        })
+}
+
+/// Move any in-flight attempt for this run to `uncertain`.
+///
+/// A cancelled or abandoned in-flight request is exactly ambiguous: it may
+/// have executed. Recording that is what stops a later restart from quietly
+/// duplicating it.
+pub(crate) fn reconcile_run(store: &OrchStore, run_id: &str) {
+    let Ok(attempts) = store.list_attempts_for_run(run_id) else {
+        return;
+    };
+    for attempt in attempts {
+        if attempt.send_state != SendState::Sending {
+            continue;
+        }
+        let _ = store.update_attempt(attempt.attempt_id.as_str(), |attempt| {
+            reconcile_interrupted(attempt).map_err(anyhow::Error::msg)
+        });
+    }
+}
+
+/// Settle this run's attempts once the turn is over.
+///
+/// `succeeded` is the *turn's* outcome, which is deliberately not treated as
+/// evidence about the *request*. A turn can succeed without its provider call
+/// succeeding — a Chat turn renders a failed model call as its reply, and a
+/// tool loop can finish on a local answer — so reading turn success as a
+/// provider acknowledgement would manufacture a receipt for a request that
+/// may never have arrived.
+///
+/// So `sent` is never reached from here. Only the transport can observe an
+/// acknowledgement, and it records one through
+/// [`crate::physical_send::mark_sent`]. What is left in `sending` at turn end
+/// is a request that crossed the boundary and was never reported on again:
+/// that is exactly `uncertain`, whatever the turn went on to return.
+pub fn settle_run(store: &OrchStore, run_id: &str, succeeded: bool, usage: Option<UsageReceipt>) {
+    let Ok(attempts) = store.list_attempts_for_run(run_id) else {
+        return;
+    };
+    for attempt in attempts {
+        let id = attempt.attempt_id.as_str().to_string();
+        let next = match attempt.send_state {
+            // Reported on by the transport, so the turn's end is its end.
+            SendState::Sent | SendState::Responding => SendState::Settled,
+            // Crossed the boundary, never reported on again.
+            SendState::Sending => SendState::Uncertain,
+            // Already ambiguous; a turn that went on to succeed did get its
+            // reply, so the identity can be released.
+            SendState::Uncertain if succeeded => SendState::Settled,
+            // Provably unsent, still ambiguous, or already terminal.
+            SendState::KnownNotSent | SendState::Uncertain | SendState::Settled => continue,
+        };
+        let _ = store.update_attempt(&id, |attempt| {
+            // Receipts are only justified where the record already implies the
+            // provider was reached.
+            if next == SendState::Settled {
+                record_reply(&mut attempt.receipts, usage);
+            }
+            attempt.advance(next).map_err(anyhow::Error::msg)
+        });
     }
 }
