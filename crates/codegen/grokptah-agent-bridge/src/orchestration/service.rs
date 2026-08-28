@@ -2472,8 +2472,8 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         self.ensure_session_binding(auth, session_id)?;
-        self.ensure_work_binding(auth, work_id)?;
         let (item, _) = self.load_work_scoped(session_id, workspace, work_id, true)?;
+        self.ensure_work_binding(auth, &item.work_id)?;
         self.workload_value(item, true)
     }
 
@@ -2529,8 +2529,8 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         self.ensure_session_binding(auth, session_id)?;
-        self.ensure_plan_binding(auth, plan_id)?;
         let (_, plan) = self.load_manager_plan_scoped(session_id, workspace, plan_id)?;
+        self.ensure_plan_binding(auth, &plan.plan_id)?;
         Ok(json!({ "plan": plan }))
     }
 
@@ -4261,6 +4261,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let (item, _) = self.load_work_scoped(session_id, workspace, work_id, true)?;
+        self.ensure_work_binding(auth, &item.work_id)?;
         let decisions = self.store.list_work_decisions(&item.work_id)?;
         Ok(json!({ "workId": item.work_id, "decisions": decisions }))
     }
@@ -4635,8 +4636,8 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         self.ensure_session_binding(auth, session_id)?;
-        self.ensure_routine_binding(auth, routine_id)?;
         let (routine, _) = self.load_routine_scoped(session_id, workspace, routine_id, true)?;
+        self.ensure_routine_binding(auth, &routine.routine_id)?;
         self.routine_value(routine, true)
     }
 
@@ -4649,8 +4650,8 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         self.ensure_session_binding(auth, session_id)?;
-        self.ensure_routine_binding(auth, routine_id)?;
         let (routine, _) = self.load_routine_scoped(session_id, workspace, routine_id, true)?;
+        self.ensure_routine_binding(auth, &routine.routine_id)?;
         let activations = self.store.list_activations(&routine.routine_id, 128)?;
         Ok(json!({
             "routineId": routine.routine_id,
@@ -5549,8 +5550,9 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        let run = self.load_authorized_run(run_id)?;
         self.ensure_run_binding(auth, run_id)?;
-        self.run_value(self.load_authorized_run(run_id)?)
+        self.run_value(run)
     }
 
     pub fn get_run_scoped(
@@ -5562,8 +5564,9 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         self.ensure_session_binding(auth, session_id)?;
+        let run = self.authorize_run_request(session_id, workspace, run_id)?;
         self.ensure_run_binding(auth, run_id)?;
-        self.run_value(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.run_value(run)
     }
 
     fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5579,8 +5582,9 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        let run = self.load_authorized_run(run_id)?;
         self.ensure_run_binding(auth, run_id)?;
-        self.progress_value(self.load_authorized_run(run_id)?)
+        self.progress_value(run)
     }
 
     pub fn get_progress_scoped(
@@ -5592,8 +5596,9 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         self.ensure_session_binding(auth, session_id)?;
+        let run = self.authorize_run_request(session_id, workspace, run_id)?;
         self.ensure_run_binding(auth, run_id)?;
-        self.progress_value(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.progress_value(run)
     }
 
     fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5641,8 +5646,8 @@ impl OrchestrationService {
                 "run_id is required for get_events",
             )
         })?;
-        self.ensure_run_binding(auth, rid)?;
         let run = self.load_authorized_run(rid)?;
+        self.ensure_run_binding(auth, rid)?;
         self.events_for_run(run, after_seq, limit)
     }
 
@@ -5657,12 +5662,9 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         self.ensure_session_binding(auth, session_id)?;
+        let run = self.authorize_run_request(session_id, workspace, run_id)?;
         self.ensure_run_binding(auth, run_id)?;
-        self.events_for_run(
-            self.authorize_run_request(session_id, workspace, run_id)?,
-            after_seq,
-            limit,
-        )
+        self.events_for_run(run, after_seq, limit)
     }
 
     /// Authorize a run and return its current journal bounds plus an initial
@@ -5678,8 +5680,8 @@ impl OrchestrationService {
     ) -> Result<(LiveRunScope, JournalPage), OrchError> {
         self.require_current_auth(auth)?;
         self.ensure_session_binding(auth, session_id)?;
-        self.ensure_run_binding(auth, run_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        self.ensure_run_binding(auth, run_id)?;
         let Some(start_seq) = run.start_seq else {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -5894,8 +5896,9 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        let run = self.load_authorized_run(run_id)?;
         self.ensure_run_binding(auth, run_id)?;
-        self.changes_for_run(self.load_authorized_run(run_id)?)
+        self.changes_for_run(run)
     }
 
     pub fn get_changes_scoped(
@@ -5907,8 +5910,9 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         self.ensure_session_binding(auth, session_id)?;
+        let run = self.authorize_run_request(session_id, workspace, run_id)?;
         self.ensure_run_binding(auth, run_id)?;
-        self.changes_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.changes_for_run(run)
     }
 
     fn changes_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5937,8 +5941,9 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        let run = self.load_authorized_run(run_id)?;
         self.ensure_run_binding(auth, run_id)?;
-        self.test_results_for_run(self.load_authorized_run(run_id)?)
+        self.test_results_for_run(run)
     }
 
     pub fn get_test_results_scoped(
@@ -5950,8 +5955,9 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         self.ensure_session_binding(auth, session_id)?;
+        let run = self.authorize_run_request(session_id, workspace, run_id)?;
         self.ensure_run_binding(auth, run_id)?;
-        self.test_results_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.test_results_for_run(run)
     }
 
     fn test_results_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -6026,8 +6032,9 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        let run = self.load_authorized_run(run_id)?;
         self.ensure_run_binding(auth, run_id)?;
-        self.handoff_for_run(self.load_authorized_run(run_id)?)
+        self.handoff_for_run(run)
     }
 
     pub fn get_handoff_scoped(
@@ -6039,8 +6046,9 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         self.ensure_session_binding(auth, session_id)?;
+        let run = self.authorize_run_request(session_id, workspace, run_id)?;
         self.ensure_run_binding(auth, run_id)?;
-        self.handoff_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.handoff_for_run(run)
     }
 
     fn handoff_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -6118,22 +6126,23 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: &str,
     ) -> Result<RunRecord, OrchError> {
-        let run = self.load_authorized_run(run_id)?;
+        let run = self
+            .store
+            .load_run(run_id)
+            .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?
+            .ok_or_else(run_scope_denied)?;
         if run.session_id != session_id {
-            return Err(OrchError::new(
-                OrchErrorCode::ForbiddenScope,
-                "run does not belong to the requested session",
-            ));
+            return Err(run_scope_denied());
         }
-        let session = self.require_build_session(session_id)?;
+        let session = self
+            .require_build_session(session_id)
+            .map_err(|_| run_scope_denied())?;
         let cwd = (!session.cwd.is_empty()).then(|| PathBuf::from(&session.cwd));
         let allowlist = self.config.lock().allowlist.clone();
-        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)?;
+        let claimed = require_workspace_match(&allowlist, cwd.as_deref(), workspace)
+            .map_err(|_| run_scope_denied())?;
         if claimed.display().to_string() != run.workspace {
-            return Err(OrchError::new(
-                OrchErrorCode::WorkspaceMismatch,
-                "run workspace does not match the requested workspace",
-            ));
+            return Err(run_scope_denied());
         }
         Ok(run)
     }
@@ -8437,6 +8446,13 @@ fn computer_scope_denied() -> OrchError {
     OrchError::new(
         OrchErrorCode::ForbiddenScope,
         "computer run is not available to this session",
+    )
+}
+
+fn run_scope_denied() -> OrchError {
+    OrchError::new(
+        OrchErrorCode::ForbiddenScope,
+        "run is not available in the requested scope",
     )
 }
 
