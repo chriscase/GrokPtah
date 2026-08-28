@@ -104,7 +104,10 @@ impl ComputerUseService {
                     SERVICE_PRINCIPAL_ID,
                     AUTH_GENERATION,
                     POLICY_GENERATION,
-                    ["create_run", "settle_receipt"],
+                    RUN_OPERATIONS
+                        .iter()
+                        .copied()
+                        .chain(["create_run", "settle_receipt"]),
                     "computer-host",
                     Utc::now(),
                 )
@@ -1137,6 +1140,38 @@ impl ComputerUseService {
             })
     }
 
+    fn consume_durable_claim(&self, operation: &str) -> ComputerResult<()> {
+        let snapshot = self
+            .service_capability
+            .as_ref()
+            .map(|binding| binding.snapshot.clone())
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "canonical durable capability envelope is unavailable",
+                )
+            })?;
+        let lease = self
+            .capability_authority
+            .lease_from_envelope(
+                SERVICE_ENVELOPE_ID,
+                operation,
+                "computer-host",
+                &format!("durable.claim.{operation}"),
+                Utc::now(),
+                Duration::seconds(5),
+            )
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Unauthorized, error.to_string())
+            })?;
+        self.capability_authority
+            .consume(lease, &snapshot, Utc::now())
+            .map(|_| ())
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::PermissionRevoked, error.to_string())
+            })
+    }
+
     fn consume_durable_lease(
         &self,
         operation: &str,
@@ -1213,7 +1248,7 @@ impl ComputerUseService {
     ) -> ComputerResult<Option<ComputerResult<T>>> {
         // Claiming the durable receipt is itself an effect. It has its own
         // bounded host lease rather than relying on admission alone.
-        self.consume_durable_lease(operation, payload)?;
+        self.consume_durable_claim(operation)?;
         let hash = crate::orchestration::hash_payload(payload);
         match self.store.claim_mutation(request_id, operation, &hash)? {
             MutationClaim::Perform => Ok(None),
