@@ -470,7 +470,7 @@ impl AdaptiveController {
     /// Re-evaluate the observed risk on every turn. Risk can only rise; a
     /// newly revealed consequential/destructive surface never gets a weaker
     /// profile merely because the objective digest stayed the same.
-    pub(crate) fn enforce_risk_floor(
+    pub fn enforce_risk_floor(
         &mut self,
         observed_risk: super::risk::TaskRisk,
     ) -> Option<ProfileTransition> {
@@ -482,10 +482,6 @@ impl AdaptiveController {
         } else {
             None
         }
-    }
-
-    pub(crate) fn objective_digest(&self) -> Option<&str> {
-        self.state.objective_digest.as_deref()
     }
 
     #[allow(dead_code)]
