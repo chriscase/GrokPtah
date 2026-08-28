@@ -2246,7 +2246,10 @@ where
         if cancel.is_cancelled() {
             bail!("cancelled");
         }
-        let send_once = |c: &crate::auth_store::WireCredentials| {
+        let send_once = |
+            c: &crate::auth_store::WireCredentials,
+            request_key: &str,
+        | {
             let mut req = client
                 .post(&url)
                 .header("Content-Type", "application/json")
@@ -2257,9 +2260,9 @@ where
             let req = crate::auth_store::apply_auth_headers(req, c, &base);
             let req = req.header(
                 xai_provider_attempt::IDEMPOTENCY_KEY_HEADER,
-                &idempotency_key,
+                request_key,
             );
-            let req = req.header("x-grok-req-id", &idempotency_key);
+            let req = req.header("x-grok-req-id", request_key);
             req.json(&body)
         };
         let mut observation_attempt =
@@ -2272,7 +2275,7 @@ where
 
         revalidate_provider_permit(&provider_attempt, &mut physical_permit)?;
         let resp_result = tokio::select! {
-            r = send_once(&creds).send() => r,
+            r = send_once(&creds, &idempotency_key).send() => r,
             _ = cancel.cancelled() => {
                 mark_permit_cancelled_after_write(&provider_attempt, physical_permit.take());
                 if let Some((route, attempt)) = observation_attempt.take() {
@@ -2387,7 +2390,7 @@ where
                             });
                     revalidate_provider_permit(&provider_attempt, &mut physical_permit)?;
                     resp = tokio::select! {
-                        r = send_once(&creds).send() => match r {
+                        r = send_once(&creds, &idempotency_key).send() => match r {
                             Ok(response) => response,
                             Err(error) => {
                                 if let Some((route, attempt)) = observation_attempt.take() {
