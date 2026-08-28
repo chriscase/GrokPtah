@@ -1990,6 +1990,7 @@ mod tests {
         )
         .await
         .expect("action must reach the backend before cancellation");
+        eprintln!("cancel-race: backend entered");
 
         let cancelled = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -1998,6 +1999,7 @@ mod tests {
         .await
         .expect("cancel must release an in-flight action")
         .unwrap();
+        eprintln!("cancel-race: cancelled");
         assert_eq!(cancelled.state, ComputerRunState::Cancelled);
         assert_eq!(
             cancelled.control_disposition,
