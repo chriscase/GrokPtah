@@ -32,6 +32,7 @@ pub enum ProfileReason {
     IndependentVerifierUnavailable,
     ModelNotQualified,
     AuthorityUnavailable,
+    ProviderUncertain,
 }
 
 impl ProfileReason {
@@ -56,6 +57,7 @@ impl ProfileReason {
             Self::IndependentVerifierUnavailable => "independent_verifier_unavailable",
             Self::ModelNotQualified => "model_not_qualified",
             Self::AuthorityUnavailable => "authority_unavailable",
+            Self::ProviderUncertain => "provider_uncertain",
         }
     }
 
@@ -110,6 +112,9 @@ impl ProfileReason {
             Self::AuthorityUnavailable => {
                 "Canonical principal, capability-generation, and provider-attempt authority is unavailable."
             }
+            Self::ProviderUncertain => {
+                "The provider attempt may have reached the provider, so the result will not be replayed automatically."
+            }
         }
     }
 }
@@ -129,6 +134,7 @@ pub enum RuntimeSignal {
     BudgetExhausted,
     DestructiveIntentDetected,
     AuthorityUnavailable,
+    ProviderUncertain,
 }
 
 impl RuntimeSignal {
@@ -147,6 +153,7 @@ impl RuntimeSignal {
             Self::BudgetExhausted => ProfileReason::BudgetExhausted,
             Self::DestructiveIntentDetected => ProfileReason::DestructiveIntent,
             Self::AuthorityUnavailable => ProfileReason::AuthorityUnavailable,
+            Self::ProviderUncertain => ProfileReason::ProviderUncertain,
         }
     }
 
@@ -157,6 +164,7 @@ impl RuntimeSignal {
                 | Self::CapabilityRevoked
                 | Self::BudgetExhausted
                 | Self::AuthorityUnavailable
+                | Self::ProviderUncertain
                 | Self::DestructiveIntentDetected
         )
     }

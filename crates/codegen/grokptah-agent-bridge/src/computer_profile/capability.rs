@@ -90,7 +90,7 @@ impl ModelCapabilityEvidence {
     pub const fn may_propose(&self) -> bool {
         self.tools
             && matches!(self.attribution, CapabilityAttribution::Measured)
-            && (self.durable_authority || self.session_measured)
+            && self.durable_authority
     }
 }
 
@@ -154,6 +154,7 @@ impl CapabilityEvidence {
     pub fn synthetic(model: ModelCapabilityEvidence, host: HostCapabilityEvidence) -> Self {
         Self {
             model: ModelCapabilityEvidence {
+                durable_authority: false,
                 session_measured: true,
                 synthetic_only: true,
                 ..model
@@ -170,7 +171,7 @@ impl CapabilityEvidence {
     }
 
     pub fn may_propose(&self) -> bool {
-        self.model.may_propose() && (self.authority.is_some() || self.model.synthetic_only)
+        self.authority.is_some() && self.model.may_propose()
     }
 
     pub(crate) fn principal_generation_reference(&self) -> Option<String> {

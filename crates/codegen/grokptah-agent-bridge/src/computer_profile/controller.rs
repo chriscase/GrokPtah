@@ -534,7 +534,7 @@ impl AdaptiveController {
         &mut self,
         rendered_observation_bytes: u64,
         truncated: bool,
-        receipt: Option<&super::authority_seam::ProviderAttemptEvidence>,
+        receipt: Option<&super::authority_seam::ProviderAttemptUsage>,
     ) {
         self.state.turn_in_flight = false;
         self.state.spend.model_calls = self.state.spend.model_calls.saturating_add(1);

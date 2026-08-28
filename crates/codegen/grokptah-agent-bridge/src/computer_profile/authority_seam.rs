@@ -10,7 +10,10 @@
 #![allow(dead_code)]
 
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 
+use async_trait::async_trait;
 use uuid::Uuid;
 
 const MAX_OPAQUE_REFERENCE_BYTES: usize = 128;
@@ -21,6 +24,7 @@ pub(crate) enum AuthorityFailure {
     Stale,
     Revoked,
     Malformed,
+    Uncertain,
 }
 
 impl fmt::Display for AuthorityFailure {
@@ -32,6 +36,7 @@ impl fmt::Display for AuthorityFailure {
             Self::Stale => "host-issued adaptive authority is stale",
             Self::Revoked => "host-issued adaptive authority was revoked",
             Self::Malformed => "host-issued adaptive authority evidence is malformed",
+            Self::Uncertain => "provider attempt outcome is uncertain",
         })
     }
 }
@@ -113,21 +118,54 @@ impl fmt::Debug for OpaqueAuthorityToken {
     }
 }
 
-/// Authenticated receipt returned by the future #478 physical transport.
-/// Fields have no public constructor and are not deserializable.
+/// Pre-send handle returned by the future canonical #478 transport authority.
+/// It has no acknowledgment, usage, latency, or settlement data.
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct ProviderAttemptEvidence {
+pub(crate) struct ProviderAttemptHandle {
+    token: OpaqueAuthorityToken,
+}
+
+impl fmt::Debug for ProviderAttemptHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderAttemptHandle")
+            .field("token", &"[opaque]")
+            .finish()
+    }
+}
+
+impl ProviderAttemptHandle {
+    pub(crate) fn from_authority(token: String) -> Result<Self, AuthorityFailure> {
+        if token.trim().is_empty()
+            || token.len() > MAX_OPAQUE_REFERENCE_BYTES
+            || token.contains(['\0', '/', '\\'])
+        {
+            return Err(AuthorityFailure::Malformed);
+        }
+        Ok(Self {
+            token: OpaqueAuthorityToken(token),
+        })
+    }
+}
+
+/// Post-send authenticated evidence authored only by the future #478 physical
+/// transport. It is intentionally not serializable and has no public
+/// constructor.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProviderAttemptUsage {
     attempt_reference: String,
+    provider_acknowledged: bool,
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
     latency_millis: u64,
 }
 
-impl fmt::Debug for ProviderAttemptEvidence {
+impl fmt::Debug for ProviderAttemptUsage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ProviderAttemptEvidence")
+            .debug_struct("ProviderAttemptUsage")
             .field("attempt_reference", &"[opaque]")
+            .field("provider_acknowledged", &self.provider_acknowledged)
             .field("prompt_tokens", &self.prompt_tokens)
             .field("completion_tokens", &self.completion_tokens)
             .field("latency_millis", &self.latency_millis)
@@ -135,9 +173,10 @@ impl fmt::Debug for ProviderAttemptEvidence {
     }
 }
 
-impl ProviderAttemptEvidence {
+impl ProviderAttemptUsage {
     pub(crate) fn from_transport(
         attempt_reference: String,
+        provider_acknowledged: bool,
         prompt_tokens: Option<u64>,
         completion_tokens: Option<u64>,
         latency_millis: u64,
@@ -151,6 +190,7 @@ impl ProviderAttemptEvidence {
         }
         Ok(Self {
             attempt_reference,
+            provider_acknowledged,
             prompt_tokens,
             completion_tokens,
             latency_millis,
@@ -170,6 +210,36 @@ impl ProviderAttemptEvidence {
     }
 }
 
+pub(crate) struct ProviderAttemptSettlement {
+    outcome: crate::computer_agent::ProposalOutcome,
+    usage: ProviderAttemptUsage,
+}
+
+impl fmt::Debug for ProviderAttemptSettlement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderAttemptSettlement")
+            .field("outcome", &"[redacted]")
+            .field("usage", &self.usage)
+            .finish()
+    }
+}
+
+impl ProviderAttemptSettlement {
+    pub(crate) fn from_transport(
+        outcome: crate::computer_agent::ProposalOutcome,
+        usage: ProviderAttemptUsage,
+    ) -> Self {
+        Self { outcome, usage }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (crate::computer_agent::ProposalOutcome, ProviderAttemptUsage) {
+        (self.outcome, self.usage)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderAttemptRequest {
     pub(crate) principal: OpaqueAuthorityToken,
@@ -181,10 +251,16 @@ pub(crate) struct ProviderAttemptRequest {
     pub(crate) request_digest: String,
 }
 
+pub(crate) type ProviderInvocation<'a> = Pin<
+    Box<dyn Future<Output = anyhow::Result<crate::computer_agent::ProposalOutcome>> + Send + 'a>,
+>;
+
 /// Consumer seam for the future host authority. Implementations must obtain
-/// every opaque value from the canonical authority and must revalidate the
-/// same binding at effect time. There is intentionally no synthetic
-/// implementation in production.
+/// every opaque value from the canonical authority. Admission is pre-send only;
+/// settlement must own the physical provider call and may author usage,
+/// acknowledgment, and latency only after that call. There is intentionally no
+/// synthetic implementation in production.
+#[async_trait]
 pub(crate) trait AdaptiveAuthorityAdapter: Send + Sync + fmt::Debug {
     fn current_binding(
         &self,
@@ -195,10 +271,16 @@ pub(crate) trait AdaptiveAuthorityAdapter: Send + Sync + fmt::Debug {
 
     fn validate_current(&self, binding: &HostIssuedBinding) -> Result<(), AuthorityFailure>;
 
-    fn provider_attempt(
+    fn admit_provider_attempt(
         &self,
         request: ProviderAttemptRequest,
-    ) -> Result<ProviderAttemptEvidence, AuthorityFailure>;
+    ) -> Result<ProviderAttemptHandle, AuthorityFailure>;
+
+    async fn settle_provider_attempt<'a>(
+        &self,
+        handle: ProviderAttemptHandle,
+        invocation: ProviderInvocation<'a>,
+    ) -> Result<ProviderAttemptSettlement, AuthorityFailure>;
 }
 
 #[cfg(test)]
@@ -216,6 +298,8 @@ mod tests {
             .unwrap_err(),
             AuthorityFailure::Malformed
         );
-        assert!(ProviderAttemptEvidence::from_transport("attempt".into(), None, None, 20,).is_ok());
+        assert!(
+            ProviderAttemptUsage::from_transport("attempt".into(), false, None, None, 20,).is_ok()
+        );
     }
 }

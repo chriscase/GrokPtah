@@ -28,6 +28,8 @@ and High Assurance risk floors respectively. A capability ceiling is calculated
 from measured, route-bound evidence. Unknown, malformed, unsupported, or
 synthetic-only evidence never becomes live eligibility; a risk floor above the
 ceiling stops the run.
+Volatile session measurements are diagnostic evidence only and cannot substitute
+for durable measured authority.
 
 Run-scoped adaptive state is persisted in the existing `ComputerRun` record.
 The record includes bounded profile transitions, observation IDs and opaque
@@ -35,10 +37,14 @@ structural digests, decision reasons, capability snapshot references, typed
 proposal/result evidence, recovery state, latency, and provider-reported usage
 when available. Provider cost is never estimated.
 
-The state is bound through interfaces for the host-issued principal generation
-from #477, capability generation from #458, and authenticated provider-attempt
-receipt from #478. No fallback authority is minted in this layer. Until the
-assembled host installs those interfaces, adaptive live proposals stop with
+The state is consumed through a private adapter seam for the host-issued
+principal generation from #477, capability/effect-lease generation from #458,
+and physical provider-attempt authority from #478. The seam has separate
+pre-send admission and post-send settlement stages. Only the future physical
+transport can produce acknowledgment, usage, latency, or an uncertain outcome;
+the adaptive layer never authors or deserializes those values. No fallback
+authority is minted here, and no public installation hook exists. Until the
+canonical host assembly supplies the seam, adaptive live proposals stop with
 `authority_unavailable`.
 
 Semantic/headless observations use deterministic candidate ranking and bounded

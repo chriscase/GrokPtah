@@ -1138,7 +1138,8 @@ export type AdaptiveProfileReason =
   | "budget_exhausted"
   | "independent_verifier_unavailable"
   | "model_not_qualified"
-  | "authority_unavailable";
+  | "authority_unavailable"
+  | "provider_uncertain";
 
 export interface AdaptiveProfileProjection {
   profile: AdaptiveProfile;

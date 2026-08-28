@@ -17,8 +17,8 @@ use crate::completion::{
     CompletionUsage,
 };
 use crate::computer_agent::{
-    propose_semantic_action, propose_semantic_action_with_profile, qualify_semantic_model,
-    resolve_computer_eligibility, ComputerAgentEligibility, ComputerAgentProposal,
+    propose_semantic_action_with_profile, qualify_semantic_model, resolve_computer_eligibility,
+    ComputerAgentEligibility, ComputerAgentProposal,
 };
 use crate::computer_profile::{
     AdaptiveController, AdaptivePolicyEngine, CapabilityEvidence, HostCapabilityEvidence,
@@ -1066,38 +1066,11 @@ impl AgentHostHandle {
         objective: &str,
         observation: &crate::computer_use::ComputerObservation,
     ) -> Result<ComputerAgentProposal> {
-        let (_operation_id, cancel, _guard) = self.begin_computer_agent_operation(session_id)?;
-        let (model, effort) = self.selected_computer_model(session_id)?;
-        let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
-            .map_err(anyhow::Error::msg)?
-            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let resolved = resolve_computer_eligibility(&credentials, &model)?;
-        let durable_authority =
-            resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct;
-        let session_authority = self
-            .inner
-            .lock()
-            .computer_agent_qualifications
-            .get(&(session_id, model.clone()))
-            .is_some_and(|record| record.route_fingerprint == resolved.route_fingerprint);
-        if !durable_authority && !session_authority {
-            bail!("selected model is not qualified for semantic Computer actions");
-        }
-        let proposal = propose_semantic_action(
-            &credentials,
-            &model,
-            effort,
-            objective,
-            observation,
-            &cancel,
+        let _ = (session_id, objective, observation);
+        bail!(
+            "adaptive Computer Use authority is unavailable; \
+             run-scoped proposals require the sealed host authority adapter"
         )
-        .await
-        .context("selected model did not return a valid bounded Computer proposal")?;
-        if cancel.is_cancelled() {
-            bail!("Computer model proposal was cancelled");
-        }
-        self.ensure_computer_route_unchanged(session_id, &model, &resolved.route_fingerprint)?;
-        Ok(proposal)
     }
 
     /// Adaptive production proposal boundary for an existing Computer Run.
@@ -1281,8 +1254,8 @@ impl AgentHostHandle {
         request_hasher.update([0]);
         request_hasher.update(permit.profile.as_str().as_bytes());
         let request_digest = format!("{:x}", request_hasher.finalize());
-        let receipt =
-            match authority.provider_attempt(crate::computer_profile::ProviderAttemptRequest {
+        let handle = match authority.admit_provider_attempt(
+            crate::computer_profile::ProviderAttemptRequest {
                 principal: snapshot.principal_for_request(),
                 capability: snapshot.capability_for_request(),
                 effect_lease: snapshot.effect_lease_for_request(),
@@ -1290,23 +1263,24 @@ impl AgentHostHandle {
                 run_id: run_id.to_string(),
                 route_fingerprint: resolved.route_fingerprint.clone(),
                 request_digest,
-            }) {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    controller.abort_turn(false);
-                    controller.apply_signal(RuntimeSignal::AuthorityUnavailable);
-                    self.persist_adaptive_state(
-                        &store,
-                        session_id,
-                        run_id,
-                        expected_version,
-                        &controller,
-                        "provider_attempt_unavailable",
-                    )?;
-                    return Err(anyhow!(error.to_string()));
-                }
-            };
-        let outcome = propose_semantic_action_with_profile(
+            },
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                controller.abort_turn(false);
+                controller.apply_signal(RuntimeSignal::AuthorityUnavailable);
+                self.persist_adaptive_state(
+                    &store,
+                    session_id,
+                    run_id,
+                    expected_version,
+                    &controller,
+                    "provider_attempt_unavailable",
+                )?;
+                return Err(anyhow!(error.to_string()));
+            }
+        };
+        let invocation = Box::pin(propose_semantic_action_with_profile(
             &credentials,
             &model,
             effort,
@@ -1315,8 +1289,29 @@ impl AgentHostHandle {
             &permit,
             evidence_bytes,
             &cancel,
-        )
-        .await;
+        ));
+        let settlement = match authority.settle_provider_attempt(handle, invocation).await {
+            Ok(settlement) => settlement,
+            Err(error) => {
+                controller.abort_turn(true);
+                controller.apply_signal(match error {
+                    crate::computer_profile::AuthorityFailure::Uncertain => {
+                        RuntimeSignal::ProviderUncertain
+                    }
+                    _ => RuntimeSignal::AuthorityUnavailable,
+                });
+                self.persist_adaptive_state(
+                    &store,
+                    session_id,
+                    run_id,
+                    expected_version,
+                    &controller,
+                    "provider_attempt_unsettled",
+                )?;
+                return Err(anyhow!(error.to_string()));
+            }
+        };
+        let (outcome, receipt) = settlement.into_parts();
         match outcome {
             Ok(outcome) => {
                 if let Err(error) = authority.validate_current(&snapshot) {
