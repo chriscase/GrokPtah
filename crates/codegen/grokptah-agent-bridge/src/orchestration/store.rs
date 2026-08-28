@@ -200,9 +200,9 @@ impl OrchStore {
             )
         })?;
         let audit_root = root.join("audit");
-        let audit = AuditLedger::open_with_options(
+        let audit = AuditLedger::open_with_keyring(
             &audit_root,
-            custody.keys(),
+            custody.all_keys(),
             AuditLedgerOptions {
                 legacy_v1_dir: Some(audit_root.clone()),
                 ..AuditLedgerOptions::default()

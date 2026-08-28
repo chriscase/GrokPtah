@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use super::documents::*;
 use super::files;
@@ -163,7 +163,8 @@ struct Inner {
 
 pub struct AuditLedger {
     root: PathBuf,
-    keys: Arc<AuditKeys>,
+    keys: RwLock<Arc<AuditKeys>>,
+    keyring: RwLock<Vec<Arc<AuditKeys>>>,
     witness: Arc<dyn AuditWitness>,
     inner: Mutex<Inner>,
     /// Serializes transactions that span more than one durable document.  The
@@ -223,6 +224,18 @@ impl AuditLedger {
         keys: Arc<AuditKeys>,
         options: AuditLedgerOptions,
     ) -> AuditResult<Self> {
+        Self::open_with_keyring(root, vec![keys], options)
+    }
+
+    pub fn open_with_keyring(
+        root: impl AsRef<Path>,
+        keys: Vec<Arc<AuditKeys>>,
+        options: AuditLedgerOptions,
+    ) -> AuditResult<Self> {
+        let initial_key = keys
+            .first()
+            .cloned()
+            .ok_or(AuditError::Poisoned(PoisonReason::KeyUnavailable))?;
         let witness: Arc<dyn AuditWitness> = options
             .witness
             .unwrap_or_else(|| Arc::new(UnwitnessedBoundary));
@@ -237,23 +250,46 @@ impl AuditLedger {
         files::create_private_dir_all(&root.join("generations"))?;
 
         let mut recovery = RecoverySummary::default();
-        let manifest = match Self::load_manifest(&root, &keys)? {
-            Some(manifest) => manifest,
-            None => {
-                recovery.initialized = true;
-                let plan = match options.legacy_v1_dir.as_deref() {
-                    Some(dir) if dir.exists() => plan_legacy_import(dir)?,
-                    _ => LegacyImportPlan::default(),
-                };
-                recovery.imported_generations = plan.generations.len();
-                Self::initialize(&root, &keys, &plan)?
+        let (selected_key, manifest) = {
+            let mut last_error = None;
+            let mut selected = None;
+            for key in &keys {
+                match Self::load_manifest(&root, key) {
+                    Ok(Some(manifest)) => {
+                        selected = Some((Arc::clone(key), manifest));
+                        break;
+                    }
+                    Ok(None) => {
+                        selected = Some((Arc::clone(key), None));
+                        break;
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            match selected {
+                Some((key, Some(manifest))) => (key, manifest),
+                Some((key, None)) => {
+                    recovery.initialized = true;
+                    let plan = match options.legacy_v1_dir.as_deref() {
+                        Some(dir) if dir.exists() => plan_legacy_import(dir)?,
+                        _ => LegacyImportPlan::default(),
+                    };
+                    recovery.imported_generations = plan.generations.len();
+                    let manifest = Self::initialize(&root, &key, &plan)?;
+                    (key, manifest)
+                }
+                None => {
+                    return Err(last_error
+                        .unwrap_or(AuditError::Poisoned(PoisonReason::ManifestMacMismatch)))
+                }
             }
         };
-        Self::check_structure(&manifest, &keys)?;
+        Self::check_structure(&manifest, &selected_key)?;
 
         let ledger = Self {
             root,
-            keys,
+            keys: RwLock::new(selected_key),
+            keyring: RwLock::new(keys),
             witness,
             inner: Mutex::new(Inner {
                 live: LiveTail {
@@ -322,8 +358,8 @@ impl AuditLedger {
         &self.root
     }
 
-    pub(crate) fn keys(&self) -> &AuditKeys {
-        &self.keys
+    pub(crate) fn keys(&self) -> Arc<AuditKeys> {
+        self.keys.read().clone()
     }
 
     // ------------------------------------------------------------ documents
@@ -388,9 +424,18 @@ impl AuditLedger {
     }
 
     fn write_manifest(&self, manifest: &mut Manifest) -> AuditResult<()> {
+        let keys = self.keys();
+        self.write_manifest_with_key(manifest, &keys)
+    }
+
+    fn write_manifest_with_key(
+        &self,
+        manifest: &mut Manifest,
+        keys: &AuditKeys,
+    ) -> AuditResult<()> {
         manifest.manifest_epoch = manifest.manifest_epoch.saturating_add(1);
         manifest.updated_at = Utc::now();
-        manifest.seal(&self.keys)?;
+        manifest.seal(keys)?;
         let bytes = serde_json::to_vec(manifest)
             .map_err(|error| AuditError::Io(format!("serialize manifest: {error}")))?;
         files::atomic_write(&Self::manifest_path(&self.root), &bytes)?;
@@ -415,16 +460,18 @@ impl AuditLedger {
         let bytes = files::read_bytes(&path)?;
         let anchor: Anchor = serde_json::from_slice(&bytes)
             .map_err(|_| AuditError::Poisoned(PoisonReason::AnchorMacMismatch))?;
-        anchor.verify(&self.keys, generation_id)?;
+        let keys = self.keys();
+        anchor.verify(&keys, generation_id)?;
         Ok(anchor)
     }
 
     fn write_anchor(&self, live: &LiveTail) -> AuditResult<()> {
+        let keys = self.keys();
         Self::write_anchor_at(
             &self.root,
-            &self.keys,
+            &keys,
             &live.generation_id,
-            self.keys.key_epoch(),
+            keys.key_epoch(),
             live.last_seq,
             &live.last_tag,
             live.journal_bytes,
@@ -619,6 +666,9 @@ impl AuditLedger {
         if manifest.installation_id != keys.installation_id() {
             return Err(AuditError::Poisoned(PoisonReason::ManifestMacMismatch));
         }
+        if manifest.key_id != keys.key_id() || manifest.key_epoch != keys.key_epoch() {
+            return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+        }
         let active_count = manifest
             .generations
             .iter()
@@ -780,7 +830,8 @@ impl AuditLedger {
             let bytes = files::read_bytes(&self.gap_path())?;
             let gap: GapFile = serde_json::from_slice(&bytes)
                 .map_err(|_| AuditError::Poisoned(PoisonReason::GapMacMismatch))?;
-            gap.verify(&self.keys)?;
+            let keys = self.keys();
+            gap.verify(&keys)?;
             guard.recovery.durable_gaps = gap.gaps;
         }
 
@@ -788,7 +839,9 @@ impl AuditLedger {
         // authenticated tail the anchor does not yet cover.
         let active = guard.manifest.active()?.clone();
         let anchor = self.load_anchor(&active.generation_id)?;
+        let active_key = self.key_for_generation(&active)?;
         let scan = self.scan_journal(
+            &active_key,
             &Self::journal_path(&self.root, &active.generation_id),
             &active.generation_id,
             &active.chain_base,
@@ -931,7 +984,8 @@ impl AuditLedger {
         let mut file = GapFile::new();
         file.gaps = guard.recovery.durable_gaps.clone();
         drop(guard);
-        file.seal(&self.keys)?;
+        let keys = self.keys();
+        file.seal(&keys)?;
         let bytes = serde_json::to_vec(&file)
             .map_err(|error| AuditError::Io(format!("serialize gap file: {error}")))?;
         files::atomic_write(&self.gap_path(), &bytes)
@@ -941,6 +995,7 @@ impl AuditLedger {
 
     fn scan_journal(
         &self,
+        keys: &AuditKeys,
         path: &Path,
         generation_id: &str,
         chain_base: &str,
@@ -948,13 +1003,22 @@ impl AuditLedger {
         origin_authenticated: bool,
     ) -> AuditResult<JournalScan> {
         scan_journal_at(
-            &self.keys,
+            keys,
             path,
             generation_id,
             chain_base,
             first_seq,
             origin_authenticated,
         )
+    }
+
+    fn key_for_generation(&self, generation: &GenerationDescriptor) -> AuditResult<Arc<AuditKeys>> {
+        self.keyring
+            .read()
+            .iter()
+            .find(|key| key.key_id() == generation.key_id)
+            .cloned()
+            .ok_or(AuditError::Poisoned(PoisonReason::KeyUnavailable))
     }
 }
 
@@ -1102,11 +1166,17 @@ impl AuditLedger {
         // violation instead of interleaving two chains into one journal: in the
         // healthy case the durable anchor always equals the in-memory tail.
         let on_disk = self.load_anchor(&guard.live.generation_id)?;
-        if on_disk.last_seq != guard.live.last_seq {
+        if on_disk.generation_id != guard.live.generation_id
+            || on_disk.last_seq != guard.live.last_seq
+            || on_disk.last_tag != guard.live.last_tag
+            || on_disk.journal_bytes != guard.live.journal_bytes
+            || on_disk.open_intents != guard.live.open_intents
+        {
             guard.poisoned = Some(PoisonReason::ConcurrentWriter);
             return Err(AuditError::Poisoned(PoisonReason::ConcurrentWriter));
         }
         let live = guard.live.clone();
+        let keys = self.keys();
         let mut record = AuditRecord {
             v: RECORD_VERSION,
             generation: live.generation_id.clone(),
@@ -1116,13 +1186,10 @@ impl AuditLedger {
             phase: entry.phase,
             outcome: entry.outcome,
             reason: entry.reason,
-            actor: entry.actor.as_deref().map(|v| self.keys.opaque_digest(v)),
-            request: entry.request.as_deref().map(|v| self.keys.opaque_digest(v)),
-            scope: entry.scope.as_deref().map(|v| self.keys.opaque_digest(v)),
-            intent: entry
-                .intent_id
-                .as_deref()
-                .map(|v| self.keys.opaque_digest(v)),
+            actor: entry.actor.as_deref().map(|v| keys.opaque_digest(v)),
+            request: entry.request.as_deref().map(|v| keys.opaque_digest(v)),
+            scope: entry.scope.as_deref().map(|v| keys.opaque_digest(v)),
+            intent: entry.intent_id.as_deref().map(|v| keys.opaque_digest(v)),
             authz_rev: entry.authz_rev,
             cap_rev: entry.cap_rev,
             policy_rev: entry.policy_rev,
@@ -1130,7 +1197,7 @@ impl AuditLedger {
             prev: live.last_tag.clone(),
             tag: String::new(),
         };
-        record.tag = record.compute_tag(&self.keys)?;
+        record.tag = record.compute_tag(&keys)?;
         let mut line = serde_json::to_string(&record)
             .map_err(|error| AuditError::Io(format!("serialize record: {error}")))?;
         line.push('\n');
@@ -1191,7 +1258,8 @@ impl AuditLedger {
             });
             file.gaps = guard.recovery.durable_gaps.clone();
         }
-        file.seal(&self.keys)?;
+        let keys = self.keys();
+        file.seal(&keys)?;
         let bytes = serde_json::to_vec(&file)
             .map_err(|error| AuditError::Io(format!("serialize gap file: {error}")))?;
         files::atomic_write(&self.gap_path(), &bytes)?;
@@ -1240,8 +1308,10 @@ impl AuditLedger {
             (guard.manifest.clone(), guard.live.clone())
         };
         let outgoing = manifest.active()?.clone();
+        let outgoing_key = self.key_for_generation(&outgoing)?;
         let journal = Self::journal_path(&self.root, &outgoing.generation_id);
         let scan = self.scan_journal(
+            &outgoing_key,
             &journal,
             &outgoing.generation_id,
             &outgoing.chain_base,
@@ -1258,6 +1328,13 @@ impl AuditLedger {
         // R2: prepare the next generation on disk. No manifest change yet.
         let next_index = outgoing.index.saturating_add(1);
         let next_id = generation_id(next_index);
+        let next_keys = if reason == RotationReason::KeyRotation {
+            let next = outgoing_key.rotated();
+            next.persist_epoch(&self.root)?;
+            Arc::new(next)
+        } else {
+            Arc::clone(&outgoing_key)
+        };
         let next_dir = Self::generation_dir(&self.root, &next_id);
         if !next_dir.exists() {
             files::create_private_dir_new(&next_dir)?;
@@ -1273,7 +1350,16 @@ impl AuditLedger {
             journal_bytes: 0,
             open_intents: 0,
         };
-        self.write_anchor(&next_live)?;
+        Self::write_anchor_at(
+            &self.root,
+            &next_keys,
+            &next_id,
+            next_keys.key_epoch(),
+            next_live.last_seq,
+            &next_live.last_tag,
+            next_live.journal_bytes,
+            next_live.open_intents,
+        )?;
         files::fsync_dir(&next_dir)?;
         files::fsync_dir(&self.root.join("generations"))?;
         self.cut(CrashPoint::R2Prepared)?;
@@ -1297,8 +1383,8 @@ impl AuditLedger {
             generation_id: next_id.clone(),
             index: next_index,
             state: GenerationState::Active,
-            key_id: self.keys.key_id().to_string(),
-            key_epoch: self.keys.key_epoch(),
+            key_id: next_keys.key_id().to_string(),
+            key_epoch: next_keys.key_epoch(),
             predecessor_id: Some(outgoing.generation_id.clone()),
             chain_base: scan.last_tag.clone(),
             first_seq: scan.last_seq.saturating_add(1),
@@ -1317,7 +1403,13 @@ impl AuditLedger {
         });
         manifest.active_generation_id = next_id.clone();
         manifest.global_last_seq_floor = scan.last_seq;
-        self.commit_manifest(manifest)?;
+        manifest.key_id = next_keys.key_id().to_string();
+        manifest.key_epoch = next_keys.key_epoch();
+        if reason == RotationReason::KeyRotation {
+            self.commit_manifest_with_key(manifest, next_keys.clone())?;
+        } else {
+            self.commit_manifest(manifest)?;
+        }
         {
             let mut guard = self.inner.lock();
             guard.live = next_live;
@@ -1337,6 +1429,13 @@ impl AuditLedger {
         Ok(next_id)
     }
 
+    /// Rotate to the next authenticated custody epoch. The old epoch remains
+    /// in the private key ring so sealed generations stay verifiable after a
+    /// restart; the manifest switch is still the single commit boundary.
+    pub fn rotate_key(&self) -> AuditResult<String> {
+        self.rotate(RotationReason::KeyRotation)
+    }
+
     // -------------------------------------------------------------- verify
 
     pub fn verify_generation(&self, generation_id: &str) -> AuditResult<GenerationVerification> {
@@ -1349,7 +1448,9 @@ impl AuditLedger {
             return Err(AuditError::Refused(RefuseReason::GenerationTombstoned));
         }
         let path = Self::journal_path(&self.root, generation_id);
+        let generation_key = self.key_for_generation(&descriptor)?;
         let scan = self.scan_journal(
+            &generation_key,
             &path,
             generation_id,
             &descriptor.chain_base,
@@ -1441,11 +1542,21 @@ impl AuditLedger {
     }
 
     pub(crate) fn commit_manifest(&self, manifest: Manifest) -> AuditResult<()> {
+        let keys = self.keys();
+        self.commit_manifest_with_key(manifest, keys)
+    }
+
+    fn commit_manifest_with_key(
+        &self,
+        manifest: Manifest,
+        commit_key: Arc<AuditKeys>,
+    ) -> AuditResult<()> {
         let expected_epoch = self.inner.lock().manifest.manifest_epoch;
         if manifest.manifest_epoch != expected_epoch {
             return Err(AuditError::Poisoned(PoisonReason::ConcurrentWriter));
         }
-        if let Some(on_disk) = Self::load_manifest(&self.root, &self.keys)? {
+        let current_key = self.keys();
+        if let Some(on_disk) = Self::load_manifest(&self.root, &current_key)? {
             if on_disk.manifest_epoch != expected_epoch
                 || on_disk.active_generation_id != self.inner.lock().manifest.active_generation_id
             {
@@ -1454,7 +1565,16 @@ impl AuditLedger {
             }
         }
         let mut manifest = manifest;
-        self.write_manifest(&mut manifest)?;
+        self.write_manifest_with_key(&mut manifest, &commit_key)?;
+        if !self
+            .keyring
+            .read()
+            .iter()
+            .any(|key| key.key_id() == commit_key.key_id())
+        {
+            self.keyring.write().push(Arc::clone(&commit_key));
+        }
+        *self.keys.write() = commit_key;
         self.inner.lock().manifest = manifest;
         Ok(())
     }

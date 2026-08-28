@@ -5,7 +5,7 @@
 //! `crates/codegen/grokptah-agent-bridge/Cargo.lock` and `--locked` checks stay
 //! reproducible offline.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -91,6 +91,7 @@ pub enum AuditKeyMode {
 pub struct AuditKeyCustody {
     mode: AuditKeyMode,
     keys: Arc<AuditKeys>,
+    additional_keys: Vec<Arc<AuditKeys>>,
 }
 
 impl std::fmt::Debug for AuditKeyCustody {
@@ -118,6 +119,7 @@ impl AuditKeyCustody {
         Self {
             mode: AuditKeyMode::ExternalConsumer,
             keys,
+            additional_keys: Vec::new(),
         }
     }
 
@@ -125,8 +127,11 @@ impl AuditKeyCustody {
         self.mode
     }
 
-    pub(crate) fn keys(&self) -> Arc<AuditKeys> {
-        Arc::clone(&self.keys)
+    pub(crate) fn all_keys(&self) -> Vec<Arc<AuditKeys>> {
+        let mut keys = Vec::with_capacity(self.additional_keys.len() + 1);
+        keys.push(Arc::clone(&self.keys));
+        keys.extend(self.additional_keys.iter().cloned());
+        keys
     }
 
     fn file_backed(root: &Path, mode: AuditKeyMode) -> AuditResult<Self> {
@@ -138,10 +143,42 @@ impl AuditKeyCustody {
         if path.exists() {
             super::files::reject_symlink(&path)?;
         }
-        let keys = AuditKeys::load_or_create_file(&path)?;
+        let keys = Arc::new(AuditKeys::load_or_create_file(&path)?);
+        let mut additional_keys = Vec::new();
+        let epochs = root.join(".audit-key-epochs");
+        if epochs.exists() {
+            super::files::reject_symlink(&epochs)?;
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(&epochs)
+                .map_err(|error| AuditError::Io(format!("audit key epochs: {error}")))?
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<Result<_, _>>()
+                .map_err(|error| AuditError::Io(format!("audit key epoch entry: {error}")))?;
+            paths.sort();
+            for epoch_path in paths {
+                super::files::reject_symlink(&epoch_path)?;
+                let name = epoch_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or(AuditError::Poisoned(PoisonReason::KeyUnavailable))?;
+                let epoch = name
+                    .strip_prefix("epoch-")
+                    .and_then(|name| name.strip_suffix(".key"))
+                    .and_then(|name| name.parse::<u32>().ok())
+                    .ok_or(AuditError::Poisoned(PoisonReason::KeyUnavailable))?;
+                if epoch <= 1 {
+                    return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+                }
+                let epoch_keys = AuditKeys::load_epoch_file(&epoch_path, epoch)?;
+                if epoch_keys.installation_id() != keys.installation_id() {
+                    return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+                }
+                additional_keys.push(Arc::new(epoch_keys));
+            }
+        }
         Ok(Self {
             mode,
-            keys: Arc::new(keys),
+            keys,
+            additional_keys,
         })
     }
 }
@@ -161,7 +198,7 @@ impl AuditKeys {
         Self::derive_for_epoch(installation_key, 1)
     }
 
-    fn derive_for_epoch(installation_key: &[u8], epoch: u32) -> Self {
+    pub(crate) fn derive_for_epoch(installation_key: &[u8], epoch: u32) -> Self {
         let epoch_label = |label: &[u8]| {
             if epoch == 1 {
                 label.to_vec()
@@ -194,6 +231,25 @@ impl AuditKeys {
     /// owner; a new epoch never overwrites the old key's identity.
     pub(crate) fn rotated(&self) -> Self {
         Self::derive_for_epoch(&self.root_material, self.epoch.saturating_add(1))
+    }
+
+    pub(crate) fn persist_epoch(&self, root: &Path) -> AuditResult<()> {
+        let dir = root.join(".audit-key-epochs");
+        super::files::create_private_dir_all(&dir)?;
+        let path = dir.join(format!("epoch-{:08}.key", self.epoch));
+        if path.exists() {
+            let existing = Self::load_epoch_file(&path, self.epoch)?;
+            if existing.key_id() != self.key_id() {
+                return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+            }
+            return Ok(());
+        }
+        write_private_key(&path, &self.root_material)
+    }
+
+    fn load_epoch_file(path: &Path, epoch: u32) -> AuditResult<Self> {
+        let material = read_private_key(path)?;
+        Ok(Self::derive_for_epoch(&material, epoch))
     }
 
     pub(crate) fn key_epoch(&self) -> u32 {

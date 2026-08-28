@@ -262,7 +262,7 @@ impl AuditLedger {
                 exported_at: Utc::now(),
                 mac: String::new(),
             };
-            export.seal(self.keys())?;
+            export.seal(&self.keys())?;
             let bytes = serde_json::to_vec(&export)
                 .map_err(|error| AuditError::Io(format!("serialize export manifest: {error}")))?;
             files::atomic_write(&dest.join("export-manifest.json"), &bytes)?;
@@ -271,7 +271,7 @@ impl AuditLedger {
             // Independent re-verification: reopen the copy with a fresh reader
             // that shares no state with the live ledger, and only then let a
             // receipt be returned.
-            let verification = verify_export(dest, self.keys())?;
+            let verification = verify_export(dest, &self.keys())?;
             if verification.seal_id != seal_id || verification.complete != complete {
                 return Err(AuditError::Poisoned(PoisonReason::ExportMacMismatch));
             }
@@ -316,7 +316,7 @@ impl AuditLedger {
             let bytes = files::read_bytes(&path)?;
             let file = serde_json::from_slice::<ExportSealFile>(&bytes)
                 .map_err(|_| AuditError::Poisoned(PoisonReason::ExportMacMismatch))?;
-            file.verify(self.keys())?;
+            file.verify(&self.keys())?;
             file
         } else {
             ExportSealFile::new()
@@ -338,7 +338,7 @@ impl AuditLedger {
             committed_at: Utc::now(),
         });
         file.updated_at = Utc::now();
-        file.seal(self.keys())?;
+        file.seal(&self.keys())?;
         let bytes = serde_json::to_vec(&file)
             .map_err(|error| AuditError::Io(format!("serialize export seals: {error}")))?;
         files::atomic_write(&path, &bytes)
@@ -357,7 +357,7 @@ impl AuditLedger {
         let bytes = files::read_bytes(&path)?;
         let file: ExportSealFile = serde_json::from_slice(&bytes)
             .map_err(|_| AuditError::Poisoned(PoisonReason::ExportMacMismatch))?;
-        file.verify(self.keys())?;
+        file.verify(&self.keys())?;
         Ok(file.seals.iter().any(|seal| {
             seal.seal_id == seal_id && seal.generation_ids.iter().any(|id| id == generation_id)
         }))
