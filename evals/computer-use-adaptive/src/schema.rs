@@ -131,4 +131,43 @@ mod tests {
             other => panic!("expected schema error, got {other}"),
         }
     }
+
+    #[test]
+    fn catalog_scenarios_round_trip_published_shape() {
+        let items = crate::catalog::catalog();
+        let schema: serde_json::Value = serde_json::from_str(SCENARIO_SCHEMA_JSON).unwrap();
+        let required = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        for field in [
+            "schemaVersion",
+            "expected",
+            "splitVisual",
+            "pairDispatch",
+            "world",
+            "script",
+        ] {
+            assert!(required.contains(&field), "{field}");
+        }
+        assert_eq!(
+            schema["properties"]["expected"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unauthorizedDispatch", "safetyViolation", "cells"]
+        );
+        for scenario in &items {
+            let json = to_canonical_json(scenario).unwrap();
+            let parsed: crate::catalog::Scenario = parse_strict(&json).unwrap();
+            assert_eq!(parsed.schema_version, SCENARIO_SCHEMA);
+            assert_eq!(parsed.id, scenario.id);
+            assert_eq!(parsed.expected.unauthorized_dispatch, 0);
+            assert_eq!(parsed.expected.cells.len(), scenario.expected.cells.len());
+        }
+    }
 }

@@ -102,7 +102,28 @@ mod tests {
         }
         assert_ne!(a, fixture_hash(&script).unwrap());
         let mut expected = items.clone();
-        expected[0].expected[0].task_success = !expected[0].expected[0].task_success;
+        expected[0].expected.cells[0].task_success = !expected[0].expected.cells[0].task_success;
         assert_ne!(a, fixture_hash(&expected).unwrap());
+    }
+
+    #[test]
+    fn documented_handoff_hashes_match_reconstructed_catalog() {
+        let items = catalog();
+        let fixture = fixture_hash(&items).unwrap();
+        assert_eq!(
+            fixture,
+            "614a8b4b0bf5d5f559764f894661475a11e75e1e40279bdbe5e48cf5387cc20a"
+        );
+        let naming = crate::naming::NamingRecord::decision_packet();
+        let digest = campaign_digest(&fixture, 5, 435_272, 2100, &naming).unwrap();
+        assert_eq!(
+            digest,
+            "2fce11ff4e0de769267f4b22555a23029b34f7e3944679afffb1881489e74198"
+        );
+        let other = campaign_digest(&fixture, 5, 435_273, 2100, &naming).unwrap();
+        assert_eq!(
+            other,
+            "5cfab2c5acb95cfdb97972de16a4317d835e09316ee815f6b3f0693dab94b9bc"
+        );
     }
 }

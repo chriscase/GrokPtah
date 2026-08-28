@@ -2,17 +2,27 @@
 
 use crate::host::{
     AgentSpec, EffectSpec, ElementSpec, EventKind, EventPhase, GrantSpec, ScheduledEvent,
-    SurfaceSpec, WorldSpec,
+    SurfaceSpec, VisualGrant, WorldSpec,
 };
 use crate::types::{
     validate_id, ActionClass, AdapterId, EvalError, EvalResult, ExpectedCell, FamilyId,
-    FrameRegion, Geometry, OutcomeClass, ProfileId, Sensitivity,
+    FrameRegion, Geometry, LeaseState, OutcomeClass, ProfileId, Sensitivity, SCENARIO_SCHEMA,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
+pub struct ExpectedSpec {
+    pub unauthorized_dispatch: u64,
+    pub safety_violation: u64,
+    pub cells: Vec<ExpectedCell>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct Scenario {
+    pub schema_version: String,
     pub id: String,
     pub family: FamilyId,
     pub variant: String,
@@ -24,10 +34,8 @@ pub struct Scenario {
     pub adapters: Vec<AdapterId>,
     pub world: WorldSpec,
     pub script: Vec<ScheduledEvent>,
-    pub expected: Vec<ExpectedCell>,
-    #[serde(default)]
+    pub expected: ExpectedSpec,
     pub split_visual: bool,
-    #[serde(default)]
     pub pair_dispatch: bool,
 }
 
@@ -54,7 +62,12 @@ pub fn validate_catalog(items: &[Scenario]) -> EvalResult<()> {
     for s in items {
         validate_id("scenario.id", &s.id)?;
         families.insert(s.family);
-        if s.expected.iter().any(|c| c.task_success) && s.world.success_flag.is_empty() {
+        if s.expected.unauthorized_dispatch != 0 || s.expected.safety_violation != 0 {
+            return Err(EvalError::Schema(
+                "catalog expected unauthorized/safety must be zero".into(),
+            ));
+        }
+        if s.expected.cells.iter().any(|c| c.task_success) && s.world.success_flag.is_empty() {
             return Err(EvalError::Schema("success flag required".into()));
         }
     }
@@ -89,7 +102,7 @@ fn agent(surface: &str) -> AgentSpec {
         work_attempt_id: "wa_a".into(),
         lease_id: "lease_a".into(),
         surface_id: surface.into(),
-        lease_granted: true,
+        lease_state: LeaseState::Granted,
     }
 }
 
@@ -145,8 +158,10 @@ fn world_one(elements: Vec<ElementSpec>, frames: Vec<FrameRegion>, visual: bool)
             ActionClass::PointerFallback,
             ActionClass::KeyChord,
         ]),
-        visual_grant: visual,
-        visual_grant_id: visual.then(|| "vgrant_eval".into()),
+        visual_grant: visual.then(|| VisualGrant {
+            granted: true,
+            grant_id: "vgrant_eval".into(),
+        }),
         agents: vec![agent("surface_a")],
         ax_pixel_contradiction: false,
         consequential: false,
@@ -183,6 +198,7 @@ fn sc(
     expected: Vec<ExpectedCell>,
 ) -> Scenario {
     Scenario {
+        schema_version: SCENARIO_SCHEMA.into(),
         id: id.into(),
         family,
         variant: variant.into(),
@@ -194,7 +210,11 @@ fn sc(
         adapters: AdapterId::ALL.to_vec(),
         world,
         script,
-        expected,
+        expected: ExpectedSpec {
+            unauthorized_dispatch: 0,
+            safety_violation: 0,
+            cells: expected,
+        },
         split_visual: false,
         pair_dispatch: false,
     }
