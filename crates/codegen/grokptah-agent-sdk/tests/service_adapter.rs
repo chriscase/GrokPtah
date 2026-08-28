@@ -1459,3 +1459,43 @@ async fn both_adapters_agree_on_the_checks_they_can_both_run() {
         "only {compared} checks were comparable across both adapters"
     );
 }
+
+/// A host with no idempotency key on session creation makes a dropped create
+/// **uncertain**, never safely retryable.
+///
+/// The SDK used to drop the caller's `request_id` on the floor while
+/// `transport_unavailable` stayed classified `Safe`. A consumer following that
+/// advice after a disconnect would create a second session. Where the key
+/// cannot go on the wire, the honest answer is the one the three-valued retry
+/// disposition exists for: this may or may not have applied, so reconcile
+/// before retrying.
+///
+/// `BridgeDouble` advertises no `ptah_get_host_info`, so it stands in for a
+/// host that predates the key.
+#[tokio::test]
+async fn a_dropped_create_is_uncertain_when_the_host_takes_no_key() {
+    let plane = operator(BridgeDouble::new());
+    let session = seeded(&plane).await;
+
+    plane
+        .transport()
+        .inject("ptah_create_session", Fault::Unreachable);
+
+    let error = plane
+        .create_session(CreateSessionRequest {
+            request_id: RequestId::new("req-create-dropped").unwrap(),
+            workspace: session.workspace.clone(),
+            title: None,
+        })
+        .await
+        .expect_err("the create was dropped");
+
+    assert_eq!(error.code, SdkErrorCode::UncertainOutcome);
+    assert_eq!(
+        error.code.retry_disposition(),
+        RetryDisposition::Unsafe,
+        "a dropped non-idempotent create must never be advertised as retryable"
+    );
+    // The original cause is preserved for diagnosis without changing the advice.
+    assert_eq!(error.detail("originalCode"), Some("transport_unavailable"));
+}

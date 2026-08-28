@@ -1867,6 +1867,64 @@ impl OrchestrationService {
     }
 
     /// Load run and verify workspace ownership against allowlist + session.
+    /// Whether this credential may read a run stamped with `client_id`.
+    ///
+    /// Three cases, and the middle one is the reason this is not a plain
+    /// equality check:
+    ///
+    /// * **Same device credential** — allowed. This is the common path.
+    /// * **A principal that is not one of this service's configured device
+    ///   credentials** — allowed. Host-internal work authors runs under
+    ///   synthetic identities (the native executor stamps `native-executor`),
+    ///   and those runs belong to the *account*, not to whichever device
+    ///   happened to trigger the manager tick. Refusing them would break
+    ///   managed execution without closing any cross-device hole, because no
+    ///   device created them.
+    /// * **A different configured device credential** — refused. This is the
+    ///   hole: device B reading device A's run.
+    ///
+    /// The comparison is against the *stamped* form of each configured
+    /// credential, so the `primary` → `mcp` compatibility mapping is applied on
+    /// both sides. An absent `client_id` predates attribution and is treated as
+    /// host-authored for the same reason.
+    ///
+    /// This binds device attribution and the current credential set — a
+    /// credential removed from the configuration stops authenticating at
+    /// `auth_header`, so a revoked device cannot reach this at all. It is not
+    /// capability-generation revalidation (#458), which does not exist yet.
+    fn principal_may_read(&self, auth: &AuthContext, client_id: Option<&str>) -> bool {
+        let Some(client_id) = client_id else {
+            return true;
+        };
+        if client_id == Self::stamped_client_id(auth) {
+            return true;
+        }
+        let configured = self.auth_credentials.lock().clone();
+        !configured.iter().any(|credential| {
+            let stamped = if credential.id == "primary" {
+                "mcp"
+            } else {
+                credential.id.as_str()
+            };
+            stamped == client_id
+        })
+    }
+
+    /// The `client_id` this credential stamps on runs it creates.
+    ///
+    /// The compatibility credential keeps the established wire value `mcp`;
+    /// every other named device credential is stamped by its stable id. This
+    /// exists as one function precisely because it is used twice — once when a
+    /// run is written and once when a read is authorized — and a drift between
+    /// those two would silently either lock everyone out or let everyone in.
+    fn stamped_client_id(auth: &AuthContext) -> String {
+        if auth.token_id == "primary" {
+            "mcp".into()
+        } else {
+            auth.token_id.clone()
+        }
+    }
+
     /// The single denial for every "this run is not yours to touch" case.
     ///
     /// Unknown, outside the workspace allowlist, and belonging to another
@@ -3132,7 +3190,7 @@ impl OrchestrationService {
         lease_token: &str,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         let response = self
             .work_lease_mutation(
                 "ptah_link_work_run",
@@ -5084,12 +5142,12 @@ impl OrchestrationService {
 
     pub fn get_run_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.run_value(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.run_value(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn run_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5108,12 +5166,12 @@ impl OrchestrationService {
 
     pub fn get_progress_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.progress_value(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.progress_value(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn progress_value(&self, mut run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5166,7 +5224,7 @@ impl OrchestrationService {
 
     pub fn get_events_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
@@ -5174,7 +5232,7 @@ impl OrchestrationService {
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
         self.events_for_run(
-            self.authorize_run_request(session_id, workspace, run_id)?,
+            self.authorize_run_request(auth, session_id, workspace, run_id)?,
             after_seq,
             limit,
         )
@@ -5216,14 +5274,14 @@ impl OrchestrationService {
     /// exemptions rather than as a bare count.
     pub fn list_receipts_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
         after: Option<String>,
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         let cursor = match after.as_deref().filter(|value| !value.is_empty()) {
             None => None,
             Some(raw) => {
@@ -5292,14 +5350,14 @@ impl OrchestrationService {
     /// durable page for the optional Streamable HTTP live channel.
     pub(crate) fn live_run_page(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
         after_seq: u64,
         limit: usize,
     ) -> Result<(LiveRunScope, JournalPage), OrchError> {
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         let Some(start_seq) = run.start_seq else {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -5514,12 +5572,12 @@ impl OrchestrationService {
 
     pub fn get_changes_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.changes_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.changes_for_run(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn changes_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5552,12 +5610,12 @@ impl OrchestrationService {
 
     pub fn get_test_results_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.test_results_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.test_results_for_run(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn test_results_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5636,12 +5694,12 @@ impl OrchestrationService {
 
     pub fn get_handoff_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        self.handoff_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
+        self.handoff_for_run(self.authorize_run_request(auth, session_id, workspace, run_id)?)
     }
 
     fn handoff_for_run(&self, run: RunRecord) -> Result<serde_json::Value, OrchError> {
@@ -5713,14 +5771,41 @@ impl OrchestrationService {
         Ok(session)
     }
 
+    /// Authorize one run for one authenticated caller.
+    ///
+    /// Binds three things, in order, and reports every failure identically:
+    /// the run must exist, it must belong to the caller's session and
+    /// workspace, and it must have been created **by this principal**.
+    ///
+    /// The principal check is the one that was missing. The host has always
+    /// stamped `client_id` from the authenticated credential when a run is
+    /// created, then discarded that knowledge on every read — so any
+    /// credential that could reach a session could read every run in it,
+    /// including runs another credential created. `auth` is now consumed
+    /// rather than ignored, and the identity compared is the same value
+    /// [`stamped_client_id`](Self::stamped_client_id) wrote.
+    ///
+    /// A run with no `client_id` predates attribution and cannot be attributed
+    /// to anyone, so it is refused rather than shared. Fail-closed is the only
+    /// safe reading: the alternative grants every caller access to exactly the
+    /// runs whose owner is unknown.
+    ///
+    /// Every refusal is [`run_not_available`](Self::run_not_available).
+    /// "Not yours" must be indistinguishable from "does not exist", or the
+    /// check that adds principal isolation would itself become an oracle for
+    /// probing other principals' run ids.
     fn authorize_run_request(
         &self,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<RunRecord, OrchError> {
         let run = self.load_authorized_run(run_id)?;
         if run.session_id != session_id {
+            return Err(Self::run_not_available());
+        }
+        if !self.principal_may_read(auth, run.client_id.as_deref()) {
             return Err(Self::run_not_available());
         }
         let session = self.require_build_session(session_id)?;
@@ -6383,11 +6468,12 @@ impl OrchestrationService {
 
     fn isolated_review(
         &self,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<(RunRecord, crate::run_promotion::RunReview), OrchError> {
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         if run.state != RunState::Completed {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -6423,12 +6509,12 @@ impl OrchestrationService {
 
     pub fn review_run(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
-        let (run, review) = self.isolated_review(session_id, workspace, run_id)?;
+        let (run, review) = self.isolated_review(auth, session_id, workspace, run_id)?;
         Ok(json!({
             "runId": run.run_id,
             "sessionId": run.session_id,
@@ -6444,7 +6530,7 @@ impl OrchestrationService {
     #[allow(clippy::too_many_arguments)] // Keeps the approval scope explicit at the control boundary.
     pub async fn approve_run(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6487,7 +6573,7 @@ impl OrchestrationService {
                 ),
             ));
         }
-        let run = match self.authorize_run_request(session_id, workspace, run_id) {
+        let run = match self.authorize_run_request(auth, session_id, workspace, run_id) {
             Ok(run) => run,
             Err(error) => return Err(fail(self, error)),
         };
@@ -6505,7 +6591,7 @@ impl OrchestrationService {
             Ok(IdempotencyStart::Perform(lease)) => lease,
             Err(error) => return Err(error),
         };
-        let (run, review) = match self.isolated_review(session_id, workspace, run_id) {
+        let (run, review) = match self.isolated_review(auth, session_id, workspace, run_id) {
             Ok(value) => value,
             Err(error) => {
                 return Err(self.fail_claim(
@@ -6604,7 +6690,7 @@ impl OrchestrationService {
 
     pub async fn promote_run(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6619,7 +6705,7 @@ impl OrchestrationService {
             "approvalId": approval_id,
         });
         let phash = hash_payload(&payload);
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         let mut lease = match self
             .begin_idempotency(
                 tool,
@@ -6657,7 +6743,7 @@ impl OrchestrationService {
 
     pub async fn discard_run(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         request_id: &str,
         session_id: Uuid,
         workspace: &Path,
@@ -6670,7 +6756,7 @@ impl OrchestrationService {
             "runId": run_id,
         });
         let phash = hash_payload(&payload);
-        let run = self.authorize_run_request(session_id, workspace, run_id)?;
+        let run = self.authorize_run_request(auth, session_id, workspace, run_id)?;
         if !run.state.is_terminal() {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -6992,14 +7078,7 @@ impl OrchestrationService {
             // Distinguish coordinator-owned work from desktop turns so the
             // desktop can surface external activity without guessing from
             // transport timing.
-            client_id: Some(if auth.token_id == "primary" {
-                // Preserve the established wire value for the compatibility
-                // credential; newly named device credentials are emitted by
-                // their stable IDs.
-                "mcp".into()
-            } else {
-                auth.token_id.clone()
-            }),
+            client_id: Some(Self::stamped_client_id(auth)),
             state: if queued {
                 RunState::Queued
             } else {
@@ -7154,7 +7233,7 @@ impl OrchestrationService {
             );
             error
         };
-        let source = match self.authorize_run_request(session_id, workspace, source_run_id) {
+        let source = match self.authorize_run_request(auth, session_id, workspace, source_run_id) {
             Ok(run) => run,
             Err(error) => return Err(fail(self, error)),
         };

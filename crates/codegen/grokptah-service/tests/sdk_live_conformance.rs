@@ -33,6 +33,7 @@ use grokptah_agent_bridge::{
 use grokptah_agent_sdk::conformance::{self, CheckOutcome, Harness};
 use grokptah_agent_sdk::prelude::*;
 use grokptah_agent_sdk::service::{McpTransport, ServiceControlPlane, TransportFault};
+use grokptah_service::{start_service, ServiceConfig};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -427,5 +428,206 @@ async fn the_live_host_states_its_own_contract_version() {
         connected.document.host.host_version,
         connected.document.contract_version
     );
+    service.stop_and_wait().await;
+}
+
+// ── Two principals ────────────────────────────────────────────────────────
+
+/// A second credential on the same host, same session, same workspace.
+///
+/// This is the check the single-owner harness had to skip, and it is the one
+/// that matters most: the host stamps `client_id` from the authenticated
+/// credential when a run is created, and until this branch it discarded that
+/// on every read. Any credential that could reach a session could read every
+/// run in it, including runs another credential created.
+///
+/// Two properties are asserted together, and the second is as important as the
+/// first: the foreign principal is refused, **and** its refusal is
+/// byte-identical to the refusal for a run that does not exist. A principal
+/// check that answered "exists but not yours" differently from "no such run"
+/// would close the read and open an oracle for probing other principals' run
+/// ids.
+#[tokio::test]
+async fn a_second_principal_cannot_read_the_first_principals_run() {
+    const OTHER_TOKEN: &str = "second-principal-token-with-enough-entropy";
+
+    let env = ServiceEnv::new();
+    let workspace = env.workspace_path();
+
+    let config = ServiceConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TOKEN,
+        vec![workspace.clone()],
+        false,
+        4,
+        std::time::Duration::from_secs(8),
+    )
+    .expect("valid service config")
+    .with_runtime_home(env._home.path())
+    .expect("valid runtime home");
+    let config = ServiceConfig {
+        client_credentials: vec![
+            grokptah_agent_bridge::orchestration::AuthCredential::new("primary", TOKEN)
+                .expect("primary credential"),
+            grokptah_agent_bridge::orchestration::AuthCredential::new("second", OTHER_TOKEN)
+                .expect("second credential"),
+        ],
+        ..config
+    };
+    let service = start_service(config).await.expect("start service");
+
+    // Principal A creates the session and submits the run.
+    let harness = live_harness(&env, service.addr, service.host()).await;
+    let accepted = harness
+        .plane
+        .submit_task(TaskSubmission {
+            request_id: harness.next_request_id(),
+            session_id: harness.session.session_id.clone(),
+            workspace: harness.session.workspace.clone(),
+            prompt: "owned by the first principal".into(),
+            bounds: None,
+            execution_mode: ExecutionMode::Shared,
+            allow_queue: false,
+        })
+        .await
+        .expect("principal A submits");
+
+    // Principal A can read its own run. Without this the test would pass even
+    // if the binding refused everyone.
+    let selector = RunSelector {
+        session_id: harness.session.session_id.clone(),
+        workspace: harness.session.workspace.clone(),
+        run_id: accepted.run_id.clone(),
+    };
+    harness
+        .plane
+        .observe_run(selector.clone())
+        .await
+        .expect("the owning principal reads its own run");
+
+    // Principal B: a different credential on the same host, reaching the same
+    // session and the same allowlisted workspace.
+    let mut other_client = McpControlClient::new(format!("http://{}", service.addr), OTHER_TOKEN);
+    other_client.initialize().await.expect("initialize as B");
+    let other_plane = ServiceControlPlane::read_only(LiveTransport {
+        client: Mutex::new(other_client),
+    })
+    .with_operator_authority();
+
+    // B learns the workspace legitimately — the host reports it to B too, so
+    // this is not a forged reference.
+    let b_sessions = other_plane
+        .list_sessions(PageRequest::new())
+        .await
+        .expect("B lists sessions");
+    let b_session = b_sessions
+        .items
+        .into_iter()
+        .next()
+        .expect("B sees the session; the workspace is allowlisted for B as well");
+
+    let foreign_read = other_plane
+        .observe_run(RunSelector {
+            session_id: b_session.session_id.clone(),
+            workspace: b_session.workspace.clone(),
+            run_id: accepted.run_id.clone(),
+        })
+        .await
+        .expect_err("a second principal must not read the first principal's run");
+
+    let unknown_read = other_plane
+        .observe_run(RunSelector {
+            session_id: b_session.session_id.clone(),
+            workspace: b_session.workspace.clone(),
+            run_id: RunId::new("run-that-never-existed").unwrap(),
+        })
+        .await
+        .expect_err("an unknown run is refused");
+
+    assert_eq!(
+        foreign_read.code, unknown_read.code,
+        "a foreign run must be refused exactly like one that does not exist"
+    );
+    assert_eq!(foreign_read.code, SdkErrorCode::ForbiddenScope);
+    assert_eq!(
+        foreign_read.message, unknown_read.message,
+        "the refusal message must not distinguish them either"
+    );
+
+    // Receipts obey the same fence.
+    let foreign_receipts = other_plane
+        .list_receipts(
+            RunSelector {
+                session_id: b_session.session_id.clone(),
+                workspace: b_session.workspace.clone(),
+                run_id: accepted.run_id.clone(),
+            },
+            PageRequest::new(),
+        )
+        .await
+        .expect_err("a second principal must not read the first principal's receipts");
+    assert_eq!(foreign_receipts.code, SdkErrorCode::ForbiddenScope);
+
+    service.stop_and_wait().await;
+}
+
+/// Session creation is idempotent end to end, against the real host.
+///
+/// The SDK used to build `ptah_create_session` arguments from the workspace
+/// and title only, silently dropping the `request_id` the caller supplied — so
+/// a timeout could create a second session even after the host learned how to
+/// deduplicate. This drives the whole path: the key goes on the wire, the host
+/// records a receipt, and the exact retry replays the original session rather
+/// than minting another.
+#[tokio::test]
+async fn creating_a_session_twice_under_one_key_yields_one_session() {
+    let env = ServiceEnv::new();
+    let service = start_isolated(&env, vec![env.workspace_path()], 4).await;
+    let harness = live_harness(&env, service.addr, service.host()).await;
+
+    let before = harness
+        .plane
+        .list_sessions(PageRequest::new())
+        .await
+        .expect("list before")
+        .items
+        .len();
+
+    let key = harness.next_request_id();
+    let request = CreateSessionRequest {
+        request_id: key.clone(),
+        workspace: harness.session.workspace.clone(),
+        title: None,
+    };
+
+    let first = harness
+        .plane
+        .create_session(request.clone())
+        .await
+        .expect("first create");
+    let second = harness
+        .plane
+        .create_session(request)
+        .await
+        .expect("exact retry replays rather than creating a second session");
+
+    assert_eq!(
+        first.session_id, second.session_id,
+        "the same key produced two different sessions"
+    );
+
+    let after = harness
+        .plane
+        .list_sessions(PageRequest::new())
+        .await
+        .expect("list after")
+        .items
+        .len();
+    assert_eq!(
+        after,
+        before + 1,
+        "exactly one session should have been created across two calls"
+    );
+
     service.stop_and_wait().await;
 }

@@ -4885,9 +4885,18 @@ impl OrchStore {
             }
             found.push(receipt);
         }
+        // Order on exactly the key the cursor encodes.
+        //
+        // Sorting by the full `created_at` while the cursor carries only
+        // milliseconds is not a cosmetic mismatch: two receipts inside one
+        // millisecond whose sub-millisecond order is the inverse of their
+        // request-id order straddle the boundary, and the second is skipped on
+        // resume. Truncating here makes the comparison the pager performs and
+        // the comparison the ordering performs the same comparison.
         found.sort_by(|a, b| {
             a.created_at
-                .cmp(&b.created_at)
+                .timestamp_millis()
+                .cmp(&b.created_at.timestamp_millis())
                 .then_with(|| a.request_id.cmp(&b.request_id))
         });
         if let Some((millis, request_id)) = after {
@@ -5438,6 +5447,77 @@ fn write_json_exclusive<T: serde::Serialize>(path: &Path, value: &T) -> std::io:
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Two receipts in the same millisecond, whose sub-millisecond order is the
+    /// inverse of their request-id order, must both survive a paged walk.
+    ///
+    /// This is the exact shape the old code lost. Ordering compared the full
+    /// `created_at` while the cursor carried only milliseconds, so the pair
+    /// straddled the page boundary in opposite directions and the second was
+    /// skipped on resume. Ordering and paging now use the same truncated key.
+    #[test]
+    fn same_millisecond_receipts_with_inverse_ids_are_never_skipped() {
+        let root = tempfile::tempdir().expect("temp root");
+        let store = OrchStore::open(root.path()).expect("open store");
+
+        // `bbb` is earlier in the millisecond but later by id; `aaa` is later
+        // in the millisecond but earlier by id. Under the old comparison these
+        // disagreed and one fell through the boundary.
+        // Pinned to a millisecond boundary so the sub-millisecond offset
+        // cannot spill into the next millisecond and dissolve the fixture.
+        let base = chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+            .expect("fixed millisecond boundary");
+        let earlier_sub_ms = base;
+        let later_sub_ms = base + Duration::nanoseconds(400_000);
+        assert_eq!(
+            earlier_sub_ms.timestamp_millis(),
+            later_sub_ms.timestamp_millis(),
+            "the fixture must place both inside one millisecond"
+        );
+
+        for (request_id, created_at) in [("bbb", earlier_sub_ms), ("aaa", later_sub_ms)] {
+            store
+                .save_idempotency(&IdempotencyReceipt {
+                    request_id: request_id.into(),
+                    payload_hash: format!("{request_id}-hash"),
+                    run_id: Some("run-precision".into()),
+                    tool: "ptah_submit_task".into(),
+                    response: serde_json::json!({}),
+                    error: None,
+                    created_at,
+                    status: "complete".into(),
+                })
+                .expect("save receipt");
+        }
+
+        // Walk one at a time, exactly as a paging consumer would.
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<(i64, String)> = None;
+        for _ in 0..8 {
+            let (page, has_more) = store
+                .list_idempotency_for_run("run-precision", cursor.clone(), 1)
+                .expect("list page");
+            let Some(receipt) = page.into_iter().next() else {
+                break;
+            };
+            cursor = Some((
+                receipt.created_at.timestamp_millis(),
+                receipt.request_id.clone(),
+            ));
+            seen.push(receipt.request_id);
+            if !has_more {
+                break;
+            }
+        }
+
+        assert_eq!(
+            seen,
+            vec!["aaa".to_string(), "bbb".to_string()],
+            "a one-at-a-time walk must return both receipts, in the cursor's own order"
+        );
+    }
+
     use super::*;
     use crate::orchestration::types::RunPurpose;
     use crate::orchestration::types::{

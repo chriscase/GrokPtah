@@ -979,6 +979,19 @@ impl<T: McpTransport> AgentControlPlane for ServiceControlPlane<T> {
         self.authority.require("create_session")?;
         let workspace = self.resolve_workspace(&request.workspace)?;
 
+        // Whether this host accepts an idempotency key on session creation.
+        // `ptah_get_host_info` and the `request_id` argument landed in the same
+        // contract minor, so the tool's presence is an exact proxy — and it is
+        // checked rather than assumed, because an older host declares
+        // `additionalProperties: false` and would reject the key outright.
+        let idempotent = self
+            .transport
+            .list_tools()
+            .await
+            .map_err(TransportFault::into_sdk_error)?
+            .iter()
+            .any(|name| name == tools::HOST_INFO);
+
         let mut args = Map::new();
         args.insert("workspace".into(), Value::String(workspace));
         insert_optional(
@@ -989,10 +1002,38 @@ impl<T: McpTransport> AgentControlPlane for ServiceControlPlane<T> {
                 .as_ref()
                 .map(|title| Value::String(title.as_str().to_string())),
         );
+        if idempotent {
+            args.insert(
+                "request_id".into(),
+                Value::String(request.request_id.as_str().to_string()),
+            );
+        }
 
         let body = self
             .call(tools::CREATE_SESSION, Value::Object(args))
-            .await?;
+            .await
+            .map_err(|error| {
+                if idempotent {
+                    return error;
+                }
+                // Without a key on the wire, a dropped or ambiguous create is
+                // exactly the case the three-valued retry disposition exists
+                // for: the session may already exist, and retrying would make a
+                // second one. Re-code it so no caller can be told this is safe
+                // to repeat automatically.
+                match error.code {
+                    SdkErrorCode::TransportUnavailable
+                    | SdkErrorCode::Timeout
+                    | SdkErrorCode::Internal => SdkError::new(
+                        SdkErrorCode::UncertainOutcome,
+                        "session creation did not complete and this host accepts no \
+                         idempotency key, so it may or may not have been created; \
+                         reconcile with list_sessions before retrying",
+                    )
+                    .with_detail("originalCode", error.code.as_wire()),
+                    _ => error,
+                }
+            })?;
         let reported = str_field(&body, "workspace", "workspace")
             .ok_or_else(|| malformed("createSession.workspace"))?;
         let workspace = self.learn_workspace(&reported)?;
