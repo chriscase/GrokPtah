@@ -94,6 +94,16 @@ rename is the only commit point.
 Nothing is ranked by mtime, file size, or highest sequence number: the manifest
 is the sole authority for which generation is active.
 
+## Single-writer discipline
+
+The ledger relies on the process-wide `InstanceLock` (`src/instance_lock.rs`)
+rather than taking a second lock of its own, and it holds its internal lock
+across a whole append so two in-process appenders cannot be issued the same
+sequence. It also *detects* a violation it cannot prevent: before each append
+it checks that the durable anchor still matches the in-memory tail, and a
+second writer that advanced the anchor poisons with `concurrent_writer` instead
+of interleaving two chains into one journal.
+
 ## Retention
 
 The only path that deletes bytes. It requires a **sealed, non-current** generation,
