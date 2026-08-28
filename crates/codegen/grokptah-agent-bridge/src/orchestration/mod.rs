@@ -11,7 +11,7 @@ mod routine;
 mod service;
 mod store;
 mod supervisor;
-mod types;
+pub(crate) mod types;
 mod worker;
 mod workload;
 
@@ -67,11 +67,10 @@ pub use types::{
     safe_id_filename, AgentAuthorityPolicy, AgentLaneAssociation, AgentMemoryPolicy,
     AgentModelSpec, AgentRecord, AgentResumePlan, AgentRuntimeState, AgentSpec, AgentState,
     AuditEntry, ChangeRecord, ContinuationCheckpoint, ContinuationReason, IdempotencyReceipt,
-    IdempotencyScope, OrchError, OrchErrorCode, PromotionState, RunAggregates, RunApproval,
-    RunBounds, RunExecution, RunExecutionMode, RunProgress, RunPurpose, RunRecord, RunState,
-    RunStopCause, TestObservation, AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS,
-    DEFAULT_AGENT_TOOL_IDS, DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS,
-    HOST_AUTHORED_CLIENT_ID, MAX_AGENT_CONTEXT_BYTES,
+    OrchError, OrchErrorCode, PromotionState, RunAggregates, RunApproval, RunBounds, RunExecution,
+    RunExecutionMode, RunProgress, RunPurpose, RunRecord, RunState, RunStopCause, TestObservation,
+    AGENT_SPEC_SCHEMA_VERSION, CONTROL_TOOLS, DEFAULT_AGENT_TOOL_IDS,
+    DEFAULT_PERSISTENT_AGENT_MAX_TOTAL_TOKENS, FORBIDDEN_TOOLS, MAX_AGENT_CONTEXT_BYTES,
 };
 pub use worker::{
     reject_privilege_amplification, MeasuredCapability, WorkerHostKind, WorkerLivenessState,

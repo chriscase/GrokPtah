@@ -1966,15 +1966,11 @@ impl OrchestrationService {
     /// can reach. Deriving it twice from two different values is how the two
     /// fences would drift.
     fn idempotency_scope(auth: &AuthContext) -> IdempotencyScope {
-        IdempotencyScope::for_client_id(&Self::stamped_client_id(auth))
+        IdempotencyScope::of(auth)
     }
 
     fn stamped_client_id(auth: &AuthContext) -> String {
-        if auth.token_id == "primary" {
-            "mcp".into()
-        } else {
-            auth.token_id.clone()
-        }
+        super::types::stamped_client_id(auth)
     }
 
     /// The single denial for every "this run is not yours to touch" case.

@@ -195,14 +195,87 @@ different failure with a different correct answer. So the fault is now injected
 around a real transport — `PostEffectDisconnect` makes the call, waits for the
 host to act, and only then discards the response.
 
-`a_lost_response_is_reconciled_after_a_real_restart` drives the whole sequence:
-the caller creates a session under a key and never sees the answer; the effect
-is shown to be durable *before* anything restarts, so a later failure cannot be
-blamed on the write never happening; the service process stops and a genuinely
-new one starts against the same durable home; the caller retries the same key
-and is handed the session it already has. Not a second one, and not nothing.
-The session count is asserted at each step, so both failure directions — a lost
-effect and a duplicated one — fail the test.
+Two tests, deliberately separated, because they prove different things.
+
+`a_lost_response_is_reconciled_after_a_host_restart_in_process` isolates the
+host lifecycle: the caller creates a session under a key and never sees the
+answer; the effect is shown durable *before* anything restarts, so a later
+failure cannot be blamed on the write never happening; the host stops and
+reopens against the same home; the retry is handed the session it already has.
+**This is not a process restart** — an earlier version of this document called
+it one, which it is not: the allocator, the tokio runtime, every `static` and
+the advisory instance lock all survive a stop-and-reopen in one test process.
+
+`a_killed_service_process_replays_its_receipt_to_a_second_process` is the
+process-boundary proof, and the one that answers the review. It spawns the
+`grokptah-service` **binary** as a child OS process over a real socket, takes
+the mutation there, discards the response before the caller sees it, then
+**SIGKILLs** the child — no unwinding, no `Drop`, no flush, so whatever is on
+disk is whatever was already committed. A second child starts against the same
+home; the test asserts the two PIDs differ, that the effect survived, and that
+retrying the key returns the existing session. It also proves in passing that
+the advisory instance lock is released by process death rather than by a clean
+shutdown path.
+
+Both assert the session count at every step, so both failure directions — a
+lost effect and a duplicated one — fail. Verified as guards, not assumed:
+pointing the second child at a *different* home fails the durability assertion
+(`left: 0, right: 2`) rather than passing quietly. `ChildService` kills its
+child from `Drop`, so a failing assertion cannot leak a process that would hold
+a port, a home and the instance lock and make the *next* test fail for an
+unrelated reason.
+
+### F-9 — The scope was sealed by convention, not by the type (fixed)
+
+Review's sharpest point, and correct. F-6 scoped the *storage*, but left every
+key to that storage public: `IdempotencyScope` was re-exported from the crate
+root, `for_client_id` took a `&str`, `HOST_AUTHORED_CLIENT_ID` was a public
+constant, and eight `OrchStore` methods were `pub fn` taking a scope. So any
+in-process or out-of-tree caller could spell another principal's scope — or the
+host's — and read, claim, settle or list its receipts, and mint cursors for
+them. The HTTP fence was real; the boundary underneath it was decorative.
+
+Three changes, all structural:
+
+* **A scope cannot be built from a string.** `for_client_id(&str)` is gone. The
+  only constructors are `of(&AuthContext)` — which requires the caller's own
+  authenticated context — and `host()`, the single named host identity. Naming
+  a namespace now requires the authority it stands for.
+* **Nothing is re-exported.** `IdempotencyScope` and `HOST_AUTHORED_CLIENT_ID`
+  are `pub(crate)` and absent from the crate root, so no caller outside this
+  crate can name either.
+* **Every receipt method is `pub(crate)`.** `save`, `load`, `claim`, `complete`,
+  `fail`, `list_idempotency_for_run`, `receipt_cursor` and
+  `parse_receipt_cursor`.
+
+`no_public_function_accepts_a_scope` keeps it that way as a source-level guard —
+verified to fail when one method is made `pub` again. A behavioural test would
+not notice: a `pub fn` handed a scope compiles and passes everything else in the
+file.
+
+The sharp remaining case is stated rather than hidden:
+`the_host_namespace_is_not_reachable_by_spelling_its_name` asserts that a
+credential *named* `native-executor` does land in the host scope. That is a
+deployment constraint on credential naming, not something this type can close.
+
+### F-10 — Settlement rewrote the page ordering key (fixed)
+
+`finish_idempotency` stamped `created_at = Utc::now()`, so the key a listing
+orders by was mutable. The failure is precise: a caller takes page one and holds
+a cursor at the receipt it just saw; that receipt is still pending; it settles;
+its key jumps *past* the cursor; page two hands the caller the same receipt
+again.
+
+The claim time is now immutable for the receipt's whole life, and settlement is
+recorded separately as `settledAt`. Retention still ranks by settlement (falling
+back to the claim for a receipt that never settled), because ageing a settled
+receipt from a moment before its work began would be wrong in the other
+direction.
+
+`settling_a_receipt_does_not_move_it_past_an_issued_cursor` is written in the
+failing shape — the receipt that settles mid-walk is the one page one already
+returned — and was confirmed to fail against the original code
+(`["beta", "alpha"]`) before the fix.
 
 ### F-7 — The page cursor was a claim, not a check (fixed)
 
@@ -385,6 +458,19 @@ as a new request rather than replayed. This is deliberate — the alternative is
 to guess an owner for a record that has none — but it is a one-time behaviour
 change and a host operator should know it happens rather than discover it.
 
+**R10 — The scope is derived from the stamped credential id, and that is
+provisional.** It is *not* canonical authority: there is no owner identity, no
+auth generation, and no delegation chain in it, so a renamed credential is a
+different principal and a reused name inherits the old namespace without an
+epoch to separate them. That binding belongs to #460/#458. What is done here is
+to make the eventual change a migration rather than a silent orphaning: every
+receipt records `SCOPE_DERIVATION_VERSION` alongside its scope, so a canonical
+rule arrives as version 2 with a readable before and after. The digest was also
+widened from 64 to 128 bits — enough is not the same as ample for a value that
+separates principals. `scope_follows_the_credential_and_records_how_it_was_derived`
+pins both consequences so neither is a surprise. **No consumer may read the
+current scope as canonical identity.**
+
 **R9 — Two live fault checks still skip.**
 `faults.lost_connection_is_safely_retryable` and
 `faults.uncertain_send_is_never_auto_retried` remain skipped in both matrices:
@@ -422,18 +508,20 @@ authority.
 | SDK `fmt` / `clippy -D warnings` / `test --locked` | clean; 125 tests |
 | SDK feature matrix (default / none / fake / conformance) | clean |
 | Reference consumer `fmt` / `clippy` / `test` | clean; 8 tests |
+| Bridge strict clippy, the exact CI command | clean apart from the two macOS-gated `computer_use` findings present at base |
 | Bridge `cargo test --locked --no-fail-fast -- --test-threads=1` | 720 passed; the 2 pre-existing failures below |
-| `sdk_live_conformance` (2 battery drivers + 8 focused) | 10 passed |
+| `sdk_live_conformance` (2 battery drivers + 9 focused) | 11 passed |
 | Live service + Desktop battery matrices | 15 passed / 0 failed / 11 skipped each, agreeing |
 
 The bridge sweep runs with `--no-fail-fast`. Without it `cargo test` stops at
 the first failing target and never reaches the ones after it — which is how an
 earlier packet reported a clean local sweep and then went red in CI.
 
-The eight focused live tests: two-principal run reads, redacted receipts, host
-contract version, session idempotency, credential rotation across a restart,
-cross-principal idempotency keys (F-6), forged page cursors (F-7), and a
-post-effect disconnect reconciled across a real restart (F-8).
+The nine focused live tests: two-principal run reads, redacted receipts, host
+contract version, session idempotency, credential rotation across a host
+restart, cross-principal idempotency keys (F-6), forged page cursors (F-7), a
+post-effect disconnect reconciled across a host restart, and the same fault
+reconciled across a **SIGKILLed child process** (F-8).
 
 The failures are **established pre-existing** rather than assumed. Each was
 re-run with the bridge source reverted to the base — whose tree (`3a801b5e`) is
@@ -453,6 +541,16 @@ byte-identical to `origin/main` — and failed identically there:
 
 All are Linux-container artifacts; the hosted `desktop` job runs macOS, where
 the native keychain backend applies and none reproduces.
+
+### Service-crate clippy
+
+`cargo clippy --all-targets -D warnings` on `grokptah-service` reports two
+dead-code findings in `tests/common/mod.rs` (`other_workspace`,
+`other_workspace_path`). That module is compiled into each of the crate's three
+test targets and those items are used by the other two, so the finding is an
+artifact of per-target dead-code analysis and is present at base. Nothing in
+this branch touches `tests/common/mod.rs`, and CI runs `cargo test --locked
+--test sdk_live_conformance` for this crate rather than clippy.
 
 ### Bridge clippy
 

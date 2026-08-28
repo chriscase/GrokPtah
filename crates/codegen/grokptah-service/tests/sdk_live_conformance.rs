@@ -678,8 +678,229 @@ async fn creating_a_session_twice_under_one_key_yields_one_session() {
     service.stop_and_wait().await;
 }
 
-/// A mutation that lands and then loses its response is recoverable — across
-/// a real restart, in a second process.
+/// A `grokptah-service` running as a genuine child OS process.
+///
+/// `start_service` runs the host inside the test process, which is good
+/// persistence evidence and *not* a restart: the allocator, the tokio runtime,
+/// every `static`, and the advisory instance lock all survive it. Only a real
+/// process boundary proves that what came back was read from disk, and only a
+/// real kill proves it survived a process that never got to shut down.
+struct ChildService {
+    child: std::process::Child,
+    addr: std::net::SocketAddr,
+    reaped: bool,
+}
+
+impl ChildService {
+    /// Spawn the service binary against `home`, and wait for it to listen.
+    async fn spawn(home: &std::path::Path, workspace: &std::path::Path) -> Self {
+        // Ask the OS for a free port and immediately give it back. A race with
+        // another listener is possible in principle; the alternative is having
+        // the child report its port, which the binary has no flag for.
+        let addr = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe port");
+            probe.local_addr().expect("probe addr")
+        };
+
+        let child = std::process::Command::new(env!("CARGO_BIN_EXE_grokptah-service"))
+            .arg("--listen")
+            .arg(addr.to_string())
+            .arg("--token")
+            .arg(TOKEN)
+            .arg("--workspace")
+            .arg(workspace)
+            .env("GROKPTAH_HOME", home)
+            .env("GROKPTAH_AGENT_OFFLINE", "1")
+            .spawn()
+            .expect("spawn the service binary");
+
+        let mut service = Self {
+            child,
+            addr,
+            reaped: false,
+        };
+        service.wait_until_listening().await;
+        println!(
+            "spawned {} pid {} on {}",
+            env!("CARGO_BIN_EXE_grokptah-service"),
+            service.child.id(),
+            service.addr
+        );
+        service
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Poll the socket until it accepts.
+    ///
+    /// A readiness poll on the real condition, not a sleep standing in for one:
+    /// it yields rather than timing out a guess, it fails the moment the child
+    /// exits, and it has a hard deadline so a hang is a failure rather than a
+    /// hung suite.
+    async fn wait_until_listening(&mut self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll child") {
+                panic!("the service exited before listening: {status}");
+            }
+            if tokio::net::TcpStream::connect(self.addr).await.is_ok() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the service never started listening on {}",
+                self.addr
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// SIGKILL. No unwinding, no `Drop`, no flush — whatever is on disk is
+    /// whatever was already committed.
+    fn kill(mut self) {
+        self.child.kill().expect("kill the service");
+        let status = self.child.wait().expect("reap the service");
+        self.reaped = true;
+        assert!(
+            !status.success(),
+            "the process was supposed to be killed, not to exit cleanly"
+        );
+    }
+}
+
+impl Drop for ChildService {
+    /// A panicking assertion skips the explicit `kill`, and a leaked service
+    /// holds a port, a home, and the advisory instance lock — so the *next*
+    /// test fails for a reason that has nothing to do with what it asserts.
+    /// A failing test must fail alone.
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A mutation that lands and loses its response survives an abrupt kill and a
+/// **real second OS process**.
+///
+/// This is the strong form of the previous test. There the service was stopped
+/// and reopened inside one test process, which proves durability across a host
+/// instance but not across a process: statics, the allocator, the runtime and
+/// the advisory lock all persisted. Here a child process takes the mutation,
+/// the response is discarded before the caller sees it, the process is
+/// **SIGKILLed** rather than shut down, and a second process is started against
+/// the same home. Retrying the key must return the session that already exists.
+///
+/// Both failure directions fail the test: a lost effect (the retry mints a new
+/// session, or the count does not rise) and a duplicated one (the count rises
+/// twice).
+#[tokio::test]
+async fn a_killed_service_process_replays_its_receipt_to_a_second_process() {
+    let env = ServiceEnv::new();
+    let home = env._home.path().to_path_buf();
+    let workspace = env.workspace_path();
+
+    let first = ChildService::spawn(&home, &workspace).await;
+
+    // Seed one session through the raw client so the adapter has a workspace
+    // to *learn*. It is never told a path.
+    let mut seed = mcp_client(first.addr).await;
+    create_build_session(&mut seed, &workspace, "child-process-restart").await;
+
+    let (faulty, armed) = PostEffectDisconnect::connect(first.addr).await;
+    let plane = ServiceControlPlane::read_only(faulty).with_operator_authority();
+    let workspace_ref = plane
+        .list_sessions(PageRequest::new())
+        .await
+        .expect("list sessions from the child process")
+        .items
+        .into_iter()
+        .next()
+        .expect("the seeded session is visible")
+        .workspace;
+    let before = 1;
+
+    let key = RequestId::new("child-restart-key-000001").expect("valid key");
+    armed.store(true, Ordering::SeqCst);
+    let lost = plane
+        .create_session(CreateSessionRequest {
+            request_id: key.clone(),
+            workspace: workspace_ref,
+            title: Some(Label::new("created before the kill").unwrap()),
+        })
+        .await
+        .expect_err("the response was dropped, so the caller must see a fault");
+    armed.store(false, Ordering::SeqCst);
+    assert!(
+        matches!(
+            lost.code,
+            SdkErrorCode::TransportUnavailable | SdkErrorCode::UncertainOutcome
+        ),
+        "a lost response must not be reported as a clean failure, got {:?}",
+        lost.code
+    );
+
+    // Killed, not stopped. Nothing gets to run on the way out.
+    drop(plane);
+    let first_pid = first.pid();
+    first.kill();
+
+    let second = ChildService::spawn(&home, &workspace).await;
+    assert_ne!(
+        first_pid,
+        second.pid(),
+        "the second service must be a different OS process"
+    );
+    let reconnected = ServiceControlPlane::read_only(LiveTransport::connect(second.addr).await)
+        .with_operator_authority();
+
+    let survivors = reconnected
+        .list_sessions(PageRequest::new())
+        .await
+        .expect("the second process reports what survived")
+        .items;
+    assert_eq!(
+        survivors.len(),
+        before + 1,
+        "the mutation must have survived a process that was killed mid-flight"
+    );
+    let known: Vec<_> = survivors
+        .iter()
+        .map(|session| session.session_id.clone())
+        .collect();
+
+    let recovered = reconnected
+        .create_session(CreateSessionRequest {
+            request_id: key,
+            workspace: survivors[0].workspace.clone(),
+            title: Some(Label::new("created before the kill").unwrap()),
+        })
+        .await
+        .expect("retrying the key in a new process must reconcile, not fail");
+    assert!(
+        known.contains(&recovered.session_id),
+        "the retry minted a new session instead of replaying the durable one"
+    );
+    assert_eq!(
+        reconnected
+            .list_sessions(PageRequest::new())
+            .await
+            .expect("list after reconciliation")
+            .items
+            .len(),
+        before + 1,
+        "reconciliation created a second session"
+    );
+
+    second.kill();
+}
+
+/// A mutation that lands and then loses its response is recoverable across a
+/// **host restart inside one process**.
 ///
 /// This is the case the three-valued retry disposition and the durable receipt
 /// exist for, and it cannot be produced honestly by a fake: dropping a call
@@ -687,12 +908,16 @@ async fn creating_a_session_twice_under_one_key_yields_one_session() {
 /// So the fault is injected around a real transport, after the host has
 /// already acted.
 ///
-/// The sequence is the real one. The caller creates a session under a key and
-/// never sees the answer. The service process stops. A new process starts
-/// against the same durable home. The caller retries the same key and must be
-/// handed **the session it already has** — not a second one, and not nothing.
+/// **What this does and does not prove.** The service is stopped and a new one
+/// opened against the same durable home, in the same test process: the
+/// allocator, the tokio runtime, every `static` and the advisory instance lock
+/// all survive. That is real evidence about the host lifecycle and the store,
+/// and it is *not* a process restart — an earlier version of this comment said
+/// it was. `a_killed_service_process_replays_its_receipt_to_a_second_process`
+/// is the process-boundary proof; this one is kept because it isolates the
+/// host-lifecycle half from process teardown.
 #[tokio::test]
-async fn a_lost_response_is_reconciled_after_a_real_restart() {
+async fn a_lost_response_is_reconciled_after_a_host_restart_in_process() {
     let env = ServiceEnv::new();
     let workspace = env.workspace_path();
 
@@ -782,7 +1007,7 @@ async fn a_lost_response_is_reconciled_after_a_real_restart() {
         .map(|session| session.session_id.clone())
         .collect();
 
-    // A genuine second process against the same durable home.
+    // A second host instance against the same durable home — same process.
     drop(plane);
     service.stop_and_wait().await;
     let service = start_service(config()).await.expect("restart service");
@@ -792,7 +1017,7 @@ async fn a_lost_response_is_reconciled_after_a_real_restart() {
     let reconnected_workspace = reconnected
         .list_sessions(PageRequest::new())
         .await
-        .expect("the new process reports its sessions")
+        .expect("the reopened host reports its sessions")
         .items
         .into_iter()
         .next()
@@ -806,7 +1031,7 @@ async fn a_lost_response_is_reconciled_after_a_real_restart() {
             title: Some(Label::new("created behind a lost response").unwrap()),
         })
         .await
-        .expect("retrying the key after a restart must reconcile, not fail");
+        .expect("retrying the key after the host reopens must reconcile, not fail");
 
     assert!(
         created.contains(&recovered.session_id),

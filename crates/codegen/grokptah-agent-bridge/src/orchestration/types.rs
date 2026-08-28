@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::authz::AuthContext;
 use crate::completion::{CompletionEvidence, CompletionUsage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1249,23 +1250,51 @@ fn validate_bounded_string(value: &str, max_bytes: usize, field: &str) -> Result
 /// `AuthContext` this service issues carries that account's `owner_id`, so
 /// hashing the owner in as well would separate nothing the directory does not
 /// already separate while giving the two fences different keys.
+///
+/// # Sealing
+///
+/// A scope is **not constructible from a string**. The only two ways to obtain
+/// one are [`of`](Self::of), which requires the caller's own [`AuthContext`],
+/// and [`host`](Self::host), the single named host identity. Nothing — inside
+/// this crate or outside it — can name another principal's namespace without
+/// holding that principal's authenticated context, and the type is not
+/// re-exported from the crate root at all.
+///
+/// That is the difference between a fence and a convention. A `for_client_id`
+/// taking `&str` would have let any in-process caller mint any scope, which
+/// makes the storage boundary decorative however carefully the HTTP surface
+/// is gated.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdempotencyScope(String);
+pub(crate) struct IdempotencyScope(String);
 
 impl IdempotencyScope {
     /// Width of the on-disk prefix. Fixed, so a stored name parses by position.
-    pub(crate) const WIDTH: usize = 16;
+    ///
+    /// 32 hex characters — 128 bits of the digest. The first cut took 64, which
+    /// is more than enough against accident and less than one wants for a value
+    /// that separates principals.
+    pub(crate) const WIDTH: usize = 32;
 
     /// The scope of work this host authored for itself (the native executor,
     /// managed intents, in-process resume). Named, never inferred from absence.
-    pub fn host() -> Self {
-        Self::for_client_id(HOST_AUTHORED_CLIENT_ID)
+    pub(crate) fn host() -> Self {
+        Self::derive(HOST_AUTHORED_CLIENT_ID)
     }
 
-    /// The scope of a caller stamped with `client_id`.
-    pub fn for_client_id(client_id: &str) -> Self {
+    /// The scope belonging to an authenticated caller.
+    ///
+    /// Takes the `AuthContext` rather than a client id so a scope cannot be
+    /// named without the authority it stands for.
+    pub(crate) fn of(auth: &AuthContext) -> Self {
+        Self::derive(&stamped_client_id(auth))
+    }
+
+    /// Private on purpose: the two entry points above are the whole API.
+    fn derive(client_id: &str) -> Self {
         use sha2::{Digest, Sha256};
-        let digest = hex_sha256(&Sha256::digest(client_id.as_bytes()));
+        let digest = hex_sha256(&Sha256::digest(
+            format!("{SCOPE_DERIVATION_VERSION}\u{1f}{client_id}").as_bytes(),
+        ));
         Self(digest[..Self::WIDTH].to_string())
     }
 
@@ -1277,8 +1306,33 @@ impl IdempotencyScope {
         Self(value.to_string())
     }
 
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Which rule produced a scope value.
+///
+/// Recorded in every receipt so a later change to the derivation — binding to
+/// canonical #460 principal identity, an auth generation, a delegation chain —
+/// is a **deliberate migration** with a readable before and after, rather than
+/// a silent orphaning of every receipt written under the old rule.
+///
+/// `1` is the provisional rule: the stamped credential id. It is not canonical
+/// authority and this crate does not claim it is.
+pub(crate) const SCOPE_DERIVATION_VERSION: u32 = 1;
+
+/// The `client_id` a credential stamps on the runs and receipts it creates.
+///
+/// Lives here, beside the scope that consumes it, because the run fence and
+/// the receipt fence must not derive ownership from two different values. The
+/// compatibility credential keeps the established wire value `mcp`; every other
+/// named device credential is stamped by its stable id.
+pub(crate) fn stamped_client_id(auth: &AuthContext) -> String {
+    if auth.token_id == "primary" {
+        "mcp".into()
+    } else {
+        auth.token_id.clone()
     }
 }
 
@@ -1286,7 +1340,7 @@ impl IdempotencyScope {
 ///
 /// Declared here because both the run fence and the idempotency scope depend
 /// on it, and a second definition is how the two would drift.
-pub const HOST_AUTHORED_CLIENT_ID: &str = "native-executor";
+pub(crate) const HOST_AUTHORED_CLIENT_ID: &str = "native-executor";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1308,7 +1362,20 @@ pub struct IdempotencyReceipt {
     /// Durable rejected/failed outcome. Exact retries replay this error.
     #[serde(default)]
     pub error: Option<OrchError>,
+    /// When the key was **claimed**. Immutable for the receipt's whole life.
+    ///
+    /// Settlement used to overwrite this with `Utc::now()`, which made the
+    /// page ordering mutable: a pending receipt claimed before an issued
+    /// cursor would settle, jump ahead of that cursor, and be handed to the
+    /// caller a second time on the next page. A key that orders a listing has
+    /// to be one the listing cannot change underneath a walk.
     pub created_at: DateTime<Utc>,
+    /// When the receipt reached `complete` or `failed`. `None` while pending.
+    ///
+    /// Separated from `created_at` rather than replacing it, so settlement can
+    /// be observed without moving the receipt in the order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_at: Option<DateTime<Utc>>,
     /// pending | complete | failed
     #[serde(default = "default_receipt_status")]
     pub status: String,

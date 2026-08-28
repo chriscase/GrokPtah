@@ -2133,7 +2133,7 @@ impl AgentHostHandle {
         // In-process resume is host-authored work: there is no bearer here,
         // and the identity is the one the run fence names rather than one
         // inferred from the absence of a caller.
-        let scope = crate::orchestration::IdempotencyScope::host();
+        let scope = crate::orchestration::types::IdempotencyScope::host();
         match store.claim_idempotency(
             &scope,
             "persistent_agent_resume",
@@ -11964,7 +11964,7 @@ mod tests {
         assert_eq!(host.list_session_runs(session_id).unwrap().len(), run_count);
         let receipt = store
             .load_idempotency(
-                &crate::orchestration::IdempotencyScope::host(),
+                &crate::orchestration::types::IdempotencyScope::host(),
                 "deterministic-continuation-replay",
             )
             .unwrap()
