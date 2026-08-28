@@ -573,7 +573,7 @@ impl ComputerUseService {
                     ));
                 }
                 run.transition(ComputerRunState::Paused)?;
-                self.revoke_authority(run);
+                revoke_authority(run);
                 run.set_control_disposition(ComputerControlDisposition::Paused);
                 run.record_audit("pause", "paused", None, None, None);
                 Ok(())
@@ -588,7 +588,9 @@ impl ComputerUseService {
                     .map_err(|error| {
                         ComputerError::new(ComputerErrorCode::PermissionRevoked, error.to_string())
                     })?;
-                self.backend.cancel(run_id).await.map(|()| run)
+                let result = self.backend.cancel(run_id).await;
+                self.revoke_run_capability(run_id);
+                result.map(|()| run)
             }
             Err(error) => {
                 self.record_denial(run_id, "pause", None, &error);
@@ -619,7 +621,7 @@ impl ComputerUseService {
                 ensure_version(run, expected_version)?;
                 self.consume_durable_lease("take_over", &payload)?;
                 run.transition(ComputerRunState::Paused)?;
-                self.revoke_authority(run);
+                revoke_authority(run);
                 run.set_control_disposition(ComputerControlDisposition::OperatorTakeover);
                 run.record_audit("take_over", "operator_control", None, None, None);
                 Ok(())
@@ -634,7 +636,9 @@ impl ComputerUseService {
                     .map_err(|error| {
                         ComputerError::new(ComputerErrorCode::PermissionRevoked, error.to_string())
                     })?;
-                self.backend.cancel(run_id).await.map(|()| run)
+                let result = self.backend.cancel(run_id).await;
+                self.revoke_run_capability(run_id);
+                result.map(|()| run)
             }
             Err(error) => {
                 self.record_denial(run_id, "take_over", None, &error);
@@ -657,7 +661,7 @@ impl ComputerUseService {
                 self.consume_durable_lease("cancel", &payload)?;
                 if !run.state.is_terminal() {
                     run.transition(ComputerRunState::Cancelled)?;
-                    self.revoke_authority(run);
+                    revoke_authority(run);
                     run.set_control_disposition(ComputerControlDisposition::Stopped);
                     run.record_audit("cancel", "cancelled", None, None, None);
                 }
@@ -666,14 +670,23 @@ impl ComputerUseService {
             .and_then(|run| run.ok_or_else(unknown_run));
         let result = match cancelled {
             Ok(run) => {
-                let capability = self.require_run_capability(&run)?;
-                let lease = self.effect_lease(&capability, &run, "computer.cancel")?;
-                self.capability_authority
-                    .consume(lease, &capability.snapshot, Utc::now())
-                    .map_err(|error| {
-                        ComputerError::new(ComputerErrorCode::PermissionRevoked, error.to_string())
-                    })?;
-                self.backend.cancel(run_id).await.map(|()| run)
+                if run.state.is_terminal() && !self.run_capabilities.lock().contains_key(run_id) {
+                    Ok(run)
+                } else {
+                    let capability = self.require_run_capability(&run)?;
+                    let lease = self.effect_lease(&capability, &run, "computer.cancel")?;
+                    self.capability_authority
+                        .consume(lease, &capability.snapshot, Utc::now())
+                        .map_err(|error| {
+                            ComputerError::new(
+                                ComputerErrorCode::PermissionRevoked,
+                                error.to_string(),
+                            )
+                        })?;
+                    let result = self.backend.cancel(run_id).await;
+                    self.revoke_run_capability(run_id);
+                    result.map(|()| run)
+                }
             }
             Err(error) => {
                 self.record_denial(run_id, "cancel", None, &error);
@@ -1016,10 +1029,14 @@ impl ComputerUseService {
         }
     }
 
-    fn revoke_authority(&self, run: &mut ComputerRun) {
-        if let Some(binding) = self.run_capabilities.lock().remove(&run.run_id) {
+    fn revoke_run_capability(&self, run_id: &str) {
+        if let Some(binding) = self.run_capabilities.lock().remove(run_id) {
             let _ = self.capability_authority.revoke(&binding.snapshot);
         }
+    }
+
+    fn revoke_authority(&self, run: &mut ComputerRun) {
+        self.revoke_run_capability(&run.run_id);
         revoke_authority(run);
     }
 
