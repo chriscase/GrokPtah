@@ -9,6 +9,7 @@
 //! manifest epoch. Producing an export is not permission to delete anything.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,8 @@ pub struct CoverageElement {
     pub journal_sha256: String,
     pub journal_bytes: u64,
     pub entry_count: u64,
+    pub key_id: String,
+    pub key_epoch: u32,
     /// `false` for imported legacy bytes: preserved, never vouched for.
     pub origin_authenticated: bool,
     pub preceding_loss_unknown: bool,
@@ -187,6 +190,8 @@ impl AuditLedger {
                     journal_sha256: tombstone.journal_sha256.clone(),
                     journal_bytes: tombstone.journal_bytes,
                     entry_count: tombstone.entry_count,
+                    key_id: descriptor.key_id.clone(),
+                    key_epoch: descriptor.key_epoch,
                     origin_authenticated: descriptor.origin_authenticated,
                     preceding_loss_unknown: descriptor.preceding_loss_unknown,
                     retention_epoch: Some(tombstone.retention_epoch),
@@ -204,6 +209,8 @@ impl AuditLedger {
                     journal_sha256: verification.journal_sha256.clone(),
                     journal_bytes: verification.journal_bytes,
                     entry_count: verification.entry_count,
+                    key_id: descriptor.key_id.clone(),
+                    key_epoch: descriptor.key_epoch,
                     origin_authenticated: descriptor.origin_authenticated,
                     preceding_loss_unknown: descriptor.preceding_loss_unknown,
                     retention_epoch: None,
@@ -271,7 +278,7 @@ impl AuditLedger {
             // Independent re-verification: reopen the copy with a fresh reader
             // that shares no state with the live ledger, and only then let a
             // receipt be returned.
-            let verification = verify_export(dest, &self.keys())?;
+            let verification = verify_export_with_keyring(dest, &self.keyring())?;
             if verification.seal_id != seal_id || verification.complete != complete {
                 return Err(AuditError::Poisoned(PoisonReason::ExportMacMismatch));
             }
@@ -316,7 +323,9 @@ impl AuditLedger {
             let bytes = files::read_bytes(&path)?;
             let file = serde_json::from_slice::<ExportSealFile>(&bytes)
                 .map_err(|_| AuditError::Poisoned(PoisonReason::ExportMacMismatch))?;
-            file.verify(&self.keys())?;
+            if !self.keyring().iter().any(|key| file.verify(key).is_ok()) {
+                return Err(AuditError::Poisoned(PoisonReason::ExportMacMismatch));
+            }
             file
         } else {
             ExportSealFile::new()
@@ -357,7 +366,9 @@ impl AuditLedger {
         let bytes = files::read_bytes(&path)?;
         let file: ExportSealFile = serde_json::from_slice(&bytes)
             .map_err(|_| AuditError::Poisoned(PoisonReason::ExportMacMismatch))?;
-        file.verify(&self.keys())?;
+        if !self.keyring().iter().any(|key| file.verify(key).is_ok()) {
+            return Err(AuditError::Poisoned(PoisonReason::ExportMacMismatch));
+        }
         Ok(file.seals.iter().any(|seal| {
             seal.seal_id == seal_id && seal.generation_ids.iter().any(|id| id == generation_id)
         }))
@@ -369,6 +380,14 @@ impl AuditLedger {
 /// Accepts both `grokptah-audit-export.v1` and `.v2`, so exports taken before
 /// generations existed stay verifiable forever.
 pub fn verify_export(dir: &Path, keys: &AuditKeys) -> AuditResult<ExportVerification> {
+    let key = Arc::new(keys.clone());
+    verify_export_with_keyring(dir, &[key])
+}
+
+pub(crate) fn verify_export_with_keyring(
+    dir: &Path,
+    keys: &[Arc<AuditKeys>],
+) -> AuditResult<ExportVerification> {
     files::reject_symlink_components(dir)?;
     files::reject_symlink(dir)?;
     let path = dir.join("export-manifest.json");
@@ -379,9 +398,13 @@ pub fn verify_export(dir: &Path, keys: &AuditKeys) -> AuditResult<ExportVerifica
     if export.schema != EXPORT_SCHEMA_V1 && export.schema != EXPORT_SCHEMA_V2 {
         return Err(AuditError::Poisoned(PoisonReason::ManifestUnknownSchema));
     }
-    export.verify_mac(keys)?;
+    let export_key = keys
+        .iter()
+        .find(|key| key.key_id() == export.key_id)
+        .ok_or(AuditError::Poisoned(PoisonReason::KeyUnavailable))?;
+    export.verify_mac(export_key)?;
 
-    if export.installation_id != keys.installation_id() {
+    if export.installation_id != export_key.installation_id() {
         return Err(AuditError::Poisoned(PoisonReason::ExportMacMismatch));
     }
     if export.key_id.is_empty() {
@@ -393,7 +416,7 @@ pub fn verify_export(dir: &Path, keys: &AuditKeys) -> AuditResult<ExportVerifica
         let manifest_bytes = files::read_bytes(&manifest_path)?;
         let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
             .map_err(|_| AuditError::Poisoned(PoisonReason::ManifestUnknownSchema))?;
-        manifest.verify(keys)?;
+        manifest.verify(export_key)?;
         if manifest.installation_id != export.installation_id
             || manifest.key_id != export.key_id
             || manifest.manifest_epoch != export.manifest_epoch
@@ -432,6 +455,13 @@ pub fn verify_export(dir: &Path, keys: &AuditKeys) -> AuditResult<ExportVerifica
                 return Err(AuditError::Poisoned(PoisonReason::ChainDiscontinuity));
             }
         }
+        let element_key = keys
+            .iter()
+            .find(|key| key.key_id() == element.key_id)
+            .ok_or(AuditError::Poisoned(PoisonReason::KeyUnavailable))?;
+        if element.key_epoch == 0 {
+            return Err(AuditError::Poisoned(PoisonReason::ExportCoverageInvalid));
+        }
         if !element.origin_authenticated {
             unauthenticated += 1;
         }
@@ -456,7 +486,7 @@ pub fn verify_export(dir: &Path, keys: &AuditKeys) -> AuditResult<ExportVerifica
                     return Err(AuditError::Poisoned(PoisonReason::SealedGenerationChanged));
                 }
                 let scan = scan_journal_at(
-                    keys,
+                    element_key,
                     &journal,
                     &element.generation_id,
                     &element.chain_base,
@@ -472,7 +502,7 @@ pub fn verify_export(dir: &Path, keys: &AuditKeys) -> AuditResult<ExportVerifica
                 let anchor_bytes = files::read_bytes(&anchor)?;
                 let anchor: Anchor = serde_json::from_slice(&anchor_bytes)
                     .map_err(|_| AuditError::Poisoned(PoisonReason::AnchorMacMismatch))?;
-                anchor.verify(keys, &element.generation_id)?;
+                anchor.verify(element_key, &element.generation_id)?;
                 if anchor.last_seq != element.last_seq
                     || anchor.last_tag != element.final_tag
                     || anchor.journal_bytes != element.journal_bytes

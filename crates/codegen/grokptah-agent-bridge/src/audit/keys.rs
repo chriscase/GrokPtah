@@ -65,6 +65,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Derived audit keys. The installation key never leaves this struct, and no
 /// subkey is ever written to disk or into a projection.
+#[derive(Clone)]
 pub struct AuditKeys {
     root_material: Vec<u8>,
     chain: [u8; 32],

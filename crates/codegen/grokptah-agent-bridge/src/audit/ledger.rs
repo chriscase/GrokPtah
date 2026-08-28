@@ -117,6 +117,7 @@ pub struct RecoverySummary {
 pub struct AuditStatus {
     pub installation_id: String,
     pub key_id: String,
+    pub key_epoch: u32,
     pub manifest_epoch: u64,
     pub retention_epoch: u64,
     pub active_generation_id: String,
@@ -371,6 +372,10 @@ impl AuditLedger {
 
     pub(crate) fn keys(&self) -> Arc<AuditKeys> {
         self.keys.read().clone()
+    }
+
+    pub(crate) fn keyring(&self) -> Vec<Arc<AuditKeys>> {
+        self.keyring.read().clone()
     }
 
     // ------------------------------------------------------------ documents
@@ -757,6 +762,32 @@ impl AuditLedger {
                 return Err(AuditError::Poisoned(PoisonReason::TombstoneInconsistent));
             }
         }
+        let mut tombstone_ids = Vec::with_capacity(manifest.tombstones.len());
+        for tombstone in &manifest.tombstones {
+            if !tombstone_ids
+                .iter()
+                .all(|generation_id| generation_id != &tombstone.generation_id)
+            {
+                return Err(AuditError::Poisoned(PoisonReason::TombstoneInconsistent));
+            }
+            tombstone_ids.push(tombstone.generation_id.clone());
+            let descriptor = manifest
+                .generation(&tombstone.generation_id)
+                .ok_or(AuditError::Poisoned(PoisonReason::TombstoneInconsistent))?;
+            if descriptor.state != GenerationState::Tombstoned
+                || descriptor.index != tombstone.index
+                || descriptor.first_seq != tombstone.first_seq
+                || descriptor.last_seq != tombstone.last_seq
+                || descriptor.entry_count != tombstone.entry_count
+                || descriptor.journal_bytes != tombstone.journal_bytes
+                || descriptor.journal_sha256.as_deref() != Some(tombstone.journal_sha256.as_str())
+                || descriptor.chain_base != tombstone.chain_base
+                || descriptor.final_tag.as_deref() != Some(tombstone.final_tag.as_str())
+                || descriptor.key_id != tombstone.key_id
+            {
+                return Err(AuditError::Poisoned(PoisonReason::TombstoneInconsistent));
+            }
+        }
         let active = manifest.active()?;
         if manifest.global_last_seq_floor != active.last_seq {
             return Err(AuditError::Poisoned(PoisonReason::SequenceDiscontinuity));
@@ -808,7 +839,11 @@ impl AuditLedger {
                 })
                 .map(|t| t.generation_id.clone());
             let Some(generation_id) = pending else { break };
-            std::fs::remove_dir_all(Self::generation_dir(&self.root, &generation_id))
+            let generation_dir = Self::generation_dir(&self.root, &generation_id);
+            if generation_dir.exists() {
+                files::reject_symlink(&generation_dir)?;
+            }
+            std::fs::remove_dir_all(generation_dir)
                 .map_err(|error| AuditError::Io(format!("resume removal: {error}")))?;
             files::fsync_dir(&self.root.join("generations"))?;
             if let Some(tombstone) = guard
@@ -873,10 +908,18 @@ impl AuditLedger {
         // Durable dropped-entry evidence survives restart.
         if self.gap_path().exists() {
             let bytes = files::read_bytes(&self.gap_path())?;
-            let gap: GapFile = serde_json::from_slice(&bytes)
+            let mut gap: GapFile = serde_json::from_slice(&bytes)
                 .map_err(|_| AuditError::Poisoned(PoisonReason::GapMacMismatch))?;
-            let keys = self.keys();
-            gap.verify(&keys)?;
+            if !self.keyring().iter().any(|key| gap.verify(key).is_ok()) {
+                return Err(AuditError::Poisoned(PoisonReason::GapMacMismatch));
+            }
+            let current_key = self.keys();
+            if gap.verify(&current_key).is_err() {
+                gap.seal(&current_key)?;
+                let bytes = serde_json::to_vec(&gap)
+                    .map_err(|error| AuditError::Io(format!("serialize gap file: {error}")))?;
+                files::atomic_write(&self.gap_path(), &bytes)?;
+            }
             guard.recovery.durable_gaps = gap.gaps;
         }
 
@@ -1549,6 +1592,7 @@ impl AuditLedger {
         AuditStatus {
             installation_id: guard.manifest.installation_id.clone(),
             key_id: guard.manifest.key_id.clone(),
+            key_epoch: guard.manifest.key_epoch,
             manifest_epoch: guard.manifest.manifest_epoch,
             retention_epoch: guard.manifest.retention_epoch,
             active_generation_id: guard.manifest.active_generation_id.clone(),

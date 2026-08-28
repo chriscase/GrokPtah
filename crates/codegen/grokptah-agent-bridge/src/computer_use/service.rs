@@ -881,6 +881,7 @@ fn run_limit_error() -> ComputerError {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use chrono::Duration;
@@ -1051,6 +1052,36 @@ mod tests {
             ComputerStore::open(dir.join("computer-use")).unwrap(),
         );
         (backend, service)
+    }
+
+    #[test]
+    fn configured_service_pairs_computer_intent_and_outcome_in_orchestration_audit() {
+        let dir = tempdir().unwrap();
+        let audit =
+            crate::orchestration::OrchStore::open(dir.path().join("orchestration")).unwrap();
+        let service = ComputerUseService::new(
+            Arc::new(SimulatorBackend::new()),
+            ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+        )
+        .with_audit_store(audit.clone());
+        service
+            .create_run(
+                "computer-create",
+                Uuid::new_v4(),
+                None,
+                SimulatorBackend::demo_target(),
+                ComputerUseLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(audit.audit_status().global_last_seq, 2);
+        let export = dir.path().join("audit-export");
+        audit
+            .export_audit(&export, crate::audit::ExportFormat::Auto)
+            .unwrap();
+        let journal = fs::read_to_string(export.join("journal.jsonl")).unwrap();
+        assert!(journal.contains("\"phase\":\"intent\""));
+        assert!(journal.contains("\"phase\":\"outcome\""));
+        assert!(!journal.contains("computer-create"));
     }
 
     fn grant(run: &ComputerRun) -> ActionGrant {
