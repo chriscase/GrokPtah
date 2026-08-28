@@ -1173,10 +1173,10 @@ pub(crate) fn sandbox_blocks_shell(profile: &str, command: &str) -> bool {
 /// Per-turn override wins over host-wide config; default 24; hard cap 24.
 pub(crate) fn resolve_turn_max_rounds(
     turn_override: Option<u32>,
-    host_default: Option<u32>,
+    configured_default: Option<u32>,
 ) -> usize {
     turn_override
-        .or(host_default)
+        .or(configured_default)
         .map(|n| n.max(1) as usize)
         .unwrap_or(24)
         .min(24)
