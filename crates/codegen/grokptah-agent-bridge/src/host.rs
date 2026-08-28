@@ -986,32 +986,33 @@ impl AgentHostHandle {
     ) -> Result<()> {
         let principal = self.capability_principal(session_id)?;
         let (model, _) = self.selected_computer_model(session_id)?;
-        let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
+        if let Some(credentials) = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
-            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let target = crate::host_helpers::resolve_model_target(&credentials, &model)?;
-        let selection =
-            crate::gateway_config::parse_model_selection(&model).map_err(anyhow::Error::msg)?;
-        let provider_snapshot = CapabilitySnapshot::provider(
-            &principal,
-            &selection.provider_id,
-            &selection.model_id,
-            &target.base_url,
-            &target.wire_model,
-            &format!("{:?}", target.dialect),
-            &credentials.qualification_identity_fingerprint(),
-            &target.capabilities,
-        )?;
-        self.capability_authority.install_canonical_envelope(
-            &format!("provider-send:{}:{}", principal.id(), selection.model_id),
-            provider_snapshot,
-            principal.id(),
-            principal.auth_generation(),
-            principal.policy_generation(),
-            ["provider.send"],
-            &provider_effect_resource(&credentials, &target),
-            Utc::now(),
-        )?;
+        {
+            let target = crate::host_helpers::resolve_model_target(&credentials, &model)?;
+            let selection =
+                crate::gateway_config::parse_model_selection(&model).map_err(anyhow::Error::msg)?;
+            let provider_snapshot = CapabilitySnapshot::provider(
+                &principal,
+                &selection.provider_id,
+                &selection.model_id,
+                &target.base_url,
+                &target.wire_model,
+                &format!("{:?}", target.dialect),
+                &credentials.qualification_identity_fingerprint(),
+                &target.capabilities,
+            )?;
+            self.capability_authority.install_canonical_envelope(
+                &format!("provider-send:{}:{}", principal.id(), selection.model_id),
+                provider_snapshot,
+                principal.id(),
+                principal.auth_generation(),
+                principal.policy_generation(),
+                ["provider.send"],
+                &provider_effect_resource(&credentials, &target),
+                Utc::now(),
+            )?;
+        }
         for tool_name in DEFAULT_AGENT_TOOL_IDS {
             let snapshot = CapabilitySnapshot::tool(&principal, tool_name)?;
             self.capability_authority.install_canonical_envelope(
@@ -11777,6 +11778,27 @@ mod tests {
         let session = host
             .session_new_kind(SessionKind::Build)
             .expect("create build session");
+        let agent = host
+            .ensure_session_agent(session.id)
+            .expect("create canonical Agent");
+        host.ensure_orchestration_store()
+            .expect("open orchestration store")
+            .claim_agent_owner(&agent.agent_id, "primary")
+            .expect("bind canonical Agent owner");
+        let _authority_service = crate::orchestration::OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            crate::orchestration::OrchStore::open(tmp.path().join("authority-orch"))
+                .expect("open authority store"),
+            crate::orchestration::OrchestrationConfig {
+                bearer_token: "host-test-authority".into(),
+                allowlist: crate::orchestration::WorkspaceAllowlist::new(
+                    [std::env::current_dir().expect("current directory")],
+                ),
+                max_concurrent_runs: 1,
+                bounds: RunBounds::default(),
+            },
+        );
         (
             TestHome {
                 _tmp: tmp,
