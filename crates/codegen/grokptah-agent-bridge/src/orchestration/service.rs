@@ -1,6 +1,6 @@
 //! Orchestration service: reads + bounded mutations over AgentHostHandle (#196).
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -260,8 +260,38 @@ impl OrchestrationService {
             vec![AuthCredential::new("primary", config.bearer_token.clone())
                 .expect("non-empty bearer token should form a primary credential")]
         };
-        let auth_registry = AuthRegistry::open(store.root(), &auth_credentials, "primary")
+        let mut auth_registry = AuthRegistry::open(store.root(), &auth_credentials, "primary")
             .unwrap_or_else(|error| AuthRegistry::unavailable(store.root(), error.to_string()));
+        let known_sessions = host
+            .list_all_sessions()
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<HashSet<_>>();
+        if let Err(error) = auth_registry.recover_pending_session_bindings(&known_sessions) {
+            auth_registry = AuthRegistry::unavailable(store.root(), error.to_string());
+        }
+        let allowlist = config.allowlist.clone();
+        let legacy_session_ids = host
+            .list_all_sessions()
+            .into_iter()
+            .filter(|session| {
+                session.kind == SessionKind::Build
+                    && !session.cwd.is_empty()
+                    && allowlist.contains(Path::new(&session.cwd))
+            })
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        if !legacy_session_ids.is_empty() && !auth_credentials.is_empty() {
+            if let Err(error) =
+                auth_registry
+                    .primary_context(&auth_credentials)
+                    .and_then(|primary| {
+                        auth_registry.migrate_legacy_session_bindings(&legacy_session_ids, &primary)
+                    })
+            {
+                auth_registry = AuthRegistry::unavailable(store.root(), error.to_string());
+            }
+        }
         let initial_owner_id = auth_registry.owner_id().to_string();
         let workload_supervisor =
             WorkloadSupervisor::start(store.clone(), DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL);
@@ -1512,7 +1542,6 @@ impl OrchestrationService {
     /// Install named device/client credentials while retaining the existing
     /// primary-token configuration field for compatibility with embedders.
     pub fn set_auth_credentials(&self, credentials: Vec<AuthCredential>) -> Result<(), OrchError> {
-        let previous = self.auth_credentials.lock().clone();
         if credentials.is_empty() {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
@@ -1542,18 +1571,6 @@ impl OrchestrationService {
         {
             let mut registry = self.auth_registry.lock();
             registry.set_credentials(&credentials, &owner_id)?;
-            // This API replaces credential material supplied by a caller.
-            // Secret rotation with continuity is exposed separately through
-            // `set_token`; changing a named credential here gets a fresh
-            // incarnation and cannot inherit old resources.
-            for credential in &credentials {
-                if previous
-                    .iter()
-                    .any(|old| old.id == credential.id && old.token() != credential.token())
-                {
-                    registry.replace_credential(&credential.id, &owner_id)?;
-                }
-            }
         }
         self.config.lock().bearer_token = primary_token;
         *self.auth_credentials.lock() = credentials;
@@ -1594,8 +1611,10 @@ impl OrchestrationService {
         )
     }
 
-    pub fn set_allowlist(&self, allowlist: WorkspaceAllowlist) {
+    pub fn set_allowlist(&self, allowlist: WorkspaceAllowlist) -> Result<(), OrchError> {
+        self.auth_registry.lock().rotate_policy_generation()?;
         self.config.lock().allowlist = allowlist;
+        Ok(())
     }
 
     pub(crate) fn audit_transport_result(&self, tool: &str, error: Option<&OrchError>) {
@@ -1691,12 +1710,30 @@ impl OrchestrationService {
             .ensure_resource_binding(&resource.into(), auth)
     }
 
+    fn verify_resource_binding(
+        &self,
+        auth: &AuthContext,
+        resource: impl Into<String>,
+    ) -> Result<(), OrchError> {
+        self.auth_registry
+            .lock()
+            .verify_resource_binding(&resource.into(), auth)
+    }
+
     fn ensure_session_binding(
         &self,
         auth: &AuthContext,
         session_id: Uuid,
     ) -> Result<(), OrchError> {
         self.ensure_resource_binding(auth, format!("session:{session_id}"))
+    }
+
+    fn verify_session_binding(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+    ) -> Result<(), OrchError> {
+        self.verify_resource_binding(auth, format!("session:{session_id}"))
     }
 
     fn ensure_run_binding(&self, auth: &AuthContext, run_id: &str) -> Result<(), OrchError> {
@@ -1745,7 +1782,7 @@ impl OrchestrationService {
     /// generation material, and persisted lease/hash fields are host data.
     pub(crate) fn public_projection(&self, value: serde_json::Value) -> serde_json::Value {
         let handles = {
-            let registry = self.auth_registry.lock();
+            let mut registry = self.auth_registry.lock();
             self.auth_credentials
                 .lock()
                 .iter()
@@ -2220,18 +2257,18 @@ impl OrchestrationService {
     pub fn list_sessions(&self, auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let allowlist = self.config.lock().allowlist.clone();
-        let sessions = self.host.list_sessions_by_kind(SessionKind::Build, false);
-        for session in &sessions {
-            self.ensure_session_binding(auth, session.id)?;
-        }
+        let sessions = self
+            .host
+            .list_sessions_by_kind(SessionKind::Build, false)
+            .into_iter()
+            .filter(|session| {
+                !session.cwd.is_empty()
+                    && allowlist.contains(Path::new(&session.cwd))
+                    && self.verify_session_binding(auth, session.id).is_ok()
+            })
+            .collect::<Vec<_>>();
         let rows: Vec<serde_json::Value> = sessions
             .into_iter()
-            .filter(|s| {
-                if s.cwd.is_empty() {
-                    return false;
-                }
-                allowlist.contains(Path::new(&s.cwd))
-            })
             .map(|s| {
                 let busy = self.host.session_busy(s.id);
                 json!({
@@ -2279,19 +2316,61 @@ impl OrchestrationService {
         let reservation = self
             .auth_registry
             .lock()
-            .begin_resource_binding(&format!("session:{}", staged.id()), auth)?;
-        let summary = match self.host.commit_staged_session(staged) {
+            .begin_session_binding(staged.id(), auth)?;
+        if let Err(error) = self.host.persist_staged_session(&staged) {
+            let rollback = self
+                .auth_registry
+                .lock()
+                .rollback_session_binding(&reservation);
+            if let Err(rollback_error) = rollback {
+                return Err(OrchError::new(
+                    OrchErrorCode::Internal,
+                    format!(
+                        "session creation failed and authority rollback failed: {error:#}; \
+                         recovery required: {rollback_error}"
+                    ),
+                ));
+            }
+            return Err(OrchError::new(OrchErrorCode::Internal, error.to_string()));
+        }
+        if let Err(error) = self
+            .auth_registry
+            .lock()
+            .commit_session_binding(&reservation)
+        {
+            if let Err(rollback_error) = self.host.rollback_staged_session(&staged) {
+                return Err(OrchError::new(
+                    OrchErrorCode::Internal,
+                    format!(
+                        "session authority commit failed and session rollback failed: {error}; \
+                         recovery required: {rollback_error}"
+                    ),
+                ));
+            }
+            return Err(error);
+        }
+        let summary = match self.host.publish_staged_session(&staged) {
             Ok(summary) => summary,
             Err(error) => {
-                let rollback = self
+                let authority_rollback = self
                     .auth_registry
                     .lock()
-                    .rollback_resource_binding(reservation);
-                if let Err(rollback_error) = rollback {
+                    .rollback_session_binding(&reservation);
+                let session_rollback = self.host.rollback_staged_session(&staged);
+                if let Err(rollback_error) = authority_rollback {
                     return Err(OrchError::new(
                         OrchErrorCode::Internal,
                         format!(
-                            "session creation failed and authority rollback failed: {error:#}; \
+                            "session publication failed and authority rollback failed: {error:#}; \
+                             recovery required: {rollback_error}"
+                        ),
+                    ));
+                }
+                if let Err(rollback_error) = session_rollback {
+                    return Err(OrchError::new(
+                        OrchErrorCode::Internal,
+                        format!(
+                            "session publication failed and session rollback failed: {error:#}; \
                              recovery required: {rollback_error}"
                         ),
                     ));
@@ -2355,9 +2434,9 @@ impl OrchestrationService {
                 run.session_id == session_id && run.workspace == claimed.display().to_string()
             })
             .collect::<Vec<_>>();
-        self.ensure_session_binding(auth, session_id)?;
+        self.verify_session_binding(auth, session_id)?;
         for run in &runs {
-            self.ensure_run_binding(auth, &run.run_id)?;
+            self.verify_resource_binding(auth, format!("run:{}", run.run_id))?;
         }
         Ok(json!({ "runs": runs }))
     }
@@ -2481,7 +2560,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
-        self.ensure_session_binding(auth, session_id)?;
+        self.verify_session_binding(auth, session_id)?;
         let work = self
             .store
             .list_work_items()
@@ -2490,10 +2569,11 @@ impl OrchestrationService {
             .filter(|item| {
                 item.session_id == session_id && item.workspace == claimed.display().to_string()
             })
+            .filter(|item| {
+                self.verify_resource_binding(auth, format!("work:{}", item.work_id))
+                    .is_ok()
+            })
             .collect::<Vec<_>>();
-        for item in &work {
-            self.ensure_work_binding(auth, &item.work_id)?;
-        }
         Ok(json!({ "work": work }))
     }
 
@@ -2505,9 +2585,9 @@ impl OrchestrationService {
         work_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.ensure_session_binding(auth, session_id)?;
+        self.verify_session_binding(auth, session_id)?;
         let (item, _) = self.load_work_scoped(session_id, workspace, work_id, true)?;
-        self.ensure_work_binding(auth, &item.work_id)?;
+        self.verify_resource_binding(auth, format!("work:{}", item.work_id))?;
         self.workload_value(item, true)
     }
 
@@ -2539,7 +2619,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
-        self.ensure_session_binding(auth, session_id)?;
+        self.verify_session_binding(auth, session_id)?;
         let plans = self
             .store
             .list_manager_plans()?
@@ -2547,10 +2627,11 @@ impl OrchestrationService {
             .filter(|plan| {
                 plan.session_id == session_id && plan.workspace == claimed.display().to_string()
             })
+            .filter(|plan| {
+                self.verify_resource_binding(auth, format!("manager-plan:{}", plan.plan_id))
+                    .is_ok()
+            })
             .collect::<Vec<_>>();
-        for plan in &plans {
-            self.ensure_plan_binding(auth, &plan.plan_id)?;
-        }
         Ok(json!({ "plans": plans }))
     }
 
@@ -2562,9 +2643,9 @@ impl OrchestrationService {
         plan_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.ensure_session_binding(auth, session_id)?;
+        self.verify_session_binding(auth, session_id)?;
         let (_, plan) = self.load_manager_plan_scoped(session_id, workspace, plan_id)?;
-        self.ensure_plan_binding(auth, &plan.plan_id)?;
+        self.verify_resource_binding(auth, format!("manager-plan:{}", plan.plan_id))?;
         Ok(json!({ "plan": plan }))
     }
 
@@ -4295,7 +4376,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let (item, _) = self.load_work_scoped(session_id, workspace, work_id, true)?;
-        self.ensure_work_binding(auth, &item.work_id)?;
+        self.verify_resource_binding(auth, format!("work:{}", item.work_id))?;
         let decisions = self.store.list_work_decisions(&item.work_id)?;
         Ok(json!({ "workId": item.work_id, "decisions": decisions }))
     }
@@ -4474,7 +4555,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
-        let page = self.store.list_messages(
+        let mut page = self.store.list_messages(
             session_id,
             &claimed.display().to_string(),
             after_seq,
@@ -4482,9 +4563,10 @@ impl OrchestrationService {
             None,
             100,
         )?;
-        for message in &page.messages {
-            self.ensure_message_binding(auth, &message.message_id)?;
-        }
+        page.messages.retain(|message| {
+            self.verify_resource_binding(auth, format!("message:{}", message.message_id))
+                .is_ok()
+        });
         Ok(json!(page))
     }
 
@@ -4498,7 +4580,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
-        let page = self.store.list_messages(
+        let mut page = self.store.list_messages(
             session_id,
             &claimed.display().to_string(),
             after_seq,
@@ -4506,9 +4588,10 @@ impl OrchestrationService {
             Some(actor_id),
             100,
         )?;
-        for message in &page.messages {
-            self.ensure_message_binding(auth, &message.message_id)?;
-        }
+        page.messages.retain(|message| {
+            self.verify_resource_binding(auth, format!("message:{}", message.message_id))
+                .is_ok()
+        });
         Ok(json!(page))
     }
 
@@ -4645,7 +4728,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let claimed = self.authorize_routine_read_scope(session_id, workspace)?;
-        self.ensure_session_binding(auth, session_id)?;
+        self.verify_session_binding(auth, session_id)?;
         let routines = self
             .store
             .list_routines()?
@@ -4654,10 +4737,11 @@ impl OrchestrationService {
                 routine.session_id == session_id
                     && routine.workspace == claimed.display().to_string()
             })
+            .filter(|routine| {
+                self.verify_resource_binding(auth, format!("routine:{}", routine.routine_id))
+                    .is_ok()
+            })
             .collect::<Vec<_>>();
-        for routine in &routines {
-            self.ensure_routine_binding(auth, &routine.routine_id)?;
-        }
         Ok(json!({ "routines": routines }))
     }
 
@@ -4669,9 +4753,9 @@ impl OrchestrationService {
         routine_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.ensure_session_binding(auth, session_id)?;
+        self.verify_session_binding(auth, session_id)?;
         let (routine, _) = self.load_routine_scoped(session_id, workspace, routine_id, true)?;
-        self.ensure_routine_binding(auth, &routine.routine_id)?;
+        self.verify_resource_binding(auth, format!("routine:{}", routine.routine_id))?;
         self.routine_value(routine, true)
     }
 
@@ -4683,9 +4767,9 @@ impl OrchestrationService {
         routine_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
-        self.ensure_session_binding(auth, session_id)?;
+        self.verify_session_binding(auth, session_id)?;
         let (routine, _) = self.load_routine_scoped(session_id, workspace, routine_id, true)?;
-        self.ensure_routine_binding(auth, &routine.routine_id)?;
+        self.verify_resource_binding(auth, format!("routine:{}", routine.routine_id))?;
         let activations = self.store.list_activations(&routine.routine_id, 128)?;
         Ok(json!({
             "routineId": routine.routine_id,

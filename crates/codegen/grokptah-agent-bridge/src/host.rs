@@ -247,6 +247,7 @@ pub(crate) struct Inner {
 
 pub(crate) struct StagedSession {
     session: Session,
+    prior_chrome: Option<Vec<u8>>,
 }
 
 impl StagedSession {
@@ -2885,7 +2886,7 @@ impl AgentHostHandle {
             eprintln!("[grokptah] transcript rewrite failed: {e:#}");
             return;
         }
-        let mut g = self.inner.lock();
+        let g = self.inner.lock();
         if let Some(s) = g.sessions.get_mut(&id) {
             s.persisted_len = s.transcript.len();
             s.transcript_loaded = true;
@@ -3055,22 +3056,22 @@ impl AgentHostHandle {
             session.title = title;
             session.updated_at = Utc::now();
         }
-        Ok(StagedSession { session })
+        let prior_chrome = match std::fs::read(session_store::chrome_path()) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(StagedSession {
+            session,
+            prior_chrome,
+        })
     }
 
-    pub(crate) fn commit_staged_session(&self, staged: StagedSession) -> Result<SessionSummary> {
-        let mut g = self.inner.lock();
-        if !g.running {
-            bail!("agent not started");
-        }
-        if g.sessions.contains_key(&staged.session.id) {
-            bail!("session id already exists");
-        }
-        let id = staged.session.id;
-        let cwd = staged.session.cwd.clone();
-        let next_chrome = WorkspaceChrome {
+    fn staged_chrome(&self, g: &Inner, session: &Session) -> WorkspaceChrome {
+        let id = session.id;
+        WorkspaceChrome {
             version: 2,
-            project_cwd: Some(cwd.display().to_string()),
+            project_cwd: Some(session.cwd.display().to_string()),
             active_session: Some(id),
             open_tab_ids: {
                 let mut ids = g.open_tab_ids.clone();
@@ -3085,11 +3086,37 @@ impl AgentHostHandle {
             appearance: g.appearance.clone(),
             always_approve: g.always_approve,
             subagent_isolation: g.subagent_isolation,
-        };
+        }
+    }
+
+    pub(crate) fn persist_staged_session(
+        &self,
+        staged: &StagedSession,
+    ) -> Result<session_store::SessionCommitStatus> {
+        let g = self.inner.lock();
+        if !g.running {
+            bail!("agent not started");
+        }
+        if g.sessions.contains_key(&staged.session.id) {
+            bail!("session id already exists");
+        }
+        let next_chrome = self.staged_chrome(&g, &staged.session);
         // Durable files and the chrome pointer commit before any live map is
         // changed. A leftover intent is recovery metadata, not a second
         // publication state.
-        session_store::create_session_durable(&staged.session, &next_chrome)?;
+        session_store::create_session_durable(&staged.session, &next_chrome)
+    }
+
+    pub(crate) fn publish_staged_session(&self, staged: &StagedSession) -> Result<SessionSummary> {
+        let mut g = self.inner.lock();
+        if !g.running {
+            bail!("agent not started");
+        }
+        if g.sessions.contains_key(&staged.session.id) {
+            bail!("session id already exists");
+        }
+        let id = staged.session.id;
+        let cwd = staged.session.cwd.clone();
         let summary = staged.session.summary();
         g.project_cwd = Some(cwd.clone());
         g.mcp_servers = crate::discover::load_mcp_servers(Some(&cwd));
@@ -3100,6 +3127,16 @@ impl AgentHostHandle {
         }
         g.sessions.insert(id, staged.session);
         Ok(summary)
+    }
+
+    pub(crate) fn rollback_staged_session(&self, staged: &StagedSession) -> Result<()> {
+        session_store::delete_session(staged.session.id)?;
+        session_store::restore_chrome_snapshot(staged.prior_chrome.as_deref())
+    }
+
+    pub(crate) fn commit_staged_session(&self, staged: StagedSession) -> Result<SessionSummary> {
+        self.persist_staged_session(&staged)?;
+        self.publish_staged_session(&staged)
     }
 
     pub fn session_new_kind(&self, kind: SessionKind) -> Result<SessionSummary> {

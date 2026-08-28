@@ -110,11 +110,33 @@ impl std::fmt::Debug for AuthenticationGeneration {
     }
 }
 
+/// Revision of the host policy that issued an authenticated capability.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PolicyRevision(u64);
+
+impl std::fmt::Debug for PolicyRevision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PolicyRevision([redacted])")
+    }
+}
+
+/// Generation of the capability policy used at the authority boundary.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CapabilityGeneration(u64);
+
+impl std::fmt::Debug for CapabilityGeneration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CapabilityGeneration([redacted])")
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct AuthorityStamp {
     principal: PrincipalRef,
     incarnation: CredentialIncarnation,
     generation: AuthenticationGeneration,
+    policy_revision: PolicyRevision,
+    capability_generation: CapabilityGeneration,
     credential_id: String,
     owner_id: String,
 }
@@ -125,6 +147,8 @@ impl std::fmt::Debug for AuthorityStamp {
             .field("principal", &self.principal)
             .field("incarnation", &self.incarnation)
             .field("generation", &self.generation)
+            .field("policy_revision", &self.policy_revision)
+            .field("capability_generation", &self.capability_generation)
             .field("credential_id", &"[redacted]")
             .field("owner_id", &"[redacted]")
             .finish()
@@ -179,16 +203,24 @@ impl AuthContext {
         &self.stamp.owner_id
     }
 
-    /// Opaque digest stored alongside durable resources. It includes the
-    /// incarnation and generation but reveals neither to a client.
+    /// Opaque stable ownership digest stored alongside durable resources.
+    /// Current authentication and policy authority are separate fences.
     pub(crate) fn binding_digest(&self) -> String {
-        let mut bytes = Vec::with_capacity(16 + 16 + 8);
+        let mut bytes = Vec::with_capacity(16 + 16);
         bytes.extend_from_slice(&self.stamp.principal.0);
         bytes.extend_from_slice(&self.stamp.incarnation.0);
-        bytes.extend_from_slice(&self.stamp.generation.0.to_be_bytes());
         hex_sha256(&bytes)
     }
 
+    fn authority_digest(&self) -> String {
+        let mut bytes = Vec::with_capacity(16 + 16 + 8 + 8 + 8);
+        bytes.extend_from_slice(&self.stamp.principal.0);
+        bytes.extend_from_slice(&self.stamp.incarnation.0);
+        bytes.extend_from_slice(&self.stamp.generation.0.to_be_bytes());
+        bytes.extend_from_slice(&self.stamp.policy_revision.0.to_be_bytes());
+        bytes.extend_from_slice(&self.stamp.capability_generation.0.to_be_bytes());
+        hex_sha256(&bytes)
+    }
     fn matches(&self, record: &StoredCredential) -> bool {
         self.stamp.credential_id == record.credential_id
             && self.stamp.owner_id == record.owner_id
@@ -313,6 +345,14 @@ pub(crate) struct ResourceBindingReservation {
     inserted: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct SessionBindingReservation {
+    transaction_id: String,
+    resource: String,
+    digest: String,
+    inserted: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredCredential {
@@ -321,6 +361,10 @@ struct StoredCredential {
     principal: String,
     incarnation: String,
     generation: u64,
+    /// Hash of credential material used only to detect rotation. The material
+    /// itself never enters durable authority state.
+    #[serde(default)]
+    credential_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,6 +381,10 @@ struct StoredEffectLease {
 struct StoredAuthority {
     schema_version: u32,
     next_generation: u64,
+    #[serde(default = "default_authority_revision")]
+    policy_revision: u64,
+    #[serde(default = "default_authority_revision")]
+    capability_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owner_id: Option<String>,
     credentials: Vec<StoredCredential>,
@@ -349,6 +397,10 @@ struct StoredAuthority {
     /// cannot reacquire a lease consumed by this process.
     #[serde(default)]
     effect_leases: BTreeMap<String, StoredEffectLease>,
+    /// Session bindings that have been authorized but not yet published.
+    /// Service startup resolves these against the session ledger.
+    #[serde(default)]
+    pending_session_bindings: BTreeMap<String, StoredPendingSessionBinding>,
 }
 
 impl Default for StoredAuthority {
@@ -356,12 +408,27 @@ impl Default for StoredAuthority {
         Self {
             schema_version: AUTHORITY_SCHEMA_VERSION,
             next_generation: 1,
+            policy_revision: 1,
+            capability_generation: 1,
             owner_id: None,
             credentials: Vec::new(),
             bindings: BTreeMap::new(),
             effect_leases: BTreeMap::new(),
+            pending_session_bindings: BTreeMap::new(),
         }
     }
+}
+
+fn default_authority_revision() -> u64 {
+    1
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredPendingSessionBinding {
+    session_id: Uuid,
+    resource: String,
+    digest: String,
 }
 
 /// Host-owned registry loaded from and persisted to the canonical orchestration
@@ -511,79 +578,87 @@ impl AuthRegistry {
 
     fn persist_state_locked(&self, state: &StoredAuthority) -> Result<(), OrchError> {
         let path = self.root.join(AUTHORITY_FILE);
-        let tmp = self.root.join("auth-authority.json.tmp");
-        authority_fault("write")?;
+        let tmp = self.root.join(format!(
+            "auth-authority.json.tmp-{}",
+            Uuid::new_v4().simple()
+        ));
         let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
             OrchError::new(
                 OrchErrorCode::Internal,
                 format!("serialize durable auth authority: {error}"),
             )
         })?;
-        {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&tmp)
-                .map_err(|error| {
+        let result = (|| {
+            authority_fault("write")?;
+            {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&tmp)
+                    .map_err(|error| {
+                        OrchError::new(
+                            OrchErrorCode::Internal,
+                            format!("write durable auth authority: {error}"),
+                        )
+                    })?;
+                file.write_all(&bytes).map_err(|error| {
                     OrchError::new(
                         OrchErrorCode::Internal,
                         format!("write durable auth authority: {error}"),
                     )
                 })?;
-            file.write_all(&bytes).map_err(|error| {
+                authority_fault("file_sync")?;
+                file.sync_all().map_err(|error| {
+                    OrchError::new(
+                        OrchErrorCode::Internal,
+                        format!("flush durable auth authority: {error}"),
+                    )
+                })?;
+            }
+            if let Some(parent) = path.parent() {
+                let directory = std::fs::File::open(parent).map_err(|error| {
+                    OrchError::new(
+                        OrchErrorCode::Internal,
+                        format!("open durable auth directory: {error}"),
+                    )
+                })?;
+                authority_fault("dir_sync")?;
+                directory.sync_all().map_err(|error| {
+                    OrchError::new(
+                        OrchErrorCode::Internal,
+                        format!("flush durable auth directory: {error}"),
+                    )
+                })?;
+            }
+            authority_fault("rename")?;
+            std::fs::rename(&tmp, &path).map_err(|error| {
                 OrchError::new(
                     OrchErrorCode::Internal,
-                    format!("write durable auth authority: {error}"),
+                    format!("commit durable auth authority: {error}"),
                 )
             })?;
-            authority_fault("file_sync")?;
-            file.sync_all().map_err(|error| {
-                OrchError::new(
-                    OrchErrorCode::Internal,
-                    format!("flush durable auth authority: {error}"),
-                )
-            })?;
+            if let Some(parent) = path.parent() {
+                let directory = std::fs::File::open(parent).map_err(|error| {
+                    OrchError::new(
+                        OrchErrorCode::Internal,
+                        format!("open durable auth directory: {error}"),
+                    )
+                })?;
+                authority_fault("dir_sync")?;
+                directory.sync_all().map_err(|error| {
+                    OrchError::new(
+                        OrchErrorCode::Internal,
+                        format!("flush durable auth directory: {error}"),
+                    )
+                })?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-        if let Some(parent) = path.parent() {
-            let directory = std::fs::File::open(parent).map_err(|error| {
-                OrchError::new(
-                    OrchErrorCode::Internal,
-                    format!("open durable auth directory: {error}"),
-                )
-            })?;
-            authority_fault("dir_sync")?;
-            directory.sync_all().map_err(|error| {
-                OrchError::new(
-                    OrchErrorCode::Internal,
-                    format!("flush durable auth directory: {error}"),
-                )
-            })?;
-        }
-        authority_fault("rename")?;
-        std::fs::rename(&tmp, &path).map_err(|error| {
-            OrchError::new(
-                OrchErrorCode::Internal,
-                format!("commit durable auth authority: {error}"),
-            )
-        })?;
-        if let Some(parent) = path.parent() {
-            let directory = std::fs::File::open(parent).map_err(|error| {
-                OrchError::new(
-                    OrchErrorCode::Internal,
-                    format!("open durable auth directory: {error}"),
-                )
-            })?;
-            authority_fault("dir_sync")?;
-            directory.sync_all().map_err(|error| {
-                OrchError::new(
-                    OrchErrorCode::Internal,
-                    format!("flush durable auth directory: {error}"),
-                )
-            })?;
-        }
-        Ok(())
+        result
     }
 
     /// Apply an authority mutation against the latest durable state while
@@ -649,8 +724,15 @@ impl AuthRegistry {
             else {
                 return Err(stale_authority());
             };
+            let old_authority = authority_digest_for_record(
+                &state.credentials[index],
+                state.policy_revision,
+                state.capability_generation,
+            );
             let generation = allocate_generation(state)?;
-            state.credentials[index] = new_stored_credential(credential_id, owner_id, generation);
+            state.credentials[index] =
+                new_stored_credential(credential_id, owner_id, generation, String::new());
+            invalidate_effect_leases(state, &old_authority);
             Ok(())
         })
     }
@@ -658,6 +740,17 @@ impl AuthRegistry {
     pub(crate) fn change_owner(&mut self, owner_id: &str) -> Result<(), OrchError> {
         validate_owner(owner_id)?;
         self.transactional(|state| {
+            let old_leases = state
+                .credentials
+                .iter()
+                .map(|record| {
+                    authority_digest_for_record(
+                        record,
+                        state.policy_revision,
+                        state.capability_generation,
+                    )
+                })
+                .collect::<Vec<_>>();
             state.owner_id = Some(owner_id.to_string());
             if state.credentials.is_empty() {
                 return Ok(());
@@ -670,9 +763,13 @@ impl AuthRegistry {
                     &record.credential_id,
                     owner_id,
                     generation,
+                    record.credential_fingerprint.clone(),
                 ));
             }
             state.credentials = replacement;
+            for digest in old_leases {
+                invalidate_effect_leases(state, &digest);
+            }
             Ok(())
         })
     }
@@ -717,6 +814,8 @@ impl AuthRegistry {
                     principal: PrincipalRef(principal),
                     incarnation: CredentialIncarnation(incarnation),
                     generation: AuthenticationGeneration(record.generation),
+                    policy_revision: PolicyRevision(state.policy_revision),
+                    capability_generation: CapabilityGeneration(state.capability_generation),
                     credential_id: credential.id.clone(),
                     owner_id: record.owner_id.clone(),
                 },
@@ -729,15 +828,100 @@ impl AuthRegistry {
         self.with_latest_state(|state| require_current_state(state, auth))
     }
 
-    pub(crate) fn public_actor_handle(&self, credential_id: &str) -> Option<PublicActorHandle> {
-        self.state
-            .credentials
-            .iter()
-            .find(|record| record.credential_id == credential_id)
-            .and_then(actor_handle_for_record)
+    pub(crate) fn public_actor_handle(&mut self, credential_id: &str) -> Option<PublicActorHandle> {
+        self.with_latest_state(|state| {
+            Ok(state
+                .credentials
+                .iter()
+                .find(|record| record.credential_id == credential_id)
+                .and_then(actor_handle_for_record))
+        })
+        .ok()
+        .flatten()
     }
 
     pub(crate) fn ensure_resource_binding(
+        &mut self,
+        resource: &str,
+        auth: &AuthContext,
+    ) -> Result<(), OrchError> {
+        self.claim_resource_bindings(&[resource.to_string()], auth)
+    }
+
+    pub(crate) fn claim_resource_bindings(
+        &mut self,
+        resources: &[String],
+        auth: &AuthContext,
+    ) -> Result<(), OrchError> {
+        for resource in resources {
+            if resource.is_empty() || resource.len() > 512 {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "authority resource key is empty or exceeds its bound",
+                ));
+            }
+        }
+        let resources = resources.to_vec();
+        let digest = auth.binding_digest();
+        self.transactional(|state| {
+            require_current_state(state, auth)?;
+            for resource in resources {
+                match state.bindings.get(&resource) {
+                    Some(existing) if existing == &digest => {}
+                    Some(_) => return Err(stale_authority()),
+                    None => {
+                        state.bindings.insert(resource, digest.clone());
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn migrate_resource_bindings(
+        &mut self,
+        resources: &[String],
+        from: &AuthContext,
+        to: &AuthContext,
+    ) -> Result<(), OrchError> {
+        for resource in resources {
+            if resource.is_empty() || resource.len() > 512 {
+                return Err(OrchError::new(
+                    OrchErrorCode::InvalidRequest,
+                    "authority resource key is empty or exceeds its bound",
+                ));
+            }
+        }
+        let resources = resources.to_vec();
+        let from_digest = from.binding_digest();
+        let to_digest = to.binding_digest();
+        self.transactional(|state| {
+            require_current_state(state, from)?;
+            require_current_state(state, to)?;
+            for resource in resources {
+                if state.bindings.get(&resource) == Some(&from_digest) {
+                    state.bindings.insert(resource, to_digest.clone());
+                } else {
+                    return Err(stale_authority());
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn migrate_legacy_session_bindings(
+        &mut self,
+        session_ids: &[Uuid],
+        auth: &AuthContext,
+    ) -> Result<(), OrchError> {
+        let resources = session_ids
+            .iter()
+            .map(|session_id| format!("session:{session_id}"))
+            .collect::<Vec<_>>();
+        self.claim_resource_bindings(&resources, auth)
+    }
+
+    pub(crate) fn verify_resource_binding(
         &mut self,
         resource: &str,
         auth: &AuthContext,
@@ -750,15 +934,11 @@ impl AuthRegistry {
         }
         let resource = resource.to_string();
         let digest = auth.binding_digest();
-        self.transactional(|state| {
+        self.with_latest_state(|state| {
             require_current_state(state, auth)?;
             match state.bindings.get(&resource) {
                 Some(existing) if existing == &digest => Ok(()),
-                Some(_) => Err(stale_authority()),
-                None => {
-                    state.bindings.insert(resource, digest);
-                    Ok(())
-                }
+                _ => Err(stale_authority()),
             }
         })
     }
@@ -811,6 +991,126 @@ impl AuthRegistry {
         })
     }
 
+    pub(crate) fn begin_session_binding(
+        &mut self,
+        session_id: Uuid,
+        auth: &AuthContext,
+    ) -> Result<SessionBindingReservation, OrchError> {
+        let resource = format!("session:{session_id}");
+        let digest = auth.binding_digest();
+        let transaction_id = Uuid::new_v4().simple().to_string();
+        let inserted = self.transactional(|state| {
+            require_current_state(state, auth)?;
+            match state.bindings.get(&resource) {
+                Some(existing) if existing == &digest => Ok(false),
+                Some(_) => Err(stale_authority()),
+                None => {
+                    state.pending_session_bindings.insert(
+                        transaction_id.clone(),
+                        StoredPendingSessionBinding {
+                            session_id,
+                            resource: resource.clone(),
+                            digest: digest.clone(),
+                        },
+                    );
+                    Ok(true)
+                }
+            }
+        })?;
+        Ok(SessionBindingReservation {
+            transaction_id,
+            resource,
+            digest,
+            inserted,
+        })
+    }
+
+    pub(crate) fn commit_session_binding(
+        &mut self,
+        reservation: &SessionBindingReservation,
+    ) -> Result<(), OrchError> {
+        if !reservation.inserted {
+            return Ok(());
+        }
+        self.transactional(|state| {
+            let Some(pending) = state
+                .pending_session_bindings
+                .get(&reservation.transaction_id)
+            else {
+                return Err(stale_authority());
+            };
+            if pending.resource != reservation.resource || pending.digest != reservation.digest {
+                return Err(stale_authority());
+            }
+            state
+                .pending_session_bindings
+                .remove(&reservation.transaction_id);
+            state
+                .bindings
+                .insert(reservation.resource.clone(), reservation.digest.clone());
+            Ok(())
+        })
+    }
+
+    pub(crate) fn rollback_session_binding(
+        &mut self,
+        reservation: &SessionBindingReservation,
+    ) -> Result<(), OrchError> {
+        if !reservation.inserted {
+            return Ok(());
+        }
+        self.transactional(|state| {
+            state
+                .pending_session_bindings
+                .remove(&reservation.transaction_id);
+            if state
+                .bindings
+                .get(&reservation.resource)
+                .is_some_and(|digest| digest == &reservation.digest)
+            {
+                state.bindings.remove(&reservation.resource);
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn recover_pending_session_bindings(
+        &mut self,
+        sessions: &std::collections::HashSet<Uuid>,
+    ) -> Result<(), OrchError> {
+        self.transactional(|state| {
+            let pending = std::mem::take(&mut state.pending_session_bindings);
+            for (_, binding) in pending {
+                if sessions.contains(&binding.session_id) {
+                    match state.bindings.get(&binding.resource) {
+                        Some(existing) if existing != &binding.digest => {
+                            return Err(stale_authority());
+                        }
+                        _ => {
+                            state.bindings.insert(binding.resource, binding.digest);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn rotate_policy_generation(&mut self) -> Result<(), OrchError> {
+        self.transactional(|state| {
+            state.policy_revision = state
+                .policy_revision
+                .checked_add(1)
+                .ok_or_else(|| internal_error("policy revision exhausted"))?;
+            state.capability_generation = state
+                .capability_generation
+                .checked_add(1)
+                .ok_or_else(|| internal_error("capability generation exhausted"))?;
+            state.effect_leases.clear();
+            Ok(())
+        })
+    }
+
     pub(crate) fn mint_effect_lease(
         &mut self,
         auth: &AuthContext,
@@ -824,7 +1124,7 @@ impl AuthRegistry {
             ));
         }
         let lease_id = Uuid::new_v4().simple().to_string();
-        let binding = auth.binding_digest();
+        let binding = auth.authority_digest();
         let expires_at = Instant::now() + EFFECT_LEASE_TTL;
         let expires_at_unix_ms = unix_time_millis()
             .checked_add(
@@ -929,8 +1229,14 @@ impl AuthRegistry {
             else {
                 return Err(stale_authority());
             };
+            let old_authority = authority_digest_for_record(
+                &state.credentials[index],
+                state.policy_revision,
+                state.capability_generation,
+            );
             let generation = allocate_generation(state)?;
             state.credentials[index].generation = generation;
+            invalidate_effect_leases(state, &old_authority);
             Ok(())
         })
     }
@@ -950,12 +1256,27 @@ impl AuthRegistry {
 
     pub(crate) fn revoke(&mut self, credential_id: &str) -> Result<(), OrchError> {
         self.transactional(|state| {
+            let old_authorities = state
+                .credentials
+                .iter()
+                .filter(|record| record.credential_id == credential_id)
+                .map(|record| {
+                    authority_digest_for_record(
+                        record,
+                        state.policy_revision,
+                        state.capability_generation,
+                    )
+                })
+                .collect::<Vec<_>>();
             let old_len = state.credentials.len();
             state
                 .credentials
                 .retain(|record| record.credential_id != credential_id);
             if old_len == state.credentials.len() {
                 return Err(stale_authority());
+            }
+            for digest in old_authorities {
+                invalidate_effect_leases(state, &digest);
             }
             Ok(())
         })
@@ -974,6 +1295,22 @@ fn reconcile_state(
         .credentials
         .iter()
         .any(|record| record.owner_id != owner_id);
+    let removed_authorities = state
+        .credentials
+        .iter()
+        .filter(|record| {
+            owner_changed
+                || !credentials
+                    .iter()
+                    .any(|credential| credential.id == record.credential_id)
+        })
+        .map(|record| {
+            authority_digest_for_record(record, state.policy_revision, state.capability_generation)
+        })
+        .collect::<Vec<_>>();
+    for digest in removed_authorities {
+        invalidate_effect_leases(state, &digest);
+    }
     let mut next = Vec::with_capacity(credentials.len());
     for credential in credentials {
         let existing = if owner_changed {
@@ -984,13 +1321,34 @@ fn reconcile_state(
                 .iter()
                 .find(|record| record.credential_id == credential.id)
         };
-        let record = match existing {
+        let mut record = match existing {
             Some(record) => record.clone(),
             None => {
                 changed = true;
-                new_stored_credential(&credential.id, owner_id, allocate_generation(state)?)
+                new_stored_credential(
+                    &credential.id,
+                    owner_id,
+                    allocate_generation(state)?,
+                    credential_fingerprint(credential.token()),
+                )
             }
         };
+        let fingerprint = credential_fingerprint(credential.token());
+        if !record.credential_fingerprint.is_empty() && record.credential_fingerprint != fingerprint
+        {
+            let old_authority = authority_digest_for_record(
+                &record,
+                state.policy_revision,
+                state.capability_generation,
+            );
+            record.generation = allocate_generation(state)?;
+            invalidate_effect_leases(state, &old_authority);
+            changed = true;
+        }
+        if record.credential_fingerprint != fingerprint {
+            record.credential_fingerprint = fingerprint;
+            changed = true;
+        }
         next.push(record);
     }
     if next.len() != state.credentials.len() || next != state.credentials || owner_changed {
@@ -1022,7 +1380,13 @@ fn require_current_state(state: &StoredAuthority, auth: &AuthContext) -> Result<
         return Err(stale_authority());
     };
     if auth.matches(record) {
-        Ok(())
+        if auth.stamp.policy_revision == PolicyRevision(state.policy_revision)
+            && auth.stamp.capability_generation == CapabilityGeneration(state.capability_generation)
+        {
+            Ok(())
+        } else {
+            Err(stale_authority())
+        }
     } else {
         Err(stale_authority())
     }
@@ -1117,7 +1481,11 @@ fn validate_credentials(credentials: &[AuthCredential]) -> Result<(), OrchError>
 }
 
 fn validate_stored_authority(state: &StoredAuthority) -> Result<(), OrchError> {
-    if state.schema_version != AUTHORITY_SCHEMA_VERSION || state.next_generation == 0 {
+    if state.schema_version != AUTHORITY_SCHEMA_VERSION
+        || state.next_generation == 0
+        || state.policy_revision == 0
+        || state.capability_generation == 0
+    {
         return Err(OrchError::new(
             OrchErrorCode::Internal,
             "durable auth authority schema is invalid",
@@ -1141,6 +1509,12 @@ fn validate_stored_authority(state: &StoredAuthority) -> Result<(), OrchError> {
             || record.owner_id.is_empty()
             || record.owner_id.len() > MAX_AUTH_OWNER_BYTES
             || record.generation == 0
+            || (!record.credential_fingerprint.is_empty()
+                && (record.credential_fingerprint.len() != 64
+                    || !record
+                        .credential_fingerprint
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit())))
             || decode_fixed_hex(&record.principal).is_none()
             || decode_fixed_hex(&record.incarnation).is_none()
         {
@@ -1183,16 +1557,68 @@ fn validate_stored_authority(state: &StoredAuthority) -> Result<(), OrchError> {
             ));
         }
     }
+    for (transaction_id, pending) in &state.pending_session_bindings {
+        if transaction_id.is_empty()
+            || transaction_id.len() > MAX_EFFECT_LEASE_ID_BYTES
+            || pending.resource.len() > 512
+            || !pending.resource.starts_with("session:")
+            || pending.digest.len() != 64
+            || !pending.digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Internal,
+                "durable pending session binding is invalid",
+            ));
+        }
+    }
     Ok(())
 }
 
-fn new_stored_credential(id: &str, owner_id: &str, generation: u64) -> StoredCredential {
+fn new_stored_credential(
+    id: &str,
+    owner_id: &str,
+    generation: u64,
+    credential_fingerprint: String,
+) -> StoredCredential {
     StoredCredential {
         credential_id: id.to_string(),
         owner_id: owner_id.to_string(),
         principal: hex_sha256(&Uuid::new_v4().into_bytes()),
         incarnation: hex_sha256(&Uuid::new_v4().into_bytes()),
         generation,
+        credential_fingerprint,
+    }
+}
+
+fn credential_fingerprint(token: &str) -> String {
+    hex_sha256(token.as_bytes())
+}
+
+fn authority_digest_for_record(
+    record: &StoredCredential,
+    policy_revision: u64,
+    capability_generation: u64,
+) -> String {
+    let Some(principal) = decode_fixed_hex(&record.principal) else {
+        return String::new();
+    };
+    let Some(incarnation) = decode_fixed_hex(&record.incarnation) else {
+        return String::new();
+    };
+    let mut bytes = Vec::with_capacity(16 + 16 + 8 + 8 + 8);
+    bytes.extend_from_slice(&principal);
+    bytes.extend_from_slice(&incarnation);
+    bytes.extend_from_slice(&record.generation.to_be_bytes());
+    bytes.extend_from_slice(&policy_revision.to_be_bytes());
+    bytes.extend_from_slice(&capability_generation.to_be_bytes());
+    hex_sha256(&bytes)
+}
+
+fn invalidate_effect_leases(state: &mut StoredAuthority, authority_digest: &str) {
+    if !authority_digest.is_empty() {
+        state
+            .effect_leases
+            .retain(|_, lease| lease.binding != authority_digest);
     }
 }
 
@@ -1469,7 +1895,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_same_incarnation_secret_rotation_preserves_actor_binding() {
+    fn credential_material_rotation_advances_authority_atomically() {
         let root = tempdir().unwrap();
         let old = AuthCredential::new("primary", "old-secret").unwrap();
         let mut registry =
@@ -1486,7 +1912,12 @@ mod tests {
             .unwrap();
         assert_eq!(before.actor_handle(), after.actor_handle());
         assert_eq!(before.binding_digest(), after.binding_digest());
-        assert!(registry.require_current(&before).is_ok());
+        assert!(registry.require_current(&before).is_err());
+        assert!(registry.require_current(&after).is_ok());
+        let durable = std::fs::read_to_string(root.path().join(AUTHORITY_FILE)).unwrap();
+        assert!(!durable.contains("old-secret"));
+        assert!(!durable.contains("new-secret"));
+        assert!(durable.contains("credentialFingerprint"));
     }
 
     #[test]

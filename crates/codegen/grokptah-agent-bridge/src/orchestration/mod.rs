@@ -17,7 +17,8 @@ mod workload;
 
 pub use authz::{
     canonical_workspace, constant_time_eq, AuthContext, AuthCredential, AuthenticationGeneration,
-    CredentialIncarnation, EffectLease, PrincipalRef, PublicActorHandle, WorkspaceAllowlist,
+    CapabilityGeneration, CredentialIncarnation, EffectLease, PolicyRevision, PrincipalRef,
+    PublicActorHandle, WorkspaceAllowlist,
 };
 pub(crate) fn initialize_host_authority(root: &std::path::Path) -> Result<(), OrchError> {
     authz::AuthRegistry::initialize_host_anchor(root)
