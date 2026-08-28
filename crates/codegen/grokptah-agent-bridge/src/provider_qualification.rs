@@ -704,6 +704,42 @@ fn safe_probe_error(error: &anyhow::Error) -> String {
     }
 }
 
+fn restart_qualification_attempt_after_body_change(
+    provider_attempt: &mut xai_provider_attempt::AttemptContext,
+    permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
+    provider_id: &str,
+    body: &[u8],
+    rejected_status: u16,
+) -> Result<String> {
+    if let Some(mut permit) = permit.take() {
+        provider_attempt.semantic_rejection(&mut permit, rejected_status)?;
+    }
+    let next = provider_attempt.acquire_next_effect_lease()?;
+    let next_permit = next.begin(provider_id, body, true)?;
+    let key = next_permit.idempotency_key().to_owned();
+    *provider_attempt = next;
+    *permit = Some(next_permit);
+    Ok(key)
+}
+
+fn qualification_provider_attempt_id(
+    base_url: &str,
+    credentials: &QualificationCredentials,
+    stream: bool,
+) -> String {
+    let credential_identity = credentials
+        .current()
+        .map(crate::auth_store::WireCredentials::qualification_identity_fingerprint)
+        .unwrap_or_else(|| "anonymous".into());
+    format!(
+        "qualification-{}-{}-{}-{}",
+        credentials.expected_provider_id,
+        if stream { "stream" } else { "json" },
+        xai_provider_attempt::AttemptSpec::fingerprint_bytes(base_url.as_bytes()),
+        credential_identity
+    )
+}
+
 async fn completion(
     client: &reqwest::Client,
     base_url: &str,
@@ -715,17 +751,21 @@ async fn completion(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let mut removed_tool_choice = false;
     let mut transient_retries = 0_u32;
-    let request_bytes =
+    let mut request_bytes =
         serde_json::to_vec(&body).context("serialize provider qualification request")?;
-    let provider_attempt = provider_attempt
+    let mut provider_attempt = provider_attempt
         .acquire_next_effect_lease()
         .map_err(|error| anyhow!("allocate qualification effect lease: {error}"))?;
     let mut permit = Some(
         provider_attempt
-            .begin("provider-qualification", &request_bytes, true)
+            .begin(
+                &qualification_provider_attempt_id(base_url, credentials, false),
+                &request_bytes,
+                true,
+            )
             .map_err(|error| anyhow!("admit provider qualification: {error}"))?,
     );
-    let idempotency_key = permit
+    let mut idempotency_key = permit
         .as_ref()
         .map(|permit| permit.idempotency_key().to_owned())
         .ok_or_else(|| anyhow!("provider qualification permit is unavailable"))?;
@@ -779,6 +819,14 @@ async fn completion(
             if let Some(object) = body.as_object_mut() {
                 object.remove("tool_choice");
             }
+            idempotency_key = restart_qualification_attempt_after_body_change(
+                &mut provider_attempt,
+                &mut permit,
+                &qualification_provider_attempt_id(base_url, credentials, false),
+                &serde_json::to_vec(&body)?,
+                status.as_u16(),
+            )?;
+            request_bytes = serde_json::to_vec(&body)?;
             removed_tool_choice = true;
             continue;
         }
@@ -844,7 +892,11 @@ async fn streaming_probe(
         .map_err(|error| anyhow!("allocate qualification stream effect lease: {error}"))?;
     let mut permit = Some(
         provider_attempt
-            .begin("provider-qualification-stream", &request_bytes, true)
+            .begin(
+                &qualification_provider_attempt_id(base_url, credentials, true),
+                &request_bytes,
+                true,
+            )
             .map_err(|error| anyhow!("admit provider stream qualification: {error}"))?,
     );
     let idempotency_key = permit

@@ -629,8 +629,8 @@ impl AttemptContext {
             return Err(AttemptError::NotExplicitlyAuthorized);
         }
         let bytes = fs::read(path)?;
-        let record: StoredReconciliation = serde_json::from_slice(&bytes)
-            .map_err(|_| AttemptError::NotExplicitlyAuthorized)?;
+        let record: StoredReconciliation =
+            serde_json::from_slice(&bytes).map_err(|_| AttemptError::NotExplicitlyAuthorized)?;
         let payload = serde_json::to_vec(&record.payload)
             .map_err(|error| AttemptError::Serialization(error.to_string()))?;
         let public_key = self

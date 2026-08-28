@@ -2246,11 +2246,11 @@ where
                     context.begin_attempt().ok().map(|attempt| (route, attempt))
                 });
 
-        revalidate_provider_permit(provider_attempt, &mut physical_permit)?;
+        revalidate_provider_permit(&provider_attempt, &mut physical_permit)?;
         let resp_result = tokio::select! {
             r = send_once(&creds).send() => r,
             _ = cancel.cancelled() => {
-                mark_permit_cancelled_after_write(provider_attempt, physical_permit.take());
+                mark_permit_cancelled_after_write(&provider_attempt, physical_permit.take());
                 if let Some((route, attempt)) = observation_attempt.take() {
                     record_provider_attempt(
                         Some(attempt),
@@ -2270,7 +2270,7 @@ where
         let mut resp = match resp_result {
             Ok(r) => r,
             Err(e) => {
-                mark_permit_transport_ambiguous(provider_attempt, physical_permit.take());
+                mark_permit_transport_ambiguous(&provider_attempt, physical_permit.take());
                 if let Some((route, attempt)) = observation_attempt.take() {
                     record_provider_attempt(
                         Some(attempt),
@@ -2354,7 +2354,7 @@ where
                             .and_then(|(route, context)| {
                                 context.begin_attempt().ok().map(|attempt| (route, attempt))
                             });
-                    revalidate_provider_permit(provider_attempt, &mut physical_permit)?;
+                    revalidate_provider_permit(&provider_attempt, &mut physical_permit)?;
                     resp = tokio::select! {
                         r = send_once(&creds).send() => match r {
                             Ok(response) => response,
@@ -2389,7 +2389,7 @@ where
                             }
                         },
                         _ = cancel.cancelled() => {
-                            mark_permit_cancelled_after_write(provider_attempt, physical_permit.take());
+                            mark_permit_cancelled_after_write(&provider_attempt, physical_permit.take());
                             if let Some((route, attempt)) = observation_attempt.take() {
                                 record_provider_attempt(
                                     Some(attempt),
@@ -2408,7 +2408,7 @@ where
                     };
                 }
                 Err(error) => {
-                    mark_permit_semantic_rejection(provider_attempt, physical_permit.take(), 401);
+                    mark_permit_semantic_rejection(&provider_attempt, physical_permit.take(), 401);
                     bail!("HTTP 401 (OIDC refresh refused: {})", error.code());
                 }
             }
@@ -2420,7 +2420,7 @@ where
             || status == reqwest::StatusCode::REQUEST_TIMEOUT
         {
             if status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT {
-                mark_permit_transport_ambiguous(provider_attempt, physical_permit.take());
+                mark_permit_transport_ambiguous(&provider_attempt, physical_permit.take());
             }
             let headers = resp.headers().clone();
             let text = read_bounded_response_body(resp, cancel)
@@ -2465,7 +2465,7 @@ where
             }
             if status.as_u16() == 429 {
                 mark_permit_semantic_rejection(
-                    provider_attempt,
+                    &provider_attempt,
                     physical_permit.take(),
                     status.as_u16(),
                 );
@@ -2558,14 +2558,14 @@ where
             }
             if target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions {
                 mark_permit_semantic_rejection(
-                    provider_attempt,
+                    &provider_attempt,
                     physical_permit.take(),
                     status.as_u16(),
                 );
                 bail!("configured provider returned HTTP {status}");
             }
             mark_permit_semantic_rejection(
-                provider_attempt,
+                &provider_attempt,
                 physical_permit.take(),
                 status.as_u16(),
             );
@@ -2649,7 +2649,7 @@ where
                 );
             }
             settle_provider_http_response(
-                provider_attempt,
+                &provider_attempt,
                 &mut physical_permit,
                 status.as_u16(),
                 raw.as_bytes(),
@@ -2717,7 +2717,7 @@ where
                 );
             }
             settle_provider_http_response(
-                provider_attempt,
+                &provider_attempt,
                 &mut physical_permit,
                 status.as_u16(),
                 raw.as_bytes(),
@@ -2861,7 +2861,7 @@ where
                 );
             }
             settle_provider_http_response(
-                provider_attempt,
+                &provider_attempt,
                 &mut physical_permit,
                 status.as_u16(),
                 settlement_evidence.as_bytes(),
@@ -2932,7 +2932,7 @@ where
                 );
             }
             settle_provider_http_response(
-                provider_attempt,
+                &provider_attempt,
                 &mut physical_permit,
                 status.as_u16(),
                 settlement_evidence.as_bytes(),
@@ -2961,7 +2961,7 @@ where
                 );
             }
             settle_provider_http_response(
-                provider_attempt,
+                &provider_attempt,
                 &mut physical_permit,
                 status.as_u16(),
                 settlement_evidence.as_bytes(),
@@ -2989,7 +2989,7 @@ where
                 );
             }
             settle_provider_http_response(
-                provider_attempt,
+                &provider_attempt,
                 &mut physical_permit,
                 status.as_u16(),
                 settlement_evidence.as_bytes(),
@@ -3018,7 +3018,7 @@ where
             );
         }
         settle_provider_http_response(
-            provider_attempt,
+            &provider_attempt,
             &mut physical_permit,
             status.as_u16(),
             settlement_evidence.as_bytes(),
