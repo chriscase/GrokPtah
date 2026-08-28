@@ -519,6 +519,7 @@ impl CapabilityAuthority {
     /// Install one exact provider-send envelope from a host-owned principal.
     /// This is a policy-installation API, not a request or physical-send API;
     /// the returned authority is never exposed to the caller.
+    #[allow(clippy::too_many_arguments)]
     pub fn install_provider_envelope(
         &self,
         principal: &CapabilityPrincipal,

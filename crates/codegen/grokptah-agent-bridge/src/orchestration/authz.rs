@@ -148,7 +148,7 @@ impl AuthContext {
         let mut bytes = Vec::with_capacity(32);
         bytes.extend_from_slice(&self.stamp.principal.0);
         bytes.extend_from_slice(&self.stamp.incarnation.0);
-        PublicActorHandle(format!("actor_{}", hex_sha256(&bytes)[..32].to_string()))
+        PublicActorHandle(format!("actor_{}", &hex_sha256(&bytes)[..32]))
     }
 
     pub(crate) fn credential_id(&self) -> &str {
@@ -170,7 +170,7 @@ impl AuthContext {
         let mut bytes = Vec::with_capacity(32);
         bytes.extend_from_slice(&self.stamp.principal.0);
         bytes.extend_from_slice(&self.stamp.incarnation.0);
-        format!("principal_{}", hex_sha256(&bytes)[..32].to_string())
+        format!("principal_{}", &hex_sha256(&bytes)[..32])
     }
 
     /// Opaque digest stored alongside durable resources. It includes the
