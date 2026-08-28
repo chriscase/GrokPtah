@@ -1299,10 +1299,10 @@ mod tests {
                     )
                     .unwrap();
                 run_id = run.run_id.clone();
-                expected_version = run.version;
                 let run = service
                     .authorize("backend-authorize", &run.run_id, run.version, grant(&run))
                     .unwrap();
+                expected_version = run.version;
                 let service = service.with_crash_at(point);
                 let result = service
                     .observe("backend-observe", &run.run_id, run.version)
