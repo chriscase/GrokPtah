@@ -1306,20 +1306,6 @@ impl AgentHostHandle {
                     return Err(anyhow!(error.to_string()));
                 }
             };
-        if let Err(error) = receipt.validate() {
-            controller.abort_turn(false);
-            controller.apply_signal(RuntimeSignal::AuthorityUnavailable);
-            self.persist_adaptive_state(
-                &store,
-                session_id,
-                run_id,
-                expected_version,
-                &controller,
-                "provider_receipt_invalid",
-            )?;
-            return Err(anyhow!(error.to_string()));
-        }
-
         let outcome = propose_semantic_action_with_profile(
             &credentials,
             &model,

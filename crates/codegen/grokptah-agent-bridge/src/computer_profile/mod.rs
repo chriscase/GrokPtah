@@ -19,10 +19,7 @@ pub mod risk;
 pub(crate) use adapters::{
     AdaptiveObservationAdapter, ProviderImageInput, SemanticHeadlessAdapter, VisualGroundingAdapter,
 };
-pub(crate) use authority_seam::{
-    AdaptiveAuthorityAdapter, AuthorityFailure, HostIssuedBinding, ProviderAttemptEvidence,
-    ProviderAttemptRequest,
-};
+pub(crate) use authority_seam::{AdaptiveAuthorityAdapter, ProviderAttemptRequest};
 pub use capability::{
     CapabilityAttribution, CapabilityEvidence, HostCapabilityEvidence, ModelCapabilityEvidence,
 };
