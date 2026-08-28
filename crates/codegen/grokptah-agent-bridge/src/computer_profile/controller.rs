@@ -469,6 +469,7 @@ impl AdaptiveController {
         self.state.objective_digest.as_deref()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn bind_effect_authority(&mut self) {
         self.state.effect_authority_bound = true;
     }

@@ -130,8 +130,9 @@ pub use computer_use::{
     ComputerRunEventPage, ComputerRunEventRange, ComputerRunProgress, ComputerRunProjection,
     ComputerRunReads, ComputerRunState, ComputerScopeCapacity, ComputerStore, ComputerTarget,
     ComputerTargetCandidate, ComputerTargetSummary, ComputerUseLimits, ComputerUseService,
-    GrantIssuer, MacOsObservationPlatform, ObservationGeometry, ObservationSummary, SemanticAction,
-    SemanticElement, Sensitivity, SimulatorBackend, DEFAULT_EVENT_PAGE, MAX_EVENT_PAGE,
+    EvidenceRef, GrantIssuer, MacOsObservationPlatform, ObservationGeometry, ObservationSummary,
+    SemanticAction, SemanticElement, Sensitivity, SimulatorBackend, DEFAULT_EVENT_PAGE,
+    MAX_EVENT_PAGE,
 };
 pub use discover::{
     grokptah_home, home_override_serial, is_project_mcp_trusted, project_has_local_mcp_servers,

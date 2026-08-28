@@ -315,6 +315,7 @@ api.computerUseCockpitStageAction = async (
           : action.type === "activate_target"
             ? "Application focus"
             : "Semantic action",
+      executionEnvelope: "story-opaque-execution-envelope",
       createdAt: new Date().toISOString(),
     },
   };
