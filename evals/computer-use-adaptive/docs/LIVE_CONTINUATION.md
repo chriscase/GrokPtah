@@ -5,8 +5,10 @@ Synthetic campaigns set `providerCalls: 0` and `eligibility: synthetic_only`.
 A later live lane MUST:
 
 1. Reuse `grokptah.cu_eval_scenario.v1`, `grokptah.cu_eval_episode_result.v1`,
-   `grokptah.cu_eval_evidence.v1`, and `grokptah.cu_eval_campaign_report.v1`
-   without weakening additionalProperties / deny-unknown-fields rules.
+   `grokptah.cu_eval_evidence.v1`, `grokptah.cu_eval_evidence_set.v1`, and
+   `grokptah.cu_eval_campaign_report.v1` without weakening additionalProperties /
+   deny-unknown-fields rules. Campaign evidence is the evidence-set object, not a
+   bare array.
 2. Keep the same closed action grammar and fail-closed parsing.
 3. Set `eligibility` to `live_reusable_schema` only when `providerCalls > 0`.
 4. Set `live_authoritative` only with a structured `ProviderReceipt`

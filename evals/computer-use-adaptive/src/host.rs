@@ -13,7 +13,9 @@ use crate::types::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct EffectSpec {
+    #[serde(rename = "type")]
     pub kind: String,
     pub flag: Option<String>,
     pub key: Option<String>,
@@ -22,6 +24,7 @@ pub struct EffectSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ElementSpec {
     pub stable_key: String,
     pub role: String,
@@ -38,6 +41,7 @@ pub struct ElementSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct SurfaceSpec {
     pub surface_id: String,
     pub conflict_domain: String,
@@ -54,6 +58,7 @@ pub struct SurfaceSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct GrantSpec {
     pub grant_id: String,
     pub action_classes: Vec<ActionClass>,
@@ -63,12 +68,21 @@ pub struct GrantSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct VisualGrant {
+    pub granted: bool,
+    pub grant_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct AgentSpec {
     pub agent_id: String,
     pub work_attempt_id: String,
     pub lease_id: String,
     pub surface_id: String,
-    pub lease_granted: bool,
+    pub lease_state: crate::types::LeaseState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,16 +92,22 @@ pub struct WorldSpec {
     pub run_id: String,
     pub surfaces: Vec<SurfaceSpec>,
     pub grant: GrantSpec,
-    pub visual_grant: bool,
-    pub visual_grant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_grant: Option<VisualGrant>,
     pub agents: Vec<AgentSpec>,
     pub ax_pixel_contradiction: bool,
     pub consequential: bool,
     pub success_flag: String,
 }
 
+impl WorldSpec {
+    pub fn visual_granted(&self) -> bool {
+        self.visual_grant.as_ref().is_some_and(|g| g.granted)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
     Takeover,
     Cancel,
@@ -129,6 +149,7 @@ pub struct ScheduledEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct TraceEvent {
     pub step: u32,
     pub clock_ms: u64,
@@ -247,7 +268,10 @@ impl Host {
                     agent_id: agent.agent_id.clone(),
                     surface_id: agent.surface_id.clone(),
                     conflict_domain: domain,
-                    granted: agent.lease_granted,
+                    granted: matches!(
+                        agent.lease_state,
+                        crate::types::LeaseState::Granted | crate::types::LeaseState::Dispatching
+                    ),
                     dispatching: false,
                     incarnation: 1,
                     revoked: false,
@@ -255,6 +279,12 @@ impl Host {
             );
         }
         let primary = world.agents.first();
+        let visual_granted = world.visual_granted();
+        let visual_grant_id = world
+            .visual_grant
+            .as_ref()
+            .filter(|g| g.granted)
+            .map(|g| g.grant_id.clone());
         Self {
             clock: 0,
             step: 0,
@@ -264,8 +294,8 @@ impl Host {
             run_id: world.run_id,
             surfaces,
             grant: world.grant,
-            visual_grant: world.visual_grant,
-            visual_grant_id: world.visual_grant_id,
+            visual_grant: visual_granted,
+            visual_grant_id,
             leases,
             observations: BTreeMap::new(),
             current_obs: BTreeMap::new(),
@@ -1047,14 +1077,13 @@ mod tests {
                 expires_at_ms: 1_000_000,
                 remaining_uses: Some(8),
             },
-            visual_grant: false,
-            visual_grant_id: None,
+            visual_grant: None,
             agents: vec![AgentSpec {
                 agent_id: "agent_a".into(),
                 work_attempt_id: "wa_a".into(),
                 lease_id: "lease_a".into(),
                 surface_id: "surface_a".into(),
-                lease_granted: true,
+                lease_state: crate::types::LeaseState::Granted,
             }],
             ax_pixel_contradiction: false,
             consequential: false,

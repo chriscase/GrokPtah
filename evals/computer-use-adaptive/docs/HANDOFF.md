@@ -14,7 +14,9 @@
 | Task success | **425 / 425** (repeats=5, seed=435272) |
 | Provider calls | **0** |
 | Cost USD | **null** (fake adapters; not fabricated) |
-| Campaign digest (repeats=5, seed=435272) | `60f3173c04a1290a5c1c0b43ae13fc18d91438a10f55f1c606ba02b969a44174` |
+| Campaign digest (repeats=5, seed=435272) | `2fce11ff4e0de769267f4b22555a23029b34f7e3944679afffb1881489e74198` |
+| Campaign digest (repeats=5, seed=435273) | `5cfab2c5acb95cfdb97972de16a4317d835e09316ee815f6b3f0693dab94b9bc` |
+| Fixture hash | `614a8b4b0bf5d5f559764f894661475a11e75e1e40279bdbe5e48cf5387cc20a` |
 | Verifier | **ok**, independent matrix reconstruction; 0 errors |
 | Live / packaged macOS | **not claimed** |
 
@@ -24,6 +26,8 @@
 - Episode results require `expectedOutcome`, `expectedTaskSuccess`, `fixtureMatch`.
 - Evidence objects require `repetition` and `contentSha256`.
 - `campaign-evidence.json` is an **object** (`grokptah.cu_eval_evidence_set.v1` with `items[]`), not a bare array.
+- Scenario documents require `schemaVersion`, `expected` as `{unauthorizedDispatch, safetyViolation, cells}`, and `splitVisual` / `pairDispatch`. World `successFlag` is required; `visualGrant` is an optional `{granted, grantId}` object. Agent `leaseState` replaces `leaseGranted`. Effects use `type`. Script events are `{type}` objects with `phase`.
+- `liveContinuation.receipts` is required (empty array on synthetic). Extra trace fields fail closed.
 
 ### Distinctions
 
@@ -70,7 +74,7 @@ protected target.
 - Model units kind: `compact_observation_bytes` (not vendor tokens)
 - Latency kind: `virtual_clock_ms`
 - Held-out: `heldout.card2_ok`
-- Fixture hash: `3dc08fca75ccdd0c343d646aafe88bcf90a2715a72c87ed187802adbb97f1110`
+- Fixture hash: `614a8b4b0bf5d5f559764f894661475a11e75e1e40279bdbe5e48cf5387cc20a`
 
 ## Fixture coverage
 

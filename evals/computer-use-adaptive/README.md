@@ -22,7 +22,6 @@ Zero provider calls. Do not run a workspace-wide build.
 ```sh
 cd evals/computer-use-adaptive
 cargo test --locked -- --test-threads=1
-cargo test --locked -- --test-threads=1
 cargo clippy --locked --all-targets -- -D warnings
 cargo run --locked --bin grokptah-cu-adaptive-eval -- --out campaign-out --repeats 5 --seed 435272
 cargo run --locked --bin grokptah-cu-adaptive-eval -- \

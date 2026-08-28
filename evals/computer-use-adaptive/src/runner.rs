@@ -117,6 +117,7 @@ pub fn run_episode(
     );
     let expected = scenario
         .expected
+        .cells
         .iter()
         .find(|c| c.profile == profile && c.adapter == adapter)
         .cloned();
@@ -138,7 +139,7 @@ pub fn run_episode(
             profile,
             objective: &scenario.objective,
             observation: &obs,
-            visual_grant: scenario.world.visual_grant,
+            visual_grant: scenario.world.visual_granted(),
             caps: host.caps,
             step: host.step,
             seed,
@@ -173,7 +174,7 @@ pub fn run_episode(
                 host.escalations += 1;
                 outcome = OutcomeClass::Escalate;
                 if scenario.split_visual
-                    && scenario.world.visual_grant
+                    && scenario.world.visual_granted()
                     && ProfileBudget::for_profile(profile).allow_pointer
                     && adapter == AdapterId::TextOnlyTools
                 {
@@ -234,7 +235,7 @@ pub fn run_episode(
                 action,
             } => {
                 if scenario.pair_dispatch {
-                    run_pair(&mut host, scenario, adapter, &observation_id, &action);
+                    run_pair(&mut host, scenario, adapter, &observation_id, &action, seed);
                 } else {
                     let _ = host.try_dispatch(&surface, &lease, &observation_id, &action);
                 }
@@ -416,6 +417,7 @@ fn run_pair(
     adapter: AdapterId,
     observation_id: &str,
     action: &TypedAction,
+    seed: u64,
 ) {
     let surface_a = host.primary_surface.clone();
     let lease_a = host.primary_lease.clone();
@@ -427,10 +429,10 @@ fn run_pair(
             profile: host.profile,
             objective: &scenario.objective,
             observation: &obs_b,
-            visual_grant: scenario.world.visual_grant,
+            visual_grant: scenario.world.visual_granted(),
             caps: adapter.capabilities(),
             step: host.step,
-            seed: host.seed,
+            seed,
             allow_visual_subtask: false,
         };
         let (out_b, units) = infer_counted(adapter, &ctx);
@@ -458,6 +460,7 @@ pub fn expected_cell(
 ) -> Option<&crate::types::ExpectedCell> {
     scenario
         .expected
+        .cells
         .iter()
         .find(|c| c.profile == profile && c.adapter == adapter)
 }

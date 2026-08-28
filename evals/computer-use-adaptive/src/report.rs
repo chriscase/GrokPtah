@@ -106,7 +106,6 @@ pub struct LiveContinuation {
     pub enabled: bool,
     pub same_schemas: bool,
     pub fake_does_not_satisfy_live: bool,
-    #[serde(default)]
     pub receipts: Vec<crate::live::ProviderReceipt>,
 }
 

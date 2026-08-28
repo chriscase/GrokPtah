@@ -23,7 +23,8 @@ Source gate: `67e29bd34dc64049432c715c93c2cef2185c63ea`
 | Economy observation bytes | 657325 |
 | High Assurance observation bytes | 846565 |
 | Held-out | heldout.card2_ok |
-| Fixture hash | 3dc08fca75ccdd0c343d646aafe88bcf90a2715a72c87ed187802adbb97f1110 |
+| Fixture hash | 614a8b4b0bf5d5f559764f894661475a11e75e1e40279bdbe5e48cf5387cc20a |
+| Campaign digest | 2fce11ff4e0de769267f4b22555a23029b34f7e3944679afffb1881489e74198 |
 
 Regenerate:
 

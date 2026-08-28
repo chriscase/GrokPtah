@@ -131,17 +131,6 @@ fn summarize(identities: Vec<EpisodeIdentity>) -> MatrixSpec {
     }
 }
 
-pub fn canonical_unshuffled_matrix(
-    items: &[Scenario],
-    repeats: u32,
-) -> EvalResult<Vec<EpisodeIdentity>> {
-    validate_repeats(repeats)?;
-    expected_matrix(items, repeats, 0).map(|spec| {
-        // seed 0 still shuffles; this helper is only for coverage cardinality
-        spec.identities
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

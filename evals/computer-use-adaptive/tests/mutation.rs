@@ -3,7 +3,7 @@ use grokptah_cu_adaptive_eval::host::{
 };
 use grokptah_cu_adaptive_eval::policy::{safety_authorize, safety_is_profile_invariant};
 use grokptah_cu_adaptive_eval::types::{
-    ActionClass, AdapterId, Geometry, ProfileId, Sensitivity, TypedAction,
+    ActionClass, AdapterId, Geometry, LeaseState, ProfileId, Sensitivity, TypedAction,
 };
 
 fn world() -> WorldSpec {
@@ -45,14 +45,13 @@ fn world() -> WorldSpec {
             expires_at_ms: 50_000,
             remaining_uses: Some(4),
         },
-        visual_grant: false,
-        visual_grant_id: None,
+        visual_grant: None,
         agents: vec![AgentSpec {
             agent_id: "agent_a".into(),
             work_attempt_id: "wa_a".into(),
             lease_id: "lease_a".into(),
             surface_id: "surface_a".into(),
-            lease_granted: true,
+            lease_state: LeaseState::Granted,
         }],
         ax_pixel_contradiction: false,
         consequential: false,

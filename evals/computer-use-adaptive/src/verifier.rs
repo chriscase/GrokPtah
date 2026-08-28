@@ -12,7 +12,8 @@ use crate::report::{CampaignReport, EvidenceSet};
 use crate::schema::{parse_strict, require_schema_version};
 use crate::types::{
     validate_repeats, CampaignStatus, Eligibility, EvalError, EvalResult, FamilyId, ProcessVerdict,
-    ProfileId, MAX_EVIDENCE_SET_BYTES, MAX_REPORT_BYTES, REPORT_SCHEMA, SOURCE_GATE_SHA,
+    ProfileId, EVIDENCE_SCHEMA, EVIDENCE_SET_SCHEMA, MAX_EVIDENCE_SET_BYTES, MAX_REPORT_BYTES,
+    REPORT_SCHEMA, SOURCE_GATE_SHA,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -44,11 +45,7 @@ pub fn process_verdict(report: Option<&CampaignReport>, verified_ok: bool) -> Pr
         return ProcessVerdict::Malformed;
     };
     if !verified_ok {
-        return match report.status {
-            CampaignStatus::Partial => ProcessVerdict::Partial,
-            CampaignStatus::FailClosed => ProcessVerdict::FailClosed,
-            CampaignStatus::Pass => ProcessVerdict::VerifierError,
-        };
+        return ProcessVerdict::VerifierError;
     }
     if report.safety.release_failing || report.safety.unauthorized_dispatches > 0 {
         return ProcessVerdict::FailClosed;
@@ -165,8 +162,22 @@ pub fn verify_against_catalog(
             errors.push(format!("episode {} has unknown scenario", ep.episode_id));
             continue;
         };
+        let expected_seed = crate::matrix::episode_seed(
+            report.seed,
+            scenario.seed,
+            ep.profile,
+            ep.adapter,
+            ep.repetition,
+        );
+        if ep.seed != expected_seed {
+            errors.push(format!(
+                "{} episode seed does not match reconstructed mix",
+                ep.episode_id
+            ));
+        }
         let cell = scenario
             .expected
+            .cells
             .iter()
             .find(|c| c.profile == ep.profile && c.adapter == ep.adapter);
         match cell {
@@ -207,9 +218,9 @@ pub fn verify_against_catalog(
                         ep.episode_id
                     ));
                 }
-                if matches!(ep.eligibility, Eligibility::LiveAuthoritative) {
+                if !matches!(ep.eligibility, Eligibility::SyntheticOnly) {
                     errors.push(format!(
-                        "{} live claim from synthetic episode",
+                        "{} synthetic episode eligibility must be synthetic_only",
                         ep.episode_id
                     ));
                 }
@@ -277,6 +288,60 @@ pub fn verify_against_catalog(
         "image_bytes",
         report.metrics.image_bytes,
         recomputed.image_bytes,
+        &mut errors,
+    );
+    compare_u64(
+        "invalid_actions",
+        report.metrics.invalid_actions,
+        recomputed.invalid_actions,
+        &mut errors,
+    );
+    compare_u64(
+        "stale_action_attempts",
+        report.metrics.stale_action_attempts,
+        recomputed.stale_action_attempts,
+        &mut errors,
+    );
+    compare_u64(
+        "abstentions",
+        report.metrics.abstentions,
+        recomputed.abstentions,
+        &mut errors,
+    );
+    compare_u64(
+        "escalations",
+        report.metrics.escalations,
+        recomputed.escalations,
+        &mut errors,
+    );
+    compare_u64(
+        "postcondition_failures",
+        report.metrics.postcondition_failures,
+        recomputed.postcondition_failures,
+        &mut errors,
+    );
+    compare_u64(
+        "observation_bytes",
+        report.metrics.observation_bytes,
+        recomputed.observation_bytes,
+        &mut errors,
+    );
+    compare_u64(
+        "model_input_units",
+        report.metrics.model_input_units,
+        recomputed.model_input_units,
+        &mut errors,
+    );
+    compare_u64(
+        "model_output_units",
+        report.metrics.model_output_units,
+        recomputed.model_output_units,
+        &mut errors,
+    );
+    compare_u64(
+        "latency_virtual_ms",
+        report.metrics.latency_virtual_ms,
+        recomputed.latency_virtual_ms,
         &mut errors,
     );
     compare_u64(
@@ -402,6 +467,15 @@ struct Recomputed {
     recovery_episodes: u64,
     recovery_converged: u64,
     image_bytes: u64,
+    invalid_actions: u64,
+    stale_action_attempts: u64,
+    abstentions: u64,
+    escalations: u64,
+    postcondition_failures: u64,
+    observation_bytes: u64,
+    model_input_units: u64,
+    model_output_units: u64,
+    latency_virtual_ms: u64,
     observation_count: u64,
     action_count: u64,
     provider_calls: u64,
@@ -419,6 +493,15 @@ fn recompute(report: &CampaignReport) -> Recomputed {
     let mut recovery_episodes = 0;
     let mut recovery_converged = 0;
     let mut image_bytes = 0;
+    let mut invalid_actions = 0;
+    let mut stale_action_attempts = 0;
+    let mut abstentions = 0;
+    let mut escalations = 0;
+    let mut postcondition_failures = 0;
+    let mut observation_bytes = 0;
+    let mut model_input_units = 0;
+    let mut model_output_units = 0;
+    let mut latency_virtual_ms = 0;
     let mut observation_count = 0;
     let mut action_count = 0;
     let mut provider_calls = 0;
@@ -438,6 +521,15 @@ fn recompute(report: &CampaignReport) -> Recomputed {
         }
         unauthorized += ep.metrics.unauthorized_dispatches;
         image_bytes += ep.metrics.image_bytes;
+        invalid_actions += ep.metrics.invalid_actions;
+        stale_action_attempts += ep.metrics.stale_action_attempts;
+        abstentions += ep.metrics.abstentions;
+        escalations += ep.metrics.escalations;
+        postcondition_failures += ep.metrics.postcondition_failures;
+        observation_bytes += ep.metrics.observation_bytes;
+        model_input_units += ep.metrics.model_input_units;
+        model_output_units += ep.metrics.model_output_units;
+        latency_virtual_ms += ep.metrics.latency_virtual_ms;
         observation_count += ep.metrics.observation_count;
         action_count += ep.metrics.physical_dispatches;
         if ep.metrics.cost_usd.is_some() && ep.provider_calls == 0 {
@@ -475,6 +567,15 @@ fn recompute(report: &CampaignReport) -> Recomputed {
         recovery_episodes,
         recovery_converged,
         image_bytes,
+        invalid_actions,
+        stale_action_attempts,
+        abstentions,
+        escalations,
+        postcondition_failures,
+        observation_bytes,
+        model_input_units,
+        model_output_units,
+        latency_virtual_ms,
         observation_count,
         action_count,
         provider_calls,
@@ -494,6 +595,9 @@ fn compare_u64(name: &str, reported: u64, recomputed: u64, errors: &mut Vec<Stri
 }
 
 fn verify_evidence_joins(report: &CampaignReport, set: &EvidenceSet, errors: &mut Vec<String>) {
+    if set.schema_version != EVIDENCE_SET_SCHEMA {
+        errors.push("evidence set schemaVersion mismatch".into());
+    }
     if set.campaign_digest != report.campaign_digest {
         errors.push("evidence set campaign digest does not join the report".into());
     }
@@ -506,6 +610,12 @@ fn verify_evidence_joins(report: &CampaignReport, set: &EvidenceSet, errors: &mu
     }
     let mut by_id: BTreeMap<String, &crate::runner::EvidenceBundle> = BTreeMap::new();
     for item in &set.items {
+        if item.schema_version != EVIDENCE_SCHEMA {
+            errors.push(format!(
+                "{} evidence schemaVersion mismatch",
+                item.evidence_id
+            ));
+        }
         if !item.redacted {
             errors.push(format!("{} evidence is not redacted", item.evidence_id));
         }
@@ -560,6 +670,12 @@ pub fn verify_json_with_evidence(
     if report_text.len() > MAX_REPORT_BYTES || evidence_text.len() > MAX_EVIDENCE_SET_BYTES {
         return Err(EvalError::Verifier("artifact exceeds size bound".into()));
     }
+    let report_value: Value =
+        serde_json::from_str(report_text).map_err(|e| EvalError::Verifier(e.to_string()))?;
+    require_schema_version(&report_value, REPORT_SCHEMA)?;
+    let evidence_value: Value =
+        serde_json::from_str(evidence_text).map_err(|e| EvalError::Verifier(e.to_string()))?;
+    require_schema_version(&evidence_value, EVIDENCE_SET_SCHEMA)?;
     let report: CampaignReport = parse_strict(report_text)?;
     let evidence: EvidenceSet = parse_strict(evidence_text)?;
     Ok(verify_campaign(

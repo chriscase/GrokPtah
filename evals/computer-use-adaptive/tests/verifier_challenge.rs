@@ -15,8 +15,14 @@ fn clean() -> grokptah_cu_adaptive_eval::CampaignOutput {
 
 #[test]
 fn extra_report_fields_fail_closed() {
-    let json = "{\"schemaVersion\":\"grokptah.cu_eval_campaign_report.v1\",\"extra\":true}";
-    assert!(parse_strict::<grokptah_cu_adaptive_eval::CampaignReport>(json).is_err());
+    let out = clean();
+    let json = to_canonical_json(&out.report).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("extra".into(), serde_json::json!(true));
+    assert!(parse_strict::<grokptah_cu_adaptive_eval::CampaignReport>(&value.to_string()).is_err());
 }
 
 #[test]
@@ -120,6 +126,12 @@ fn changed_aggregate_with_unchanged_episodes_is_rejected() {
         .errors
         .iter()
         .any(|e| e.contains("task_success.numerator")));
+
+    let mut out = clean();
+    out.report.metrics.invalid_actions = out.report.metrics.invalid_actions.saturating_add(9);
+    let v = verify_report(&out.report);
+    assert!(!v.ok);
+    assert!(v.errors.iter().any(|e| e.contains("invalid_actions")));
 }
 
 #[test]
@@ -242,6 +254,48 @@ fn rust_required_episode_fields_are_required_in_schema() {
         report_schema["properties"]["episodes"]["items"]["$ref"],
         "urn:grokptah:schema:cu-eval-result:v1"
     );
+}
+
+#[test]
+fn live_reusable_schema_is_rejected_in_synthetic_mode() {
+    let mut out = clean();
+    out.report.episodes[0].eligibility = Eligibility::LiveReusableSchema;
+    out.report.episodes[0].provider_calls = 0;
+    let v = verify_report(&out.report);
+    assert!(!v.ok);
+    assert!(v.errors.iter().any(|e| e.contains("synthetic_only")));
+}
+
+#[test]
+fn rewritten_episode_seed_is_rejected() {
+    let mut out = clean();
+    out.report.episodes[0].seed = 1;
+    let v = verify_report(&out.report);
+    assert!(!v.ok);
+    assert!(v.errors.iter().any(|e| e.contains("episode seed")));
+}
+
+#[test]
+fn extra_trace_fields_fail_closed() {
+    let out = clean();
+    let json = to_canonical_json(&out.evidence).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let traces = value["items"][0]["trace"].as_array_mut().unwrap();
+    if traces.is_empty() {
+        traces.push(serde_json::json!({
+            "step": 0,
+            "clockMs": 0,
+            "kind": "observe",
+            "detail": "x",
+            "secret": "needle"
+        }));
+    } else {
+        traces[0]
+            .as_object_mut()
+            .unwrap()
+            .insert("secret".into(), serde_json::json!("needle"));
+    }
+    assert!(parse_strict::<grokptah_cu_adaptive_eval::EvidenceSet>(&value.to_string()).is_err());
 }
 
 #[test]
