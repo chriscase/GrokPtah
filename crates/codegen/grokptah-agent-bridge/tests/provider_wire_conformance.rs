@@ -2,15 +2,15 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use grokptah_agent_bridge::orchestration::{
+    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
+};
 use grokptah_agent_bridge::{
     public_xai_endpoint_fingerprint, replay_xai_provider_contract_on_loopback, AgentHost,
     ArtifactReference, AttemptDisposition, CampaignActuals, CampaignBudgets, CampaignIdentity,
     CertificationCheck, CredentialMethodClass, HostConfig, PersistentAgentCapture,
     ProviderAttemptEvidence, ProviderDialectClass, ProviderIdentity, ProviderRouteClass,
     RuntimeHome, SessionKind, StreamFraming, UsageEvidence, PERSISTENT_AGENT_CAPTURE_SCHEMA,
-};
-use grokptah_agent_bridge::orchestration::{
-    OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
 };
 use grokptah_test_gateway::{split_at, Frame, MockGateway, Response, Step};
 use serde::Deserialize;
@@ -228,8 +228,9 @@ fn physical_provider_tool_and_qualification_boundaries_never_issue() {
     assert!(!provider_boundary.contains("install_test_"));
     assert!(!provider_boundary.contains("provider-qualification"));
 
-    let qualification_source = std::fs::read_to_string(manifest.join("src/provider_qualification.rs"))
-        .expect("qualification source");
+    let qualification_source =
+        std::fs::read_to_string(manifest.join("src/provider_qualification.rs"))
+            .expect("qualification source");
     let qualification_boundary = qualification_source
         .split("fn consume_qualification_send_lease")
         .nth(1)
@@ -240,8 +241,7 @@ fn physical_provider_tool_and_qualification_boundaries_never_issue() {
     assert!(!qualification_boundary.contains("install_test_"));
     assert!(!qualification_boundary.contains("provider-qualification"));
 
-    let host_source =
-        std::fs::read_to_string(manifest.join("src/host.rs")).expect("host source");
+    let host_source = std::fs::read_to_string(manifest.join("src/host.rs")).expect("host source");
     let tool_admission = host_source
         .split("fn admit_tool_effect")
         .nth(1)
@@ -255,10 +255,11 @@ fn physical_provider_tool_and_qualification_boundaries_never_issue() {
 
 #[tokio::test]
 async fn replay_without_an_outer_envelope_has_zero_provider_requests() {
-    let gateway = MockGateway::start_ordered(vec![Step::respond(Response::sse_stream(
-        vec![Frame::new(b"data: [DONE]\n\n")],
-    ))])
-    .await;
+    let gateway =
+        MockGateway::start_ordered(vec![Step::respond(Response::sse_stream(vec![Frame::new(
+            b"data: [DONE]\n\n",
+        )]))])
+        .await;
     let (_runtime, host, principal) = canonical_replay_context();
     let authority = host.capability_authority();
     let base = format!("{}/v1", gateway.base_url());

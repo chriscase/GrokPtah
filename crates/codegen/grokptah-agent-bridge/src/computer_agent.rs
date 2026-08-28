@@ -8,9 +8,7 @@ use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::capability_authority::{
-    CapabilityAuthority, CapabilityPrincipal, CapabilitySnapshot,
-};
+use crate::capability_authority::{CapabilityAuthority, CapabilityPrincipal, CapabilitySnapshot};
 use crate::computer_use::{
     ComputerAction, ComputerObservation, ComputerUseLimits, SemanticAction, SimulatorBackend,
 };

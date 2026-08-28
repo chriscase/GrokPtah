@@ -459,11 +459,7 @@ impl AuthRegistry {
                 Some(record) => record.clone(),
                 None => {
                     changed = true;
-                    new_stored_credential(
-                        &credential.id,
-                        owner_id,
-                        self.allocate_generation()?,
-                    )
+                    new_stored_credential(&credential.id, owner_id, self.allocate_generation()?)
                 }
             };
             next.push(record);
@@ -513,8 +509,7 @@ impl AuthRegistry {
             return Err(stale_authority());
         };
         let generation = self.allocate_generation()?;
-        self.state.credentials[index] =
-            new_stored_credential(credential_id, owner_id, generation);
+        self.state.credentials[index] = new_stored_credential(credential_id, owner_id, generation);
         self.persist()
     }
 
@@ -574,10 +569,7 @@ impl AuthRegistry {
             ));
         };
         let principal = decode_fixed_hex(&record.principal).ok_or_else(|| {
-            OrchError::new(
-                OrchErrorCode::Internal,
-                "durable auth principal is invalid",
-            )
+            OrchError::new(OrchErrorCode::Internal, "durable auth principal is invalid")
         })?;
         let incarnation = decode_fixed_hex(&record.incarnation).ok_or_else(|| {
             OrchError::new(
@@ -683,10 +675,7 @@ impl AuthRegistry {
         self.authenticate(Some(&format!("Bearer {}", primary.token())), credentials)
     }
 
-    pub(crate) fn rotate_generation(
-        &mut self,
-        credential_id: &str,
-    ) -> Result<(), OrchError> {
+    pub(crate) fn rotate_generation(&mut self, credential_id: &str) -> Result<(), OrchError> {
         let generation = self.allocate_generation()?;
         let Some(record) = self
             .state
@@ -959,9 +948,14 @@ mod tests {
         let root = tempdir().unwrap();
         let credential = AuthCredential::new("primary", "tok").unwrap();
         let registry = AuthRegistry::open(root.path(), &[credential], "primary").unwrap();
-        assert!(registry.authenticate(None, &[AuthCredential::new("primary", "tok").unwrap()]).is_err());
         assert!(registry
-            .authenticate(Some("tok"), &[AuthCredential::new("primary", "tok").unwrap()])
+            .authenticate(None, &[AuthCredential::new("primary", "tok").unwrap()])
+            .is_err());
+        assert!(registry
+            .authenticate(
+                Some("tok"),
+                &[AuthCredential::new("primary", "tok").unwrap()]
+            )
             .is_err());
         assert!(registry
             .authenticate(
@@ -1013,10 +1007,7 @@ mod tests {
 
         let primary = AuthCredential::new("primary", "control").unwrap();
         let with_control = AuthRegistry::open(root.path(), &[primary], "primary").unwrap();
-        assert_eq!(
-            with_control.local_desktop_context().unwrap(),
-            first_context
-        );
+        assert_eq!(with_control.local_desktop_context().unwrap(), first_context);
     }
 
     #[test]

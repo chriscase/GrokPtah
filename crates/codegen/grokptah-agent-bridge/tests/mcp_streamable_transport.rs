@@ -2242,7 +2242,10 @@ async fn live_computer_reads_node_smoke() {
         OrchStore::open(home.path().join("authority-orch")).unwrap(),
         OrchestrationConfig {
             bearer_token: "computer-smoke-authority".into(),
-            allowlist: WorkspaceAllowlist::new([ws.path().to_path_buf(), ws_other.path().to_path_buf()]),
+            allowlist: WorkspaceAllowlist::new([
+                ws.path().to_path_buf(),
+                ws_other.path().to_path_buf(),
+            ]),
             max_concurrent_runs: 2,
             bounds: RunBounds::default(),
         },

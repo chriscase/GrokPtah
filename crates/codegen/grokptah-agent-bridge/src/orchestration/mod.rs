@@ -19,9 +19,7 @@ pub use authz::{
     canonical_workspace, constant_time_eq, AuthContext, AuthCredential, AuthenticationGeneration,
     CredentialIncarnation, EffectLease, PrincipalRef, PublicActorHandle, WorkspaceAllowlist,
 };
-pub(crate) fn local_desktop_auth_context(
-    root: &std::path::Path,
-) -> Result<AuthContext, OrchError> {
+pub(crate) fn local_desktop_auth_context(root: &std::path::Path) -> Result<AuthContext, OrchError> {
     authz::AuthRegistry::open_local_desktop(root)?.local_desktop_context()
 }
 

@@ -990,10 +990,7 @@ impl AgentHostHandle {
     /// Preinstall the exact provider and tool envelopes for one durable Agent.
     /// Physical requests can only select these envelopes; they cannot issue
     /// authority from their model, tool, or payload fields.
-    pub(crate) fn preinstall_canonical_capability_policy(
-        &self,
-        session_id: Uuid,
-    ) -> Result<()> {
+    pub(crate) fn preinstall_canonical_capability_policy(&self, session_id: Uuid) -> Result<()> {
         let principal = self.capability_principal(session_id)?;
         let (model, _) = self.selected_computer_model(session_id)?;
         if let Some(credentials) = crate::auth_store::resolve_wire_credentials_for_model(&model)
@@ -1172,7 +1169,9 @@ impl AgentHostHandle {
         let capability = self
             .capability_authority
             .preinstalled_capability(&current.capability_snapshot)
-            .map_err(|error| anyhow!("canonical Computer Use capability envelope is unavailable: {error}"))?;
+            .map_err(|error| {
+                anyhow!("canonical Computer Use capability envelope is unavailable: {error}")
+            })?;
         {
             let mut inner = self.inner.lock();
             if inner
@@ -1429,9 +1428,7 @@ impl AgentHostHandle {
             &format!("tool:{tool_name}"),
             Utc::now(),
         )?;
-        Ok(ToolCapabilityAdmission {
-            snapshot,
-        })
+        Ok(ToolCapabilityAdmission { snapshot })
     }
 
     fn consume_tool_effect_lease(
@@ -10543,12 +10540,12 @@ impl AgentHostHandle {
                 };
             let provider_observation = self.provider_observation_context(session_id);
             let capability_principal = match self.capability_principal(session_id) {
-                    Ok(principal) => principal,
-                    Err(error) => {
-                        last = format!("GP subagent capability admission failed: {error:#}");
-                        break;
-                    }
-                };
+                Ok(principal) => principal,
+                Err(error) => {
+                    last = format!("GP subagent capability admission failed: {error:#}");
+                    break;
+                }
+            };
             let step = call_xai_agent_step_observed_with_authority(
                 &creds,
                 &model,
@@ -11808,9 +11805,9 @@ mod tests {
                 .expect("open authority store"),
             crate::orchestration::OrchestrationConfig {
                 bearer_token: "host-test-authority".into(),
-                allowlist: crate::orchestration::WorkspaceAllowlist::new(
-                    [std::env::current_dir().expect("current directory")],
-                ),
+                allowlist: crate::orchestration::WorkspaceAllowlist::new([
+                    std::env::current_dir().expect("current directory")
+                ]),
                 max_concurrent_runs: 1,
                 bounds: RunBounds::default(),
             },

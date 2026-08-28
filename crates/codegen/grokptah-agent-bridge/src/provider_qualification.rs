@@ -7,9 +7,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::capability_authority::{
-    CapabilityAuthority, CapabilityPrincipal, CapabilitySnapshot,
-};
+use crate::capability_authority::{CapabilityAuthority, CapabilityPrincipal, CapabilitySnapshot};
 use crate::computer_use::{ComputerBackend, ComputerUseLimits, SemanticAction, SimulatorBackend};
 use crate::gateway_config::{CapabilitySource, ComputerUseTier};
 
@@ -302,13 +300,12 @@ pub(crate) async fn qualify_provider_model_with_authority(
         credential_fingerprint.as_deref(),
     )
     .map_err(anyhow::Error::msg)?;
-    let mut credentials =
-        QualificationCredentials::new_with_authority(
-            resolved_credentials,
-            &profile,
-            authority.clone(),
-            principal,
-        )?;
+    let mut credentials = QualificationCredentials::new_with_authority(
+        resolved_credentials,
+        &profile,
+        authority.clone(),
+        principal,
+    )?;
     if profile.managed_by_env {
         bail!("environment-managed profiles cannot persist measured capabilities");
     }
@@ -1415,15 +1412,9 @@ mod tests {
         )
         .unwrap();
 
-        let value = completion(
-            &client,
-            &base_url,
-            &mut credentials,
-            body,
-            false,
-        )
-        .await
-        .unwrap();
+        let value = completion(&client, &base_url, &mut credentials, body, false)
+            .await
+            .unwrap();
         assert_eq!(message_content(&value), Some(GENERATION_MARKER));
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         assert_eq!(credentials.current().unwrap().bearer, "fresh-token");
@@ -1487,11 +1478,8 @@ mod tests {
             request_count: request_count.clone(),
         })
         .await;
-        let profile = crate::gateway_config::ProviderProfile::openai_compatible(
-            "test",
-            "Test",
-            &base_url,
-        );
+        let profile =
+            crate::gateway_config::ProviderProfile::openai_compatible("test", "Test", &base_url);
         let mut credentials =
             QualificationCredentials::new(Some(wire_credentials("test", "token", false)), &profile)
                 .unwrap();
@@ -1758,15 +1746,9 @@ mod tests {
             "messages": [{"role": "user", "content": "synthetic"}],
             "stream": false
         });
-        let value = completion(
-            &client,
-            &base_url,
-            &mut credentials,
-            body.clone(),
-            false,
-        )
-        .await
-        .unwrap();
+        let value = completion(&client, &base_url, &mut credentials, body.clone(), false)
+            .await
+            .unwrap();
         assert_eq!(message_content(&value), Some(GENERATION_MARKER));
         assert_eq!(request_count.load(Ordering::SeqCst), 3);
         server.abort();
@@ -1791,15 +1773,9 @@ mod tests {
             credentials.current(),
         )
         .unwrap();
-        let error = completion(
-            &client,
-            &base_url,
-            &mut credentials,
-            body,
-            false,
-        )
-        .await
-        .unwrap_err();
+        let error = completion(&client, &base_url, &mut credentials, body, false)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("HTTP 429"));
         assert_eq!(request_count.load(Ordering::SeqCst), 4);
         server.abort();

@@ -1258,16 +1258,7 @@ pub(crate) async fn propose_plan_with_authority(
     authority: &CapabilityAuthority,
     principal: &CapabilityPrincipal,
 ) -> Result<(Vec<String>, Option<crate::completion::CompletionUsage>)> {
-    propose_plan_with_authority_inner(
-        creds,
-        model,
-        cwd,
-        goal,
-        cancel,
-        authority,
-        principal,
-    )
-    .await
+    propose_plan_with_authority_inner(creds, model, cwd, goal, cancel, authority, principal).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2308,8 +2299,7 @@ where
     let mut last_err = None::<String>;
     let provider_authority =
         authority.ok_or_else(|| anyhow!("host provider capability authority is unavailable"))?;
-    let principal =
-        principal.ok_or_else(|| anyhow!("host provider principal is unavailable"))?;
+    let principal = principal.ok_or_else(|| anyhow!("host provider principal is unavailable"))?;
     for _request_attempt in 0..MAX_REQUEST_ATTEMPTS {
         if cancel.is_cancelled() {
             bail!("cancelled");
@@ -4019,13 +4009,7 @@ async fn call_xai_chat_inner(
         req.json(&body)
     };
 
-    consume_provider_send_lease(
-        provider_authority,
-        &creds,
-        model,
-        &target,
-        principal,
-    )?;
+    consume_provider_send_lease(provider_authority, &creds, model, &target, principal)?;
     let mut resp = send_once(&creds).send().await.map_err(|e| {
         // Surface classify-able transport failures (DNS, TLS, timeout) so the
         // UI is not a vague "error sending request".
@@ -4055,13 +4039,7 @@ async fn call_xai_chat_inner(
         match crate::auth_store::force_refresh(&creds).await {
             Ok(fresh) => {
                 creds = fresh;
-                consume_provider_send_lease(
-                    provider_authority,
-                    &creds,
-                    model,
-                    &target,
-                    principal,
-                )?;
+                consume_provider_send_lease(provider_authority, &creds, model, &target, principal)?;
                 resp = send_once(&creds).send().await.map_err(|error| {
                     let class = if error.is_timeout() {
                         "timeout"

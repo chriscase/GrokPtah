@@ -190,7 +190,11 @@ impl CapabilitySnapshot {
             CapabilityKind::Tool,
             principal.id(),
             tool_name,
-            [tool_name, principal.policy_generation(), &principal.auth_generation().to_string()],
+            [
+                tool_name,
+                principal.policy_generation(),
+                &principal.auth_generation().to_string(),
+            ],
         )
     }
 
@@ -630,14 +634,7 @@ impl CapabilityAuthority {
                 .map(|envelope| envelope.envelope_id.clone())
                 .ok_or_else(|| anyhow::anyhow!("canonical capability envelope is unavailable"))?
         };
-        self.lease_from_envelope(
-            &envelope_id,
-            operation,
-            resource,
-            effect_scope,
-            now,
-            ttl,
-        )
+        self.lease_from_envelope(&envelope_id, operation, resource, effect_scope, now, ttl)
     }
 
     /// Revalidate an exact preinstalled envelope without exposing its opaque
@@ -772,7 +769,11 @@ impl CapabilityAuthority {
             // merely because a later request causes another lookup. A new
             // generation requires an explicit higher-authority `issue` call.
             let key = removed.capability.key;
-            if !state.envelopes.values().any(|envelope| envelope.capability.key == key) {
+            if !state
+                .envelopes
+                .values()
+                .any(|envelope| envelope.capability.key == key)
+            {
                 state.current.remove(&key);
             }
         }
