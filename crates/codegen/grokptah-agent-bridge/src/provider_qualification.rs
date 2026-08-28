@@ -937,27 +937,6 @@ fn consume_qualification_send_lease(
         &credential_fingerprint,
         &crate::gateway_config::ModelCapabilities::default(),
     )?;
-    #[cfg(test)]
-    if credentials
-        .authority
-        .revalidate_preinstalled(
-            &snapshot,
-            "provider.qualification.send",
-            &format!("qualification:{provider_id}:{model_id}"),
-            chrono::Utc::now(),
-        )
-        .is_err()
-    {
-        install_test_qualification_envelope(
-            &credentials.authority,
-            &credentials.principal,
-            provider_id,
-            model_id,
-            base_url,
-            model_id,
-            credentials.current(),
-        )?;
-    }
     let lease = credentials.authority.lease_from_preinstalled(
         &snapshot,
         "provider.qualification.send",
@@ -1420,16 +1399,27 @@ mod tests {
         .unwrap();
         credentials.forced_refresh_override = Some(wire_credentials("xai", "fresh-token", true));
         let client = reqwest::Client::new();
+        let body = serde_json::json!({
+            "model": "grok-4.5",
+            "messages": [{"role": "user", "content": "synthetic"}],
+            "stream": false
+        });
+        install_test_qualification_envelope(
+            &credentials.authority,
+            &credentials.principal,
+            "xai",
+            "grok-4.5",
+            &base_url,
+            "grok-4.5",
+            credentials.current(),
+        )
+        .unwrap();
 
         let value = completion(
             &client,
             &base_url,
             &mut credentials,
-            serde_json::json!({
-                "model": "grok-4.5",
-                "messages": [{"role": "user", "content": "synthetic"}],
-                "stream": false
-            }),
+            body,
             false,
         )
         .await
@@ -1455,13 +1445,62 @@ mod tests {
         refreshed.principal_id = Some("user-b".into());
         let mut credentials = QualificationCredentials::new(Some(initial), &profile).unwrap();
         credentials.forced_refresh_override = Some(refreshed);
+        install_test_qualification_envelope(
+            &credentials.authority,
+            &credentials.principal,
+            "xai",
+            "grok-4.5",
+            &base_url,
+            "grok-4.5",
+            credentials.current(),
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "model": "grok-4.5",
+            "messages": [{"role": "user", "content": "synthetic"}],
+            "stream": false
+        });
 
         let error = completion(
             &reqwest::Client::new(),
             &base_url,
             &mut credentials,
+            body,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("principal or mode changed"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn qualification_without_an_outer_envelope_sends_no_request() {
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) = start_gateway(GatewayState {
+            prose_tools: false,
+            json_for_stream: false,
+            reject_first_tool_choice: false,
+            tool_choice_rejections: Arc::new(AtomicUsize::new(0)),
+            rate_limits_remaining: Arc::new(AtomicUsize::new(0)),
+            request_count: request_count.clone(),
+        })
+        .await;
+        let profile = crate::gateway_config::ProviderProfile::openai_compatible(
+            "test",
+            "Test",
+            &base_url,
+        );
+        let mut credentials =
+            QualificationCredentials::new(Some(wire_credentials("test", "token", false)), &profile)
+                .unwrap();
+        let error = completion(
+            &reqwest::Client::new(),
+            &base_url,
+            &mut credentials,
             serde_json::json!({
-                "model": "grok-4.5",
+                "model": "cheap-code-model",
                 "messages": [{"role": "user", "content": "synthetic"}],
                 "stream": false
             }),
@@ -1469,8 +1508,8 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("principal or mode changed"));
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(error.to_string().contains("capability envelope"));
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
         server.abort();
     }
 
@@ -1704,15 +1743,26 @@ mod tests {
         let profile =
             crate::gateway_config::ProviderProfile::openai_compatible("test", "Test", &base_url);
         let mut credentials = QualificationCredentials::new(None, &profile).unwrap();
+        install_test_qualification_envelope(
+            &credentials.authority,
+            &credentials.principal,
+            "test",
+            "cheap-code-model",
+            &base_url,
+            "cheap-code-model",
+            credentials.current(),
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "model": "cheap-code-model",
+            "messages": [{"role": "user", "content": "synthetic"}],
+            "stream": false
+        });
         let value = completion(
             &client,
             &base_url,
             &mut credentials,
-            serde_json::json!({
-                "model": "cheap-code-model",
-                "messages": [{"role": "user", "content": "synthetic"}],
-                "stream": false
-            }),
+            body.clone(),
             false,
         )
         .await
@@ -1731,15 +1781,21 @@ mod tests {
             request_count: request_count.clone(),
         })
         .await;
+        install_test_qualification_envelope(
+            &credentials.authority,
+            &credentials.principal,
+            "test",
+            "cheap-code-model",
+            &base_url,
+            "cheap-code-model",
+            credentials.current(),
+        )
+        .unwrap();
         let error = completion(
             &client,
             &base_url,
             &mut credentials,
-            serde_json::json!({
-                "model": "cheap-code-model",
-                "messages": [{"role": "user", "content": "synthetic"}],
-                "stream": false
-            }),
+            body,
             false,
         )
         .await

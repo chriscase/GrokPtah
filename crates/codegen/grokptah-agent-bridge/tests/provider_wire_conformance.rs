@@ -250,6 +250,29 @@ fn physical_provider_tool_and_qualification_boundaries_never_issue() {
 }
 
 #[tokio::test]
+async fn replay_without_an_outer_envelope_has_zero_provider_requests() {
+    let gateway = MockGateway::start_ordered(vec![Step::respond(Response::sse_stream(
+        b"data: [DONE]\n\n".to_vec(),
+    ))])
+    .await;
+    let (_runtime, host, principal) = canonical_replay_context();
+    let authority = host.capability_authority();
+    let base = format!("{}/v1", gateway.base_url());
+    let error = replay_xai_provider_contract_on_loopback(
+        authority.as_ref(),
+        &principal,
+        &base,
+        "grok-fixture",
+        &[serde_json::json!({"role": "user", "content": "synthetic"})],
+        &serde_json::json!([]),
+    )
+    .await
+    .expect_err("provider replay must require an outer canonical envelope");
+    assert!(error.to_string().contains("capability envelope"));
+    assert!(gateway.requests().is_empty());
+}
+
+#[tokio::test]
 async fn synthetic_xai_fixture_replays_through_the_production_provider_path() {
     let (fixture, response) = load_fixture();
     let gateway = MockGateway::start_ordered(vec![Step::respond(Response::sse_stream(split_at(

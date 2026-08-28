@@ -1822,21 +1822,6 @@ fn consume_provider_send_lease(
         &credentials.qualification_identity_fingerprint(),
         &target.capabilities,
     )?;
-    #[cfg(test)]
-    if authority
-        .revalidate_preinstalled(
-            &snapshot,
-            "provider.send",
-            &provider_effect_resource(credentials, target),
-            Utc::now(),
-        )
-        .is_err()
-    {
-        // Unit transports use a deterministic fake that is isolated behind
-        // this test-only block. Production sends never install at effect
-        // time and fail closed when the host envelope is absent.
-        install_test_provider_envelope(authority, principal, credentials, selected_model, target)?;
-    }
     let lease = authority.lease_from_preinstalled(
         &snapshot,
         "provider.send",
