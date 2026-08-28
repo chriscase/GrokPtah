@@ -88,6 +88,42 @@ rotation and must drop to zero after cleanup.
 | `grokptah-isolated-visual-qualify` without VF launch | fail-closed / partial |
 | Signed helper + image + VF boot/frame/input/cleanup | required for PASS |
 
+## Continuous integration
+
+`.github/workflows/computer-use-isolated-visual.yml` is the only place this
+crate's tests execute. `grokptah-isolated-visual` declares its own
+`[workspace]`, so the `grokptah-agent-bridge` and desktop `cargo test`
+invocations compile the library as a path dependency but never run its 23 unit
+tests or the 5-case adversarial matrix.
+
+| Job | Runner | Proves |
+|---|---|---|
+| `isolated-visual` | ubuntu-latest | fmt, clippy `-D warnings`, serial tests, adversarial reachability, fail-closed qualification |
+| `lockfile-integrity` | ubuntu-latest | every committed `Cargo.lock` resolves under `--locked` |
+
+Tests run with `--test-threads=1`. That is required, not stylistic: the store
+takes advisory file locks and `store_lock_rejects_a_second_open` asserts a
+second open is refused, which only holds when nothing else holds the lock.
+
+Two checks back this, and both are runnable locally:
+
+```sh
+scripts/check-committed-lockfiles.sh     # every committed lockfile resolves
+scripts/check-adversarial-reachable.sh   # the adversarial suites still run
+```
+
+`check-adversarial-reachable.sh` labels its evidence. `[dynamic]` means the
+test binary was compiled and the harness enumerated the name; `[static]` means
+only the file and its invocation path were inspected. The bridge suites
+(`orchestration_adversarial`, `computer_use_release_gate`,
+`isolation_capability`) are `[static]` here because they run under
+`desktop.yml` on macOS, not in this workflow.
+
+CI runners have no Virtualization.framework and no signed helper or image, so
+the qualification step asserts the evidence stays `fail_closed` and never
+reports a launch. A green run is simulator and source evidence only: it is not
+VM, macOS, or hardware qualification, and the table above still governs.
+
 ## Continuation (blocked on disk/artifacts)
 
 This environment had less than 25 GiB free, occupied Cargo targets, and no
