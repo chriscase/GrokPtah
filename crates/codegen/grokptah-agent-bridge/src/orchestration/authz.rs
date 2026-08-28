@@ -929,6 +929,32 @@ impl AuthRegistry {
         })
     }
 
+    pub(crate) fn verify_resource_or_session_binding(
+        &mut self,
+        resource: &str,
+        session_id: Uuid,
+        auth: &AuthContext,
+    ) -> Result<(), OrchError> {
+        if resource.is_empty() || resource.len() > 512 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "authority resource key is empty or exceeds its bound",
+            ));
+        }
+        let resource = resource.to_string();
+        let session_resource = format!("session:{session_id}");
+        let digest = auth.binding_digest();
+        self.with_latest_state(|state| {
+            require_current_state(state, auth)?;
+            match state.bindings.get(&resource) {
+                Some(existing) if existing == &digest => Ok(()),
+                Some(_) => Err(stale_authority()),
+                None if state.bindings.get(&session_resource) == Some(&digest) => Ok(()),
+                None => Err(stale_authority()),
+            }
+        })
+    }
+
     pub(crate) fn begin_session_binding(
         &mut self,
         session_id: Uuid,

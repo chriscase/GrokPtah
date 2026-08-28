@@ -1738,14 +1738,15 @@ impl OrchestrationService {
             .ensure_resource_binding(&resource.into(), auth)
     }
 
-    fn verify_resource_binding(
+    fn verify_resource_or_session_binding(
         &self,
         auth: &AuthContext,
         resource: impl Into<String>,
+        session_id: Uuid,
     ) -> Result<(), OrchError> {
         self.auth_registry
             .lock()
-            .verify_resource_binding(&resource.into(), auth)
+            .verify_resource_or_session_binding(&resource.into(), session_id, auth)
     }
 
     fn ensure_session_binding(
@@ -2465,7 +2466,11 @@ impl OrchestrationService {
             .collect::<Vec<_>>();
         self.verify_session_binding(auth, session_id)?;
         for run in &runs {
-            self.verify_resource_binding(auth, format!("run:{}", run.run_id))?;
+            self.verify_resource_or_session_binding(
+                auth,
+                format!("run:{}", run.run_id),
+                run.session_id,
+            )?;
         }
         Ok(json!({ "runs": runs }))
     }
@@ -2599,8 +2604,12 @@ impl OrchestrationService {
                 item.session_id == session_id && item.workspace == claimed.display().to_string()
             })
             .filter(|item| {
-                self.verify_resource_binding(auth, format!("work:{}", item.work_id))
-                    .is_ok()
+                self.verify_resource_or_session_binding(
+                    auth,
+                    format!("work:{}", item.work_id),
+                    session_id,
+                )
+                .is_ok()
             })
             .collect::<Vec<_>>();
         Ok(json!({ "work": work }))
@@ -2616,7 +2625,11 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.verify_session_binding(auth, session_id)?;
         let (item, _) = self.load_work_scoped(session_id, workspace, work_id, true)?;
-        self.verify_resource_binding(auth, format!("work:{}", item.work_id))?;
+        self.verify_resource_or_session_binding(
+            auth,
+            format!("work:{}", item.work_id),
+            session_id,
+        )?;
         self.workload_value(item, true)
     }
 
@@ -2657,8 +2670,12 @@ impl OrchestrationService {
                 plan.session_id == session_id && plan.workspace == claimed.display().to_string()
             })
             .filter(|plan| {
-                self.verify_resource_binding(auth, format!("manager-plan:{}", plan.plan_id))
-                    .is_ok()
+                self.verify_resource_or_session_binding(
+                    auth,
+                    format!("manager-plan:{}", plan.plan_id),
+                    session_id,
+                )
+                .is_ok()
             })
             .collect::<Vec<_>>();
         Ok(json!({ "plans": plans }))
@@ -2674,7 +2691,11 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.verify_session_binding(auth, session_id)?;
         let (_, plan) = self.load_manager_plan_scoped(session_id, workspace, plan_id)?;
-        self.verify_resource_binding(auth, format!("manager-plan:{}", plan.plan_id))?;
+        self.verify_resource_or_session_binding(
+            auth,
+            format!("manager-plan:{}", plan.plan_id),
+            session_id,
+        )?;
         Ok(json!({ "plan": plan }))
     }
 
@@ -4405,7 +4426,11 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let (item, _) = self.load_work_scoped(session_id, workspace, work_id, true)?;
-        self.verify_resource_binding(auth, format!("work:{}", item.work_id))?;
+        self.verify_resource_or_session_binding(
+            auth,
+            format!("work:{}", item.work_id),
+            session_id,
+        )?;
         let decisions = self.store.list_work_decisions(&item.work_id)?;
         Ok(json!({ "workId": item.work_id, "decisions": decisions }))
     }
@@ -4593,8 +4618,12 @@ impl OrchestrationService {
             100,
         )?;
         page.messages.retain(|message| {
-            self.verify_resource_binding(auth, format!("message:{}", message.message_id))
-                .is_ok()
+            self.verify_resource_or_session_binding(
+                auth,
+                format!("message:{}", message.message_id),
+                session_id,
+            )
+            .is_ok()
         });
         Ok(json!(page))
     }
@@ -4618,8 +4647,12 @@ impl OrchestrationService {
             100,
         )?;
         page.messages.retain(|message| {
-            self.verify_resource_binding(auth, format!("message:{}", message.message_id))
-                .is_ok()
+            self.verify_resource_or_session_binding(
+                auth,
+                format!("message:{}", message.message_id),
+                session_id,
+            )
+            .is_ok()
         });
         Ok(json!(page))
     }
@@ -4767,8 +4800,12 @@ impl OrchestrationService {
                     && routine.workspace == claimed.display().to_string()
             })
             .filter(|routine| {
-                self.verify_resource_binding(auth, format!("routine:{}", routine.routine_id))
-                    .is_ok()
+                self.verify_resource_or_session_binding(
+                    auth,
+                    format!("routine:{}", routine.routine_id),
+                    session_id,
+                )
+                .is_ok()
             })
             .collect::<Vec<_>>();
         Ok(json!({ "routines": routines }))
@@ -4784,7 +4821,11 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.verify_session_binding(auth, session_id)?;
         let (routine, _) = self.load_routine_scoped(session_id, workspace, routine_id, true)?;
-        self.verify_resource_binding(auth, format!("routine:{}", routine.routine_id))?;
+        self.verify_resource_or_session_binding(
+            auth,
+            format!("routine:{}", routine.routine_id),
+            session_id,
+        )?;
         self.routine_value(routine, true)
     }
 
@@ -4798,7 +4839,11 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.verify_session_binding(auth, session_id)?;
         let (routine, _) = self.load_routine_scoped(session_id, workspace, routine_id, true)?;
-        self.verify_resource_binding(auth, format!("routine:{}", routine.routine_id))?;
+        self.verify_resource_or_session_binding(
+            auth,
+            format!("routine:{}", routine.routine_id),
+            session_id,
+        )?;
         let activations = self.store.list_activations(&routine.routine_id, 128)?;
         Ok(json!({
             "routineId": routine.routine_id,
@@ -5249,7 +5294,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         self.verify_session_binding(auth, session_id)?;
-        self.verify_resource_binding(auth, format!("agent:{agent_id}"))?;
+        self.verify_resource_or_session_binding(auth, format!("agent:{agent_id}"), session_id)?;
         let _ =
             self.authorize_persistent_agent_request(auth, session_id, workspace, agent_id, false)?;
         let plan = self
@@ -5447,7 +5492,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         self.verify_session_binding(auth, session_id)?;
-        self.verify_resource_binding(auth, format!("agent:{agent_id}"))?;
+        self.verify_resource_or_session_binding(auth, format!("agent:{agent_id}"), session_id)?;
         let agent = self.store.require_agent_in_scope(
             agent_id,
             session_id,
@@ -5707,7 +5752,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let run = self.load_authorized_run(run_id)?;
-        self.verify_resource_binding(auth, format!("run:{run_id}"))?;
+        self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), run.session_id)?;
         self.run_value(run)
     }
 
@@ -5721,7 +5766,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.verify_session_binding(auth, session_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
-        self.verify_resource_binding(auth, format!("run:{run_id}"))?;
+        self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), session_id)?;
         self.run_value(run)
     }
 
@@ -5739,7 +5784,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let run = self.load_authorized_run(run_id)?;
-        self.verify_resource_binding(auth, format!("run:{run_id}"))?;
+        self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), run.session_id)?;
         self.progress_value(run)
     }
 
@@ -5753,7 +5798,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.verify_session_binding(auth, session_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
-        self.verify_resource_binding(auth, format!("run:{run_id}"))?;
+        self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), session_id)?;
         self.progress_value(run)
     }
 
@@ -5803,7 +5848,7 @@ impl OrchestrationService {
             )
         })?;
         let run = self.load_authorized_run(rid)?;
-        self.verify_resource_binding(auth, format!("run:{rid}"))?;
+        self.verify_resource_or_session_binding(auth, format!("run:{rid}"), run.session_id)?;
         self.events_for_run(run, after_seq, limit)
     }
 
@@ -5819,7 +5864,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.verify_session_binding(auth, session_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
-        self.verify_resource_binding(auth, format!("run:{run_id}"))?;
+        self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), session_id)?;
         self.events_for_run(run, after_seq, limit)
     }
 
@@ -5837,7 +5882,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.verify_session_binding(auth, session_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
-        self.verify_resource_binding(auth, format!("run:{run_id}"))?;
+        self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), session_id)?;
         let Some(start_seq) = run.start_seq else {
             return Err(OrchError::new(
                 OrchErrorCode::Conflict,
@@ -6053,7 +6098,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let run = self.load_authorized_run(run_id)?;
-        self.verify_resource_binding(auth, format!("run:{run_id}"))?;
+        self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), run.session_id)?;
         self.changes_for_run(run)
     }
 
@@ -6067,7 +6112,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.verify_session_binding(auth, session_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
-        self.verify_resource_binding(auth, format!("run:{run_id}"))?;
+        self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), session_id)?;
         self.changes_for_run(run)
     }
 
@@ -6098,7 +6143,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let run = self.load_authorized_run(run_id)?;
-        self.verify_resource_binding(auth, format!("run:{run_id}"))?;
+        self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), run.session_id)?;
         self.test_results_for_run(run)
     }
 
@@ -6112,7 +6157,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.verify_session_binding(auth, session_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
-        self.verify_resource_binding(auth, format!("run:{run_id}"))?;
+        self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), session_id)?;
         self.test_results_for_run(run)
     }
 
@@ -6189,7 +6234,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let run = self.load_authorized_run(run_id)?;
-        self.verify_resource_binding(auth, format!("run:{run_id}"))?;
+        self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), run.session_id)?;
         self.handoff_for_run(run)
     }
 
@@ -6203,7 +6248,7 @@ impl OrchestrationService {
         self.require_current_auth(auth)?;
         self.verify_session_binding(auth, session_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
-        self.verify_resource_binding(auth, format!("run:{run_id}"))?;
+        self.verify_resource_or_session_binding(auth, format!("run:{run_id}"), session_id)?;
         self.handoff_for_run(run)
     }
 
