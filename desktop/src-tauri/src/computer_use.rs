@@ -1051,7 +1051,7 @@ mod tests {
     /// Host fixture with its persist directories bound under the disposable
     /// fixture directory. The process-global home override is serialized and
     /// restored so parallel tests never touch the real user home.
-    fn test_host(dir: &std::path::Path) -> AgentHostHandle {
+    fn test_host(dir: &std::path::Path) -> grokptah_agent_bridge::HostRuntime {
         let _guard = grokptah_agent_bridge::home_override_serial();
         grokptah_agent_bridge::set_grokptah_home_override(Some(dir.join(".grokptah")));
         let host = grokptah_agent_bridge::AgentHost::create(Default::default());
@@ -1059,7 +1059,10 @@ mod tests {
         host
     }
 
-    fn test_desktop() -> (tempfile::TempDir, DesktopComputerUse) {
+    /// The `HostRuntime` is returned so each test keeps the single owner
+    /// of the process lock and task supervisor alive: dropping it closes
+    /// the lifecycle and every request handle then fails closed (#455).
+    fn test_desktop() -> (tempfile::TempDir, grokptah_agent_bridge::HostRuntime, DesktopComputerUse) {
         let dir = tempfile::tempdir().unwrap();
         // Tests deliberately open an isolated store in the fixture directory;
         // production `new()` must borrow the host's shared handle instead.
@@ -1069,9 +1072,11 @@ mod tests {
             store.clone(),
         ));
         // Build the host before `dir` moves into the returned tuple.
-        let host = test_host(dir.path());
+        let runtime = test_host(dir.path());
+        let host = runtime.handle();
         (
             dir,
+            runtime,
             DesktopComputerUse {
                 host,
                 platform: None,
@@ -1087,8 +1092,13 @@ mod tests {
         )
     }
 
-    fn native_test_desktop() -> (tempfile::TempDir, DesktopComputerUse, Arc<AtomicUsize>) {
-        let (dir, mut desktop) = test_desktop();
+    fn native_test_desktop() -> (
+        tempfile::TempDir,
+        grokptah_agent_bridge::HostRuntime,
+        DesktopComputerUse,
+        Arc<AtomicUsize>,
+    ) {
+        let (dir, runtime, mut desktop) = test_desktop();
         let actions = Arc::new(AtomicUsize::new(0));
         let target = ComputerTarget {
             app_id: NATIVE_TEST_APP_ID.into(),
@@ -1115,12 +1125,12 @@ mod tests {
             actions: actions.clone(),
             available: std::sync::Mutex::new(true),
         }));
-        (dir, desktop, actions)
+        (dir, runtime, desktop, actions)
     }
 
     #[tokio::test]
     async fn approval_is_exact_one_use_and_requires_reobservation() {
-        let (_dir, desktop) = test_desktop();
+        let (_dir, _runtime, desktop) = test_desktop();
         let owner = Uuid::new_v4();
         let target = SimulatorBackend::demo_target();
         let started = desktop
@@ -1174,7 +1184,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_proposal_is_revalidated_and_staged_without_dispatch() {
-        let (_dir, desktop) = test_desktop();
+        let (_dir, _runtime, desktop) = test_desktop();
         let owner = Uuid::new_v4();
         let target = SimulatorBackend::demo_target();
         let started = desktop
@@ -1222,7 +1232,7 @@ mod tests {
 
     #[tokio::test]
     async fn model_completion_only_revokes_authority_on_exact_current_frame() {
-        let (_dir, desktop) = test_desktop();
+        let (_dir, _runtime, desktop) = test_desktop();
         let owner = Uuid::new_v4();
         let target = SimulatorBackend::demo_target();
         let started = desktop
@@ -1256,7 +1266,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_cannot_cross_sessions_or_survive_takeover() {
-        let (_dir, desktop) = test_desktop();
+        let (_dir, _runtime, desktop) = test_desktop();
         let owner = Uuid::new_v4();
         let other = Uuid::new_v4();
         let target = SimulatorBackend::demo_target();
@@ -1315,7 +1325,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_run_uses_the_same_exact_one_use_approval_path() {
-        let (_dir, desktop, actions) = native_test_desktop();
+        let (_dir, _runtime, desktop, actions) = native_test_desktop();
         let owner = Uuid::new_v4();
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let started = desktop
@@ -1358,7 +1368,7 @@ mod tests {
 
     #[tokio::test]
     async fn starting_a_native_run_prunes_terminal_native_backends() {
-        let (_dir, desktop, _actions) = native_test_desktop();
+        let (_dir, _runtime, desktop, _actions) = native_test_desktop();
         let first_owner = Uuid::new_v4();
         let candidate = desktop.list_targets().await.unwrap().remove(0);
         let first = desktop

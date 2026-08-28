@@ -21,7 +21,7 @@ fn setup_with_guard(
 ) -> (
     tempfile::TempDir,
     HomeGuard,
-    grokptah_agent_bridge::AgentHostHandle,
+    grokptah_agent_bridge::HostRuntime,
     tempfile::TempDir,
     Arc<OrchestrationService>,
 ) {

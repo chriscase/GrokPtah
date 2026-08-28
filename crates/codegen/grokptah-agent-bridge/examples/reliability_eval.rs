@@ -17,8 +17,8 @@ use grokptah_agent_bridge::reliability_eval::{
     write_report, EventLedger, ReliabilityReport, ScenarioCheck, ScenarioResult,
 };
 use grokptah_agent_bridge::{
-    home_override_serial, set_grokptah_home_override, AgentHost, AgentHostHandle, EventReceiver,
-    HostConfig, PermissionDecision, SessionUpdate, SteeringDisposition, ToolCallStatus,
+    home_override_serial, set_grokptah_home_override, AgentHost, EventReceiver, HostConfig,
+    HostRuntime, PermissionDecision, SessionUpdate, SteeringDisposition, ToolCallStatus,
 };
 use tokio::time::timeout;
 
@@ -64,7 +64,7 @@ fn fixture_repo() -> Result<tempfile::TempDir> {
     Ok(dir)
 }
 
-fn started_host(always_approve: bool) -> Result<AgentHostHandle> {
+fn started_host(always_approve: bool) -> Result<HostRuntime> {
     let host = AgentHost::create(HostConfig {
         always_approve,
         ..HostConfig::default()

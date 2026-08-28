@@ -26,7 +26,7 @@ use common::ProcessEnvGuard;
 fn setup() -> (
     tempfile::TempDir,
     ProcessEnvGuard,
-    grokptah_agent_bridge::AgentHostHandle,
+    grokptah_agent_bridge::HostRuntime,
     tempfile::TempDir,
     std::sync::Arc<OrchestrationService>,
 ) {

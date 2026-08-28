@@ -38,6 +38,7 @@ use crate::host_helpers::{
     surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
     IdenticalToolCallRun, McpToolIndex,
 };
+use crate::host_runtime::HostRuntime;
 use crate::lane::LaneSummary;
 use crate::local_tools;
 use crate::memory::{MemoryAccess, MemoryAddress, MemoryScope};
@@ -748,8 +749,12 @@ pub struct AgentHostHandle {
     /// children it spawns. A session counter is not a safe run identity.
     run_usage_trackers: Arc<Mutex<HashMap<Uuid, Arc<RunUsageTracker>>>>,
     provider_observation: Option<ProviderObservationSession>,
-    /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
-    _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
+    /// Shared process lifecycle (#455). The handle observes the phase and
+    /// registers supervised tasks; it deliberately does **not** own the
+    /// single-instance lock, which lives in the non-cloneable
+    /// [`crate::HostRuntime`] so release is an explicit ordered action rather
+    /// than a clone-refcount side effect.
+    pub(crate) lifecycle: Arc<crate::host_runtime::HostLifecycle>,
     /// Selects the durable root for legacy modules that still resolve paths
     /// through `grokptah_home()`. Shared by all host clones.
     runtime_home: crate::discover::RuntimeHome,
@@ -765,8 +770,14 @@ pub(crate) struct ExternalRunContext {
 pub struct AgentHost;
 
 impl AgentHost {
-    /// Create a new host. Events are pulled via [`AgentHostHandle::take_event_receiver`] once.
-    pub fn create(config: HostConfig) -> AgentHostHandle {
+    /// Create a new host runtime. Events are pulled via
+    /// [`AgentHostHandle::take_event_receiver`] once.
+    ///
+    /// The returned [`HostRuntime`] is **not** `Clone`: it is the single owner
+    /// of the process instance lock and of the task supervisor (#455). It
+    /// derefs to [`AgentHostHandle`], and `runtime.clone()` yields a cloneable
+    /// *request handle* that carries no process authority of its own.
+    pub fn create(config: HostConfig) -> HostRuntime {
         Self::create_with_runtime_home(config, crate::discover::RuntimeHome::discover())
     }
 
@@ -776,17 +787,21 @@ impl AgentHost {
     pub fn create_with_runtime_home(
         config: HostConfig,
         runtime_home: crate::discover::RuntimeHome,
-    ) -> AgentHostHandle {
+    ) -> HostRuntime {
         let runtime_home_context = Arc::new(runtime_home.install());
         // Single-instance guard before any GC or writes that could race another process.
         let instance_lock = match crate::instance_lock::InstanceLock::try_acquire_at(&runtime_home)
         {
-            Ok(l) => Some(Arc::new(l)),
+            Ok(l) => Some(l),
             Err(e) => {
                 eprintln!("[grokptah] {e:#}");
                 None
             }
         };
+        let lifecycle = crate::host_runtime::HostLifecycle::new(
+            instance_lock,
+            runtime_home.instance_lock_path(),
+        );
         let mut event_tx = crate::event_bus::EventBus::new(
             config
                 .event_bus_capacity
@@ -843,7 +858,7 @@ impl AgentHost {
         // Drop tab ids that no longer exist.
         open_tab_ids.retain(|id| sessions.contains_key(id));
         // Soft GC only when we own the instance lock (never GC another process's sessions).
-        if instance_lock.is_some() {
+        if lifecycle.acquired_process_lock() {
             if let Ok(n) = session_store::garbage_collect(&open_tab_ids, 80, 24 * 7) {
                 if n > 0 {
                     if let Ok(reloaded) = session_store::load_all_metas() {
@@ -923,7 +938,7 @@ impl AgentHost {
             live_shells: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             session_usage: HashMap::new(),
         };
-        AgentHostHandle {
+        let handle = AgentHostHandle {
             inner: Arc::new(Mutex::new(inner)),
             event_rx_factory: Arc::new(Mutex::new(Some(event_rx))),
             orchestration_store: Arc::new(Mutex::new(None)),
@@ -933,10 +948,11 @@ impl AgentHost {
             orchestration_wakeup: Arc::new(Notify::new()),
             run_usage_trackers: Arc::new(Mutex::new(HashMap::new())),
             provider_observation: config.provider_observation,
-            _instance_lock: instance_lock,
+            lifecycle: lifecycle.clone(),
             runtime_home,
             _runtime_home_context: runtime_home_context,
-        }
+        };
+        HostRuntime::new(handle, lifecycle)
     }
 }
 
@@ -944,6 +960,120 @@ impl AgentHostHandle {
     /// The validated durable root owned by this host process.
     pub fn runtime_home(&self) -> crate::discover::RuntimeHome {
         self.runtime_home.clone()
+    }
+
+    /// Current lifecycle phase of the owning [`crate::HostRuntime`] (#455).
+    pub fn lifecycle_phase(&self) -> crate::host_runtime::HostPhase {
+        self.lifecycle.phase()
+    }
+
+    /// True while this handle may still take new process authority. A handle
+    /// that outlived its runtime reports false and refuses new work.
+    pub fn is_accepting_work(&self) -> bool {
+        self.lifecycle.is_open()
+    }
+
+    /// Fail-closed guard for authority-bearing operations.
+    pub(crate) fn ensure_accepting(&self, operation: &str) -> Result<()> {
+        self.lifecycle.ensure_open(operation)
+    }
+
+    /// Cancellation token fired when the owning runtime begins shutdown.
+    /// Long-lived supervised tasks select on this so the join barrier is
+    /// bounded without polling or sleeping.
+    pub(crate) fn shutdown_token(&self) -> CancellationToken {
+        self.lifecycle.cancel_token()
+    }
+
+    /// Spawn a task the owning runtime must join before releasing the process
+    /// lock. Refused once shutdown has begun (#455).
+    pub(crate) fn spawn_supervised<F>(
+        &self,
+        operation: &str,
+        future: F,
+    ) -> Result<tokio::task::JoinHandle<F::Output>>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.lifecycle.spawn_supervised(operation, future)
+    }
+
+    /// Cancel every unit of in-flight work this host owns, so the shutdown
+    /// join barrier is bounded: turns (which also cascade to their subagents
+    /// and tool shells), standalone subagents, background scans and shell
+    /// tasks, Computer Use operations, and any live child processes.
+    ///
+    /// Cancellation is cooperative — durable finalization still runs — and the
+    /// caller joins the supervised tasks afterwards.
+    pub async fn cancel_all_activity(&self) {
+        let (live_shells, shell_ids) = {
+            let mut g = self.inner.lock();
+            for token in g.turn_cancels.values() {
+                token.cancel();
+            }
+            for (_, token) in g.subagent_cancels.drain() {
+                token.cancel();
+            }
+            for subagent in g.subagents.iter_mut() {
+                if subagent.status == "running" {
+                    subagent.status = "cancelled".into();
+                    subagent.summary = Some("host shutdown".into());
+                }
+            }
+            for (_, token) in g.background_cancels.drain() {
+                token.cancel();
+            }
+            for task in g.background_tasks.iter_mut() {
+                if task.status == "running" {
+                    task.status = "cancelled".into();
+                    task.detail = Some("host shutdown".into());
+                }
+            }
+            for (_, (_, token)) in g.computer_agent_operations.drain() {
+                token.cancel();
+            }
+            let shell_ids: Vec<Uuid> = g.turn_cancels.keys().copied().collect();
+            (g.live_shells.clone(), shell_ids)
+        };
+        kill_shells(live_shells, shell_ids).await;
+        // Any surviving child process for a session with no live turn.
+        let orphans: Vec<Uuid> = {
+            let map = self.inner.lock().live_shells.clone();
+            let guard = map.lock().await;
+            guard.keys().copied().collect()
+        };
+        if !orphans.is_empty() {
+            let map = self.inner.lock().live_shells.clone();
+            kill_shells(map, orphans).await;
+        }
+        self.invalidate_computer_agent_authority();
+    }
+
+    /// Persist the durable state this process owns and release the shared
+    /// ledgers, so a replacement host on the same home reopens a consistent
+    /// world. Called by ordered shutdown after every supervised task joined.
+    pub fn flush_durable_state(&self) {
+        self.persist_chrome();
+        let sessions: Vec<Uuid> = self.inner.lock().prompt_queues.keys().copied().collect();
+        for session_id in sessions {
+            let _ = self.persist_prompt_queue(session_id);
+        }
+        let subagents = self.inner.lock().subagents.clone();
+        let subagent_sessions: HashSet<Uuid> = subagents
+            .iter()
+            .filter_map(|s| s.session_id.as_deref())
+            .filter_map(|s| Uuid::parse_str(s).ok())
+            .collect();
+        for session_id in subagent_sessions {
+            let _ = session_store::save_session_subagents(session_id, &subagents);
+        }
+        // Drop this process's ledger handles last: they must outlive every
+        // supervised task that could still be writing.
+        let orchestration = self.orchestration_store.lock().take();
+        drop(orchestration);
+        let computer = self.computer_store.lock().take();
+        drop(computer);
     }
 
     fn provider_observation_context(&self, session_id: Uuid) -> Option<ProviderObservationContext> {
@@ -1196,6 +1326,9 @@ impl AgentHostHandle {
 
     /// Open the single process-owned durable run ledger on first use.
     pub fn ensure_orchestration_store(&self) -> Result<OrchStore> {
+        // A stale handle must not reopen the durable ledger for a home this
+        // process no longer owns (#455).
+        self.ensure_accepting("opening the durable orchestration ledger")?;
         let mut store = self.orchestration_store.lock();
         if let Some(existing) = store.as_ref() {
             return Ok(existing.clone());
@@ -1210,6 +1343,7 @@ impl AgentHostHandle {
     /// and embedded MCP control plane alike — must share this handle; a
     /// second open in the same process would fail on the lock.
     pub fn ensure_computer_store(&self) -> Result<crate::computer_use::ComputerStore> {
+        self.ensure_accepting("opening the durable Computer Run ledger")?;
         let mut store = self.computer_store.lock();
         if let Some(existing) = store.as_ref() {
             return Ok(existing.clone());
@@ -2545,14 +2679,24 @@ impl AgentHostHandle {
         run_id: &str,
         session_id: Uuid,
         store: OrchStore,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let run_id = run_id.to_string();
         let mut receiver = self.subscribe_events();
-        tokio::spawn(async move {
-            while let Some(update) = receiver.recv().await {
-                apply_run_aggregate(&store, &run_id, session_id, &update);
+        let shutdown = self.shutdown_token();
+        self.spawn_supervised("starting a desktop run aggregator", async move {
+            loop {
+                tokio::select! {
+                    update = receiver.recv() => {
+                        let Some(update) = update else { break };
+                        apply_run_aggregate(&store, &run_id, session_id, &update);
+                    }
+                    // Without this arm the aggregator would outlive shutdown
+                    // and stall the join barrier forever.
+                    _ = shutdown.cancelled() => break,
+                }
             }
         })
+        .ok()
     }
 
     fn checkpoint_context(
@@ -2946,13 +3090,15 @@ impl AgentHostHandle {
     }
 
     pub fn start(&self) -> Result<()> {
-        if self._instance_lock.is_none() {
+        if !self.lifecycle.acquired_process_lock() {
             bail!(
                 "another GrokPtah instance is already using {}. \
                  Quit the other window before starting a second one.",
                 crate::discover::grokptah_home().display()
             );
         }
+        // A handle that outlived its runtime must not restart the host (#455).
+        self.lifecycle.ensure_open("starting the agent host")?;
         self.inner.lock().running = true;
         Ok(())
     }
@@ -3090,6 +3236,11 @@ impl AgentHostHandle {
     /// Reject work/state mutations for an archived Lane while leaving read and
     /// explicit recovery operations available.
     pub fn ensure_session_accepts_new_work(&self, id: Uuid) -> Result<()> {
+        // Ordered shutdown rejects new admissions before anything is torn
+        // down, and stale handles stay rejected forever (#455). This is the
+        // single seam shared by desktop turns, orchestration reservations,
+        // queued admissions and Computer Use, so one check closes them all.
+        self.ensure_accepting("admitting new work")?;
         let g = self.inner.lock();
         let session = g
             .sessions
@@ -4949,6 +5100,27 @@ impl AgentHostHandle {
         self.spawn_gp_subagent_parallel(session_id, &cwd, prompt, kind, &parent_cancel, &event_tx)
     }
 
+    /// Test helper: register a Computer Use operation the same way the
+    /// production qualify/propose paths do, so lifecycle tests can assert that
+    /// ordered shutdown cancels Computer authority without a live provider.
+    pub fn begin_computer_agent_operation_for_test(
+        &self,
+        session_id: Uuid,
+    ) -> Result<(String, CancellationToken)> {
+        let (operation_id, cancel, guard) = self.begin_computer_agent_operation(session_id)?;
+        // Deliberately leak the busy guard: this models the exact hazard #455
+        // is about — a guard that still holds session authority when shutdown
+        // starts. Ordered shutdown, not the guard's `Drop`, must be what
+        // clears the registration and cancels the operation.
+        std::mem::forget(guard);
+        Ok((operation_id, cancel))
+    }
+
+    /// Number of Computer Use operations currently holding session authority.
+    pub fn computer_agent_operation_count(&self) -> usize {
+        self.inner.lock().computer_agent_operations.len()
+    }
+
     /// Test helper: register a parent turn cancel token for `session_id`.
     pub fn begin_turn_for_test(&self, session_id: Uuid) {
         let mut g = self.inner.lock();
@@ -5066,7 +5238,17 @@ impl AgentHostHandle {
         let task_id = id.clone();
         let event_tx = self.inner.lock().event_tx.clone();
         let title_for_task = title.clone();
-        tokio::spawn(async move {
+        // Background scans and shells hold host authority, so shutdown must be
+        // able to cancel and join them (#455).
+        let shutdown_cancel = cancel.clone();
+        let shutdown = self.shutdown_token();
+        let cascade =
+            self.spawn_supervised("cascading shutdown to a background task", async move {
+                shutdown.cancelled().await;
+                shutdown_cancel.cancel();
+            });
+        drop(cascade);
+        let spawned = self.spawn_supervised("scheduling a background task", async move {
             let final_status = if is_shell {
                 let cmd = title_for_task.trim_start().trim_start_matches('!').trim();
                 let cwd = host.inner.lock().project_cwd.clone();
@@ -5189,6 +5371,19 @@ impl AgentHostHandle {
                 status: final_status,
             });
         });
+        if spawned.is_err() {
+            // Shutting down: never leave a phantom "running" row behind.
+            let mut g = self.inner.lock();
+            g.background_cancels.remove(&id);
+            if let Some(task) = g.background_tasks.iter_mut().find(|task| task.id == id) {
+                task.status = "cancelled".into();
+                task.detail = Some("host shutdown".into());
+            }
+            let mut refused = t.clone();
+            refused.status = "cancelled".into();
+            refused.detail = Some("host shutdown".into());
+            return refused;
+        }
         t
     }
 
@@ -7210,7 +7405,7 @@ impl AgentHostHandle {
                 .lock()
                 .insert(session_id, tracker.clone());
         }
-        let mut desktop_aggregator = desktop_run.as_ref().map(|(run_id, store)| {
+        let mut desktop_aggregator = desktop_run.as_ref().and_then(|(run_id, store)| {
             self.start_desktop_run_aggregator(run_id, session_id, store.clone())
         });
         let _ = event_tx.send(SessionUpdate::TurnStarted {
@@ -9967,7 +10162,15 @@ impl AgentHostHandle {
         // the session after the parent finishes could charge a later Run.
         let run_usage_tracker = self.run_usage_trackers.lock().get(&session_id).cloned();
         let sub_id_task = sub_id.clone();
-        tokio::spawn(async move {
+        // Subagents capture a host clone, so ordered shutdown must cancel and
+        // join them before the process lock is released (#455).
+        let subagent_cancel = child_cancel.clone();
+        let shutdown = self.shutdown_token();
+        let _ = self.spawn_supervised("cascading shutdown to a subagent", async move {
+            shutdown.cancelled().await;
+            subagent_cancel.cancel();
+        });
+        let spawned = self.spawn_supervised("spawning a subagent", async move {
             host.run_gp_subagent_body(
                 session_id,
                 &child_cwd,
@@ -9981,6 +10184,14 @@ impl AgentHostHandle {
             )
             .await;
         });
+        if spawned.is_err() {
+            let mut g = self.inner.lock();
+            g.subagent_cancels.remove(&sub_id);
+            if let Some(entry) = g.subagents.iter_mut().find(|entry| entry.id == sub_id) {
+                entry.status = "cancelled".into();
+                entry.summary = Some("host shutdown".into());
+            }
+        }
 
         let isolation_note = match execution_mode {
             SubagentExecutionMode::Worktree => "isolated worktree",
@@ -11334,7 +11545,7 @@ mod tests {
         }
     }
 
-    fn test_host() -> (TestHome, AgentHostHandle, Uuid) {
+    fn test_host() -> (TestHome, HostRuntime, Uuid) {
         let lock = home_override_serial();
         let tmp = tempfile::tempdir().expect("test home");
         let home = tmp.path().join(".grokptah");

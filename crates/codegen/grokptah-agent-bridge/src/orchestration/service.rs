@@ -7108,13 +7108,30 @@ impl OrchestrationService {
         let mut agg_rx = bus.subscribe();
         let store_agg = store.clone();
         let rid_agg = rid.clone();
-        let agg_task = tokio::spawn(async move {
-            while let Some(update) = agg_rx.recv().await {
-                apply_run_aggregate(&store_agg, &rid_agg, session_id, &update);
-            }
-        });
+        let agg_shutdown = self.host.shutdown_token();
+        let Ok(agg_task) = self
+            .host
+            .spawn_supervised("starting a run aggregator", async move {
+                loop {
+                    tokio::select! {
+                        update = agg_rx.recv() => {
+                            let Some(update) = update else { break };
+                            apply_run_aggregate(&store_agg, &rid_agg, session_id, &update);
+                        }
+                        _ = agg_shutdown.cancelled() => break,
+                    }
+                }
+            })
+        else {
+            // Shutting down: the admission slot must not be stranded.
+            self.host.release_orchestration_turn(&rid);
+            return;
+        };
 
-        let join = tokio::spawn(async move {
+        let run_shutdown = self.host.shutdown_token();
+        let run_id_for_release = rid.clone();
+        let agg_abort = agg_task.abort_handle();
+        let spawned = self.host.spawn_supervised("starting a run", async move {
             let admission_guard = AdmissionGuard {
                 host: host.clone(),
                 run_id: rid.clone(),
@@ -7133,8 +7150,30 @@ impl OrchestrationService {
 
             // Cancellation and teardown are bounded. A backend that ignores its
             // token cannot hold admission capacity forever.
+            let mut host_stopped = false;
             let (timed_out, result): (bool, Result<String, anyhow::Error>) = tokio::select! {
                 biased;
+                _ = run_shutdown.cancelled() => {
+                    // Ordered host shutdown: stop the turn through the same
+                    // bounded teardown the duration limit uses, so the run
+                    // still finalizes durably before the task is joined.
+                    host_stopped = true;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        host.cancel_turn_and_await(Some(session_id)),
+                    ).await;
+                    let settled = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        &mut prompt_fut,
+                    ).await;
+                    let result = match settled {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow::anyhow!(
+                            "host shutdown stopped this run before it completed"
+                        )),
+                    };
+                    (false, result)
+                }
                 _ = &mut deadline => {
                     let _ = tokio::time::timeout(
                         Duration::from_secs(5),
@@ -7173,7 +7212,19 @@ impl OrchestrationService {
             candidate.end_seq = candidate.end_seq.or(Some(end_seq));
             candidate.updated_at = Utc::now();
             if !candidate.state.is_terminal() {
-                if timed_out {
+                if host_stopped {
+                    // A run stopped by host shutdown is interrupted, not
+                    // failed or limit-reached: it records the same durable
+                    // state that crash recovery produces, so the replacement
+                    // process sees one consistent story.
+                    candidate.state = RunState::Interrupted;
+                    candidate.terminal_result = Some("interrupted".into());
+                    candidate.error_code = Some("interrupted".into());
+                    candidate.stop_cause = Some(RunStopCause::Interrupted);
+                    if let Ok(text) = &durable_result {
+                        candidate.final_response = Some(text.clone());
+                    }
+                } else if timed_out {
                     candidate.state = RunState::LimitReached;
                     candidate.terminal_result = Some("limit_reached".into());
                     candidate.error_code = Some("limit_reached".into());
@@ -7321,7 +7372,16 @@ impl OrchestrationService {
             }
         });
         self.reaping_handles();
-        self.join_handles.lock().push(join);
+        match spawned {
+            Ok(join) => self.join_handles.lock().push(join),
+            Err(_) => {
+                // Shutting down between the aggregator and the run task: leave
+                // nothing stranded. The durable record stays non-terminal and
+                // is recovered as interrupted by the replacement process.
+                agg_abort.abort();
+                self.host.release_orchestration_turn(&run_id_for_release);
+            }
+        }
     }
 
     pub async fn queue_prompt(

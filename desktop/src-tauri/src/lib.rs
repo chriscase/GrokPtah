@@ -8,11 +8,19 @@ mod remote_service;
 
 use std::sync::Mutex;
 
-use grokptah_agent_bridge::{start_control_from_env, AgentHost, ControlServerHandle, HostConfig};
+use grokptah_agent_bridge::{
+    start_control_from_env, AgentHost, ControlServerHandle, HostConfig, HostRuntime,
+};
 use tauri::Manager;
 
 pub struct AppState {
+    /// Cloneable *request handle* used by every command. It carries no process
+    /// authority of its own and fails closed after shutdown (#455).
     pub host: grokptah_agent_bridge::AgentHostHandle,
+    /// The single non-cloneable owner of the process instance lock and of the
+    /// task supervisor. Held in app state so it outlives setup and so exit can
+    /// run the ordered shutdown (#455).
+    pub runtime: HostRuntime,
     pub pty: pty_host::PtyHub,
     /// Loopback MCP control plane (#196); optional when token not configured.
     pub control: Mutex<Option<ControlServerHandle>>,
@@ -22,16 +30,18 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let host = AgentHost::create(HostConfig::default());
+    let runtime = AgentHost::create(HostConfig::default());
     // Prefer fan-out subscribe so MCP can also attach; fall back to take for compat.
-    let event_rx = host.subscribe_events();
-    let _primary = host.take_event_receiver();
+    let event_rx = runtime.subscribe_events();
+    let _primary = runtime.take_event_receiver();
+    let host = runtime.handle();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             host: host.clone(),
+            runtime,
             pty: pty_host::PtyHub::new(),
             control: Mutex::new(None),
             computer_use: computer_use::DesktopComputerUse::new(&host),
@@ -241,8 +251,32 @@ pub fn run() {
             commands::pty_backlog,
             commands::pty_create_command,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running GrokPtah");
+        .build(tauri::generate_context!())
+        .expect("error while running GrokPtah")
+        .run(|app_handle, event| {
+            // Ordered shutdown on exit (#455): stop and join the control plane
+            // first, then let the runtime cancel and join every supervised
+            // task, flush durable state, and release the single-instance lock
+            // exactly once. Without this the next launch could find
+            // `.instance.lock` still held.
+            if matches!(event, tauri::RunEvent::Exit) {
+                let Some(state) = app_handle.try_state::<AppState>() else {
+                    return;
+                };
+                let control = state.control.lock().ok().and_then(|mut slot| slot.take());
+                let report = tauri::async_runtime::block_on(async {
+                    if let Some(server) = control {
+                        server.stop_and_wait().await;
+                    }
+                    state.runtime.shutdown().await
+                });
+                eprintln!(
+                    "[grokptah] host shutdown: {} supervised task(s) joined, \
+                     instance lock released={}",
+                    report.supervised_tasks_at_quiesce, report.process_lock_released
+                );
+            }
+        });
 }
 
 /// Start control plane when `GROKPTAH_CONTROL_TOKEN` is set (loopback only).
