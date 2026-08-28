@@ -37,6 +37,7 @@ use crate::session::{Session, TranscriptEntry};
 use crate::types::{EffortLevel, SubagentIsolationPreference};
 
 const STORE_VERSION: u32 = 2;
+const SESSION_CREATION_INTENT_FILE: &str = "session-create-intent.json";
 
 // ── Workspace chrome (always small) ─────────────────────────────────────────
 
@@ -57,6 +58,14 @@ pub struct WorkspaceChrome {
     pub always_approve: bool,
     #[serde(default)]
     pub subagent_isolation: SubagentIsolationPreference,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionCreationIntent {
+    session_id: Uuid,
+    #[serde(default)]
+    prior_chrome: Option<Vec<u8>>,
+    next_chrome: WorkspaceChrome,
 }
 
 impl Default for WorkspaceChrome {
@@ -224,6 +233,7 @@ pub fn load_workspace() -> Result<(WorkspaceChrome, HashMap<Uuid, Session>)> {
     ensure_home();
     let _ = fs::create_dir_all(sessions_root());
 
+    recover_session_creation_intent()?;
     // One-shot migration from monolithic v1 file.
     migrate_v1_if_needed()?;
 
@@ -244,6 +254,47 @@ pub fn save_session_meta(session: &Session) -> Result<()> {
     fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
     let meta = SessionMeta::from_session(session);
     atomic_write_json(&meta_path(session.id), &meta)
+}
+
+/// Persist a new session and its chrome publication as one recoverable
+/// transaction. The session is not visible to a restarted host unless both
+/// its durable files and the chrome pointer were committed.
+pub fn create_session_durable(session: &Session, next_chrome: &WorkspaceChrome) -> Result<()> {
+    ensure_home();
+    let dir = session_dir(session.id);
+    if dir.exists() {
+        bail!("session id already exists");
+    }
+    let prior_chrome = match fs::read(chrome_path()) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let intent = SessionCreationIntent {
+        session_id: session.id,
+        prior_chrome,
+        next_chrome: next_chrome.clone(),
+    };
+    let intent_path = grokptah_home().join(SESSION_CREATION_INTENT_FILE);
+    atomic_write_json(&intent_path, &intent)?;
+
+    let result = (|| {
+        rewrite_transcript(session)?;
+        save_chrome(next_chrome)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => remove_file_durable(&intent_path),
+        Err(error) => {
+            let rollback = rollback_session_creation(&intent);
+            if let Err(rollback_error) = rollback {
+                return Err(anyhow::anyhow!(
+                    "{error:#}; session creation rollback failed: {rollback_error:#}"
+                ));
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Append transcript entries that are not yet on disk (`from_index..`).
@@ -375,6 +426,11 @@ pub fn delete_session(id: Uuid) -> Result<()> {
     let dir = session_dir(id);
     if dir.is_dir() {
         fs::remove_dir_all(&dir).with_context(|| format!("rm -rf {}", dir.display()))?;
+        if let Some(parent) = dir.parent() {
+            if let Ok(dirf) = File::open(parent) {
+                let _ = dirf.sync_all();
+            }
+        }
     }
     Ok(())
 }
@@ -576,6 +632,85 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn remove_file_durable(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    if let Some(parent) = path.parent() {
+        if let Ok(dirf) = File::open(parent) {
+            dirf.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dirf) = File::open(parent) {
+            dirf.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+fn rollback_session_creation(intent: &SessionCreationIntent) -> Result<()> {
+    let mut first_error = None;
+    if let Err(error) = delete_session(intent.session_id) {
+        first_error = Some(error);
+    }
+    let chrome_result = match intent.prior_chrome.as_deref() {
+        Some(bytes) => atomic_write_bytes(&chrome_path(), bytes),
+        None => remove_file_durable(&chrome_path()),
+    };
+    if let Err(error) = chrome_result {
+        if first_error.is_none() {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn recover_session_creation_intent() -> Result<()> {
+    let intent_path = grokptah_home().join(SESSION_CREATION_INTENT_FILE);
+    if !intent_path.is_file() {
+        return Ok(());
+    }
+    let intent: SessionCreationIntent = serde_json::from_slice(&fs::read(&intent_path)?)
+        .context("parse session creation intent")?;
+    let session_complete = session_dir(intent.session_id).join("meta.json").is_file()
+        && session_dir(intent.session_id)
+            .join("transcript.jsonl")
+            .is_file();
+    let chrome_complete = fs::read(chrome_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<WorkspaceChrome>(&bytes).ok())
+        .is_some_and(|chrome| {
+            serde_json::to_vec(&chrome).ok() == serde_json::to_vec(&intent.next_chrome).ok()
+        });
+    if session_complete && chrome_complete {
+        remove_file_durable(&intent_path)?;
+        return Ok(());
+    }
+    rollback_session_creation(&intent)?;
+    remove_file_durable(&intent_path)
 }
 
 /// Migrate monolithic v1 workspace.json → v2 layout.

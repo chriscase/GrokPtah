@@ -3010,6 +3010,31 @@ impl AgentHostHandle {
             let effort = g.effort;
             let s = Session::new_with_kind(cwd, model, effort, kind);
             let summary = s.summary();
+            let next_chrome = WorkspaceChrome {
+                version: 2,
+                project_cwd: g
+                    .project_cwd
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                active_session: Some(s.id),
+                open_tab_ids: {
+                    let mut ids = g.open_tab_ids.clone();
+                    if !ids.contains(&s.id) {
+                        ids.push(s.id);
+                    }
+                    ids
+                },
+                model: g.model.clone(),
+                effort: g.effort,
+                sandbox_profile: g.sandbox_profile.clone(),
+                appearance: g.appearance.clone(),
+                always_approve: g.always_approve,
+                subagent_isolation: g.subagent_isolation,
+            };
+            // Do not publish any map or active-session state until the
+            // transcript, metadata, and chrome commit as one recoverable
+            // durable transaction.
+            session_store::create_session_durable(&s, &next_chrome)?;
             g.active_session = Some(s.id);
             if !g.open_tab_ids.contains(&s.id) {
                 g.open_tab_ids.push(s.id);
@@ -3017,9 +3042,6 @@ impl AgentHostHandle {
             g.sessions.insert(s.id, s);
             summary
         };
-        // Empty shell: meta + empty transcript file.
-        self.persist_session_rewrite(summary.id);
-        self.persist_chrome();
         Ok(summary)
     }
 

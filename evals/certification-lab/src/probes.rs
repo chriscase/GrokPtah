@@ -3165,7 +3165,9 @@ async fn identity(
         agents.iter().any(|candidate| {
             candidate["agentId"].as_str() == Some(agent.agent_id.as_str())
                 && candidate["sessionId"].as_str() == Some(agent.session_id.as_str())
-                && candidate["workspace"].as_str() == Some(workspace)
+                && candidate["workspace"]
+                    .as_str()
+                    .is_some_and(|value| is_opaque_workspace_handle(value, workspace))
         })
     }) {
         return Err(DiagnosticCode::McpResultMalformed);
@@ -3179,6 +3181,15 @@ async fn identity(
     probe.retain_id(DurableIdKind::Session, &agent.session_id);
     probe.retain_id(DurableIdKind::Agent, &agent.agent_id);
     Ok(())
+}
+
+fn is_opaque_workspace_handle(value: &str, raw_workspace: &str) -> bool {
+    let prefix = "workspace_";
+    value != raw_workspace
+        && value.len() == prefix.len() + 32
+        && value
+            .strip_prefix(prefix)
+            .is_some_and(|digest| digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 async fn continuation_resume(
