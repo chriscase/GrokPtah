@@ -186,9 +186,18 @@ struct AuthorityState {
 /// The type is public only so host handles can share it with desktop adapters.
 /// Its constructor, issuance, validation, and lease methods are crate-private;
 /// no SDK/MCP caller can mint or deserialize authority.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CapabilityAuthority {
     state: Arc<Mutex<AuthorityState>>,
+}
+
+impl std::fmt::Debug for CapabilityAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CapabilityAuthority")
+            .field("state", &"[opaque]")
+            .finish()
+    }
 }
 
 impl CapabilityAuthority {

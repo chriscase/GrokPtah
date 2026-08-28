@@ -266,7 +266,7 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
-                let _capability = self.require_run_capability(run)?;
+                let _capability = self.ensure_run_capability(run)?;
                 self.consume_durable_lease("authorize", &payload)?;
                 if run.control_disposition == ComputerControlDisposition::OperatorTakeover {
                     return Err(ComputerError::new(
@@ -314,7 +314,7 @@ impl ComputerUseService {
                     let error = run_limit_error();
                     run.last_error = Some(error.clone());
                     run.transition(ComputerRunState::LimitReached)?;
-                    revoke_authority(run);
+                    self.revoke_authority(run);
                     run.record_audit("observe", "limit_reached", None, None, Some(error.code));
                     budget_error = Some(error);
                     return Ok(());
@@ -433,7 +433,7 @@ impl ComputerUseService {
                     let error = run_limit_error();
                     run.last_error = Some(error.clone());
                     run.transition(ComputerRunState::LimitReached)?;
-                    revoke_authority(run);
+                    self.revoke_authority(run);
                     run.record_audit(
                         "act",
                         "limit_reached",
@@ -573,7 +573,7 @@ impl ComputerUseService {
                     ));
                 }
                 run.transition(ComputerRunState::Paused)?;
-                revoke_authority(run);
+                self.revoke_authority(run);
                 run.set_control_disposition(ComputerControlDisposition::Paused);
                 run.record_audit("pause", "paused", None, None, None);
                 Ok(())
@@ -619,7 +619,7 @@ impl ComputerUseService {
                 ensure_version(run, expected_version)?;
                 self.consume_durable_lease("take_over", &payload)?;
                 run.transition(ComputerRunState::Paused)?;
-                revoke_authority(run);
+                self.revoke_authority(run);
                 run.set_control_disposition(ComputerControlDisposition::OperatorTakeover);
                 run.record_audit("take_over", "operator_control", None, None, None);
                 Ok(())
@@ -657,7 +657,7 @@ impl ComputerUseService {
                 self.consume_durable_lease("cancel", &payload)?;
                 if !run.state.is_terminal() {
                     run.transition(ComputerRunState::Cancelled)?;
-                    revoke_authority(run);
+                    self.revoke_authority(run);
                     run.set_control_disposition(ComputerControlDisposition::Stopped);
                     run.record_audit("cancel", "cancelled", None, None, None);
                 }
@@ -726,7 +726,7 @@ impl ComputerUseService {
                 ensure_version(run, expected_version)?;
                 self.consume_durable_lease("complete", &payload)?;
                 run.transition(ComputerRunState::Completed)?;
-                revoke_authority(run);
+                self.revoke_authority(run);
                 run.record_audit("complete", "completed", None, None, None);
                 Ok(())
             })
@@ -791,7 +791,7 @@ impl ComputerUseService {
                     );
                     run.last_error = Some(error.clone());
                     run.transition(ComputerRunState::LimitReached)?;
-                    revoke_authority(run);
+                    self.revoke_authority(run);
                     run.record_audit("observe", "limit_reached", None, None, Some(error.code));
                     limit_error = Some(error);
                     return Ok(());
@@ -879,10 +879,10 @@ impl ComputerUseService {
                     .is_some_and(|grant| grant.uses_remaining == Some(0));
                 if run.action_count >= run.limits.max_actions {
                     run.transition(ComputerRunState::LimitReached)?;
-                    revoke_authority(run);
+                    self.revoke_authority(run);
                 } else if grant_exhausted {
                     run.transition(ComputerRunState::Paused)?;
-                    revoke_authority(run);
+                    self.revoke_authority(run);
                     run.set_control_disposition(ComputerControlDisposition::Paused);
                 } else {
                     run.transition(ComputerRunState::Ready)?;
@@ -919,7 +919,7 @@ impl ComputerUseService {
             ) {
                 run.last_error = Some(error.clone());
                 run.transition(ComputerRunState::Failed)?;
-                revoke_authority(run);
+                self.revoke_authority(run);
                 if error.code == ComputerErrorCode::UncertainOutcome {
                     run.set_control_disposition(ComputerControlDisposition::UncertainOutcome);
                 }
@@ -986,6 +986,41 @@ impl ComputerUseService {
                 )
             })?;
         Ok(capability)
+    }
+
+    fn ensure_run_capability(&self, run: &ComputerRun) -> ComputerResult<RunCapability> {
+        match self.require_run_capability(run) {
+            Ok(capability) => Ok(capability),
+            Err(error) if error.code == ComputerErrorCode::Unauthorized => {
+                let snapshot = self.snapshot_for_run(run)?;
+                let capability = self
+                    .capability_authority
+                    .issue(
+                        &snapshot,
+                        Utc::now(),
+                        crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+                    )
+                    .map_err(|issue_error| {
+                        ComputerError::new(ComputerErrorCode::Unauthorized, issue_error.to_string())
+                    })?;
+                let binding = RunCapability {
+                    snapshot,
+                    capability,
+                };
+                self.run_capabilities
+                    .lock()
+                    .insert(run.run_id.clone(), binding.clone());
+                Ok(binding)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn revoke_authority(&self, run: &mut ComputerRun) {
+        if let Some(binding) = self.run_capabilities.lock().remove(&run.run_id) {
+            let _ = self.capability_authority.revoke(&binding.snapshot);
+        }
+        revoke_authority(run);
     }
 
     fn effect_lease(
