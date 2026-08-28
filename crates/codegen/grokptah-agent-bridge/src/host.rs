@@ -107,6 +107,7 @@ impl std::fmt::Debug for VerifiedProviderReceipt {
 }
 
 impl VerifiedProviderReceipt {
+    #[allow(dead_code)]
     pub(crate) fn from_provider_response(
         provider_request_id: impl Into<String>,
         provider_effect_id: Option<impl Into<String>>,

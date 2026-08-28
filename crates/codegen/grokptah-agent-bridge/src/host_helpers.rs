@@ -2,7 +2,6 @@
 //! Keep tool schemas, API wire, sandbox helpers, and transcript helpers here.
 
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
