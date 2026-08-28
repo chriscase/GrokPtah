@@ -157,6 +157,7 @@ struct OrchestrationPendingAdmission {
 
 #[derive(Debug, Clone)]
 struct SessionComputerQualification {
+    snapshot: CapabilitySnapshot,
     capability: HostCapability,
     tier: crate::gateway_config::ComputerUseTier,
 }
@@ -1059,6 +1060,7 @@ impl AgentHostHandle {
             )?;
             return Ok(resolved.eligibility);
         }
+        self.clear_computer_agent_qualification(session_id, &model);
         let (capability_principal, capability_policy) =
             self.computer_capability_identity(session_id)?;
         qualify_semantic_model(
@@ -1097,6 +1099,7 @@ impl AgentHostHandle {
             inner.computer_agent_qualifications.insert(
                 (session_id, model.clone()),
                 SessionComputerQualification {
+                    snapshot: current.capability_snapshot,
                     capability,
                     tier: crate::gateway_config::ComputerUseTier::SemanticAct,
                 },
@@ -1202,6 +1205,17 @@ impl AgentHostHandle {
         };
         for token in tokens {
             token.cancel();
+        }
+    }
+
+    fn clear_computer_agent_qualification(&self, session_id: Uuid, model: &str) {
+        let previous = self
+            .inner
+            .lock()
+            .computer_agent_qualifications
+            .remove(&(session_id, model.to_string()));
+        if let Some(previous) = previous {
+            let _ = self.capability_authority.revoke(&previous.snapshot);
         }
     }
 
@@ -11494,28 +11508,31 @@ mod computer_agent_host_tests {
         let first = host.session_new().unwrap();
         let second = host.session_new().unwrap();
         let model = host.inner.lock().model.clone();
+        let snapshot = crate::capability_authority::CapabilitySnapshot::provider(
+            "test-owner",
+            "xai",
+            "test-run",
+            "https://example.invalid",
+            "test-run",
+            "test-dialect",
+            "test-credential",
+            &crate::gateway_config::ModelCapabilities::default(),
+            "test-policy",
+        )
+        .unwrap();
+        let capability = host
+            .capability_authority
+            .issue(
+                &snapshot,
+                Utc::now(),
+                crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+            )
+            .unwrap();
         host.inner.lock().computer_agent_qualifications.insert(
             (first.id, model.clone()),
             SessionComputerQualification {
-                capability: host
-                    .capability_authority
-                    .issue(
-                        &crate::capability_authority::CapabilitySnapshot::provider(
-                            "test-owner",
-                            "xai",
-                            "test-run",
-                            "https://example.invalid",
-                            "test-run",
-                            "test-dialect",
-                            "test-credential",
-                            &crate::gateway_config::ModelCapabilities::default(),
-                            "test-policy",
-                        )
-                        .unwrap(),
-                        Utc::now(),
-                        crate::capability_authority::DEFAULT_CAPABILITY_TTL,
-                    )
-                    .unwrap(),
+                snapshot,
+                capability,
                 tier: crate::gateway_config::ComputerUseTier::SemanticAct,
             },
         );
