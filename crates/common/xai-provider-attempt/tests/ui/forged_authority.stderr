@@ -64,7 +64,7 @@ warning: unreachable statement
 21 |     let _ = attempt.admit(todo!());
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
    |
-   = note: `#[warn(unreachable_code)]` on by default
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
 
 error[E0624]: method `admit` is private
   --> tests/ui/forged_authority.rs:21:21
@@ -81,15 +81,15 @@ warning: unreachable call
   --> tests/ui/forged_authority.rs:21:21
    |
 21 |     let _ = attempt.admit(todo!());
-   |                     ^^^^^ ------- unreachable call
+   |                     ^^^^^ ------- any code following this expression is unreachable
    |                     |
-   |                     any code following this expression is unreachable
+   |                     unreachable call
 
 error[E0624]: method `begin_send` is private
   --> tests/ui/forged_authority.rs:22:21
    |
-22 |     let _ = attempt.begin_send(todo!());
-   |                     ^^^^^^^^^^ private method
+22 |       let _ = attempt.begin_send(todo!());
+   |                       ^^^^^^^^^^ private method
    |
   ::: src/lib.rs
    |
@@ -103,15 +103,15 @@ warning: unreachable call
   --> tests/ui/forged_authority.rs:22:21
    |
 22 |     let _ = attempt.begin_send(todo!());
-   |                     ^^^^^^^^^^ ------- unreachable call
+   |                     ^^^^^^^^^^ ------- any code following this expression is unreachable
    |                     |
-   |                     any code following this expression is unreachable
+   |                     unreachable call
 
 error[E0624]: method `reconcile` is private
   --> tests/ui/forged_authority.rs:23:21
    |
-23 |     let _ = attempt.reconcile(
-   |                     ^^^^^^^^^ private method
+23 |       let _ = attempt.reconcile(
+   |                       ^^^^^^^^^ private method
    |
   ::: src/lib.rs
    |
@@ -166,8 +166,8 @@ error[E0624]: method `transport_after_possible_write` is private
 error[E0624]: method `settle_http_response` is private
   --> tests/ui/forged_authority.rs:32:20
    |
-32 |     let _ = permit.settle_http_response(200, b"result");
-   |                    ^^^^^^^^^^^^^^^^^^^^ private method
+32 |       let _ = permit.settle_http_response(200, b"result");
+   |                      ^^^^^^^^^^^^^^^^^^^^ private method
    |
   ::: src/lib.rs
    |

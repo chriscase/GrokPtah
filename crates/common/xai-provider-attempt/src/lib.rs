@@ -176,12 +176,23 @@ pub struct AttemptProjection {
 /// Snapshot supplied by the canonical host adapter. The adapter must source
 /// these values from the live principal (#477) and capability/effect lease
 /// authorities; the ledger never accepts an `AuthorityBinding` from callers.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct CanonicalHostAuthority {
     pub principal_incarnation: String,
     pub principal_generation: u64,
     pub capability_generation: u64,
     pub effect_lease: String,
+}
+
+impl fmt::Debug for CanonicalHostAuthority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CanonicalHostAuthority")
+            .field("principal_incarnation", &"[redacted]")
+            .field("principal_generation", &"[redacted]")
+            .field("capability_generation", &"[redacted]")
+            .field("effect_lease", &"[redacted]")
+            .finish()
+    }
 }
 
 /// Provider truth supplied by an explicit operator-authorized reconciliation.
@@ -351,12 +362,12 @@ impl AttemptContext {
         Self::new(store, operation_id, binding, revalidate)
     }
 
-    pub fn begin(
+    pub fn prepare(
         &self,
         provider_id: &str,
         body: &[u8],
         supports_idempotency: bool,
-    ) -> Result<PhysicalSendPermit, AttemptError> {
+    ) -> Result<ProviderAttempt, AttemptError> {
         let spec = AttemptSpec::new(
             self.operation_id.clone(),
             provider_id.to_owned(),
@@ -366,6 +377,13 @@ impl AttemptContext {
         )?;
         let attempt = self.store.create(spec)?;
         attempt.admit(&self.authority)?;
+        Ok(attempt)
+    }
+
+    pub fn begin_send(
+        &self,
+        attempt: &ProviderAttempt,
+    ) -> Result<PhysicalSendPermit, AttemptError> {
         let current = match (self.revalidate)() {
             Some(current) => current,
             None => {
@@ -373,8 +391,26 @@ impl AttemptContext {
                 return Err(AttemptError::InvalidAuthority);
             }
         };
-        let permit = attempt.begin_send(&current)?;
+        let permit = match attempt.begin_send(&current) {
+            Ok(permit) => permit,
+            Err(error) => {
+                if matches!(error, AttemptError::StaleAuthority) {
+                    let _ = attempt.cancel_without_send();
+                }
+                return Err(error);
+            }
+        };
         Ok(permit.with_revalidator(self.revalidate.clone(), self.authority.clone()))
+    }
+
+    pub fn begin(
+        &self,
+        provider_id: &str,
+        body: &[u8],
+        supports_idempotency: bool,
+    ) -> Result<PhysicalSendPermit, AttemptError> {
+        let attempt = self.prepare(provider_id, body, supports_idempotency)?;
+        self.begin_send(&attempt)
     }
 
     pub fn revalidate_before_physical_write(

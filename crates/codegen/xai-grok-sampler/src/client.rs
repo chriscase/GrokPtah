@@ -86,18 +86,18 @@ fn default_provider_attempt_context(
             .unwrap_or(DEFAULT_CLIENT_IDENTIFIER)
             .as_bytes(),
     );
-    let authority = xai_provider_attempt::AuthorityBinding::new(
-        format!("sampler-principal-{principal}"),
-        1,
-        1,
-        format!("sampler-effect-lease-{}", std::process::id()),
-    )
-    .map_err(|error| SamplingError::Auth(format!("create provider authority: {error}")))?;
-    xai_provider_attempt::AttemptContext::new(
+    let authority = xai_provider_attempt::CanonicalHostAuthority {
+        principal_incarnation: format!("sampler-principal-{principal}"),
+        principal_generation: 1,
+        capability_generation: 1,
+        effect_lease: format!("sampler-effect-lease-{}", std::process::id()),
+    };
+    let revalidate_authority = authority.clone();
+    xai_provider_attempt::AttemptContext::from_host_authority(
         store,
         format!("sampler-operation-{}", uuid::Uuid::new_v4()),
-        authority.clone(),
-        std::sync::Arc::new(move || Some(authority.clone())),
+        authority,
+        std::sync::Arc::new(move || Some(revalidate_authority.clone())),
     )
     .map_err(|error| SamplingError::Auth(format!("create provider attempt context: {error}")))
 }
