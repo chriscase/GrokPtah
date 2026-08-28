@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::audit::{
     AuditEntryInput, AuditKeyCustody, AuditLedger, AuditLedgerOptions, AuditStatus, AuditWitness,
-    EntryOutcome, EntryPhase, EntryReason, ExportFormat, ExportReceipt, GenerationVerification,
-    RetentionReceipt, RetentionRequest, RotationReason,
+    EntryOutcome, EntryPhase, EntryReason, ExportFormat, ExportReceipt, ExportScope,
+    GenerationVerification, RetentionReceipt, RetentionRequest, RotationReason,
 };
 
 use super::audit_bridge;
@@ -73,10 +73,19 @@ impl Drop for OrchStoreInner {
         if let Some(join) = self.audit_writer.join.lock().take() {
             let _ = join.join();
         }
-        let _ = self.audit.append(
+        // A failed shutdown record is never swallowed. Reporting a clean
+        // ledger while the last thing we tried to write was lost would make
+        // the shutdown itself unaccounted for.
+        if let Err(error) = self.audit.append(
             AuditEntryInput::new("host.shutdown", EntryPhase::Outcome, EntryOutcome::Accepted)
                 .with_reason(EntryReason::HostShutdown),
-        );
+        ) {
+            let code = error.code();
+            *self.last_audit_error.lock() = Some(code.to_string());
+            // Best effort durable evidence that the shutdown went unrecorded.
+            let _ = self.audit.record_dropped(1);
+            eprintln!("[grokptah] audit shutdown record failed: {code}");
+        }
     }
 }
 
@@ -5094,11 +5103,30 @@ impl OrchStore {
             .map_err(|error| anyhow::anyhow!("audit verify: {}", error.code()))
     }
 
-    /// Sealed operator export. Never rotates, truncates, or deletes.
+    /// Sealed **public** operator export. Never rotates, truncates, or deletes.
+    ///
+    /// Imported v1 bytes are withheld: they were preserved verbatim and were
+    /// never redacted to the v2 rules, so they can still contain workspace
+    /// paths, free-text detail, IO strings and provider material.
     pub fn export_audit(&self, dest: &Path, format: ExportFormat) -> anyhow::Result<ExportReceipt> {
         self.inner
             .audit
-            .export(dest, format)
+            .export(dest, format, ExportScope::Public)
+            .map_err(|error| anyhow::anyhow!("audit export: {}", error.code()))
+    }
+
+    /// Sealed **privileged raw preservation** export.
+    ///
+    /// Carries imported v1 bytes verbatim. For operator custody only; the
+    /// receipt and the sealed manifest both declare that it is not redacted.
+    pub fn export_audit_privileged_raw(
+        &self,
+        dest: &Path,
+        format: ExportFormat,
+    ) -> anyhow::Result<ExportReceipt> {
+        self.inner
+            .audit
+            .export(dest, format, ExportScope::PrivilegedRaw)
             .map_err(|error| anyhow::anyhow!("audit export: {}", error.code()))
     }
 
@@ -5405,14 +5433,18 @@ fn note_legacy_v1_state(audit: &AuditLedger, legacy_dir: &Path) -> anyhow::Resul
         if imported.iter().any(|known| known == &digest) {
             continue;
         }
-        let _ = audit.append(
-            AuditEntryInput::new(
-                "audit.legacy_v1",
-                EntryPhase::Outcome,
-                EntryOutcome::Uncertain,
-            )
-            .with_reason(EntryReason::LegacyWrittenAfterCutover),
-        );
+        // Report a given divergence once, not on every open forever.
+        if audit.record_legacy_divergence_once(&digest).unwrap_or(true) {
+            let _ = audit.append(
+                AuditEntryInput::new(
+                    "audit.legacy_v1",
+                    EntryPhase::Outcome,
+                    EntryOutcome::Uncertain,
+                )
+                .with_reason(EntryReason::LegacyWrittenAfterCutover)
+                .with_code(&digest),
+            );
+        }
     }
     Ok(())
 }

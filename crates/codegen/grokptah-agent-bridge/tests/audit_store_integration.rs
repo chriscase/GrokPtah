@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use grokptah_agent_bridge::audit::{
-    verify_export, AuditKeyCustody, AuditWitness, ExportFormat, RetentionRequest, RotationReason,
-    WitnessBeacon, WitnessState, WitnessVerdict,
+    verify_export, AuditKeyCustody, AuditWitness, ExportFormat, ExportScope, RetentionRequest,
+    RotationReason, WitnessBeacon, WitnessState, WitnessVerdict,
 };
 use grokptah_agent_bridge::orchestration::{AuditEntry, AuditPhase, OrchStore};
 use tempfile::TempDir;
@@ -450,7 +450,17 @@ fn a_migrated_store_refuses_lossy_v1_emission() {
     let dest = out.path().join("v2");
     let receipt = store.export_audit(&dest, ExportFormat::Auto).unwrap();
     assert!(receipt.schema.ends_with(".v2"));
-    assert_eq!(receipt.unauthenticated_generations, 2);
+    // A public export withholds the imported generations rather than carrying
+    // them, so it carries no unauthenticated generation at all.
+    assert_eq!(receipt.unauthenticated_generations, 0);
+    assert_eq!(receipt.withheld, 2);
+    assert!(!receipt.complete);
+    // The privileged raw scope is the only one that carries them.
+    let raw = store
+        .export_audit_privileged_raw(&out.path().join("raw"), ExportFormat::Auto)
+        .unwrap();
+    assert_eq!(raw.unauthenticated_generations, 2);
+    assert!(raw.contains_unauthenticated_legacy);
 }
 
 #[test]
@@ -834,4 +844,200 @@ fn a_symlinked_or_relative_root_resolves_to_one_key_and_one_ledger() {
             "exactly one store tree plus its symlink"
         );
     }
+}
+
+// ------------------------------------- migrated legacy bytes in exports (#462)
+//
+// Imported v1 bytes are preserved verbatim by design, so they still carry
+// whatever the v1 ledger recorded: raw workspace paths, free-text `detail`
+// holding `OrchError::message`, IO strings, and provider material. A public
+// export must not carry them. A fresh-v2 no-needle test cannot see this,
+// because a fresh ledger has no legacy generation to leak.
+
+/// A legacy v1 ledger containing exactly what the retired writer could record.
+const LEGACY_NEEDLES: [&str; 6] = [
+    "/Users/someone/private/workspace",
+    "sk-live-LEGACY-CREDENTIAL-9f3a",
+    "LEGACY-PROMPT-BODY-do-the-thing",
+    "AXUIElementLocator-legacy-42",
+    "LEGACY-CLIPBOARD-CONTENTS",
+    "legacy-provider-private-route",
+];
+
+fn seed_tainted_legacy_v1(root: &Path) {
+    let older = format!(
+        "{{\"ts\":\"2026-01-01T00:00:00Z\",\"tool\":\"ptah_submit_task\",\"workspace\":\"{}\",\"outcome\":\"rejected\",\"detail\":\"{} {}\"}}\n",
+        LEGACY_NEEDLES[0], LEGACY_NEEDLES[2], LEGACY_NEEDLES[3]
+    );
+    let current = format!(
+        "{{\"ts\":\"2026-01-02T00:00:00Z\",\"tool\":\"auth\",\"requestId\":\"{}\",\"outcome\":\"rejected\",\"detail\":\"{} {}\"}}\n",
+        LEGACY_NEEDLES[1], LEGACY_NEEDLES[4], LEGACY_NEEDLES[5]
+    );
+    seed_legacy_v1(root, &older, &current);
+}
+
+#[test]
+fn a_public_export_withholds_migrated_legacy_bytes_and_leaks_no_needle() {
+    let dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    seed_tainted_legacy_v1(dir.path());
+    let store = OrchStore::open(dir.path()).unwrap();
+    store
+        .append_audit(&entry("native-after-migration", "accepted"))
+        .unwrap();
+
+    // The legacy bytes really are on disk, verbatim, with the needles in them.
+    let imported = read_journal(dir.path(), "g-000001");
+    assert!(
+        imported.contains(LEGACY_NEEDLES[0]),
+        "precondition: legacy bytes preserved"
+    );
+
+    let dest = out.path().join("public");
+    let receipt = store.export_audit(&dest, ExportFormat::Auto).unwrap();
+    assert_eq!(receipt.scope, ExportScope::Public);
+    assert!(!receipt.contains_unauthenticated_legacy);
+    assert_eq!(
+        receipt.withheld, 2,
+        "both imported generations are withheld"
+    );
+    assert!(
+        !receipt.complete,
+        "a withheld range is never reported as complete"
+    );
+
+    // Every byte of the public export, not just the manifest.
+    let mut files = Vec::new();
+    walk_files(&dest, &mut files);
+    assert!(!files.is_empty());
+    for path in &files {
+        let text = String::from_utf8_lossy(&std::fs::read(path).unwrap()).to_string();
+        for needle in LEGACY_NEEDLES {
+            assert!(
+                !text.contains(needle),
+                "{} leaked into the public export at {}",
+                needle,
+                path.display()
+            );
+        }
+    }
+    // The withheld generations carry no files at all.
+    assert!(!dest.join("generations").join("g-000001").exists());
+    assert!(!dest.join("generations").join("g-000002").exists());
+
+    // The receipt and the status projection are equally clean.
+    let rendered = format!("{receipt:?}{:?}", store.audit_status());
+    for needle in LEGACY_NEEDLES {
+        assert!(
+            !rendered.contains(needle),
+            "{needle} leaked into a projection"
+        );
+    }
+
+    // And it still verifies as a coherent, explicitly partial export.
+    let keys = AuditKeyCustody::local_file_for(dir.path())
+        .resolve()
+        .unwrap();
+    let verified = verify_export(&dest, &keys).unwrap();
+    assert_eq!(verified.withheld, 2);
+    assert!(!verified.complete);
+    assert_eq!(verified.global_first_seq, 1);
+}
+
+#[test]
+fn a_privileged_raw_export_carries_legacy_bytes_and_declares_that_it_does() {
+    let dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    seed_tainted_legacy_v1(dir.path());
+    let store = OrchStore::open(dir.path()).unwrap();
+
+    let dest = out.path().join("raw");
+    let receipt = store
+        .export_audit_privileged_raw(&dest, ExportFormat::Auto)
+        .unwrap();
+    assert_eq!(receipt.scope, ExportScope::PrivilegedRaw);
+    assert!(
+        receipt.contains_unauthenticated_legacy,
+        "a raw export must declare that it is not redacted"
+    );
+    assert_eq!(receipt.withheld, 0);
+    assert!(receipt.complete);
+
+    // The bytes really are carried — that is the point of raw preservation.
+    let carried = std::fs::read_to_string(
+        dest.join("generations")
+            .join("g-000001")
+            .join("journal.jsonl"),
+    )
+    .unwrap();
+    assert!(carried.contains(LEGACY_NEEDLES[0]));
+
+    // The sealed manifest says so too, so nobody can mistake it for public.
+    let manifest = std::fs::read_to_string(dest.join("export-manifest.json")).unwrap();
+    assert!(manifest.contains("\"scope\":\"privileged_raw\""));
+    assert!(manifest.contains("\"containsUnauthenticatedLegacy\":true"));
+
+    let keys = AuditKeyCustody::local_file_for(dir.path())
+        .resolve()
+        .unwrap();
+    let verified = verify_export(&dest, &keys).unwrap();
+    assert!(verified.contains_unauthenticated_legacy);
+    assert_eq!(verified.scope, ExportScope::PrivilegedRaw);
+}
+
+#[test]
+fn a_public_export_manifest_that_claims_to_carry_legacy_bytes_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let out = TempDir::new().unwrap();
+    seed_tainted_legacy_v1(dir.path());
+    let store = OrchStore::open(dir.path()).unwrap();
+    let dest = out.path().join("raw");
+    store
+        .export_audit_privileged_raw(&dest, ExportFormat::Auto)
+        .unwrap();
+
+    // Relabel a raw export as public without re-sealing: the MAC catches it.
+    let path = dest.join("export-manifest.json");
+    let body = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("\"scope\":\"privileged_raw\"", "\"scope\":\"public\"");
+    std::fs::write(&path, body).unwrap();
+    let keys = AuditKeyCustody::local_file_for(dir.path())
+        .resolve()
+        .unwrap();
+    assert!(
+        verify_export(&dest, &keys).is_err(),
+        "a relabelled export must not verify"
+    );
+}
+
+#[test]
+fn legacy_divergence_after_the_cutover_is_recorded_once_not_on_every_open() {
+    let dir = TempDir::new().unwrap();
+    seed_legacy_v1(dir.path(), "", "{\"tool\":\"auth\"}\n");
+    let store = OrchStore::open(dir.path()).unwrap();
+    let generation = store.audit_status().active_generation_id;
+    drop(store);
+
+    std::fs::write(
+        legacy_dir(dir.path()).join("audit.jsonl"),
+        "{\"tool\":\"auth\"}\n{\"tool\":\"from_an_older_binary\"}\n",
+    )
+    .unwrap();
+
+    let mut counts = Vec::new();
+    for _ in 0..3 {
+        let store = OrchStore::open(dir.path()).unwrap();
+        counts.push(
+            read_journal(dir.path(), &generation)
+                .matches("legacy_written_after_cutover")
+                .count(),
+        );
+        drop(store);
+    }
+    assert_eq!(
+        counts,
+        vec![1, 1, 1],
+        "the same divergence must be recorded once, not on every open"
+    );
 }

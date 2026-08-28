@@ -108,6 +108,27 @@ pub enum EntryReason {
 /// Maximum length of a producer code.
 pub const MAX_CODE_BYTES: usize = 64;
 
+/// Constrain a producer op to `[a-z0-9_.-]{1,64}`.
+///
+/// `op` was previously arbitrary text truncated to 64 bytes, so a producer
+/// could put a secret fragment in the durable record. The shape admits no path
+/// separator, whitespace, quote, or control character, so it cannot carry a
+/// path, a prompt, or a credential. Tool names and the ledger's own dotted ops
+/// fit it; anything else is replaced rather than truncated, because a truncated
+/// secret is still a secret.
+pub fn sanitize_op(op: &str) -> String {
+    let acceptable = !op.is_empty()
+        && op.len() <= MAX_CODE_BYTES
+        && op.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.' || b == b'-'
+        });
+    if acceptable {
+        op.to_string()
+    } else {
+        "invalid_op".to_string()
+    }
+}
+
 /// Constrain a producer code to `[a-z0-9_]{1,64}`.
 ///
 /// Anything else is replaced rather than truncated: a truncated path is still

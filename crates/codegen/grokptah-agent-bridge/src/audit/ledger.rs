@@ -178,8 +178,99 @@ pub struct AuditLedger {
     keys: Arc<AuditKeys>,
     witness: Arc<dyn AuditWitness>,
     inner: Mutex<Inner>,
+    /// Serializes structural mutations (rotation, retention, export copy)
+    /// against each other. `inner` alone is not enough: those transactions
+    /// span several file operations, and a rotation that released `inner`
+    /// between its journal snapshot and its manifest commit let a concurrent
+    /// append land in the generation being sealed — stranding that entry
+    /// outside the sealed range and duplicating its sequence in the next
+    /// generation.
+    structural: Mutex<()>,
     #[cfg(test)]
     crash_at: Option<CrashPoint>,
+    /// Test-only observation point inside a structural transaction, used to
+    /// assert the barrier is held rather than to time anything.
+    #[cfg(test)]
+    on_structural_barrier: Option<StructuralObserver>,
+}
+
+/// Test-only observation callback fired inside a structural transaction.
+#[cfg(test)]
+pub(crate) type StructuralObserver = Arc<dyn Fn(&AuditLedger) + Send + Sync>;
+
+/// A structural mutation transaction.
+///
+/// Holds the ledger-wide structural barrier *and* the inner state lock for its
+/// whole extent, so rotation, retention and the export copy phase are atomic
+/// with respect to appends and to each other.
+pub(crate) struct StructuralTx<'a> {
+    ledger: &'a AuditLedger,
+    guard: parking_lot::MutexGuard<'a, Inner>,
+    _structural: parking_lot::MutexGuard<'a, ()>,
+}
+
+impl<'a> StructuralTx<'a> {
+    pub(crate) fn manifest(&self) -> &Manifest {
+        &self.guard.manifest
+    }
+
+    pub(crate) fn manifest_clone(&self) -> Manifest {
+        self.guard.manifest.clone()
+    }
+
+    pub(crate) fn live_last_seq(&self) -> u64 {
+        self.guard.live.last_seq
+    }
+
+    pub(crate) fn open_intents(&self) -> usize {
+        self.guard.live.open_intent_ids.len()
+    }
+
+    pub(crate) fn poisoned(&self) -> Option<PoisonReason> {
+        self.guard.poisoned
+    }
+
+    pub(crate) fn append(
+        &mut self,
+        entry: AuditEntryInput,
+        producer_digest: Option<String>,
+    ) -> AuditResult<u64> {
+        self.ledger
+            .append_locked(&mut self.guard, entry, None, producer_digest)
+    }
+
+    /// Commit a manifest, compare-and-swapping against the epoch this
+    /// transaction observed. A second process that committed underneath us
+    /// fails the swap instead of being silently overwritten.
+    pub(crate) fn commit_manifest(&mut self, manifest: Manifest) -> AuditResult<()> {
+        let expected = self.guard.manifest.manifest_epoch;
+        let mut manifest = manifest;
+        self.ledger.write_manifest(&mut manifest, Some(expected))?;
+        self.guard.manifest = manifest;
+        Ok(())
+    }
+
+    pub(crate) fn cut(&self, point: CrashPoint) -> AuditResult<()> {
+        self.ledger.cut(point)
+    }
+
+    fn switch_live(&mut self, live: LiveTail) {
+        self.guard.live = live;
+    }
+
+    /// Read the witness state without re-entering the inner lock this
+    /// transaction already holds.
+    pub(crate) fn witness_state(&self) -> WitnessState {
+        self.guard.witness_state
+    }
+
+    pub(crate) fn verify_generation(
+        &self,
+        generation_id: &str,
+    ) -> AuditResult<GenerationVerification> {
+        self.ledger
+            .verify_generation_with(&self.guard.manifest, generation_id)
+    }
 }
 
 impl std::fmt::Debug for AuditLedger {
@@ -271,8 +362,11 @@ impl AuditLedger {
                 recovery,
                 witness_state: WitnessState::Unwitnessed,
             }),
+            structural: Mutex::new(()),
             #[cfg(test)]
             crash_at: None,
+            #[cfg(test)]
+            on_structural_barrier: None,
         };
         ledger.recover()?;
         Ok(ledger)
@@ -282,6 +376,35 @@ impl AuditLedger {
     pub(crate) fn with_crash_at(mut self, point: CrashPoint) -> Self {
         self.crash_at = Some(point);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_structural_observer(mut self, observer: StructuralObserver) -> Self {
+        self.on_structural_barrier = Some(observer);
+        self
+    }
+
+    /// Test-only: is the inner state lock currently free?
+    #[cfg(test)]
+    pub(crate) fn inner_is_unlocked(&self) -> bool {
+        self.inner.try_lock().is_some()
+    }
+
+    /// Begin a structural mutation transaction.
+    pub(crate) fn structural_tx(&self) -> StructuralTx<'_> {
+        let structural = self.structural.lock();
+        let guard = self.inner.lock();
+        #[cfg(test)]
+        if let Some(observer) = self.on_structural_barrier.clone() {
+            // Observed while both locks are held, so a barrier assertion in a
+            // test is a statement about the lock, not about timing.
+            observer(self);
+        }
+        StructuralTx {
+            ledger: self,
+            guard,
+            _structural: structural,
+        }
     }
 
     #[cfg(test)]
@@ -318,6 +441,46 @@ impl AuditLedger {
 
     fn gap_path(&self) -> PathBuf {
         self.root.join("gap.json")
+    }
+
+    fn legacy_divergence_path(&self) -> PathBuf {
+        self.root.join("legacy-divergence.json")
+    }
+
+    /// Record a divergent legacy digest once per installation.
+    ///
+    /// Returns `true` if this digest had not been reported before. Without the
+    /// set, a permanently diverged v1 file appended one uncertain record on
+    /// every single open, forever.
+    pub fn record_legacy_divergence_once(&self, digest: &str) -> AuditResult<bool> {
+        let path = self.legacy_divergence_path();
+        let mut file = if path.exists() {
+            let bytes = files::read_bytes(&path)?;
+            let existing: GapFile = serde_json::from_slice(&bytes)
+                .map_err(|_| AuditError::Poisoned(PoisonReason::GapMacMismatch))?;
+            existing.verify(&self.keys)?;
+            existing
+        } else {
+            GapFile::new()
+        };
+        if file.gaps.iter().any(|gap| gap.generation_id == digest) {
+            return Ok(false);
+        }
+        file.gaps.push(GapRecord {
+            generation_id: digest.to_string(),
+            after_seq: 0,
+            lost_entries: 0,
+            reason: EntryReason::LegacyWrittenAfterCutover,
+            recorded_at: Utc::now(),
+            journaled: true,
+        });
+        file.updated_at = Utc::now();
+        file.mac = String::new();
+        file.seal(&self.keys)?;
+        let bytes = serde_json::to_vec(&file)
+            .map_err(|error| AuditError::Io(format!("serialize divergence file: {error}")))?;
+        files::atomic_write(&path, &bytes)?;
+        Ok(true)
     }
 
     pub fn root(&self) -> &Path {
@@ -389,7 +552,24 @@ impl AuditLedger {
         Ok(Some(manifest))
     }
 
-    fn write_manifest(&self, manifest: &mut Manifest) -> AuditResult<()> {
+    /// Commit a manifest.
+    ///
+    /// `expected_prior_epoch` is a compare-and-swap against the epoch the
+    /// caller observed: a second writer that committed underneath us fails the
+    /// swap rather than being silently overwritten. Recovery passes `None`,
+    /// because it holds the only handle that has read the state it is fixing.
+    fn write_manifest(
+        &self,
+        manifest: &mut Manifest,
+        expected_prior_epoch: Option<u64>,
+    ) -> AuditResult<()> {
+        if let Some(expected) = expected_prior_epoch {
+            let on_disk = Self::load_manifest(&self.root, &self.keys)?
+                .ok_or(AuditError::Poisoned(PoisonReason::ConcurrentWriter))?;
+            if on_disk.manifest_epoch != expected {
+                return Err(AuditError::Poisoned(PoisonReason::ConcurrentWriter));
+            }
+        }
         manifest.manifest_epoch = manifest.manifest_epoch.saturating_add(1);
         manifest.updated_at = Utc::now();
         manifest.seal(&self.keys)?;
@@ -725,7 +905,7 @@ impl AuditLedger {
                 tombstone.removed_at = Some(Utc::now());
             }
             let mut manifest = guard.manifest.clone();
-            self.write_manifest(&mut manifest)?;
+            self.write_manifest(&mut manifest, None)?;
             guard.manifest = manifest;
             guard.recovery.resumed_removals.push(generation_id);
         }
@@ -739,7 +919,7 @@ impl AuditLedger {
         }
         if needs_commit {
             let mut manifest = guard.manifest.clone();
-            self.write_manifest(&mut manifest)?;
+            self.write_manifest(&mut manifest, None)?;
             guard.manifest = manifest;
         }
 
@@ -1091,6 +1271,19 @@ impl AuditLedger {
         producer_digest: Option<String>,
     ) -> AuditResult<u64> {
         let mut guard = self.inner.lock();
+        self.append_locked(&mut guard, entry, recovery, producer_digest)
+    }
+
+    /// The append implementation. The caller must already hold the inner lock,
+    /// which is what lets a structural transaction append without releasing the
+    /// barrier between its own steps.
+    fn append_locked(
+        &self,
+        guard: &mut Inner,
+        entry: AuditEntryInput,
+        recovery: Option<RecoveryEvidence>,
+        producer_digest: Option<String>,
+    ) -> AuditResult<u64> {
         if let Some(reason) = guard.poisoned {
             return Err(AuditError::Poisoned(reason));
         }
@@ -1109,7 +1302,7 @@ impl AuditLedger {
             generation: live.generation_id.clone(),
             seq: live.last_seq.saturating_add(1),
             ts: Utc::now(),
-            op: bounded(&entry.op, 64),
+            op: sanitize_op(&entry.op),
             phase: entry.phase,
             outcome: entry.outcome,
             reason: entry.reason,
@@ -1239,19 +1432,25 @@ impl AuditLedger {
 
     // --------------------------------------------------------------- rotate
 
+    /// Seal the active generation and open the next one.
+    ///
+    /// The whole transaction runs inside one structural barrier: the sealing
+    /// entry, the end-to-end verification, the preparation of the next
+    /// generation, the manifest commit, and the opening entry. Releasing the
+    /// lock anywhere in between let a concurrent append land in the generation
+    /// being sealed, which stranded that entry outside the sealed range and
+    /// duplicated its sequence as the next generation's `firstSeq`.
     pub fn rotate(&self, reason: RotationReason) -> AuditResult<String> {
-        {
-            let guard = self.inner.lock();
-            if let Some(poison) = guard.poisoned {
-                return Err(AuditError::Poisoned(poison));
-            }
-            if !guard.live.open_intent_ids.is_empty() {
-                return Err(AuditError::Refused(RefuseReason::OpenIntentsPresent));
-            }
+        let mut tx = self.structural_tx();
+        if let Some(poison) = tx.poisoned() {
+            return Err(AuditError::Poisoned(poison));
+        }
+        if tx.open_intents() != 0 {
+            return Err(AuditError::Refused(RefuseReason::OpenIntentsPresent));
         }
 
         // R0.5: the sealing record is the last entry of the outgoing generation.
-        self.append_internal(
+        tx.append(
             AuditEntryInput::new(
                 "audit.generation.sealing",
                 EntryPhase::Outcome,
@@ -1262,11 +1461,9 @@ impl AuditLedger {
         )?;
 
         // R1: freeze and verify the outgoing generation end to end.
-        let (manifest, live) = {
-            let guard = self.inner.lock();
-            (guard.manifest.clone(), guard.live.clone())
-        };
+        let manifest = tx.manifest_clone();
         let outgoing = manifest.active()?.clone();
+        let live_last_seq = tx.live_last_seq();
         let journal = Self::journal_path(&self.root, &outgoing.generation_id);
         let scan = self.scan_journal(
             &journal,
@@ -1275,12 +1472,12 @@ impl AuditLedger {
             outgoing.first_seq,
             outgoing.origin_authenticated,
         )?;
-        if scan.torn.is_some() || scan.last_seq != live.last_seq {
+        if scan.torn.is_some() || scan.last_seq != live_last_seq {
             return Err(AuditError::Poisoned(PoisonReason::SealedGenerationChanged));
         }
         let journal_bytes = files::read_bytes(&journal).unwrap_or_default();
         let journal_sha256 = sha256_hex(&journal_bytes);
-        self.cut(CrashPoint::R1Frozen)?;
+        tx.cut(CrashPoint::R1Frozen)?;
 
         // R2: prepare the next generation on disk. No manifest change yet.
         let next_index = outgoing.index.saturating_add(1);
@@ -1293,18 +1490,19 @@ impl AuditLedger {
         if !next_journal.exists() {
             drop(files::create_private_file_new(&next_journal)?);
         }
-        let next_live = LiveTail {
-            generation_id: next_id.clone(),
-            last_seq: scan.last_seq,
-            last_tag: scan.last_tag.clone(),
-            journal_bytes: 0,
-            open_intent_ids: Vec::new(),
-            intent_tracking_overflowed: false,
-        };
-        self.write_anchor(&next_live)?;
+        Self::write_anchor_at(
+            &self.root,
+            &self.keys,
+            &next_id,
+            scan.last_seq,
+            &scan.last_tag,
+            0,
+            Vec::new(),
+            false,
+        )?;
         files::fsync_dir(&next_dir)?;
         files::fsync_dir(&self.root.join("generations"))?;
-        self.cut(CrashPoint::R2Prepared)?;
+        tx.cut(CrashPoint::R2Prepared)?;
 
         // R3: the single commit point.
         let now = Utc::now();
@@ -1344,16 +1542,19 @@ impl AuditLedger {
         });
         manifest.active_generation_id = next_id.clone();
         manifest.global_last_seq_floor = scan.last_seq;
-        self.write_manifest(&mut manifest)?;
-        {
-            let mut guard = self.inner.lock();
-            guard.manifest = manifest;
-            guard.live = next_live;
-        }
-        self.cut(CrashPoint::R3Committed)?;
+        tx.commit_manifest(manifest)?;
+        tx.switch_live(LiveTail {
+            generation_id: next_id.clone(),
+            last_seq: scan.last_seq,
+            last_tag: scan.last_tag.clone(),
+            journal_bytes: 0,
+            open_intent_ids: Vec::new(),
+            intent_tracking_overflowed: false,
+        });
+        tx.cut(CrashPoint::R3Committed)?;
 
         // R4: publish.
-        self.append_internal(
+        tx.append(
             AuditEntryInput::new(
                 "audit.generation.opened",
                 EntryPhase::Outcome,
@@ -1369,6 +1570,16 @@ impl AuditLedger {
 
     pub fn verify_generation(&self, generation_id: &str) -> AuditResult<GenerationVerification> {
         let manifest = self.inner.lock().manifest.clone();
+        self.verify_generation_with(&manifest, generation_id)
+    }
+
+    /// Verify against an already-held manifest, so a structural transaction can
+    /// verify without releasing its barrier.
+    pub(crate) fn verify_generation_with(
+        &self,
+        manifest: &Manifest,
+        generation_id: &str,
+    ) -> AuditResult<GenerationVerification> {
         let descriptor = manifest
             .generation(generation_id)
             .ok_or(AuditError::Refused(RefuseReason::GenerationUnknown))?
@@ -1469,17 +1680,15 @@ impl AuditLedger {
     }
 
     pub(crate) fn commit_manifest(&self, manifest: Manifest) -> AuditResult<()> {
+        let mut guard = self.inner.lock();
+        let expected = guard.manifest.manifest_epoch;
         let mut manifest = manifest;
-        self.write_manifest(&mut manifest)?;
-        self.inner.lock().manifest = manifest;
+        self.write_manifest(&mut manifest, Some(expected))?;
+        guard.manifest = manifest;
         Ok(())
     }
 }
 
 fn count_lines(bytes: &[u8]) -> u64 {
     bytes.iter().filter(|b| **b == b'\n').count() as u64
-}
-
-fn bounded(value: &str, max: usize) -> String {
-    crate::textutil::truncate_at_char_boundary(value, max).to_string()
 }

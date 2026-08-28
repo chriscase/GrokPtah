@@ -58,13 +58,13 @@ pub mod witness;
 mod tests;
 
 pub use documents::{
-    sanitize_code, Anchor, AuditRecord, EntryOutcome, EntryPhase, EntryReason, GapRecord,
-    GenerationDescriptor, GenerationState, Manifest, RecoveryEvidence, RetentionReason,
+    sanitize_code, sanitize_op, Anchor, AuditRecord, EntryOutcome, EntryPhase, EntryReason,
+    GapRecord, GenerationDescriptor, GenerationState, Manifest, RecoveryEvidence, RetentionReason,
     RotationReason, SequenceOrigin, Tombstone, MAX_CODE_BYTES, MAX_LINE_BYTES,
 };
 pub use export::{
     verify_export, CoverageElement, CoverageKind, ExportFormat, ExportManifest, ExportReceipt,
-    ExportVerification,
+    ExportScope, ExportVerification, WithheldReason,
 };
 pub use keys::{AuditKeyCustody, AuditKeys};
 pub use ledger::{

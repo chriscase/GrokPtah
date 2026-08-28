@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use tempfile::TempDir;
 
 use super::documents::*;
-use super::export::{verify_export, ExportFormat};
+use super::export::{verify_export, ExportFormat, ExportScope};
 use super::ledger::{AuditEntryInput, AuditLedger, AuditLedgerOptions, CrashPoint};
 use super::retention::RetentionRequest;
 use super::witness::{AuditWitness, WitnessBeacon, WitnessState, WitnessVerdict};
@@ -541,7 +541,11 @@ fn tombstone_first_retention_keeps_the_chain_across_the_hole() {
     ledger.rotate(RotationReason::Bytes).unwrap();
     ledger.append(entry("post")).unwrap();
     let receipt = ledger
-        .export(&export_dir.path().join("out"), ExportFormat::Auto)
+        .export(
+            &export_dir.path().join("out"),
+            ExportFormat::Auto,
+            ExportScope::Public,
+        )
         .unwrap();
     ledger
         .retain(RetentionRequest::new("g-000001").with_export_seal(&receipt.seal_id))
@@ -650,17 +654,29 @@ fn never_rotated_ledger_exports_as_v1_and_v2() {
     let out = TempDir::new().unwrap();
     let ledger = fresh(dir.path());
     let v1 = ledger
-        .export(&out.path().join("v1"), ExportFormat::V1)
+        .export(
+            &out.path().join("v1"),
+            ExportFormat::V1,
+            ExportScope::Public,
+        )
         .unwrap();
     let v2 = ledger
-        .export(&out.path().join("v2"), ExportFormat::V2)
+        .export(
+            &out.path().join("v2"),
+            ExportFormat::V2,
+            ExportScope::Public,
+        )
         .unwrap();
     assert!(v1.schema.ends_with(".v1") && v1.complete);
     assert!(v2.schema.ends_with(".v2") && v2.complete);
     assert_eq!(v1.global_last_seq, 5);
     // Auto picks v1 for a never-rotated, fully authenticated ledger.
     let auto = ledger
-        .export(&out.path().join("auto"), ExportFormat::Auto)
+        .export(
+            &out.path().join("auto"),
+            ExportFormat::Auto,
+            ExportScope::Public,
+        )
         .unwrap();
     assert!(auto.schema.ends_with(".v1"));
 }
@@ -674,13 +690,21 @@ fn multi_generation_refuses_v1_and_auto_selects_v2() {
     assert_eq!(
         refusal_of(
             ledger
-                .export(&out.path().join("v1"), ExportFormat::V1)
+                .export(
+                    &out.path().join("v1"),
+                    ExportFormat::V1,
+                    ExportScope::Public
+                )
                 .unwrap_err()
         ),
         RefuseReason::ExportV1IncompatibleMultiGeneration
     );
     let auto = ledger
-        .export(&out.path().join("auto"), ExportFormat::Auto)
+        .export(
+            &out.path().join("auto"),
+            ExportFormat::Auto,
+            ExportScope::Public,
+        )
         .unwrap();
     assert!(auto.schema.ends_with(".v2"));
     assert!(auto.complete);
@@ -699,7 +723,9 @@ fn export_after_retention_is_incomplete_with_an_explicit_hole() {
         .unwrap();
 
     let dest = out.path().join("after");
-    let receipt = ledger.export(&dest, ExportFormat::Auto).unwrap();
+    let receipt = ledger
+        .export(&dest, ExportFormat::Auto, ExportScope::Public)
+        .unwrap();
     assert!(
         !receipt.complete,
         "a retained hole must never be reported as complete"
@@ -724,7 +750,11 @@ fn export_never_rotates_truncates_or_deletes() {
     let epoch = ledger.manifest_snapshot().manifest_epoch;
 
     ledger
-        .export(&out.path().join("out"), ExportFormat::Auto)
+        .export(
+            &out.path().join("out"),
+            ExportFormat::Auto,
+            ExportScope::Public,
+        )
         .unwrap();
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -740,7 +770,11 @@ fn export_into_an_existing_directory_is_refused() {
     let dest = out.path().join("occupied");
     std::fs::create_dir_all(&dest).unwrap();
     assert_eq!(
-        refusal_of(ledger.export(&dest, ExportFormat::Auto).unwrap_err()),
+        refusal_of(
+            ledger
+                .export(&dest, ExportFormat::Auto, ExportScope::Public)
+                .unwrap_err()
+        ),
         RefuseReason::ExportDestinationExists
     );
 }
@@ -837,7 +871,11 @@ fn witness_outage_is_fail_soft_and_receipt_honest() {
     // ...and must not silently upgrade into an implied guarantee.
     assert_eq!(ledger.status().witness_state, WitnessState::Unverified);
     let receipt = ledger
-        .export(&out.path().join("out"), ExportFormat::Auto)
+        .export(
+            &out.path().join("out"),
+            ExportFormat::Auto,
+            ExportScope::Public,
+        )
         .unwrap();
     assert_eq!(receipt.witness_state, WitnessState::Unverified);
 }
@@ -1017,21 +1055,41 @@ fn imported_ledger_refuses_v1_export_and_labels_unauthenticated_in_v2() {
     assert_eq!(
         refusal_of(
             ledger
-                .export(&out.path().join("v1"), ExportFormat::V1)
+                .export(
+                    &out.path().join("v1"),
+                    ExportFormat::V1,
+                    ExportScope::Public
+                )
                 .unwrap_err()
         ),
         RefuseReason::ExportV1IncompatibleMultiGeneration
     );
+    // A public export withholds the imported generations rather than carrying
+    // them: preserved verbatim means never redacted to the v2 rules.
     let dest = out.path().join("v2");
-    let receipt = ledger.export(&dest, ExportFormat::Auto).unwrap();
+    let receipt = ledger
+        .export(&dest, ExportFormat::Auto, ExportScope::Public)
+        .unwrap();
     assert!(receipt.schema.ends_with(".v2"));
-    assert_eq!(receipt.unauthenticated_generations, 2);
-    assert_eq!(
-        verify_export(&dest, &keys())
-            .unwrap()
-            .unauthenticated_generations,
-        2
-    );
+    assert_eq!(receipt.unauthenticated_generations, 0);
+    assert_eq!(receipt.withheld, 2);
+    assert!(!receipt.complete);
+    let verified = verify_export(&dest, &keys()).unwrap();
+    assert_eq!(verified.unauthenticated_generations, 0);
+    assert_eq!(verified.withheld, 2);
+
+    // Privileged raw preservation is the only scope that carries them, and it
+    // declares that it does.
+    let raw = ledger
+        .export(
+            &out.path().join("raw"),
+            ExportFormat::Auto,
+            ExportScope::PrivilegedRaw,
+        )
+        .unwrap();
+    assert_eq!(raw.unauthenticated_generations, 2);
+    assert!(raw.contains_unauthenticated_legacy);
+    assert!(raw.complete);
 }
 
 #[test]
@@ -1040,7 +1098,9 @@ fn v1_export_verifies_with_the_v2_verifier() {
     let out = TempDir::new().unwrap();
     let ledger = fresh(dir.path());
     let dest = out.path().join("v1");
-    let receipt = ledger.export(&dest, ExportFormat::V1).unwrap();
+    let receipt = ledger
+        .export(&dest, ExportFormat::V1, ExportScope::Public)
+        .unwrap();
     drop(ledger);
 
     // Backward read: the current verifier still accepts a v1 export.
@@ -1232,7 +1292,9 @@ fn a_failed_export_leaves_no_partial_destination() {
     file.sync_all().unwrap();
 
     let dest = out.path().join("partial");
-    assert!(ledger.export(&dest, ExportFormat::Auto).is_err());
+    assert!(ledger
+        .export(&dest, ExportFormat::Auto, ExportScope::Public)
+        .is_err());
     assert!(
         !dest.exists(),
         "a refused export must not leave a directory that could pass for a sealed one"
@@ -1263,4 +1325,179 @@ fn concurrent_appends_never_issue_a_sequence_twice() {
     let ledger = opened(dir.path());
     assert_eq!(ledger.status().global_last_seq, 100);
     assert_eq!(ledger.verify_all().unwrap()[0].entry_count, 100);
+}
+
+// ------------------------------------------------- structural barrier (#462)
+
+#[test]
+fn a_structural_transaction_holds_the_barrier_against_appends() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = TempDir::new().unwrap();
+    let held = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&held);
+    let ledger = opened(dir.path()).with_structural_observer(Arc::new(move |ledger| {
+        // Deterministic: this asserts the lock is held, not that a race lost.
+        flag.store(!ledger.inner_is_unlocked(), Ordering::SeqCst);
+    }));
+    ledger.append(entry("before")).unwrap();
+    ledger.rotate(RotationReason::Operator).unwrap();
+    assert!(
+        held.load(Ordering::SeqCst),
+        "a rotation must hold the inner lock for its whole transaction"
+    );
+}
+
+#[test]
+fn a_manifest_commit_is_refused_when_another_writer_moved_the_epoch() {
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    let manifest = ledger.manifest_snapshot();
+
+    // Stand in for a second process: advance the committed epoch underneath us.
+    let mut behind_our_back = manifest.clone();
+    behind_our_back.manifest_epoch += 5;
+    behind_our_back.seal(&keys()).unwrap();
+    std::fs::write(
+        AuditLedger::manifest_path(dir.path()),
+        serde_json::to_vec(&behind_our_back).unwrap(),
+    )
+    .unwrap();
+
+    // The swap fails rather than silently overwriting the other writer.
+    assert_eq!(
+        poison_of(ledger.commit_manifest(manifest).unwrap_err()),
+        PoisonReason::ConcurrentWriter
+    );
+}
+
+#[test]
+fn concurrent_appends_during_a_rotation_never_strand_an_entry() {
+    let dir = TempDir::new().unwrap();
+    let ledger = Arc::new(opened(dir.path()));
+    for index in 0..5 {
+        ledger.append(entry(&format!("pre.{index}"))).unwrap();
+    }
+
+    // Appenders run against the ledger while a rotation is in flight. The
+    // assertions are invariants, not timings: whichever order the barrier
+    // admits them in, the chain must replay and no sequence may repeat.
+    let mut handles = Vec::new();
+    for worker in 0..4 {
+        let ledger = Arc::clone(&ledger);
+        handles.push(std::thread::spawn(move || {
+            for index in 0..20 {
+                ledger.append(entry(&format!("w{worker}.{index}"))).unwrap();
+            }
+        }));
+    }
+    let rotator = Arc::clone(&ledger);
+    let rotation = std::thread::spawn(move || rotator.rotate(RotationReason::Operator));
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    rotation.join().unwrap().expect("rotation");
+
+    // 5 pre + 80 concurrent + sealing + opened.
+    let total = 5 + 80 + 2;
+    assert_eq!(ledger.status().global_last_seq, total);
+    let verified = ledger.verify_all().unwrap();
+    assert_eq!(verified.len(), 2);
+    // Every issued sequence lands in exactly one generation, contiguously.
+    let manifest = ledger.manifest_snapshot();
+    let mut expected = 1u64;
+    for generation in &manifest.generations {
+        assert_eq!(generation.first_seq, expected);
+        expected = generation.last_seq + 1;
+    }
+    assert_eq!(
+        verified.iter().map(|v| v.entry_count).sum::<u64>(),
+        total,
+        "an entry was stranded outside a sealed range"
+    );
+}
+
+#[test]
+fn a_rotation_racing_a_retention_never_drops_a_generation_or_regresses_the_epoch() {
+    let dir = TempDir::new().unwrap();
+    let ledger = Arc::new(opened(dir.path()));
+    ledger.append(entry("first")).unwrap();
+    ledger.rotate(RotationReason::Operator).unwrap();
+    ledger.append(entry("second")).unwrap();
+    ledger.rotate(RotationReason::Operator).unwrap();
+    ledger.append(entry("third")).unwrap();
+    let epoch_before = ledger.manifest_snapshot().manifest_epoch;
+
+    let retainer = Arc::clone(&ledger);
+    let retention = std::thread::spawn(move || {
+        retainer.retain(RetentionRequest::new("g-000001").allow_unexported())
+    });
+    let rotator = Arc::clone(&ledger);
+    let rotation = std::thread::spawn(move || rotator.rotate(RotationReason::Operator));
+    retention.join().unwrap().expect("retention");
+    rotation.join().unwrap().expect("rotation");
+
+    let manifest = ledger.manifest_snapshot();
+    assert!(manifest.manifest_epoch > epoch_before, "epoch regressed");
+    assert_eq!(manifest.retention_epoch, 1);
+    assert_eq!(manifest.tombstones.len(), 1);
+    // Four generations: three sealed or tombstoned, one active. None dropped.
+    assert_eq!(manifest.generations.len(), 4);
+    let mut expected = 1u64;
+    for generation in &manifest.generations {
+        assert_eq!(generation.first_seq, expected, "a generation was dropped");
+        expected = generation.last_seq + 1;
+    }
+    ledger.verify_all().unwrap();
+}
+
+#[test]
+fn an_arbitrary_op_string_cannot_carry_a_secret_fragment() {
+    let dir = TempDir::new().unwrap();
+    let ledger = opened(dir.path());
+    let generation = ledger.status().active_generation_id;
+    ledger
+        .append(AuditEntryInput::new(
+            "/private/workspace sk-live-SECRET",
+            EntryPhase::Outcome,
+            EntryOutcome::Accepted,
+        ))
+        .unwrap();
+    let body = read_lines(&journal_of(dir.path(), &generation)).join("\n");
+    assert!(body.contains("\"op\":\"invalid_op\""));
+    assert!(!body.contains("sk-live-SECRET"));
+    assert!(!body.contains("/private/workspace"));
+    // A normal tool name survives untouched.
+    assert_eq!(
+        super::documents::sanitize_op("ptah_submit_task"),
+        "ptah_submit_task"
+    );
+    assert_eq!(
+        super::documents::sanitize_op("audit.generation.opened"),
+        "audit.generation.opened"
+    );
+}
+
+#[test]
+fn an_append_that_cannot_land_poisons_rather_than_reporting_clean() {
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    let generation = ledger.status().active_generation_id;
+    let journal = journal_of(dir.path(), &generation);
+
+    // Replace the journal with a directory. Unlike a mode change this is not
+    // bypassed by a privileged uid, so the test means the same thing whoever
+    // runs it.
+    std::fs::remove_file(&journal).unwrap();
+    std::fs::create_dir(&journal).unwrap();
+
+    assert!(ledger.append(entry("cannot-land")).is_err());
+    assert_eq!(
+        ledger.status().poisoned,
+        Some(PoisonReason::PartialPersistence),
+        "a failed append must not leave the ledger reporting clean"
+    );
+    // And a poisoned ledger refuses every later structural operation.
+    assert!(ledger.rotate(RotationReason::Operator).is_err());
+    assert!(ledger.append(entry("still-refused")).is_err());
 }

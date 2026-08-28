@@ -160,15 +160,34 @@ closed rather than degrading to an unauthenticated ledger:
 Errors carry only a stable code (`key_unavailable`, `manifest_mac_mismatch`).
 No key path and no key bytes appear in any error, receipt, or health field.
 
-## Single-writer discipline
+## Concurrency
 
-The ledger relies on the process-wide `InstanceLock` (`src/instance_lock.rs`)
-rather than taking a second lock of its own, and it holds its internal lock
-across a whole append so two in-process appenders cannot be issued the same
-sequence. It also *detects* a violation it cannot prevent: before each append
-it checks that the durable anchor still matches the in-memory tail, and a
-second writer that advanced the anchor poisons with `concurrent_writer` instead
-of interleaving two chains into one journal.
+Three separate mechanisms, because they defend against three different things.
+
+**Per-append atomicity.** The inner state lock is held across a whole append.
+Releasing it between the journal write and the anchor update let a second
+in-process appender read a stale tail and be issued a sequence that had already
+been written.
+
+**The structural barrier.** Rotation, retention, and the copy phase of an export
+run inside one ledger-wide transaction that holds both the structural lock and
+the inner lock for their whole extent. A rotation that released the inner lock
+between its journal snapshot and its manifest commit let a concurrent append
+land in the generation being sealed — stranding that entry outside the sealed
+range and duplicating its sequence as the next generation's `firstSeq`. A
+retention that built its manifest from a snapshot taken before its verification
+could overwrite a rotation that committed in between, dropping a committed
+generation and regressing the epoch.
+
+**Manifest compare-and-swap.** Every structural commit re-reads the on-disk
+manifest and requires its epoch to match the one the transaction observed. A
+second *process* that committed underneath us fails the swap with
+`concurrent_writer` instead of being silently overwritten.
+
+Beyond that the ledger relies on the process-wide `InstanceLock`
+(`src/instance_lock.rs`) and the orchestration store lock rather than taking a
+third lock of its own, and it *detects* the violation it cannot prevent: before
+each append it checks that the durable anchor still matches the in-memory tail.
 
 ## Retention
 
@@ -191,6 +210,28 @@ Never: delete before T3, delete the active generation, delete over a torn
 chain, delete on a read/rotation/export path, or delete to make room.
 
 ## Export
+
+### Scope: public versus privileged raw
+
+Imported v1 bytes are preserved **verbatim**, which means they still carry
+whatever the v1 ledger recorded — raw workspace paths, free-text `detail`
+holding `OrchError::message`, IO strings, and provider material. None of that
+was ever redacted to the v2 rules, so it must not leave the machine in an
+artifact anyone treats as public.
+
+| Scope | Imported v1 generations | Declares |
+| --- | --- | --- |
+| `Public` (default) | **withheld** — named in `coverage` as `kind: "withheld"` with `withheldReason: "unauthenticated_legacy"`, and no files carried | `complete: false` |
+| `PrivilegedRaw` | carried verbatim, for operator custody only | `containsUnauthenticatedLegacy: true` |
+
+The verifier enforces the separation in both directions: a public export that
+carries an unauthenticated generation is refused, and so is a raw export that
+claims to withhold one. Relabelling one as the other fails the seal MAC.
+
+`OrchStore::export_audit` is the public scope; `export_audit_privileged_raw` is
+the other, and its name is the warning.
+
+### Format
 
 `ExportFormat::Auto` emits v1 for a never-rotated, fully authenticated ledger
 and v2 otherwise. `ExportFormat::V1` is **refused** for anything a v1 document
@@ -232,6 +273,22 @@ clearing exactly those declared directories and re-running; the v1 source files
 are read-only inputs and are never moved or truncated, so nothing can be lost.
 
 ## Limits this does not close
+
+- **Producer intent/outcome pairing is partial.** Most of the 33 shipped
+  producers record outcomes only; run finalization and retention are the real
+  intent/outcome pairs. `actor` is the session UUID, not an authenticated
+  principal, and `authzRev`/`capRev`/`policyRev` are unset. Completing this
+  needs the canonical auth, principal, queue and Computer Use authorities
+  (#460, #461, #458) and is deliberately not guessed at here.
+- **Computer Use does not reach this ledger.** It keeps its own bounded per-run
+  ring in `computer_use/types.rs`.
+- **Production key custody is not wired.** `AuditKeyCustody` has the packaged
+  desktop, headless service and external consumer variants, and each fails
+  closed, but the shipped default is still `LocalFile`: no caller passes
+  keychain or environment material yet. There is also no versioned key rotation
+  — a changed installation key is *rejected*, not rolled over.
+- **Retention authority is unauthenticated.** `allow_unexported` is an argument,
+  not a proven operator identity.
 
 - **Joint rollback.** Restoring the manifest, every anchor and every journal to
   the same earlier moment satisfies every invariant above, and the ledger opens

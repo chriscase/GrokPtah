@@ -38,6 +38,34 @@ pub enum CoverageKind {
     /// A range removed by an authorized retention transaction. The chain is
     /// still stitched across it by `chainBase`/`finalTag`.
     Hole,
+    /// A range whose bytes exist but are not carried by this export because
+    /// the scope forbids them. Used for imported v1 bytes in a public export:
+    /// they were never redacted to the v2 rules and can contain workspace
+    /// paths, free-text `detail`, IO strings and provider material.
+    Withheld,
+}
+
+/// Who an export is for.
+///
+/// Imported v1 bytes are preserved verbatim by design, which means they still
+/// carry whatever the v1 ledger recorded. A public export must therefore not
+/// carry them, and a raw preservation export must say plainly that it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportScope {
+    /// Redacted: every carried generation was written under the v2 privacy
+    /// rules. Unauthenticated legacy ranges are withheld and declared.
+    Public,
+    /// Privileged raw preservation: carries unauthenticated legacy bytes
+    /// verbatim. For operator custody only, never a public artifact.
+    PrivilegedRaw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WithheldReason {
+    /// Imported v1 bytes: preserved, never redacted, never public.
+    UnauthenticatedLegacy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +87,8 @@ pub struct CoverageElement {
     pub retention_epoch: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub export_seal_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub withheld_reason: Option<WithheldReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +103,10 @@ pub struct ExportManifest {
     pub global_first_seq: u64,
     pub global_last_seq: u64,
     pub witness_state: WitnessState,
+    pub scope: ExportScope,
+    /// `true` when this export carries verbatim v1 bytes that were never
+    /// redacted to the v2 rules. Always `false` for a public export.
+    pub contains_unauthenticated_legacy: bool,
     /// `true` only when every coverage element is a generation.
     pub complete: bool,
     pub coverage: Vec<CoverageElement>,
@@ -103,6 +137,9 @@ impl ExportManifest {
 pub struct ExportReceipt {
     pub seal_id: String,
     pub schema: String,
+    pub scope: ExportScope,
+    pub contains_unauthenticated_legacy: bool,
+    pub withheld: usize,
     pub complete: bool,
     pub generations_exported: usize,
     pub holes: usize,
@@ -116,6 +153,9 @@ pub struct ExportReceipt {
 pub struct ExportVerification {
     pub seal_id: String,
     pub schema: String,
+    pub scope: ExportScope,
+    pub contains_unauthenticated_legacy: bool,
+    pub withheld: usize,
     pub complete: bool,
     pub generations_verified: usize,
     pub holes: usize,
@@ -126,7 +166,12 @@ pub struct ExportVerification {
 }
 
 impl AuditLedger {
-    pub fn export(&self, dest: &Path, format: ExportFormat) -> AuditResult<ExportReceipt> {
+    pub fn export(
+        &self,
+        dest: &Path,
+        format: ExportFormat,
+        scope: ExportScope,
+    ) -> AuditResult<ExportReceipt> {
         if let Some(poison) = self.is_poisoned() {
             return Err(AuditError::Poisoned(poison));
         }
@@ -137,7 +182,8 @@ impl AuditLedger {
             return Err(AuditError::Refused(RefuseReason::ExportDestinationExists));
         }
 
-        let manifest = self.manifest_snapshot();
+        let tx = self.structural_tx();
+        let manifest = tx.manifest_clone();
         let multi = manifest.generations.len() > 1 || !manifest.tombstones.is_empty();
         let unauthenticated = manifest
             .generations
@@ -148,6 +194,8 @@ impl AuditLedger {
         // "unauthenticated origin", so emitting one for either state would
         // misrepresent the range. Refusing is mandatory, not a convenience.
         let v1_possible = !multi && unauthenticated == 0;
+        // A public export of imported v1 bytes withholds them, so the range is
+        // partial by construction and v1 cannot represent it either way.
         let schema = match format {
             ExportFormat::V1 if !v1_possible => {
                 return Err(AuditError::Refused(
@@ -187,9 +235,29 @@ impl AuditLedger {
                     preceding_loss_unknown: descriptor.preceding_loss_unknown,
                     retention_epoch: Some(tombstone.retention_epoch),
                     export_seal_id: tombstone.export_seal_id.clone(),
+                    withheld_reason: None,
+                }
+            } else if scope == ExportScope::Public && !descriptor.origin_authenticated {
+                // Preserved, never redacted, never public.
+                let verification = tx.verify_generation(&descriptor.generation_id)?;
+                CoverageElement {
+                    kind: CoverageKind::Withheld,
+                    generation_id: descriptor.generation_id.clone(),
+                    first_seq: descriptor.first_seq,
+                    last_seq: verification.last_seq,
+                    chain_base: descriptor.chain_base.clone(),
+                    final_tag: verification.final_tag.clone(),
+                    journal_sha256: verification.journal_sha256.clone(),
+                    journal_bytes: verification.journal_bytes,
+                    entry_count: verification.entry_count,
+                    origin_authenticated: false,
+                    preceding_loss_unknown: descriptor.preceding_loss_unknown,
+                    retention_epoch: None,
+                    export_seal_id: None,
+                    withheld_reason: Some(WithheldReason::UnauthenticatedLegacy),
                 }
             } else {
-                let verification = self.verify_generation(&descriptor.generation_id)?;
+                let verification = tx.verify_generation(&descriptor.generation_id)?;
                 CoverageElement {
                     kind: CoverageKind::Generation,
                     generation_id: descriptor.generation_id.clone(),
@@ -204,6 +272,7 @@ impl AuditLedger {
                     preceding_loss_unknown: descriptor.preceding_loss_unknown,
                     retention_epoch: None,
                     export_seal_id: None,
+                    withheld_reason: None,
                 }
             };
             expected_seq = element.last_seq.saturating_add(1);
@@ -215,9 +284,9 @@ impl AuditLedger {
         // Everything after the destination is created runs inside one fallible
         // scope: a failed export must never leave a half-written directory that
         // could be mistaken for a sealed one.
-        let sealed = (|| -> AuditResult<(ExportManifest, ExportVerification)> {
+        let sealed = (|| -> AuditResult<ExportManifest> {
             for element in &coverage {
-                if element.kind == CoverageKind::Hole {
+                if element.kind != CoverageKind::Generation {
                     continue;
                 }
                 let source = Self::generation_dir(self.root(), &element.generation_id);
@@ -239,6 +308,7 @@ impl AuditLedger {
             }
 
             let complete = coverage.iter().all(|c| c.kind == CoverageKind::Generation);
+            // `Withheld` and `Hole` both make the range partial.
             let seal_id = format!(
                 "seal-{}",
                 &self.keys().opaque_digest(&format!("{}", Uuid::new_v4()))[..32]
@@ -252,7 +322,11 @@ impl AuditLedger {
                 retention_epoch: manifest.retention_epoch,
                 global_first_seq: manifest.global_first_seq,
                 global_last_seq,
-                witness_state: self.witness_state(),
+                witness_state: tx.witness_state(),
+                scope,
+                contains_unauthenticated_legacy: coverage
+                    .iter()
+                    .any(|c| c.kind == CoverageKind::Generation && !c.origin_authenticated),
                 complete,
                 coverage,
                 exported_at: Utc::now(),
@@ -264,17 +338,29 @@ impl AuditLedger {
             files::atomic_write(&dest.join("export-manifest.json"), &bytes)?;
             files::fsync_dir(dest)?;
 
-            // Independent re-verification: reopen the copy with a fresh reader
-            // that shares no state with the live ledger, and only then let a
-            // receipt be returned.
-            let verification = verify_export(dest, self.keys())?;
-            if verification.seal_id != seal_id || verification.complete != complete {
-                return Err(AuditError::Poisoned(PoisonReason::ExportMacMismatch));
-            }
-            Ok((export, verification))
+            Ok(export)
         })();
 
-        let (export, verification) = match sealed {
+        let export = match sealed {
+            Ok(export) => export,
+            Err(error) => {
+                // Only a destination this call created is ever removed.
+                let _ = std::fs::remove_dir_all(dest);
+                return Err(error);
+            }
+        };
+        drop(tx);
+
+        // Independent re-verification: a fresh reader over the copy, holding
+        // no ledger state and no barrier.
+        let verified = (|| -> AuditResult<ExportVerification> {
+            let verification = verify_export(dest, self.keys())?;
+            if verification.seal_id != export.seal_id || verification.complete != export.complete {
+                return Err(AuditError::Poisoned(PoisonReason::ExportMacMismatch));
+            }
+            Ok(verification)
+        })();
+        let verification = match verified {
             Ok(sealed) => sealed,
             Err(error) => {
                 // Only a destination this call created is ever removed.
@@ -286,6 +372,9 @@ impl AuditLedger {
         Ok(ExportReceipt {
             seal_id: export.seal_id,
             schema: export.schema,
+            scope: export.scope,
+            contains_unauthenticated_legacy: export.contains_unauthenticated_legacy,
+            withheld: verification.withheld,
             complete: export.complete,
             generations_exported: verification.generations_verified,
             holes: verification.holes,
@@ -326,6 +415,7 @@ pub fn verify_export(dir: &Path, keys: &AuditKeys) -> AuditResult<ExportVerifica
     let mut expected_seq = export.global_first_seq;
     let mut generations_verified = 0usize;
     let mut holes = 0usize;
+    let mut withheld = 0usize;
     let mut unauthenticated = 0usize;
     let mut previous_tag: Option<String> = None;
 
@@ -339,11 +429,25 @@ pub fn verify_export(dir: &Path, keys: &AuditKeys) -> AuditResult<ExportVerifica
                 return Err(AuditError::Poisoned(PoisonReason::ChainDiscontinuity));
             }
         }
-        if !element.origin_authenticated {
+        // Only a *carried* generation can leak. A withheld element names an
+        // unauthenticated range precisely so its bytes are absent.
+        if element.kind == CoverageKind::Generation && !element.origin_authenticated {
             unauthenticated += 1;
         }
         match element.kind {
             CoverageKind::Hole => holes += 1,
+            CoverageKind::Withheld => {
+                withheld += 1;
+                if export.scope != ExportScope::Public {
+                    // Only a public export withholds; a raw export that claims
+                    // to withhold is misdescribing itself.
+                    return Err(AuditError::Poisoned(PoisonReason::ExportCoverageInvalid));
+                }
+                let carried = dir.join("generations").join(&element.generation_id);
+                if carried.exists() {
+                    return Err(AuditError::Poisoned(PoisonReason::ExportCoverageInvalid));
+                }
+            }
             CoverageKind::Generation => {
                 let generation_dir = if export.schema == EXPORT_SCHEMA_V1 {
                     dir.to_path_buf()
@@ -382,13 +486,23 @@ pub fn verify_export(dir: &Path, keys: &AuditKeys) -> AuditResult<ExportVerifica
     if expected_seq.saturating_sub(1) != export.global_last_seq {
         return Err(AuditError::Poisoned(PoisonReason::ExportCoverageInvalid));
     }
-    if export.complete != (holes == 0) {
+    if export.scope == ExportScope::Public && unauthenticated > 0 {
+        // A public export must not carry an unauthenticated generation.
+        return Err(AuditError::Poisoned(PoisonReason::ExportCoverageInvalid));
+    }
+    if export.contains_unauthenticated_legacy != (unauthenticated > 0) {
+        return Err(AuditError::Poisoned(PoisonReason::ExportCoverageInvalid));
+    }
+    if export.complete != (holes == 0 && withheld == 0) {
         return Err(AuditError::Poisoned(PoisonReason::ExportCoverageInvalid));
     }
 
     Ok(ExportVerification {
         seal_id: export.seal_id,
         schema: export.schema,
+        scope: export.scope,
+        contains_unauthenticated_legacy: export.contains_unauthenticated_legacy,
+        withheld,
         complete: export.complete,
         generations_verified,
         holes,

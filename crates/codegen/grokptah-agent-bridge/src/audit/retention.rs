@@ -63,11 +63,17 @@ pub struct RetentionReceipt {
 }
 
 impl AuditLedger {
+    /// Tombstone-first retention, entirely inside one structural barrier.
+    ///
+    /// Taking a manifest snapshot, verifying, then committing a manifest built
+    /// from that snapshot let a rotation commit in between and be silently
+    /// overwritten — dropping a committed generation and regressing the epoch.
     pub fn retain(&self, request: RetentionRequest) -> AuditResult<RetentionReceipt> {
-        if let Some(poison) = self.is_poisoned() {
+        let mut tx = self.structural_tx();
+        if let Some(poison) = tx.poisoned() {
             return Err(AuditError::Poisoned(poison));
         }
-        let manifest = self.manifest_snapshot();
+        let manifest = tx.manifest_clone();
         let descriptor = manifest
             .generation(&request.generation_id)
             .ok_or(AuditError::Refused(RefuseReason::GenerationUnknown))?
@@ -101,7 +107,7 @@ impl AuditLedger {
         if descriptor.journal_sha256.as_deref() != Some(journal_sha256.as_str()) {
             return Err(AuditError::Poisoned(PoisonReason::SealedGenerationChanged));
         }
-        let verification = self.verify_generation(&descriptor.generation_id)?;
+        let verification = tx.verify_generation(&descriptor.generation_id)?;
         if verification.last_seq != descriptor.last_seq
             || verification.final_tag.as_str()
                 != descriptor.final_tag.as_deref().unwrap_or_default()
@@ -121,7 +127,7 @@ impl AuditLedger {
         }
 
         // T2: intent before the effect boundary.
-        self.append(
+        tx.append(
             AuditEntryInput::new(
                 "audit.retention",
                 EntryPhase::Intent,
@@ -130,10 +136,11 @@ impl AuditLedger {
             .with_reason(EntryReason::RetentionIntent)
             .with_producer(&descriptor.generation_id)
             .with_scope(&descriptor.generation_id),
+            None,
         )?;
 
         // T3: commit the tombstone. Bytes are still on disk after this returns.
-        let mut manifest = self.manifest_snapshot();
+        let mut manifest = tx.manifest_clone();
         manifest.retention_epoch = manifest.retention_epoch.saturating_add(1);
         let retention_epoch = manifest.retention_epoch;
         let now = Utc::now();
@@ -162,8 +169,8 @@ impl AuditLedger {
             target.state = GenerationState::Tombstoned;
             target.tombstoned_at = Some(now);
         }
-        self.commit_manifest(manifest)?;
-        self.cut(CrashPoint::T3Committed)?;
+        tx.commit_manifest(manifest)?;
+        tx.cut(CrashPoint::T3Committed)?;
 
         // T4: remove the bytes the committed manifest authorized removing.
         let dir = Self::generation_dir(self.root(), &descriptor.generation_id);
@@ -172,10 +179,10 @@ impl AuditLedger {
                 .map_err(|error| AuditError::Io(format!("retention removal: {error}")))?;
             files::fsync_dir(&self.root().join("generations"))?;
         }
-        self.cut(CrashPoint::T4Removed)?;
+        tx.cut(CrashPoint::T4Removed)?;
 
         // T5: mark the removal complete.
-        let mut manifest = self.manifest_snapshot();
+        let mut manifest = tx.manifest_clone();
         if let Some(tombstone) = manifest
             .tombstones
             .iter_mut()
@@ -183,10 +190,10 @@ impl AuditLedger {
         {
             tombstone.removed_at = Some(Utc::now());
         }
-        self.commit_manifest(manifest)?;
+        tx.commit_manifest(manifest)?;
 
         // T6: pair the intent so open intents return to zero.
-        self.append(
+        tx.append(
             AuditEntryInput::new(
                 "audit.retention",
                 EntryPhase::Outcome,
@@ -195,6 +202,7 @@ impl AuditLedger {
             .with_reason(EntryReason::RetentionOutcome)
             .with_producer(&descriptor.generation_id)
             .with_scope(&descriptor.generation_id),
+            None,
         )?;
 
         Ok(RetentionReceipt {
