@@ -715,6 +715,9 @@ impl AuditLedger {
             if !valid_generation_id(&generation.generation_id) {
                 return Err(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid));
             }
+            if !keyring.iter().any(|key| key.key_id() == generation.key_id) {
+                return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+            }
             if generation.index as usize != position + 1 {
                 return Err(AuditError::Poisoned(
                     PoisonReason::GenerationIndexDiscontinuity,

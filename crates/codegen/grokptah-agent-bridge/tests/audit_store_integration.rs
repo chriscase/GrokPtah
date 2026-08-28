@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::thread;
 
 use chrono::Utc;
-use grokptah_agent_bridge::audit::{ExportFormat, RetentionRequest};
+use grokptah_agent_bridge::audit::{AuditKeyCustody, AuditKeys, ExportFormat, RetentionRequest};
 use grokptah_agent_bridge::orchestration::AuditEntry;
 use grokptah_agent_bridge::OrchStore;
 use tempfile::TempDir;
@@ -118,7 +118,7 @@ fn real_store_migrates_legacy_bytes_once_and_labels_them_untrusted() {
         .append_audit(&audit_entry("native", "native-intent", "private"))
         .unwrap();
     assert_eq!(store.audit_status().global_last_seq, 4);
-    drop(store);
+    store.shutdown().unwrap();
 
     let reopened = OrchStore::open(temp.path()).unwrap();
     assert_eq!(reopened.audit_status().imported_generations, 2);
@@ -137,7 +137,7 @@ fn real_store_tamper_fails_closed_before_use() {
         .append_audit(&audit_entry("tamper-target", "tamper-intent", "private"))
         .unwrap();
     let generation = store.audit_status().active_generation_id;
-    drop(store);
+    store.shutdown().unwrap();
 
     let journal = temp
         .path()
@@ -184,7 +184,7 @@ fn real_store_retention_requires_a_verified_export_and_keeps_tombstone() {
         .join("generations")
         .join("g-000001")
         .exists());
-    drop(store);
+    store.shutdown().unwrap();
 
     let reopened = OrchStore::open(temp.path()).unwrap();
     assert_eq!(reopened.audit_status().tombstones, 1);
@@ -233,7 +233,7 @@ fn two_process_immediate_same_home_reuse_after_explicit_shutdown() {
     store
         .append_audit(&audit_entry("parent", "parent-intent", "private"))
         .unwrap();
-    drop(store);
+    store.shutdown().unwrap();
 
     let output = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
@@ -249,4 +249,40 @@ fn two_process_immediate_same_home_reuse_after_explicit_shutdown() {
     );
     let reopened = OrchStore::open(&root).unwrap();
     assert_eq!(reopened.audit_status().global_last_seq, 2);
+}
+
+#[test]
+fn key_custody_modes_fail_closed_without_safe_material() {
+    let temp = TempDir::new().unwrap();
+    let key_path = temp.path().join(".audit-key");
+    fs::write(&key_path, [0u8; 64]).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    assert!(AuditKeyCustody::headless_service(temp.path()).is_err());
+    assert!(AuditKeyCustody::packaged_desktop(temp.path()).is_err());
+
+    let external = AuditKeyCustody::external_consumer(Arc::new(AuditKeys::derive(
+        b"external-consumer-held-key",
+    )));
+    let store = OrchStore::open_with_custody(temp.path().join("external"), external).unwrap();
+    assert_eq!(store.audit_status().key_epoch, 1);
+    store.shutdown().unwrap();
+}
+
+#[test]
+fn missing_retired_epoch_fails_closed_instead_of_claiming_clean_audit() {
+    let temp = TempDir::new().unwrap();
+    let store = OrchStore::open(temp.path()).unwrap();
+    store.rotate_audit_key().unwrap();
+    store.shutdown().unwrap();
+    fs::remove_file(
+        temp.path()
+            .join(".audit-key-epochs")
+            .join("epoch-00000002.key"),
+    )
+    .unwrap();
+    assert!(OrchStore::open(temp.path()).is_err());
 }

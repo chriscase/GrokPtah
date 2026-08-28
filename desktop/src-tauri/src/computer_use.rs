@@ -9,8 +9,10 @@ use grokptah_agent_bridge::{
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
     ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer, OrchStore,
-    MacOsObservationPlatform, SemanticAction, SimulatorBackend,
+    SemanticAction, SimulatorBackend,
 };
+#[cfg(target_os = "macos")]
+use grokptah_agent_bridge::MacOsObservationPlatform;
 use serde::Serialize;
 use tokio::sync::Mutex;
 use uuid::Uuid;

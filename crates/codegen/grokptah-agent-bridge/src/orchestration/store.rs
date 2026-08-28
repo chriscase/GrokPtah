@@ -238,6 +238,17 @@ impl OrchStore {
         &self.inner.root
     }
 
+    /// Explicitly close the shared store. Refuse while another handle still
+    /// owns the lock so callers cannot mistake a dropped local reference for
+    /// host-wide shutdown.
+    pub fn shutdown(self) -> anyhow::Result<()> {
+        if Arc::strong_count(&self.inner) != 1 {
+            return Err(anyhow::anyhow!("orchestration store still has live owners"));
+        }
+        drop(self);
+        Ok(())
+    }
+
     fn run_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
         let safe = safe_id_filename(run_id)?;
         Ok(self.inner.root.join("runs").join(format!("{safe}.json")))
