@@ -1342,9 +1342,16 @@ pub(crate) fn stamped_client_id(auth: &AuthContext) -> String {
 /// on it, and a second definition is how the two would drift.
 pub(crate) const HOST_AUTHORED_CLIENT_ID: &str = "native-executor";
 
+/// A durable receipt, as stored.
+///
+/// `pub(crate)` with the rest of the receipt surface. It carries the full
+/// replayed `response` and an `error` with its message, so it is the thing the
+/// projection exists to avoid handing out: [`PublicReceipt`] is what leaves
+/// this host. Exporting the type while every method that produces one is
+/// crate-private would advertise an affordance that does not exist.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IdempotencyReceipt {
+pub(crate) struct IdempotencyReceipt {
     pub request_id: String,
     /// The scope this receipt was claimed in.
     ///

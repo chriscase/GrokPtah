@@ -246,7 +246,11 @@ Three changes, all structural:
   crate can name either.
 * **Every receipt method is `pub(crate)`.** `save`, `load`, `claim`, `complete`,
   `fail`, `list_idempotency_for_run`, `receipt_cursor` and
-  `parse_receipt_cursor`.
+  `parse_receipt_cursor`. `IdempotencyReceipt` itself went with them: it carries
+  the full replayed `response` and an `error` with its message, which is exactly
+  what `PublicReceipt` exists to project away from, and exporting a type whose
+  every producer is crate-private only advertises an affordance that is not
+  there.
 
 `no_public_function_accepts_a_scope` keeps it that way as a source-level guard —
 verified to fail when one method is made `pub` again. A behavioural test would

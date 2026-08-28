@@ -6345,9 +6345,16 @@ mod tests {
             leaked.join("\n  ")
         );
 
-        // And the crate root must not re-export the scope or the host identity.
+        // And the crate root must not re-export the scope, the host identity,
+        // or the stored receipt — which carries the full replayed response and
+        // an error with its message, and is exactly what `PublicReceipt`
+        // exists to project away from.
         let root = include_str!("mod.rs");
-        for symbol in ["IdempotencyScope", "HOST_AUTHORED_CLIENT_ID"] {
+        for symbol in [
+            "IdempotencyScope",
+            "HOST_AUTHORED_CLIENT_ID",
+            "IdempotencyReceipt",
+        ] {
             assert!(
                 !root.contains(symbol),
                 "`{symbol}` is re-exported from the crate root; a caller \
