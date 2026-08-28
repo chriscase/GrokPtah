@@ -103,8 +103,10 @@ fn real_store_migrates_legacy_bytes_once_and_labels_them_untrusted() {
     let temp = TempDir::new().unwrap();
     let audit_dir = temp.path().join("audit");
     fs::create_dir_all(&audit_dir).unwrap();
-    let older = b"{\"tool\":\"auth\",\"outcome\":\"rejected\"}\n";
-    let current = b"{\"tool\":\"run\",\"outcome\":\"accepted\"}\n{\"tool\":\"cancel\",\"outcome\":\"accepted\"}\n";
+    let older =
+        b"{\"tool\":\"auth\",\"detail\":\"/private/path prompt credential clipboard locator\"}\n";
+    let current = b"{\"tool\":\"run\",\"detail\":\"provider-private-payload\"}\n\
+          {\"tool\":\"cancel\",\"outcome\":\"accepted\"}\n";
     fs::write(audit_dir.join("audit.jsonl.1"), older).unwrap();
     fs::write(audit_dir.join("audit.jsonl"), current).unwrap();
 
@@ -133,8 +135,18 @@ fn real_store_migrates_legacy_bytes_once_and_labels_them_untrusted() {
         .unwrap();
     assert_eq!(receipt.withheld_generations, 2);
     let public_bytes = all_bytes(&public_destination);
-    assert!(!public_bytes.windows(5).any(|window| window == b"\"old\""));
-    assert!(!public_bytes.windows(5).any(|window| window == b"\"new\""));
+    for forbidden in [
+        "/private/path",
+        "prompt",
+        "credential",
+        "clipboard",
+        "locator",
+        "provider-private-payload",
+    ] {
+        assert!(!public_bytes
+            .windows(forbidden.len())
+            .any(|window| window == forbidden.as_bytes()));
+    }
 }
 
 #[test]
@@ -161,6 +173,29 @@ fn real_store_tamper_fails_closed_before_use() {
     bytes[position] = b'b';
     fs::write(journal, bytes).unwrap();
     assert!(OrchStore::open(temp.path()).is_err());
+}
+
+#[test]
+fn real_store_records_legacy_divergence_after_cutover() {
+    let temp = TempDir::new().unwrap();
+    let audit_dir = temp.path().join("audit");
+    fs::create_dir_all(&audit_dir).unwrap();
+    fs::write(audit_dir.join("audit.jsonl.1"), b"{\"legacy\":1}\n").unwrap();
+    fs::write(audit_dir.join("audit.jsonl"), b"{\"legacy\":2}\n").unwrap();
+    let store = OrchStore::open(temp.path()).unwrap();
+    store.shutdown().unwrap();
+    fs::write(audit_dir.join("audit.jsonl"), b"{\"legacy\":3}\n").unwrap();
+
+    let reopened = OrchStore::open(temp.path()).unwrap();
+    assert_eq!(reopened.audit_status().recovery.legacy_divergences.len(), 1);
+    assert_eq!(reopened.audit_status().global_last_seq, 5);
+    reopened.shutdown().unwrap();
+    let final_open = OrchStore::open(temp.path()).unwrap();
+    assert!(final_open
+        .audit_status()
+        .recovery
+        .legacy_divergences
+        .is_empty());
 }
 
 #[test]

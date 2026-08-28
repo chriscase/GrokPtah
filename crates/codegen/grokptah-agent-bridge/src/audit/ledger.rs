@@ -1753,6 +1753,13 @@ impl AuditLedger {
             return Err(AuditError::Refused(RefuseReason::GenerationTombstoned));
         }
         let path = Self::journal_path(&self.root, generation_id);
+        if !path.is_file() {
+            return Err(AuditError::Poisoned(match descriptor.state {
+                GenerationState::Active => PoisonReason::ActiveGenerationInvalid,
+                GenerationState::Sealed => PoisonReason::SealedGenerationChanged,
+                GenerationState::Tombstoned => PoisonReason::TombstoneInconsistent,
+            }));
+        }
         let generation_key = self.key_for_generation(&descriptor)?;
         let scan = self.scan_journal(
             &generation_key,

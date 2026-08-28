@@ -82,6 +82,7 @@ fallback.
 | C7 | `manifestEpoch` and `retentionEpoch` are strictly monotonic. |
 | C8 | The manifest holds `globalLastSeqFloor` (exact only for sealed generations); the anchor holds the live value. |
 | C9 | A generation id is never reused, and a tombstoned generation's descriptor is never removed. |
+| C10 | A producer intent must carry a keyed identity, and an outcome closes only the same identity; the tracking ceiling refuses before writing. |
 
 ## Rotation and the crash-cut contract
 
@@ -97,6 +98,7 @@ rename is the only commit point.
 | Manifest names g-N+1 | Reopen **g-N+1**; g-N is sealed and immutable |
 | Journal extends past the anchor | Recompute the chain forward; adopt if it verifies, poison if a complete line fails |
 | Trailing bytes with no newline | Trim exactly that run, record `recovery.torn_tail`. In a sealed generation this is poison |
+| Sealed generation changed | **Poison at open**; sealed bytes are verified before the store becomes usable |
 | `manifest.json` absent, `.tmp` present | **Poison** — a temporary is never promoted |
 | No manifest but generation directories exist | **Poison**, unless an authenticated bootstrap marker covers them (see Migration) |
 | Intent with no outcome | Append an `uncertain` outcome with `host_restart_interrupted`. Never fabricate success, never auto-redispatch |
@@ -117,10 +119,10 @@ shared `OrchStore` custody boundary.
 ## Retention
 
 The only path that deletes bytes. It requires a **sealed, non-current,
-authenticated** generation, an operator authorization, and either an export
-seal covering the range or an explicit `allow_unexported` override that is
-itself recorded permanently. The target is verified completely first — you may
-not tombstone imported, unverified, or otherwise unverifiable evidence.
+authenticated** generation and either an authenticated export seal covering the
+range or an explicit local policy override that is recorded permanently. The
+target is verified completely first — imported, unverified, or otherwise
+unverifiable evidence is rejected.
 
 `T1 verify → T2 intent → T3 commit tombstone → T4 remove bytes → T5 mark removed → T6 outcome`
 
@@ -144,10 +146,13 @@ generation — because a v1 document has no way to say "partial" or
 
 A v2 export carries a `coverage` array that must tile
 `globalFirstSeq..globalLastSeq` exactly, with `kind: "hole"` elements for
-retained ranges, and `complete` is true only when every element is a
-generation. The chain must stitch across holes as well as generations. After
-writing, the export is reopened by a fresh reader that shares no state with the
-live ledger and re-verified before a path-free receipt is returned.
+retained ranges and `kind: "withheld"` elements for unauthenticated imported
+legacy ranges. Withheld ranges are acknowledged but their verbatim bytes are
+not copied into the public export. `complete` is true only when every element
+is a carried authenticated generation. The chain must stitch across holes and
+withheld ranges. After writing, the export is reopened by a fresh reader that
+shares no state with the live ledger and re-verified before a path-free receipt
+is returned. Extra files and unverified copied anchors are rejected.
 
 `verify_export` accepts both v1 and v2, so exports taken before generations
 existed stay verifiable.
@@ -177,12 +182,18 @@ manifest commit clears only the now-redundant marker. The manifest atomic rename
 is the single switch boundary. The v1 source files are read-only inputs and are
 never moved or truncated, so nothing can be lost.
 
+On later opens, the preserved v1 source files are compared with the imported
+digests. A write, truncation, deletion, or symlink replacement by an older
+binary becomes a durable `uncertain` `legacy_written_after_cutover` record and
+is never repaired or treated as a clean history.
+
 The store adapter maps producer operations to keyed intent identities and
 outcomes. The same v2 authority is used for orchestration, provider attempts,
-approvals, queue/background work, subagents, cancellation, shutdown, and
-Computer Use service mutations. Free-form legacy `detail` is deliberately not
-adapted; the bounded public projection contains no prompt, credential, path,
-locator, clipboard, frame, HMAC key, or private provider payload.
+approvals, queue/background work, subagents, cancellation, explicit store
+shutdown, and configured Computer Use service mutations. Free-form legacy
+`detail` is deliberately not adapted; the bounded public projection contains no
+prompt, credential, path, locator, clipboard, frame, HMAC key, or private
+provider payload.
 
 ## Operator recovery
 
@@ -214,22 +225,20 @@ queue, Computer Use, or shutdown outcomes for explicit reconciliation.
   default is `UnwitnessedBoundary`, and every export receipt states its
   `witnessState`. A witness that cannot be reached is fail-soft for operation
   and never upgrades into an implied guarantee.
-- **Boot verification is bounded.** The active generation's tail beyond the
-  anchor is always verified. Sealed generations are verified on export, on
-  retention, and on explicit `verify_all`, not at every start — so tampering
-  with a sealed generation is detected at those points, not necessarily at the
-  next boot.
+- **Standalone locking.** The production `OrchStore` owns the process-wide
+  lock. A standalone `AuditLedger` is intentionally an embeddable primitive
+  and does not claim to prevent independent processes from racing it.
 - **Key loss.** Losing a retired epoch makes the affected generation
   unverifiable. It does not delete it, and the store fails closed rather than
   reporting a clean ledger.
 - **Filesystem access.** An operator who can delete the audit directory can
   still do so. Only an external append-only sink or a witness makes that
   detectable.
-- **Interrupted intents are closed in aggregate.** Recovery states the exact
-  number of intents left open and marks the outcome uncertain. Producer-supplied
-  request IDs receive exact keyed intent continuity; legacy records without one
-  use a deliberately weaker session/tool fallback and make no stronger claim.
-- **Shutdown ownership.** Explicit `OrchStore` drop releases its store lock and
-  the two-process reuse gate proves this store boundary. Full host clone
-  quiescence remains owned by the separate #455 lifecycle work; this change
-  does not claim to implement or qualify that host runtime.
+- **Interrupted intents.** Recovery closes each tracked producer identity with
+  its own uncertain outcome. Inputs without an identity are refused for intent
+  phase; legacy outcome-only records make no causal pairing claim.
+- **Shutdown ownership.** Explicit `OrchStore::shutdown` journals a paired
+  shutdown outcome and releases its store lock; the two-process reuse gate
+  proves this store boundary. Full host clone quiescence remains owned by the
+  separate #455 lifecycle work; this change does not claim to implement or
+  qualify that host runtime.
