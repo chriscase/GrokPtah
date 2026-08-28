@@ -612,6 +612,7 @@ impl AuditLedger {
                 sequence_origin: SequenceOrigin::ImportAssigned,
                 origin_authenticated: false,
                 preceding_loss_unknown: legacy.preceding_loss_unknown,
+                legacy_source: Some(legacy.source_name.clone()),
                 opened_at: now,
                 sealed_at: Some(now),
                 tombstoned_at: None,
@@ -667,6 +668,7 @@ impl AuditLedger {
             sequence_origin: SequenceOrigin::Issued,
             origin_authenticated: true,
             preceding_loss_unknown: false,
+            legacy_source: None,
             opened_at: now,
             sealed_at: None,
             tombstoned_at: None,
@@ -1046,11 +1048,13 @@ impl AuditLedger {
             .cloned()
             .collect::<Vec<_>>();
         for (index, generation) in imported.iter().enumerate() {
-            let name = if index == 0 {
-                "audit.jsonl.1"
-            } else {
-                "audit.jsonl"
-            };
+            let name = generation.legacy_source.as_deref().unwrap_or_else(|| {
+                if imported.len() == 1 || index > 0 {
+                    "audit.jsonl"
+                } else {
+                    "audit.jsonl.1"
+                }
+            });
             let path = legacy_dir.join(name);
             let (digest, bytes) = match std::fs::symlink_metadata(&path) {
                 Ok(metadata) => {
@@ -1702,6 +1706,7 @@ impl AuditLedger {
             sequence_origin: SequenceOrigin::Issued,
             origin_authenticated: true,
             preceding_loss_unknown: false,
+            legacy_source: None,
             opened_at: now,
             sealed_at: None,
             tombstoned_at: None,

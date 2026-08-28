@@ -72,6 +72,7 @@ pub(crate) fn bootstrap_path(root: &Path) -> PathBuf {
 
 #[derive(Debug, Clone)]
 pub(crate) struct LegacyGenerationPlan {
+    pub source_name: String,
     pub bytes: Vec<u8>,
     pub sha256: String,
     pub lines: u64,
@@ -99,6 +100,7 @@ pub(crate) fn plan_legacy_import(legacy_dir: &Path) -> AuditResult<LegacyImportP
         let sha256 = sha256_hex(&bytes);
         let lines = count_legacy_lines(&bytes);
         plan.generations.push(LegacyGenerationPlan {
+            source_name: name.to_string(),
             bytes,
             sha256,
             lines,

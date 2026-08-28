@@ -194,6 +194,8 @@ pub struct GenerationDescriptor {
     pub origin_authenticated: bool,
     /// `true` when v1 already destroyed generations older than this one.
     pub preceding_loss_unknown: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub legacy_source: Option<String>,
     pub opened_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sealed_at: Option<DateTime<Utc>>,

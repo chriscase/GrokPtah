@@ -1258,6 +1258,20 @@ fn legacy_write_after_cutover_is_persisted_as_uncertain_divergence() {
 }
 
 #[test]
+fn a_single_legacy_current_file_is_not_misread_as_a_missing_predecessor() {
+    let dir = TempDir::new().unwrap();
+    let legacy = dir.path().join("legacy");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("audit.jsonl"), b"{\"only\":1}\n").unwrap();
+    let root = dir.path().join("audit");
+    drop(open_with_legacy(&root, &legacy).unwrap());
+
+    let reopened = open_with_legacy(&root, &legacy).unwrap();
+    assert!(reopened.status().recovery.legacy_divergences.is_empty());
+    assert_eq!(reopened.status().global_last_seq, 1);
+}
+
+#[test]
 fn intent_and_outcome_share_one_opaque_producer_identity() {
     let dir = TempDir::new().unwrap();
     let ledger = opened(dir.path());
