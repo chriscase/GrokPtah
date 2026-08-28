@@ -194,14 +194,15 @@ impl DurableWriteGuard {
         Self::unowned(std::path::Path::new("/nonexistent/.instance.lock"))
     }
 
-    /// The owning runtime's own final write, taken *after* the durable-write
-    /// seal holds.
+    /// The owning runtime's own write, at a point where it is the only possible
+    /// writer: host construction (before any handle exists) and the shutdown
+    /// flush (after the seal holds).
     ///
-    /// It is deliberately uncounted: the seal already guarantees no other
-    /// writer exists, and counting it would make the seal wait on itself. It
-    /// can only be built from a lifecycle reference the runtime holds, so a
+    /// Deliberately uncounted — at construction there is nothing to wait for,
+    /// and at flush time counting would make the seal wait on itself. It can
+    /// only be built from a lifecycle reference the runtime itself holds, so a
     /// stale handle can never reach one.
-    pub(crate) fn for_shutdown_flush(lifecycle: &Arc<HostLifecycle>) -> Self {
+    pub(crate) fn owner_uncounted(lifecycle: &Arc<HostLifecycle>) -> Self {
         Self {
             lifecycle: lifecycle.clone(),
             counted: false,
@@ -531,6 +532,36 @@ impl HostShutdownReport {
             self.process_lock_retained_for_safety,
             self.flush_errors,
         )
+    }
+}
+
+/// A token that can *mint* durable-write authority, without holding any.
+///
+/// Long-running operations that only write at the end — a provider discovery
+/// or qualification round-trip, for instance — take this instead of a
+/// [`DurableWriteGuard`]. Holding a guard across network I/O would make an
+/// ordinary slow request block the shutdown seal, and a blocked seal means the
+/// process lock is retained and the next launch is refused. Minting at the
+/// write keeps the authority window as short as the write itself.
+#[derive(Clone)]
+pub(crate) struct WriteAuthority {
+    lifecycle: Arc<HostLifecycle>,
+}
+
+impl WriteAuthority {
+    pub(crate) fn new(lifecycle: Arc<HostLifecycle>) -> Self {
+        Self { lifecycle }
+    }
+
+    pub(crate) fn begin(&self, operation: &str) -> Result<DurableWriteGuard> {
+        self.lifecycle.begin_durable_write(operation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unowned_for_test() -> Self {
+        Self {
+            lifecycle: HostLifecycle::build(None, PathBuf::from("/nonexistent/.instance.lock")),
+        }
     }
 }
 
