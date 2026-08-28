@@ -352,6 +352,14 @@ impl AdaptivePolicyEngine {
         capability_failure_reason: Option<ProfileReason>,
     ) -> ProfileTransition {
         let ceiling = evidence.ceiling();
+        if required <= current {
+            return ProfileTransition::Stop(PolicyStop {
+                reason,
+                profile: current,
+                required_profile: None,
+                ceiling,
+            });
+        }
         if required > ceiling {
             return ProfileTransition::Stop(PolicyStop {
                 reason: capability_failure_reason.unwrap_or(reason),
@@ -495,6 +503,20 @@ mod tests {
                 ProfileTransition::Stop(stop) => assert!(!stop.operator_message().is_empty()),
             }
         }
+    }
+
+    #[test]
+    fn signal_at_high_assurance_does_not_claim_a_stronger_required_profile() {
+        let evidence = evidence(true, true, true);
+        let ProfileTransition::Stop(stop) = AdaptivePolicyEngine.reassess(
+            AdaptiveProfile::HighAssurance,
+            &evidence,
+            RuntimeSignal::DestructiveIntentDetected,
+        ) else {
+            panic!("high assurance has no stronger rung");
+        };
+        assert_eq!(stop.required_profile, None);
+        assert_eq!(stop.profile, AdaptiveProfile::HighAssurance);
     }
 
     #[test]
