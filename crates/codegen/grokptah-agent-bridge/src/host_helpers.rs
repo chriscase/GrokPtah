@@ -1248,13 +1248,38 @@ pub(crate) fn parse_effort_arg(raw: &str) -> EffortLevel {
     }
 }
 
-/// Ask the model for a short numbered plan (no tools).
-pub(crate) async fn propose_plan_with_model(
+pub(crate) async fn propose_plan_with_authority(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
     cwd: &Path,
     goal: &str,
     cancel: &CancellationToken,
+    authority: &CapabilityAuthority,
+    principal: &str,
+    policy_digest: &str,
+) -> Result<(Vec<String>, Option<crate::completion::CompletionUsage>)> {
+    propose_plan_with_authority_inner(
+        creds,
+        model,
+        cwd,
+        goal,
+        cancel,
+        authority,
+        principal,
+        policy_digest,
+    )
+    .await
+}
+
+async fn propose_plan_with_authority_inner(
+    creds: &crate::auth_store::WireCredentials,
+    model: &str,
+    cwd: &Path,
+    goal: &str,
+    cancel: &CancellationToken,
+    authority: &CapabilityAuthority,
+    principal: &str,
+    policy_digest: &str,
 ) -> Result<(Vec<String>, Option<crate::completion::CompletionUsage>)> {
     if cancel.is_cancelled() {
         bail!("cancelled");
@@ -1264,13 +1289,16 @@ pub(crate) async fn propose_plan_with_model(
          Return ONLY a numbered list of 3-8 concrete steps (no preamble).\n\nGoal: {goal}\nProject: {}",
         cwd.display()
     );
-    let reply = call_xai_chat(
+    let reply = call_xai_chat_with_authority(
         creds,
         model,
         &[("user".into(), prompt)],
         None,
         cwd,
         SessionKind::Build,
+        authority,
+        principal,
+        policy_digest,
     )
     .await?;
     let steps = parse_numbered_plan(&reply.text);
@@ -3812,6 +3840,56 @@ pub(crate) async fn call_xai_chat(
     cwd: &Path,
     kind: SessionKind,
 ) -> Result<ChatReply> {
+    call_xai_chat_inner(
+        creds,
+        model,
+        history,
+        compacted_summary,
+        cwd,
+        kind,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn call_xai_chat_with_authority(
+    creds: &crate::auth_store::WireCredentials,
+    model: &str,
+    history: &[(String, String)],
+    compacted_summary: Option<&str>,
+    cwd: &Path,
+    kind: SessionKind,
+    authority: &CapabilityAuthority,
+    principal: &str,
+    policy_digest: &str,
+) -> Result<ChatReply> {
+    call_xai_chat_inner(
+        creds,
+        model,
+        history,
+        compacted_summary,
+        cwd,
+        kind,
+        Some(authority),
+        Some(principal),
+        Some(policy_digest),
+    )
+    .await
+}
+
+async fn call_xai_chat_inner(
+    creds: &crate::auth_store::WireCredentials,
+    model: &str,
+    history: &[(String, String)],
+    compacted_summary: Option<&str>,
+    cwd: &Path,
+    kind: SessionKind,
+    authority: Option<&CapabilityAuthority>,
+    principal: Option<&str>,
+    policy_digest: Option<&str>,
+) -> Result<ChatReply> {
     // Prefer a non-expired / refreshed OIDC access token before the first call.
     let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
 
@@ -3888,7 +3966,16 @@ pub(crate) async fn call_xai_chat(
         "stream": false
     });
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
-    let provider_authority = CapabilityAuthority::new(true);
+    let local_authority;
+    let provider_authority = match authority {
+        Some(authority) => authority,
+        None => {
+            local_authority = CapabilityAuthority::new(true);
+            &local_authority
+        }
+    };
+    let principal = principal.unwrap_or("provider-chat");
+    let policy_digest = policy_digest.unwrap_or("provider-chat");
 
     let send_once = |c: &crate::auth_store::WireCredentials| {
         let req = client.post(&url).header("Content-Type", "application/json");
@@ -3901,8 +3988,8 @@ pub(crate) async fn call_xai_chat(
         &creds,
         model,
         &target,
-        "provider-chat",
-        "provider-chat",
+        principal,
+        policy_digest,
     )?;
     let mut resp = send_once(&creds).send().await.map_err(|e| {
         // Surface classify-able transport failures (DNS, TLS, timeout) so the
@@ -3938,8 +4025,8 @@ pub(crate) async fn call_xai_chat(
                     &creds,
                     model,
                     &target,
-                    "provider-chat",
-                    "provider-chat",
+                    principal,
+                    policy_digest,
                 )?;
                 resp = send_once(&creds).send().await.map_err(|error| {
                     let class = if error.is_timeout() {

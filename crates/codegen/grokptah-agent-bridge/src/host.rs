@@ -26,18 +26,18 @@ use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host_helpers::{
     action_stationarity_nudge, action_stationarity_stop_message, api_context_messages,
     auto_cargo_reverify_command, build_agent_messages, build_compact_summary,
-    call_xai_agent_step_observed_with_authority, call_xai_chat, cargo_test_failure_coaching,
-    cargo_test_output_failed, cargo_test_output_passed, cargo_test_reverify_coaching,
-    coding_agent_tools, count_cargo_test_failures, emit_message, emit_thought,
-    filter_tools_batch_edit_only, filter_tools_edit_and_shell, filter_tools_edit_only,
-    is_incomplete_stop_message, is_round_limit_stop_message, is_true_noop_tool_step,
-    multi_failure_partial_edit_coaching, normalize_sandbox_profile, offline_plan_steps,
-    parse_effort_arg, post_cargo_failure_skip_message, propose_plan_with_model, push_assistant,
-    push_thought, push_tool, recovery_round_limit_stop_message, resolve_turn_max_rounds,
-    round_limit_stop_message, sandbox_blocks_shell, sandbox_is_readonly,
-    should_auto_cargo_reverify_after_edit, should_skip_tool_after_cargo_failure,
-    surface_rate_limit_or_error, tool_kind, tool_step_signature, tool_web_fetch, AgentStep,
-    IdenticalToolCallRun, McpToolIndex,
+    call_xai_agent_step_observed_with_authority, call_xai_chat, call_xai_chat_with_authority,
+    cargo_test_failure_coaching, cargo_test_output_failed, cargo_test_output_passed,
+    cargo_test_reverify_coaching, coding_agent_tools, count_cargo_test_failures, emit_message,
+    emit_thought, filter_tools_batch_edit_only, filter_tools_edit_and_shell,
+    filter_tools_edit_only, is_incomplete_stop_message, is_round_limit_stop_message,
+    is_true_noop_tool_step, multi_failure_partial_edit_coaching, normalize_sandbox_profile,
+    offline_plan_steps, parse_effort_arg, post_cargo_failure_skip_message,
+    propose_plan_with_authority, push_assistant, push_thought, push_tool,
+    recovery_round_limit_stop_message, resolve_turn_max_rounds, round_limit_stop_message,
+    sandbox_blocks_shell, sandbox_is_readonly, should_auto_cargo_reverify_after_edit,
+    should_skip_tool_after_cargo_failure, surface_rate_limit_or_error, tool_kind,
+    tool_step_signature, tool_web_fetch, AgentStep, IdenticalToolCallRun, McpToolIndex,
 };
 use crate::lane::LaneSummary;
 use crate::local_tools;
@@ -4111,13 +4111,18 @@ impl AgentHostHandle {
             if !call_allowed {
                 None
             } else {
-                match call_xai_chat(
+                let (capability_principal, capability_policy) =
+                    self.computer_capability_identity(id)?;
+                match call_xai_chat_with_authority(
                     &creds,
                     &model,
                     &[("user".into(), prompt)],
                     None,
                     &cwd,
                     SessionKind::Build,
+                    self.capability_authority.as_ref(),
+                    &capability_principal,
+                    &capability_policy,
                 )
                 .await
                 {
@@ -7769,13 +7774,18 @@ impl AgentHostHandle {
                 crate::auth_store::resolve_wire_credentials_for_model(model)
                     .map_err(anyhow::Error::msg)?
             {
-                match call_xai_chat(
+                let (capability_principal, capability_policy) =
+                    self.computer_capability_identity(session_id)?;
+                match call_xai_chat_with_authority(
                     &creds,
                     model,
                     &wire_messages,
                     compacted_summary.as_deref(),
                     cwd,
                     SessionKind::Chat,
+                    self.capability_authority.as_ref(),
+                    &capability_principal,
+                    &capability_policy,
                 )
                 .await
                 {
@@ -7827,7 +7837,20 @@ impl AgentHostHandle {
                 if plan_token_stop.is_some() {
                     offline_plan_steps(&goal)
                 } else {
-                    match propose_plan_with_model(&creds, model, cwd, &goal, &cancel).await {
+                    let (capability_principal, capability_policy) =
+                        self.computer_capability_identity(session_id)?;
+                    match propose_plan_with_authority(
+                        &creds,
+                        model,
+                        cwd,
+                        &goal,
+                        &cancel,
+                        self.capability_authority.as_ref(),
+                        &capability_principal,
+                        &capability_policy,
+                    )
+                    .await
+                    {
                         Ok((steps, usage)) if !steps.is_empty() => {
                             plan_token_stop = self.finish_provider_attempt(
                                 session_id,
@@ -10007,13 +10030,18 @@ impl AgentHostHandle {
                 if usage_attempt.is_some()
                     || self.run_token_stop_before_request(session_id).is_none()
                 {
-                    match call_xai_chat(
+                    let (capability_principal, capability_policy) =
+                        self.computer_capability_identity(session_id)?;
+                    match call_xai_chat_with_authority(
                         &creds,
                         &model,
                         &[("user".into(), ask)],
                         None,
                         cwd,
                         SessionKind::Build,
+                        self.capability_authority.as_ref(),
+                        &capability_principal,
+                        &capability_policy,
                     )
                     .await
                     {
