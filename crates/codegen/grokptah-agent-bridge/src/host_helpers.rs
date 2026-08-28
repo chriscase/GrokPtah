@@ -1248,6 +1248,7 @@ pub(crate) fn parse_effort_arg(raw: &str) -> EffortLevel {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn propose_plan_with_authority(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
@@ -1271,6 +1272,7 @@ pub(crate) async fn propose_plan_with_authority(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn propose_plan_with_authority_inner(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
@@ -2294,7 +2296,7 @@ where
                 });
 
         consume_provider_send_lease(
-            &provider_authority,
+            provider_authority,
             &creds,
             selected_model,
             &target,
@@ -2399,7 +2401,7 @@ where
                                 context.begin_attempt().ok().map(|attempt| (route, attempt))
                             });
                     consume_provider_send_lease(
-                        &provider_authority,
+                        provider_authority,
                         &creds,
                         selected_model,
                         &target,
@@ -3854,6 +3856,7 @@ pub(crate) async fn call_xai_chat(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_xai_chat_with_authority(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
@@ -3879,6 +3882,7 @@ pub(crate) async fn call_xai_chat_with_authority(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn call_xai_chat_inner(
     creds: &crate::auth_store::WireCredentials,
     model: &str,
@@ -3984,7 +3988,7 @@ async fn call_xai_chat_inner(
     };
 
     consume_provider_send_lease(
-        &provider_authority,
+        provider_authority,
         &creds,
         model,
         &target,
@@ -4021,7 +4025,7 @@ async fn call_xai_chat_inner(
             Ok(fresh) => {
                 creds = fresh;
                 consume_provider_send_lease(
-                    &provider_authority,
+                    provider_authority,
                     &creds,
                     model,
                     &target,

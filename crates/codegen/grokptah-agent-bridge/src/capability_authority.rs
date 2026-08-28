@@ -61,6 +61,7 @@ pub(crate) struct CapabilitySnapshot {
 }
 
 impl CapabilitySnapshot {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn provider(
         principal: &str,
         provider_id: &str,

@@ -715,7 +715,7 @@ async fn completion(
     let mut removed_tool_choice = false;
     let mut transient_retries = 0_u32;
     for _attempt in 0..5 {
-        consume_qualification_send_lease(&credentials, base_url, &body)?;
+        consume_qualification_send_lease(credentials, base_url, &body)?;
         let mut request = client
             .post(&url)
             .header("Content-Type", "application/json")
