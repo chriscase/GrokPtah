@@ -628,7 +628,9 @@ impl SamplingClient {
         };
         let permit = context
             .begin("sampler-provider", body, true)
-            .map_err(|error| SamplingError::Auth(format!("provider attempt unavailable: {error}")))?;
+            .map_err(|error| {
+                SamplingError::Auth(format!("provider attempt unavailable: {error}"))
+            })?;
         let builder = builder
             .header(
                 xai_provider_attempt::IDEMPOTENCY_KEY_HEADER,
@@ -638,9 +640,7 @@ impl SamplingClient {
         Ok((builder, Some(permit)))
     }
 
-    fn mark_transport_ambiguous(
-        permit: Option<xai_provider_attempt::PhysicalSendPermit>,
-    ) {
+    fn mark_transport_ambiguous(permit: Option<xai_provider_attempt::PhysicalSendPermit>) {
         if let Some(mut permit) = permit {
             let _ = permit.transport_after_possible_write();
         }
@@ -659,9 +659,9 @@ impl SamplingClient {
         permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
     ) -> Result<()> {
         if let Some(permit) = permit.as_mut() {
-            permit
-                .mark_response_started()
-                .map_err(|error| SamplingError::Auth(format!("provider response state: {error}")))?;
+            permit.mark_response_started().map_err(|error| {
+                SamplingError::Auth(format!("provider response state: {error}"))
+            })?;
         }
         Ok(())
     }
@@ -943,9 +943,7 @@ impl SamplingClient {
             deployment_id: payload.x_grok_deployment_id.as_deref(),
             user_id: payload.x_grok_user_id.as_deref(),
         };
-        let http_request = grok_headers
-            .apply(self.post(self.endpoint("chat/completions")))
-            ;
+        let http_request = grok_headers.apply(self.post(self.endpoint("chat/completions")));
         let (http_request, mut permit) = self.authorize_request(
             http_request,
             &serde_json::to_vec(&payload).map_err(SamplingError::Serialization)?,
@@ -965,13 +963,12 @@ impl SamplingClient {
             Self::mark_response_started(&mut permit)?;
         }
         let status = response.status();
-        self.handle_response(response).await
-            .and_then(|result| {
-                if status.is_success() {
-                    Self::settle_response(&mut permit, status)?;
-                }
-                Ok(result)
-            })
+        self.handle_response(response).await.and_then(|result| {
+            if status.is_success() {
+                Self::settle_response(&mut permit, status)?;
+            }
+            Ok(result)
+        })
     }
 
     /// Start a streaming chat completion request. Returns a stream of typed chunks.
@@ -1024,8 +1021,7 @@ impl SamplingClient {
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
         let request_bytes =
             serde_json::to_vec(&streaming_request).map_err(SamplingError::Serialization)?;
-        let (http_request, mut permit) =
-            self.authorize_request(http_request, &request_bytes)?;
+        let (http_request, mut permit) = self.authorize_request(http_request, &request_bytes)?;
         let http_request = http_request.json(&streaming_request);
 
         let built_request = http_request.build().map_err(|e| {
@@ -1267,8 +1263,7 @@ impl SamplingClient {
         )?;
         let request_bytes =
             serde_json::to_vec(&request_body).map_err(SamplingError::Serialization)?;
-        let (http_request, mut permit) =
-            self.authorize_request(http_request, &request_bytes)?;
+        let (http_request, mut permit) = self.authorize_request(http_request, &request_bytes)?;
         let http_request = http_request.json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
@@ -1779,8 +1774,7 @@ impl SamplingClient {
             .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
         let request_bytes =
             serde_json::to_vec(&request.inner).map_err(SamplingError::Serialization)?;
-        let (http_request, mut permit) =
-            self.authorize_request(http_request, &request_bytes)?;
+        let (http_request, mut permit) = self.authorize_request(http_request, &request_bytes)?;
         let http_request = http_request.json(&request.inner);
 
         let built_request = http_request.build().map_err(|e| {

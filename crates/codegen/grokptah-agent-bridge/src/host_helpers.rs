@@ -25,7 +25,7 @@ use crate::session::{Session, SessionKind, TranscriptEntry};
 use crate::types::EffortLevel;
 use sha2::{Digest, Sha256};
 
-type ProviderAttemptContext = xai_provider_attempt::AttemptContext;
+pub(crate) type ProviderAttemptContext = xai_provider_attempt::AttemptContext;
 
 pub(crate) fn push_assistant(host: &AgentHostHandle, session_id: Uuid, text: &str) {
     let mut g = host.inner.lock();
@@ -2979,7 +2979,7 @@ pub async fn replay_xai_provider_contract_on_loopback(
     .map_err(|error| anyhow!("create provider contract authority: {error}"))?;
     let provider_attempt = ProviderAttemptContext::new(
         attempt_store,
-        "provider-contract-replay".into(),
+        "provider-contract-replay",
         attempt_authority.clone(),
         Arc::new(move || Some(attempt_authority.clone())),
     )
@@ -3066,7 +3066,7 @@ mod compatible_stream_tests {
         .unwrap();
         ProviderAttemptContext::new(
             store,
-            "provider-test-operation".into(),
+            "provider-test-operation",
             authority.clone(),
             Arc::new(move || Some(authority.clone())),
         )
