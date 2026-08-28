@@ -35,7 +35,7 @@ use crate::host_helpers::{
     filter_tools_edit_only, is_incomplete_stop_message, is_round_limit_stop_message,
     is_true_noop_tool_step, multi_failure_partial_edit_coaching, normalize_sandbox_profile,
     offline_plan_steps, parse_effort_arg, post_cargo_failure_skip_message,
-    propose_plan_with_authority, push_assistant, push_thought, push_tool,
+    propose_plan_with_authority, provider_effect_resource, push_assistant, push_thought, push_tool,
     recovery_round_limit_stop_message, resolve_turn_max_rounds, round_limit_stop_message,
     sandbox_blocks_shell, sandbox_is_readonly, should_auto_cargo_reverify_after_edit,
     should_skip_tool_after_cargo_failure, surface_rate_limit_or_error, tool_kind,
@@ -167,7 +167,6 @@ struct SessionComputerQualification {
 #[derive(Debug, Clone)]
 struct ToolCapabilityAdmission {
     snapshot: CapabilitySnapshot,
-    capability: HostCapability,
 }
 
 pub(crate) struct Inner {
@@ -763,6 +762,10 @@ pub struct AgentHostHandle {
     /// durable mutation boundaries in this process. A process without the
     /// instance lock is observation-only and cannot issue capabilities.
     capability_authority: Arc<CapabilityAuthority>,
+    /// The canonical #477 authenticated context installed by the durable
+    /// orchestration authority. There is intentionally no local-session or
+    /// provider-credential fallback.
+    canonical_auth_context: Arc<Mutex<Option<crate::orchestration::AuthContext>>>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
     /// Selects the durable root for legacy modules that still resolve paths
@@ -949,6 +952,7 @@ impl AgentHost {
             run_usage_trackers: Arc::new(Mutex::new(HashMap::new())),
             provider_observation: config.provider_observation,
             capability_authority: Arc::new(CapabilityAuthority::new(instance_lock.is_some())),
+            canonical_auth_context: Arc::new(Mutex::new(None)),
             _instance_lock: instance_lock,
             runtime_home,
             _runtime_home_context: runtime_home_context,
@@ -963,30 +967,78 @@ impl AgentHostHandle {
         self.capability_authority.clone()
     }
 
+    /// Install the opaque authenticated context issued by the durable #477
+    /// authority. This is a host lifecycle operation, never a request-derived
+    /// identity conversion.
+    pub(crate) fn install_canonical_auth_context(
+        &self,
+        auth_context: crate::orchestration::AuthContext,
+    ) {
+        *self.canonical_auth_context.lock() = Some(auth_context);
+    }
+
+    /// Preinstall the exact provider and tool envelopes for one durable Agent.
+    /// Physical requests can only select these envelopes; they cannot issue
+    /// authority from their model, tool, or payload fields.
+    pub(crate) fn preinstall_canonical_capability_policy(
+        &self,
+        session_id: Uuid,
+    ) -> Result<()> {
+        let principal = self.capability_principal(session_id)?;
+        let (model, _) = self.selected_computer_model(session_id)?;
+        let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
+        let target = crate::host_helpers::resolve_model_target(&credentials, &model)?;
+        let selection =
+            crate::gateway_config::parse_model_selection(&model).map_err(anyhow::Error::msg)?;
+        let provider_snapshot = CapabilitySnapshot::provider(
+            &principal,
+            &selection.provider_id,
+            &selection.model_id,
+            &target.base_url,
+            &target.wire_model,
+            &format!("{:?}", target.dialect),
+            &credentials.qualification_identity_fingerprint(),
+            &target.capabilities,
+        )?;
+        self.capability_authority.install_canonical_envelope(
+            &format!("provider-send:{}:{}", principal.id(), selection.model_id),
+            provider_snapshot,
+            principal.id(),
+            principal.auth_generation(),
+            principal.policy_generation(),
+            ["provider.send"],
+            &provider_effect_resource(&credentials, &target),
+            Utc::now(),
+        )?;
+        for tool_name in DEFAULT_AGENT_TOOL_IDS {
+            let snapshot = CapabilitySnapshot::tool(&principal, tool_name)?;
+            self.capability_authority.install_canonical_envelope(
+                &format!("tool-dispatch:{}:{tool_name}", principal.id()),
+                snapshot,
+                principal.id(),
+                principal.auth_generation(),
+                principal.policy_generation(),
+                ["tool.dispatch"],
+                &format!("tool:{tool_name}"),
+                Utc::now(),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Return the opaque principal generation from the canonical Agent seam.
     /// This object is accepted only by host-owned adapters and is never a wire
     /// projection.
     pub fn capability_principal(&self, session_id: Uuid) -> Result<CapabilityPrincipal> {
-        let (principal, policy_digest) = self.canonical_computer_identity(session_id)?;
-        let (model, _) = self.selected_computer_model(session_id)?;
-        let credential_fingerprint = crate::auth_store::resolve_wire_credentials_for_model(&model)
-            .map_err(anyhow::Error::msg)?
-            .map(|credentials| credentials.qualification_identity_fingerprint())
-            .unwrap_or_else(|| "anonymous".into());
-        let authentication_material = crate::orchestration::hash_payload(&serde_json::json!({
-            "principal": principal,
-            "policy": policy_digest,
-            "credential": credential_fingerprint,
-        }));
-        let auth_generation = u64::from_str_radix(
-            authentication_material
-                .get(..16)
-                .ok_or_else(|| anyhow!("canonical authentication generation is malformed"))?,
-            16,
-        )
-        .map_err(|_| anyhow!("canonical authentication generation is malformed"))?
-        .max(1);
-        CapabilityPrincipal::new(principal, auth_generation, policy_digest)
+        let auth_context = self
+            .canonical_auth_context
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow!("durable #477 authentication authority is unavailable"))?;
+        let policy_generation = self.canonical_policy_generation(session_id)?;
+        CapabilityPrincipal::from_auth_context(auth_context, policy_generation)
             .map_err(|error| anyhow!("invalid canonical capability principal: {error}"))
     }
 
@@ -1038,14 +1090,8 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let (principal, policy_digest) = self.canonical_computer_identity(session_id)?;
-        let resolved =
-            resolve_computer_eligibility(&credentials, &model, &principal, &policy_digest)?;
-        let _ = self.capability_authority.issue(
-            &resolved.capability_snapshot,
-            Utc::now(),
-            crate::capability_authority::DEFAULT_CAPABILITY_TTL,
-        )?;
+        let principal = self.capability_principal(session_id)?;
+        let resolved = resolve_computer_eligibility(&credentials, &model, &principal)?;
         if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
             return Ok(resolved.eligibility);
         }
@@ -1088,28 +1134,19 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let (principal, policy_digest) = self.canonical_computer_identity(session_id)?;
-        let resolved =
-            resolve_computer_eligibility(&credentials, &model, &principal, &policy_digest)?;
+        let principal = self.capability_principal(session_id)?;
+        let resolved = resolve_computer_eligibility(&credentials, &model, &principal)?;
         if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
-            let _ = self.capability_authority.issue(
-                &resolved.capability_snapshot,
-                Utc::now(),
-                crate::capability_authority::DEFAULT_CAPABILITY_TTL,
-            )?;
             return Ok(resolved.eligibility);
         }
         self.clear_computer_agent_qualification(session_id, &model);
-        let (capability_principal, capability_policy) =
-            self.canonical_computer_identity(session_id)?;
         qualify_semantic_model(
             &credentials,
             &model,
             effort,
             &cancel,
             self.capability_authority.as_ref(),
-            &capability_principal,
-            &capability_policy,
+            &principal,
         )
         .await
         .context("selected model did not pass bounded Computer qualification")?;
@@ -1120,11 +1157,6 @@ impl AgentHostHandle {
             session_id,
             &model,
             &resolved.capability_snapshot,
-        )?;
-        let capability = self.capability_authority.issue(
-            &current.capability_snapshot,
-            Utc::now(),
-            crate::capability_authority::DEFAULT_CAPABILITY_TTL,
         )?;
         {
             let mut inner = self.inner.lock();
@@ -1139,7 +1171,9 @@ impl AgentHostHandle {
                 (session_id, model.clone()),
                 SessionComputerQualification {
                     snapshot: current.capability_snapshot,
-                    capability,
+                    capability: return Err(anyhow!(
+                        "canonical Computer Use capability envelope is not installed"
+                    )),
                     tier: crate::gateway_config::ComputerUseTier::SemanticAct,
                 },
             );
@@ -1164,14 +1198,8 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let (principal, policy_digest) = self.canonical_computer_identity(session_id)?;
-        let resolved =
-            resolve_computer_eligibility(&credentials, &model, &principal, &policy_digest)?;
-        let _ = self.capability_authority.issue(
-            &resolved.capability_snapshot,
-            Utc::now(),
-            crate::capability_authority::DEFAULT_CAPABILITY_TTL,
-        )?;
+        let principal = self.capability_principal(session_id)?;
+        let resolved = resolve_computer_eligibility(&credentials, &model, &principal)?;
         let durable_authority =
             resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct;
         let session_authority = self
@@ -1202,7 +1230,6 @@ impl AgentHostHandle {
             &cancel,
             &self.capability_authority,
             &principal,
-            &policy_digest,
         )
         .await
         .context("selected model did not return a valid bounded Computer proposal")?;
@@ -1309,60 +1336,7 @@ impl AgentHostHandle {
         Ok((operation_id, cancel, guard))
     }
 
-    fn computer_capability_identity(&self, session_id: Uuid) -> Result<(String, String)> {
-        let agent_id = {
-            let inner = self.inner.lock();
-            inner
-                .sessions
-                .get(&session_id)
-                .ok_or_else(|| anyhow!("unknown session"))?
-                .agent_id
-                .clone()
-        };
-        if let Some(agent_id) = agent_id {
-            let store = self
-                .orchestration_store
-                .lock()
-                .clone()
-                .ok_or_else(|| anyhow!("persistent Agent store is unavailable"))?;
-            let agent = store
-                .load_agent(&agent_id)?
-                .ok_or_else(|| anyhow!("persistent Agent record is missing"))?;
-            let spec = agent.current_spec()?;
-            let principal = agent
-                .owner_principal_id
-                .clone()
-                .unwrap_or_else(|| agent.agent_id.clone());
-            let policy_digest = crate::orchestration::hash_payload(
-                &serde_json::to_value(spec).map_err(|error| anyhow!(error.to_string()))?,
-            );
-            return Ok((principal, policy_digest));
-        }
-
-        // Chat/local sessions have no durable Agent owner yet. Their
-        // capability is still explicitly scoped to this session and the
-        // current host policy; it is never a broad process-wide LocalUser
-        // grant.
-        let (permission_mode, always_approve, allow_rules, deny_rules) = {
-            let inner = self.inner.lock();
-            (
-                inner.permission_mode.clone(),
-                inner.always_approve,
-                inner.allow_rules.clone(),
-                inner.deny_rules.clone(),
-            )
-        };
-        let principal = format!("local-session:{session_id}");
-        let policy_digest = crate::orchestration::hash_payload(&serde_json::json!({
-            "permission_mode": permission_mode,
-            "always_approve": always_approve,
-            "allow_rules": allow_rules,
-            "deny_rules": deny_rules,
-        }));
-        Ok((principal, policy_digest))
-    }
-
-    fn canonical_computer_identity(&self, session_id: Uuid) -> Result<(String, String)> {
+    fn canonical_policy_generation(&self, session_id: Uuid) -> Result<String> {
         let agent_id = {
             let inner = self.inner.lock();
             inner
@@ -1381,15 +1355,21 @@ impl AgentHostHandle {
         let agent = store
             .load_agent(&agent_id)?
             .ok_or_else(|| anyhow!("canonical Agent record is unavailable"))?;
-        let spec = agent.current_spec()?;
-        let principal = agent
-            .owner_principal_id
+        let auth_context = self
+            .canonical_auth_context
+            .lock()
             .clone()
-            .unwrap_or_else(|| agent.agent_id.clone());
-        let policy_digest = crate::orchestration::hash_payload(
-            &serde_json::to_value(spec).map_err(|error| anyhow!(error.to_string()))?,
-        );
-        Ok((principal, policy_digest))
+            .ok_or_else(|| anyhow!("durable #477 authentication authority is unavailable"))?;
+        let owner = agent
+            .owner_principal_id
+            .as_deref()
+            .filter(|owner| !owner.trim().is_empty())
+            .ok_or_else(|| anyhow!("canonical Agent principal binding is unavailable"))?;
+        if owner != auth_context.owner_id() {
+            bail!("canonical Agent principal binding is foreign");
+        }
+        let spec = agent.current_spec()?;
+        Ok(spec.revision.to_string())
     }
 
     fn ensure_computer_capability_unchanged(
@@ -1405,9 +1385,8 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&current_model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
-        let (principal, policy_digest) = self.canonical_computer_identity(session_id)?;
-        let current =
-            resolve_computer_eligibility(&credentials, &current_model, &principal, &policy_digest)?;
+        let principal = self.capability_principal(session_id)?;
+        let current = resolve_computer_eligibility(&credentials, &current_model, &principal)?;
         if current.capability_snapshot != *expected_capability {
             bail!("provider capability changed while the Computer request was running");
         }
@@ -1418,15 +1397,10 @@ impl AgentHostHandle {
         &self,
         session_id: Uuid,
         tool_name: &str,
-        input: &serde_json::Value,
+        _input: &serde_json::Value,
     ) -> Result<CapabilitySnapshot> {
-        let (principal, policy_digest) = self.computer_capability_identity(session_id)?;
-        let input_digest = crate::orchestration::hash_payload(input);
-        CapabilitySnapshot::tool(
-            &principal,
-            tool_name,
-            &format!("{policy_digest}:{input_digest}"),
-        )
+        let principal = self.capability_principal(session_id)?;
+        CapabilitySnapshot::tool(&principal, tool_name)
     }
 
     fn admit_tool_effect(
@@ -1436,14 +1410,14 @@ impl AgentHostHandle {
         input: &serde_json::Value,
     ) -> Result<ToolCapabilityAdmission> {
         let snapshot = self.tool_capability_snapshot(session_id, tool_name, input)?;
-        let capability = self.capability_authority.issue(
+        self.capability_authority.revalidate_preinstalled(
             &snapshot,
+            "tool.dispatch",
+            &format!("tool:{tool_name}"),
             Utc::now(),
-            crate::capability_authority::DEFAULT_CAPABILITY_TTL,
         )?;
         Ok(ToolCapabilityAdmission {
             snapshot,
-            capability,
         })
     }
 
@@ -1458,11 +1432,16 @@ impl AgentHostHandle {
         if admission.snapshot != current {
             return Err(anyhow!("tool capability changed while waiting to dispatch"));
         }
-        self.capability_authority
-            .revalidate(&admission.capability, &current, Utc::now())?;
-        let lease = self.capability_authority.lease(
-            &admission.capability,
+        self.capability_authority.revalidate_preinstalled(
             &current,
+            "tool.dispatch",
+            &format!("tool:{tool_name}"),
+            Utc::now(),
+        )?;
+        let lease = self.capability_authority.lease_from_preinstalled(
+            &current,
+            "tool.dispatch",
+            &format!("tool:{tool_name}"),
             "tool.dispatch",
             Utc::now(),
             chrono::Duration::seconds(5),
@@ -4197,8 +4176,7 @@ impl AgentHostHandle {
             if !call_allowed {
                 None
             } else {
-                let (capability_principal, capability_policy) =
-                    self.computer_capability_identity(id)?;
+                let capability_principal = self.capability_principal(id)?;
                 match call_xai_chat_with_authority(
                     &creds,
                     &model,
@@ -4208,7 +4186,6 @@ impl AgentHostHandle {
                     SessionKind::Build,
                     self.capability_authority.as_ref(),
                     &capability_principal,
-                    &capability_policy,
                 )
                 .await
                 {
@@ -6046,10 +6023,17 @@ impl AgentHostHandle {
         provider_id: &str,
         model_id: &str,
     ) -> Result<crate::provider_qualification::ProviderQualificationReport> {
+        let session_id = self
+            .inner
+            .lock()
+            .active_session
+            .ok_or_else(|| anyhow!("canonical Agent session is unavailable"))?;
+        let principal = self.capability_principal(session_id)?;
         crate::provider_qualification::qualify_provider_model_with_authority(
             provider_id,
             model_id,
             self.capability_authority.clone(),
+            principal,
         )
         .await
     }
@@ -7860,8 +7844,7 @@ impl AgentHostHandle {
                 crate::auth_store::resolve_wire_credentials_for_model(model)
                     .map_err(anyhow::Error::msg)?
             {
-                let (capability_principal, capability_policy) =
-                    self.computer_capability_identity(session_id)?;
+                let capability_principal = self.capability_principal(session_id)?;
                 match call_xai_chat_with_authority(
                     &creds,
                     model,
@@ -7871,7 +7854,6 @@ impl AgentHostHandle {
                     SessionKind::Chat,
                     self.capability_authority.as_ref(),
                     &capability_principal,
-                    &capability_policy,
                 )
                 .await
                 {
@@ -7923,8 +7905,7 @@ impl AgentHostHandle {
                 if plan_token_stop.is_some() {
                     offline_plan_steps(&goal)
                 } else {
-                    let (capability_principal, capability_policy) =
-                        self.computer_capability_identity(session_id)?;
+                    let capability_principal = self.capability_principal(session_id)?;
                     match propose_plan_with_authority(
                         &creds,
                         model,
@@ -7933,7 +7914,6 @@ impl AgentHostHandle {
                         &cancel,
                         self.capability_authority.as_ref(),
                         &capability_principal,
-                        &capability_policy,
                     )
                     .await
                     {
@@ -8936,8 +8916,7 @@ impl AgentHostHandle {
                 }
             };
             let provider_observation = self.provider_observation_context(session_id);
-            let (capability_principal, capability_policy) =
-                self.computer_capability_identity(session_id)?;
+            let capability_principal = self.capability_principal(session_id)?;
             let step = match call_xai_agent_step_observed_with_authority(
                 creds,
                 model,
@@ -8949,7 +8928,6 @@ impl AgentHostHandle {
                 provider_observation.as_ref(),
                 self.capability_authority.as_ref(),
                 &capability_principal,
-                &capability_policy,
                 |delta| {
                     emit_message(event_tx, session_id, delta);
                 },
@@ -10132,8 +10110,7 @@ impl AgentHostHandle {
                 if usage_attempt.is_some()
                     || self.run_token_stop_before_request(session_id).is_none()
                 {
-                    let (capability_principal, capability_policy) =
-                        self.computer_capability_identity(session_id)?;
+                    let capability_principal = self.capability_principal(session_id)?;
                     match call_xai_chat_with_authority(
                         &creds,
                         &model,
@@ -10143,7 +10120,6 @@ impl AgentHostHandle {
                         SessionKind::Build,
                         self.capability_authority.as_ref(),
                         &capability_principal,
-                        &capability_policy,
                     )
                     .await
                     {
@@ -10534,9 +10510,8 @@ impl AgentHostHandle {
                     }
                 };
             let provider_observation = self.provider_observation_context(session_id);
-            let (capability_principal, capability_policy) =
-                match self.computer_capability_identity(session_id) {
-                    Ok(identity) => identity,
+            let capability_principal = match self.capability_principal(session_id) {
+                    Ok(principal) => principal,
                     Err(error) => {
                         last = format!("GP subagent capability admission failed: {error:#}");
                         break;
@@ -10555,7 +10530,6 @@ impl AgentHostHandle {
                 provider_observation.as_ref(),
                 self.capability_authority.as_ref(),
                 &capability_principal,
-                &capability_policy,
                 |_d| {},
                 |_t| {},
             )
@@ -11580,8 +11554,10 @@ mod computer_agent_host_tests {
         let first = host.session_new().unwrap();
         let second = host.session_new().unwrap();
         let model = host.inner.lock().model.clone();
+        let principal =
+            CapabilityPrincipal::new("test-owner".into(), 1, "test-policy".into()).unwrap();
         let snapshot = crate::capability_authority::CapabilitySnapshot::provider(
-            "test-owner",
+            &principal,
             "xai",
             "test-run",
             "https://example.invalid",
@@ -11589,7 +11565,6 @@ mod computer_agent_host_tests {
             "test-dialect",
             "test-credential",
             &crate::gateway_config::ModelCapabilities::default(),
-            "test-policy",
         )
         .unwrap();
         let capability = host

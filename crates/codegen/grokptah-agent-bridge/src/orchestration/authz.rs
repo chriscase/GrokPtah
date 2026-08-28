@@ -62,6 +62,12 @@ impl std::fmt::Debug for AuthenticationGeneration {
     }
 }
 
+impl AuthenticationGeneration {
+    pub(crate) fn value(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct AuthorityStamp {
     principal: PrincipalRef,
@@ -116,6 +122,22 @@ impl std::fmt::Debug for AuthContext {
 }
 
 impl AuthContext {
+    #[cfg(test)]
+    pub(crate) fn test_context(id: String, generation: u64) -> Self {
+        let principal = PrincipalRef(Uuid::new_v4().into_bytes());
+        let incarnation = CredentialIncarnation(Uuid::new_v4().into_bytes());
+        Self {
+            stamp: AuthorityStamp {
+                principal,
+                incarnation,
+                generation: AuthenticationGeneration(generation.max(1)),
+                credential_id: id.clone(),
+                owner_id: id,
+            },
+            delegation: None,
+        }
+    }
+
     pub fn principal_ref(&self) -> &PrincipalRef {
         &self.stamp.principal
     }
@@ -133,6 +155,20 @@ impl AuthContext {
 
     pub(crate) fn owner_id(&self) -> &str {
         &self.stamp.owner_id
+    }
+
+    pub(crate) fn authentication_generation(&self) -> AuthenticationGeneration {
+        self.stamp.generation
+    }
+
+    /// Stable, secret-free identity for the durable PrincipalRef and
+    /// CredentialIncarnation pair. The authentication generation is kept
+    /// separate so rotation stales capabilities without changing identity.
+    pub(crate) fn capability_identity(&self) -> String {
+        let mut bytes = Vec::with_capacity(32);
+        bytes.extend_from_slice(&self.stamp.principal.0);
+        bytes.extend_from_slice(&self.stamp.incarnation.0);
+        format!("principal_{}", hex_sha256(&bytes)[..32].to_string())
     }
 
     /// Opaque digest stored alongside durable resources. It includes the

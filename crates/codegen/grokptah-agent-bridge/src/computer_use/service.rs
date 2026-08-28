@@ -132,17 +132,15 @@ impl ComputerUseService {
             format!("{}:computer-service", principal.policy_generation());
         let action_policy_generation = format!("{}:computer-action", principal.policy_generation());
         let service_snapshot = CapabilitySnapshot::computer_use_service(
-            principal.id(),
+            &principal,
             &self.backend.capabilities(),
             &service_policy_generation,
-            principal.auth_generation(),
         )
         .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error.to_string()))?;
         let action_snapshot = CapabilitySnapshot::computer_use_service(
-            principal.id(),
+            &principal,
             &self.backend.capabilities(),
             &action_policy_generation,
-            principal.auth_generation(),
         )
         .map_err(|error| ComputerError::new(ComputerErrorCode::Internal, error.to_string()))?;
         let service_capability = self

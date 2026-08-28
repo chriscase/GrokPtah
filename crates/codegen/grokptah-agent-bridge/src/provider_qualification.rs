@@ -7,7 +7,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::capability_authority::{CapabilityAuthority, CapabilitySnapshot};
+use crate::capability_authority::{
+    CapabilityAuthority, CapabilityPrincipal, CapabilitySnapshot,
+};
 use crate::computer_use::{ComputerBackend, ComputerUseLimits, SemanticAction, SimulatorBackend};
 use crate::gateway_config::{CapabilitySource, ComputerUseTier};
 
@@ -89,6 +91,7 @@ struct QualificationCredentials {
     allow_xai_oidc_refresh: bool,
     forced_refresh_used: bool,
     authority: Arc<CapabilityAuthority>,
+    principal: CapabilityPrincipal,
     #[cfg(test)]
     forced_refresh_override: Option<crate::auth_store::WireCredentials>,
 }
@@ -99,13 +102,23 @@ impl QualificationCredentials {
         current: Option<crate::auth_store::WireCredentials>,
         profile: &crate::gateway_config::ProviderProfile,
     ) -> Result<Self> {
-        Self::new_with_authority(current, profile, Arc::new(CapabilityAuthority::new(true)))
+        Self::new_with_authority(
+            current,
+            profile,
+            Arc::new(CapabilityAuthority::new(true)),
+            CapabilityPrincipal::new(
+                "qualification-test".into(),
+                1,
+                "qualification-test-policy".into(),
+            )?,
+        )
     }
 
     fn new_with_authority(
         current: Option<crate::auth_store::WireCredentials>,
         profile: &crate::gateway_config::ProviderProfile,
         authority: Arc<CapabilityAuthority>,
+        principal: CapabilityPrincipal,
     ) -> Result<Self> {
         validate_qualification_credential_binding(profile, current.as_ref())?;
         Ok(Self {
@@ -121,6 +134,7 @@ impl QualificationCredentials {
             current,
             forced_refresh_used: false,
             authority,
+            principal,
             #[cfg(test)]
             forced_refresh_override: None,
         })
@@ -206,6 +220,11 @@ pub async fn qualify_provider_model(
             provider_id,
             model_id,
             Arc::new(CapabilityAuthority::new(true)),
+            CapabilityPrincipal::new(
+                "qualification-test".into(),
+                1,
+                "qualification-test-policy".into(),
+            )?,
         )
         .await
     }
@@ -220,6 +239,7 @@ pub(crate) async fn qualify_provider_model_with_authority(
     provider_id: &str,
     model_id: &str,
     authority: Arc<CapabilityAuthority>,
+    principal: CapabilityPrincipal,
 ) -> Result<ProviderQualificationReport> {
     if model_id.trim().is_empty() {
         bail!("model id is required");
@@ -261,7 +281,12 @@ pub(crate) async fn qualify_provider_model_with_authority(
     )
     .map_err(anyhow::Error::msg)?;
     let mut credentials =
-        QualificationCredentials::new_with_authority(resolved_credentials, &profile, authority)?;
+        QualificationCredentials::new_with_authority(
+            resolved_credentials,
+            &profile,
+            authority.clone(),
+            principal,
+        )?;
     if profile.managed_by_env {
         bail!("environment-managed profiles cannot persist measured capabilities");
     }
@@ -274,6 +299,16 @@ pub(crate) async fn qualify_provider_model_with_authority(
             anyhow!("model `{model_id}` is not registered on provider `{provider_id}`")
         })?;
     let wire_model_id = provider_model.wire_model_id().to_string();
+    #[cfg(test)]
+    install_test_qualification_envelope(
+        &credentials.authority,
+        &credentials.principal,
+        &profile.id,
+        model_id,
+        &profile.base_url,
+        &wire_model_id,
+        credentials.current(),
+    )?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(45))
         .connect_timeout(Duration::from_secs(10))
@@ -859,22 +894,19 @@ fn consume_qualification_send_lease(
     base_url: &str,
     body: &serde_json::Value,
 ) -> Result<()> {
-    let provider_id = credentials
+    let current = credentials
         .current()
-        .map(|current| current.provider_id.as_str())
-        .unwrap_or("anonymous-provider");
-    let credential_fingerprint = credentials
-        .current()
-        .map(crate::auth_store::WireCredentials::qualification_identity_fingerprint)
-        .unwrap_or_else(|| "anonymous".into());
+        .ok_or_else(|| anyhow!("qualification provider credentials are unavailable"))?;
+    let provider_id = current.provider_id.as_str();
+    let credential_fingerprint = current.qualification_identity_fingerprint();
     let model_id = body
         .get("model")
         .and_then(serde_json::Value::as_str)
         .filter(|model| !model.trim().is_empty())
         .ok_or_else(|| anyhow!("qualification request has no model"))?;
-    let request_digest = crate::orchestration::hash_payload(body);
+    let _ = body;
     let snapshot = CapabilitySnapshot::provider(
-        "provider-qualification",
+        &credentials.principal,
         provider_id,
         model_id,
         base_url,
@@ -882,16 +914,11 @@ fn consume_qualification_send_lease(
         "qualification",
         &credential_fingerprint,
         &crate::gateway_config::ModelCapabilities::default(),
-        &request_digest,
     )?;
-    let capability = credentials.authority.issue(
+    let lease = credentials.authority.lease_from_preinstalled(
         &snapshot,
-        chrono::Utc::now(),
-        crate::capability_authority::DEFAULT_CAPABILITY_TTL,
-    )?;
-    let lease = credentials.authority.lease(
-        &capability,
-        &snapshot,
+        "provider.qualification.send",
+        &format!("qualification:{provider_id}:{model_id}"),
         "provider.qualification.send",
         chrono::Utc::now(),
         chrono::Duration::seconds(5),
@@ -899,6 +926,41 @@ fn consume_qualification_send_lease(
     credentials
         .authority
         .consume(lease, &snapshot, chrono::Utc::now())?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn install_test_qualification_envelope(
+    authority: &CapabilityAuthority,
+    principal: &CapabilityPrincipal,
+    provider_id: &str,
+    model_id: &str,
+    base_url: &str,
+    wire_model_id: &str,
+    credentials: Option<&crate::auth_store::WireCredentials>,
+) -> Result<()> {
+    let credentials =
+        credentials.ok_or_else(|| anyhow!("qualification test credentials are unavailable"))?;
+    let snapshot = CapabilitySnapshot::provider(
+        principal,
+        provider_id,
+        model_id,
+        base_url,
+        wire_model_id,
+        "qualification",
+        &credentials.qualification_identity_fingerprint(),
+        &crate::gateway_config::ModelCapabilities::default(),
+    )?;
+    authority.install_canonical_envelope(
+        &format!("test-qualification:{provider_id}:{model_id}"),
+        snapshot,
+        principal.id(),
+        principal.auth_generation(),
+        principal.policy_generation(),
+        ["provider.qualification.send"],
+        &format!("qualification:{provider_id}:{model_id}"),
+        chrono::Utc::now(),
+    )?;
     Ok(())
 }
 

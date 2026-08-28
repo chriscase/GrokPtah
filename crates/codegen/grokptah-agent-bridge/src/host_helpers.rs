@@ -1256,8 +1256,7 @@ pub(crate) async fn propose_plan_with_authority(
     goal: &str,
     cancel: &CancellationToken,
     authority: &CapabilityAuthority,
-    principal: &str,
-    policy_digest: &str,
+    principal: &CapabilityPrincipal,
 ) -> Result<(Vec<String>, Option<crate::completion::CompletionUsage>)> {
     propose_plan_with_authority_inner(
         creds,
@@ -1267,7 +1266,6 @@ pub(crate) async fn propose_plan_with_authority(
         cancel,
         authority,
         principal,
-        policy_digest,
     )
     .await
 }
@@ -1280,8 +1278,7 @@ async fn propose_plan_with_authority_inner(
     goal: &str,
     cancel: &CancellationToken,
     authority: &CapabilityAuthority,
-    principal: &str,
-    policy_digest: &str,
+    principal: &CapabilityPrincipal,
 ) -> Result<(Vec<String>, Option<crate::completion::CompletionUsage>)> {
     if cancel.is_cancelled() {
         bail!("cancelled");
@@ -1300,7 +1297,6 @@ async fn propose_plan_with_authority_inner(
         SessionKind::Build,
         authority,
         principal,
-        policy_digest,
     )
     .await?;
     let steps = parse_numbered_plan(&reply.text);
@@ -1797,8 +1793,7 @@ fn consume_provider_send_lease(
     credentials: &crate::auth_store::WireCredentials,
     selected_model: &str,
     target: &ResolvedModelTarget,
-    principal: &str,
-    policy_digest: &str,
+    principal: &CapabilityPrincipal,
 ) -> Result<()> {
     // Re-resolve immediately before every physical send. A profile edit,
     // provider replacement, credential rotation, or capability downgrade
@@ -1826,22 +1821,24 @@ fn consume_provider_send_lease(
         &format!("{:?}", target.dialect),
         &credentials.qualification_identity_fingerprint(),
         &target.capabilities,
-        policy_digest,
     )?;
-    let capability = authority.issue(
+    let lease = authority.lease_from_preinstalled(
         &snapshot,
-        Utc::now(),
-        crate::capability_authority::DEFAULT_CAPABILITY_TTL,
-    )?;
-    let lease = authority.lease(
-        &capability,
-        &snapshot,
+        "provider.send",
+        &provider_effect_resource(credentials, target),
         "provider.send",
         Utc::now(),
         chrono::Duration::seconds(5),
     )?;
     authority.consume(lease, &snapshot, Utc::now())?;
     Ok(())
+}
+
+pub(crate) fn provider_effect_resource(
+    credentials: &crate::auth_store::WireCredentials,
+    target: &ResolvedModelTarget,
+) -> String {
+    format!("provider:{}:{}", credentials.provider_id, target.wire_model)
 }
 
 fn sha256_hex(value: &str) -> String {
@@ -2076,6 +2073,40 @@ where
     .await
 }
 
+#[cfg(test)]
+fn test_provider_authority(
+    creds: &crate::auth_store::WireCredentials,
+    model: &str,
+) -> Result<(CapabilityAuthority, CapabilityPrincipal)> {
+    let authority = CapabilityAuthority::new(true);
+    let principal =
+        CapabilityPrincipal::new("test-provider".into(), 1, "test-provider-policy".into())?;
+    let target = resolve_model_target(creds, model)?;
+    let selection =
+        crate::gateway_config::parse_model_selection(model).map_err(anyhow::Error::msg)?;
+    let snapshot = CapabilitySnapshot::provider(
+        &principal,
+        &selection.provider_id,
+        &selection.model_id,
+        &target.base_url,
+        &target.wire_model,
+        &format!("{:?}", target.dialect),
+        &creds.qualification_identity_fingerprint(),
+        &target.capabilities,
+    )?;
+    authority.install_canonical_envelope(
+        "test-provider-send",
+        snapshot,
+        principal.id(),
+        principal.auth_generation(),
+        principal.policy_generation(),
+        ["provider.send"],
+        &provider_effect_resource(creds, &target),
+        Utc::now(),
+    )?;
+    Ok((authority, principal))
+}
+
 /// Execute a provider step with optional bounded structural observation of
 /// every physical HTTP attempt. Observation is deliberately orthogonal to
 /// provider execution and failures in the recorder never affect the result.
@@ -2097,6 +2128,7 @@ where
     F: FnMut(&str),
     G: FnMut(&str),
 {
+    let (authority, principal) = test_provider_authority(creds, model)?;
     call_xai_agent_step_observed_inner(
         creds,
         model,
@@ -2106,9 +2138,8 @@ where
         allow_transient_retries,
         cancel,
         observation,
-        None,
-        None,
-        None,
+        Some(&authority),
+        Some(&principal),
         on_delta,
         on_thought,
     )
@@ -2126,8 +2157,7 @@ pub(crate) async fn call_xai_agent_step_observed_with_authority<F, G>(
     cancel: &CancellationToken,
     observation: Option<&ProviderObservationContext>,
     authority: &CapabilityAuthority,
-    principal: &str,
-    policy_digest: &str,
+    principal: &CapabilityPrincipal,
     on_delta: F,
     on_thought: G,
 ) -> Result<AgentStep>
@@ -2146,7 +2176,6 @@ where
         observation,
         Some(authority),
         Some(principal),
-        Some(policy_digest),
         on_delta,
         on_thought,
     )
@@ -2164,8 +2193,7 @@ async fn call_xai_agent_step_observed_inner<F, G>(
     cancel: &CancellationToken,
     observation: Option<&ProviderObservationContext>,
     authority: Option<&CapabilityAuthority>,
-    principal: Option<&str>,
-    policy_digest: Option<&str>,
+    principal: Option<&CapabilityPrincipal>,
     on_delta: F,
     on_thought: G,
 ) -> Result<AgentStep>
@@ -2198,7 +2226,6 @@ where
         observation_route,
         authority,
         principal,
-        policy_digest,
         on_delta,
         on_thought,
     )
@@ -2218,8 +2245,7 @@ async fn call_provider_agent_step<F, G>(
     observation: Option<&ProviderObservationContext>,
     mut observation_route: Option<ProviderObservationRoute>,
     authority: Option<&CapabilityAuthority>,
-    principal: Option<&str>,
-    policy_digest: Option<&str>,
+    principal: Option<&CapabilityPrincipal>,
     mut on_delta: F,
     mut on_thought: G,
 ) -> Result<AgentStep>
@@ -2267,31 +2293,10 @@ where
     const MAX_TRANSIENT_RETRIES: u32 = 3;
     let mut transient_retries = 0u32;
     let mut last_err = None::<String>;
-    #[cfg(test)]
-    let local_authority;
-    let provider_authority = match authority {
-        Some(authority) => authority,
-        None => {
-            #[cfg(test)]
-            {
-                local_authority = CapabilityAuthority::new(true);
-                &local_authority
-            }
-            #[cfg(not(test))]
-            {
-                bail!("host provider capability authority is unavailable");
-            }
-        }
-    };
-    #[cfg(test)]
-    let principal = principal.unwrap_or("provider-send");
-    #[cfg(not(test))]
-    let principal = principal.ok_or_else(|| anyhow!("host provider principal is unavailable"))?;
-    #[cfg(test)]
-    let policy_digest = policy_digest.unwrap_or("provider-send");
-    #[cfg(not(test))]
-    let policy_digest =
-        policy_digest.ok_or_else(|| anyhow!("host provider policy generation is unavailable"))?;
+    let provider_authority =
+        authority.ok_or_else(|| anyhow!("host provider capability authority is unavailable"))?;
+    let principal =
+        principal.ok_or_else(|| anyhow!("host provider principal is unavailable"))?;
     for _request_attempt in 0..MAX_REQUEST_ATTEMPTS {
         if cancel.is_cancelled() {
             bail!("cancelled");
@@ -2324,7 +2329,6 @@ where
             selected_model,
             &target,
             principal,
-            policy_digest,
         )?;
         let resp_result = tokio::select! {
             r = send_once(&creds).send() => r,
@@ -2429,7 +2433,6 @@ where
                         selected_model,
                         &target,
                         principal,
-                        policy_digest,
                     )?;
                     resp = tokio::select! {
                         r = send_once(&creds).send() => match r {
@@ -3869,6 +3872,7 @@ pub(crate) async fn call_xai_chat(
     cwd: &Path,
     kind: SessionKind,
 ) -> Result<ChatReply> {
+    let (authority, principal) = test_provider_authority(creds, model)?;
     call_xai_chat_inner(
         creds,
         model,
@@ -3876,9 +3880,8 @@ pub(crate) async fn call_xai_chat(
         compacted_summary,
         cwd,
         kind,
-        None,
-        None,
-        None,
+        Some(&authority),
+        Some(&principal),
     )
     .await
 }
@@ -3892,8 +3895,7 @@ pub(crate) async fn call_xai_chat_with_authority(
     cwd: &Path,
     kind: SessionKind,
     authority: &CapabilityAuthority,
-    principal: &str,
-    policy_digest: &str,
+    principal: &CapabilityPrincipal,
 ) -> Result<ChatReply> {
     call_xai_chat_inner(
         creds,
@@ -3904,7 +3906,6 @@ pub(crate) async fn call_xai_chat_with_authority(
         kind,
         Some(authority),
         Some(principal),
-        Some(policy_digest),
     )
     .await
 }
@@ -3918,8 +3919,7 @@ async fn call_xai_chat_inner(
     cwd: &Path,
     kind: SessionKind,
     authority: Option<&CapabilityAuthority>,
-    principal: Option<&str>,
-    policy_digest: Option<&str>,
+    principal: Option<&CapabilityPrincipal>,
 ) -> Result<ChatReply> {
     // Prefer a non-expired / refreshed OIDC access token before the first call.
     let mut creds = crate::auth_store::ensure_fresh_credentials(creds.clone()).await;
@@ -3997,31 +3997,9 @@ async fn call_xai_chat_inner(
         "stream": false
     });
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
-    #[cfg(test)]
-    let local_authority;
-    let provider_authority = match authority {
-        Some(authority) => authority,
-        None => {
-            #[cfg(test)]
-            {
-                local_authority = CapabilityAuthority::new(true);
-                &local_authority
-            }
-            #[cfg(not(test))]
-            {
-                bail!("host chat capability authority is unavailable");
-            }
-        }
-    };
-    #[cfg(test)]
-    let principal = principal.unwrap_or("provider-chat");
-    #[cfg(not(test))]
+    let provider_authority =
+        authority.ok_or_else(|| anyhow!("host chat capability authority is unavailable"))?;
     let principal = principal.ok_or_else(|| anyhow!("host chat principal is unavailable"))?;
-    #[cfg(test)]
-    let policy_digest = policy_digest.unwrap_or("provider-chat");
-    #[cfg(not(test))]
-    let policy_digest =
-        policy_digest.ok_or_else(|| anyhow!("host chat policy generation is unavailable"))?;
 
     let send_once = |c: &crate::auth_store::WireCredentials| {
         let req = client.post(&url).header("Content-Type", "application/json");
@@ -4035,7 +4013,6 @@ async fn call_xai_chat_inner(
         model,
         &target,
         principal,
-        policy_digest,
     )?;
     let mut resp = send_once(&creds).send().await.map_err(|e| {
         // Surface classify-able transport failures (DNS, TLS, timeout) so the
@@ -4072,7 +4049,6 @@ async fn call_xai_chat_inner(
                     model,
                     &target,
                     principal,
-                    policy_digest,
                 )?;
                 resp = send_once(&creds).send().await.map_err(|error| {
                     let class = if error.is_timeout() {

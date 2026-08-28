@@ -22,12 +22,16 @@ pub(crate) const DEFAULT_CAPABILITY_TTL: Duration = Duration::minutes(15);
 const MAX_CAPABILITY_TTL: Duration = Duration::hours(1);
 const MAX_EFFECT_LEASE_TTL: Duration = Duration::seconds(30);
 
-/// Opaque principal/auth-generation input supplied by the canonical host seam.
-/// Callers cannot construct or deserialize this identity.
+/// Opaque principal/auth-generation input supplied by the canonical #477 seam.
+///
+/// The durable `AuthContext` is retained as the source of truth.  This type
+/// only carries a derived, secret-free lookup key and the durable Agent policy
+/// revision used to bind capability snapshots.  It is not constructible from
+/// provider credentials, Agent ids, or wire data.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CapabilityPrincipal {
+    auth_context: crate::orchestration::AuthContext,
     id: String,
-    auth_generation: u64,
     policy_generation: String,
 }
 
@@ -37,11 +41,15 @@ impl std::fmt::Debug for CapabilityPrincipal {
             .debug_struct("CapabilityPrincipal")
             .field("id", &"[opaque]")
             .field("auth_generation", &"[opaque]")
+            .field("policy_generation", &"[opaque]")
             .finish()
     }
 }
 
 impl CapabilityPrincipal {
+    /// Test-only construction for unit fixtures. Production callers must
+    /// receive an AuthContext from the durable #477 authority seam.
+    #[cfg(test)]
     pub(crate) fn new(id: String, auth_generation: u64, policy_generation: String) -> Result<Self> {
         if id.trim().is_empty()
             || auth_generation == 0
@@ -51,8 +59,29 @@ impl CapabilityPrincipal {
             bail!("canonical capability principal is invalid");
         }
         Ok(Self {
+            auth_context: crate::orchestration::AuthContext::test_context(
+                id,
+                auth_generation,
+            ),
+            id: "test-principal".into(),
+            policy_generation,
+        })
+    }
+
+    pub(crate) fn from_auth_context(
+        auth_context: crate::orchestration::AuthContext,
+        policy_generation: String,
+    ) -> Result<Self> {
+        if policy_generation.trim().is_empty() || policy_generation.len() > 256 {
+            bail!("canonical capability policy generation is invalid");
+        }
+        let id = auth_context.capability_identity();
+        if id.is_empty() {
+            bail!("canonical capability principal is unavailable");
+        }
+        Ok(Self {
+            auth_context,
             id,
-            auth_generation,
             policy_generation,
         })
     }
@@ -62,7 +91,7 @@ impl CapabilityPrincipal {
     }
 
     pub(crate) fn auth_generation(&self) -> u64 {
-        self.auth_generation
+        self.auth_context.authentication_generation().value()
     }
 
     pub(crate) fn policy_generation(&self) -> &str {
@@ -109,7 +138,7 @@ pub(crate) struct CapabilitySnapshot {
 impl CapabilitySnapshot {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn provider(
-        principal: &str,
+        principal: &CapabilityPrincipal,
         provider_id: &str,
         model_id: &str,
         base_url: &str,
@@ -117,12 +146,11 @@ impl CapabilitySnapshot {
         dialect: &str,
         credential_fingerprint: &str,
         capabilities: &ModelCapabilities,
-        policy_digest: &str,
     ) -> Result<Self> {
         let capabilities = serde_json::to_vec(capabilities)?;
         Self::from_parts(
             CapabilityKind::Provider,
-            principal,
+            principal.id(),
             model_id,
             [
                 provider_id,
@@ -130,38 +158,38 @@ impl CapabilitySnapshot {
                 wire_model_id,
                 dialect,
                 credential_fingerprint,
-                policy_digest,
+                principal.policy_generation(),
+                &principal.auth_generation().to_string(),
                 std::str::from_utf8(&capabilities).unwrap_or_default(),
             ],
         )
     }
 
     pub(crate) fn computer_use_service(
-        principal: &str,
+        principal: &CapabilityPrincipal,
         backend: &ComputerCapabilities,
-        policy_digest: &str,
-        auth_generation: u64,
+        policy_generation: &str,
     ) -> Result<Self> {
         let backend = serde_json::to_vec(backend)?;
-        let scope = format!("computer-use-service:{policy_digest}");
+        let scope = format!("computer-use-service:{policy_generation}");
         Self::from_parts(
             CapabilityKind::ComputerUse,
-            principal,
+            principal.id(),
             &scope,
             [
                 std::str::from_utf8(&backend).unwrap_or_default(),
-                policy_digest,
-                &auth_generation.to_string(),
+                policy_generation,
+                &principal.auth_generation().to_string(),
             ],
         )
     }
 
-    pub(crate) fn tool(principal: &str, tool_name: &str, tool_policy_digest: &str) -> Result<Self> {
+    pub(crate) fn tool(principal: &CapabilityPrincipal, tool_name: &str) -> Result<Self> {
         Self::from_parts(
             CapabilityKind::Tool,
-            principal,
+            principal.id(),
             tool_name,
-            [tool_name, tool_policy_digest],
+            [tool_name, principal.policy_generation(), &principal.auth_generation().to_string()],
         )
     }
 
@@ -451,6 +479,37 @@ impl CapabilityAuthority {
         Ok(())
     }
 
+    /// Install an envelope during an explicit host-policy transition. This is
+    /// the only non-test helper that combines generation issuance with
+    /// installation; physical provider/tool/qualification paths can only
+    /// select envelopes through `lease_from_preinstalled`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn install_canonical_envelope(
+        &self,
+        envelope_id: &str,
+        snapshot: CapabilitySnapshot,
+        principal_id: &str,
+        auth_generation: u64,
+        policy_generation: &str,
+        allowed_operations: impl IntoIterator<Item = impl Into<String>>,
+        resource_scope: &str,
+        now: DateTime<Utc>,
+    ) -> Result<HostCapability> {
+        let capability = self.issue(&snapshot, now, DEFAULT_CAPABILITY_TTL)?;
+        self.install_envelope(
+            envelope_id,
+            capability.clone(),
+            snapshot,
+            principal_id,
+            auth_generation,
+            policy_generation,
+            allowed_operations,
+            resource_scope,
+            now,
+        )?;
+        Ok(capability)
+    }
+
     /// Lease an effect from an already-installed envelope. This method never
     /// calls `issue`; arbitrary request data is only checked against the
     /// envelope's closed operation/resource scope.
@@ -502,6 +561,85 @@ impl CapabilityAuthority {
             effect_scope: effect_scope.to_string(),
             expires_at,
         })
+    }
+
+    /// Lease from an envelope that was installed by the canonical host policy
+    /// boundary. This lookup is deliberately snapshot-based: request fields
+    /// can select only an exact preinstalled envelope and can never mint one.
+    pub(crate) fn lease_from_preinstalled(
+        &self,
+        snapshot: &CapabilitySnapshot,
+        operation: &str,
+        resource: &str,
+        effect_scope: &str,
+        now: DateTime<Utc>,
+        ttl: Duration,
+    ) -> Result<EffectLease> {
+        let envelope_id = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("capability authority is unavailable"))?;
+            state
+                .envelopes
+                .values()
+                .find(|envelope| {
+                    envelope.snapshot == *snapshot
+                        && envelope.allowed_operations.contains(operation)
+                        && envelope.resource_scope == resource
+                })
+                .map(|envelope| envelope.envelope_id.clone())
+                .ok_or_else(|| anyhow::anyhow!("canonical capability envelope is unavailable"))?
+        };
+        self.lease_from_envelope(
+            &envelope_id,
+            operation,
+            resource,
+            effect_scope,
+            now,
+            ttl,
+        )
+    }
+
+    /// Revalidate an exact preinstalled envelope without exposing its opaque
+    /// capability token to a request boundary.
+    pub(crate) fn revalidate_preinstalled(
+        &self,
+        snapshot: &CapabilitySnapshot,
+        operation: &str,
+        resource: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability authority is unavailable"))?;
+        let envelope = state
+            .envelopes
+            .values()
+            .find(|envelope| {
+                envelope.snapshot == *snapshot
+                    && envelope.allowed_operations.contains(operation)
+                    && envelope.resource_scope == resource
+            })
+            .ok_or_else(|| anyhow::anyhow!("canonical capability envelope is unavailable"))?;
+        validate_envelope_locked(&state, envelope, now)
+    }
+
+    pub(crate) fn preinstalled_capability(
+        &self,
+        snapshot: &CapabilitySnapshot,
+    ) -> Result<HostCapability> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability authority is unavailable"))?;
+        state
+            .envelopes
+            .values()
+            .find(|envelope| envelope.snapshot == *snapshot)
+            .map(|envelope| envelope.capability.clone())
+            .ok_or_else(|| anyhow::anyhow!("canonical capability envelope is unavailable"))
     }
 
     pub(crate) fn revalidate_envelope(
@@ -588,7 +726,16 @@ impl CapabilityAuthority {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("capability authority is unavailable"))?;
-        state.envelopes.remove(envelope_id);
+        let removed = state.envelopes.remove(envelope_id);
+        if let Some(removed) = removed {
+            // Removal is absorbing. A stale capability must not become valid
+            // merely because a later request causes another lookup. A new
+            // generation requires an explicit higher-authority `issue` call.
+            let key = removed.capability.key;
+            if !state.envelopes.values().any(|envelope| envelope.capability.key == key) {
+                state.current.remove(&key);
+            }
+        }
         Ok(())
     }
 
@@ -599,6 +746,9 @@ impl CapabilityAuthority {
             .lock()
             .map_err(|_| anyhow::anyhow!("capability authority is unavailable"))?;
         state.current.remove(&snapshot.key);
+        state
+            .envelopes
+            .retain(|_, envelope| envelope.snapshot.key != snapshot.key);
         Ok(())
     }
 
@@ -803,8 +953,10 @@ mod tests {
     fn installed_envelope_rejects_request_scopes_without_minting() {
         let authority = CapabilityAuthority::new(true);
         let now = Utc::now();
+        let principal =
+            CapabilityPrincipal::new(TEST_PRINCIPAL_ID.into(), 1, "policy-v1".into()).unwrap();
         let snapshot = CapabilitySnapshot::computer_use_service(
-            TEST_PRINCIPAL_ID,
+            &principal,
             &ComputerCapabilities {
                 backend_id: "test".into(),
                 observe: true,
@@ -814,7 +966,6 @@ mod tests {
                 pointer_fallback: false,
             },
             "policy-v1",
-            1,
         )
         .unwrap();
         let capability = authority

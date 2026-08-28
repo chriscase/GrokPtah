@@ -8,7 +8,9 @@ use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::capability_authority::{CapabilityAuthority, CapabilitySnapshot};
+use crate::capability_authority::{
+    CapabilityAuthority, CapabilityPrincipal, CapabilitySnapshot,
+};
 use crate::computer_use::{
     ComputerAction, ComputerObservation, ComputerUseLimits, SemanticAction, SimulatorBackend,
 };
@@ -90,8 +92,7 @@ struct ProposalArguments {
 pub(crate) fn resolve_computer_eligibility(
     credentials: &crate::auth_store::WireCredentials,
     model: &str,
-    principal: &str,
-    policy_digest: &str,
+    principal: &CapabilityPrincipal,
 ) -> Result<ResolvedComputerEligibility> {
     let target = resolve_model_target(credentials, model)?;
     let selection =
@@ -111,7 +112,6 @@ pub(crate) fn resolve_computer_eligibility(
         &format!("{:?}", target.dialect),
         &credentials.qualification_identity_fingerprint(),
         &target.capabilities,
-        policy_digest,
     )?;
     Ok(ResolvedComputerEligibility {
         eligibility: ComputerAgentEligibility {
@@ -129,8 +129,7 @@ pub(crate) async fn qualify_semantic_model(
     effort: EffortLevel,
     cancel: &CancellationToken,
     authority: &CapabilityAuthority,
-    principal: &str,
-    policy_digest: &str,
+    principal: &CapabilityPrincipal,
 ) -> Result<()> {
     let simulator = SimulatorBackend::new();
     let target = SimulatorBackend::demo_target();
@@ -163,7 +162,6 @@ pub(crate) async fn qualify_semantic_model(
             None,
             authority,
             principal,
-            policy_digest,
             |_| {},
             |_| {},
         )
@@ -216,7 +214,6 @@ pub(crate) async fn qualify_semantic_model(
             None,
             authority,
             principal,
-            policy_digest,
             |_| {},
             |_| {},
         )
@@ -239,8 +236,7 @@ pub(crate) async fn propose_semantic_action(
     observation: &ComputerObservation,
     cancel: &CancellationToken,
     authority: &CapabilityAuthority,
-    principal: &str,
-    policy_digest: &str,
+    principal: &CapabilityPrincipal,
 ) -> Result<ComputerAgentProposal> {
     validate_objective(objective)?;
     observation.validate(&ComputerUseLimits::ceiling())?;
@@ -267,7 +263,6 @@ pub(crate) async fn propose_semantic_action(
             None,
             authority,
             principal,
-            policy_digest,
             |_| {},
             |_| {},
         )

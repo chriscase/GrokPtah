@@ -261,6 +261,11 @@ impl OrchestrationService {
         };
         let auth_registry = AuthRegistry::open(store.root(), &auth_credentials, "primary")
             .unwrap_or_else(|error| AuthRegistry::unavailable(store.root(), error.to_string()));
+        // The provider/tool/Computer Use authority must consume this durable
+        // #477 context. Do not derive a replacement principal from local
+        // sessions or provider credentials.
+        let canonical_auth_context = auth_registry.primary_context(&auth_credentials).ok();
+        let capability_host = host.clone();
         let workload_supervisor =
             WorkloadSupervisor::start(store.clone(), DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL);
         let routine_supervisor =
@@ -288,6 +293,14 @@ impl OrchestrationService {
             native_executor_watcher: Mutex::new(None),
             join_handles: Mutex::new(Vec::new()),
         });
+        if let Some(auth_context) = canonical_auth_context {
+            capability_host.install_canonical_auth_context(auth_context);
+            for session in capability_host.list_all_sessions() {
+                // A missing Agent, credential, or provider route leaves that
+                // session fail-closed. It must not trigger request-time minting.
+                let _ = capability_host.preinstall_canonical_capability_policy(session.id);
+            }
+        }
         service.start_scheduler_watcher();
         service.start_native_executor();
         service.start_manager_supervisor();
