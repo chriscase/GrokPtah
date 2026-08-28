@@ -1450,6 +1450,10 @@ impl OrchestrationService {
     /// This is separate from `Drop` because an async service shutdown must
     /// wait for the supervisor task to release its store handle.
     pub async fn stop_background_tasks(&self) {
+        if let Some(watcher) = self.scheduler_watcher.lock().take() {
+            watcher.abort();
+            let _ = watcher.await;
+        }
         let supervisor = self.workload_supervisor.lock().take();
         if let Some(mut supervisor) = supervisor {
             supervisor.stop_and_wait();
@@ -1466,6 +1470,11 @@ impl OrchestrationService {
         }
         self.native_executor.lock().enabled = false;
         self.manager_supervisor.lock().enabled = false;
+        let handles = self.join_handles.lock().drain(..).collect::<Vec<_>>();
+        for handle in handles {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 
     pub fn store(&self) -> &OrchStore {
