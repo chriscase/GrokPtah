@@ -1784,6 +1784,12 @@ impl OrchestrationService {
                             "workspace" | "cwd" | "path" | "sourceworkspace" | "executionworkspace"
                         ) {
                             let replacement = match (lower.as_str(), value.as_str()) {
+                                (_, Some(handle))
+                                    if handle.starts_with("workspace_")
+                                        || handle.starts_with("path_") =>
+                                {
+                                    handle.to_string()
+                                }
                                 ("path", Some(path)) => public_path_handle(path),
                                 (_, Some(workspace)) => public_workspace_handle(workspace),
                                 ("path", None) => "path_redacted".into(),
