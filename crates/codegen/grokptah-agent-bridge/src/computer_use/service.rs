@@ -1955,7 +1955,13 @@ mod tests {
         });
         backend.action_entered.notified().await;
 
-        let cancelled = service.cancel("cancel-race", &run.run_id).await.unwrap();
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            service.cancel("cancel-race", &run.run_id),
+        )
+        .await
+        .expect("cancel must release an in-flight action")
+        .unwrap();
         assert_eq!(cancelled.state, ComputerRunState::Cancelled);
         assert_eq!(
             cancelled.control_disposition,
