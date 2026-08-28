@@ -230,6 +230,7 @@ pub(crate) async fn qualify_semantic_model(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn propose_semantic_action(
     credentials: &crate::auth_store::WireCredentials,
     model: &str,
