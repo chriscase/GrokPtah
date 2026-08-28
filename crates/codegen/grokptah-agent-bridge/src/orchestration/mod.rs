@@ -19,6 +19,9 @@ pub use authz::{
     canonical_workspace, constant_time_eq, AuthContext, AuthCredential, AuthenticationGeneration,
     CredentialIncarnation, EffectLease, PrincipalRef, PublicActorHandle, WorkspaceAllowlist,
 };
+pub(crate) fn initialize_host_authority(root: &std::path::Path) -> Result<(), OrchError> {
+    authz::AuthRegistry::initialize_host_anchor(root)
+}
 pub use continuation::{
     assemble_continuation_context, AgentContinuationPlan, ContinuationAssemblyFailure,
     ContinuationContext, ContinuationFidelity, ContinuationInputSnapshot, ContinuationMemoryFact,

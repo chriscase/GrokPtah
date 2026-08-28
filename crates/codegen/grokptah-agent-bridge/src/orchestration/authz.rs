@@ -267,6 +267,25 @@ pub(crate) struct AuthRegistry {
 }
 
 impl AuthRegistry {
+    pub(crate) fn initialize_host_anchor(root: &Path) -> Result<(), OrchError> {
+        let path = root.join(AUTHORITY_FILE);
+        if path.is_file() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(root).map_err(|error| {
+            OrchError::new(
+                OrchErrorCode::Internal,
+                format!("create durable auth authority root: {error}"),
+            )
+        })?;
+        let registry = Self {
+            root: root.to_path_buf(),
+            state: StoredAuthority::default(),
+            durable_error: None,
+        };
+        registry.persist()
+    }
+
     pub(crate) fn unavailable(root: &Path, error: impl Into<String>) -> Self {
         Self {
             root: root.to_path_buf(),

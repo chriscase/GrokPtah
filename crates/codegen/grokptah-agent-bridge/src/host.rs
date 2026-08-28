@@ -787,6 +787,13 @@ impl AgentHost {
                 None
             }
         };
+        if instance_lock.is_some() {
+            if let Err(error) =
+                crate::orchestration::initialize_host_authority(&runtime_home.orchestration_root())
+            {
+                eprintln!("[grokptah] durable auth authority anchor failed: {error}");
+            }
+        }
         let mut event_tx = crate::event_bus::EventBus::new(
             config
                 .event_bus_capacity
