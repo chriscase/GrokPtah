@@ -425,6 +425,7 @@ impl AuthRegistry {
         })?;
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(self.root.join(AUTHORITY_LOCK_FILE))
@@ -1395,10 +1396,10 @@ mod tests {
         let auth = registry
             .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
             .unwrap();
-        let mut lease = registry.mint_effect_lease(&auth, "provider:run-1").unwrap();
+        let lease = registry.mint_effect_lease(&auth, "provider:run-1").unwrap();
         registry.rotate_generation("primary").unwrap();
         assert!(registry
-            .consume_effect_lease(&auth, &mut lease, "provider:run-1")
+            .consume_effect_lease(&auth, &lease, "provider:run-1")
             .is_err());
         assert!(!lease.is_locally_consumed());
     }
