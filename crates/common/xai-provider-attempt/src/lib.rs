@@ -495,6 +495,33 @@ impl AttemptContext {
         self.begin_send(&attempt)
     }
 
+    /// Start a new logical provider round with a fresh one-use effect lease.
+    /// Principal/auth and capability authority remain sourced from this
+    /// adapter; the lease is never cloned or replayed across attempts.
+    #[cfg(feature = "trusted-host-adapter")]
+    pub fn fork_effect_lease(&self) -> Result<Self, AttemptError> {
+        let effect_lease_id = format!("effect-lease-{}", Uuid::new_v4());
+        let authority = AuthorityBinding {
+            principal_incarnation: self.authority.principal_incarnation.clone(),
+            auth_generation: self.authority.auth_generation,
+            capability_generation: self.authority.capability_generation,
+            effect_lease_id: effect_lease_id.clone(),
+            effect_scope: self.authority.effect_scope.clone(),
+        };
+        let source = self.revalidate.clone();
+        let revalidate = Arc::new(move || {
+            let mut current = source()?;
+            current.effect_lease_id = effect_lease_id.clone();
+            Some(current)
+        });
+        Self::new(
+            self.store.clone(),
+            self.operation_id.clone(),
+            authority,
+            revalidate,
+        )
+    }
+
     pub fn revalidate_before_physical_write(
         &self,
         permit: &PhysicalSendPermit,

@@ -697,6 +697,9 @@ impl SamplingClient {
             // the context through `with_provider_attempt_context`.
             return Ok((builder, None));
         };
+        let context = context.fork_effect_lease().map_err(|error| {
+            SamplingError::Auth(format!("allocate provider effect lease: {error}"))
+        })?;
         let mut permit = context
             .begin("sampler-provider", body, true)
             .map_err(|error| {
