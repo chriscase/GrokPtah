@@ -3927,10 +3927,14 @@ mod tests {
 
         let canon_a = canonical_workspace_string(ws_a.path()).unwrap();
         let canon_b = canonical_workspace_string(ws_b.path()).unwrap();
-        let computer = ComputerUseService::new(
+        let computer = ComputerUseService::new_with_authority(
             Arc::new(SimulatorBackend::new()),
             host.ensure_computer_store().unwrap(),
+            host.capability_authority(),
         );
+        computer
+            .install_host_policy(host.capability_principal(session_a.id).unwrap())
+            .unwrap();
         let run_a = computer
             .create_run(
                 "create-a",
@@ -4277,7 +4281,14 @@ mod tests {
 
         let canon = canonical_workspace_string(ws.path()).unwrap();
         let store = host.ensure_computer_store().unwrap();
-        let computer = ComputerUseService::new(Arc::new(SimulatorBackend::new()), store.clone());
+        let computer = ComputerUseService::new_with_authority(
+            Arc::new(SimulatorBackend::new()),
+            store.clone(),
+            host.capability_authority(),
+        );
+        computer
+            .install_host_policy(host.capability_principal(session.id).unwrap())
+            .unwrap();
         let run = computer
             .create_run(
                 "create-ring",
@@ -4383,7 +4394,14 @@ mod tests {
         {
             let store =
                 ComputerStore::open(crate::discover::grokptah_home().join("computer-use")).unwrap();
-            let computer = ComputerUseService::new(Arc::new(SimulatorBackend::new()), store);
+            let computer = ComputerUseService::new_with_authority(
+                Arc::new(SimulatorBackend::new()),
+                store,
+                host.capability_authority(),
+            );
+            computer
+                .install_host_policy(host.capability_principal(session.id).unwrap())
+                .unwrap();
             let run = computer
                 .create_run(
                     "create-restart",
