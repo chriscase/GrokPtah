@@ -14,8 +14,7 @@ use crate::computer_use::{
 };
 use crate::gateway_config::{CapabilitySource, ComputerUseTier};
 use crate::host_helpers::{
-    call_xai_agent_step, call_xai_agent_step_observed_with_authority, resolve_model_target,
-    AgentStep, AgentToolCall,
+    call_xai_agent_step_observed_with_authority, resolve_model_target, AgentStep, AgentToolCall,
 };
 use crate::types::EffortLevel;
 
@@ -238,6 +237,9 @@ pub(crate) async fn propose_semantic_action(
     objective: &str,
     observation: &ComputerObservation,
     cancel: &CancellationToken,
+    authority: &CapabilityAuthority,
+    principal: &str,
+    policy_digest: &str,
 ) -> Result<ComputerAgentProposal> {
     validate_objective(objective)?;
     observation.validate(&ComputerUseLimits::ceiling())?;
@@ -253,7 +255,7 @@ pub(crate) async fn propose_semantic_action(
         }),
     ];
     let call = one_tool_call(
-        call_xai_agent_step(
+        call_xai_agent_step_observed_with_authority(
             credentials,
             model,
             effort,
@@ -261,6 +263,10 @@ pub(crate) async fn propose_semantic_action(
             &proposal_tools(),
             true,
             cancel,
+            None,
+            authority,
+            principal,
+            policy_digest,
             |_| {},
             |_| {},
         )

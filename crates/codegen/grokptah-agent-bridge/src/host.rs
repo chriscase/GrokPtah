@@ -1200,6 +1200,9 @@ impl AgentHostHandle {
             objective,
             observation,
             &cancel,
+            &self.capability_authority,
+            &principal,
+            &policy_digest,
         )
         .await
         .context("selected model did not return a valid bounded Computer proposal")?;
