@@ -1556,7 +1556,9 @@ mod tests {
             .observe("observe-generation-restart", &run_id, recovered.version)
             .await
             .unwrap_err();
-        assert_eq!(error.code, ComputerErrorCode::Unauthorized);
+        // Restart recovery interrupts the run before any stale in-memory
+        // capability can be consulted; both fences deny the observation.
+        assert_eq!(error.code, ComputerErrorCode::InvalidState);
     }
 
     #[tokio::test]
