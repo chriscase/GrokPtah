@@ -385,7 +385,7 @@ fn run_record(
         session_id: session,
         workspace: workspace.into(),
         request_id: intent_id.into(),
-        client_id: Some("native-executor".into()),
+        client_id: Some("actor_native_fixture".into()),
         state,
         purpose: Default::default(),
         agent_id: Some(agent_id.into()),

@@ -12361,7 +12361,7 @@ mod tests {
             session_id: lane_id,
             workspace: agent.workspace.clone(),
             request_id: "manager-proposal-intent".into(),
-            client_id: Some("native-executor".into()),
+            client_id: Some("actor_native_fixture".into()),
             state: RunState::Running,
             purpose: RunPurpose::ManagerProposal,
             agent_id: Some(agent.agent_id.clone()),
