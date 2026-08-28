@@ -58,12 +58,13 @@ impl CapabilityPrincipal {
         {
             bail!("canonical capability principal is invalid");
         }
+        let id = id.clone();
         Ok(Self {
             auth_context: crate::orchestration::AuthContext::test_context(
-                id,
+                id.clone(),
                 auth_generation,
             ),
-            id: "test-principal".into(),
+            id,
             policy_generation,
         })
     }
