@@ -155,6 +155,8 @@ impl ComputerUseService {
         validate_id("run_id", run_id)?;
         validate_id("asset_id", asset_id)?;
         let run = self.store.load_run(run_id)?.ok_or_else(unknown_run)?;
+        let capability = self.require_run_capability(&run)?;
+        let lease = self.effect_lease(&capability, &run, "computer.capture")?;
         let evidence = run
             .current_observation
             .as_ref()
@@ -165,6 +167,11 @@ impl ComputerUseService {
                     ComputerErrorCode::Unauthorized,
                     "evidence is not attached to the current observation",
                 )
+            })?;
+        self.capability_authority
+            .consume(lease, &capability.snapshot, Utc::now())
+            .map_err(|error| {
+                ComputerError::new(ComputerErrorCode::PermissionRevoked, error.to_string())
             })?;
         let bytes = self
             .backend
@@ -407,7 +414,7 @@ impl ComputerUseService {
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
-                let capability = self.require_run_capability(run)?;
+                let _capability = self.require_run_capability(run)?;
                 self.consume_durable_lease("act", &payload)?;
                 let now = Utc::now();
                 if self.policy.run_limit_reached(run, now) {
@@ -506,7 +513,7 @@ impl ComputerUseService {
                     Ok(outcome) => {
                         self.commit_action(run_id, &action, &observation, control_epoch, outcome)
                     }
-                    Err(error) => {
+                    Err(_error) => {
                         let uncertain = ComputerError::new(
                             ComputerErrorCode::UncertainOutcome,
                             "Computer input may have reached the backend; outcome is uncertain and will not be retried automatically",
@@ -555,7 +562,16 @@ impl ComputerUseService {
             })
             .and_then(|run| run.ok_or_else(unknown_run));
         let result = match paused {
-            Ok(run) => self.backend.cancel(run_id).await.map(|()| run),
+            Ok(run) => {
+                let capability = self.require_run_capability(&run)?;
+                let lease = self.effect_lease(&capability, &run, "computer.cancel")?;
+                self.capability_authority
+                    .consume(lease, &capability.snapshot, Utc::now())
+                    .map_err(|error| {
+                        ComputerError::new(ComputerErrorCode::PermissionRevoked, error.to_string())
+                    })?;
+                self.backend.cancel(run_id).await.map(|()| run)
+            }
             Err(error) => {
                 self.record_denial(run_id, "pause", None, &error);
                 Err(error)
@@ -592,7 +608,16 @@ impl ComputerUseService {
             })
             .and_then(|run| run.ok_or_else(unknown_run));
         let result = match taken_over {
-            Ok(run) => self.backend.cancel(run_id).await.map(|()| run),
+            Ok(run) => {
+                let capability = self.require_run_capability(&run)?;
+                let lease = self.effect_lease(&capability, &run, "computer.cancel")?;
+                self.capability_authority
+                    .consume(lease, &capability.snapshot, Utc::now())
+                    .map_err(|error| {
+                        ComputerError::new(ComputerErrorCode::PermissionRevoked, error.to_string())
+                    })?;
+                self.backend.cancel(run_id).await.map(|()| run)
+            }
             Err(error) => {
                 self.record_denial(run_id, "take_over", None, &error);
                 Err(error)
@@ -622,7 +647,23 @@ impl ComputerUseService {
             })
             .and_then(|run| run.ok_or_else(unknown_run));
         let result = match cancelled {
-            Ok(run) => self.backend.cancel(run_id).await.map(|()| run),
+            Ok(run) => {
+                if run.state.is_terminal() {
+                    Ok(run)
+                } else {
+                    let capability = self.require_run_capability(&run)?;
+                    let lease = self.effect_lease(&capability, &run, "computer.cancel")?;
+                    self.capability_authority
+                        .consume(lease, &capability.snapshot, Utc::now())
+                        .map_err(|error| {
+                            ComputerError::new(
+                                ComputerErrorCode::PermissionRevoked,
+                                error.to_string(),
+                            )
+                        })?;
+                    self.backend.cancel(run_id).await.map(|()| run)
+                }
+            }
             Err(error) => {
                 self.record_denial(run_id, "cancel", None, &error);
                 Err(error)
@@ -671,6 +712,14 @@ impl ComputerUseService {
             .as_ref()
             .map_or(0, |evidence| evidence.byte_len);
         let mut limit_error = None;
+        self.consume_durable_lease(
+            "settle_observation",
+            &json!({
+                "runId": run_id,
+                "observationId": observation.observation_id.clone(),
+                "sequence": observation.sequence,
+            }),
+        )?;
         self.store
             .update_run(run_id, |run| {
                 if run.state != ComputerRunState::Observing {
@@ -737,6 +786,15 @@ impl ComputerUseService {
         outcome: ActionOutcome,
     ) -> ComputerResult<ActionOutcome> {
         let mut uncertain_error = None;
+        self.consume_durable_lease(
+            "settle_action",
+            &json!({
+                "runId": run_id,
+                "observationId": observation.observation_id,
+                "action": action,
+                "controlEpoch": control_epoch,
+            }),
+        )?;
         self.store
             .update_run(run_id, |run| {
                 if run.state != ComputerRunState::Acting || run.control_epoch != control_epoch {
@@ -988,6 +1046,16 @@ impl ComputerUseService {
         request_id: &str,
         result: &ComputerResult<T>,
     ) -> ComputerResult<()> {
+        self.consume_durable_lease(
+            "settle_receipt",
+            &json!({
+                "requestId": request_id,
+                "result": match result {
+                    Ok(_) => "success",
+                    Err(error) => error.code,
+                },
+            }),
+        )?;
         let encoded = match result {
             Ok(value) => serde_json::to_value(value).map_err(|error| {
                 ComputerError::new(ComputerErrorCode::Internal, error.to_string())

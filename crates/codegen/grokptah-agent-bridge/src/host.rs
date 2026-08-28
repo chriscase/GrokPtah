@@ -12,7 +12,7 @@ use tokio::sync::{oneshot, Notify};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::capability_authority::{CapabilityAuthority, HostCapability};
+use crate::capability_authority::{CapabilityAuthority, CapabilitySnapshot, HostCapability};
 use crate::completion::{
     build_evidence, enrich_terminal_handoff, observe_updates, CompletionObservations,
     CompletionUsage,
@@ -159,6 +159,12 @@ struct OrchestrationPendingAdmission {
 struct SessionComputerQualification {
     capability: HostCapability,
     tier: crate::gateway_config::ComputerUseTier,
+}
+
+#[derive(Debug, Clone)]
+struct ToolCapabilityAdmission {
+    snapshot: CapabilitySnapshot,
+    capability: HostCapability,
 }
 
 pub(crate) struct Inner {
@@ -1294,6 +1300,61 @@ impl AgentHostHandle {
             bail!("provider capability changed while the Computer request was running");
         }
         Ok(current)
+    }
+
+    fn tool_capability_snapshot(
+        &self,
+        session_id: Uuid,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Result<CapabilitySnapshot> {
+        let (principal, policy_digest) = self.computer_capability_identity(session_id)?;
+        let input_digest = crate::orchestration::hash_payload(input);
+        CapabilitySnapshot::tool(
+            &principal,
+            tool_name,
+            &format!("{policy_digest}:{input_digest}"),
+        )
+    }
+
+    fn admit_tool_effect(
+        &self,
+        session_id: Uuid,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Result<ToolCapabilityAdmission> {
+        let snapshot = self.tool_capability_snapshot(session_id, tool_name, input)?;
+        let capability = self.capability_authority.issue(
+            &snapshot,
+            Utc::now(),
+            crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+        )?;
+        Ok(ToolCapabilityAdmission {
+            snapshot,
+            capability,
+        })
+    }
+
+    fn consume_tool_effect_lease(
+        &self,
+        session_id: Uuid,
+        tool_name: &str,
+        input: &serde_json::Value,
+        admission: &ToolCapabilityAdmission,
+    ) -> Result<()> {
+        let current = self.tool_capability_snapshot(session_id, tool_name, input)?;
+        self.capability_authority
+            .revalidate(&admission.capability, &current, Utc::now())?;
+        let lease = self.capability_authority.lease(
+            &admission.capability,
+            &current,
+            "tool.dispatch",
+            Utc::now(),
+            chrono::Duration::seconds(5),
+        )?;
+        self.capability_authority
+            .consume(lease, &current, Utc::now())?;
+        Ok(())
     }
 
     /// Shared wake-up for every embedded orchestration scheduler.
@@ -9400,6 +9461,8 @@ impl AgentHostHandle {
                     .ok_or_else(|| anyhow!("glob_files requires pattern"))?
                     .to_string();
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(80) as usize;
+                let admission = self.admit_tool_effect(session_id, "glob_files", &args)?;
+                self.consume_tool_effect_lease(session_id, "glob_files", &args, &admission)?;
                 let hits = crate::project_context::glob_files(cwd, &pattern, limit);
                 let out = if hits.is_empty() {
                     "(no matches)".into()
@@ -9498,6 +9561,12 @@ impl AgentHostHandle {
                         }
                     }
                 }
+                let admission = self.admit_tool_effect(session_id, "apply_patch", &input)?;
+                if let Err(error) =
+                    self.consume_tool_effect_lease(session_id, "apply_patch", &input, &admission)
+                {
+                    return Ok(format!("DENIED by capability lease: {error}"));
+                }
                 match crate::project_context::apply_patch(cwd, &patch) {
                     Ok(report) => {
                         // Record + live-diff every path in the report
@@ -9551,6 +9620,8 @@ impl AgentHostHandle {
                     .and_then(|v| v.as_str())
                     .unwrap_or("explore the codebase")
                     .to_string();
+                let admission = self.admit_tool_effect(session_id, "spawn_explore", &args)?;
+                self.consume_tool_effect_lease(session_id, "spawn_explore", &args, &admission)?;
                 self.run_explore_subagent(session_id, cwd, &query, cancel, event_tx)
                     .await
             }
@@ -9567,10 +9638,14 @@ impl AgentHostHandle {
                     .and_then(|v| v.as_str())
                     .unwrap_or("general-purpose")
                     .to_string();
+                let admission = self.admit_tool_effect(session_id, "spawn_subagent", &args)?;
+                self.consume_tool_effect_lease(session_id, "spawn_subagent", &args, &admission)?;
                 // Fire-and-forget: returns immediately so multiple children run in parallel (#151).
                 self.spawn_gp_subagent_parallel(session_id, cwd, &prompt, &kind, cancel, event_tx)
             }
             "todo_write" => {
+                let admission = self.admit_tool_effect(session_id, "todo_write", &args)?;
+                self.consume_tool_effect_lease(session_id, "todo_write", &args, &admission)?;
                 let (items, merge) =
                     crate::todo_list::TodoList::from_tool_args(&args).map_err(|e| anyhow!(e))?;
                 let rendered = {
@@ -10456,6 +10531,10 @@ impl AgentHostHandle {
             return Ok(format!("DENIED by deny rule: MCP `{wire_name}`"));
         }
         let always = matches!(gate, ToolGate::AutoAllow);
+        let admission = match self.admit_tool_effect(session_id, wire_name, args) {
+            Ok(admission) => admission,
+            Err(error) => return Ok(format!("DENIED by capability lease: {error}")),
+        };
         let call_id = Uuid::new_v4().to_string();
         if !always {
             let decision = self
@@ -10491,6 +10570,10 @@ impl AgentHostHandle {
             status: ToolCallStatus::Running,
             input: args.clone(),
         });
+        if let Err(error) = self.consume_tool_effect_lease(session_id, wire_name, args, &admission)
+        {
+            return Ok(format!("DENIED by capability lease: {error}"));
+        }
         let result = tokio::select! {
             r = crate::mcp_runtime::call_mcp_tool(Some(cwd), server, tool, args.clone()) => r,
             _ = cancel.cancelled() => {
@@ -10600,6 +10683,10 @@ impl AgentHostHandle {
             return Ok(format!("DENIED by deny rule: tool `{tool_name}`"));
         }
         let always = matches!(gate, ToolGate::AutoAllow);
+        let admission = match self.admit_tool_effect(session_id, tool_name, input) {
+            Ok(admission) => admission,
+            Err(error) => return Ok(format!("DENIED by capability lease: {error}")),
+        };
 
         if needs_perm && !always {
             let decision = self
@@ -10644,6 +10731,11 @@ impl AgentHostHandle {
             ToolCallStatus::Running,
             None,
         );
+
+        if let Err(error) = self.consume_tool_effect_lease(session_id, tool_name, input, &admission)
+        {
+            return Ok(format!("DENIED by capability lease: {error}"));
+        }
 
         match f().await {
             Ok(tr) => {
@@ -10778,6 +10870,11 @@ impl AgentHostHandle {
             return Ok(msg);
         }
         let always = matches!(gate, ToolGate::AutoAllow);
+        let tool_input = serde_json::json!({ "command": command });
+        let admission = match self.admit_tool_effect(session_id, "run_terminal_cmd", &tool_input) {
+            Ok(admission) => admission,
+            Err(error) => return Ok(format!("DENIED by capability lease: {error}")),
+        };
 
         // Ask-tier risk forces a prompt even under allow-rules (unless YOLO).
         let force_ask = risk.tier == crate::exec_risk::RiskTier::Ask && !yolo;
@@ -10852,6 +10949,11 @@ impl AgentHostHandle {
             ToolCallStatus::Running,
             None,
         );
+        if let Err(error) =
+            self.consume_tool_effect_lease(session_id, "run_terminal_cmd", &tool_input, &admission)
+        {
+            return Ok(format!("DENIED by capability lease: {error}"));
+        }
         let _ = event_tx.send(SessionUpdate::ShellSessionStarted {
             session_id,
             call_id: call_id.clone(),

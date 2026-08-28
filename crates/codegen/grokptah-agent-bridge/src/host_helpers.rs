@@ -9,6 +9,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::capability_authority::{CapabilityAuthority, CapabilitySnapshot};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
 use crate::host::AgentHostHandle;
 use crate::local_tools;
@@ -1761,6 +1762,50 @@ struct ProviderObservationRoute {
     credential_binding: Option<OpaqueIdentity>,
 }
 
+fn consume_provider_send_lease(
+    authority: &CapabilityAuthority,
+    credentials: &crate::auth_store::WireCredentials,
+    selected_model: &str,
+    target: &ResolvedModelTarget,
+) -> Result<()> {
+    // Re-resolve immediately before every physical send. A profile edit,
+    // provider replacement, credential rotation, or capability downgrade
+    // therefore cannot leave an already-admitted request authorized.
+    let current = resolve_model_target(credentials, selected_model)?;
+    if current.base_url != target.base_url
+        || current.wire_model != target.wire_model
+        || current.dialect != target.dialect
+        || current.capabilities != target.capabilities
+    {
+        bail!("provider capability changed while the request was waiting to send");
+    }
+    let snapshot = CapabilitySnapshot::provider(
+        "provider-send",
+        &credentials.provider_id,
+        selected_model,
+        &target.base_url,
+        &target.wire_model,
+        &format!("{:?}", target.dialect),
+        &credentials.qualification_identity_fingerprint(),
+        &target.capabilities,
+        "provider-send",
+    )?;
+    let capability = authority.issue(
+        &snapshot,
+        Utc::now(),
+        crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+    )?;
+    let lease = authority.lease(
+        &capability,
+        &snapshot,
+        "provider.send",
+        Utc::now(),
+        chrono::Duration::seconds(5),
+    )?;
+    authority.consume(lease, &snapshot, Utc::now())?;
+    Ok(())
+}
+
 fn sha256_hex(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
@@ -2027,6 +2072,7 @@ where
     call_provider_agent_step(
         creds,
         target,
+        model,
         effort,
         messages,
         tools,
@@ -2044,6 +2090,7 @@ where
 async fn call_provider_agent_step<F, G>(
     mut creds: crate::auth_store::WireCredentials,
     target: ResolvedModelTarget,
+    selected_model: &str,
     effort: EffortLevel,
     messages: &[serde_json::Value],
     tools: &serde_json::Value,
@@ -2098,6 +2145,7 @@ where
     const MAX_TRANSIENT_RETRIES: u32 = 3;
     let mut transient_retries = 0u32;
     let mut last_err = None::<String>;
+    let provider_authority = CapabilityAuthority::new(true);
     for _request_attempt in 0..MAX_REQUEST_ATTEMPTS {
         if cancel.is_cancelled() {
             bail!("cancelled");
@@ -2124,6 +2172,7 @@ where
                     context.begin_attempt().ok().map(|attempt| (route, attempt))
                 });
 
+        consume_provider_send_lease(&provider_authority, &creds, selected_model, &target)?;
         let resp_result = tokio::select! {
             r = send_once(&creds).send() => r,
             _ = cancel.cancelled() => {
@@ -2221,6 +2270,12 @@ where
                             .and_then(|(route, context)| {
                                 context.begin_attempt().ok().map(|attempt| (route, attempt))
                             });
+                    consume_provider_send_lease(
+                        &provider_authority,
+                        &creds,
+                        selected_model,
+                        &target,
+                    )?;
                     resp = tokio::select! {
                         r = send_once(&creds).send() => match r {
                             Ok(response) => response,
@@ -2871,6 +2926,7 @@ pub async fn replay_xai_provider_contract_on_loopback(
     let step = call_provider_agent_step(
         credentials,
         target,
+        model,
         EffortLevel::None,
         messages,
         tools,
@@ -3659,8 +3715,8 @@ pub(crate) async fn call_xai_chat(
     if !target.capabilities.chat {
         bail!("provider model `{}` is not chat-capable", target.wire_model);
     }
-    let base = target.base_url;
-    let model_id = target.wire_model;
+    let base = target.base_url.clone();
+    let model_id = target.wire_model.clone();
     let request_timeout = target.deadline_class.chat_timeout();
     let is_compatible =
         target.dialect == crate::gateway_config::ProviderDialect::OpenAiChatCompletions;
@@ -3727,6 +3783,7 @@ pub(crate) async fn call_xai_chat(
         "stream": false
     });
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+    let provider_authority = CapabilityAuthority::new(true);
 
     let send_once = |c: &crate::auth_store::WireCredentials| {
         let req = client.post(&url).header("Content-Type", "application/json");
@@ -3734,6 +3791,7 @@ pub(crate) async fn call_xai_chat(
         req.json(&body)
     };
 
+    consume_provider_send_lease(&provider_authority, &creds, model, &target)?;
     let mut resp = send_once(&creds).send().await.map_err(|e| {
         // Surface classify-able transport failures (DNS, TLS, timeout) so the
         // UI is not a vague "error sending request".
@@ -3763,6 +3821,7 @@ pub(crate) async fn call_xai_chat(
         match crate::auth_store::force_refresh(&creds).await {
             Ok(fresh) => {
                 creds = fresh;
+                consume_provider_send_lease(&provider_authority, &creds, model, &target)?;
                 resp = send_once(&creds).send().await.map_err(|error| {
                     let class = if error.is_timeout() {
                         "timeout"

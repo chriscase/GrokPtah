@@ -90,9 +90,10 @@ impl DesktopComputerUse {
             ),
         };
         let simulator = store.clone().map(|store| {
-            Arc::new(ComputerUseService::new(
+            Arc::new(ComputerUseService::new_with_authority(
                 Arc::new(SimulatorBackend::new()),
                 store,
+                host.capability_authority(),
             ))
         });
         Self {
@@ -196,7 +197,8 @@ impl DesktopComputerUse {
             .bind_target(selection_token)
             .await
             .map_err(|error| error.to_string())?;
-        let service = ComputerUseService::new(backend, store);
+        let service =
+            ComputerUseService::new_with_authority(backend, store, self.host.capability_authority());
         let limits = ComputerUseLimits {
             max_actions: 1,
             max_duration_secs: 5 * 60,
@@ -387,7 +389,11 @@ impl DesktopComputerUse {
             .store
             .clone()
             .ok_or_else(|| self.initialization_error())?;
-        let service = Arc::new(ComputerUseService::new(backend, store));
+        let service = Arc::new(ComputerUseService::new_with_authority(
+            backend,
+            store,
+            self.host.capability_authority(),
+        ));
         let limits = ComputerUseLimits {
             max_actions: 8,
             max_duration_secs: 10 * 60,
@@ -568,26 +574,11 @@ impl DesktopComputerUse {
                     completed: false,
                 })
             }
-            ComputerAgentProposal::Complete { summary, .. } => {
-                let (service, run) = self.owned_service(owner_session_id, run_id)?;
-                if run.version != expected_version
-                    || run.state != ComputerRunState::Ready
-                    || run
-                        .current_observation
-                        .as_ref()
-                        .map(|observation| observation.observation_id.as_str())
-                        != Some(observation_id)
-                {
-                    return Err("The Computer Run changed while the model was responding".into());
-                }
-                service
-                    .complete(&Uuid::new_v4().to_string(), run_id, expected_version)
-                    .map_err(|error| error.to_string())?;
-                Ok(ComputerAgentProposalResult {
-                    snapshot: self.cockpit_snapshot(owner_session_id)?,
-                    summary,
-                    completed: true,
-                })
+            ComputerAgentProposal::Complete {
+                summary: _,
+                ..
+            } => {
+                Err("model-authored completion is not accepted; only a host-authored execution receipt can settle a Computer Run".into())
             }
         }
     }
@@ -1221,7 +1212,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_completion_only_revokes_authority_on_exact_current_frame() {
+    async fn model_completion_cannot_settle_a_run_without_a_host_receipt() {
         let (_dir, desktop) = test_desktop();
         let owner = Uuid::new_v4();
         let target = SimulatorBackend::demo_target();
@@ -1243,15 +1234,11 @@ mod tests {
                 },
             )
             .await
-            .unwrap();
-        assert!(result.completed);
-        let completed = result.snapshot.run.unwrap();
-        assert_eq!(completed.state, ComputerRunState::Completed);
-        assert!(completed
-            .grant
-            .as_ref()
-            .is_some_and(|grant| grant.revoked_at.is_some()));
-        assert_eq!(completed.action_count, 0);
+            .unwrap_err();
+        assert!(result.contains("host-authored execution receipt"));
+        let unchanged = desktop.cockpit_snapshot(owner).unwrap().run.unwrap();
+        assert_eq!(unchanged.state, ComputerRunState::Ready);
+        assert_eq!(unchanged.action_count, 0);
     }
 
     #[tokio::test]
