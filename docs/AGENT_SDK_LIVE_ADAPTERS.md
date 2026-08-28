@@ -532,13 +532,18 @@ authority.
 | SDK feature matrix (default / none / fake / conformance) | clean |
 | Reference consumer `fmt` / `clippy` / `test` | clean; 8 tests |
 | Bridge strict clippy, the exact CI command | clean apart from the two macOS-gated `computer_use` findings present at base |
-| Bridge `cargo test --locked --no-fail-fast -- --test-threads=1` | 725 passed; the pre-existing failures below |
+| Bridge `cargo test --locked --no-fail-fast -- --test-threads=1` | 29 targets, 724 passed; the 2 pre-existing failures below |
 | `sdk_live_conformance` (2 battery drivers + 9 focused) | 11 passed |
 | Live service + Desktop battery matrices | 15 passed / 0 failed / 11 skipped each, agreeing |
 
-The bridge sweep runs with `--no-fail-fast`. Without it `cargo test` stops at
-the first failing target and never reaches the ones after it — which is how an
-earlier packet reported a clean local sweep and then went red in CI.
+The bridge sweep runs with `--no-fail-fast`, and its output is read whole.
+Without `--no-fail-fast`, `cargo test` stops at the first failing target and
+never reaches the ones after it — which is how an earlier packet reported a
+clean local sweep and then went red in CI. Piping the report through `head`
+has the same effect one layer up: truncation cuts the *end*, so a later
+target's failure disappears while the count still looks plausible. One such
+report here read "715 passed, 1 failed" when the run had 29 targets, 724
+passing and 2 failing. A summary that can only under-report is not a summary.
 
 The nine focused live tests: two-principal run reads, redacted receipts, host
 contract version, session idempotency, credential rotation across a host
