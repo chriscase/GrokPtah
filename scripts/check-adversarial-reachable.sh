@@ -36,7 +36,7 @@ cargo test --locked --manifest-path "$iso" --test adversarial_matrix -- --list 2
 
 # Safety/authority invariants that must never silently stop being exercised.
 expected='
-cleanup::tests::incomplete_cleanup_is_uncertain
+cleanup::tests::incomplete_observation_is_uncertain
 git_hermetic::tests::rejects_alternates_replace_index_hooks_and_unpinned_git
 host_tests::crash_after_inject_then_two_restarts_do_not_replay
 host_tests::duplicate_dispatch_is_exactly_once
