@@ -405,6 +405,15 @@ fn signing_key(root: &Path) -> Result<SigningKey> {
     match fs::read(&public_key_path) {
         Ok(existing) if existing == public_key => {}
         Ok(_) => return Err(anyhow!("canonical authority public key mismatch")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&public_key_path)?;
+            file.write_all(&public_key)?;
+            set_private_permissions(&file)?;
+            file.sync_all()?;
+        }
         Err(error) => return Err(error.into()),
     };
     Ok(key)
