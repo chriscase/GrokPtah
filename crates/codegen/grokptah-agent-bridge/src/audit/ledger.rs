@@ -703,6 +703,8 @@ impl AuditLedger {
             .ok_or(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid))?;
         if last.state != GenerationState::Active
             || last.generation_id != manifest.active_generation_id
+            || last.key_id != manifest.key_id
+            || last.key_epoch != manifest.key_epoch
         {
             return Err(AuditError::Poisoned(PoisonReason::ActiveGenerationInvalid));
         }
