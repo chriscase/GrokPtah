@@ -29,8 +29,28 @@ impl ComputerStore {
         self.inner.write_lease.lock().clone()
     }
 
-    pub(crate) fn bind_lifecycle(&self, lifecycle: &Arc<crate::host_runtime::HostLifecycle>) {
-        self.inner.write_lease.lock().bind(lifecycle);
+    /// Test seam: replace this handle's authority with one that grants nothing,
+    /// modelling a clone whose runtime has sealed durable writes.
+    #[cfg(test)]
+    pub(crate) fn deny_lease_for_test(&self, reason: &str) {
+        *self.inner.write_lease.lock() = crate::host_runtime::WriteLease::denied(reason);
+    }
+
+    /// Bind to the runtime that owns this handle's home.
+    ///
+    /// Returns `false` without touching this handle's authority when that
+    /// runtime owns a different home: authority is never borrowed across
+    /// homes.
+    pub(crate) fn bind_lifecycle(
+        &self,
+        lifecycle: &Arc<crate::host_runtime::HostLifecycle>,
+    ) -> bool {
+        let Some(rebound) = crate::host_runtime::WriteLease::bound_to(&self.inner.root, lifecycle)
+        else {
+            return false;
+        };
+        *self.inner.write_lease.lock() = rebound;
+        true
     }
 }
 
@@ -79,6 +99,17 @@ impl ComputerStore {
 
     pub fn open(root: impl AsRef<Path>) -> anyhow::Result<Self> {
         let root = root.as_ref().to_path_buf();
+        // Authority before mutation (#455): nothing is created on a home this
+        // process may not write.
+        let write_lease = crate::host_runtime::WriteLease::for_store_root(&root);
+        // Held, not merely taken: the guard covers the layout creation and the
+        // store lock below. A guard dropped at the end of its own statement is
+        // a check, and a check can go stale before the mutation (#455).
+        let _open_write = write_lease
+            .begin("opening the durable Computer Run ledger")
+            .map_err(|error| {
+                anyhow::anyhow!("durable-write authority for the Computer Run ledger: {error:#}")
+            })?;
         fs::create_dir_all(root.join("runs"))?;
         fs::create_dir_all(root.join("receipts"))?;
         let root = dunce::canonicalize(root)?;
@@ -97,7 +128,7 @@ impl ComputerStore {
         })?;
         let store = Self {
             inner: Arc::new(ComputerStoreInner {
-                write_lease: Mutex::new(crate::host_runtime::WriteLease::for_store_root(&root)),
+                write_lease: Mutex::new(write_lease),
                 root,
                 _store_lock: store_lock,
                 lock: Mutex::new(()),
@@ -212,7 +243,7 @@ impl ComputerStore {
             result: None,
             error: None,
         };
-        write_json_exclusive(&path, &receipt).map_err(internal_error)?;
+        write_json_exclusive(&self.lease(), &path, &receipt).map_err(internal_error)?;
         Ok(MutationClaim::Perform)
     }
 
@@ -330,7 +361,9 @@ impl ComputerStore {
         Ok(())
     }
 
-    fn prune_retention(&self) -> ComputerResult<()> {
+    /// Retention pass. Public so lifecycle tests can drive the durable-remove
+    /// primitive directly and prove it refuses a stale handle (#455).
+    pub fn prune_retention(&self) -> ComputerResult<()> {
         let _guard = self.inner.lock.lock();
         let now = Utc::now();
 
@@ -572,7 +605,12 @@ fn atomic_write_json<T: Serialize>(
     Ok(())
 }
 
-fn write_json_exclusive<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+fn write_json_exclusive<T: Serialize>(
+    lease: &crate::host_runtime::WriteLease,
+    path: &Path,
+    value: &T,
+) -> anyhow::Result<()> {
+    let _write = lease.begin("creating a durable Computer Run record")?;
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(&serde_json::to_vec_pretty(value)?)?;
     file.sync_all()?;
@@ -587,6 +625,56 @@ fn internal_error(error: impl ToString) -> ComputerError {
 
 #[cfg(test)]
 mod tests {
+    /// P0 — bypass inventory, Computer Run half.
+    ///
+    /// `claim_mutation` reaches `write_json_exclusive`, and `complete_mutation`
+    /// reaches `atomic_write_json`; neither goes through the append that was
+    /// guarded first. A handle whose runtime has sealed must be refused through
+    /// both, and must leave no receipt behind when it is.
+    #[test]
+    fn computer_mutation_primitives_refuse_a_sealed_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ComputerStore::open(dir.path().join("computer")).unwrap();
+        let hash = "a".repeat(64);
+
+        // Live: the claim/complete pair works, so the refusals below are the
+        // lease deciding rather than the store being unusable.
+        assert!(matches!(
+            store.claim_mutation("req-live", "op", &hash).unwrap(),
+            MutationClaim::Perform
+        ));
+        store
+            .complete_mutation("req-live", &Ok(serde_json::Value::Null))
+            .unwrap();
+
+        let stale = store.clone();
+        stale.deny_lease_for_test("the runtime that opened this handle has sealed");
+
+        let claim = stale.claim_mutation("req-stale", "op", &hash);
+        assert!(
+            claim.is_err(),
+            "an exclusive receipt create must refuse a sealed handle"
+        );
+        assert!(
+            !dir.path()
+                .join("computer")
+                .join("receipts")
+                .join("req-stale.json")
+                .exists(),
+            "a refused claim must not leave a receipt on disk"
+        );
+        assert!(
+            stale
+                .complete_mutation("req-live", &Ok(serde_json::Value::Null))
+                .is_err(),
+            "a receipt update must refuse a sealed handle"
+        );
+
+        // The lease is shared through the handle's inner, so the original is
+        // refused too: authority does not survive in one clone of a handle.
+        assert!(store.claim_mutation("req-after", "op", &hash).is_err());
+    }
+
     use std::collections::BTreeSet;
 
     use chrono::Duration;

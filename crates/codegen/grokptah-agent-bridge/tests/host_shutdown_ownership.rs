@@ -1175,3 +1175,363 @@ async fn headless_construction_fails_before_reading_credentials_or_state() {
     let replacement = restart_same_home_now(&lane);
     drop(replacement);
 }
+
+// ---------------------------------------------------------------------------
+// Negative controls for the second correction packet: each of these bites
+// against a specific bypass that existed before it was closed.
+// ---------------------------------------------------------------------------
+
+/// P0 — the check-only probe was a TOCTOU.
+///
+/// An unbound handle used to *probe* the instance lock and then write. A
+/// `HostRuntime` could acquire the lock between the probe and the write and the
+/// writer would never know. The handle now **holds** the lock for its whole
+/// lifetime, so the negative control is decisive: while the handle is alive a
+/// replacement host cannot be constructed at all, and once it is dropped the
+/// host starts immediately.
+#[test]
+fn an_offline_handle_holds_the_home_lock_for_its_whole_lifetime() {
+    let lane = Lane::new();
+    let store = OrchStore::open(lane.grokptah_home().join("orchestration"))
+        .expect("no runtime owns this home, so offline maintenance may take it");
+
+    // A momentary probe would have said "free" here. The retained lock does not.
+    assert!(
+        grokptah_agent_bridge::instance_lock_is_held(&lane.instance_lock()),
+        "an offline handle must hold the home's lock, not merely have probed it"
+    );
+    // The decisive form of that claim: the handle can say it *is* the owner.
+    // A reintroduced check-only probe would leave this false while writes kept
+    // succeeding, so this assertion is what bites if the TOCTOU comes back.
+    assert!(
+        store.holds_home_lock_itself(),
+        "an unowned-home handle must retain the OS lock itself, not authorize from a probe"
+    );
+    assert!(
+        !store.is_lease_bound(),
+        "there is no runtime to be bound to; the authority must be the retained lock"
+    );
+    let refused = AgentHost::create(HostConfig::default());
+    assert!(
+        refused.is_err(),
+        "a host must not start beside a live offline maintenance handle"
+    );
+    // And the handle can still write, because it is the owner.
+    assert!(probe_store_write(&store, Uuid::nil()).is_ok());
+
+    drop(store);
+    let runtime = AgentHost::create(HostConfig::default())
+        .expect("the home is free once the offline handle is dropped");
+    runtime.start().unwrap();
+    drop(runtime);
+}
+
+/// P0 — mutation before authority.
+///
+/// `OrchStore::open` and `ComputerStore::open` used to create their whole
+/// directory layout and `.store.lock` before proving anything. On a home
+/// another process owns, the refusal must now leave the filesystem untouched.
+#[test]
+fn a_refused_store_open_creates_nothing() {
+    if std::env::var_os(LOCK_HOLDER_ENV).is_some() {
+        return;
+    }
+    let lane = Lane::new();
+    let home = lane.grokptah_home();
+    std::fs::create_dir_all(&home).unwrap();
+    let release = home.join("release-the-lock");
+
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "holds_the_instance_lock_until_released",
+            "--nocapture",
+            "--test-threads=1",
+            "--ignored",
+        ])
+        .env(LOCK_HOLDER_ENV, "1")
+        .env("GROKPTAH_HOME", &home)
+        .env("GROKPTAH_LOCK_RELEASE", &release)
+        .spawn()
+        .expect("re-exec as the lock holder");
+    let mut child = ChildGuard {
+        child,
+        release: release.clone(),
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !grokptah_agent_bridge::instance_lock_is_held(&lane.instance_lock()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child never took the lock"
+        );
+        assert!(
+            child.child.try_wait().unwrap().is_none(),
+            "child exited early"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let orch_root = home.join("orchestration-untouched");
+    let computer_root = home.join("computer-untouched");
+    assert!(OrchStore::open(&orch_root).is_err());
+    assert!(
+        !orch_root.exists(),
+        "a refused orchestration open must not have created its layout"
+    );
+    assert!(grokptah_agent_bridge::computer_use::ComputerStore::open(&computer_root).is_err());
+    assert!(
+        !computer_root.exists(),
+        "a refused Computer Run open must not have created its layout"
+    );
+
+    child.release();
+}
+
+/// P0 — bypass inventory. Each of these public entry points reaches a durable
+/// primitive that was **not** the audit append: exclusive create, durable
+/// remove, and the Computer Run mutation claim. A stale clone must be refused
+/// through every one of them, not merely through the one that was guarded
+/// first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn every_durable_primitive_refuses_a_stale_clone() {
+    let lane = Lane::new();
+    let (runtime, session_id) = lane.boot();
+    let orch = runtime.ensure_orchestration_store().unwrap();
+    let computer = runtime.ensure_computer_store().unwrap();
+    let stale_orch = orch.clone();
+    let stale_computer = computer.clone();
+
+    // Live: each primitive works.
+    assert!(probe_store_write(&orch, session_id).is_ok(), "audit append");
+    assert!(
+        orch.claim_idempotency("probe", "req-live", "hash-live")
+            .is_ok(),
+        "exclusive create"
+    );
+    assert!(
+        orch.prune_retention(Default::default()).is_ok(),
+        "durable remove / retention"
+    );
+
+    assert_clean_shutdown(&runtime.shutdown().await);
+
+    // Stale: every one of them is refused.
+    let mut refusals: Vec<(&str, String)> = Vec::new();
+    if let Err(error) = probe_store_write(&stale_orch, session_id) {
+        refusals.push(("audit append", format!("{error:#}")));
+    }
+    if let Err(error) = stale_orch.claim_idempotency("probe", "req-stale", "hash-stale") {
+        refusals.push(("exclusive create", format!("{error:?}")));
+    }
+    if let Err(error) = stale_orch.prune_retention(Default::default()) {
+        refusals.push(("durable remove", format!("{error:#}")));
+    }
+    if let Err(error) = stale_computer.prune_retention() {
+        refusals.push(("computer retention", format!("{error:?}")));
+    }
+    assert_eq!(
+        refusals.len(),
+        4,
+        "every durable primitive must refuse a stale clone; got {refusals:?}"
+    );
+
+    let replacement = restart_same_home_now(&lane);
+    drop(replacement);
+}
+
+/// P0 — external effects must not survive lock release.
+///
+/// Sealing durable writes says nothing about a supervised task that is still
+/// running: it can edit the workspace, send to a provider, or drive Computer
+/// Use. `Drop` therefore releases only when nothing is outstanding, and this
+/// proves an old task cannot act after a new host would have acquired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
+async fn drop_with_an_outstanding_task_refuses_a_replacement_host() {
+    let lane = Lane::new();
+    let (mut runtime, session_id) = lane.boot();
+    runtime.set_durable_write_seal_timeout(Duration::from_millis(100));
+    let handle = runtime.handle();
+
+    // A supervised task that ignores cancellation — the shape of an effectful
+    // task mid-flight: it performs no durable write, only an external effect.
+    let released = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let acted_after_release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let entered_tx = entered.clone();
+    let release_rx = released.clone();
+    let acted = acted_after_release.clone();
+    handle
+        .spawn_supervised("an effectful task", async move {
+            entered_tx.notify_one();
+            release_rx.notified().await;
+            acted.store(true, std::sync::atomic::Ordering::Release);
+        })
+        .expect("a running host supervises work");
+    entered.notified().await;
+    assert!(runtime.supervised_task_count() > 0);
+
+    drop(runtime);
+
+    // Fail closed: the task is still outstanding, so the home is not handed on.
+    let refused = AgentHost::create(HostConfig::default());
+    assert!(
+        refused.is_err(),
+        "a replacement must not start while a supervised task can still act"
+    );
+    assert!(
+        !acted_after_release.load(std::sync::atomic::Ordering::Acquire),
+        "the task has not acted yet; the refusal is what matters"
+    );
+
+    // Even after the task finishes, the retained lock stays retained for this
+    // process — Drop cannot await, so it has no later point to re-check.
+    released.notify_one();
+    handle.shutdown_signal().cancelled().await;
+    let still_refused = AgentHost::create(HostConfig::default());
+    assert!(
+        still_refused.is_err(),
+        "a lock retained by Drop stays retained for the life of the process"
+    );
+    let _ = session_id;
+}
+
+/// P0 — an *external* effect must not survive the lock release either.
+///
+/// The durable-write seal only covers writes to the home. A supervised task can
+/// also touch the world outside it: a workspace edit, a Computer Use input, a
+/// provider send. Those effects have no guard to refuse them, so the only thing
+/// standing between an old task and a replacement host is the join.
+///
+/// This test is adversarial about that join. The old task's effect is a file
+/// written **outside** the home — nothing in the lease machinery can stop it —
+/// and it is racing a replacement that acquires the moment the lock frees. The
+/// property proved is ordering, not refusal: by the time a replacement can
+/// acquire, the effectful task has already run to completion and been joined,
+/// so there is never a moment when both an old effect and a new owner are live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::await_holding_lock)]
+async fn an_effectful_task_cannot_act_after_a_replacement_acquires() {
+    let lane = Lane::new();
+    let (runtime, _session_id) = lane.boot();
+    let handle = runtime.handle();
+
+    // The effect lands outside the home, so no durable-write guard governs it.
+    let effect_path = lane.ws().join("external-effect.txt");
+    let effect_for_task = effect_path.clone();
+    // Observed by the task at the instant it acts: was the home already free?
+    let acted_while_home_was_free = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = acted_while_home_was_free.clone();
+    let lock_path = lane.instance_lock();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let entered_tx = entered.clone();
+
+    handle
+        .spawn_supervised("an effectful task outside the home", async move {
+            entered_tx.notify_one();
+            // Yield enough times that a shutdown racing this task would have
+            // every chance to seal and release before the effect lands.
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            // `flock` is per open-file-description, so this same-process probe
+            // is meaningful: it is false exactly while some handle owns the home.
+            if !grokptah_agent_bridge::instance_lock_is_held(&lock_path) {
+                observed.store(true, std::sync::atomic::Ordering::Release);
+            }
+            std::fs::write(&effect_for_task, b"the old runtime acted here").unwrap();
+        })
+        .expect("a running host supervises work");
+    entered.notified().await;
+
+    // Ordered shutdown must join that task before it releases the lock.
+    assert_clean_shutdown(&runtime.shutdown().await);
+
+    // The effect completed *before* the release, never after it.
+    assert!(
+        effect_path.is_file(),
+        "an ordered shutdown joins effectful work rather than abandoning it"
+    );
+    assert!(
+        !acted_while_home_was_free.load(std::sync::atomic::Ordering::Acquire),
+        "a supervised task must never act while the home is unowned; the join is \
+         what keeps an old effect and a new owner from ever being live together"
+    );
+
+    // A replacement can now take the home, and the stale handle can no longer
+    // introduce a new effectful task into it.
+    let replacement = restart_same_home_now(&lane);
+    assert!(
+        handle
+            .spawn_supervised("a late effectful task", async {})
+            .is_err(),
+        "a stale handle must not be able to spawn effectful work into a home a \
+         replacement now owns"
+    );
+
+    // Negative control: the same task shape, spawned *outside* supervision, does
+    // reach the hazardous state. This is what proves the assertion above is
+    // testing supervision rather than a timing accident — if `spawn_supervised`
+    // silently degraded to a bare spawn, the assertion above would still pass
+    // while this one shows the window it was supposed to close.
+    let lock_path = lane.instance_lock();
+    let unsupervised_saw_a_foreign_owner = tokio::spawn(async move {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        // The home is owned again — by the *replacement*, not by the runtime
+        // that spawned this task. An unjoined task cannot tell the difference,
+        // which is exactly why the join, not a probe, is the guarantee.
+        grokptah_agent_bridge::instance_lock_is_held(&lock_path)
+    })
+    .await
+    .unwrap();
+    assert!(
+        unsupervised_saw_a_foreign_owner,
+        "the probe used above must be able to observe an owned home, or the \
+         negative assertion would be vacuous"
+    );
+
+    assert_clean_shutdown(&replacement.shutdown().await);
+}
+
+/// P1 — a lease may only be bound to a runtime that owns its home.
+///
+/// Binding is refused across homes, and — the part that matters — the refusal
+/// does not silently hand the foreign ledger this runtime's authority. It
+/// keeps the OS lock it took for its own home at open, so it still writes its
+/// own home and gains nothing over this one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_store_cannot_be_bound_to_a_runtime_that_owns_another_home() {
+    let lane = Lane::new();
+    let (runtime, _session_id) = lane.boot();
+
+    // A ledger under a *different* home than the one this runtime owns.
+    let other = tempfile::tempdir().unwrap();
+    let foreign = OrchStore::open(other.path().join(".grokptah").join("orchestration"))
+        .expect("the foreign home is unowned");
+    assert!(
+        !runtime.bind_store_for_test(&foreign),
+        "a runtime must not adopt a ledger for a home it does not own"
+    );
+    assert!(
+        !foreign.is_lease_bound(),
+        "the refused bind must leave the foreign ledger on its own authority, \
+         not on this runtime's lifecycle"
+    );
+    // The foreign ledger still owns its own home and still writes there.
+    assert!(probe_store_write(&foreign, Uuid::nil()).is_ok());
+
+    // The decisive half: this runtime shutting down must not affect a home it
+    // never owned, and the foreign ledger must not have inherited authority
+    // over *this* runtime's home either.
+    assert_clean_shutdown(&runtime.shutdown().await);
+    assert!(
+        probe_store_write(&foreign, Uuid::nil()).is_ok(),
+        "a ledger holding its own home's lock is unaffected by another home's shutdown"
+    );
+
+    drop(foreign);
+}

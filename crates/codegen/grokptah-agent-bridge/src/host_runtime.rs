@@ -77,6 +77,36 @@ fn owner_key(lock_path: &std::path::Path) -> PathBuf {
     }
 }
 
+/// The single-instance lock that governs durable writes to `root`.
+///
+/// A durable root inside a GrokPtah home is governed by **that home's** lock, so
+/// one runtime's `.instance.lock` covers every durable surface it owns —
+/// orchestration ledger, Computer Run ledger, event journal — and stopping the
+/// runtime seals all of them together.
+///
+/// A root that is *not* inside a home governs itself: its lock lives in the root
+/// rather than in its parent. Deriving the home by simply taking the parent is
+/// wrong for such a root — it would put the lock in whatever directory happens
+/// to contain it (the system temp directory, a user's home, a checkout) and make
+/// every unrelated root under that directory contend for one lock, or worse,
+/// believe an unrelated lock protects it. Two writers on the same root are still
+/// excluded, which is the property the lease actually needs (#455).
+///
+/// "Inside a home" is decided by evidence, never by shape: either a live runtime
+/// is registered for the parent, or the parent *is* the home this process is
+/// configured to use.
+fn governing_home_lock(root: &std::path::Path) -> PathBuf {
+    if let Some(parent) = root.parent() {
+        let parent_lock = owner_key(&parent.join(".instance.lock"));
+        let parent_is_a_home = registered_owner(&parent_lock).is_some()
+            || owner_key(&crate::discover::grokptah_home().join(".instance.lock")) == parent_lock;
+        if parent_is_a_home {
+            return parent_lock;
+        }
+    }
+    owner_key(&root.join(".instance.lock"))
+}
+
 /// The live runtime that owns `home_lock_path`, if any.
 fn registered_owner(home_lock_path: &std::path::Path) -> Option<Arc<HostLifecycle>> {
     let mut owners = CURRENT_OWNERS.lock();
@@ -203,6 +233,22 @@ pub(crate) struct HostLifecycle {
 /// guard is alive the shutdown seal waits for it; once the seal holds, no new
 /// guard is ever issued, so a stale handle cannot write to a home a replacement
 /// process now owns.
+///
+/// `#[must_use]` is load-bearing, not decoration. A guard that is produced and
+/// immediately dropped —
+///
+/// ```ignore
+/// lease.begin("writing")?;      // refused: the guard dies on this line
+/// let _write = lease.begin("writing")?;  // correct: authority is *held*
+/// ```
+///
+/// — degrades this from held authority into a check-only probe, which is the
+/// exact TOCTOU the lease exists to remove: the seal could take effect between
+/// the answer and the mutation it was supposed to authorize. Under
+/// `clippy -D warnings` the unbound form is a compile error, so this bypass
+/// class cannot reappear silently at any of the durable-mutation sites (#455).
+#[must_use = "durable-write authority must be held across the mutation it authorizes; \
+              binding the guard (`let _write = …`) is what makes it a lease rather than a probe"]
 pub(crate) struct DurableWriteGuard {
     lifecycle: Arc<HostLifecycle>,
     /// Whether this guard is part of the in-flight count the seal waits on.
@@ -596,6 +642,51 @@ impl HostShutdownReport {
     }
 }
 
+/// Exclusive ownership of a home that no runtime owns, held for the whole
+/// lifetime of the handle that carries it.
+///
+/// This replaces what used to be a check-only probe. A momentary
+/// `instance_lock_is_held` test proves nothing: a `HostRuntime` can acquire the
+/// lock between the probe and the write, and the writer would never know. The
+/// only sound answer is to *hold* the lock — so an offline maintenance handle
+/// takes the same OS lock a host would and keeps it until it is dropped. A
+/// replacement host is then refused for as long as the handle can still write,
+/// which is exactly the invariant the probe could not provide (#455).
+pub(crate) struct OfflineMaintenanceAuthority {
+    _lock: InstanceLock,
+    home_lock_path: PathBuf,
+}
+
+impl OfflineMaintenanceAuthority {
+    /// Take exclusive ownership of an unowned home, or fail.
+    fn acquire(home_lock_path: &std::path::Path) -> Result<Self> {
+        let home = home_lock_path.parent().unwrap_or(home_lock_path);
+        let lock = InstanceLock::try_acquire_path(home_lock_path, home)?;
+        Ok(Self {
+            _lock: lock,
+            home_lock_path: home_lock_path.to_path_buf(),
+        })
+    }
+
+    pub(crate) fn home_lock_path(&self) -> &std::path::Path {
+        &self.home_lock_path
+    }
+}
+
+/// How a durable handle proves it may write.
+enum LeaseState {
+    /// A live runtime owns this home; its lifecycle decides, and the write is
+    /// counted against that runtime's shutdown seal.
+    Runtime(std::sync::Weak<HostLifecycle>),
+    /// No runtime owns this home, so the handle owns it: the OS lock is held
+    /// for the handle's whole lifetime, not merely probed.
+    Offline(OfflineMaintenanceAuthority),
+    /// Authority could not be established at open. Every write fails closed
+    /// with this reason; the handle never retries, because retrying a refusal
+    /// is how a writer talks itself into a home someone else owns.
+    Denied(String),
+}
+
 /// The durable-write authority a **store handle** carries.
 ///
 /// `OrchStore`, `ComputerStore` and the event journal are cloneable handles on
@@ -605,84 +696,111 @@ impl HostShutdownReport {
 /// the check travels with the clone instead of living at a call site someone
 /// has to remember.
 ///
-/// A lease resolves its authority at every write, never once at open:
-///
-/// * bound to a live lifecycle → that runtime's authority, refused once it is
-///   quiescing, closed, or sealed;
-/// * bound to a lifecycle that is gone → refused; the handle is stale by
-///   definition;
-/// * unbound, but a runtime is registered for this home now → refused; the
-///   handle was opened outside the owner that holds the home;
-/// * unbound, and the OS instance lock is held → refused; another process owns
-///   this home and registry absence is not authority;
-/// * unbound and the home is genuinely unowned → allowed. This is the library
-///   and test path, and it is the only case where a write proceeds without a
-///   runtime.
+/// Authority is established **once, at open**, and is either a live runtime's
+/// lifecycle or a retained OS lock. There is no path that authorizes a write
+/// from the *absence* of an owner, and none that authorizes one from a probe
+/// whose answer may already be stale.
 #[derive(Clone)]
 pub(crate) struct WriteLease {
     home_lock_path: PathBuf,
-    bound: Option<std::sync::Weak<HostLifecycle>>,
+    state: Arc<LeaseState>,
 }
 
 impl WriteLease {
-    /// A lease for a durable root, bound to whichever runtime owns the home
-    /// containing it at open time.
-    ///
-    /// `root` is a store directory inside the home (`…/.grokptah/orchestration`),
-    /// so the home is its parent; a root that is the home itself resolves to
-    /// the same key through canonicalization.
+    /// A lease for a durable root, resolved against the home that governs it.
     pub(crate) fn for_store_root(root: &std::path::Path) -> Self {
-        let home = root.parent().unwrap_or(root);
-        let home_lock_path = owner_key(&home.join(".instance.lock"));
-        let bound = registered_owner(&home_lock_path).map(|owner| Arc::downgrade(&owner));
+        Self::for_home_lock(&governing_home_lock(root))
+    }
+
+    fn for_home_lock(home_lock_path: &std::path::Path) -> Self {
+        let state = match registered_owner(home_lock_path) {
+            Some(owner) => LeaseState::Runtime(Arc::downgrade(&owner)),
+            None => match OfflineMaintenanceAuthority::acquire(home_lock_path) {
+                Ok(authority) => LeaseState::Offline(authority),
+                Err(error) => LeaseState::Denied(format!(
+                    "no GrokPtah runtime owns {} and its single-instance lock could not be \
+                     taken for offline maintenance ({error:#})",
+                    home_lock_path.display()
+                )),
+            },
+        };
         Self {
-            home_lock_path,
-            bound,
+            home_lock_path: home_lock_path.to_path_buf(),
+            state: Arc::new(state),
         }
     }
 
-    /// Bind (or rebind) this lease to the runtime that owns it. Used when a
-    /// host installs a store it did not open itself.
-    pub(crate) fn bind(&mut self, lifecycle: &Arc<HostLifecycle>) {
-        self.bound = Some(Arc::downgrade(lifecycle));
+    /// A lease bound to a runtime from the start, for handles the runtime opens
+    /// itself.
+    ///
+    /// Returns `None` when the runtime does not own the home this root lives
+    /// in (P1 of the third correction packet): a handle must never borrow
+    /// authority for a home its binder does not hold, so a foreign root keeps
+    /// whatever authority it established at open — its own retained OS lock —
+    /// instead of silently inheriting this runtime's.
+    pub(crate) fn bound_to(root: &std::path::Path, lifecycle: &Arc<HostLifecycle>) -> Option<Self> {
+        // The same rule `for_store_root` uses, so a bind can never disagree
+        // with the authority the handle established at open.
+        let home_lock_path = governing_home_lock(root);
+        if home_lock_path != owner_key(lifecycle.lock_path()) {
+            return None;
+        }
+        Some(Self {
+            home_lock_path,
+            state: Arc::new(LeaseState::Runtime(Arc::downgrade(lifecycle))),
+        })
     }
 
+    /// A lease that authorizes nothing, for a durable surface that has no home
+    /// yet (an in-memory event bus with no persist directory).
+    pub(crate) fn denied(reason: impl Into<String>) -> Self {
+        Self {
+            home_lock_path: PathBuf::new(),
+            state: Arc::new(LeaseState::Denied(reason.into())),
+        }
+    }
+
+    /// Whether this handle is bound to a live runtime rather than owning the
+    /// home itself.
     pub(crate) fn is_bound(&self) -> bool {
-        self.bound.is_some()
+        matches!(self.state.as_ref(), LeaseState::Runtime(_))
+    }
+
+    /// Whether this handle holds the home's OS lock itself.
+    pub(crate) fn is_offline_owner(&self) -> bool {
+        matches!(self.state.as_ref(), LeaseState::Offline(_))
+    }
+
+    pub(crate) fn home_lock_path(&self) -> &std::path::Path {
+        &self.home_lock_path
     }
 
     /// Authorize one durable effect through this handle, or fail closed.
     pub(crate) fn begin(&self, operation: &str) -> Result<DurableWriteGuard> {
-        if let Some(bound) = self.bound.as_ref() {
-            let Some(lifecycle) = bound.upgrade() else {
-                bail!(
-                    "{operation} is refused: this durable handle outlived the GrokPtah runtime \
-                     that opened {}",
-                    self.home_lock_path.display()
-                );
-            };
-            return lifecycle.begin_durable_write(operation);
+        match self.state.as_ref() {
+            LeaseState::Runtime(bound) => {
+                let Some(lifecycle) = bound.upgrade() else {
+                    bail!(
+                        "{operation} is refused: this durable handle outlived the GrokPtah \
+                         runtime that opened {}",
+                        self.home_lock_path.display()
+                    );
+                };
+                lifecycle.begin_durable_write(operation)
+            }
+            // The OS lock is held for this handle's lifetime, so no runtime can
+            // be starting underneath this write. Uncounted because there is no
+            // lifecycle to seal against — the retained lock itself is the seal.
+            //
+            // The guard's home comes from the retained authority rather than
+            // this handle's copy of the path, so the write is attributed to the
+            // lock actually held and the two can never be reported apart.
+            LeaseState::Offline(authority) => Ok(DurableWriteGuard {
+                lifecycle: HostLifecycle::build(None, authority.home_lock_path().to_path_buf()),
+                counted: false,
+            }),
+            LeaseState::Denied(reason) => bail!("{operation} is refused: {reason}"),
         }
-        if let Some(owner) = registered_owner(&self.home_lock_path) {
-            // Somebody owns the home this handle was opened outside of. Do not
-            // borrow their authority — the handle is not theirs.
-            let _ = owner;
-            bail!(
-                "{operation} is refused: this durable handle is not bound to the GrokPtah \
-                 runtime that now owns {}",
-                self.home_lock_path.display()
-            );
-        }
-        if crate::instance_lock::instance_lock_is_held(&self.home_lock_path) {
-            bail!(
-                "{operation} is refused: another process holds the single-instance lock for {}",
-                self.home_lock_path.display()
-            );
-        }
-        Ok(DurableWriteGuard {
-            lifecycle: HostLifecycle::build(None, self.home_lock_path.clone()),
-            counted: false,
-        })
     }
 }
 
@@ -1077,23 +1195,35 @@ impl Drop for HostRuntime {
         self.lifecycle.mark_closed();
 
         let sealed = self.lifecycle.seal_durable_writes(self.write_seal_timeout);
-        if !sealed {
+
+        // Sealing durable writes is not enough to make a release safe. A
+        // supervised task that is still running can act *outside* the durable
+        // home — edit the user's workspace, send a physical provider request,
+        // drive Computer Use input, hold a shell — and none of that is bounded
+        // by the durable-write seal. Handing the lock to a replacement host
+        // while any such task is outstanding is exactly the split brain this
+        // seam exists to prevent, so `Drop` releases only when nothing is
+        // outstanding at all (#455). Until every effect is bound to this
+        // lifecycle (#454 / #463), "no supervised task" is the honest proxy
+        // for "no effect can still happen".
+        //
+        // Retaining is permanent for this process: `Drop` cannot await, so
+        // there is no later point at which it could re-check. The OS reclaims
+        // the lock when the process exits, and until then a replacement is
+        // refused. `shutdown().await` is the path that joins and releases.
+        let outstanding_after = self.lifecycle.tasks().len();
+        if !sealed || outstanding_after > 0 {
             eprintln!(
-                "[grokptah] host runtime for {} dropped with {} durable write(s) still in \
-                 progress; the instance lock is RETAINED so no replacement process can write \
-                 this home. Await HostRuntime::shutdown() for an ordered stop.",
+                "[grokptah] host runtime for {} dropped without an ordered shutdown: \
+                 {} durable write(s) in flight, {outstanding_after} supervised task(s) \
+                 outstanding. The instance lock is RETAINED for the life of this process so \
+                 no replacement can start beside work that may still act. Await \
+                 HostRuntime::shutdown() for an ordered stop.",
                 self.lifecycle.lock_path().display(),
-                self.lifecycle.in_flight_durable_writes()
+                self.lifecycle.in_flight_durable_writes(),
             );
+            let _ = outstanding;
             return;
-        }
-        if outstanding > 0 {
-            eprintln!(
-                "[grokptah] host runtime for {} dropped with {outstanding} supervised task(s) \
-                 still running; durable writes are sealed, so the lock release is safe, but \
-                 await HostRuntime::shutdown() for an ordered stop.",
-                self.lifecycle.lock_path().display()
-            );
         }
         self.lifecycle.release_process_lock();
     }

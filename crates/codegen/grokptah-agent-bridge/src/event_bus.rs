@@ -62,6 +62,46 @@ pub struct EventBus {
     lagged_events: Arc<AtomicU64>,
     persistence_error: Arc<Mutex<Option<String>>>,
     journal_gap: Arc<Mutex<Option<(u64, u64)>>>,
+    /// Durable-write authority for the journal, shared by every clone of this
+    /// bus (#455). A bus with no persist directory has no home and authorizes
+    /// nothing; `with_persist_dir` resolves the real one.
+    write_lease: Arc<Mutex<crate::host_runtime::WriteLease>>,
+    /// The directory the journal persists into, kept so the authority above can
+    /// be re-checked against the home a runtime actually owns.
+    persist_root: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl EventBus {
+    fn journal_lease(&self) -> crate::host_runtime::WriteLease {
+        self.write_lease.lock().clone()
+    }
+
+    /// Bind the journal's durable-write authority to the runtime that owns the
+    /// home it persists into.
+    ///
+    /// `with_persist_dir` resolves authority by looking the home up, which is
+    /// correct but implicit. This makes it explicit and *checked*: the bind
+    /// succeeds only when the canonical home of the journal directory is the
+    /// canonical home this runtime holds the lock for, so a journal can never
+    /// borrow a runtime's authority for a different home (#455, P1).
+    ///
+    /// Returns whether it bound. A journal outside this runtime's home keeps
+    /// the authority it established at `with_persist_dir` time.
+    pub(crate) fn bind_journal_lifecycle(
+        &self,
+        lifecycle: &Arc<crate::host_runtime::HostLifecycle>,
+    ) -> bool {
+        let mut current = self.write_lease.lock();
+        let root = self.persist_root.lock().clone();
+        let Some(root) = root else {
+            return false;
+        };
+        let Some(rebound) = crate::host_runtime::WriteLease::bound_to(&root, lifecycle) else {
+            return false;
+        };
+        *current = rebound;
+        true
+    }
 }
 
 struct PersistenceHandle {
@@ -245,6 +285,12 @@ impl EventBus {
             lagged_events: Arc::new(AtomicU64::new(0)),
             persistence_error: Arc::new(Mutex::new(None)),
             journal_gap: Arc::new(Mutex::new(None)),
+            // No persist directory yet, so no home and no authority. Every
+            // durable path is refused until `with_persist_dir` resolves one.
+            write_lease: Arc::new(Mutex::new(crate::host_runtime::WriteLease::denied(
+                "this event bus has no durable home",
+            ))),
+            persist_root: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -279,9 +325,23 @@ impl EventBus {
         let path = dir.as_ref().join("event_journal.jsonl");
         let sequence_path = dir.as_ref().join("event_journal.seq");
         let gap_path = dir.as_ref().join("event_journal.gap.json");
-        if let Some(parent) = path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                *self.persistence_error.lock() = Some(error.to_string());
+        // Authority *before* mutation (#455): the journal directory is itself a
+        // durable effect on the home, so it is created under a held guard —
+        // never on a home this process may not write, and never before the
+        // authority to write it has been established.
+        let writer_lease = crate::host_runtime::WriteLease::for_store_root(dir.as_ref());
+        *self.write_lease.lock() = writer_lease.clone();
+        *self.persist_root.lock() = Some(dir.as_ref().to_path_buf());
+        match writer_lease.begin("creating the durable event-journal directory") {
+            Ok(_write) => {
+                if let Some(parent) = path.parent() {
+                    if let Err(error) = std::fs::create_dir_all(parent) {
+                        *self.persistence_error.lock() = Some(error.to_string());
+                    }
+                }
+            }
+            Err(error) => {
+                *self.persistence_error.lock() = Some(format!("{error:#}"));
             }
         }
         {
@@ -314,7 +374,7 @@ impl EventBus {
                         g.journal = loaded.clone();
                         durable_tail = loaded;
                         // Compact durable file to current in-memory tail.
-                        if let Err(e) = rewrite_journal_file(&path, &g.journal) {
+                        if let Err(e) = rewrite_journal_file(&writer_lease, &path, &g.journal) {
                             *self.persistence_error.lock() = Some(e.to_string());
                         }
                     }
@@ -323,20 +383,21 @@ impl EventBus {
                     }
                 }
             }
-            let sequence_ready = match reserve_sequence_range(&sequence_path, g.next_seq) {
-                Ok((start, reserved_through)) => {
-                    g.next_seq = start;
-                    g.reserved_through = reserved_through;
-                    g.sequence_path = Some(sequence_path);
-                    true
-                }
-                Err(error) => {
-                    *self.persistence_error.lock() = Some(error.to_string());
-                    g.reserved_through = u64::MAX;
-                    g.sequence_path = None;
-                    false
-                }
-            };
+            let sequence_ready =
+                match reserve_sequence_range(&writer_lease, &sequence_path, g.next_seq) {
+                    Ok((start, reserved_through)) => {
+                        g.next_seq = start;
+                        g.reserved_through = reserved_through;
+                        g.sequence_path = Some(sequence_path);
+                        true
+                    }
+                    Err(error) => {
+                        *self.persistence_error.lock() = Some(error.to_string());
+                        g.reserved_through = u64::MAX;
+                        g.sequence_path = None;
+                        false
+                    }
+                };
             if sequence_ready && gap_ready {
                 let (tx, rx) = sync_channel::<JournalEntry>(256);
                 let persistence_error = self.persistence_error.clone();
@@ -346,13 +407,12 @@ impl EventBus {
                 let capacity = g.capacity;
                 // The journal directory lives under the runtime home, so the
                 // writer binds to whichever runtime owns that home (#455).
-                let writer_lease = crate::host_runtime::WriteLease::for_store_root(dir.as_ref());
                 let join = std::thread::Builder::new()
                     .name("grokptah-event-journal".into())
                     .spawn(move || {
                         run_journal_writer(
                             &JournalWriterContext {
-                                lease: writer_lease,
+                                lease: writer_lease.clone(),
                                 path: writer_path,
                                 gap_path: writer_gap_path,
                                 capacity,
@@ -402,7 +462,7 @@ impl EventBus {
         let mut g = self.inner.lock();
         if g.next_seq > g.reserved_through {
             if let Some(path) = g.sequence_path.clone() {
-                match reserve_sequence_range(&path, g.next_seq) {
+                match reserve_sequence_range(&self.journal_lease(), &path, g.next_seq) {
                     Ok((start, reserved_through)) => {
                         g.next_seq = start;
                         g.reserved_through = reserved_through;
@@ -448,9 +508,11 @@ impl EventBus {
                 *self.persistence_error.lock() = Some(detail.into());
                 record_journal_gap(&self.journal_gap, seq);
                 if disconnected {
-                    if let Err(error) =
-                        persist_current_gap(&persistence.gap_path, &self.journal_gap)
-                    {
+                    if let Err(error) = persist_current_gap(
+                        &self.journal_lease(),
+                        &persistence.gap_path,
+                        &self.journal_gap,
+                    ) {
                         *self.persistence_error.lock() = Some(error.to_string());
                     }
                 }
@@ -688,12 +750,24 @@ fn run_journal_writer(
             Ok(entry) => Some(entry),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => {
-                flush_journal_gap(gap_path, journal_gap, &mut persisted_gap, persistence_error);
+                flush_journal_gap(
+                    lease,
+                    gap_path,
+                    journal_gap,
+                    &mut persisted_gap,
+                    persistence_error,
+                );
                 break;
             }
         };
         let Some(entry) = entry else {
-            flush_journal_gap(gap_path, journal_gap, &mut persisted_gap, persistence_error);
+            flush_journal_gap(
+                lease,
+                gap_path,
+                journal_gap,
+                &mut persisted_gap,
+                persistence_error,
+            );
             continue;
         };
         let entry_bytes = journal_entry_size(&entry);
@@ -705,7 +779,7 @@ fn run_journal_writer(
             }
         }
         let result = if file_bytes.saturating_add(entry_bytes) > MAX_JOURNAL_BYTES {
-            rewrite_journal_file(path, &tail).map(|_| {
+            rewrite_journal_file(lease, path, &tail).map(|_| {
                 file_bytes = tail_bytes;
             })
         } else {
@@ -717,7 +791,13 @@ fn run_journal_writer(
             *persistence_error.lock() = Some(error.to_string());
             record_journal_gap(journal_gap, entry.seq);
         }
-        flush_journal_gap(gap_path, journal_gap, &mut persisted_gap, persistence_error);
+        flush_journal_gap(
+            lease,
+            gap_path,
+            journal_gap,
+            &mut persisted_gap,
+            persistence_error,
+        );
     }
 }
 
@@ -742,6 +822,7 @@ fn load_journal_gap(path: &Path) -> std::io::Result<(u64, u64)> {
 }
 
 fn flush_journal_gap(
+    lease: &crate::host_runtime::WriteLease,
     path: &Path,
     journal_gap: &Mutex<Option<(u64, u64)>>,
     persisted_gap: &mut Option<(u64, u64)>,
@@ -756,7 +837,7 @@ fn flush_journal_gap(
     };
     let result = serde_json::to_vec(&gap)
         .map_err(std::io::Error::other)
-        .and_then(|bytes| atomic_write_bytes(path, &bytes));
+        .and_then(|bytes| atomic_write_bytes(lease, path, &bytes));
     match result {
         Ok(()) => *persisted_gap = Some(gap),
         Err(error) => *persistence_error.lock() = Some(error.to_string()),
@@ -764,6 +845,7 @@ fn flush_journal_gap(
 }
 
 fn persist_current_gap(
+    lease: &crate::host_runtime::WriteLease,
     path: &Path,
     journal_gap: &Mutex<Option<(u64, u64)>>,
 ) -> std::io::Result<()> {
@@ -771,7 +853,7 @@ fn persist_current_gap(
         return Ok(());
     };
     let bytes = serde_json::to_vec(&gap).map_err(std::io::Error::other)?;
-    atomic_write_bytes(path, &bytes)
+    atomic_write_bytes(lease, path, &bytes)
 }
 
 fn append_journal_line(
@@ -783,7 +865,7 @@ fn append_journal_line(
 
     // The journal is durable state on the runtime home, so the writer thread
     // carries the same authority every other durable effect does (#455).
-    lease
+    let _write = lease
         .begin("appending to the durable event journal")
         .map_err(std::io::Error::other)?;
     let mut f = std::fs::OpenOptions::new()
@@ -794,7 +876,14 @@ fn append_journal_line(
     writeln!(f, "{line}")
 }
 
-fn rewrite_journal_file(path: &Path, journal: &VecDeque<JournalEntry>) -> std::io::Result<()> {
+fn rewrite_journal_file(
+    lease: &crate::host_runtime::WriteLease,
+    path: &Path,
+    journal: &VecDeque<JournalEntry>,
+) -> std::io::Result<()> {
+    let _write = lease
+        .begin("compacting the durable event journal")
+        .map_err(std::io::Error::other)?;
     let tmp = path.with_extension("jsonl.tmp");
     {
         use std::io::Write;
@@ -808,7 +897,14 @@ fn rewrite_journal_file(path: &Path, journal: &VecDeque<JournalEntry>) -> std::i
     Ok(())
 }
 
-fn reserve_sequence_range(path: &Path, requested_start: u64) -> std::io::Result<(u64, u64)> {
+fn reserve_sequence_range(
+    lease: &crate::host_runtime::WriteLease,
+    path: &Path,
+    requested_start: u64,
+) -> std::io::Result<(u64, u64)> {
+    let _write = lease
+        .begin("reserving a durable event sequence range")
+        .map_err(std::io::Error::other)?;
     let previous = match std::fs::read_to_string(path) {
         Ok(text) => text.trim().parse::<u64>().map_err(|error| {
             std::io::Error::new(
@@ -821,11 +917,18 @@ fn reserve_sequence_range(path: &Path, requested_start: u64) -> std::io::Result<
     };
     let start = requested_start.max(previous.saturating_add(1));
     let reserved_through = start.saturating_add(SEQUENCE_RESERVATION_SIZE - 1);
-    atomic_write_bytes(path, format!("{reserved_through}\n").as_bytes())?;
+    atomic_write_bytes(lease, path, format!("{reserved_through}\n").as_bytes())?;
     Ok((start, reserved_through))
 }
 
-fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn atomic_write_bytes(
+    lease: &crate::host_runtime::WriteLease,
+    path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let _write = lease
+        .begin("writing durable event-journal metadata")
+        .map_err(std::io::Error::other)?;
     use std::io::Write;
 
     let tmp = path.with_extension("tmp");
@@ -1143,6 +1246,156 @@ fn scrub_registered_secret(text: &str, secret: &str) -> String {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// P1 — a journal may only be bound to a runtime that owns its home.
+    ///
+    /// `with_persist_dir` resolves authority by looking up the journal's home.
+    /// Binding must *verify* that home rather than trust the caller, or a
+    /// runtime could hand a journal outside its home its own authority — the
+    /// case where a stale journal keeps writing after a replacement acquires.
+    #[test]
+    fn a_journal_cannot_be_bound_to_a_runtime_that_owns_another_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join(".grokptah");
+        std::fs::create_dir_all(&home).unwrap();
+
+        // A real acquired lock: only a runtime that actually holds one is an
+        // owner, which is the rule production runs under.
+        let lock_path = home.join(".instance.lock");
+        let lock = crate::instance_lock::InstanceLock::try_acquire_path(&lock_path, &home).unwrap();
+        let owner = crate::host_runtime::HostLifecycle::new(Some(lock), lock_path);
+
+        // A journal inside the home this lifecycle owns binds.
+        let inside = EventBus::new(8).with_persist_dir(home.join("orchestration"));
+        assert!(
+            inside.bind_journal_lifecycle(&owner),
+            "a journal in this runtime's home must bind to it"
+        );
+
+        // A journal in a different home does not, and keeps its own authority.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside_root = elsewhere.path().join(".grokptah").join("orchestration");
+        let outside = EventBus::new(8).with_persist_dir(&outside_root);
+        assert!(
+            !outside.bind_journal_lifecycle(&owner),
+            "a journal outside this runtime's home must not borrow its authority"
+        );
+
+        // A bus with no durable home has nothing to bind and authorizes nothing.
+        let homeless = EventBus::new(8);
+        assert!(!homeless.bind_journal_lifecycle(&owner));
+        assert!(append_journal_line(
+            &homeless.journal_lease(),
+            &dir.path().join("nope.jsonl"),
+            &JournalEntry {
+                seq: 1,
+                ts: "1970-01-01T00:00:00Z".into(),
+                update: SessionUpdate::AgentMessageChunk {
+                    session_id: Uuid::nil(),
+                    text: "probe".into(),
+                },
+            },
+        )
+        .is_err());
+    }
+
+    /// P0 — bypass inventory, journal half.
+    ///
+    /// Every durable journal primitive must refuse a lease that carries no
+    /// authority, not merely the append that was guarded first. Each of these
+    /// is a *separate* filesystem mutation reachable without going through
+    /// `append_journal_line`, so each needs its own refusal.
+    ///
+    /// The negative control is the second half: the identical calls succeed
+    /// through a lease that does hold authority, so a refusal here is the lease
+    /// deciding rather than the path or the payload being unusable.
+    #[test]
+    fn every_journal_primitive_refuses_a_lease_without_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal.jsonl");
+        let seq_path = dir.path().join("seq");
+        let gap_path = dir.path().join("gap");
+        let entry = JournalEntry {
+            seq: 1,
+            ts: "1970-01-01T00:00:00Z".into(),
+            update: SessionUpdate::AgentMessageChunk {
+                session_id: Uuid::nil(),
+                text: "probe".into(),
+            },
+        };
+        let mut ring = VecDeque::new();
+        ring.push_back(entry.clone());
+
+        let denied = crate::host_runtime::WriteLease::denied("no authority in this test");
+        let mut refused: Vec<&str> = Vec::new();
+        let mut accepted: Vec<&str> = Vec::new();
+        macro_rules! check {
+            ($name:literal, $call:expr) => {
+                if $call.is_err() {
+                    refused.push($name);
+                } else {
+                    accepted.push($name);
+                }
+            };
+        }
+        check!(
+            "append_journal_line",
+            append_journal_line(&denied, &journal, &entry)
+        );
+        check!(
+            "rewrite_journal_file",
+            rewrite_journal_file(&denied, &journal, &ring)
+        );
+        check!(
+            "reserve_sequence_range",
+            reserve_sequence_range(&denied, &seq_path, 1)
+        );
+        check!(
+            "atomic_write_bytes",
+            atomic_write_bytes(&denied, &gap_path, b"probe")
+        );
+        let gap = Mutex::new(Some((1u64, 2u64)));
+        check!(
+            "persist_current_gap",
+            persist_current_gap(&denied, &gap_path, &gap)
+        );
+        assert!(
+            accepted.is_empty(),
+            "these journal primitives wrote without authority: {accepted:?}"
+        );
+        assert_eq!(refused.len(), 5, "expected the whole journal write surface");
+
+        // Nothing may have been created on the way to those refusals.
+        assert!(!journal.exists(), "a refused append must leave no journal");
+        assert!(
+            !seq_path.exists(),
+            "a refused reservation must leave no file"
+        );
+        assert!(!gap_path.exists(), "a refused gap write must leave no file");
+
+        // `flush_journal_gap` swallows its error into the persistence-error
+        // slot rather than returning it, so it is checked through that slot.
+        let persistence_error = Mutex::new(None);
+        let mut persisted = None;
+        flush_journal_gap(&denied, &gap_path, &gap, &mut persisted, &persistence_error);
+        assert!(
+            persistence_error.lock().is_some(),
+            "a refused gap flush must be reported, not silently dropped"
+        );
+        assert!(
+            persisted.is_none(),
+            "a refused flush must not record progress"
+        );
+
+        // Negative control: with real authority the same calls all succeed, so
+        // the refusals above are the lease's doing.
+        let owner = crate::host_runtime::WriteLease::for_store_root(&dir.path().join("store"));
+        assert!(append_journal_line(&owner, &journal, &entry).is_ok());
+        assert!(rewrite_journal_file(&owner, &journal, &ring).is_ok());
+        assert!(reserve_sequence_range(&owner, &seq_path, 1).is_ok());
+        assert!(atomic_write_bytes(&owner, &gap_path, b"probe").is_ok());
+        assert!(persist_current_gap(&owner, &gap_path, &gap).is_ok());
+    }
 
     #[test]
     fn fan_out_preserves_order_for_two_subscribers() {
