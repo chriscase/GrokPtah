@@ -15,9 +15,12 @@ mod types;
 mod worker;
 mod workload;
 
+pub use crate::canonical_authority::{
+    AuthContext, HostAuthority, IssuedAuth, PublicActorHandle, ResourceKind,
+};
 pub use authz::{
-    authenticate_bearer, canonical_workspace, constant_time_eq, require_bearer, AuthContext,
-    AuthCredential, WorkspaceAllowlist,
+    authenticate_bearer, canonical_workspace, constant_time_eq, match_bearer, require_bearer,
+    AuthCredential, BearerIdentity, WorkspaceAllowlist,
 };
 pub use continuation::{
     assemble_continuation_context, AgentContinuationPlan, ContinuationAssemblyFailure,

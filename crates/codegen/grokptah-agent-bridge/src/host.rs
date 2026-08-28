@@ -11647,12 +11647,11 @@ mod tests {
         assert_eq!(entries[0].version, steering.version + 1);
     }
 
-    /// Make the durable write fail deterministically: `atomic_write_json`
-    /// creates `<queue>.json.tmp`, so a directory at that path fails the
-    /// create without touching anything else.
+    /// Make the durable write fail deterministically: a directory at the
+    /// destination path causes rename to fail closed regardless of tmp name.
     fn block_queue_persistence(session_id: Uuid) {
-        let blocked = crate::session_store::session_dir(session_id).join("prompt_queue.json.tmp");
-        std::fs::create_dir_all(&blocked).expect("block the queue temp path");
+        let blocked = crate::session_store::session_dir(session_id).join("prompt_queue.json");
+        std::fs::create_dir_all(&blocked).expect("block the queue destination path");
     }
 
     fn seed_pending_steering(

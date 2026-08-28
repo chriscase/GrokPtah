@@ -16,8 +16,7 @@ use crate::prompt_queue::{PromptQueueEntry, SteeringDisposition};
 use crate::session::{SessionKind, WorkspaceStatus};
 
 use super::authz::{
-    authenticate_bearer, canonical_workspace, require_workspace_match, AuthContext, AuthCredential,
-    WorkspaceAllowlist,
+    canonical_workspace, require_workspace_match, AuthContext, AuthCredential, WorkspaceAllowlist,
 };
 use super::managed::{
     assemble_managed_run_input, managed_execution_eligible, select_relevant_managed_messages,
@@ -48,6 +47,7 @@ use super::workload::{
     WorkAttempt, WorkAttemptView, WorkDecision, WorkDependency, WorkItem, WorkPolicy, WorkProgress,
     WorkResult, WorkState,
 };
+use crate::canonical_authority::ResourceKind;
 
 /// Admission is deliberately bounded so an untrusted coordinator cannot turn
 /// queued submissions into an unbounded in-memory prompt store.
@@ -259,6 +259,12 @@ impl OrchestrationService {
             WorkloadSupervisor::start(store.clone(), DEFAULT_WORKLOAD_RECONCILIATION_INTERVAL);
         let routine_supervisor =
             RoutineSupervisor::start(store.clone(), DEFAULT_ROUTINE_TICK_INTERVAL);
+        if !auth_credentials.is_empty() {
+            store
+                .authority()
+                .install_credentials(&auth_credentials, "primary")
+                .unwrap_or_else(|error| panic!("canonical authority install: {error}"));
+        }
         let service = Arc::new_cyclic(|self_ref| Self {
             host,
             bus,
@@ -1327,10 +1333,8 @@ impl OrchestrationService {
         intent.attempt_id = Some(claim.attempt.attempt_id.clone());
         intent.updated_at = Utc::now();
         self.store.save_managed_intent(&intent)?;
-        let auth = AuthContext {
-            token_id: "native-executor".into(),
-            owner_id: owner_id.to_string(),
-        };
+        let _ = owner_id;
+        let auth = self.internal_auth("native-executor")?;
         let bounds_json = serde_json::to_value(&bounds)
             .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?;
         let submitted = match self
@@ -1445,6 +1449,7 @@ impl OrchestrationService {
                 .expect("non-empty bearer token should form a primary credential")]
         };
         *self.auth_credentials.lock() = credentials;
+        let _ = self.replace_authority_secrets();
     }
 
     /// Install named device/client credentials while retaining the existing
@@ -1477,7 +1482,7 @@ impl OrchestrationService {
         }
         self.config.lock().bearer_token = primary_token;
         *self.auth_credentials.lock() = credentials;
-        Ok(())
+        self.replace_authority_secrets()
     }
 
     pub fn set_agent_owner_id(&self, owner_id: String) -> Result<(), OrchError> {
@@ -1489,11 +1494,74 @@ impl OrchestrationService {
             ));
         }
         *self.agent_owner_id.lock() = owner_id;
-        Ok(())
+        self.sync_authority()
     }
 
     fn agent_owner_id(&self) -> String {
         self.agent_owner_id.lock().clone()
+    }
+
+    fn sync_authority(&self) -> Result<(), OrchError> {
+        let credentials = self.auth_credentials.lock().clone();
+        let owner_id = self.agent_owner_id();
+        self.store
+            .authority()
+            .install_credentials(&credentials, &owner_id)
+    }
+
+    fn replace_authority_secrets(&self) -> Result<(), OrchError> {
+        let credentials = self.auth_credentials.lock().clone();
+        let owner_id = self.agent_owner_id();
+        self.store
+            .authority()
+            .replace_secrets(&credentials, &owner_id)
+    }
+
+    fn require_current_auth(&self, auth: &AuthContext) -> Result<(), OrchError> {
+        self.store.authority().require_current(auth.issued())
+    }
+
+    fn require_mutation_auth(&self, auth: &AuthContext) -> Result<(), OrchError> {
+        self.store.authority().require_mutation(auth.issued())
+    }
+
+    fn bind_named(
+        &self,
+        auth: &AuthContext,
+        kind: ResourceKind,
+        resource_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<(), OrchError> {
+        self.store.authority().bind_resource(
+            auth.issued(),
+            kind,
+            resource_id,
+            &session_id.to_string(),
+            workspace,
+        )
+    }
+
+    fn require_named(
+        &self,
+        auth: &AuthContext,
+        kind: ResourceKind,
+        resource_id: &str,
+        session_id: Uuid,
+        workspace: &Path,
+    ) -> Result<(), OrchError> {
+        self.store.authority().require_resource(
+            auth.issued(),
+            kind,
+            resource_id,
+            &session_id.to_string(),
+            workspace,
+        )
+    }
+
+    pub(crate) fn internal_auth(&self, class: &'static str) -> Result<AuthContext, OrchError> {
+        let issued = self.store.authority().issue_internal(class)?;
+        Ok(AuthContext::from_issued(issued))
     }
 
     pub fn set_allowlist(&self, allowlist: WorkspaceAllowlist) {
@@ -1519,7 +1587,11 @@ impl OrchestrationService {
     pub fn auth_header(&self, header: Option<&str>) -> Result<AuthContext, OrchError> {
         let credentials = self.auth_credentials.lock().clone();
         let owner_id = self.agent_owner_id();
-        let res = authenticate_bearer(header, &credentials, &owner_id);
+        let res = self
+            .store
+            .authority()
+            .authenticate(header, &credentials, &owner_id)
+            .map(AuthContext::from_issued);
         if let Err(ref e) = res {
             self.audit(
                 "auth",
@@ -1902,7 +1974,8 @@ impl OrchestrationService {
 
     // ── reads ──────────────────────────────────────────────────────────
 
-    pub fn list_sessions(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+    pub fn list_sessions(&self, auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let allowlist = self.config.lock().allowlist.clone();
         let sessions = self.host.list_sessions_by_kind(SessionKind::Build, false);
         let rows: Vec<serde_json::Value> = sessions
@@ -1937,10 +2010,11 @@ impl OrchestrationService {
     /// the service host.
     pub fn create_session(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         workspace: &Path,
         title: Option<String>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_mutation_auth(auth)?;
         let claimed = canonical_workspace(workspace)?;
         if !self.config.lock().allowlist.contains(&claimed) {
             return Err(OrchError::new(
@@ -1967,6 +2041,20 @@ impl OrchestrationService {
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
             None => summary,
         };
+        self.bind_named(
+            auth,
+            ResourceKind::Session,
+            &summary.id.to_string(),
+            summary.id,
+            &claimed,
+        )?;
+        self.bind_named(
+            auth,
+            ResourceKind::Workspace,
+            &claimed.display().to_string(),
+            summary.id,
+            &claimed,
+        )?;
         Ok(json!({
             "sessionId": summary.id,
             "title": summary.title,
@@ -1983,6 +2071,7 @@ impl OrchestrationService {
         &self,
         auth: &AuthContext,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let allowlist = self.config.lock().allowlist.clone();
         let agents = self
             .host
@@ -2007,10 +2096,11 @@ impl OrchestrationService {
     /// without exposing runs from another session or workspace.
     pub fn list_runs_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let claimed = self.authorize_queue_request(session_id, workspace)?;
         let runs = self
             .store
@@ -2134,10 +2224,11 @@ impl OrchestrationService {
 
     pub fn list_work_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let work = self
             .store
@@ -2153,11 +2244,12 @@ impl OrchestrationService {
 
     pub fn get_work_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         work_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_named(auth, ResourceKind::Work, work_id, session_id, workspace)?;
         let (item, _) = self.load_work_scoped(session_id, workspace, work_id, true)?;
         self.workload_value(item, true)
     }
@@ -2819,6 +2911,7 @@ impl OrchestrationService {
         dependencies: Vec<WorkDependency>,
         policy: WorkPolicy,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_mutation_auth(auth)?;
         let tool = "ptah_create_work";
         let payload = json!({
             "sessionId": session_id,
@@ -2867,6 +2960,21 @@ impl OrchestrationService {
                 OrchError::new(OrchErrorCode::Internal, error.to_string()),
             ));
         }
+        if let Err(error) = self.bind_named(
+            auth,
+            ResourceKind::Work,
+            &item.work_id,
+            session_id,
+            &claimed,
+        ) {
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(item.work_id.clone()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
         let response = self.workload_value(item.clone(), false)?;
         lease
             .complete(Some(item.work_id.clone()), response.clone())
@@ -2896,6 +3004,7 @@ impl OrchestrationService {
         lease_ms: Option<u64>,
         agent_id: Option<String>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_mutation_auth(auth)?;
         let tool = "ptah_claim_work";
         let payload = json!({
             "sessionId": session_id,
@@ -2939,6 +3048,15 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
+        if let Err(error) = self.bind_named(
+            auth,
+            ResourceKind::WorkAttempt,
+            &claim.attempt.attempt_id,
+            session_id,
+            &claimed,
+        ) {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
         let response = json!({
             "work": claim.work,
             "attempt": WorkAttemptView::from(&claim.attempt),
@@ -4371,6 +4489,7 @@ impl OrchestrationService {
         routine_id: &str,
         payload: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_mutation_auth(auth)?;
         let tool = "ptah_fire_routine";
         let idempotency_payload = json!({
             "sessionId": session_id,
@@ -4416,6 +4535,19 @@ impl OrchestrationService {
                 return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error))
             }
         };
+        if let Some(work_id) = activation.work_id.as_deref() {
+            if let Err(error) =
+                self.bind_named(auth, ResourceKind::Work, work_id, session_id, &claimed)
+            {
+                return Err(self.fail_claim(
+                    &mut lease,
+                    Some(work_id.to_string()),
+                    session_id,
+                    &claimed,
+                    error,
+                ));
+            }
+        }
         let response = json!({
             "activation": activation,
             "routineId": routine.routine_id,
@@ -4719,6 +4851,8 @@ impl OrchestrationService {
         agent_id: &str,
         policy: ManagedExecutionPolicy,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_mutation_auth(auth)?;
+        self.bind_named(auth, ResourceKind::Agent, agent_id, session_id, workspace)?;
         policy.validate()?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let _ = self.store.require_agent_in_scope(
@@ -4859,12 +4993,13 @@ impl OrchestrationService {
 
     pub fn resolve_work_input(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         permission_id: Uuid,
         allow: bool,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_mutation_auth(auth)?;
         let claimed = self.authorize_work_mutation_scope(session_id, workspace)?;
         let claimed_text = claimed.display().to_string();
         let intent = self.store.inspect_parked_managed_permission(
@@ -4930,7 +5065,8 @@ impl OrchestrationService {
         }))
     }
 
-    pub fn get_capacity(&self, _auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+    pub fn get_capacity(&self, auth: &AuthContext) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let max = self.host.orchestration_capacity_limit();
         let active = self.host.orchestration_active_count();
         let queued = self.host.orchestration_pending_count();
@@ -5006,11 +5142,12 @@ impl OrchestrationService {
 
     pub fn get_run_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_named(auth, ResourceKind::Run, run_id, session_id, workspace)?;
         self.run_value(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5198,10 +5335,11 @@ impl OrchestrationService {
 
     pub fn list_computer_runs_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let reads = self.computer_reads()?;
         let claimed = self.authorize_computer_scope(session_id, workspace)?;
         let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
@@ -5213,11 +5351,12 @@ impl OrchestrationService {
 
     pub fn get_computer_run_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let reads = self.computer_reads()?;
         let claimed = self.authorize_computer_scope(session_id, workspace)?;
         let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
@@ -5230,13 +5369,14 @@ impl OrchestrationService {
 
     pub fn get_computer_run_events_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
         run_id: &str,
         after_seq: Option<u64>,
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let reads = self.computer_reads()?;
         let claimed = self.authorize_computer_scope(session_id, workspace)?;
         let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
@@ -5263,10 +5403,11 @@ impl OrchestrationService {
 
     pub fn get_computer_capacity_scoped(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let reads = self.computer_reads()?;
         let claimed = self.authorize_computer_scope(session_id, workspace)?;
         let binding = crate::computer_use::ComputerReadBinding::new(session_id, &claimed);
@@ -5714,10 +5855,11 @@ impl OrchestrationService {
 
     pub fn get_queue(
         &self,
-        _auth: &AuthContext,
+        auth: &AuthContext,
         session_id: Uuid,
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
         let claimed = self.authorize_queue_request(session_id, workspace)?;
         let snapshot = self
             .host
@@ -6619,7 +6761,7 @@ impl OrchestrationService {
         expected_agent_spec_revision: Option<u64>,
         proposal_only: bool,
     ) -> Result<serde_json::Value, OrchError> {
-        let _ = auth;
+        self.require_mutation_auth(auth)?;
         let tool = idempotency_tool;
         if proposal_only && allow_queue {
             return Err(OrchError::new(
@@ -6864,6 +7006,10 @@ impl OrchestrationService {
             }
             let e = OrchError::new(OrchErrorCode::Internal, e.to_string());
             return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, e));
+        }
+        if let Err(error) = self.bind_named(auth, ResourceKind::Run, &run_id, session_id, &claimed)
+        {
+            return Err(self.fail_claim(&mut lease, Some(run_id), session_id, &claimed, error));
         }
 
         let queued_position = if queued {
@@ -7333,7 +7479,7 @@ impl OrchestrationService {
         prompt: String,
         priority: bool,
     ) -> Result<serde_json::Value, OrchError> {
-        let _ = auth;
+        self.require_mutation_auth(auth)?;
         let tool = "ptah_queue_prompt";
         let payload = json!({
             "sessionId": session_id,

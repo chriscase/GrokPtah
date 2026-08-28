@@ -31,6 +31,8 @@ use super::types::{
     IdempotencyReceipt, OrchError, OrchErrorCode, PromotionState, RunBounds, RunRecord, RunState,
     RunStopCause,
 };
+use crate::canonical_authority::HostAuthority;
+
 use super::worker::{WorkerHostKind, WorkerPresence, WorkerProjection};
 use super::workload::{
     lease_duration, AssignmentStatus, AttemptState, WorkApproval, WorkAttempt, WorkClaim,
@@ -52,6 +54,7 @@ struct OrchStoreInner {
     last_audit_error: Arc<Mutex<Option<String>>>,
     audit_file_lock: Arc<Mutex<()>>,
     audit_writer: AuditWriter,
+    authority: Mutex<HostAuthority>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -199,6 +202,8 @@ impl OrchStore {
                 root.display()
             )
         })?;
+        let authority = HostAuthority::open(&root)
+            .map_err(|error| anyhow::anyhow!("canonical authority unavailable: {error}"))?;
         let last_audit_error = Arc::new(Mutex::new(None));
         let audit_file_lock = Arc::new(Mutex::new(()));
         let (audit_tx, audit_rx) = sync_channel::<AuditEntry>(256);
@@ -228,6 +233,7 @@ impl OrchStore {
                     tx: Mutex::new(Some(audit_tx)),
                     join: Mutex::new(Some(audit_join)),
                 },
+                authority: Mutex::new(authority),
             }),
         };
         store.recover_agent_activation_intents()?;
@@ -246,6 +252,10 @@ impl OrchStore {
 
     pub fn root(&self) -> &Path {
         &self.inner.root
+    }
+
+    pub(crate) fn authority(&self) -> parking_lot::MutexGuard<'_, HostAuthority> {
+        self.inner.authority.lock()
     }
 
     fn run_path(&self, run_id: &str) -> Result<PathBuf, OrchError> {
@@ -5284,20 +5294,8 @@ pub(crate) fn workspaces_match(left: &str, right: &str) -> bool {
 }
 
 fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    use std::io::Write;
-    let mut file = fs::File::create(&tmp)?;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
-    file.sync_all()?;
-    fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        fs::File::open(parent)?.sync_all()?;
-    }
-    Ok(())
+    crate::durable_fs::atomic_write_json(path, value)
+        .map_err(|error| anyhow::anyhow!(error.message))
 }
 
 fn write_json_exclusive<T: serde::Serialize>(path: &Path, value: &T) -> std::io::Result<()> {

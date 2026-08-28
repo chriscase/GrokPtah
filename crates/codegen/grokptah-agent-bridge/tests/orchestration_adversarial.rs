@@ -808,13 +808,16 @@ async fn queue_persistence_failure_does_not_mutate_memory() {
     let (home, _lock) = setup_home();
     let host = started_host();
     let session = host.session_new_kind(SessionKind::Build).unwrap();
-    let tmp_path = home
+    let session_dir = home
         .path()
         .join(".grokptah")
         .join("sessions")
-        .join(session.id.to_string())
-        .join("prompt_queue.json.tmp");
-    std::fs::create_dir_all(&tmp_path).unwrap();
+        .join(session.id.to_string());
+    std::fs::create_dir_all(session_dir.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_dir_all(&session_dir);
+    // Occupying the session directory as a file makes durable queue persistence
+    // fail closed without depending on a predictable tmp filename.
+    std::fs::write(&session_dir, b"not-a-directory").unwrap();
     assert!(host
         .session_queue_add_with_source(
             session.id,

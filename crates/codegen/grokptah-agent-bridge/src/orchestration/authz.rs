@@ -4,14 +4,13 @@ use std::path::{Path, PathBuf};
 
 use super::types::{OrchError, OrchErrorCode};
 
+pub use crate::canonical_authority::AuthContext;
+
+/// Credential match from a bearer header. This is not host-issued authority
+/// and cannot admit mutations.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthContext {
-    /// Stable credential identity used for audit and attribution. This is not
-    /// the secret itself and may safely appear in durable records.
+pub struct BearerIdentity {
     pub token_id: String,
-    /// Account/Agent owner identity shared by the service's authenticated
-    /// device credentials. A later multi-tenant service can map credentials to
-    /// different owner identities without changing the protocol shape.
     pub owner_id: String,
 }
 
@@ -121,12 +120,11 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-pub fn authenticate_bearer(
+pub fn match_bearer<'a>(
     header: Option<&str>,
-    credentials: &[AuthCredential],
-    owner_id: &str,
-) -> Result<AuthContext, OrchError> {
-    if credentials.is_empty() || owner_id.trim().is_empty() {
+    credentials: &'a [AuthCredential],
+) -> Result<&'a AuthCredential, OrchError> {
+    if credentials.is_empty() {
         return Err(OrchError::new(
             OrchErrorCode::Internal,
             "control plane credentials are not configured",
@@ -153,13 +151,22 @@ pub fn authenticate_bearer(
     let credential = credentials
         .iter()
         .find(|credential| constant_time_eq(token.as_bytes(), credential.token.as_bytes()));
-    let Some(credential) = credential else {
+    credential.ok_or_else(|| OrchError::new(OrchErrorCode::Unauthenticated, "invalid bearer token"))
+}
+
+pub fn authenticate_bearer(
+    header: Option<&str>,
+    credentials: &[AuthCredential],
+    owner_id: &str,
+) -> Result<BearerIdentity, OrchError> {
+    if owner_id.trim().is_empty() {
         return Err(OrchError::new(
-            OrchErrorCode::Unauthenticated,
-            "invalid bearer token",
+            OrchErrorCode::Internal,
+            "control plane credentials are not configured",
         ));
-    };
-    Ok(AuthContext {
+    }
+    let credential = match_bearer(header, credentials)?;
+    Ok(BearerIdentity {
         token_id: credential.id.clone(),
         owner_id: owner_id.trim().to_string(),
     })
@@ -167,7 +174,7 @@ pub fn authenticate_bearer(
 
 /// Backward-compatible single-credential helper used by pure policy tests and
 /// embedders that have not adopted named credentials yet.
-pub fn require_bearer(header: Option<&str>, expected: &str) -> Result<AuthContext, OrchError> {
+pub fn require_bearer(header: Option<&str>, expected: &str) -> Result<BearerIdentity, OrchError> {
     let credential = AuthCredential::new("primary", expected)?;
     authenticate_bearer(header, &[credential], "primary")
 }
