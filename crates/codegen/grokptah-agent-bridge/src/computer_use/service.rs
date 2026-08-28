@@ -19,7 +19,7 @@ use super::types::{
     ComputerResult, ComputerRun, ComputerRunState, ComputerTarget, ComputerUseLimits,
 };
 use crate::capability_authority::{
-    CapabilityAuthority, CapabilitySnapshot, EffectLease, HostCapability,
+    CapabilityAuthority, CapabilitySnapshot, ConsumedEffect, EffectLease, HostCapability,
 };
 use parking_lot::Mutex;
 
@@ -29,12 +29,22 @@ pub struct ComputerUseService {
     policy: ComputerPolicy,
     capability_authority: Arc<CapabilityAuthority>,
     run_capabilities: Mutex<std::collections::HashMap<String, RunCapability>>,
+    execution_receipts: Mutex<std::collections::HashMap<String, HostExecutionReceipt>>,
 }
 
 #[derive(Debug, Clone)]
 struct RunCapability {
     snapshot: CapabilitySnapshot,
     capability: HostCapability,
+}
+
+#[derive(Debug, Clone)]
+struct HostExecutionReceipt {
+    run_id: String,
+    observation_id: String,
+    action_digest: String,
+    effect: ConsumedEffect,
+    outcome: ActionOutcome,
 }
 
 impl ComputerUseService {
@@ -56,6 +66,7 @@ impl ComputerUseService {
             policy: ComputerPolicy,
             capability_authority,
             run_capabilities: Mutex::new(std::collections::HashMap::new()),
+            execution_receipts: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -396,8 +407,6 @@ impl ComputerUseService {
         observation_id: &str,
         action: ComputerAction,
     ) -> ComputerResult<ActionOutcome> {
-        #[cfg(test)]
-        eprintln!("act: start {run_id}");
         validate_id("run_id", run_id)?;
         validate_id("observation_id", observation_id)?;
         action.validate(&ComputerUseLimits::ceiling())?;
@@ -410,22 +419,14 @@ impl ComputerUseService {
         if let Some(replayed) = self.begin_mutation(request_id, "act", &payload)? {
             return replayed;
         }
-        #[cfg(test)]
-        eprintln!("act: claimed {run_id}");
 
         let mut budget_error = None;
         let prepared = self
             .store
             .update_run(run_id, |run| {
                 ensure_version(run, expected_version)?;
-                #[cfg(test)]
-                eprintln!("act: checking capability {run_id}");
                 let _capability = self.require_run_capability(run)?;
-                #[cfg(test)]
-                eprintln!("act: capability okay {run_id}");
                 self.consume_durable_lease("act", &payload)?;
-                #[cfg(test)]
-                eprintln!("act: durable okay {run_id}");
                 let now = Utc::now();
                 if self.policy.run_limit_reached(run, now) {
                     let error = run_limit_error();
@@ -473,8 +474,6 @@ impl ComputerUseService {
                 Ok(())
             })
             .and_then(|run| run.ok_or_else(unknown_run));
-        #[cfg(test)]
-        eprintln!("act: prepared {run_id}");
 
         let result = match (prepared, budget_error) {
             (Ok(_), Some(error)) => Err(error),
@@ -492,8 +491,6 @@ impl ComputerUseService {
                         return Err(error);
                     }
                 };
-                #[cfg(test)]
-                eprintln!("act: effect capability {run_id}");
                 let lease = match self.effect_lease(&capability, &prepared, "computer.input") {
                     Ok(lease) => lease,
                     Err(error) => {
@@ -502,18 +499,12 @@ impl ComputerUseService {
                         return Err(error);
                     }
                 };
-                #[cfg(test)]
-                eprintln!("act: lease issued {run_id}");
-                let outcome =
+                let effect =
                     match self
                         .capability_authority
                         .consume(lease, &capability.snapshot, Utc::now())
                     {
-                        Ok(_) => {
-                            #[cfg(test)]
-                            eprintln!("act: backend {run_id}");
-                            self.backend.act(run_id, &observation, &action).await
-                        }
+                        Ok(effect) => effect,
                         Err(error) => {
                             self.fail_inflight(
                                 run_id,
@@ -529,10 +520,16 @@ impl ComputerUseService {
                             ));
                         }
                     };
+                let outcome = self.backend.act(run_id, &observation, &action).await;
                 match outcome {
-                    Ok(outcome) => {
-                        self.commit_action(run_id, &action, &observation, control_epoch, outcome)
-                    }
+                    Ok(outcome) => self.commit_action(
+                        run_id,
+                        &action,
+                        &observation,
+                        control_epoch,
+                        effect,
+                        outcome,
+                    ),
                     Err(_error) => {
                         let uncertain = ComputerError::new(
                             ComputerErrorCode::UncertainOutcome,
@@ -686,14 +683,38 @@ impl ComputerUseService {
         result
     }
 
-    pub fn complete(
+    pub(crate) fn complete_from_execution_receipt(
         &self,
         request_id: &str,
         run_id: &str,
         expected_version: u64,
     ) -> ComputerResult<ComputerRun> {
         validate_id("run_id", run_id)?;
-        let payload = json!({ "runId": run_id, "expectedVersion": expected_version });
+        let receipt = self
+            .execution_receipts
+            .lock()
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| {
+                ComputerError::new(
+                    ComputerErrorCode::Unauthorized,
+                    "completion requires a host-authenticated execution receipt",
+                )
+            })?;
+        if receipt.run_id != run_id || receipt.outcome.expected_postcondition_met != Some(true) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Unauthorized,
+                "execution receipt does not authorize completion",
+            ));
+        }
+        let payload = json!({
+            "runId": run_id,
+            "expectedVersion": expected_version,
+            "observationId": receipt.observation_id,
+            "actionDigest": receipt.action_digest,
+            "effectLeaseId": receipt.effect.lease_id,
+            "effectGeneration": receipt.effect.generation,
+        });
         if let Some(replayed) = self.begin_mutation(request_id, "complete", &payload)? {
             return replayed;
         }
@@ -710,6 +731,8 @@ impl ComputerUseService {
             .and_then(|run| run.ok_or_else(unknown_run));
         if let Err(error) = &result {
             self.record_denial(run_id, "complete", None, error);
+        } else {
+            self.execution_receipts.lock().remove(run_id);
         }
         self.finish_mutation(request_id, &result)?;
         result
@@ -796,9 +819,21 @@ impl ComputerUseService {
         action: &ComputerAction,
         observation: &ComputerObservation,
         control_epoch: u64,
+        effect: ConsumedEffect,
         outcome: ActionOutcome,
     ) -> ComputerResult<ActionOutcome> {
         let mut uncertain_error = None;
+        let action_digest =
+            crate::orchestration::hash_payload(&serde_json::to_value(action).map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Internal, error.to_string())
+            })?);
+        let receipt = HostExecutionReceipt {
+            run_id: run_id.to_string(),
+            observation_id: observation.observation_id.clone(),
+            action_digest,
+            effect,
+            outcome: outcome.clone(),
+        };
         self.consume_durable_lease(
             "settle_action",
             &json!({
@@ -862,6 +897,9 @@ impl ComputerUseService {
         if let Some(error) = uncertain_error {
             return Err(error);
         }
+        self.execution_receipts
+            .lock()
+            .insert(run_id.to_string(), receipt);
         Ok(outcome)
     }
 
@@ -1256,9 +1294,7 @@ mod tests {
                     _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
                 }
             }
-            eprintln!("blocking-backend: released");
             let result = self.inner.act(run_id, observation, action).await;
-            eprintln!("blocking-backend: acted");
             result
         }
 
@@ -1327,6 +1363,96 @@ mod tests {
             uses_remaining: Some(8),
             revoked_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn revoking_the_run_generation_denies_before_backend_input() {
+        let (backend, service) = service();
+        let owner = Uuid::new_v4();
+        let run = service
+            .create_run(
+                "create-generation-revoke",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run = service
+            .authorize(
+                "grant-generation-revoke",
+                &run.run_id,
+                run.version,
+                grant(&run),
+            )
+            .unwrap();
+        let observation = service
+            .observe("observe-generation-revoke", &run.run_id, run.version)
+            .await
+            .unwrap();
+        let current = service.get_run(&run.run_id).unwrap().unwrap();
+        let binding = service
+            .run_capabilities
+            .lock()
+            .get(&run.run_id)
+            .cloned()
+            .unwrap();
+        service
+            .capability_authority
+            .revoke(&binding.snapshot)
+            .unwrap();
+
+        let error = service
+            .act(
+                "act-generation-revoke",
+                &run.run_id,
+                current.version,
+                &observation.observation_id,
+                ComputerAction::SetValue {
+                    element_id: format!("{}-name", observation.observation_id),
+                    text: "Ada".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::PermissionRevoked);
+        assert!(!backend.submitted());
+        assert_eq!(
+            service.get_run(&run.run_id).unwrap().unwrap().action_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_service_cannot_reuse_an_old_run_capability() {
+        let dir = tempdir().unwrap();
+        let service = ComputerUseService::new(
+            Arc::new(SimulatorBackend::new()),
+            ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+        );
+        let owner = Uuid::new_v4();
+        let run = service
+            .create_run(
+                "create-generation-restart",
+                owner,
+                None,
+                SimulatorBackend::demo_target(),
+                Default::default(),
+            )
+            .unwrap();
+        let run_id = run.run_id.clone();
+        drop(service);
+
+        let restarted = ComputerUseService::new(
+            Arc::new(SimulatorBackend::new()),
+            ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+        );
+        let recovered = restarted.get_run(&run_id).unwrap().unwrap();
+        let error = restarted
+            .observe("observe-generation-restart", &run_id, recovered.version)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ComputerErrorCode::Unauthorized);
     }
 
     #[tokio::test]
@@ -1940,14 +2066,12 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_wins_over_an_inflight_action_completion() {
-        eprintln!("cancel-race: start");
         let dir = tempdir().unwrap();
         let backend = Arc::new(BlockingBackend::default());
         let service = Arc::new(ComputerUseService::new(
             backend.clone(),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
         ));
-        eprintln!("cancel-race: service");
         let run = service
             .create_run(
                 "create-cancel-race",
@@ -1957,16 +2081,13 @@ mod tests {
                 Default::default(),
             )
             .unwrap();
-        eprintln!("cancel-race: created");
         let run = service
             .authorize("grant-cancel-race", &run.run_id, run.version, grant(&run))
             .unwrap();
-        eprintln!("cancel-race: authorized");
         let observation = service
             .observe("observe-cancel-race", &run.run_id, run.version)
             .await
             .unwrap();
-        eprintln!("cancel-race: observed");
         let current = service.get_run(&run.run_id).unwrap().unwrap();
         let action_service = service.clone();
         let action_run_id = run.run_id.clone();
@@ -1985,14 +2106,12 @@ mod tests {
                 )
                 .await
         });
-        eprintln!("cancel-race: action spawned");
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
             backend.action_entered.notified(),
         )
         .await
         .expect("action must reach the backend before cancellation");
-        eprintln!("cancel-race: backend entered");
         tokio::task::yield_now().await;
 
         let cancelled = tokio::time::timeout(
@@ -2002,7 +2121,6 @@ mod tests {
         .await
         .expect("cancel must release an in-flight action")
         .unwrap();
-        eprintln!("cancel-race: cancelled");
         assert_eq!(cancelled.state, ComputerRunState::Cancelled);
         assert_eq!(
             cancelled.control_disposition,

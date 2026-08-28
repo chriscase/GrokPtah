@@ -1001,6 +1001,11 @@ impl AgentHostHandle {
         let (principal, policy_digest) = self.computer_capability_identity(session_id)?;
         let resolved =
             resolve_computer_eligibility(&credentials, &model, &principal, &policy_digest)?;
+        let _ = self.capability_authority.issue(
+            &resolved.capability_snapshot,
+            Utc::now(),
+            crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+        )?;
         if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
             return Ok(resolved.eligibility);
         }
@@ -1047,6 +1052,11 @@ impl AgentHostHandle {
         let resolved =
             resolve_computer_eligibility(&credentials, &model, &principal, &policy_digest)?;
         if resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct {
+            let _ = self.capability_authority.issue(
+                &resolved.capability_snapshot,
+                Utc::now(),
+                crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+            )?;
             return Ok(resolved.eligibility);
         }
         qualify_semantic_model(&credentials, &model, effort, &cancel)
@@ -1105,6 +1115,11 @@ impl AgentHostHandle {
         let (principal, policy_digest) = self.computer_capability_identity(session_id)?;
         let resolved =
             resolve_computer_eligibility(&credentials, &model, &principal, &policy_digest)?;
+        let _ = self.capability_authority.issue(
+            &resolved.capability_snapshot,
+            Utc::now(),
+            crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+        )?;
         let durable_authority =
             resolved.eligibility.tier >= crate::gateway_config::ComputerUseTier::SemanticAct;
         let session_authority = self
@@ -1165,6 +1180,7 @@ impl AgentHostHandle {
     }
 
     fn invalidate_computer_agent_authority(&self) {
+        let _ = self.capability_authority.revoke_all();
         let tokens = {
             let mut inner = self.inner.lock();
             inner.computer_agent_qualifications.clear();

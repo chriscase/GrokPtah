@@ -338,6 +338,15 @@ impl CapabilityAuthority {
         Ok(())
     }
 
+    pub(crate) fn revoke_all(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capability authority is unavailable"))?;
+        state.current.clear();
+        Ok(())
+    }
+
     #[cfg(test)]
     fn disable_for_test(&self) {
         self.state.lock().unwrap().enabled = false;
@@ -425,6 +434,27 @@ mod tests {
             .unwrap();
         let consumed = authority.consume(lease, &snapshot, now).unwrap();
         assert_eq!(consumed.effect_scope, "computer.act");
+    }
+
+    #[test]
+    fn revocation_between_admission_and_effect_denies_without_consuming() {
+        let authority = CapabilityAuthority::new(true);
+        let now = Utc::now();
+        let snapshot = snapshot("stable");
+        let capability = authority
+            .issue(&snapshot, now, DEFAULT_CAPABILITY_TTL)
+            .unwrap();
+        let lease = authority
+            .lease(
+                &capability,
+                &snapshot,
+                "provider.send",
+                now,
+                Duration::seconds(5),
+            )
+            .unwrap();
+        authority.revoke(&snapshot).unwrap();
+        assert!(authority.consume(lease, &snapshot, now).is_err());
     }
 
     #[test]
