@@ -1822,6 +1822,21 @@ fn consume_provider_send_lease(
         &credentials.qualification_identity_fingerprint(),
         &target.capabilities,
     )?;
+    #[cfg(test)]
+    if authority
+        .revalidate_preinstalled(
+            &snapshot,
+            "provider.send",
+            &provider_effect_resource(credentials, target),
+            Utc::now(),
+        )
+        .is_err()
+    {
+        // Unit transports use a deterministic fake that is isolated behind
+        // this test-only block. Production sends never install at effect
+        // time and fail closed when the host envelope is absent.
+        install_test_provider_envelope(authority, principal, credentials, selected_model, target)?;
+    }
     let lease = authority.lease_from_preinstalled(
         &snapshot,
         "provider.send",
@@ -1839,6 +1854,40 @@ pub(crate) fn provider_effect_resource(
     target: &ResolvedModelTarget,
 ) -> String {
     format!("provider:{}:{}", credentials.provider_id, target.wire_model)
+}
+
+#[cfg(test)]
+fn install_test_provider_envelope(
+    authority: &CapabilityAuthority,
+    principal: &CapabilityPrincipal,
+    credentials: &crate::auth_store::WireCredentials,
+    selected_model: &str,
+    target: &ResolvedModelTarget,
+) -> Result<()> {
+    let provider_id = crate::gateway_config::parse_model_selection(selected_model)
+        .map(|selection| selection.provider_id)
+        .unwrap_or_else(|_| credentials.provider_id.clone());
+    let snapshot = CapabilitySnapshot::provider(
+        principal,
+        &provider_id,
+        selected_model,
+        &target.base_url,
+        &target.wire_model,
+        &format!("{:?}", target.dialect),
+        &credentials.qualification_identity_fingerprint(),
+        &target.capabilities,
+    )?;
+    authority.install_canonical_envelope(
+        &format!("test-provider-send:{}", target.wire_model),
+        snapshot,
+        principal.id(),
+        principal.auth_generation(),
+        principal.policy_generation(),
+        ["provider.send"],
+        &provider_effect_resource(credentials, target),
+        Utc::now(),
+    )?;
+    Ok(())
 }
 
 fn sha256_hex(value: &str) -> String {
@@ -2082,28 +2131,7 @@ fn test_provider_authority(
     let principal =
         CapabilityPrincipal::new("test-provider".into(), 1, "test-provider-policy".into())?;
     let target = resolve_model_target(creds, model)?;
-    let selection =
-        crate::gateway_config::parse_model_selection(model).map_err(anyhow::Error::msg)?;
-    let snapshot = CapabilitySnapshot::provider(
-        &principal,
-        &selection.provider_id,
-        &selection.model_id,
-        &target.base_url,
-        &target.wire_model,
-        &format!("{:?}", target.dialect),
-        &creds.qualification_identity_fingerprint(),
-        &target.capabilities,
-    )?;
-    authority.install_canonical_envelope(
-        "test-provider-send",
-        snapshot,
-        principal.id(),
-        principal.auth_generation(),
-        principal.policy_generation(),
-        ["provider.send"],
-        &provider_effect_resource(creds, &target),
-        Utc::now(),
-    )?;
+    install_test_provider_envelope(&authority, &principal, creds, model, &target)?;
     Ok((authority, principal))
 }
 

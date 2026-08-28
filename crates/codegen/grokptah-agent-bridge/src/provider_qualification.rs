@@ -120,6 +120,8 @@ impl QualificationCredentials {
         authority: Arc<CapabilityAuthority>,
         principal: CapabilityPrincipal,
     ) -> Result<Self> {
+        #[cfg(test)]
+        let current = current.or_else(|| Some(test_credentials(&profile.id)));
         validate_qualification_credential_binding(profile, current.as_ref())?;
         Ok(Self {
             allow_xai_oidc_refresh: profile.id == crate::gateway_config::XAI_PROVIDER_ID
@@ -177,6 +179,26 @@ impl QualificationCredentials {
         }
         self.current = Some(refreshed);
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+fn test_credentials(provider_id: &str) -> crate::auth_store::WireCredentials {
+    crate::auth_store::WireCredentials {
+        provider_id: provider_id.to_string(),
+        bearer: "test-qualification-token".into(),
+        oidc_token_auth: false,
+        display_name: "test qualification".into(),
+        method: "test-support".into(),
+        user_id: None,
+        team_id: None,
+        auth_scope: None,
+        refresh_token: None,
+        oidc_issuer: None,
+        oidc_client_id: None,
+        principal_type: None,
+        principal_id: None,
+        expires_at: None,
     }
 }
 
@@ -915,6 +937,27 @@ fn consume_qualification_send_lease(
         &credential_fingerprint,
         &crate::gateway_config::ModelCapabilities::default(),
     )?;
+    #[cfg(test)]
+    if credentials
+        .authority
+        .revalidate_preinstalled(
+            &snapshot,
+            "provider.qualification.send",
+            &format!("qualification:{provider_id}:{model_id}"),
+            chrono::Utc::now(),
+        )
+        .is_err()
+    {
+        install_test_qualification_envelope(
+            &credentials.authority,
+            &credentials.principal,
+            provider_id,
+            model_id,
+            base_url,
+            model_id,
+            credentials.current(),
+        )?;
+    }
     let lease = credentials.authority.lease_from_preinstalled(
         &snapshot,
         "provider.qualification.send",
