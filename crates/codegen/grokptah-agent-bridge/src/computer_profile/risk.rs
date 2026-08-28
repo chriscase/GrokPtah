@@ -211,7 +211,10 @@ mod tests {
             classify_objective("send the report and then delete the draft"),
             TaskRisk::Destructive
         );
-        assert_eq!(classify_objective("show the undeleted records"), TaskRisk::Routine);
+        assert_eq!(
+            classify_objective("show the undeleted records"),
+            TaskRisk::Routine
+        );
         assert_eq!(classify_objective("RM -RF /tmp/out"), TaskRisk::Destructive);
         assert_eq!(
             classify_objective("un-install the application"),
@@ -221,7 +224,13 @@ mod tests {
 
     #[test]
     fn consequential_objectives_are_not_model_decided() {
-        assert_eq!(classify_objective("Submit the expense claim"), TaskRisk::Consequential);
-        assert_eq!(classify_objective("find the row for order 41"), TaskRisk::Routine);
+        assert_eq!(
+            classify_objective("Submit the expense claim"),
+            TaskRisk::Consequential
+        );
+        assert_eq!(
+            classify_objective("find the row for order 41"),
+            TaskRisk::Routine
+        );
     }
 }

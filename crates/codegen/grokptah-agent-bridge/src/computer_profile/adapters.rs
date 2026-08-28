@@ -230,8 +230,8 @@ mod tests {
         ComputerTarget, EvidenceRef, ObservationGeometry, SemanticAction, SemanticElement,
         Sensitivity,
     };
-    use std::collections::BTreeSet;
     use chrono::Utc;
+    use std::collections::BTreeSet;
 
     fn observation() -> ComputerObservation {
         ComputerObservation {

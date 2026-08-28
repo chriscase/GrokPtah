@@ -243,13 +243,12 @@ impl AdaptivePolicyEngine {
         let requested = policy.minimum_profile.unwrap_or(AdaptiveProfile::Economy);
         let floor = Self::risk_floor(policy.risk).max(requested);
         if floor > ceiling {
-            let reason = if floor == AdaptiveProfile::HighAssurance
-                && !evidence.host.independent_verifier
-            {
-                ProfileReason::IndependentVerifierUnavailable
-            } else {
-                ProfileReason::InsufficientCapabilityForRisk
-            };
+            let reason =
+                if floor == AdaptiveProfile::HighAssurance && !evidence.host.independent_verifier {
+                    ProfileReason::IndependentVerifierUnavailable
+                } else {
+                    ProfileReason::InsufficientCapabilityForRisk
+                };
             return PolicyOutcome::Stop(PolicyStop {
                 reason,
                 profile: ceiling,

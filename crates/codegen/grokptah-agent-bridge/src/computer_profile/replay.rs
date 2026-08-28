@@ -118,11 +118,13 @@ impl ReplayVerifier {
                     if event.observation_id.as_deref().is_none_or(str::is_empty)
                         || !valid_digest(event.observation_digest.as_deref())
                     {
-                        return Err(if event.observation_id.as_deref().is_none_or(str::is_empty) {
-                            ReplayError::MissingObservationEvidence
-                        } else {
-                            ReplayError::InvalidDigest
-                        });
+                        return Err(
+                            if event.observation_id.as_deref().is_none_or(str::is_empty) {
+                                ReplayError::MissingObservationEvidence
+                            } else {
+                                ReplayError::InvalidDigest
+                            },
+                        );
                     }
                 }
                 ReplayEventKind::ActionProposal => {

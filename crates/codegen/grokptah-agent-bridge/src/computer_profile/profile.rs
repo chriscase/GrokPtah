@@ -321,8 +321,7 @@ const _: () = assert!(
         && within_kernel(&HIGH_ASSURANCE_BUDGET)
 );
 const _: () = assert!(
-    narrows(&ECONOMY_BUDGET, &BALANCED_BUDGET)
-        && narrows(&BALANCED_BUDGET, &HIGH_ASSURANCE_BUDGET)
+    narrows(&ECONOMY_BUDGET, &BALANCED_BUDGET) && narrows(&BALANCED_BUDGET, &HIGH_ASSURANCE_BUDGET)
 );
 const _: () = assert!(
     !ECONOMY_BUDGET.observation_detail.allows_screenshot_bytes()

@@ -124,10 +124,9 @@ impl AdaptiveRunState {
             && self.capability_ceiling >= self.profile
             && self.escalations.len() <= MAX_ESCALATIONS
             && self.observation_digests.len() <= MAX_OBSERVATION_DIGESTS
-            && self
-                .observation_digests
-                .iter()
-                .all(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            && self.observation_digests.iter().all(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
     }
 }
 
@@ -153,7 +152,9 @@ impl std::fmt::Display for ControllerError {
                 formatter,
                 "adaptive run revision conflict: expected {expected}, current {actual}"
             ),
-            Self::TurnInFlight => formatter.write_str("an adaptive model turn is already in flight"),
+            Self::TurnInFlight => {
+                formatter.write_str("an adaptive model turn is already in flight")
+            }
             Self::Terminated { reason } => formatter.write_str(reason.operator_message()),
             Self::InvalidState => formatter.write_str("adaptive run state is invalid"),
         }
@@ -401,8 +402,7 @@ impl AdaptiveController {
             });
         }
         let evidence = &self.state.evidence;
-        let transition =
-            AdaptivePolicyEngine.reassess(self.state.profile, evidence, signal);
+        let transition = AdaptivePolicyEngine.reassess(self.state.profile, evidence, signal);
         self.state.revision = self.state.revision.saturating_add(1);
         match &transition {
             ProfileTransition::Escalate { from, to, reason } => {
@@ -508,11 +508,11 @@ mod tests {
     }
 
     fn observation(value: &str) -> ComputerObservation {
-        use std::collections::BTreeSet;
-        use chrono::Utc;
         use crate::computer_use::{
             ComputerTarget, ObservationGeometry, SemanticAction, SemanticElement, Sensitivity,
         };
+        use chrono::Utc;
+        use std::collections::BTreeSet;
         ComputerObservation {
             observation_id: format!("obs-{value}"),
             sequence: 1,

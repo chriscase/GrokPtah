@@ -200,4 +200,3 @@ pub fn project_adaptive(controller: &AdaptiveController) -> AdaptiveProfileProje
         terminal: state.terminal.as_ref().map(TerminalProjection::from),
     }
 }
-
