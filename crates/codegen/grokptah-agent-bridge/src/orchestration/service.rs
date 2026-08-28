@@ -1745,7 +1745,7 @@ impl OrchestrationService {
     /// generation material, and persisted lease/hash fields are host data.
     pub(crate) fn public_projection(&self, value: serde_json::Value) -> serde_json::Value {
         let handles = {
-            let mut registry = self.auth_registry.lock();
+            let registry = self.auth_registry.lock();
             self.auth_credentials
                 .lock()
                 .iter()
@@ -2268,6 +2268,10 @@ impl OrchestrationService {
                 "workspace is not allowlisted by this service",
             ));
         }
+        let title = title.and_then(|value| {
+            let value = value.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        });
         let staged = self
             .host
             .stage_session_new_kind(SessionKind::Build, claimed.clone(), title)

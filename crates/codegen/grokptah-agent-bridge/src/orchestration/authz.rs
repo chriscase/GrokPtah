@@ -60,7 +60,11 @@ fn authority_fault(point: &str) -> Result<(), OrchError> {
             "dir_sync" => 4,
             _ => 0,
         };
-        if value != 0 && TEST_AUTHORITY_FAULT.load(Ordering::Acquire) == value {
+        if value != 0
+            && TEST_AUTHORITY_FAULT
+                .compare_exchange(value, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
             return Err(internal_error(format!(
                 "injected authority persistence failure at {point}"
             )));
@@ -588,14 +592,6 @@ impl AuthRegistry {
         self.persist_state_locked(&candidate)?;
         self.state = candidate;
         Ok(value)
-    }
-
-    pub(crate) fn reconcile(
-        &mut self,
-        credentials: &[AuthCredential],
-        owner_id: &str,
-    ) -> Result<bool, OrchError> {
-        self.transactional(|state| reconcile_state(state, credentials, owner_id))
     }
 
     fn refresh_durable_state(&mut self) -> Result<(), OrchError> {
@@ -1410,7 +1406,7 @@ mod tests {
     fn bearer_fail_closed() {
         let root = tempdir().unwrap();
         let credential = AuthCredential::new("primary", "tok").unwrap();
-        let registry = AuthRegistry::open(root.path(), &[credential], "primary").unwrap();
+        let mut registry = AuthRegistry::open(root.path(), &[credential], "primary").unwrap();
         assert!(registry
             .authenticate(None, &[AuthCredential::new("primary", "tok").unwrap()])
             .is_err());
@@ -1441,7 +1437,7 @@ mod tests {
             AuthCredential::new("laptop", "other-tok").unwrap(),
         ];
         let root = tempdir().unwrap();
-        let registry = AuthRegistry::open(root.path(), &credentials, "account-1").unwrap();
+        let mut registry = AuthRegistry::open(root.path(), &credentials, "account-1").unwrap();
         let auth = registry
             .authenticate(Some("Bearer other-tok"), &credentials)
             .unwrap();
@@ -1512,7 +1508,7 @@ mod tests {
         assert!(registry.require_current(&old_auth).is_err());
         drop(registry);
 
-        let reopened =
+        let mut reopened =
             AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "primary").unwrap();
         assert!(reopened.require_current(&old_auth).is_err());
         let new_auth = reopened
@@ -1630,6 +1626,31 @@ mod tests {
     }
 
     #[test]
+    fn authority_write_sync_rename_and_directory_faults_fail_closed() {
+        for fault in ["write", "file_sync", "rename", "dir_sync"] {
+            let root = tempdir().unwrap();
+            let credential = AuthCredential::new("primary", "secret").unwrap();
+            let mut registry =
+                AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner")
+                    .unwrap();
+            let auth = registry
+                .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
+                .unwrap();
+            let authority = root.path().join(AUTHORITY_FILE);
+            let before = std::fs::read(&authority).unwrap();
+            set_test_authority_fault(Some(fault));
+
+            assert!(registry
+                .ensure_resource_binding("run:fault", &auth)
+                .is_err());
+            set_test_authority_fault(None);
+
+            assert!(!registry.state.bindings.contains_key("run:fault"));
+            assert_eq!(std::fs::read(&authority).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn a_rotated_generation_wins_against_a_stale_cross_process_effect() {
         let root = tempdir().unwrap();
         let credential = AuthCredential::new("primary", "secret").unwrap();
@@ -1658,10 +1679,109 @@ mod tests {
     }
 
     #[test]
+    fn two_real_processes_refresh_cached_revocation_before_read() {
+        if std::env::var("GROKPTAH_AUTH_CHILD_MODE").is_ok() {
+            return;
+        }
+        let root = tempdir().unwrap();
+        let credential = AuthCredential::new("primary", "secret").unwrap();
+        AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner").unwrap();
+        let reader_ready = root.path().join("reader-ready");
+        let revoked = root.path().join("revoked");
+        let exe = std::env::current_exe().unwrap();
+        let reader = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "orchestration::authz::tests::child_revocation_reader",
+                "--nocapture",
+            ])
+            .env("GROKPTAH_AUTH_CHILD_MODE", "reader")
+            .env("GROKPTAH_AUTH_CHILD_ROOT", root.path())
+            .env("GROKPTAH_AUTH_READER_READY", &reader_ready)
+            .env("GROKPTAH_AUTH_REVOKED", &revoked)
+            .spawn()
+            .unwrap();
+        let rotator = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "orchestration::authz::tests::child_revocation_rotator",
+                "--nocapture",
+            ])
+            .env("GROKPTAH_AUTH_CHILD_MODE", "rotator")
+            .env("GROKPTAH_AUTH_CHILD_ROOT", root.path())
+            .env("GROKPTAH_AUTH_READER_READY", &reader_ready)
+            .env("GROKPTAH_AUTH_REVOKED", &revoked)
+            .spawn()
+            .unwrap();
+        let reader_status = reader.wait_with_output().unwrap();
+        let rotator_status = rotator.wait_with_output().unwrap();
+        assert!(
+            reader_status.status.success(),
+            "reader process failed: {}",
+            String::from_utf8_lossy(&reader_status.stderr)
+        );
+        assert!(
+            rotator_status.status.success(),
+            "rotator process failed: {}",
+            String::from_utf8_lossy(&rotator_status.stderr)
+        );
+    }
+
+    #[test]
+    fn child_revocation_reader() {
+        if std::env::var("GROKPTAH_AUTH_CHILD_MODE").as_deref() != Ok("reader") {
+            return;
+        }
+        let root = PathBuf::from(std::env::var("GROKPTAH_AUTH_CHILD_ROOT").unwrap());
+        let credential = AuthCredential::new("primary", "secret").unwrap();
+        let mut registry =
+            AuthRegistry::open(&root, std::slice::from_ref(&credential), "owner").unwrap();
+        let auth = registry
+            .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
+            .unwrap();
+        std::fs::write(
+            std::env::var("GROKPTAH_AUTH_READER_READY").unwrap(),
+            b"ready",
+        )
+        .unwrap();
+        let revoked = PathBuf::from(std::env::var("GROKPTAH_AUTH_REVOKED").unwrap());
+        for _ in 0..500 {
+            if revoked.is_file() {
+                assert!(registry.require_current(&auth).is_err());
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("revocation child did not observe the rotator");
+    }
+
+    #[test]
+    fn child_revocation_rotator() {
+        if std::env::var("GROKPTAH_AUTH_CHILD_MODE").as_deref() != Ok("rotator") {
+            return;
+        }
+        let root = PathBuf::from(std::env::var("GROKPTAH_AUTH_CHILD_ROOT").unwrap());
+        let ready = PathBuf::from(std::env::var("GROKPTAH_AUTH_READER_READY").unwrap());
+        for _ in 0..500 {
+            if ready.is_file() {
+                let credential = AuthCredential::new("primary", "secret").unwrap();
+                let mut registry =
+                    AuthRegistry::open(&root, std::slice::from_ref(&credential), "owner").unwrap();
+                registry.revoke("primary").unwrap();
+                std::fs::write(std::env::var("GROKPTAH_AUTH_REVOKED").unwrap(), b"revoked")
+                    .unwrap();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("rotator child did not observe the reader");
+    }
+
+    #[test]
     fn delegated_authority_is_limited_to_the_exact_host_scope() {
         let root = tempdir().unwrap();
         let credential = AuthCredential::new("primary", "secret").unwrap();
-        let registry =
+        let mut registry =
             AuthRegistry::open(root.path(), std::slice::from_ref(&credential), "owner").unwrap();
         let auth = registry
             .authenticate(Some("Bearer secret"), std::slice::from_ref(&credential))
@@ -1686,7 +1806,7 @@ mod tests {
     fn public_debug_does_not_reveal_credential_identity_or_owner() {
         let root = tempdir().unwrap();
         let credential = AuthCredential::new("private-device", "secret").unwrap();
-        let registry = AuthRegistry::open(
+        let mut registry = AuthRegistry::open(
             root.path(),
             std::slice::from_ref(&credential),
             "private-owner",

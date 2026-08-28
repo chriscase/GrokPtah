@@ -2885,7 +2885,7 @@ impl AgentHostHandle {
             eprintln!("[grokptah] transcript rewrite failed: {e:#}");
             return;
         }
-        let mut g = self.inner.lock();
+        let g = self.inner.lock();
         if let Some(s) = g.sessions.get_mut(&id) {
             s.persisted_len = s.transcript.len();
             s.transcript_loaded = true;
@@ -3043,7 +3043,7 @@ impl AgentHostHandle {
         if !cwd.is_dir() {
             bail!("not a directory: {}", cwd.display());
         }
-        let mut g = self.inner.lock();
+        let g = self.inner.lock();
         if !g.running {
             bail!("agent not started");
         }
@@ -3531,7 +3531,7 @@ impl AgentHostHandle {
             (before, s.summary())
         };
         if let Err(error) = self.persist_session_meta_only_checked(id) {
-            self.rollback_session_metadata(id, before, error)?;
+            self.rollback_session_metadata(id, before.clone(), error)?;
             bail!("session rename was not committed");
         }
         Ok(summary)
@@ -3638,7 +3638,7 @@ impl AgentHostHandle {
             (before, s.summary())
         };
         if let Err(error) = self.persist_session_meta_only_checked(id) {
-            self.rollback_session_metadata(id, before, error)?;
+            self.rollback_session_metadata(id, before.clone(), error)?;
             bail!("session cwd was not committed");
         }
 
@@ -11557,6 +11557,57 @@ mod tests {
                 .join("session-create-intent.json")
                 .exists());
         }
+    }
+
+    #[test]
+    fn service_session_creation_binds_before_publication_and_rolls_back_on_commit_failure() {
+        let (_home, host) = empty_test_host();
+        let workspace = tempfile::tempdir().unwrap();
+        let service = crate::orchestration::OrchestrationService::new(
+            host.clone(),
+            host.event_bus(),
+            crate::orchestration::OrchStore::open(
+                crate::discover::grokptah_home().join("orchestration"),
+            )
+            .unwrap(),
+            crate::orchestration::OrchestrationConfig {
+                bearer_token: "service-session-secret".into(),
+                allowlist: crate::orchestration::WorkspaceAllowlist::new([workspace
+                    .path()
+                    .to_path_buf()]),
+                max_concurrent_runs: 1,
+                bounds: crate::orchestration::RunBounds::default(),
+            },
+        );
+        let auth = service
+            .auth_header(Some("Bearer service-session-secret"))
+            .unwrap();
+
+        crate::session_store::set_test_persistence_failure(Some("chrome"));
+        assert!(service
+            .create_session(&auth, workspace.path(), Some("final service title".into()))
+            .is_err());
+        crate::session_store::set_test_persistence_failure(None);
+        assert!(host.list_all_sessions().is_empty());
+        let authority: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                crate::discover::grokptah_home()
+                    .join("orchestration")
+                    .join("auth-authority.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(authority["bindings"], serde_json::json!({}));
+
+        let created = service
+            .create_session(&auth, workspace.path(), Some("final service title".into()))
+            .unwrap();
+        let session_id = created["sessionId"].as_str().unwrap().parse().unwrap();
+        let session = host.session_inspect(session_id).unwrap();
+        assert_eq!(session.title, "final service title");
+        assert_eq!(session.cwd, workspace.path().display().to_string());
+        assert_eq!(host.list_sessions().len(), 1);
     }
 
     fn usage_test_run(run_id: &str, max_total_tokens: Option<u64>) -> RunRecord {

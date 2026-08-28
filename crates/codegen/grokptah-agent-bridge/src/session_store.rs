@@ -990,6 +990,48 @@ mod tests {
     }
 
     #[test]
+    fn atomic_session_writes_surface_file_and_directory_faults() {
+        for fault in ["write", "file_sync", "rename", "dir_sync"] {
+            let _g = home_override_serial();
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join(".grokptah");
+            std::fs::create_dir_all(home.join("sessions")).unwrap();
+            set_grokptah_home_override(Some(home));
+            set_test_persistence_failure(Some(fault));
+            assert!(save_chrome(&WorkspaceChrome::default()).is_err());
+            set_test_persistence_failure(None);
+            set_grokptah_home_override(None);
+        }
+    }
+
+    #[test]
+    fn intent_cleanup_failure_is_an_explicit_recoverable_commit() {
+        let _g = home_override_serial();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join(".grokptah");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        set_grokptah_home_override(Some(home));
+        let session = Session::new(tmp.path().to_path_buf(), "m".into(), EffortLevel::Medium);
+        let next = WorkspaceChrome {
+            active_session: Some(session.id),
+            open_tab_ids: vec![session.id],
+            ..WorkspaceChrome::default()
+        };
+        set_test_persistence_failure(Some("intent_remove"));
+        assert_eq!(
+            create_session_durable(&session, &next).unwrap(),
+            SessionCommitStatus::RecoveryRequired
+        );
+        set_test_persistence_failure(None);
+        assert!(session_dir(session.id).join("meta.json").is_file());
+        assert!(grokptah_home().join(SESSION_CREATION_INTENT_FILE).is_file());
+        let (_, sessions) = load_workspace().unwrap();
+        assert!(sessions.contains_key(&session.id));
+        assert!(!grokptah_home().join(SESSION_CREATION_INTENT_FILE).exists());
+        set_grokptah_home_override(None);
+    }
+
+    #[test]
     fn restart_recovery_removes_phantom_session_but_keeps_committed_session() {
         let _g = home_override_serial();
         let tmp = tempfile::tempdir().unwrap();
