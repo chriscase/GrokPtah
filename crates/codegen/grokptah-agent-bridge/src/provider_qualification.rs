@@ -751,7 +751,7 @@ async fn completion(
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let mut removed_tool_choice = false;
     let mut transient_retries = 0_u32;
-    let mut request_bytes =
+    let request_bytes =
         serde_json::to_vec(&body).context("serialize provider qualification request")?;
     let mut provider_attempt = provider_attempt
         .acquire_next_effect_lease()
@@ -826,7 +826,6 @@ async fn completion(
                 &serde_json::to_vec(&body)?,
                 status.as_u16(),
             )?;
-            request_bytes = serde_json::to_vec(&body)?;
             removed_tool_choice = true;
             continue;
         }
