@@ -108,26 +108,27 @@ impl WorldSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum EventKind {
-    Takeover,
-    Cancel,
-    TimeoutBeforeSend,
-    TimeoutAfterSend,
-    TimeoutAfterInput,
-    CrashBeforeSend,
-    CrashAfterSend,
-    CrashAfterInput,
-    Restart,
-    DowngradeVision,
-    DowngradeTools,
-    MoveTarget,
-    ResizeTarget,
-    RestartTarget,
-    AdvanceOtherAgent,
-    GrantVisual,
-    ExpireGrant,
-    SecondAgentSameDomain,
-    SecondAgentIsolated,
+    Takeover {},
+    Cancel {},
+    TimeoutBeforeSend {},
+    TimeoutAfterSend {},
+    TimeoutAfterInput {},
+    CrashBeforeSend {},
+    CrashAfterSend {},
+    CrashAfterInput {},
+    Restart {},
+    DowngradeVision {},
+    DowngradeTools {},
+    MoveTarget {},
+    ResizeTarget {},
+    RestartTarget {},
+    AdvanceOtherAgent {},
+    GrantVisual {},
+    ExpireGrant {},
+    SecondAgentSameDomain {},
+    SecondAgentIsolated {},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,7 +373,7 @@ impl Host {
 
     pub fn apply_event(&mut self, event: EventKind) {
         match event {
-            EventKind::Takeover => {
+            EventKind::Takeover {} => {
                 self.takeover = true;
                 for lease in self.leases.values_mut() {
                     lease.revoked = true;
@@ -382,44 +383,44 @@ impl Host {
                 self.domain_busy.clear();
                 self.log("takeover", "operator takeover is absorbing");
             }
-            EventKind::Cancel => {
+            EventKind::Cancel {} => {
                 self.cancelled = true;
                 self.log("cancel", "run cancelled");
             }
-            EventKind::TimeoutBeforeSend => {
+            EventKind::TimeoutBeforeSend {} => {
                 self.timeout = Some(TimeoutClass::DefinitelyBeforeSend);
                 self.log("timeout", "definitely_before_send");
             }
-            EventKind::TimeoutAfterSend => {
+            EventKind::TimeoutAfterSend {} => {
                 self.timeout = Some(TimeoutClass::UncertainAfterSend);
                 self.log("timeout", "uncertain_after_send");
             }
-            EventKind::TimeoutAfterInput => {
+            EventKind::TimeoutAfterInput {} => {
                 self.timeout = Some(TimeoutClass::UncertainAfterInput);
                 self.log("timeout", "uncertain_after_input");
             }
-            EventKind::CrashBeforeSend => {
+            EventKind::CrashBeforeSend {} => {
                 self.crash = Some(CrashCut::BeforeSend);
                 self.log("crash", "before_send");
             }
-            EventKind::CrashAfterSend => {
+            EventKind::CrashAfterSend {} => {
                 self.crash = Some(CrashCut::AfterSend);
                 self.log("crash", "after_send");
             }
-            EventKind::CrashAfterInput => {
+            EventKind::CrashAfterInput {} => {
                 self.crash = Some(CrashCut::AfterInput);
                 self.log("crash", "after_input");
             }
-            EventKind::Restart => self.restart(),
-            EventKind::DowngradeVision => {
+            EventKind::Restart {} => self.restart(),
+            EventKind::DowngradeVision {} => {
                 self.caps.vision = false;
                 self.log("downgrade", "vision removed; higher tier not retained");
             }
-            EventKind::DowngradeTools => {
+            EventKind::DowngradeTools {} => {
                 self.caps.tools = false;
                 self.log("downgrade", "tools removed");
             }
-            EventKind::MoveTarget => {
+            EventKind::MoveTarget {} => {
                 if let Some(s) = self.surfaces.get_mut(&self.primary_surface) {
                     s.spec.geometry.x += 40;
                     s.spec.geometry.y += 12;
@@ -427,14 +428,14 @@ impl Host {
                 self.invalidate_obs(&self.primary_surface.clone());
                 self.log("target", "moved");
             }
-            EventKind::ResizeTarget => {
+            EventKind::ResizeTarget {} => {
                 if let Some(s) = self.surfaces.get_mut(&self.primary_surface) {
                     s.spec.geometry.width = s.spec.geometry.width.saturating_add(80);
                 }
                 self.invalidate_obs(&self.primary_surface.clone());
                 self.log("target", "resized");
             }
-            EventKind::RestartTarget => {
+            EventKind::RestartTarget {} => {
                 if let Some(s) = self.surfaces.get_mut(&self.primary_surface) {
                     s.spec.generation += 1;
                     s.incarnation += 1;
@@ -442,28 +443,28 @@ impl Host {
                 self.invalidate_obs(&self.primary_surface.clone());
                 self.log("target", "restarted generation");
             }
-            EventKind::AdvanceOtherAgent => {
+            EventKind::AdvanceOtherAgent {} => {
                 if let Some(s) = self.surfaces.get_mut(&self.primary_surface) {
                     s.spec.generation += 1;
                 }
                 self.invalidate_obs(&self.primary_surface.clone());
                 self.log("contention", "other agent advanced shared surface");
             }
-            EventKind::GrantVisual => {
+            EventKind::GrantVisual {} => {
                 self.visual_grant = true;
                 if self.visual_grant_id.is_none() {
                     self.visual_grant_id = Some("vgrant_eval".into());
                 }
                 self.log("grant", "visual grounding authorized separately");
             }
-            EventKind::ExpireGrant => {
+            EventKind::ExpireGrant {} => {
                 self.grant.expires_at_ms = self.clock;
                 self.log("grant", "expired");
             }
-            EventKind::SecondAgentSameDomain => {
+            EventKind::SecondAgentSameDomain {} => {
                 self.ensure_second_agent(false);
             }
-            EventKind::SecondAgentIsolated => {
+            EventKind::SecondAgentIsolated {} => {
                 self.ensure_second_agent(true);
             }
         }

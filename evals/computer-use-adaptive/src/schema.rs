@@ -234,4 +234,52 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn extra_event_keys_fail_closed() {
+        let ok = r#"{"atStep":0,"phase":"step_start","event":{"type":"takeover"}}"#;
+        crate::schema::parse_strict::<crate::host::ScheduledEvent>(ok).unwrap();
+        let extra = r#"{"atStep":0,"phase":"step_start","event":{"type":"takeover","secret":"x"}}"#;
+        assert!(
+            parse_strict::<crate::host::ScheduledEvent>(extra).is_err(),
+            "extra event keys must fail closed"
+        );
+    }
+
+    #[test]
+    fn element_schema_required_null_fields_match_element_spec() {
+        let schema: serde_json::Value = serde_json::from_str(SCENARIO_SCHEMA_JSON).unwrap();
+        let required: Vec<&str> = schema["$defs"]["element"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for field in ["context", "value", "effect"] {
+            assert!(
+                required.contains(&field),
+                "element required missing {field}: {required:?}"
+            );
+        }
+        let json =
+            to_canonical_json(&crate::catalog::catalog()[0].world.surfaces[0].elements[0]).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for field in ["context", "value", "effect"] {
+            assert!(
+                value.get(field).is_some(),
+                "catalog element omitted {field}"
+            );
+        }
+        let parsed: crate::host::ElementSpec = parse_strict(&json).unwrap();
+        assert_eq!(
+            parsed.stable_key,
+            crate::catalog::catalog()[0].world.surfaces[0].elements[0].stable_key
+        );
+        let mut extra = value;
+        extra
+            .as_object_mut()
+            .unwrap()
+            .insert("secret".into(), serde_json::json!("needle"));
+        assert!(parse_strict::<crate::host::ElementSpec>(&extra.to_string()).is_err());
+    }
 }
