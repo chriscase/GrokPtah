@@ -127,7 +127,7 @@ fn takeover_and_expired_grant_are_denied_on_every_profile() {
         let mut h = host(profile);
         let obs = h.observe("surface_a");
         let el = obs.elements[0].element_id.clone();
-        h.apply_event(grokptah_cu_adaptive_eval::host::EventKind::Takeover);
+        h.apply_event(grokptah_cu_adaptive_eval::host::EventKind::Takeover {});
         let err = h.try_dispatch(
             "surface_a",
             "lease_a",
@@ -144,7 +144,7 @@ fn two_restarts_do_not_replay_physical_input() {
     let mut h = host(ProfileId::Balanced);
     let obs = h.observe("surface_a");
     let el = obs.elements[0].element_id.clone();
-    h.apply_event(grokptah_cu_adaptive_eval::host::EventKind::CrashAfterInput);
+    h.apply_event(grokptah_cu_adaptive_eval::host::EventKind::CrashAfterInput {});
     let _ = h.try_dispatch(
         "surface_a",
         "lease_a",

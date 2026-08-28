@@ -392,7 +392,7 @@ fn flush_restarts(host: &mut Host, scenario: &Scenario) {
     let needed = scenario
         .script
         .iter()
-        .filter(|e| matches!(e.event, EventKind::Restart))
+        .filter(|e| matches!(e.event, EventKind::Restart {}))
         .count() as u32;
     while host.restarts < needed && host.restarts < 8 {
         host.step += 1;
@@ -400,7 +400,7 @@ fn flush_restarts(host: &mut Host, scenario: &Scenario) {
         if !scenario
             .script
             .iter()
-            .any(|e| e.at_step == host.step && matches!(e.event, EventKind::Restart))
+            .any(|e| e.at_step == host.step && matches!(e.event, EventKind::Restart {}))
         {
             if host.restarts < needed {
                 host.restart();

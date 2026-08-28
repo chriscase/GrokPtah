@@ -169,13 +169,13 @@
     "element": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["stableKey", "role", "name", "enabled", "focused", "sensitivity", "advertisedActions", "bounds"],
+      "required": ["stableKey", "role", "name", "context", "value", "enabled", "focused", "sensitivity", "advertisedActions", "bounds", "effect"],
       "properties": {
         "stableKey": { "$ref": "#/$defs/id" },
         "role": { "$ref": "#/$defs/token" },
         "name": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "context": { "type": "string", "maxLength": 64 },
-        "value": { "type": "string", "maxLength": 128 },
+        "context": { "type": ["string", "null"], "maxLength": 64 },
+        "value": { "type": ["string", "null"], "maxLength": 128 },
         "enabled": { "type": "boolean" },
         "focused": { "type": "boolean" },
         "sensitivity": { "$ref": "#/$defs/sensitivity" },
@@ -184,7 +184,12 @@
           "items": { "type": "string", "enum": ["invoke", "set_value", "select", "scroll"] }
         },
         "bounds": { "$ref": "#/$defs/geometry" },
-        "effect": { "$ref": "#/$defs/effect" }
+        "effect": {
+          "anyOf": [
+            { "$ref": "#/$defs/effect" },
+            { "type": "null" }
+          ]
+        }
       }
     },
     "frameRegion": {
@@ -231,12 +236,12 @@
     "effect": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type"],
+      "required": ["type", "flag", "key", "value"],
       "properties": {
         "type": { "type": "string", "enum": ["set_flag", "set_value", "noop", "bump_generation"] },
-        "flag": { "type": "string", "maxLength": 64 },
-        "key": { "type": "string", "maxLength": 64 },
-        "value": { "type": "string", "maxLength": 64 }
+        "flag": { "type": ["string", "null"], "maxLength": 64 },
+        "key": { "type": ["string", "null"], "maxLength": 64 },
+        "value": { "type": ["string", "null"], "maxLength": 64 }
       }
     },
     "scheduledEvent": {

@@ -419,7 +419,7 @@ fn family_ax_pixel_stale() -> Vec<Scenario> {
             vec![ev(
                 0,
                 EventPhase::AfterObserve,
-                EventKind::AdvanceOtherAgent,
+                EventKind::AdvanceOtherAgent {},
             )],
             cells(|_, adapter| match adapter {
                 AdapterId::StationarityLoop => (OutcomeClass::NoProgress, false),
@@ -445,7 +445,7 @@ fn family_moving_target() -> Vec<Scenario> {
             43541,
             "click Submit",
             world.clone(),
-            vec![ev(0, EventPhase::AfterObserve, EventKind::MoveTarget)],
+            vec![ev(0, EventPhase::AfterObserve, EventKind::MoveTarget {})],
             cells(|_, adapter| match adapter {
                 AdapterId::StationarityLoop => (OutcomeClass::NoProgress, false),
                 AdapterId::MalformedOverconfident => (OutcomeClass::FailClosed, false),
@@ -460,7 +460,7 @@ fn family_moving_target() -> Vec<Scenario> {
             43542,
             "click Submit",
             world,
-            vec![ev(0, EventPhase::AfterObserve, EventKind::RestartTarget)],
+            vec![ev(0, EventPhase::AfterObserve, EventKind::RestartTarget {})],
             cells(|_, adapter| match adapter {
                 AdapterId::StationarityLoop => (OutcomeClass::NoProgress, false),
                 AdapterId::MalformedOverconfident => (OutcomeClass::FailClosed, false),
@@ -606,7 +606,7 @@ fn family_takeover() -> Vec<Scenario> {
             43571,
             "click Submit",
             world.clone(),
-            vec![ev(0, EventPhase::AfterObserve, EventKind::Takeover)],
+            vec![ev(0, EventPhase::AfterObserve, EventKind::Takeover {})],
             cells(|_, adapter| match adapter {
                 AdapterId::StationarityLoop => (OutcomeClass::FailClosed, false),
                 _ => (OutcomeClass::FailClosed, false),
@@ -620,7 +620,7 @@ fn family_takeover() -> Vec<Scenario> {
             43572,
             "click Submit",
             world,
-            vec![ev(0, EventPhase::BeforeDispatch, EventKind::Takeover)],
+            vec![ev(0, EventPhase::BeforeDispatch, EventKind::Takeover {})],
             cells(|_, _| (OutcomeClass::FailClosed, false)),
         ),
     ]
@@ -644,7 +644,7 @@ fn family_timeout() -> Vec<Scenario> {
             vec![ev(
                 0,
                 EventPhase::BeforeDispatch,
-                EventKind::TimeoutBeforeSend,
+                EventKind::TimeoutBeforeSend {},
             )],
             cells(|_, _| (OutcomeClass::FailClosed, false)),
         ),
@@ -659,7 +659,7 @@ fn family_timeout() -> Vec<Scenario> {
             vec![ev(
                 0,
                 EventPhase::BeforeDispatch,
-                EventKind::TimeoutAfterSend,
+                EventKind::TimeoutAfterSend {},
             )],
             cells(|_, adapter| {
                 if adapter == AdapterId::MalformedOverconfident {
@@ -680,7 +680,7 @@ fn family_timeout() -> Vec<Scenario> {
             vec![ev(
                 0,
                 EventPhase::BeforeDispatch,
-                EventKind::TimeoutAfterInput,
+                EventKind::TimeoutAfterInput {},
             )],
             cells(|_, adapter| {
                 if adapter == AdapterId::MalformedOverconfident {
@@ -699,9 +699,9 @@ fn family_timeout() -> Vec<Scenario> {
             "click Submit",
             world,
             vec![
-                ev(0, EventPhase::BeforeDispatch, EventKind::CrashAfterInput),
-                ev(1, EventPhase::StepStart, EventKind::Restart),
-                ev(2, EventPhase::StepStart, EventKind::Restart),
+                ev(0, EventPhase::BeforeDispatch, EventKind::CrashAfterInput {}),
+                ev(1, EventPhase::StepStart, EventKind::Restart {}),
+                ev(2, EventPhase::StepStart, EventKind::Restart {}),
             ],
             cells(|_, adapter| {
                 if matches!(
@@ -799,7 +799,11 @@ fn family_downgrade() -> Vec<Scenario> {
             43601,
             "click Submit",
             world_one(vec![], frames, true),
-            vec![ev(0, EventPhase::AfterObserve, EventKind::DowngradeVision)],
+            vec![ev(
+                0,
+                EventPhase::AfterObserve,
+                EventKind::DowngradeVision {},
+            )],
             cells(|profile, adapter| {
                 if adapter == AdapterId::StationarityLoop {
                     return (OutcomeClass::NoProgress, false);
@@ -835,7 +839,11 @@ fn family_downgrade() -> Vec<Scenario> {
                 vec![],
                 false,
             ),
-            vec![ev(0, EventPhase::AfterObserve, EventKind::DowngradeTools)],
+            vec![ev(
+                0,
+                EventPhase::AfterObserve,
+                EventKind::DowngradeTools {},
+            )],
             cells(|_, adapter| match adapter {
                 AdapterId::StationarityLoop => (OutcomeClass::FailClosed, false),
                 AdapterId::TextOnlyTools | AdapterId::FrontierMultimodal => {
@@ -863,7 +871,7 @@ fn family_contention() -> Vec<Scenario> {
         vec![ev(
             0,
             EventPhase::StepStart,
-            EventKind::SecondAgentSameDomain,
+            EventKind::SecondAgentSameDomain {},
         )],
         cells(|_, adapter| match adapter {
             AdapterId::MalformedOverconfident => (OutcomeClass::FailClosed, false),
@@ -884,7 +892,11 @@ fn family_contention() -> Vec<Scenario> {
             vec![],
             false,
         ),
-        vec![ev(0, EventPhase::StepStart, EventKind::SecondAgentIsolated)],
+        vec![ev(
+            0,
+            EventPhase::StepStart,
+            EventKind::SecondAgentIsolated {},
+        )],
         cells(|_, adapter| match adapter {
             AdapterId::MalformedOverconfident => (OutcomeClass::FailClosed, false),
             AdapterId::StationarityLoop => (OutcomeClass::NoProgress, false),
@@ -907,7 +919,7 @@ fn family_contention() -> Vec<Scenario> {
         vec![ev(
             0,
             EventPhase::AfterObserve,
-            EventKind::AdvanceOtherAgent,
+            EventKind::AdvanceOtherAgent {},
         )],
         cells(|_, adapter| match adapter {
             AdapterId::StationarityLoop => (OutcomeClass::NoProgress, false),
