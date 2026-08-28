@@ -106,7 +106,7 @@ pub(crate) fn resolve_computer_eligibility(
     let capability_snapshot = CapabilitySnapshot::provider(
         principal,
         &selection.provider_id,
-        &selection.model_id,
+        model,
         &target.base_url,
         &target.wire_model,
         &format!("{:?}", target.dialect),

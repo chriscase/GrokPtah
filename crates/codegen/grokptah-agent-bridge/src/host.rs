@@ -995,7 +995,7 @@ impl AgentHostHandle {
             let provider_snapshot = CapabilitySnapshot::provider(
                 &principal,
                 &selection.provider_id,
-                &selection.model_id,
+                &model,
                 &target.base_url,
                 &target.wire_model,
                 &format!("{:?}", target.dialect),
