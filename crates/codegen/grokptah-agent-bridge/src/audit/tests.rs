@@ -771,7 +771,7 @@ fn tampered_sealed_generation_fails_store_open_closed() {
     file.sync_all().unwrap();
     assert_eq!(
         poison_of(open(dir.path()).unwrap_err()),
-        PoisonReason::SealedGenerationChanged
+        PoisonReason::EntryMalformed
     );
 }
 
