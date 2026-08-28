@@ -1605,6 +1605,63 @@ impl OrchestrationService {
         self.require_current_auth(auth).is_ok()
     }
 
+    fn ensure_resource_binding(
+        &self,
+        auth: &AuthContext,
+        resource: impl Into<String>,
+    ) -> Result<(), OrchError> {
+        self.auth_registry
+            .lock()
+            .ensure_resource_binding(&resource.into(), auth)
+    }
+
+    fn require_resource_binding(
+        &self,
+        auth: &AuthContext,
+        resource: &str,
+    ) -> Result<(), OrchError> {
+        self.auth_registry
+            .lock()
+            .require_resource_binding(resource, auth)
+    }
+
+    fn ensure_session_binding(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+    ) -> Result<(), OrchError> {
+        self.ensure_resource_binding(auth, format!("session:{session_id}"))
+    }
+
+    fn ensure_run_binding(
+        &self,
+        auth: &AuthContext,
+        run_id: &str,
+    ) -> Result<(), OrchError> {
+        self.ensure_resource_binding(auth, format!("run:{run_id}"))
+    }
+
+    fn ensure_work_binding(
+        &self,
+        auth: &AuthContext,
+        work_id: &str,
+    ) -> Result<(), OrchError> {
+        self.ensure_resource_binding(auth, format!("work:{work_id}"))
+    }
+
+    fn ensure_queue_binding(
+        &self,
+        auth: &AuthContext,
+        session_id: Uuid,
+        entry_ids: impl IntoIterator<Item = String>,
+    ) -> Result<(), OrchError> {
+        self.ensure_session_binding(auth, session_id)?;
+        for entry_id in entry_ids {
+            self.ensure_resource_binding(auth, format!("queue:{session_id}:{entry_id}"))?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn audit(
         &self,
@@ -2040,6 +2097,7 @@ impl OrchestrationService {
                 .map_err(|error| OrchError::new(OrchErrorCode::Internal, error.to_string()))?,
             None => summary,
         };
+        self.ensure_session_binding(auth, summary.id)?;
         Ok(json!({
             "sessionId": summary.id,
             "title": summary.title,
@@ -2096,6 +2154,10 @@ impl OrchestrationService {
                 run.session_id == session_id && run.workspace == claimed.display().to_string()
             })
             .collect::<Vec<_>>();
+        self.ensure_session_binding(auth, session_id)?;
+        for run in &runs {
+            self.ensure_run_binding(auth, &run.run_id)?;
+        }
         Ok(json!({ "runs": runs }))
     }
 
@@ -2215,6 +2277,7 @@ impl OrchestrationService {
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
+        self.ensure_session_binding(auth, session_id)?;
         let work = self
             .store
             .list_work_items()
@@ -2224,6 +2287,9 @@ impl OrchestrationService {
                 item.session_id == session_id && item.workspace == claimed.display().to_string()
             })
             .collect::<Vec<_>>();
+        for item in &work {
+            self.ensure_work_binding(auth, &item.work_id)?;
+        }
         Ok(json!({ "work": work }))
     }
 
@@ -2235,6 +2301,8 @@ impl OrchestrationService {
         work_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_work_binding(auth, work_id)?;
         let (item, _) = self.load_work_scoped(session_id, workspace, work_id, true)?;
         self.workload_value(item, true)
     }
@@ -2940,6 +3008,9 @@ impl OrchestrationService {
         item.parent_work_id = parent_work_id;
         item.dependencies = dependencies;
         if let Err(error) = item.validate() {
+            return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+        }
+        if let Err(error) = self.ensure_work_binding(auth, &item.work_id) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
         if let Err(error) = self.store.save_work_item(&item) {
@@ -4626,6 +4697,9 @@ impl OrchestrationService {
             chrono::DateTime<Utc>,
         ) -> Result<(WorkItem, WorkDecision), OrchError>,
     {
+        self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_work_binding(auth, work_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -4692,6 +4766,9 @@ impl OrchestrationService {
         workspace: &Path,
         agent_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_resource_binding(auth, format!("agent:{agent_id}"))?;
         let _ =
             self.authorize_persistent_agent_request(auth, session_id, workspace, agent_id, false)?;
         let plan = self
@@ -4722,6 +4799,9 @@ impl OrchestrationService {
         prompt: String,
         max_rounds: Option<u32>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_resource_binding(auth, format!("agent:{agent_id}"))?;
         let tool = "ptah_resume_persistent_agent";
         let (agent, claimed) = match self
             .authorize_persistent_agent_request(auth, session_id, workspace, agent_id, true)
@@ -4830,6 +4910,9 @@ impl OrchestrationService {
         agent_id: &str,
         policy: ManagedExecutionPolicy,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_resource_binding(auth, format!("agent:{agent_id}"))?;
         policy.validate()?;
         let claimed = self.authorize_work_read_scope(session_id, workspace)?;
         let _ = self.store.require_agent_in_scope(
@@ -4899,6 +4982,9 @@ impl OrchestrationService {
         reason: String,
         expected_revision: Option<u64>,
     ) -> Result<serde_json::Value, OrchError> {
+        self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_work_binding(auth, work_id)?;
         let payload = json!({
             "sessionId": session_id,
             "workspace": workspace.display().to_string(),
@@ -5129,6 +5215,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_run_binding(auth, run_id)?;
         self.run_value(self.load_authorized_run(run_id)?)
     }
 
@@ -5140,6 +5227,8 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_run_binding(auth, run_id)?;
         self.run_value(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5155,6 +5244,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_run_binding(auth, run_id)?;
         self.progress_value(self.load_authorized_run(run_id)?)
     }
 
@@ -5166,6 +5256,8 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_run_binding(auth, run_id)?;
         self.progress_value(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5214,6 +5306,7 @@ impl OrchestrationService {
                 "run_id is required for get_events",
             )
         })?;
+        self.ensure_run_binding(auth, rid)?;
         let run = self.load_authorized_run(rid)?;
         self.events_for_run(run, after_seq, limit)
     }
@@ -5228,6 +5321,8 @@ impl OrchestrationService {
         limit: usize,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_run_binding(auth, run_id)?;
         self.events_for_run(
             self.authorize_run_request(session_id, workspace, run_id)?,
             after_seq,
@@ -5247,6 +5342,8 @@ impl OrchestrationService {
         limit: usize,
     ) -> Result<(LiveRunScope, JournalPage), OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_run_binding(auth, run_id)?;
         let run = self.authorize_run_request(session_id, workspace, run_id)?;
         let Some(start_seq) = run.start_seq else {
             return Err(OrchError::new(
@@ -5462,6 +5559,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_run_binding(auth, run_id)?;
         self.changes_for_run(self.load_authorized_run(run_id)?)
     }
 
@@ -5473,6 +5571,8 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_run_binding(auth, run_id)?;
         self.changes_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5502,6 +5602,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_run_binding(auth, run_id)?;
         self.test_results_for_run(self.load_authorized_run(run_id)?)
     }
 
@@ -5513,6 +5614,8 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_run_binding(auth, run_id)?;
         self.test_results_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5588,6 +5691,7 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_run_binding(auth, run_id)?;
         self.handoff_for_run(self.load_authorized_run(run_id)?)
     }
 
@@ -5599,6 +5703,8 @@ impl OrchestrationService {
         run_id: &str,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
+        self.ensure_run_binding(auth, run_id)?;
         self.handoff_for_run(self.authorize_run_request(session_id, workspace, run_id)?)
     }
 
@@ -5868,6 +5974,11 @@ impl OrchestrationService {
             .host
             .session_queue_snapshot(session_id)
             .map_err(Self::queue_error)?;
+        self.ensure_queue_binding(
+            auth,
+            session_id,
+            snapshot.entries.iter().map(|entry| entry.id.clone()),
+        )?;
         Ok(json!({
             "sessionId": session_id,
             "workspace": claimed.display().to_string(),
@@ -5888,6 +5999,7 @@ impl OrchestrationService {
         text: String,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_queue_binding(auth, session_id, [entry_id.to_string()])?;
         let tool = "ptah_edit_queue";
         if let Err(error) = reject_control_prompt(&text) {
             self.audit_err(
@@ -5964,6 +6076,7 @@ impl OrchestrationService {
         expected_version: u64,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_queue_binding(auth, session_id, [entry_id.to_string()])?;
         let tool = "ptah_remove_queue";
         let payload = json!({
             "sessionId": session_id,
@@ -6031,6 +6144,7 @@ impl OrchestrationService {
         expected_revision: u64,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_queue_binding(auth, session_id, [entry_id.to_string()])?;
         let tool = "ptah_reorder_queue";
         self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
         let payload = json!({
@@ -6102,6 +6216,7 @@ impl OrchestrationService {
         workspace: &Path,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
         let tool = "ptah_clear_queue";
         let payload = json!({
             "sessionId": session_id,
@@ -6221,6 +6336,7 @@ impl OrchestrationService {
         expected_version: u64,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_queue_binding(auth, session_id, [entry_id.to_string()])?;
         let tool = "ptah_run_next";
         self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
         let payload = json!({
@@ -6292,6 +6408,7 @@ impl OrchestrationService {
         expected_version: u64,
     ) -> Result<serde_json::Value, OrchError> {
         self.require_current_auth(auth)?;
+        self.ensure_queue_binding(auth, session_id, [entry_id.to_string()])?;
         let tool = "ptah_steer_queued";
         self.reject_selecting_control_entry(tool, request_id, session_id, workspace, entry_id)?;
         let payload = json!({
@@ -7007,6 +7124,32 @@ impl OrchestrationService {
             execution: None,
             approval: None,
         };
+        if let Err(error) = self.ensure_session_binding(auth, session_id) {
+            if !queued {
+                self.host.release_turn_reservation(session_id, &run_id);
+                self.release_capacity(&run_id);
+            }
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(run_id.clone()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
+        if let Err(error) = self.ensure_run_binding(auth, &run_id) {
+            if !queued {
+                self.host.release_turn_reservation(session_id, &run_id);
+                self.release_capacity(&run_id);
+            }
+            return Err(self.fail_claim(
+                &mut lease,
+                Some(run_id.clone()),
+                session_id,
+                &claimed,
+                error,
+            ));
+        }
         let mut effect_lease =
             self.mint_effect_lease(auth, format!("run:{run_id}:durable-create"))?;
         if let Err(error) = self.consume_effect_lease(
@@ -7502,7 +7645,8 @@ impl OrchestrationService {
         prompt: String,
         priority: bool,
     ) -> Result<serde_json::Value, OrchError> {
-        let _ = auth;
+        self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
         let tool = "ptah_queue_prompt";
         let payload = json!({
             "sessionId": session_id,
@@ -7566,6 +7710,7 @@ impl OrchestrationService {
                     ));
                 }
             };
+        self.ensure_queue_binding(auth, session_id, [changed_entry.id.clone()])?;
         let response = json!({
             "requestId": request_id,
             "actionId": request_id,
@@ -7602,7 +7747,8 @@ impl OrchestrationService {
         workspace: &Path,
         text: String,
     ) -> Result<serde_json::Value, OrchError> {
-        let _ = auth;
+        self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
         let tool = "ptah_steer";
         let payload = json!({
             "sessionId": session_id,
@@ -7698,7 +7844,8 @@ impl OrchestrationService {
         workspace: &Path,
         run_id: Option<&str>,
     ) -> Result<serde_json::Value, OrchError> {
-        let _ = auth;
+        self.require_current_auth(auth)?;
+        self.ensure_session_binding(auth, session_id)?;
         let tool = "ptah_cancel";
         let payload = json!({
             "sessionId": session_id,
@@ -7745,6 +7892,7 @@ impl OrchestrationService {
                 ));
             }
         };
+        self.ensure_run_binding(auth, rid)?;
 
         if run.session_id != session_id {
             return Err(fail(

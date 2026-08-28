@@ -12,6 +12,7 @@
 //! records. Records store only an opaque binding digest; the host revalidates
 //! that digest against this registry before every effect.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -239,6 +240,11 @@ struct StoredAuthority {
     schema_version: u32,
     next_generation: u64,
     credentials: Vec<StoredCredential>,
+    /// Resource bindings are opaque digests. Keeping this ledger separate
+    /// from public record serde prevents internal authority fields from
+    /// crossing MCP/SDK/Desktop projections.
+    #[serde(default)]
+    bindings: BTreeMap<String, String>,
 }
 
 impl Default for StoredAuthority {
@@ -247,6 +253,7 @@ impl Default for StoredAuthority {
             schema_version: AUTHORITY_SCHEMA_VERSION,
             next_generation: 1,
             credentials: Vec::new(),
+            bindings: BTreeMap::new(),
         }
     }
 }
@@ -478,6 +485,47 @@ impl AuthRegistry {
         }
     }
 
+    pub(crate) fn ensure_resource_binding(
+        &mut self,
+        resource: &str,
+        auth: &AuthContext,
+    ) -> Result<(), OrchError> {
+        self.require_current(auth)?;
+        if resource.is_empty() || resource.len() > 512 {
+            return Err(OrchError::new(
+                OrchErrorCode::InvalidRequest,
+                "authority resource key is empty or exceeds its bound",
+            ));
+        }
+        let digest = auth.binding_digest();
+        match self.state.bindings.get(resource) {
+            Some(existing) if existing == &digest => Ok(()),
+            Some(_) => Err(stale_authority()),
+            None => {
+                self.state.bindings.insert(resource.to_string(), digest);
+                self.persist()
+            }
+        }
+    }
+
+    pub(crate) fn require_resource_binding(
+        &self,
+        resource: &str,
+        auth: &AuthContext,
+    ) -> Result<(), OrchError> {
+        self.require_current(auth)?;
+        if self
+            .state
+            .bindings
+            .get(resource)
+            .is_some_and(|binding| binding == &auth.binding_digest())
+        {
+            Ok(())
+        } else {
+            Err(stale_authority())
+        }
+    }
+
     pub(crate) fn mint_effect_lease(
         &self,
         auth: &AuthContext,
@@ -625,6 +673,18 @@ fn validate_stored_authority(state: &StoredAuthority) -> Result<(), OrchError> {
             return Err(OrchError::new(
                 OrchErrorCode::Internal,
                 "durable auth authority record is invalid",
+            ));
+        }
+    }
+    for (resource, binding) in &state.bindings {
+        if resource.is_empty()
+            || resource.len() > 512
+            || binding.len() != 64
+            || !binding.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(OrchError::new(
+                OrchErrorCode::Internal,
+                "durable auth resource binding is invalid",
             ));
         }
     }
