@@ -1406,7 +1406,6 @@ impl SamplingClient {
             });
         }
         Self::mark_response_started(&mut permit)?;
-        Self::settle_response(&mut permit, status)?;
 
         let response_obj = serde_json::from_slice::<rs::Response>(&bytes).map_err(|e| {
             let raw_body = String::from_utf8_lossy(&bytes);
@@ -1417,6 +1416,7 @@ impl SamplingClient {
             );
             SamplingError::Serialization(e)
         })?;
+        Self::settle_response(&mut permit, status)?;
         Ok(response_obj)
     }
 
@@ -1804,7 +1804,6 @@ impl SamplingClient {
             });
         }
         Self::mark_response_started(&mut permit)?;
-        Self::settle_response(&mut permit, status)?;
 
         let response_obj =
             serde_json::from_slice::<messages::MessagesResponse>(&bytes).map_err(|e| {
@@ -1816,6 +1815,7 @@ impl SamplingClient {
                 );
                 SamplingError::Serialization(e)
             })?;
+        Self::settle_response(&mut permit, status)?;
         Ok(response_obj)
     }
 
