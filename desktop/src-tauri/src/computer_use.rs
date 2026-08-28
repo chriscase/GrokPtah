@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use base64::Engine;
 use chrono::{Duration, Utc};
+#[cfg(target_os = "macos")]
+use grokptah_agent_bridge::MacOsObservationPlatform;
 use grokptah_agent_bridge::{
     canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
     ComputerAgentProposal, ComputerCapabilities, ComputerError, ComputerObservation,
@@ -11,8 +13,6 @@ use grokptah_agent_bridge::{
     ComputerTargetCandidate, ComputerUseLimits, ComputerUseService, GrantIssuer, OrchStore,
     SemanticAction, SimulatorBackend,
 };
-#[cfg(target_os = "macos")]
-use grokptah_agent_bridge::MacOsObservationPlatform;
 use serde::Serialize;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -94,17 +94,17 @@ impl DesktopComputerUse {
         };
         let (audit_store, audit_error) = match host.ensure_orchestration_store() {
             Ok(store) => (Some(store), None),
-            Err(error) => (
-                None,
-                Some(format!("Audit storage is unavailable: {error}")),
-            ),
+            Err(error) => (None, Some(format!("Audit storage is unavailable: {error}"))),
         };
-        let simulator = store.clone().zip(audit_store.clone()).map(|(store, audit)| {
-            Arc::new(
-                ComputerUseService::new(Arc::new(SimulatorBackend::new()), store)
-                    .with_audit_store(audit),
-            )
-        });
+        let simulator = store
+            .clone()
+            .zip(audit_store.clone())
+            .map(|(store, audit)| {
+                Arc::new(
+                    ComputerUseService::new(Arc::new(SimulatorBackend::new()), store)
+                        .with_audit_store(audit),
+                )
+            });
         Self {
             host: host.clone(),
             platform,
@@ -406,7 +406,8 @@ impl DesktopComputerUse {
             .audit_store
             .clone()
             .ok_or_else(|| self.initialization_error())?;
-        let service = Arc::new(ComputerUseService::new(backend, store).with_audit_store(audit_store));
+        let service =
+            Arc::new(ComputerUseService::new(backend, store).with_audit_store(audit_store));
         let limits = ComputerUseLimits {
             max_actions: 8,
             max_duration_secs: 10 * 60,
