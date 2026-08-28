@@ -1721,12 +1721,19 @@ impl OrchestrationService {
                                 | "secret"
                                 | "secretkey"
                                 | "leasehash"
-                                | "workspace"
-                                | "cwd"
-                                | "path"
-                                | "sourceworkspace"
-                                | "executionworkspace"
                         ) {
+                            continue;
+                        }
+                        if matches!(
+                            lower.as_str(),
+                            "workspace" | "cwd" | "path" | "sourceworkspace" | "executionworkspace"
+                        ) {
+                            let replacement = if lower == "path" {
+                                "path_redacted"
+                            } else {
+                                "workspace_redacted"
+                            };
+                            projected.insert(key, json!(replacement));
                             continue;
                         }
                         if matches!(
