@@ -210,10 +210,6 @@ pub(crate) struct StructuralTx<'a> {
 }
 
 impl<'a> StructuralTx<'a> {
-    pub(crate) fn manifest(&self) -> &Manifest {
-        &self.guard.manifest
-    }
-
     pub(crate) fn manifest_clone(&self) -> Manifest {
         self.guard.manifest.clone()
     }
@@ -1687,10 +1683,11 @@ impl AuditLedger {
         self.inner.lock().poisoned
     }
 
-    pub(crate) fn witness_state(&self) -> WitnessState {
-        self.inner.lock().witness_state
-    }
-
+    /// Bare compare-and-swap commit, outside a structural transaction.
+    ///
+    /// Production commits go through [`StructuralTx::commit_manifest`]; this
+    /// exists to exercise the swap directly.
+    #[cfg(test)]
     pub(crate) fn commit_manifest(&self, manifest: Manifest) -> AuditResult<()> {
         let mut guard = self.inner.lock();
         let expected = guard.manifest.manifest_epoch;

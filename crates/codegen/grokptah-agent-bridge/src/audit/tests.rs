@@ -1503,3 +1503,39 @@ fn an_append_that_cannot_land_poisons_rather_than_reporting_clean() {
     assert!(ledger.rotate(RotationReason::Operator).is_err());
     assert!(ledger.append(entry("still-refused")).is_err());
 }
+
+#[test]
+fn a_failed_append_still_leaves_durable_evidence_on_disk() {
+    let dir = TempDir::new().unwrap();
+    let ledger = fresh(dir.path());
+    let generation = ledger.status().active_generation_id;
+    let journal = journal_of(dir.path(), &generation);
+
+    // Make the journal unwritable in a way a privileged uid cannot bypass.
+    std::fs::remove_file(&journal).unwrap();
+    std::fs::create_dir(&journal).unwrap();
+    assert!(ledger.append(entry("cannot-land")).is_err());
+
+    // The gap file is written before the chained record is attempted, so the
+    // loss survives even when the journal itself cannot be written. This is
+    // what stops a shutdown whose own record failed from looking clean.
+    assert!(
+        ledger.record_dropped(2).is_err(),
+        "the chained record cannot land"
+    );
+    let gap_path = dir.path().join("gap.json");
+    assert!(
+        gap_path.is_file(),
+        "durable gap evidence must exist on disk"
+    );
+    let recorded: super::documents::GapFile =
+        serde_json::from_slice(&std::fs::read(&gap_path).unwrap()).unwrap();
+    recorded
+        .verify(&keys())
+        .expect("the gap file is authenticated");
+    assert_eq!(recorded.gaps.iter().map(|g| g.lost_entries).sum::<u64>(), 2);
+    assert!(
+        recorded.gaps.iter().all(|g| !g.journaled),
+        "an unjournaled loss must stay marked unjournaled"
+    );
+}
