@@ -111,7 +111,7 @@ impl AdaptiveProfile {
 
 /// The thresholds one profile applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdaptiveThresholds {
     /// Oldest observation this profile will act on. Clamped down to the run's
     /// own kernel bound by [`AdaptiveThresholds::effective_age_bound`]; a
@@ -140,7 +140,7 @@ impl AdaptiveThresholds {
 
 /// What the proposer believes about the candidate set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AmbiguityAssessment {
     pub candidate_count: u32,
     pub top_confidence_bps: Bps,
@@ -339,7 +339,7 @@ impl AdaptiveReason {
 /// minted for one observation cannot authorize the next one, and one minted
 /// before a takeover cannot authorize anything after it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdaptiveApproval {
     pub run_id: String,
     pub control_epoch: u64,
@@ -357,7 +357,7 @@ impl AdaptiveApproval {
 
 /// What the planner is asserting about this action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdaptiveClaim {
     /// Explicit profile selection. There is no default.
     pub profile: AdaptiveProfile,
@@ -381,7 +381,7 @@ pub struct AdaptiveClaim {
 /// element identity, label, value, geometry, or backend-authored text can
 /// reach it, which is what lets it be projected to a coordinator unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdaptiveDecisionRecord {
     pub profile: AdaptiveProfile,
     pub planner: AdaptiveDisposition,
@@ -678,6 +678,19 @@ mod tests {
         ComputerAction::Invoke {
             element_id: "field".into(),
         }
+    }
+
+    #[test]
+    fn adaptive_wire_types_reject_unknown_fields() {
+        let now = Utc::now();
+        let run = run(now);
+        let mut encoded = serde_json::to_value(claim(AdaptiveProfile::Economy, &run)).unwrap();
+        encoded["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<AdaptiveClaim>(encoded).is_err());
+
+        let mut assessment = serde_json::to_value(AmbiguityAssessment::unambiguous(9_000)).unwrap();
+        assessment["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<AmbiguityAssessment>(assessment).is_err());
     }
 
     #[test]
