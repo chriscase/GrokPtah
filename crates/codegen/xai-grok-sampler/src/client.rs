@@ -290,6 +290,10 @@ pub struct SamplingClient {
     bearer_resolver: Option<crate::config::SharedBearerResolver>,
     /// Per-request header injection (OTel traceparent).
     header_injector: Option<crate::config::SharedHeaderInjector>,
+    /// Host-owned durable authority. None is retained for legacy construction
+    /// and test-only clients; production callers that send provider traffic
+    /// must install this context before invoking a method.
+    provider_attempt: Option<xai_provider_attempt::AttemptContext>,
 }
 
 impl std::fmt::Debug for SamplingClient {
@@ -538,7 +542,19 @@ impl SamplingClient {
             attribution_callback: config.attribution_callback,
             bearer_resolver: config.bearer_resolver,
             header_injector: config.header_injector,
+            provider_attempt: None,
         })
+    }
+
+    /// Attach the shared host-owned provider-attempt authority to this client.
+    /// The context is cloned into the client and its request key is allocated
+    /// only after the final request body has been serialized.
+    pub fn with_provider_attempt_context(
+        mut self,
+        context: xai_provider_attempt::AttemptContext,
+    ) -> Self {
+        self.provider_attempt = Some(context);
+        self
     }
 
     /// The configured API backend for this client.
@@ -594,6 +610,72 @@ impl SamplingClient {
             injector.inject(&mut headers);
         }
         self.http.post(url).headers(headers)
+    }
+
+    fn authorize_request(
+        &self,
+        builder: reqwest::RequestBuilder,
+        body: &[u8],
+    ) -> Result<(
+        reqwest::RequestBuilder,
+        Option<xai_provider_attempt::PhysicalSendPermit>,
+    )> {
+        let Some(context) = self.provider_attempt.as_ref() else {
+            // Legacy/unit-test clients do not have a host authority. They are
+            // retained for API compatibility; host-created clients install
+            // the context through `with_provider_attempt_context`.
+            return Ok((builder, None));
+        };
+        let permit = context
+            .begin("sampler-provider", body, true)
+            .map_err(|error| SamplingError::Auth(format!("provider attempt unavailable: {error}")))?;
+        let builder = builder
+            .header(
+                xai_provider_attempt::IDEMPOTENCY_KEY_HEADER,
+                permit.idempotency_key(),
+            )
+            .header("x-grok-req-id", permit.idempotency_key());
+        Ok((builder, Some(permit)))
+    }
+
+    fn mark_transport_ambiguous(
+        permit: Option<xai_provider_attempt::PhysicalSendPermit>,
+    ) {
+        if let Some(mut permit) = permit {
+            let _ = permit.transport_after_possible_write();
+        }
+    }
+
+    fn mark_semantic_rejection(
+        permit: Option<xai_provider_attempt::PhysicalSendPermit>,
+        status: reqwest::StatusCode,
+    ) {
+        if let Some(mut permit) = permit {
+            let _ = permit.semantic_rejection(status.as_u16());
+        }
+    }
+
+    fn mark_response_started(
+        permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
+    ) -> Result<()> {
+        if let Some(permit) = permit.as_mut() {
+            permit
+                .mark_response_started()
+                .map_err(|error| SamplingError::Auth(format!("provider response state: {error}")))?;
+        }
+        Ok(())
+    }
+
+    fn settle_response(
+        permit: &mut Option<xai_provider_attempt::PhysicalSendPermit>,
+        status: reqwest::StatusCode,
+    ) -> Result<()> {
+        if let Some(mut permit) = permit.take() {
+            permit
+                .settle_http_response(status.as_u16(), b"provider-response")
+                .map_err(|error| SamplingError::Auth(format!("provider settlement: {error}")))?;
+        }
+        Ok(())
     }
 
     /// Bearer prefix for 401 attribution. Prefers live resolver, falls back to default_headers.
@@ -863,15 +945,33 @@ impl SamplingClient {
         };
         let http_request = grok_headers
             .apply(self.post(self.endpoint("chat/completions")))
-            .json(&payload);
+            ;
+        let (http_request, mut permit) = self.authorize_request(
+            http_request,
+            &serde_json::to_vec(&payload).map_err(SamplingError::Serialization)?,
+        )?;
+        let http_request = http_request.json(&payload);
 
         let response = http_request.send().await.map_err(|e| {
             // Log at debug level; errors are surfaced to the caller.
             tracing::debug!("HTTP request failed: {}", e);
+            Self::mark_transport_ambiguous(permit.take());
             e
         })?;
 
+        if !response.status().is_success() {
+            Self::mark_semantic_rejection(permit.take(), response.status());
+        } else {
+            Self::mark_response_started(&mut permit)?;
+        }
+        let status = response.status();
         self.handle_response(response).await
+            .and_then(|result| {
+                if status.is_success() {
+                    Self::settle_response(&mut permit, status)?;
+                }
+                Ok(result)
+            })
     }
 
     /// Start a streaming chat completion request. Returns a stream of typed chunks.
@@ -921,8 +1021,12 @@ impl SamplingClient {
         };
         let http_request = grok_headers
             .apply(self.post(self.endpoint("chat/completions")))
-            .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
-            .json(&streaming_request);
+            .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        let request_bytes =
+            serde_json::to_vec(&streaming_request).map_err(SamplingError::Serialization)?;
+        let (http_request, mut permit) =
+            self.authorize_request(http_request, &request_bytes)?;
+        let http_request = http_request.json(&streaming_request);
 
         let built_request = http_request.build().map_err(|e| {
             tracing::error!("Failed to build HTTP request: {}", e);
@@ -939,6 +1043,7 @@ impl SamplingClient {
         let response = self.http.execute(built_request).await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
             record_stream_request_failure(&e);
+            Self::mark_transport_ambiguous(permit.take());
             e
         })?;
 
@@ -946,6 +1051,15 @@ impl SamplingClient {
         let span = tracing::Span::current();
         span.record("status_code", status.as_u16() as i64);
         span.record("success", status.is_success());
+        if !status.is_success() {
+            if status.is_server_error() {
+                Self::mark_transport_ambiguous(permit.take());
+            } else {
+                Self::mark_semantic_rejection(permit.take(), status);
+            }
+        } else {
+            Self::mark_response_started(&mut permit)?;
+        }
         let model_metadata = extract_model_metadata(response.headers());
         let retry_after_secs = extract_retry_after(response.headers());
         let should_retry = extract_should_retry(response.headers());
@@ -1015,8 +1129,9 @@ impl SamplingClient {
         // stream (`None`). The first transport error is emitted to the consumer,
         // then subsequent polls return `None` -- preventing an infinite busy-loop
         // when the HTTP/2 connection drops and h2 keeps producing errors.
+        let mut permit = permit;
         let chunks = event_stream
-            .scan(false, |had_transport_error, event_res| {
+            .scan(false, move |had_transport_error, event_res| {
                 if *had_transport_error {
                     return std::future::ready(None);
                 }
@@ -1024,6 +1139,9 @@ impl SamplingClient {
                     Ok(event) => {
                         let data = &event.data;
                         if data == "[DONE]" {
+                            if let Some(mut permit) = permit.take() {
+                                let _ = permit.settle_http_response(200, b"sampler-stream");
+                            }
                             return std::future::ready(None);
                         }
 
@@ -1142,12 +1260,20 @@ impl SamplingClient {
         // it in post-serialize. This is the last surviving piece of the
         // old raw_output machinery.
         xai_grok_sampling_types::patch_reasoning_text_types(&mut request_body);
-        let http_request = grok_headers
-            .apply(self.post(self.endpoint("responses")))
-            .json(&request_body);
+        let http_request = grok_headers.apply(self.post(self.endpoint("responses")));
+        let (http_request, mut permit) = self.authorize_request(
+            http_request,
+            &serde_json::to_vec(&request_body).map_err(SamplingError::Serialization)?,
+        )?;
+        let request_bytes =
+            serde_json::to_vec(&request_body).map_err(SamplingError::Serialization)?;
+        let (http_request, mut permit) =
+            self.authorize_request(http_request, &request_bytes)?;
+        let http_request = http_request.json(&request_body);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
+            Self::mark_transport_ambiguous(permit.take());
             e
         })?;
 
@@ -1158,6 +1284,11 @@ impl SamplingClient {
         let bytes = response.bytes().await?;
 
         if !status.is_success() {
+            if status.is_server_error() {
+                Self::mark_transport_ambiguous(permit.take());
+            } else {
+                Self::mark_semantic_rejection(permit.take(), status);
+            }
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 self.record_401_attribution(crate::attribution::SamplingConsumer::Responses);
                 let endpoint = self.endpoint("responses");
@@ -1192,6 +1323,8 @@ impl SamplingClient {
                 should_retry,
             });
         }
+        Self::mark_response_started(&mut permit)?;
+        Self::settle_response(&mut permit, status)?;
 
         let response_obj = serde_json::from_slice::<rs::Response>(&bytes).map_err(|e| {
             let raw_body = String::from_utf8_lossy(&bytes);
@@ -1317,6 +1450,7 @@ impl SamplingClient {
         let response = self.http.execute(built_request).await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
             record_stream_request_failure(&e);
+            Self::mark_transport_ambiguous(permit.take());
             e
         })?;
 
@@ -1324,6 +1458,15 @@ impl SamplingClient {
         let span = tracing::Span::current();
         span.record("status_code", status.as_u16() as i64);
         span.record("success", status.is_success());
+        if !status.is_success() {
+            if status.is_server_error() {
+                Self::mark_transport_ambiguous(permit.take());
+            } else {
+                Self::mark_semantic_rejection(permit.take(), status);
+            }
+        } else {
+            Self::mark_response_started(&mut permit)?;
+        }
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 span.record("error", "unauthorized (401)");
@@ -1392,6 +1535,7 @@ impl SamplingClient {
         // The scan item is an `Option`: `Some(None)` skips an absorbed
         // doom-loop event without terminating the stream (`filter_map`
         // below), while an outer `None` still ends it.
+        let mut permit = permit;
         let events = event_stream
             .scan(false, move |had_transport_error, event_res| {
                 if *had_transport_error {
@@ -1401,6 +1545,9 @@ impl SamplingClient {
                     Ok(event) => {
                         let data = &event.data;
                         if data == "[DONE]" {
+                            if let Some(mut permit) = permit.take() {
+                                let _ = permit.settle_http_response(200, b"sampler-stream");
+                            }
                             return std::future::ready(None);
                         }
 
@@ -1500,12 +1647,16 @@ impl SamplingClient {
             deployment_id: request.x_grok_deployment_id.as_deref(),
             user_id: request.x_grok_user_id.as_deref(),
         };
-        let http_request = grok_headers
-            .apply(self.post(self.endpoint("messages")))
-            .json(&request.inner);
+        let http_request = grok_headers.apply(self.post(self.endpoint("messages")));
+        let (http_request, mut permit) = self.authorize_request(
+            http_request,
+            &serde_json::to_vec(&request.inner).map_err(SamplingError::Serialization)?,
+        )?;
+        let http_request = http_request.json(&request.inner);
 
         let response = http_request.send().await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
+            Self::mark_transport_ambiguous(permit.take());
             e
         })?;
 
@@ -1516,6 +1667,11 @@ impl SamplingClient {
         let bytes = response.bytes().await?;
 
         if !status.is_success() {
+            if status.is_server_error() {
+                Self::mark_transport_ambiguous(permit.take());
+            } else {
+                Self::mark_semantic_rejection(permit.take(), status);
+            }
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 self.record_401_attribution(crate::attribution::SamplingConsumer::Messages);
                 let endpoint = self.endpoint("messages");
@@ -1550,6 +1706,8 @@ impl SamplingClient {
                 should_retry,
             });
         }
+        Self::mark_response_started(&mut permit)?;
+        Self::settle_response(&mut permit, status)?;
 
         let response_obj =
             serde_json::from_slice::<messages::MessagesResponse>(&bytes).map_err(|e| {
@@ -1618,8 +1776,12 @@ impl SamplingClient {
         };
         let http_request = grok_headers
             .apply(self.post(self.endpoint("messages")))
-            .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
-            .json(&request.inner);
+            .header(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        let request_bytes =
+            serde_json::to_vec(&request.inner).map_err(SamplingError::Serialization)?;
+        let (http_request, mut permit) =
+            self.authorize_request(http_request, &request_bytes)?;
+        let http_request = http_request.json(&request.inner);
 
         let built_request = http_request.build().map_err(|e| {
             tracing::error!("Failed to build HTTP request: {}", e);
@@ -1636,6 +1798,7 @@ impl SamplingClient {
         let response = self.http.execute(built_request).await.map_err(|e| {
             tracing::debug!("HTTP request failed: {}", e);
             record_stream_request_failure(&e);
+            Self::mark_transport_ambiguous(permit.take());
             e
         })?;
 
@@ -1643,6 +1806,15 @@ impl SamplingClient {
         let span = tracing::Span::current();
         span.record("status_code", status.as_u16() as i64);
         span.record("success", status.is_success());
+        if !status.is_success() {
+            if status.is_server_error() {
+                Self::mark_transport_ambiguous(permit.take());
+            } else {
+                Self::mark_semantic_rejection(permit.take(), status);
+            }
+        } else {
+            Self::mark_response_started(&mut permit)?;
+        }
         if !status.is_success() {
             if status == reqwest::StatusCode::UNAUTHORIZED {
                 span.record("error", "unauthorized (401)");
@@ -1709,8 +1881,9 @@ impl SamplingClient {
         // Map SSE events into MessageStreamEvent.
         // Uses `scan` so transport errors terminate the stream after the first
         // error (same pattern as `chat_completion_stream`).
+        let mut permit = permit;
         let events = event_stream
-            .scan(false, |had_transport_error, event_res| {
+            .scan(false, move |had_transport_error, event_res| {
                 if *had_transport_error {
                     return std::future::ready(None);
                 }
@@ -1718,6 +1891,9 @@ impl SamplingClient {
                     Ok(event) => {
                         let data = &event.data;
                         if data == "[DONE]" {
+                            if let Some(mut permit) = permit.take() {
+                                let _ = permit.settle_http_response(200, b"sampler-stream");
+                            }
                             return std::future::ready(None);
                         }
 
