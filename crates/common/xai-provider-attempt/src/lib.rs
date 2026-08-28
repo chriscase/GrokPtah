@@ -634,6 +634,7 @@ impl AttemptContext {
         let payload = serde_json::to_vec(&record.payload)
             .map_err(|error| AttemptError::Serialization(error.to_string()))?;
         let public_key = self
+            .store
             .read_authority_public_key()
             .map_err(|_| AttemptError::NotExplicitlyAuthorized)?;
         let signature_bytes =
