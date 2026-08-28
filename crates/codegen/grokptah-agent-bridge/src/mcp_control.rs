@@ -206,8 +206,22 @@ impl LiveStreamState {
 
     async fn next_frame(&mut self) -> Option<Bytes> {
         loop {
-            if let Some(frame) = self.pending.pop_front() {
-                return Some(frame);
+            if self.pending.front().is_some() {
+                // A frame may have been queued before credential rotation.
+                // Revalidate both after the wakeup and immediately before
+                // returning it; admission-time auth is not a stream lease.
+                if !self.orch.auth_is_current(&self.auth) {
+                    self.pending.clear();
+                    self.done = true;
+                    return None;
+                }
+                let frame = self.pending.pop_front();
+                if !self.orch.auth_is_current(&self.auth) {
+                    self.pending.clear();
+                    self.done = true;
+                    return None;
+                }
+                return frame;
             }
             if self.done {
                 return None;
@@ -238,6 +252,11 @@ impl LiveStreamState {
 
             tokio::select! {
                 event = self.receiver.recv_with_seq() => {
+                    if !self.orch.auth_is_current(&self.auth) {
+                        self.pending.clear();
+                        self.done = true;
+                        continue;
+                    }
                     let Some((seq, update)) = event else {
                         self.done = true;
                         continue;
@@ -252,6 +271,10 @@ impl LiveStreamState {
                     self.queue_entry(seq, chrono::Utc::now().to_rfc3339(), update);
                 }
                 _ = self.heartbeat.tick() => {
+                    if !self.orch.auth_is_current(&self.auth) {
+                        self.done = true;
+                        continue;
+                    }
                     return Some(Bytes::from_static(b": grokptah-control keep-alive\n\n"));
                 }
             }
