@@ -2858,6 +2858,28 @@ impl OrchestrationService {
         if let Err(error) = item.validate() {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
         }
+        // A dependency cycle does not fail on its own: `dependency_ready` only
+        // counts succeeded dependencies, so every item on the ring would stay
+        // permanently un-admittable with no operator-visible cause. Reject the
+        // cycle here instead, while the caller is still holding the request.
+        // Dependency-free work skips the ledger read entirely.
+        if !item.dependencies.is_empty() {
+            let existing = match self.store.list_work_items() {
+                Ok(existing) => existing,
+                Err(error) => {
+                    return Err(self.fail_claim(
+                        &mut lease,
+                        None,
+                        session_id,
+                        &claimed,
+                        OrchError::new(OrchErrorCode::Internal, error.to_string()),
+                    ))
+                }
+            };
+            if let Err(error) = super::graph::validate_new_dependencies(&existing, &item) {
+                return Err(self.fail_claim(&mut lease, None, session_id, &claimed, error));
+            }
+        }
         if let Err(error) = self.store.save_work_item(&item) {
             return Err(self.fail_claim(
                 &mut lease,

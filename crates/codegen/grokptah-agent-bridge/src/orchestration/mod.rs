@@ -4,6 +4,7 @@
 
 mod authz;
 mod continuation;
+mod graph;
 pub(crate) mod managed;
 mod manager;
 mod message;
@@ -25,6 +26,11 @@ pub use continuation::{
     ContinuationMemoryInput, ContinuationMemoryScope, ContinuationOmission, ContinuationReasonCode,
     ContinuationRunInput, ContinuationTestInput, ContinuationWorkloadRef,
     CONTINUATION_ASSEMBLER_VERSION, CONTINUATION_SCHEMA_VERSION,
+};
+pub use graph::{
+    admission_block, evaluate_quorum, validate_dependency_graph, validate_new_dependencies,
+    AdmissionBlock, AuditGenerationSink, ComputerUseGate, PrincipalScope, ProviderSendAdmission,
+    QuorumOutcome, ReviewQuorum, ReviewVerdict, MAX_QUORUM_REVIEWERS,
 };
 pub use managed::{
     assemble_managed_run_input, intersect_run_bounds, managed_execution_eligible,
