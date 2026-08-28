@@ -29,6 +29,7 @@ const SETTLEMENT_ENVELOPE_PREFIX: &str = "computer-settlement-envelope:";
 const SERVICE_PRINCIPAL_ID: &str = "host-principal";
 const AUTH_GENERATION: u64 = 1;
 const POLICY_GENERATION: &str = "computer-use-policy.v1";
+const ACTION_POLICY_GENERATION: &str = "computer-use-action-policy.v1";
 
 const RUN_OPERATIONS: &[&str] = &[
     "authorize",
@@ -122,12 +123,34 @@ impl ComputerUseService {
                 capability,
             })
         });
+        let action_capability = CapabilitySnapshot::computer_use_service(
+            SERVICE_PRINCIPAL_ID,
+            &backend.capabilities(),
+            "computer-use-action-policy.v1",
+        )
+        .ok()
+        .and_then(|snapshot| {
+            let capability = capability_authority
+                .issue(
+                    &snapshot,
+                    Utc::now(),
+                    crate::capability_authority::DEFAULT_CAPABILITY_TTL,
+                )
+                .ok()?;
+            Some(RunCapability {
+                envelope_id: String::new(),
+                settlement_envelope_id: String::new(),
+                snapshot,
+                capability,
+            })
+        });
         Self {
             backend,
             store,
             policy: ComputerPolicy,
             capability_authority,
             service_capability,
+            action_capability,
             run_capabilities: Mutex::new(std::collections::HashMap::new()),
             execution_receipts: Mutex::new(std::collections::HashMap::new()),
         }
@@ -1015,7 +1038,7 @@ impl ComputerUseService {
 
     fn snapshot_for_run(&self, run: &ComputerRun) -> ComputerResult<CapabilitySnapshot> {
         let _ = run;
-        self.service_capability
+        self.action_capability
             .as_ref()
             .map(|binding| binding.snapshot.clone())
             .ok_or_else(|| {
@@ -1027,7 +1050,7 @@ impl ComputerUseService {
     }
 
     fn bind_run_capability(&self, run: &ComputerRun) -> ComputerResult<RunCapability> {
-        let service = self.service_capability.as_ref().ok_or_else(|| {
+        let action = self.action_capability.as_ref().ok_or_else(|| {
             ComputerError::new(
                 ComputerErrorCode::Unauthorized,
                 "canonical computer capability envelope is unavailable",
@@ -1038,11 +1061,11 @@ impl ComputerUseService {
         self.capability_authority
             .install_envelope(
                 &envelope_id,
-                service.capability.clone(),
-                service.snapshot.clone(),
+                action.capability.clone(),
+                action.snapshot.clone(),
                 SERVICE_PRINCIPAL_ID,
                 AUTH_GENERATION,
-                POLICY_GENERATION,
+                ACTION_POLICY_GENERATION,
                 RUN_OPERATIONS.iter().copied(),
                 &run.run_id,
                 Utc::now(),
@@ -1053,11 +1076,11 @@ impl ComputerUseService {
         self.capability_authority
             .install_envelope(
                 &settlement_envelope_id,
-                service.capability.clone(),
-                service.snapshot.clone(),
+                action.capability.clone(),
+                action.snapshot.clone(),
                 SERVICE_PRINCIPAL_ID,
                 AUTH_GENERATION,
-                POLICY_GENERATION,
+                ACTION_POLICY_GENERATION,
                 SETTLEMENT_OPERATIONS.iter().copied(),
                 &run.run_id,
                 Utc::now(),
@@ -1068,8 +1091,8 @@ impl ComputerUseService {
         Ok(RunCapability {
             envelope_id,
             settlement_envelope_id,
-            snapshot: service.snapshot.clone(),
-            capability: service.capability.clone(),
+            snapshot: action.snapshot.clone(),
+            capability: action.capability.clone(),
         })
     }
 
@@ -1105,7 +1128,12 @@ impl ComputerUseService {
     fn ensure_run_capability(&self, run: &ComputerRun) -> ComputerResult<RunCapability> {
         match self.require_run_capability(run) {
             Ok(capability) => Ok(capability),
-            Err(error) if error.code == ComputerErrorCode::Unauthorized => {
+            Err(error)
+                if matches!(
+                    error.code,
+                    ComputerErrorCode::Unauthorized | ComputerErrorCode::PermissionRevoked
+                ) =>
+            {
                 let binding = self.bind_run_capability(run)?;
                 self.run_capabilities
                     .lock()
@@ -1230,9 +1258,12 @@ impl ComputerUseService {
             None => SERVICE_ENVELOPE_ID.into(),
         };
         let resource = run_id.as_deref().unwrap_or("computer-host");
-        let snapshot = self
-            .service_capability
-            .as_ref()
+        let binding = if envelope_id == SERVICE_ENVELOPE_ID {
+            self.service_capability.as_ref()
+        } else {
+            self.action_capability.as_ref()
+        };
+        let snapshot = binding
             .map(|binding| binding.snapshot.clone())
             .ok_or_else(|| {
                 ComputerError::new(
