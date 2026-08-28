@@ -6,7 +6,8 @@ use std::thread;
 
 use chrono::Utc;
 use grokptah_agent_bridge::audit::{ExportFormat, RetentionRequest};
-use grokptah_agent_bridge::{AuditEntry, OrchStore};
+use grokptah_agent_bridge::orchestration::AuditEntry;
+use grokptah_agent_bridge::OrchStore;
 use tempfile::TempDir;
 
 fn audit_entry(tool: &str, request_id: &str, detail: &str) -> AuditEntry {
