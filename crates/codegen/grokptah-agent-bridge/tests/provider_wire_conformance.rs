@@ -213,6 +213,42 @@ fn replay_boundary_has_no_local_authority_root() {
     assert!(!replay.contains("Some(\"provider-contract-loopback\")"));
 }
 
+#[test]
+fn physical_provider_tool_and_qualification_boundaries_never_issue() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let provider_source =
+        std::fs::read_to_string(manifest.join("src/host_helpers.rs")).expect("host helper source");
+    let provider_boundary = provider_source
+        .split("fn consume_provider_send_lease")
+        .nth(1)
+        .and_then(|body| body.split("fn sha256_hex").next())
+        .expect("provider boundary");
+    assert!(!provider_boundary.contains(".issue("));
+    assert!(!provider_boundary.contains("provider-qualification"));
+
+    let qualification_source = std::fs::read_to_string(manifest.join("src/provider_qualification.rs"))
+        .expect("qualification source");
+    let qualification_boundary = qualification_source
+        .split("fn consume_qualification_send_lease")
+        .nth(1)
+        .and_then(|body| body.split("fn install_test_qualification_envelope").next())
+        .expect("qualification boundary");
+    assert!(!qualification_boundary.contains(".issue("));
+    assert!(!qualification_boundary.contains("provider-qualification"));
+
+    let host_source =
+        std::fs::read_to_string(manifest.join("src/host.rs")).expect("host source");
+    let tool_admission = host_source
+        .split("fn admit_tool_effect")
+        .nth(1)
+        .and_then(|body| body.split("fn consume_tool_effect_lease").next())
+        .expect("tool admission boundary");
+    assert!(!tool_admission.contains(".issue("));
+    assert!(!tool_admission.contains("hash_payload(input)"));
+    assert!(!host_source.contains("local-session:"));
+    assert!(!host_source.contains("unwrap_or_else(|| agent.agent_id.clone())"));
+}
+
 #[tokio::test]
 async fn synthetic_xai_fixture_replays_through_the_production_provider_path() {
     let (fixture, response) = load_fixture();

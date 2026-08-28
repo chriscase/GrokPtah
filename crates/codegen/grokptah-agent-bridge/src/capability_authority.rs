@@ -364,6 +364,7 @@ impl CapabilityAuthority {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn lease(
         &self,
         capability: &HostCapability,
@@ -1048,6 +1049,72 @@ mod tests {
             )
             .unwrap();
         assert!(authority.consume(lease, &snapshot, now).is_ok());
+    }
+
+    #[test]
+    fn removed_envelope_cannot_be_readded_without_explicit_reissue() {
+        let authority = CapabilityAuthority::new(true);
+        let now = Utc::now();
+        let principal =
+            CapabilityPrincipal::new(TEST_PRINCIPAL_ID.into(), 1, "policy-v1".into()).unwrap();
+        let snapshot = CapabilitySnapshot::tool(&principal, "write_file").unwrap();
+        let capability = authority
+            .issue(&snapshot, now, DEFAULT_CAPABILITY_TTL)
+            .unwrap();
+        authority
+            .install_envelope(
+                "removed-envelope",
+                capability.clone(),
+                snapshot.clone(),
+                TEST_PRINCIPAL_ID,
+                1,
+                "policy-v1",
+                ["tool.dispatch"],
+                "tool:write_file",
+                now,
+            )
+            .unwrap();
+        authority.remove_envelope("removed-envelope").unwrap();
+        assert!(authority
+            .lease_from_preinstalled(
+                &snapshot,
+                "tool.dispatch",
+                "tool:write_file",
+                "tool.dispatch",
+                now,
+                Duration::seconds(5),
+            )
+            .is_err());
+        assert!(authority
+            .install_envelope(
+                "removed-envelope",
+                capability,
+                snapshot.clone(),
+                TEST_PRINCIPAL_ID,
+                1,
+                "policy-v1",
+                ["tool.dispatch"],
+                "tool:write_file",
+                now,
+            )
+            .is_err());
+
+        let replacement = authority
+            .issue(&snapshot, now, DEFAULT_CAPABILITY_TTL)
+            .unwrap();
+        authority
+            .install_envelope(
+                "removed-envelope",
+                replacement,
+                snapshot,
+                TEST_PRINCIPAL_ID,
+                1,
+                "policy-v1",
+                ["tool.dispatch"],
+                "tool:write_file",
+                now,
+            )
+            .unwrap();
     }
 
     #[test]
