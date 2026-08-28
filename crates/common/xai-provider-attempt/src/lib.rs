@@ -58,30 +58,35 @@ impl SendState {
 #[serde(rename_all = "camelCase")]
 pub struct AuthorityBinding {
     principal_incarnation: String,
-    principal_generation: u64,
+    auth_generation: u64,
     capability_generation: u64,
-    effect_lease: String,
+    effect_lease_id: String,
+    effect_scope: String,
 }
 
 impl AuthorityBinding {
     pub(crate) fn new(
         principal_incarnation: impl Into<String>,
-        principal_generation: u64,
+        auth_generation: u64,
         capability_generation: u64,
-        effect_lease: impl Into<String>,
+        effect_lease_id: impl Into<String>,
+        effect_scope: impl Into<String>,
     ) -> Result<Self, AttemptError> {
         let principal_incarnation = principal_incarnation.into();
-        let effect_lease = effect_lease.into();
+        let effect_lease_id = effect_lease_id.into();
+        let effect_scope = effect_scope.into();
         validate_id(&principal_incarnation, "principal incarnation")?;
-        validate_id(&effect_lease, "effect lease")?;
-        if principal_generation == 0 || capability_generation == 0 {
+        validate_id(&effect_lease_id, "effect lease id")?;
+        validate_id(&effect_scope, "effect scope")?;
+        if auth_generation == 0 || capability_generation == 0 {
             return Err(AttemptError::InvalidAuthority);
         }
         Ok(Self {
             principal_incarnation,
-            principal_generation,
+            auth_generation,
             capability_generation,
-            effect_lease,
+            effect_lease_id,
+            effect_scope,
         })
     }
 
@@ -94,9 +99,10 @@ impl fmt::Debug for AuthorityBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AuthorityBinding")
             .field("principal_incarnation", &"[redacted]")
-            .field("principal_generation", &"[redacted]")
+            .field("auth_generation", &"[redacted]")
             .field("capability_generation", &"[redacted]")
-            .field("effect_lease", &"[redacted]")
+            .field("effect_lease_id", &"[redacted]")
+            .field("effect_scope", &"[redacted]")
             .finish()
     }
 }
@@ -178,20 +184,52 @@ pub struct AttemptProjection {
 /// authorities; the ledger never accepts an `AuthorityBinding` from callers.
 #[derive(Clone, Eq, PartialEq)]
 pub struct CanonicalHostAuthority {
-    pub principal_incarnation: String,
-    pub principal_generation: u64,
-    pub capability_generation: u64,
-    pub effect_lease: String,
+    principal_incarnation: String,
+    auth_generation: u64,
+    capability_generation: u64,
+    effect_lease_id: String,
+    effect_scope: String,
 }
 
 impl fmt::Debug for CanonicalHostAuthority {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CanonicalHostAuthority")
             .field("principal_incarnation", &"[redacted]")
-            .field("principal_generation", &"[redacted]")
+            .field("auth_generation", &"[redacted]")
             .field("capability_generation", &"[redacted]")
-            .field("effect_lease", &"[redacted]")
+            .field("effect_lease_id", &"[redacted]")
+            .field("effect_scope", &"[redacted]")
             .finish()
+    }
+}
+
+impl CanonicalHostAuthority {
+    /// Construct the opaque authority token only at the trusted host-adapter
+    /// boundary. Callers must pass snapshots obtained from the canonical
+    /// #477 principal/incarnation/auth authority and #458 capability/effect
+    /// lease authority; the token's fields cannot be constructed downstream.
+    #[doc(hidden)]
+    pub fn from_trusted_host_adapter(
+        principal_incarnation: impl Into<String>,
+        auth_generation: u64,
+        capability_generation: u64,
+        effect_lease_id: impl Into<String>,
+        effect_scope: impl Into<String>,
+    ) -> Result<Self, AttemptError> {
+        AuthorityBinding::new(
+            principal_incarnation,
+            auth_generation,
+            capability_generation,
+            effect_lease_id,
+            effect_scope,
+        )
+        .map(|binding| Self {
+            principal_incarnation: binding.principal_incarnation,
+            auth_generation: binding.auth_generation,
+            capability_generation: binding.capability_generation,
+            effect_lease_id: binding.effect_lease_id,
+            effect_scope: binding.effect_scope,
+        })
     }
 }
 
@@ -241,13 +279,34 @@ impl ReconciliationAuthorization {
     }
 }
 
-/// Live authority source used by the only public reconciliation entry point.
-/// Production implementations must consult the authenticated operator
-/// authority and the provider's idempotency/status lookup; a caller-supplied
-/// boolean or provider result is not a valid replacement for this source.
-pub trait ReconciliationAuthority: Send + Sync {
-    fn operator_authorized(&self, operator_id: &str, attempt_id: &str) -> bool;
-    fn provider_confirms_not_applied(&self, provider_request_id: &str) -> bool;
+/// Opaque evidence minted by the trusted operator + provider reconciliation
+/// adapter. Downstream crates cannot construct or implement the old
+/// caller-assertable reconciliation authority.
+pub struct ReconciliationEvidence {
+    operator_id: String,
+    provider_request_id: String,
+}
+
+impl fmt::Debug for ReconciliationEvidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReconciliationEvidence([redacted])")
+    }
+}
+
+impl ReconciliationEvidence {
+    pub(crate) fn from_verified(
+        operator_id: impl Into<String>,
+        provider_request_id: impl Into<String>,
+    ) -> Result<Self, AttemptError> {
+        let operator_id = operator_id.into();
+        let provider_request_id = provider_request_id.into();
+        validate_id(&operator_id, "operator id")?;
+        validate_id(&provider_request_id, "provider request id")?;
+        Ok(Self {
+            operator_id,
+            provider_request_id,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -260,6 +319,7 @@ pub enum AttemptError {
     MissingAttempt,
     StaleAuthority,
     InvalidTransition { from: SendState, to: SendState },
+    EffectLeaseAlreadyUsed,
     NotExplicitlyAuthorized,
     SettlementDoesNotMatch,
     InvalidProviderEffect,
@@ -279,6 +339,9 @@ impl fmt::Display for AttemptError {
             Self::StaleAuthority => write!(f, "principal or capability authority is stale"),
             Self::InvalidTransition { from, to } => {
                 write!(f, "invalid provider-attempt transition {from:?} -> {to:?}")
+            }
+            Self::EffectLeaseAlreadyUsed => {
+                write!(f, "capability effect lease has already been consumed")
             }
             Self::NotExplicitlyAuthorized => {
                 write!(
@@ -345,17 +408,19 @@ impl AttemptContext {
     ) -> Result<Self, AttemptError> {
         let binding = AuthorityBinding::new(
             authority.principal_incarnation,
-            authority.principal_generation,
+            authority.auth_generation,
             authority.capability_generation,
-            authority.effect_lease,
+            authority.effect_lease_id,
+            authority.effect_scope,
         )?;
         let revalidate = Arc::new(move || {
             let current = revalidate()?;
             AuthorityBinding::new(
                 current.principal_incarnation,
-                current.principal_generation,
+                current.auth_generation,
                 current.capability_generation,
-                current.effect_lease,
+                current.effect_lease_id,
+                current.effect_scope,
             )
             .ok()
         });
@@ -394,7 +459,10 @@ impl AttemptContext {
         let permit = match attempt.begin_send(&current) {
             Ok(permit) => permit,
             Err(error) => {
-                if matches!(error, AttemptError::StaleAuthority) {
+                if matches!(
+                    error,
+                    AttemptError::StaleAuthority | AttemptError::EffectLeaseAlreadyUsed
+                ) {
                     let _ = attempt.cancel_without_send();
                 }
                 return Err(error);
@@ -472,17 +540,13 @@ impl AttemptContext {
     pub fn reconcile_not_applied(
         &self,
         attempt: &ProviderAttempt,
-        operator_id: &str,
-        authority: &dyn ReconciliationAuthority,
+        evidence: &ReconciliationEvidence,
     ) -> Result<(), AttemptError> {
-        if !authority.operator_authorized(operator_id, attempt.attempt_id()) {
-            return Err(AttemptError::NotExplicitlyAuthorized);
-        }
         let provider_request_id = attempt.provider_request_id()?;
-        if !authority.provider_confirms_not_applied(&provider_request_id) {
+        if evidence.provider_request_id != provider_request_id {
             return Err(AttemptError::NotExplicitlyAuthorized);
         }
-        let authorization = ReconciliationAuthorization::new(operator_id)?;
+        let authorization = ReconciliationAuthorization::new(&evidence.operator_id)?;
         attempt.reconcile(&authorization, ProviderTruth::NotApplied)
     }
 }
@@ -506,6 +570,8 @@ struct StoredAttempt {
     supports_idempotency: bool,
     authority: AuthorityBinding,
     state: SendState,
+    #[serde(default)]
+    lease_claimed: bool,
     sequence: u64,
     failure: Option<String>,
     settlement_effect_id: Option<String>,
@@ -548,6 +614,7 @@ impl ProviderAttemptStore {
             supports_idempotency: spec.supports_idempotency,
             authority: spec.authority,
             state: SendState::Prepared,
+            lease_claimed: false,
             sequence: 0,
             failure: None,
             settlement_effect_id: None,
@@ -723,6 +790,16 @@ impl ProviderAttemptStore {
                     to,
                 });
             }
+            if to == SendState::Sending && !record.lease_claimed {
+                if self.lease_claimed_by_other(
+                    &record.attempt_id,
+                    &record.authority.effect_lease_id,
+                    &record.authority.effect_scope,
+                )? {
+                    return Err(AttemptError::EffectLeaseAlreadyUsed);
+                }
+                record.lease_claimed = true;
+            }
             if let Some(settlement) = settlement {
                 if settlement.provider_request_id != record.provider_request_id
                     || settlement.provider_effect_id.is_empty()
@@ -737,6 +814,36 @@ impl ProviderAttemptStore {
             record.updated_at_ms = now_ms();
             Ok((Some(record), ()))
         })
+    }
+
+    fn lease_claimed_by_other(
+        &self,
+        attempt_id: &str,
+        effect_lease_id: &str,
+        effect_scope: &str,
+    ) -> Result<bool, AttemptError> {
+        for entry in fs::read_dir(&*self.root)? {
+            let path = entry?.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(other_id) = path.file_stem().and_then(|x| x.to_str()) else {
+                continue;
+            };
+            if other_id == attempt_id {
+                continue;
+            }
+            let Some(other) = self.read_record(other_id)? else {
+                continue;
+            };
+            if other.lease_claimed
+                && other.authority.effect_lease_id == effect_lease_id
+                && other.authority.effect_scope == effect_scope
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -1134,13 +1241,14 @@ fn derive_request_key(attempt_id: &str, spec: &AttemptSpec) -> String {
         &spec.provider_id,
         &spec.request_fingerprint,
         &spec.authority.principal_incarnation,
-        &spec.authority.effect_lease,
+        &spec.authority.effect_lease_id,
+        &spec.authority.effect_scope,
     ] {
         hasher.update([0]);
         hasher.update(value.as_bytes());
     }
     hasher.update([0]);
-    hasher.update(spec.authority.principal_generation.to_le_bytes());
+    hasher.update(spec.authority.auth_generation.to_le_bytes());
     hasher.update([0]);
     hasher.update(spec.authority.capability_generation.to_le_bytes());
     format!("{REQUEST_KEY_PREFIX}{}", hex(&hasher.finalize()))
@@ -1184,6 +1292,7 @@ mod tests {
             generation,
             generation,
             format!("lease-{generation}"),
+            format!("scope-{generation}"),
         )
         .unwrap()
     }
@@ -1436,23 +1545,8 @@ mod tests {
         assert_eq!(attempt.state().unwrap(), SendState::Admitted);
     }
 
-    struct TestReconciliationAuthority {
-        operator: bool,
-        provider_not_applied: bool,
-    }
-
-    impl ReconciliationAuthority for TestReconciliationAuthority {
-        fn operator_authorized(&self, _operator_id: &str, _attempt_id: &str) -> bool {
-            self.operator
-        }
-
-        fn provider_confirms_not_applied(&self, _provider_request_id: &str) -> bool {
-            self.provider_not_applied
-        }
-    }
-
     #[test]
-    fn public_reconciliation_requires_live_operator_and_provider_truth() {
+    fn trusted_reconciliation_evidence_requires_matching_provider_identity() {
         let temp = tempdir().unwrap();
         let store = ProviderAttemptStore::open(temp.path()).unwrap();
         let binding = authority(1);
@@ -1467,21 +1561,17 @@ mod tests {
         let mut permit = context.begin("xai", b"request", true).unwrap();
         permit.transport_after_possible_write().unwrap();
         let attempt = store.load(permit.attempt_id()).unwrap().unwrap();
-        let denied = TestReconciliationAuthority {
-            operator: false,
-            provider_not_applied: true,
-        };
+        let denied = ReconciliationEvidence::from_verified("operator-1", "opaque-wrong").unwrap();
         assert_eq!(
-            context.reconcile_not_applied(&attempt, "operator-1", &denied),
+            context.reconcile_not_applied(&attempt, &denied),
             Err(AttemptError::NotExplicitlyAuthorized)
         );
-        let approved = TestReconciliationAuthority {
-            operator: true,
-            provider_not_applied: true,
-        };
-        context
-            .reconcile_not_applied(&attempt, "operator-1", &approved)
-            .unwrap();
+        let approved = ReconciliationEvidence::from_verified(
+            "operator-1",
+            attempt.provider_request_id().unwrap(),
+        )
+        .unwrap();
+        context.reconcile_not_applied(&attempt, &approved).unwrap();
         assert_eq!(attempt.state().unwrap(), SendState::Admitted);
     }
 

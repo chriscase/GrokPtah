@@ -3030,12 +3030,15 @@ pub async fn replay_xai_provider_contract_on_loopback(
         std::env::temp_dir().join(format!("grokptah-provider-contract-{}", Uuid::new_v4()));
     let attempt_store = xai_provider_attempt::ProviderAttemptStore::open(&attempt_root)
         .map_err(|error| anyhow!("open provider contract attempt ledger: {error}"))?;
-    let attempt_authority = xai_provider_attempt::CanonicalHostAuthority {
-        principal_incarnation: "provider-contract-replay".into(),
-        principal_generation: 1,
-        capability_generation: 1,
-        effect_lease: "provider-contract-replay-lease".into(),
-    };
+    let attempt_authority =
+        xai_provider_attempt::CanonicalHostAuthority::from_trusted_host_adapter(
+            "provider-contract-replay",
+            1,
+            1,
+            "provider-contract-replay-lease",
+            "provider-contract-replay-scope",
+        )
+        .map_err(|error| anyhow!("create provider contract authority: {error}"))?;
     let revalidate_authority = attempt_authority.clone();
     let provider_attempt = ProviderAttemptContext::from_host_authority(
         attempt_store,
@@ -3117,12 +3120,14 @@ mod compatible_stream_tests {
     fn provider_attempt_context() -> ProviderAttemptContext {
         let root = std::env::temp_dir().join(format!("grokptah-provider-test-{}", Uuid::new_v4()));
         let store = xai_provider_attempt::ProviderAttemptStore::open(root).unwrap();
-        let authority = xai_provider_attempt::CanonicalHostAuthority {
-            principal_incarnation: "provider-test".into(),
-            principal_generation: 1,
-            capability_generation: 1,
-            effect_lease: "provider-test-lease".into(),
-        };
+        let authority = xai_provider_attempt::CanonicalHostAuthority::from_trusted_host_adapter(
+            "provider-test",
+            1,
+            1,
+            "provider-test-lease",
+            "provider-test-scope",
+        )
+        .unwrap();
         let revalidate_authority = authority.clone();
         ProviderAttemptContext::from_host_authority(
             store,

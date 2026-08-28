@@ -1034,12 +1034,14 @@ impl AgentHostHandle {
         } else {
             (format!("lane-{session_id}"), turn_generation.max(1))
         };
-        Ok(xai_provider_attempt::CanonicalHostAuthority {
+        xai_provider_attempt::CanonicalHostAuthority::from_trusted_host_adapter(
             principal_incarnation,
-            principal_generation: turn_generation.max(1),
+            turn_generation.max(1),
             capability_generation,
-            effect_lease: format!("effect-lease-{session_id}-{turn_generation}"),
-        })
+            format!("effect-lease-{session_id}-{turn_generation}"),
+            format!("effect-scope-{session_id}"),
+        )
+        .map_err(|error| anyhow!("construct provider authority: {error}"))
     }
 
     pub fn take_event_receiver(&self) -> Option<crate::event_bus::EventReceiver> {
