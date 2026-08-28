@@ -456,6 +456,33 @@ fn set_private_permissions(file: &File) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_reconciliation_record_is_private_after_atomic_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        initialize(root.path()).unwrap();
+        let operator = AuthContext {
+            token_id: "operator-1".into(),
+            owner_id: "owner-1".into(),
+        };
+        let receipt =
+            crate::host::VerifiedProviderReceipt::from_provider_response("request-1", None::<String>)
+                .unwrap();
+
+        write_verified_reconciliation(root.path(), "attempt-1", &operator, &receipt).unwrap();
+
+        let path = root.path().join("reconciliation/attempt-1.json");
+        let metadata = fs::symlink_metadata(path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o077, 0);
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
