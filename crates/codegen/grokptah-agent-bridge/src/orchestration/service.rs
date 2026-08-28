@@ -1814,7 +1814,14 @@ impl OrchestrationService {
                                 .map(ToString::to_string)
                                 .or_else(|| value.as_str().and_then(|id| handles.get(id)).cloned())
                                 .unwrap_or_else(|| "actor_redacted".into());
-                            projected.insert("actorHandle".into(), json!(replacement));
+                            if matches!(
+                                lower.as_str(),
+                                "createdby" | "reviewerid" | "claimantid" | "ackedby"
+                            ) {
+                                projected.insert(key, json!(replacement));
+                            } else {
+                                projected.insert("actorHandle".into(), json!(replacement));
+                            }
                             continue;
                         }
                         projected.insert(key, project(value, handles));
