@@ -1230,6 +1230,40 @@ fn intent_and_outcome_share_one_opaque_producer_identity() {
 }
 
 #[test]
+fn restart_closes_unfinished_intent_as_durable_uncertain_outcome() {
+    let dir = TempDir::new().unwrap();
+    let ledger = opened(dir.path());
+    ledger
+        .append(
+            AuditEntryInput::new(
+                "shutdown-boundary",
+                EntryPhase::Intent,
+                EntryOutcome::Accepted,
+            )
+            .with_intent_id("unfinished-intent"),
+        )
+        .unwrap();
+    drop(ledger);
+
+    let reopened = opened(dir.path());
+    let status = reopened.status();
+    assert_eq!(status.recovery.closed_intents, 1);
+    assert_eq!(status.open_intents, 0);
+    assert_eq!(status.global_last_seq, 2);
+}
+
+#[test]
+fn retention_refuses_unauthenticated_import_even_with_override() {
+    let dir = TempDir::new().unwrap();
+    let legacy = legacy_v1_dir(dir.path(), "{\"old\":1}\n", "{\"new\":2}\n");
+    let ledger = open_with_legacy(&dir.path().join("audit"), &legacy).unwrap();
+    let error = ledger
+        .retain(RetentionRequest::new("g-000001").allow_unexported())
+        .unwrap_err();
+    assert_eq!(refusal_of(error), RefuseReason::GenerationUnverified);
+}
+
+#[test]
 fn symlinked_root_is_rejected() {
     #[cfg(unix)]
     {
