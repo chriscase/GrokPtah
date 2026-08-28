@@ -2657,6 +2657,7 @@ where
         let mut stream = resp.bytes_stream();
         let mut decoder = crate::sse::SseLineDecoder::new();
         let mut full_body = crate::sse::BoundedBodyAccumulator::new();
+        let mut settlement_body = crate::sse::BoundedBodyAccumulator::new();
         let mut acc = AgentSseAccumulator::default();
         let mut done = false;
         let mut response_bytes = 0u64;
@@ -2705,6 +2706,7 @@ where
                 }
             };
             response_bytes = response_bytes.saturating_add(bytes.len() as u64);
+            settlement_body.push(&bytes)?;
             if !acc.saw_data {
                 full_body.push(&bytes)?;
             }
@@ -2724,6 +2726,7 @@ where
                 done = apply_agent_sse_line(&trailing, &mut acc, &mut on_delta, &mut on_thought)?;
             }
         }
+        let settlement_evidence = settlement_body.finish()?;
         if !acc.saw_data {
             let raw = full_body.finish()?;
             let value: serde_json::Value = match serde_json::from_str(raw.trim()) {
@@ -2789,7 +2792,7 @@ where
                 provider_attempt,
                 &mut physical_permit,
                 status.as_u16(),
-                response_bytes.to_le_bytes().as_slice(),
+                settlement_evidence.as_bytes(),
             )?;
             return Ok(step);
         }
@@ -2860,7 +2863,7 @@ where
                 provider_attempt,
                 &mut physical_permit,
                 status.as_u16(),
-                response_bytes.to_le_bytes().as_slice(),
+                settlement_evidence.as_bytes(),
             )?;
             return Ok(AgentStep::ToolCalls {
                 content: content_opt,
@@ -2889,7 +2892,7 @@ where
                 provider_attempt,
                 &mut physical_permit,
                 status.as_u16(),
-                response_bytes.to_le_bytes().as_slice(),
+                settlement_evidence.as_bytes(),
             )?;
             return Ok(AgentStep::Final {
                 text: acc.content,
@@ -2917,7 +2920,7 @@ where
                 provider_attempt,
                 &mut physical_permit,
                 status.as_u16(),
-                response_bytes.to_le_bytes().as_slice(),
+                settlement_evidence.as_bytes(),
             )?;
             return Ok(AgentStep::Final {
                 text: String::new(),
@@ -2946,7 +2949,7 @@ where
             provider_attempt,
             &mut physical_permit,
             status.as_u16(),
-            response_bytes.to_le_bytes().as_slice(),
+            settlement_evidence.as_bytes(),
         )?;
         return Ok(AgentStep::Final {
             text: String::new(),

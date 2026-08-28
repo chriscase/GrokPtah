@@ -458,7 +458,7 @@ impl AttemptContext {
             .as_ref()
             .map(HostAuthorityRecord::binding)
             .transpose()?
-            .unwrap_or_else(|| Ok(self.authority.clone()))?;
+            .unwrap_or_else(|| self.authority.clone());
         let permit = match attempt.begin_send_live(&current) {
             Ok(permit) => permit,
             Err(error) => {
@@ -521,7 +521,7 @@ impl AttemptContext {
             .as_ref()
             .map(HostAuthorityRecord::binding)
             .transpose()?
-            .unwrap_or_else(|| Ok(self.authority.clone()))?;
+            .unwrap_or_else(|| self.authority.clone());
         permit.revalidate_live(&current)
     }
 
