@@ -94,10 +94,11 @@ impl CapabilitySnapshot {
         policy_digest: &str,
     ) -> Result<Self> {
         let backend = serde_json::to_vec(backend)?;
+        let scope = format!("computer-use-service:{policy_digest}");
         Self::from_parts(
             CapabilityKind::ComputerUse,
             principal,
-            "computer-use-service",
+            &scope,
             [
                 std::str::from_utf8(&backend).unwrap_or_default(),
                 policy_digest,
