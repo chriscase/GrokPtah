@@ -107,6 +107,19 @@ impl AdaptiveObservationAdapter for SemanticHeadlessAdapter {
             selected.push(value);
         }
         rendered["elements"] = serde_json::Value::Array(selected);
+        let mut element_count = rendered["elements"].as_array().map_or(0, Vec::len);
+        while serde_json::to_vec(&rendered)
+            .map(|bytes| bytes.len() as u64)
+            .unwrap_or(u64::MAX)
+            > budget.max_observation_bytes
+            && element_count > 0
+        {
+            if let Some(elements) = rendered["elements"].as_array_mut() {
+                elements.pop();
+            }
+            element_count -= 1;
+            rendered["elements_truncated"] = serde_json::Value::Bool(true);
+        }
         let bytes = serde_json::to_vec(&rendered).map_err(|_| {
             ComputerError::new(
                 ComputerErrorCode::Internal,
@@ -124,7 +137,9 @@ impl AdaptiveObservationAdapter for SemanticHeadlessAdapter {
         Ok(ObservationAdapterOutput {
             semantic: rendered,
             visual: None,
-            bounded: observation.elements_truncated || cap < observation.elements.len(),
+            bounded: observation.elements_truncated
+                || cap < observation.elements.len()
+                || element_count < cap,
         })
     }
 }

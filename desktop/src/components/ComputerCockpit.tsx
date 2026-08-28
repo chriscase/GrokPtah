@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../lib/api";
+import { describeAdaptiveProfile } from "../lib/adaptiveProfile";
 import {
   computerActivityAnnouncement,
   computerActivityState,
@@ -178,6 +179,10 @@ export function ComputerCockpit({
     ["status", "AXStaticText"].includes(element.role),
   );
   const approval = snapshot?.pendingApproval ?? null;
+  const adaptive = useMemo(
+    () => (snapshot?.adaptive ? describeAdaptiveProfile(snapshot.adaptive) : null),
+    [snapshot?.adaptive],
+  );
   const grantActive = Boolean(run?.grant && !run.grant.revokedAt);
   const timeline = useMemo(() => run?.audit.slice(-12).reverse() ?? [], [run]);
   const selectedNativeTarget = nativeTargets.find(
@@ -665,8 +670,41 @@ export function ComputerCockpit({
                   </dd>
                 </div>
                 <div><dt>Grant expires</dt><dd>{grantActive && run.grant ? new Date(run.grant.expiresAt).toLocaleTimeString() : "Revoked"}</dd></div>
-                <div><dt>Pointer fallback</dt><dd>Disabled</dd></div>
+                <div><dt>Pointer fallback</dt><dd>{adaptive?.details.some((detail) => detail.value.includes("visual path qualified")) ? "Profile-gated" : "Disabled"}</dd></div>
               </dl>
+              {adaptive && (
+                <div className="computer-adaptive" aria-label="Adaptive execution profile">
+                  <span className="computer-section-label">Execution profile</span>
+                  <h3>{adaptive.profileName}</h3>
+                  <p className="computer-adaptive-reason">{adaptive.reason}</p>
+                  <dl>
+                    {adaptive.details.map((detail) => (
+                      <div key={detail.label}>
+                        <dt>{detail.label}</dt>
+                        <dd>{detail.value}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                  {adaptive.escalations.length > 0 && (
+                    <ol className="computer-adaptive-escalations">
+                      {adaptive.escalations.map((escalation) => (
+                        <li key={escalation}>{escalation}</li>
+                      ))}
+                    </ol>
+                  )}
+                  {adaptive.cautions.map((caution) => (
+                    <div key={caution.code} className="computer-alert is-warning">
+                      {caution.message}
+                    </div>
+                  ))}
+                  {adaptive.ended && (
+                    <div className="computer-alert is-error" role="alert">
+                      <strong>{adaptive.ended.title}</strong>
+                      <span>{adaptive.ended.message}</span>
+                    </div>
+                  )}
+                </div>
+              )}
               {run.lastOutcome && <div className="computer-outcome">{run.lastOutcome.summary}</div>}
               {run.lastError && (
                 <div className="computer-alert is-error" role="alert">

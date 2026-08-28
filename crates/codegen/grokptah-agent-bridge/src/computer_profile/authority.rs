@@ -142,6 +142,14 @@ impl AdaptiveAuthoritySnapshot {
     pub(crate) fn principal_reference(&self) -> &str {
         self.principal.as_str()
     }
+
+    pub(crate) fn principal(&self) -> PrincipalGenerationRef {
+        self.principal.clone()
+    }
+
+    pub(crate) fn capability(&self) -> CapabilityGenerationRef {
+        self.capability.clone()
+    }
 }
 
 /// Request passed to the canonical #478 provider-attempt authority.

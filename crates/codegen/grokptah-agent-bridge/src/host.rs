@@ -17,8 +17,12 @@ use crate::completion::{
     CompletionUsage,
 };
 use crate::computer_agent::{
-    propose_semantic_action, qualify_semantic_model, resolve_computer_eligibility,
-    ComputerAgentEligibility, ComputerAgentProposal,
+    propose_semantic_action, propose_semantic_action_with_profile, qualify_semantic_model,
+    resolve_computer_eligibility, ComputerAgentEligibility, ComputerAgentProposal,
+};
+use crate::computer_profile::{
+    AdaptiveController, AdaptivePolicyEngine, CapabilityEvidence, HostCapabilityEvidence,
+    ModelCapabilityEvidence, PolicyOutcome, ProfileReason, RuntimeSignal, TaskPolicy,
 };
 use crate::event_bus::{session_id_of, JournalPage};
 use crate::events::{SessionUpdate, ToolCallKind, ToolCallStatus};
@@ -72,6 +76,7 @@ use crate::types::{
     AuthState, BackgroundTask, EffortLevel, McpProjectTrust, McpServerInfo, ModelInfo, PluginInfo,
     SkillInfo, SubagentExecutionMode, SubagentInfo, SubagentIsolationPreference,
 };
+use sha2::{Digest, Sha256};
 
 /// UI restore payload: open tabs + active Lane + project.
 ///
@@ -748,6 +753,10 @@ pub struct AgentHostHandle {
     /// children it spawns. A session counter is not a safe run identity.
     run_usage_trackers: Arc<Mutex<HashMap<Uuid, Arc<RunUsageTracker>>>>,
     provider_observation: Option<ProviderObservationSession>,
+    /// Adapter to the canonical #477/#458/#478 authority spine. The adaptive
+    /// layer has no fallback implementation and therefore fails closed until
+    /// the assembled host installs this adapter.
+    adaptive_authority: Arc<Mutex<Option<Arc<dyn crate::computer_profile::CanonicalAuthority>>>>,
     /// Exclusive lock on `~/.grokptah` — kept alive for the process (#119).
     _instance_lock: Option<Arc<crate::instance_lock::InstanceLock>>,
     /// Selects the durable root for legacy modules that still resolve paths
@@ -933,6 +942,7 @@ impl AgentHost {
             orchestration_wakeup: Arc::new(Notify::new()),
             run_usage_trackers: Arc::new(Mutex::new(HashMap::new())),
             provider_observation: config.provider_observation,
+            adaptive_authority: Arc::new(Mutex::new(None)),
             _instance_lock: instance_lock,
             runtime_home,
             _runtime_home_context: runtime_home_context,
@@ -1089,6 +1099,245 @@ impl AgentHostHandle {
         Ok(proposal)
     }
 
+    /// Adaptive production proposal boundary for an existing Computer Run.
+    ///
+    /// Adaptive state is loaded from and written to the durable Computer Run,
+    /// never from session memory. The canonical authority adapter must issue
+    /// the principal/capability generations and authenticate the provider
+    /// attempt; absent or changed authority stops the run before a model call.
+    pub async fn propose_computer_action_for_run(
+        &self,
+        session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+        objective: &str,
+        observation: &crate::computer_use::ComputerObservation,
+    ) -> Result<ComputerAgentProposal> {
+        let authority = self
+            .adaptive_authority
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow!(ProfileReason::AuthorityUnavailable.operator_message()))?;
+        let store = self.ensure_computer_store()?;
+        let stored = store
+            .load_run(run_id)?
+            .filter(|run| run.owner_session_id == session_id)
+            .ok_or_else(|| anyhow!("Computer Run is not available to this session"))?;
+        if stored.version != expected_version
+            || stored.state != crate::computer_use::ComputerRunState::Ready
+            || stored
+                .current_observation
+                .as_ref()
+                .map(|current| current.observation_id.as_str())
+                != Some(observation.observation_id.as_str())
+        {
+            bail!("Computer Run changed before adaptive inference started");
+        }
+
+        let (model, effort) = self.selected_computer_model(session_id)?;
+        let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!(crate::auth_store::auth_help_message()))?;
+        let resolved = resolve_computer_eligibility(&credentials, &model)?;
+        let snapshot = authority
+            .current_snapshot(session_id, run_id, &resolved.route_fingerprint)
+            .map_err(|error| anyhow!(error.to_string()))?;
+        authority
+            .validate_snapshot(&snapshot)
+            .map_err(|error| anyhow!(error.to_string()))?;
+
+        let session_measured = self
+            .inner
+            .lock()
+            .computer_agent_qualifications
+            .get(&(session_id, model.clone()))
+            .is_some_and(|record| record.route_fingerprint == resolved.route_fingerprint);
+        let durable = resolved.capabilities.computer_capability_source
+            == crate::gateway_config::CapabilitySource::Measured;
+        let synthetic_only = session_measured && !durable;
+        let model_evidence = ModelCapabilityEvidence::from_model_capabilities(
+            &resolved.capabilities,
+            Some(&snapshot),
+            session_measured,
+            synthetic_only,
+        );
+        let evidence = CapabilityEvidence::with_authority(
+            model_evidence,
+            HostCapabilityEvidence {
+                semantic_observation: true,
+                screenshot_capture: observation.screenshot.is_some(),
+                // The assembled host must install a real independent verifier
+                // before High Assurance becomes eligible.
+                independent_verifier: false,
+                isolated_guest: false,
+            },
+            snapshot.clone(),
+        );
+        let task_policy = TaskPolicy {
+            risk: crate::computer_profile::classify_task(objective, observation),
+            minimum_profile: None,
+        };
+
+        let mut controller = match stored.adaptive.clone() {
+            Some(state) => {
+                let mut controller = AdaptiveController::from_state(state)
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                if controller.state().capability_snapshot_reference
+                    != evidence.capability_snapshot_reference()
+                {
+                    let transition = controller.apply_signal(RuntimeSignal::CapabilityRevoked);
+                    self.persist_adaptive_state(
+                        &store,
+                        session_id,
+                        run_id,
+                        expected_version,
+                        &controller,
+                        "capability_revoked",
+                    )?;
+                    return Err(anyhow!(format!("{transition:?}")));
+                }
+                controller.bind_authority(snapshot.clone());
+                controller
+            }
+            None => match AdaptivePolicyEngine.select(&evidence, task_policy) {
+                PolicyOutcome::Proceed(decision) => AdaptiveController::new(run_id, decision),
+                PolicyOutcome::Stop(stop) => {
+                    let controller =
+                        AdaptiveController::stopped(run_id, evidence.clone(), task_policy, stop);
+                    self.persist_adaptive_state(
+                        &store,
+                        session_id,
+                        run_id,
+                        expected_version,
+                        &controller,
+                        "selection_stopped",
+                    )?;
+                    return Err(anyhow!(stop.operator_message()));
+                }
+            },
+        };
+
+        let permit = controller
+            .begin_turn(controller.revision())
+            .map_err(|error| anyhow!(error.to_string()))?;
+        self.persist_adaptive_state(
+            &store,
+            session_id,
+            run_id,
+            expected_version,
+            &controller,
+            "turn_started",
+        )?;
+
+        let mut request_hasher = Sha256::new();
+        request_hasher.update(run_id.as_bytes());
+        request_hasher.update([0]);
+        request_hasher.update(observation.observation_id.as_bytes());
+        request_hasher.update([0]);
+        request_hasher.update(objective.as_bytes());
+        request_hasher.update([0]);
+        request_hasher.update(permit.profile.as_str().as_bytes());
+        let request_digest = format!("{:x}", request_hasher.finalize());
+        let receipt = authority
+            .provider_attempt(crate::computer_profile::ProviderAttemptRequest {
+                principal: snapshot.principal(),
+                capability: snapshot.capability(),
+                session_id,
+                run_id: run_id.to_string(),
+                route_fingerprint: resolved.route_fingerprint.clone(),
+                request_digest,
+            })
+            .map_err(|error| anyhow!(error.to_string()))?;
+        receipt
+            .validate()
+            .map_err(|error| anyhow!(error.to_string()))?;
+
+        let (_operation_id, cancel, _guard) = self.begin_computer_agent_operation(session_id)?;
+        let outcome = propose_semantic_action_with_profile(
+            &credentials,
+            &model,
+            effort,
+            objective,
+            observation,
+            &permit,
+            &cancel,
+        )
+        .await;
+        match outcome {
+            Ok(outcome) => {
+                authority
+                    .validate_snapshot(&snapshot)
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                if cancel.is_cancelled() {
+                    controller.abort_turn(true);
+                    self.persist_adaptive_state(
+                        &store,
+                        session_id,
+                        run_id,
+                        expected_version,
+                        &controller,
+                        "turn_cancelled",
+                    )?;
+                    bail!("Computer model proposal was cancelled");
+                }
+                controller.record_usable_answer();
+                controller.finish_turn(
+                    outcome.rendered.bytes,
+                    outcome.rendered.truncated,
+                    Some(&receipt),
+                );
+                self.persist_adaptive_state(
+                    &store,
+                    session_id,
+                    run_id,
+                    expected_version,
+                    &controller,
+                    "turn_completed",
+                )?;
+                Ok(outcome.proposal)
+            }
+            Err(error) => {
+                controller.abort_turn(true);
+                if let Some(signal) = controller.record_uncertain_answer() {
+                    controller.apply_signal(signal);
+                }
+                self.persist_adaptive_state(
+                    &store,
+                    session_id,
+                    run_id,
+                    expected_version,
+                    &controller,
+                    "turn_rejected",
+                )?;
+                Err(error).context("adaptive Computer proposal was rejected")
+            }
+        }
+    }
+
+    fn persist_adaptive_state(
+        &self,
+        store: &crate::computer_use::ComputerStore,
+        session_id: Uuid,
+        run_id: &str,
+        expected_version: u64,
+        controller: &AdaptiveController,
+        disposition: &str,
+    ) -> Result<()> {
+        let state = controller.state().clone();
+        let updated = store.update_run(run_id, |run| {
+            if run.owner_session_id != session_id || run.version != expected_version {
+                bail!("Computer Run changed while adaptive state was being recorded");
+            }
+            run.adaptive = Some(state);
+            run.record_audit("adaptive", disposition, None, None, None);
+            Ok(())
+        })?;
+        if updated.is_none() {
+            bail!("Computer Run is not available to this session");
+        }
+        Ok(())
+    }
+
     /// Local Stop/Take over cancellation. It does not share the Build-turn
     /// token, so cancelling Computer inference never cancels unrelated coding.
     pub fn cancel_computer_agent(&self, session_id: Uuid) -> bool {
@@ -1222,6 +1471,22 @@ impl AgentHostHandle {
     /// Return the already-open Computer Run ledger without filesystem work.
     pub fn computer_store(&self) -> Option<crate::computer_use::ComputerStore> {
         self.computer_store.lock().clone()
+    }
+
+    /// Install the assembled host's canonical authority adapter. The adapter
+    /// is intentionally replace-once: changing the authority underneath an
+    /// active run would be a generation race, so the host must restart or
+    /// revoke the run before a new authority can be installed.
+    pub fn install_canonical_adaptive_authority(
+        &self,
+        authority: Arc<dyn crate::computer_profile::CanonicalAuthority>,
+    ) -> Result<()> {
+        let mut current = self.adaptive_authority.lock();
+        if current.is_some() {
+            bail!("canonical adaptive authority is already installed");
+        }
+        *current = Some(authority);
+        Ok(())
     }
 
     /// Install a store supplied by the orchestration service when the host has

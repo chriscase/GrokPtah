@@ -149,6 +149,10 @@ impl CapabilityEvidence {
         self.authority.as_ref()
     }
 
+    pub(crate) fn bind_authority(&mut self, authority: AdaptiveAuthoritySnapshot) {
+        self.authority = Some(authority);
+    }
+
     /// Synthetic evidence is explicit and cannot be mistaken for live
     /// eligibility. It is intentionally limited to the semantic Economy path.
     pub fn synthetic(model: ModelCapabilityEvidence, host: HostCapabilityEvidence) -> Self {

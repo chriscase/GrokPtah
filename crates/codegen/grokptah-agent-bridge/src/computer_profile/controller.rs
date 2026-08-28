@@ -232,6 +232,31 @@ impl AdaptiveController {
         }
     }
 
+    pub fn stopped(
+        run_id: &str,
+        evidence: CapabilityEvidence,
+        policy: super::policy::TaskPolicy,
+        stop: PolicyStop,
+    ) -> Self {
+        let _ = run_id;
+        let decision = ProfileDecision {
+            profile: stop.profile,
+            reason: stop.reason,
+            risk: policy.risk,
+            ceiling: stop.ceiling,
+            capability_snapshot_reference: evidence.capability_snapshot_reference(),
+            evidence,
+        };
+        let mut controller = Self::new(run_id, decision);
+        controller.state.terminal = Some(TerminalOutcome {
+            kind: TerminalKind::Stopped,
+            reason: stop.reason,
+            profile: stop.profile,
+            required_profile: stop.required_profile,
+        });
+        controller
+    }
+
     pub fn from_state(state: AdaptiveRunState) -> Result<Self, ControllerError> {
         if !state.validate() {
             return Err(ControllerError::InvalidState);
@@ -269,6 +294,13 @@ impl AdaptiveController {
 
     pub fn evidence(&self) -> &CapabilityEvidence {
         &self.state.evidence
+    }
+
+    pub(crate) fn bind_authority(
+        &mut self,
+        authority: super::authority::AdaptiveAuthoritySnapshot,
+    ) {
+        self.state.evidence.bind_authority(authority);
     }
 
     pub fn revision(&self) -> u64 {

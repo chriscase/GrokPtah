@@ -1114,6 +1114,106 @@ export interface ComputerCockpitSnapshot {
   /** Local-only detail retained for approval rendering. */
   run?: ComputerRun | null;
   pendingApproval?: PendingComputerApproval | null;
+  /** Redacted adaptive state projected from the durable Computer Run. */
+  adaptive?: AdaptiveProfileProjection | null;
+}
+
+export type AdaptiveProfile = "economy" | "balanced" | "high_assurance";
+export type AdaptiveProfileReason =
+  | "routine_task"
+  | "text_oriented_model"
+  | "consequential_intent"
+  | "destructive_intent"
+  | "sensitive_surface"
+  | "ambiguous_observation"
+  | "missing_semantics"
+  | "contradictory_semantics"
+  | "repeated_stationarity"
+  | "low_confidence"
+  | "repeated_uncertainty"
+  | "verification_failed"
+  | "insufficient_capability_for_risk"
+  | "capability_revoked"
+  | "escalation_ceiling_reached"
+  | "budget_exhausted"
+  | "independent_verifier_unavailable"
+  | "model_not_qualified"
+  | "authority_unavailable";
+
+export interface AdaptiveProfileProjection {
+  profile: AdaptiveProfile;
+  profileDisplayName: string;
+  reason: AdaptiveProfileReason;
+  message: string;
+  risk: "routine" | "consequential" | "destructive";
+  capability: {
+    tier: ComputerUseTier;
+    attribution: "unknown" | "declared" | "measured";
+    structuredTools: boolean;
+    imageInput: boolean;
+    qualifiedVisualPath: boolean;
+    durableAuthority: boolean;
+    sessionMeasured: boolean;
+    syntheticOnly: boolean;
+    hostScreenshotCapture: boolean;
+    hostIndependentVerifier: boolean;
+    hostIsolatedGuest: boolean;
+    ceiling: AdaptiveProfile;
+    capabilitySnapshotReference?: string | null;
+  };
+  budget: {
+    observationDetail:
+      | "semantic_only"
+      | "semantic_with_geometry"
+      | "semantic_with_evidence_ref";
+    maxObservationElements: number;
+    maxObservationBytes: number;
+    maxModelCalls: number;
+    maxRepairs: number;
+    maxTurnMillis: number;
+    screenshotCaptureAllowed: boolean;
+    pointerFallbackAllowed: boolean;
+    keyChordAllowed: boolean;
+  };
+  safetyFloor: {
+    requiresHostVerification: boolean;
+    requiresFreshObservationBinding: boolean;
+    requiresCompletionBoundToCurrentObservation: boolean;
+    allowsScreenshotBytesToModel: boolean;
+    allowsFreeFormAction: boolean;
+    allowsAutomaticReplayAfterUncertainDispatch: boolean;
+    maxStationaryRepeats: number;
+    maxConsecutiveUncertainAnswers: number;
+    minConfidencePermille: number;
+    maxVerificationFailures: number;
+  };
+  escalations: Array<{
+    from: AdaptiveProfile;
+    to: AdaptiveProfile;
+    reason: AdaptiveProfileReason;
+    message: string;
+    revision: number;
+  }>;
+  cost: {
+    modelCalls: number;
+    observationBytes: number;
+    screenshotBytes: number;
+    providerAttempts: number;
+    providerLatencyMillis: number;
+    promptTokens: number | null;
+    completionTokens: number | null;
+  };
+  stationaryRepeats: number;
+  observationTruncated: boolean;
+  requiresIndependentVerifier: boolean;
+  revision: number;
+  terminal?: {
+    kind: "completed" | "stopped" | "interrupted";
+    reason: AdaptiveProfileReason;
+    message: string;
+    profile: AdaptiveProfile;
+    requiredProfile: AdaptiveProfile | null;
+  } | null;
 }
 
 export interface ComputerAgentEligibility {

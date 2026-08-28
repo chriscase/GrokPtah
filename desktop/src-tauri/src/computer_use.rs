@@ -4,7 +4,8 @@ use std::sync::Arc;
 use base64::Engine;
 use chrono::{Duration, Utc};
 use grokptah_agent_bridge::{
-    canonical_workspace_string, ActionClass, ActionGrant, AgentHostHandle, ComputerAction,
+    canonical_workspace_string, ActionClass, ActionGrant, AdaptiveProfileProjection,
+    AgentHostHandle, ComputerAction,
     ComputerAgentProposal, ComputerCapabilities, ComputerError, ComputerObservation,
     ComputerObservationPlatform, ComputerPermission, ComputerPermissionStatus,
     ComputerPlatformStatus, ComputerRun, ComputerRunProjection, ComputerRunState,
@@ -53,6 +54,9 @@ pub struct ComputerCockpitSnapshot {
     /// projection above is what does.
     pub run: Option<ComputerRun>,
     pub pending_approval: Option<PendingComputerApproval>,
+    /// Redacted adaptive state projected from the same durable Computer Run
+    /// record; coordinator and cockpit consumers share this exact shape.
+    pub adaptive: Option<AdaptiveProfileProjection>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -303,14 +307,17 @@ impl DesktopComputerUse {
                 .unwrap_or_else(unavailable_native_capabilities),
             None => index.capabilities(),
         };
+        let projection = run
+            .as_ref()
+            .map(|run| grokptah_agent_bridge::project_run_at(run, Utc::now()));
+        let adaptive = projection.as_ref().and_then(|projection| projection.adaptive.clone());
         Ok(ComputerCockpitSnapshot {
             backend,
             origin: "desktop".into(),
-            projection: run
-                .as_ref()
-                .map(|run| grokptah_agent_bridge::project_run_at(run, Utc::now())),
+            projection,
             run,
             pending_approval,
+            adaptive,
         })
     }
 
@@ -822,6 +829,15 @@ fn approval_copy(
             "Application focus".into(),
         ));
     }
+    if matches!(action, ComputerAction::PointerClick { .. }) {
+        return Ok((
+            "Click a target-relative point grounded in the current redacted frame".into(),
+            "Visual grounded action".into(),
+        ));
+    }
+    if matches!(action, ComputerAction::KeyChord { .. }) {
+        return Ok(("Apply the bounded key chord".into(), "Keyboard action".into()));
+    }
     let element_id = action
         .referenced_element()
         .ok_or_else(|| "The proposed action does not identify an element".to_string())?;
@@ -856,7 +872,12 @@ async fn authorize_and_observe_once(
         grant_id: Uuid::new_v4().to_string(),
         run_id: run.run_id.clone(),
         target: run.target.clone(),
-        action_classes: BTreeSet::from([ActionClass::Semantic, ActionClass::TextEntry]),
+        action_classes: BTreeSet::from([
+            ActionClass::Semantic,
+            ActionClass::TextEntry,
+            ActionClass::KeyChord,
+            ActionClass::PointerFallback,
+        ]),
         issued_by: GrantIssuer::LocalUser,
         issued_at: now,
         expires_at: now + Duration::minutes(2),

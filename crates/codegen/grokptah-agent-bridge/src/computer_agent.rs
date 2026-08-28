@@ -78,6 +78,7 @@ impl ComputerAgentProposal {
 pub(crate) struct ResolvedComputerEligibility {
     pub eligibility: ComputerAgentEligibility,
     pub route_fingerprint: String,
+    pub capabilities: crate::gateway_config::ModelCapabilities,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +136,7 @@ pub(crate) fn resolve_computer_eligibility(
             source: source.into(),
         },
         route_fingerprint: format!("{:x}", hasher.finalize()),
+        capabilities: target.capabilities.clone(),
     })
 }
 
