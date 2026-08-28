@@ -447,7 +447,7 @@ impl AttemptContext {
         validate_id(&operation_id, "operation id")?;
         let authority_scope = authority_scope.into();
         validate_id(&authority_scope, "authority scope")?;
-        let (record, lease_id) = store.select_host_lease(&authority_scope)?;
+        let (record, lease_id) = store.select_host_lease(&authority_scope, &operation_id)?;
         let mut context = Self::new(store, operation_id, record.binding_for_lease(&lease_id)?)?;
         context.authority_scope = Some(authority_scope);
         Ok(context)
@@ -525,7 +525,7 @@ impl AttemptContext {
             .authority_scope
             .as_deref()
             .ok_or(AttemptError::InvalidAuthority)?;
-        let (_record, lease_id) = self.store.select_host_lease(scope)?;
+        let (_record, lease_id) = self.store.select_host_lease(scope, &self.operation_id)?;
         let authority = self.authority.with_effect_lease(lease_id)?;
         Self::new(self.store.clone(), self.operation_id.clone(), authority).map(|mut context| {
             context.authority_scope = self.authority_scope.clone();
