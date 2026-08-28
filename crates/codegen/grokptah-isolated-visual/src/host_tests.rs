@@ -382,6 +382,30 @@ fn cleanup_after_cancel_drops_residency() {
 }
 
 #[test]
+fn helper_failure_cleanup_fails_closed_and_does_not_resume() {
+    let (_dir, mut host, _clock) = open_host();
+    let (guest, lease) = create_running(&mut host);
+    host.ingest_frame(&guest.guest_id, &lease.lease_id, 2, 2, &[1, 2, 3, 4])
+        .unwrap();
+    host.terminate(&guest.guest_id, IsolatedCleanupReason::HelperFailure)
+        .unwrap();
+    let failed = host.guest(&guest.guest_id).unwrap();
+    assert_eq!(failed.phase, IsolatedGuestPhase::Closing);
+    assert_eq!(failed.terminal, Some(IsolatedGuestTerminal::Failed));
+    let cleaned = host.cleanup(&guest.guest_id).unwrap();
+    assert!(cleaned.cleaned);
+    assert_eq!(cleaned.resident_frame_bytes, 0);
+    assert_eq!(
+        host.enqueue_lease(&guest.guest_id).unwrap_err().code,
+        IsolatedErrorCode::InvalidState
+    );
+    assert_eq!(
+        host.mark_running(&guest.guest_id).unwrap_err().code,
+        IsolatedErrorCode::InvalidState
+    );
+}
+
+#[test]
 fn resolver_object_substitution_and_rename_fail_closed() {
     let dir = tempdir().unwrap();
     let mut store = ContentAddressedStore::new();
