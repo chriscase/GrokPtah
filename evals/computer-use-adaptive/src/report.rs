@@ -146,7 +146,7 @@ pub fn run_campaign(repeats: u32, seed: u64) -> EvalResult<CampaignOutput> {
             identity.adapter,
             identity.repetition,
             seed,
-        );
+        )?;
         episodes.push(bundle.result);
         evidence_items.push(bundle.evidence);
     }

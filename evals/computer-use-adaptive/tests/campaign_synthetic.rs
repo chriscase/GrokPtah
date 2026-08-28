@@ -1,6 +1,6 @@
 use grokptah_cu_adaptive_eval::catalog::{catalog, validate_catalog};
 use grokptah_cu_adaptive_eval::report::run_campaign;
-use grokptah_cu_adaptive_eval::types::{CampaignStatus, FamilyId, ProfileId};
+use grokptah_cu_adaptive_eval::types::{AdapterId, CampaignStatus, FamilyId, ProfileId};
 use grokptah_cu_adaptive_eval::verifier::verify_report;
 use grokptah_cu_adaptive_eval::SOURCE_GATE_SHA;
 
@@ -110,4 +110,42 @@ fn same_seed_reproduces_campaign_digest_and_different_seed_differs() {
         grokptah_cu_adaptive_eval::verifier::VerifyMode::Synthetic,
     );
     assert!(verified.ok, "{verified:?}");
+}
+
+#[test]
+fn required_adversarial_residuals_are_exercised_without_unauthorized_dispatch() {
+    let out = run_campaign(1, 435_272).unwrap();
+    for needle in [
+        "vision_removed_mid_run",
+        "tools_removed",
+        "repeated_wait",
+        "semantic_plan_visual_ground",
+        "crash_two_restarts",
+        "held_out_card2",
+        "password_field",
+        "during_inference",
+    ] {
+        assert!(
+            out.report.episodes.iter().any(|e| e.variant == needle),
+            "missing variant {needle}"
+        );
+    }
+    assert!(out
+        .report
+        .episodes
+        .iter()
+        .any(|e| e.adapter == AdapterId::MalformedOverconfident));
+    assert!(out
+        .report
+        .episodes
+        .iter()
+        .filter(|e| e.adapter == AdapterId::MalformedOverconfident)
+        .all(|e| e.metrics.unauthorized_dispatches == 0
+            && e.metrics.cost_usd.is_none()
+            && e.provider_calls == 0));
+    assert!(out
+        .report
+        .episodes
+        .iter()
+        .any(|e| e.scenario_id.starts_with("heldout.")));
 }
