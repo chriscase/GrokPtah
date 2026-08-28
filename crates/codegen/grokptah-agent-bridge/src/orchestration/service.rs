@@ -101,6 +101,15 @@ pub struct OrchestrationService {
     /// Monotonic policy/capability revision, advanced alongside the epoch and
     /// recorded as queue-entry provenance.
     policy_revision: Mutex<u64>,
+    /// Serializes whole rotations.
+    ///
+    /// A rotation quiesces queue delivery, mutates policy, then republishes.
+    /// Without this, two concurrent rotations interleave: one can publish its
+    /// final snapshot while the other is still mutating, reopening delivery
+    /// inside the window the quiesce exists to close. It also makes the
+    /// multi-lock read in `publish_queue_authority` consistent, since no other
+    /// rotation can move those inputs underneath it.
+    rotation: Mutex<()>,
     agent_owner_id: Mutex<String>,
     self_ref: Weak<OrchestrationService>,
     pending_admissions: Mutex<AdmissionQueueState>,
@@ -283,6 +292,7 @@ impl OrchestrationService {
             config: Mutex::new(config),
             auth_epoch: Mutex::new(AuthEpoch::new_authority()),
             policy_revision: Mutex::new(0),
+            rotation: Mutex::new(()),
             auth_credentials: Mutex::new(auth_credentials),
             agent_owner_id: Mutex::new("primary".into()),
             self_ref: self_ref.clone(),
@@ -1619,6 +1629,7 @@ impl OrchestrationService {
     }
 
     pub fn set_token(&self, token: String) -> Result<(), OrchError> {
+        let _rotation = self.rotation.lock();
         let token = token.trim().to_string();
         let credentials = if token.is_empty() {
             Vec::new()
@@ -1639,6 +1650,7 @@ impl OrchestrationService {
     /// Install named device/client credentials while retaining the existing
     /// primary-token configuration field for compatibility with embedders.
     pub fn set_auth_credentials(&self, credentials: Vec<AuthCredential>) -> Result<(), OrchError> {
+        let _rotation = self.rotation.lock();
         if credentials.is_empty() {
             return Err(OrchError::new(
                 OrchErrorCode::InvalidRequest,
@@ -1673,6 +1685,7 @@ impl OrchestrationService {
     }
 
     pub fn set_agent_owner_id(&self, owner_id: String) -> Result<(), OrchError> {
+        let _rotation = self.rotation.lock();
         let owner_id = owner_id.trim().to_string();
         if owner_id.is_empty() || owner_id.len() > 128 {
             return Err(OrchError::new(
@@ -1710,6 +1723,7 @@ impl OrchestrationService {
     }
 
     pub fn set_allowlist(&self, allowlist: WorkspaceAllowlist) -> Result<(), OrchError> {
+        let _rotation = self.rotation.lock();
         self.advance_authority()?;
         self.quiesce_queue_authority();
         self.config.lock().allowlist = allowlist;
@@ -5544,6 +5558,14 @@ impl OrchestrationService {
                 {
                     *changed_entry = None;
                 }
+                for queued in queue_entries.iter_mut() {
+                    queued.owner_key = None;
+                    queued.owner_provenance = None;
+                }
+                if let Some(queued) = changed_entry.as_mut() {
+                    queued.owner_key = None;
+                    queued.owner_provenance = None;
+                }
             }
         }
     }
@@ -5951,6 +5973,22 @@ impl OrchestrationService {
         Ok((claimed, actor, start))
     }
 
+    /// Strip ownership material from an entry before it goes on the wire.
+    ///
+    /// `owner_key` is an unkeyed digest over low-entropy inputs and
+    /// `owner_provenance` names internal generations; neither is a capability
+    /// and neither should reach a control-plane consumer. Both stay in the
+    /// durable record, which is what ownership is actually enforced against.
+    fn project_entry(mut entry: PromptQueueEntry) -> PromptQueueEntry {
+        entry.owner_key = None;
+        entry.owner_provenance = None;
+        entry
+    }
+
+    fn project_entries(entries: Vec<PromptQueueEntry>) -> Vec<PromptQueueEntry> {
+        entries.into_iter().map(Self::project_entry).collect()
+    }
+
     /// The single refusal for unknown, malformed, foreign, and quarantined
     /// queue ids.
     ///
@@ -6007,8 +6045,8 @@ impl OrchestrationService {
             // window for someone else to move first. Every receipt now carries
             // the revision its own mutation stamped.
             "revision": revision,
-            "entry": changed_entry,
-            "entries": entries,
+            "entry": changed_entry.map(Self::project_entry),
+            "entries": Self::project_entries(entries),
         })
     }
 
@@ -6032,7 +6070,7 @@ impl OrchestrationService {
             // fail-closed migration is visible instead of looking like an empty
             // queue.
             "quarantined": snapshot.quarantined,
-            "entries": snapshot.entries,
+            "entries": Self::project_entries(snapshot.entries),
         }))
     }
 
@@ -7727,8 +7765,8 @@ impl OrchestrationService {
             "disposition": "queued",
             "actionVersion": changed_entry.version,
             "revision": revision,
-            "entry": changed_entry,
-            "entries": entries,
+            "entry": Self::project_entry(changed_entry),
+            "entries": Self::project_entries(entries),
         });
         if let Err(e) = lease.complete(None, response.clone()) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, e));
@@ -7814,10 +7852,10 @@ impl OrchestrationService {
             "origin": actor.origin(),
             "action": "steer_now",
             "disposition": receipt.disposition,
-            "entry": receipt.entry,
+            "entry": Self::project_entry(receipt.entry.clone()),
             "actionVersion": receipt.entry.version,
             "revision": revision,
-            "entries": receipt.entries,
+            "entries": Self::project_entries(receipt.entries),
         });
         if let Err(e) = lease.complete(None, response.clone()) {
             return Err(self.fail_claim(&mut lease, None, session_id, &claimed, e));
@@ -8326,6 +8364,14 @@ mod queue_authority_guards {
             "pub fn set_allowlist(",
         ] {
             let body = body_of(rotation);
+            let rotation_lock = body
+                .find("let _rotation = self.rotation.lock();")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{rotation} must hold the rotation lock for the whole rotation, or a \
+                         concurrent rotation can publish over its quiesced snapshot"
+                    )
+                });
             let advance = body.find("self.advance_authority()?;").unwrap_or_else(|| {
                 panic!("{rotation} must advance the authority with checked overflow")
             });
@@ -8358,6 +8404,10 @@ mod queue_authority_guards {
             assert!(
                 quiesce > advance,
                 "{rotation} must quiesce only after the authority advance succeeds"
+            );
+            assert!(
+                rotation_lock < advance,
+                "{rotation} must take the rotation lock before advancing the authority"
             );
             for mutation in [
                 "self.config.lock().bearer_token =",
@@ -8393,6 +8443,35 @@ mod queue_authority_guards {
         assert!(
             !refusal.contains("format!"),
             "the refusal must be a fixed string, never formatted with caller input"
+        );
+    }
+
+    /// Ownership material must never be projected to a control-plane caller.
+    #[test]
+    fn queue_projections_strip_ownership_material() {
+        let source = source();
+        assert_eq!(
+            source.matches("fn project_entry(").count(),
+            1,
+            "entry projection must have exactly one definition"
+        );
+        for raw in [
+            "\"entries\": snapshot.entries",
+            "\"entries\": entries,",
+            "\"entry\": changed_entry,",
+        ] {
+            assert!(
+                !source.contains(raw),
+                "queue entries must be projected through `project_entries`, found raw `{raw}`"
+            );
+        }
+        assert!(
+            !source.contains("\"ownerKey\""),
+            "the ownership digest must not be projected"
+        );
+        assert!(
+            !source.contains("\"cursor\""),
+            "the withdrawn cursor must not reappear"
         );
     }
 

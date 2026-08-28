@@ -306,6 +306,25 @@ async fn control_plane_reads_project_no_ownership_handle_or_cursor() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["text"], "plan");
     assert_eq!(listed["owner"], "mcp");
+
+    // The digest must not ride along on the entries either. Removing it from
+    // the envelope while leaving it on every entry would have kept the same
+    // offline oracle.
+    assert!(
+        entries[0].get("owner_key").is_none(),
+        "entries must not carry the ownership digest on the wire: {}",
+        entries[0]
+    );
+    assert!(
+        entries[0].get("owner_provenance").is_none(),
+        "entries must not carry internal generations on the wire: {}",
+        entries[0]
+    );
+    let rendered = listed.to_string();
+    assert!(
+        !rendered.contains("v1-sha256:"),
+        "no ownership digest may appear anywhere in a control-plane read: {rendered}"
+    );
 }
 
 #[tokio::test]
@@ -728,18 +747,47 @@ async fn a_delivery_boundary_carries_exactly_one_owner_end_to_end() {
         batch.text
     );
 
-    // The other principal's work is still queued, not lost.
-    let remaining: Vec<String> = fx
-        .host
-        .session_queue_take_next(fx.session)
-        .map(|result| {
-            result
-                .batch
-                .map(|b| b.entries.iter().filter_map(|e| e.owner.clone()).collect())
-                .unwrap_or_default()
-        })
-        .unwrap_or_default();
-    let _ = remaining;
+    // The principal that did not win the boundary must still have its work
+    // queued, not silently dropped.
+    //
+    // This is asserted through a scoped read, not a second drain: the first
+    // drain holds the session's turn reservation, so another `take_next` would
+    // return `None` whatever the queue contains, and would prove nothing.
+    let executed = batch
+        .entries
+        .first()
+        .and_then(|entry| entry.owner.clone())
+        .expect("the batch names its owner");
+    let (waiting_auth, waiting_label) = if executed == "mcp" {
+        (&intruder, "intruder confidential plan")
+    } else {
+        (&owner, "owner confidential plan")
+    };
+    let still_queued = fx
+        .orch
+        .get_queue(waiting_auth, fx.session, fx.workspace())
+        .expect("the waiting principal can read its own queue");
+    let texts: Vec<&str> = still_queued["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["text"].as_str())
+        .collect();
+    assert!(
+        texts.contains(&waiting_label),
+        "the principal that did not win the boundary must keep its queued work, got {texts:?}"
+    );
+
+    // And the principal that did win no longer has that entry queued.
+    let executed_auth = if executed == "mcp" { &owner } else { &intruder };
+    let executed_queue = fx
+        .orch
+        .get_queue(executed_auth, fx.session, fx.workspace())
+        .expect("the executing principal can read its own queue");
+    assert!(
+        executed_queue["entries"].as_array().unwrap().is_empty(),
+        "the drained entry must have left the executing principal's queue: {executed_queue}"
+    );
 }
 
 #[tokio::test]

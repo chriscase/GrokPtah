@@ -6055,7 +6055,7 @@ impl AgentHostHandle {
     /// Called by the orchestration service on start and on every credential or
     /// allowlist rotation, so revocation reaches delivery without the host
     /// needing to know how credentials are configured.
-    pub fn set_queue_authority(&self, authority: QueueAuthority) {
+    pub(crate) fn set_queue_authority(&self, authority: QueueAuthority) {
         self.inner.lock().queue_authority = authority;
     }
 
