@@ -308,7 +308,14 @@ pub(crate) fn initialize(root: &Path) -> Result<()> {
         }
         Err(error) => return Err(error.into()),
     }
-    let key = signing_key(root)?;
+    let key = {
+        let bytes = fs::read(&key_path)?;
+        let seed: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("canonical authority signing key is invalid"))?;
+        SigningKey::from_bytes(&seed)
+    };
     let public_key_path = directory.join(AUTHORITY_PUBLIC_KEY_FILE);
     match fs::symlink_metadata(&public_key_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
