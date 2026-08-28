@@ -2234,9 +2234,10 @@ async fn live_computer_reads_node_smoke() {
 
     let canon = canonical_workspace_string(ws.path()).unwrap();
     let canon_other = canonical_workspace_string(ws_other.path()).unwrap();
-    let computer = ComputerUseService::new(
+    let computer = ComputerUseService::new_with_audit_store(
         std::sync::Arc::new(SimulatorBackend::new()),
         host.ensure_computer_store().unwrap(),
+        host.ensure_orchestration_store().unwrap(),
     );
 
     // Run A: bound, authorized, observed — projection metadata plus journal.

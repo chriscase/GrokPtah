@@ -208,6 +208,7 @@ impl OrchStore {
             custody.all_keys(),
             AuditLedgerOptions {
                 legacy_v1_dir: Some(audit_root.clone()),
+                key_provider: Some(custody.provider()),
                 ..AuditLedgerOptions::default()
             },
         )
@@ -4982,7 +4983,7 @@ impl OrchStore {
             .map_err(|e| OrchError::new(OrchErrorCode::Internal, e.to_string()))
     }
 
-    pub fn append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
+    pub(crate) fn append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
         let outcome = adapt_audit_entry(entry);
         if outcome.intent_id.is_some() {
             let mut intent = outcome.clone();
@@ -4993,7 +4994,7 @@ impl OrchStore {
         self.append_audit_input(outcome)
     }
 
-    pub fn append_audit_input(&self, input: AuditEntryInput) -> anyhow::Result<()> {
+    pub(crate) fn append_audit_input(&self, input: AuditEntryInput) -> anyhow::Result<()> {
         let result = self.inner.audit.append(input);
         if let Err(error) = &result {
             *self.inner.last_audit_error.lock() =
@@ -5004,7 +5005,7 @@ impl OrchStore {
             .map_err(|error| anyhow::anyhow!("audit persistence failed: {}", error.code()))
     }
 
-    pub fn append_audit_housekeeping(
+    pub(crate) fn append_audit_housekeeping(
         &self,
         input: crate::audit::AuditHousekeepingInput,
         recovery: Option<crate::audit::RecoveryEvidence>,
@@ -5016,7 +5017,17 @@ impl OrchStore {
             .map_err(|error| anyhow::anyhow!("audit persistence failed: {}", error.code()))
     }
 
-    pub fn enqueue_audit(&self, entry: AuditEntry) -> anyhow::Result<()> {
+    pub(crate) fn audit_intent_state(
+        &self,
+        intent_id: &str,
+    ) -> anyhow::Result<crate::audit::AuditIntentState> {
+        self.inner
+            .audit
+            .producer_intent_state(intent_id)
+            .map_err(|error| anyhow::anyhow!("audit reconciliation failed: {}", error.code()))
+    }
+
+    pub(crate) fn enqueue_audit(&self, entry: AuditEntry) -> anyhow::Result<()> {
         // v2 is the sole authority and appends synchronously. There is no
         // second in-memory queue whose overflow could disappear at shutdown.
         self.append_audit(&entry)

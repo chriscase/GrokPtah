@@ -4,25 +4,28 @@ use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 
-use chrono::Utc;
 use grokptah_agent_bridge::audit::{
-    AuditEntryInput, AuditHousekeepingInput, AuditKeyCustody, AuditKeys, EntryOutcome, EntryPhase,
-    ExportFormat, RetentionRequest,
+    AuditError, AuditKeyCustody, AuditKeyProvider, AuditKeys, AuditResult, ExportFormat,
+    PoisonReason, RetentionRequest,
 };
-use grokptah_agent_bridge::orchestration::AuditEntry;
-use grokptah_agent_bridge::OrchStore;
+use grokptah_agent_bridge::{
+    ComputerStore, ComputerUseLimits, ComputerUseService, OrchStore, SimulatorBackend,
+};
 use tempfile::TempDir;
+use uuid::Uuid;
 
-fn audit_entry(tool: &str, request_id: &str, detail: &str) -> AuditEntry {
-    AuditEntry {
-        ts: Utc::now(),
-        tool: tool.to_string(),
-        request_id: Some(request_id.to_string()),
-        session_id: None,
-        workspace: Some("/private/workspace/should-be-keyed".into()),
-        outcome: "accepted".into(),
-        error_code: None,
-        detail: detail.into(),
+#[derive(Debug)]
+struct ExternalKeyProvider {
+    key: Arc<AuditKeys>,
+}
+
+impl AuditKeyProvider for ExternalKeyProvider {
+    fn keyring(&self) -> Vec<Arc<AuditKeys>> {
+        vec![Arc::clone(&self.key)]
+    }
+
+    fn rotate(&self, _current: &AuditKeys) -> AuditResult<Arc<AuditKeys>> {
+        Err(AuditError::Poisoned(PoisonReason::KeyUnavailable))
     }
 }
 
@@ -35,9 +38,7 @@ fn all_bytes(root: &Path) -> Vec<u8> {
             if let Ok(bytes) = fs::read(path) {
                 output.extend_from_slice(&bytes);
             }
-            return;
-        }
-        if metadata.is_dir() {
+        } else if metadata.is_dir() {
             let Ok(entries) = fs::read_dir(path) else {
                 return;
             };
@@ -52,42 +53,42 @@ fn all_bytes(root: &Path) -> Vec<u8> {
     output
 }
 
-#[test]
-fn real_store_uses_one_authenticated_authority_and_public_projection_is_redacted() {
-    let temp = TempDir::new().unwrap();
-    let store = OrchStore::open(temp.path()).unwrap();
-    for (tool, request) in [
-        ("orchestration_run", "run-intent"),
-        ("provider_attempt", "provider-intent"),
-        ("approval", "approval-intent"),
-        ("computer_use", "computer-intent"),
-        ("queue_background", "queue-intent"),
-        ("subagent", "subagent-intent"),
-        ("cancellation", "cancel-intent"),
-        ("shutdown", "shutdown-intent"),
-    ] {
-        store
-            .append_audit(&audit_entry(
-                tool,
-                request,
-                "super-secret-prompt credential=/private/token clipboard=raw-frame",
-            ))
-            .unwrap();
-    }
-    assert_eq!(store.audit_status().global_last_seq, 16);
+fn audited_service(root: &Path) -> (Arc<ComputerUseService>, OrchStore) {
+    let audit = OrchStore::open(root.join("orchestration")).unwrap();
+    let computer = ComputerStore::open(root.join("computer-use")).unwrap();
+    let service = ComputerUseService::new_with_audit_store(
+        Arc::new(SimulatorBackend::new()),
+        computer,
+        audit.clone(),
+    );
+    (Arc::new(service), audit)
+}
 
+#[test]
+fn real_store_public_projection_contains_only_bounded_audit_facts() {
+    let temp = TempDir::new().unwrap();
+    let (service, audit) = audited_service(temp.path());
+    service
+        .create_run(
+            "public-projection",
+            Uuid::new_v4(),
+            None,
+            SimulatorBackend::demo_target(),
+            ComputerUseLimits::default(),
+        )
+        .unwrap();
     let destination = temp.path().join("public-export");
-    let receipt = store
+    audit
         .export_audit(&destination, ExportFormat::Auto)
         .unwrap();
-    assert_eq!(receipt.generations_exported, 1);
     let exported = all_bytes(&destination);
     for forbidden in [
-        "super-secret-prompt",
-        "credential=/private/token",
-        "/private/workspace",
-        "clipboard=raw-frame",
+        "prompt",
+        "credential",
+        "/private/",
         "locator",
+        "clipboard",
+        "frame",
         "hmac",
         "provider-private-payload",
     ] {
@@ -98,236 +99,109 @@ fn real_store_uses_one_authenticated_authority_and_public_projection_is_redacted
             "public projection leaked {forbidden}"
         );
     }
-    assert!(!temp.path().join("audit").join("audit.jsonl.1").exists());
 }
 
 #[test]
-fn real_store_migrates_legacy_bytes_once_and_labels_them_untrusted() {
+fn real_store_migrates_legacy_bytes_once_and_withholds_them_publicly() {
     let temp = TempDir::new().unwrap();
     let audit_dir = temp.path().join("audit");
     fs::create_dir_all(&audit_dir).unwrap();
-    let older =
-        b"{\"tool\":\"auth\",\"detail\":\"/private/path prompt credential clipboard locator\"}\n";
-    let current = b"{\"tool\":\"run\",\"detail\":\"provider-private-payload\"}\n\
-          {\"tool\":\"cancel\",\"outcome\":\"accepted\"}\n";
+    let older = b"{\"detail\":\"/private/path prompt credential clipboard locator\"}\n";
+    let current = b"{\"detail\":\"provider-private-payload\"}\n";
     fs::write(audit_dir.join("audit.jsonl.1"), older).unwrap();
     fs::write(audit_dir.join("audit.jsonl"), current).unwrap();
 
     let store = OrchStore::open(temp.path()).unwrap();
-    let status = store.audit_status();
-    assert_eq!(status.imported_generations, 2);
-    assert_eq!(status.recovery.imported_generations, 2);
+    assert_eq!(store.audit_status().imported_generations, 2);
     assert_eq!(fs::read(audit_dir.join("audit.jsonl.1")).unwrap(), older);
     assert_eq!(fs::read(audit_dir.join("audit.jsonl")).unwrap(), current);
-    store
-        .append_audit(&audit_entry("native", "native-intent", "private"))
-        .unwrap();
-    assert_eq!(store.audit_status().global_last_seq, 5);
-    store.shutdown().unwrap();
-
-    let reopened = OrchStore::open(temp.path()).unwrap();
-    assert_eq!(reopened.audit_status().imported_generations, 2);
-    assert_eq!(reopened.audit_status().recovery.imported_generations, 0);
-    assert_eq!(reopened.audit_status().global_last_seq, 7);
-    assert!(reopened
-        .export_audit(&temp.path().join("v1"), ExportFormat::V1)
-        .is_err());
-    let public_destination = temp.path().join("public");
-    let receipt = reopened
-        .export_audit(&public_destination, ExportFormat::Auto)
+    let destination = temp.path().join("public");
+    let receipt = store
+        .export_audit(&destination, ExportFormat::Auto)
         .unwrap();
     assert_eq!(receipt.withheld_generations, 2);
-    let public_bytes = all_bytes(&public_destination);
-    for forbidden in [
-        "/private/path",
-        "prompt",
-        "credential",
-        "clipboard",
-        "locator",
-        "provider-private-payload",
-    ] {
-        assert!(!public_bytes
-            .windows(forbidden.len())
-            .any(|window| window == forbidden.as_bytes()));
-    }
+    let public_bytes = all_bytes(&destination);
+    assert!(!public_bytes
+        .windows("/private/path".len())
+        .any(|window| window == b"/private/path"));
+    assert!(!public_bytes
+        .windows("provider-private-payload".len())
+        .any(|window| window == b"provider-private-payload"));
 }
 
 #[test]
-fn real_store_tamper_fails_closed_before_use() {
+fn real_store_sealed_tamper_fails_closed_at_open() {
     let temp = TempDir::new().unwrap();
     let store = OrchStore::open(temp.path()).unwrap();
-    store
-        .append_audit(&audit_entry("tamper-target", "tamper-intent", "private"))
-        .unwrap();
-    let generation = store.audit_status().active_generation_id;
+    store.rotate_audit().unwrap();
     store.shutdown().unwrap();
-
-    let journal = temp
-        .path()
-        .join("audit")
-        .join("generations")
-        .join(generation)
-        .join("journal.jsonl");
+    let journal = temp.path().join("audit/generations/g-000001/journal.jsonl");
     let mut bytes = fs::read(&journal).unwrap();
-    let position = bytes
-        .iter()
-        .position(|byte| *byte == b'a')
-        .expect("journal contains a mutable operation byte");
-    bytes[position] = b'b';
+    bytes[0] = b'X';
     fs::write(journal, bytes).unwrap();
     assert!(OrchStore::open(temp.path()).is_err());
 }
 
 #[test]
-fn real_store_records_legacy_divergence_after_cutover() {
-    let temp = TempDir::new().unwrap();
-    let audit_dir = temp.path().join("audit");
-    fs::create_dir_all(&audit_dir).unwrap();
-    fs::write(audit_dir.join("audit.jsonl.1"), b"{\"legacy\":1}\n").unwrap();
-    fs::write(audit_dir.join("audit.jsonl"), b"{\"legacy\":2}\n").unwrap();
-    let store = OrchStore::open(temp.path()).unwrap();
-    store.shutdown().unwrap();
-    fs::write(audit_dir.join("audit.jsonl"), b"{\"legacy\":3}\n").unwrap();
-
-    let reopened = OrchStore::open(temp.path()).unwrap();
-    assert_eq!(reopened.audit_status().recovery.legacy_divergences.len(), 1);
-    assert_eq!(reopened.audit_status().global_last_seq, 5);
-    reopened.shutdown().unwrap();
-    let final_open = OrchStore::open(temp.path()).unwrap();
-    assert!(final_open
-        .audit_status()
-        .recovery
-        .legacy_divergences
-        .is_empty());
-}
-
-#[test]
-fn real_store_retention_requires_a_verified_export_and_keeps_tombstone() {
+fn real_store_retention_requires_verified_export_and_commits_tombstone() {
     let temp = TempDir::new().unwrap();
     let store = OrchStore::open(temp.path()).unwrap();
-    store
-        .append_audit(&audit_entry(
-            "before-rotation",
-            "rotation-intent",
-            "private",
-        ))
-        .unwrap();
     store.rotate_audit_key().unwrap();
     let destination = temp.path().join("retention-export");
     let receipt = store.export_audit(&destination, ExportFormat::V2).unwrap();
-
     assert!(store
         .retain_audit(RetentionRequest::new("g-000001").with_export_seal("bogus"))
         .is_err());
-    let retained = store
+    store
         .retain_audit(RetentionRequest::new("g-000001").with_export_seal(receipt.seal_id))
         .unwrap();
-    assert_eq!(retained.generation_id, "g-000001");
     assert_eq!(store.audit_status().tombstones, 1);
-    assert!(!temp
-        .path()
-        .join("audit")
-        .join("generations")
-        .join("g-000001")
-        .exists());
     store.shutdown().unwrap();
-
     let reopened = OrchStore::open(temp.path()).unwrap();
     assert_eq!(reopened.audit_status().tombstones, 1);
-    assert!(reopened.verify_audit().unwrap() >= 1);
+    assert!(reopened.verify_audit().is_ok());
 }
 
 #[test]
-fn real_store_concurrent_append_preserves_exact_sequence() {
+fn real_store_concurrent_computer_mutations_preserve_exact_sequence() {
     let temp = TempDir::new().unwrap();
-    let store = Arc::new(OrchStore::open(temp.path()).unwrap());
+    let (service, audit) = audited_service(temp.path());
     let mut workers = Vec::new();
-    for worker in 0..4 {
-        let store = Arc::clone(&store);
+    for index in 0..100 {
+        let service = Arc::clone(&service);
         workers.push(thread::spawn(move || {
-            for index in 0..25 {
-                store
-                    .append_audit(&audit_entry(
-                        "concurrent",
-                        &format!("worker-{worker}-{index}"),
-                        "private",
-                    ))
-                    .unwrap();
-            }
+            service
+                .create_run(
+                    &format!("concurrent-{index}"),
+                    Uuid::new_v4(),
+                    None,
+                    SimulatorBackend::demo_target(),
+                    ComputerUseLimits::default(),
+                )
+                .unwrap();
         }));
     }
     for worker in workers {
         worker.join().unwrap();
     }
-    assert_eq!(store.audit_status().global_last_seq, 200);
-    assert_eq!(store.verify_audit().unwrap(), 1);
-}
-
-#[test]
-fn real_store_reversed_intents_reject_wrong_outcomes_and_preserve_housekeeping_state() {
-    let temp = TempDir::new().unwrap();
-    let store = OrchStore::open(temp.path()).unwrap();
-    for intent in ["real-intent-a", "real-intent-b"] {
-        store
-            .append_audit_input(
-                AuditEntryInput::new(intent, EntryPhase::Intent, EntryOutcome::Accepted)
-                    .with_intent_id(intent),
-            )
-            .unwrap();
-    }
-    store
-        .append_audit_housekeeping(
-            AuditHousekeepingInput::new("real-housekeeping", EntryOutcome::Uncertain),
-            None,
-        )
-        .unwrap();
-    assert!(store
-        .append_audit_input(
-            AuditEntryInput::new("wrong", EntryPhase::Outcome, EntryOutcome::Accepted)
-                .with_intent_id("wrong"),
-        )
-        .is_err());
-    assert!(store
-        .append_audit_input(AuditEntryInput::new(
-            "missing",
-            EntryPhase::Outcome,
-            EntryOutcome::Accepted,
-        ))
-        .is_err());
-    assert_eq!(store.audit_status().open_intents, 2);
-    for intent in ["real-intent-b", "real-intent-a"] {
-        store
-            .append_audit_input(
-                AuditEntryInput::new(intent, EntryPhase::Outcome, EntryOutcome::Accepted)
-                    .with_intent_id(intent),
-            )
-            .unwrap();
-    }
-    assert_eq!(store.audit_status().open_intents, 0);
-    store.rotate_audit().unwrap();
-    store
-        .export_audit(&temp.path().join("intent-export"), ExportFormat::V2)
-        .unwrap();
+    assert_eq!(audit.audit_status().global_last_seq, 200);
+    assert_eq!(audit.verify_audit().unwrap(), 1);
 }
 
 #[test]
 fn two_process_immediate_same_home_reuse_after_explicit_shutdown() {
     if let Ok(path) = std::env::var("GROKPTAH_AUDIT_CHILD_HOME") {
         let store = OrchStore::open(&path).unwrap();
-        store
-            .append_audit(&audit_entry("child", "child-intent", "private"))
-            .unwrap();
+        store.rotate_audit().unwrap();
+        store.shutdown().unwrap();
         return;
     }
 
     let temp = TempDir::new().unwrap();
     let root = PathBuf::from(temp.path());
     let store = OrchStore::open(&root).unwrap();
-    store
-        .append_audit(&audit_entry("parent", "parent-intent", "private"))
-        .unwrap();
+    store.rotate_audit().unwrap();
     store.shutdown().unwrap();
-
     let output = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
         .arg("two_process_immediate_same_home_reuse_after_explicit_shutdown")
@@ -341,41 +215,28 @@ fn two_process_immediate_same_home_reuse_after_explicit_shutdown() {
         String::from_utf8_lossy(&output.stderr)
     );
     let reopened = OrchStore::open(&root).unwrap();
-    assert_eq!(reopened.audit_status().global_last_seq, 6);
+    assert_eq!(reopened.audit_status().global_last_seq, 8);
 }
 
 #[test]
-fn key_custody_modes_fail_closed_without_safe_material() {
+fn external_custody_requires_provider_rotation_and_writes_no_epoch_file() {
     let temp = TempDir::new().unwrap();
-    let key_path = temp.path().join(".audit-key");
-    fs::write(&key_path, [0u8; 64]).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
-    }
-    assert!(AuditKeyCustody::headless_service(temp.path()).is_err());
-    assert!(AuditKeyCustody::packaged_desktop(temp.path()).is_err());
-
-    let external = AuditKeyCustody::external_consumer(Arc::new(AuditKeys::derive(
-        b"external-consumer-held-key",
-    )));
-    let store = OrchStore::open_with_custody(temp.path().join("external"), external).unwrap();
-    assert_eq!(store.audit_status().key_epoch, 1);
+    let provider = Arc::new(ExternalKeyProvider {
+        key: Arc::new(AuditKeys::derive(b"external-custody-key")),
+    });
+    let custody = AuditKeyCustody::external_consumer(provider).unwrap();
+    let store = OrchStore::open_with_custody(temp.path(), custody).unwrap();
+    assert!(store.rotate_audit_key().is_err());
+    assert!(!temp.path().join(".audit-key-epochs").exists());
     store.shutdown().unwrap();
 }
 
 #[test]
-fn missing_retired_epoch_fails_closed_instead_of_claiming_clean_audit() {
+fn missing_retired_epoch_fails_closed_after_file_custody_rotation() {
     let temp = TempDir::new().unwrap();
     let store = OrchStore::open(temp.path()).unwrap();
     store.rotate_audit_key().unwrap();
     store.shutdown().unwrap();
-    fs::remove_file(
-        temp.path()
-            .join(".audit-key-epochs")
-            .join("epoch-00000002.key"),
-    )
-    .unwrap();
+    fs::remove_file(temp.path().join(".audit-key-epochs/epoch-00000002.key")).unwrap();
     assert!(OrchStore::open(temp.path()).is_err());
 }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::json;
@@ -15,7 +16,7 @@ use super::projection::{
     not_available, project_events, project_run_at, ComputerRunCapacity, ComputerRunEventPage,
     ComputerRunProjection,
 };
-use super::store::{ComputerStore, MutationClaim};
+use super::store::{ComputerStore, MutationClaim, MutationStage};
 use super::types::{
     validate_id, ActionGrant, ActionOutcome, ComputerAction, ComputerBackend,
     ComputerControlDisposition, ComputerError, ComputerErrorCode, ComputerObservation,
@@ -26,22 +27,155 @@ pub struct ComputerUseService {
     backend: Arc<dyn ComputerBackend>,
     store: ComputerStore,
     policy: ComputerPolicy,
-    audit_store: Option<OrchStore>,
+    audit_store: OrchStore,
+    reconciliation_error: Option<ComputerError>,
+    #[cfg(test)]
+    crash_at: Mutex<Option<MutationCrashPoint>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MutationCrashPoint {
+    AfterClaim,
+    AfterIntent,
+    BeforeBackend,
+    AfterBackend,
+    AfterEffectCommit,
+    AfterOutcome,
+    AfterReceiptComplete,
 }
 
 impl ComputerUseService {
+    #[cfg(test)]
     pub fn new(backend: Arc<dyn ComputerBackend>, store: ComputerStore) -> Self {
+        let audit_root = store.root().join("..").join("orchestration");
+        let audit_store =
+            OrchStore::open(audit_root).expect("test Computer Use audit authority opens");
+        Self::new_with_audit_store(backend, store, audit_store)
+    }
+
+    pub fn new_with_audit_store(
+        backend: Arc<dyn ComputerBackend>,
+        store: ComputerStore,
+        audit_store: OrchStore,
+    ) -> Self {
+        let reconciliation_error = Self::reconcile_incomplete_mutations(&store, &audit_store).err();
         Self {
             backend,
             store,
             policy: ComputerPolicy,
-            audit_store: None,
+            audit_store,
+            reconciliation_error,
+            #[cfg(test)]
+            crash_at: Mutex::new(None),
         }
     }
 
-    pub fn with_audit_store(mut self, audit_store: OrchStore) -> Self {
-        self.audit_store = Some(audit_store);
+    #[cfg(test)]
+    pub(crate) fn with_crash_at(self, point: MutationCrashPoint) -> Self {
+        *self.crash_at.lock() = Some(point);
         self
+    }
+
+    #[cfg(test)]
+    fn cut(&self, point: MutationCrashPoint) -> ComputerResult<()> {
+        if *self.crash_at.lock() == Some(point) {
+            return Err(ComputerError::new(
+                ComputerErrorCode::Internal,
+                "test mutation crash cut",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn cut(&self, _point: MutationCrashPoint) -> ComputerResult<()> {
+        Ok(())
+    }
+
+    fn reconcile_incomplete_mutations(
+        store: &ComputerStore,
+        audit_store: &OrchStore,
+    ) -> ComputerResult<()> {
+        for recovery in store.incomplete_mutations()? {
+            let state = audit_store
+                .audit_intent_state(&recovery.request_id)
+                .map_err(|_| {
+                    ComputerError::new(
+                        ComputerErrorCode::Internal,
+                        "computer-use audit reconciliation is unavailable",
+                    )
+                })?;
+            let mut settled = match state {
+                crate::audit::AuditIntentState::Missing => {
+                    audit_store
+                        .append_audit_input(
+                            AuditEntryInput::new(
+                                format!("computer_use.{}", recovery.operation),
+                                EntryPhase::Intent,
+                                EntryOutcome::Accepted,
+                            )
+                            .with_request(&recovery.request_id)
+                            .with_intent_id(&recovery.request_id),
+                        )
+                        .map_err(|_| {
+                            ComputerError::new(
+                                ComputerErrorCode::Internal,
+                                "computer-use audit reconciliation is unavailable",
+                            )
+                        })?;
+                    audit_store
+                        .append_audit_input(
+                            AuditEntryInput::new(
+                                format!("computer_use.{}", recovery.operation),
+                                EntryPhase::Outcome,
+                                EntryOutcome::Uncertain,
+                            )
+                            .with_request(&recovery.request_id)
+                            .with_intent_id(&recovery.request_id)
+                            .with_reason(crate::audit::EntryReason::HostRestartInterrupted),
+                        )
+                        .map_err(|_| {
+                            ComputerError::new(
+                                ComputerErrorCode::Internal,
+                                "computer-use audit reconciliation is unavailable",
+                            )
+                        })?;
+                    EntryOutcome::Uncertain
+                }
+                crate::audit::AuditIntentState::Open => {
+                    audit_store
+                        .append_audit_input(
+                            AuditEntryInput::new(
+                                format!("computer_use.{}", recovery.operation),
+                                EntryPhase::Outcome,
+                                EntryOutcome::Uncertain,
+                            )
+                            .with_request(&recovery.request_id)
+                            .with_intent_id(&recovery.request_id)
+                            .with_reason(crate::audit::EntryReason::HostRestartInterrupted),
+                        )
+                        .map_err(|_| {
+                            ComputerError::new(
+                                ComputerErrorCode::Internal,
+                                "computer-use audit reconciliation is unavailable",
+                            )
+                        })?;
+                    EntryOutcome::Uncertain
+                }
+                crate::audit::AuditIntentState::Settled(outcome) => outcome,
+            };
+            if recovery
+                .effect_run_id
+                .as_deref()
+                .and_then(|run_id| store.load_run(run_id).ok().flatten())
+                .is_some_and(|run| run.state == ComputerRunState::Interrupted)
+            {
+                settled = EntryOutcome::Uncertain;
+            }
+            store.reconcile_uncertain(&recovery.request_id, settled)?;
+        }
+        Ok(())
     }
 
     fn append_audit(
@@ -52,16 +186,13 @@ impl ComputerUseService {
         outcome: EntryOutcome,
         error_code: Option<&str>,
     ) -> ComputerResult<()> {
-        let Some(store) = self.audit_store.as_ref() else {
-            return Ok(());
-        };
         let mut input = AuditEntryInput::new(format!("computer_use.{operation}"), phase, outcome)
             .with_request(request_id)
             .with_intent_id(request_id);
         if error_code.is_some() {
             input = input.with_reason(crate::audit::EntryReason::Internal);
         }
-        store.append_audit_input(input).map_err(|_| {
+        self.audit_store.append_audit_input(input).map_err(|_| {
             ComputerError::new(
                 ComputerErrorCode::Internal,
                 "computer-use audit authority is unavailable",
@@ -312,10 +443,12 @@ impl ComputerUseService {
                 // use the ID to bind its element handles, but may not choose an
                 // identifier that could carry observed document content.
                 let observation_id = format!("observation-{}", Uuid::new_v4());
+                self.cut(MutationCrashPoint::BeforeBackend)?;
                 let observed = self
                     .backend
                     .observe(run_id, &observation_id, &prepared.target, &prepared.limits)
                     .await;
+                self.cut(MutationCrashPoint::AfterBackend)?;
                 match observed {
                     Ok(observation) => {
                         let validated = if observation.observation_id != observation_id {
@@ -439,7 +572,9 @@ impl ComputerUseService {
                     .clone()
                     .expect("prepared action has an observation");
                 let control_epoch = prepared.control_epoch;
+                self.cut(MutationCrashPoint::BeforeBackend)?;
                 let outcome = self.backend.act(run_id, &observation, &action).await;
+                self.cut(MutationCrashPoint::AfterBackend)?;
                 match outcome {
                     Ok(outcome) => {
                         self.commit_action(run_id, &action, &observation, control_epoch, outcome)
@@ -488,7 +623,12 @@ impl ComputerUseService {
             })
             .and_then(|run| run.ok_or_else(unknown_run));
         let result = match paused {
-            Ok(run) => self.backend.cancel(run_id).await.map(|()| run),
+            Ok(run) => {
+                self.cut(MutationCrashPoint::BeforeBackend)?;
+                let cancelled = self.backend.cancel(run_id).await;
+                self.cut(MutationCrashPoint::AfterBackend)?;
+                cancelled.map(|()| run)
+            }
             Err(error) => {
                 self.record_denial(run_id, "pause", None, &error);
                 Err(error)
@@ -524,7 +664,12 @@ impl ComputerUseService {
             })
             .and_then(|run| run.ok_or_else(unknown_run));
         let result = match taken_over {
-            Ok(run) => self.backend.cancel(run_id).await.map(|()| run),
+            Ok(run) => {
+                self.cut(MutationCrashPoint::BeforeBackend)?;
+                let cancelled = self.backend.cancel(run_id).await;
+                self.cut(MutationCrashPoint::AfterBackend)?;
+                cancelled.map(|()| run)
+            }
             Err(error) => {
                 self.record_denial(run_id, "take_over", None, &error);
                 Err(error)
@@ -553,7 +698,12 @@ impl ComputerUseService {
             })
             .and_then(|run| run.ok_or_else(unknown_run));
         let result = match cancelled {
-            Ok(run) => self.backend.cancel(run_id).await.map(|()| run),
+            Ok(run) => {
+                self.cut(MutationCrashPoint::BeforeBackend)?;
+                let cancelled = self.backend.cancel(run_id).await;
+                self.cut(MutationCrashPoint::AfterBackend)?;
+                cancelled.map(|()| run)
+            }
             Err(error) => {
                 self.record_denial(run_id, "cancel", None, &error);
                 Err(error)
@@ -776,9 +926,17 @@ impl ComputerUseService {
         operation: &str,
         payload: &serde_json::Value,
     ) -> ComputerResult<Option<ComputerResult<T>>> {
+        if let Some(error) = &self.reconciliation_error {
+            return Err(error.clone());
+        }
         let hash = crate::orchestration::hash_payload(payload);
-        match self.store.claim_mutation(request_id, operation, &hash)? {
+        let effect_run_id = payload.get("runId").and_then(serde_json::Value::as_str);
+        match self
+            .store
+            .claim_mutation(request_id, operation, &hash, effect_run_id)?
+        {
             MutationClaim::Perform => {
+                self.cut(MutationCrashPoint::AfterClaim)?;
                 self.append_audit(
                     request_id,
                     operation,
@@ -786,6 +944,8 @@ impl ComputerUseService {
                     EntryOutcome::Accepted,
                     None,
                 )?;
+                self.cut(MutationCrashPoint::AfterIntent)?;
+                self.store.mark_intent_recorded(request_id)?;
                 Ok(None)
             }
             MutationClaim::Pending => Ok(Some(Err(ComputerError::new(
@@ -818,6 +978,14 @@ impl ComputerUseService {
             }
             Err(_) => (EntryOutcome::Rejected, Some("computer_rejected")),
         };
+        let encoded = match result {
+            Ok(value) => serde_json::to_value(value).map_err(|error| {
+                ComputerError::new(ComputerErrorCode::Internal, error.to_string())
+            }),
+            Err(error) => Err(error.clone()),
+        };
+        self.store.commit_mutation_effect(request_id, &encoded)?;
+        self.cut(MutationCrashPoint::AfterEffectCommit)?;
         self.append_audit(
             request_id,
             operation,
@@ -825,13 +993,11 @@ impl ComputerUseService {
             outcome,
             error_code,
         )?;
-        let encoded = match result {
-            Ok(value) => serde_json::to_value(value).map_err(|error| {
-                ComputerError::new(ComputerErrorCode::Internal, error.to_string())
-            }),
-            Err(error) => Err(error.clone()),
-        };
-        self.store.complete_mutation(request_id, &encoded)
+        self.cut(MutationCrashPoint::AfterOutcome)?;
+        self.store.record_mutation_outcome(request_id)?;
+        self.store.complete_mutation(request_id, &encoded)?;
+        self.cut(MutationCrashPoint::AfterReceiptComplete)?;
+        Ok(())
     }
 }
 
@@ -882,6 +1048,7 @@ fn run_limit_error() -> ComputerError {
 mod tests {
     use std::collections::BTreeSet;
     use std::fs;
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use chrono::Duration;
@@ -1054,16 +1221,116 @@ mod tests {
         (backend, service)
     }
 
+    fn audited_service_at(dir: &Path) -> ComputerUseService {
+        let audit = crate::orchestration::OrchStore::open(dir.join("orchestration")).unwrap();
+        let computer = ComputerStore::open(dir.join("computer-use")).unwrap();
+        ComputerUseService::new_with_audit_store(Arc::new(SimulatorBackend::new()), computer, audit)
+    }
+
+    #[test]
+    fn mutation_crash_cuts_reconcile_receipt_effect_and_audit() {
+        for point in [
+            MutationCrashPoint::AfterClaim,
+            MutationCrashPoint::AfterIntent,
+            MutationCrashPoint::AfterEffectCommit,
+            MutationCrashPoint::AfterOutcome,
+            MutationCrashPoint::AfterReceiptComplete,
+        ] {
+            let dir = tempdir().unwrap();
+            {
+                let service = audited_service_at(dir.path()).with_crash_at(point);
+                let result = service.create_run(
+                    "mutation-crash",
+                    Uuid::new_v4(),
+                    None,
+                    SimulatorBackend::demo_target(),
+                    ComputerUseLimits::default(),
+                );
+                assert!(result.is_err(), "cut {point:?} must interrupt the call");
+            }
+            let audit =
+                crate::orchestration::OrchStore::open(dir.path().join("orchestration")).unwrap();
+            let service = ComputerUseService::new_with_audit_store(
+                Arc::new(SimulatorBackend::new()),
+                ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+                audit.clone(),
+            );
+            let replay = service.create_run(
+                "mutation-crash",
+                Uuid::new_v4(),
+                None,
+                SimulatorBackend::demo_target(),
+                ComputerUseLimits::default(),
+            );
+            if point == MutationCrashPoint::AfterReceiptComplete {
+                assert!(replay.is_ok(), "completed receipt should replay");
+            } else {
+                assert_eq!(
+                    replay.unwrap_err().code,
+                    ComputerErrorCode::UncertainOutcome,
+                    "cut {point:?} must not replay an effect"
+                );
+            }
+            assert_eq!(audit.audit_status().open_intents, 0);
+            assert!(audit.verify_audit().is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_crash_cuts_reconcile_without_redispatch() {
+        for point in [
+            MutationCrashPoint::BeforeBackend,
+            MutationCrashPoint::AfterBackend,
+        ] {
+            let dir = tempdir().unwrap();
+            let run_id;
+            {
+                let service = audited_service_at(dir.path());
+                let run = service
+                    .create_run(
+                        "backend-create",
+                        Uuid::new_v4(),
+                        None,
+                        SimulatorBackend::demo_target(),
+                        ComputerUseLimits::default(),
+                    )
+                    .unwrap();
+                run_id = run.run_id.clone();
+                let run = service
+                    .authorize("backend-authorize", &run.run_id, run.version, grant(&run))
+                    .unwrap();
+                let service = service.with_crash_at(point);
+                let result = service
+                    .observe("backend-observe", &run.run_id, run.version)
+                    .await;
+                assert!(result.is_err(), "cut {point:?} must interrupt observation");
+            }
+            let audit =
+                crate::orchestration::OrchStore::open(dir.path().join("orchestration")).unwrap();
+            let service = ComputerUseService::new_with_audit_store(
+                Arc::new(SimulatorBackend::new()),
+                ComputerStore::open(dir.path().join("computer-use")).unwrap(),
+                audit.clone(),
+            );
+            let error = service
+                .observe("backend-observe", &run_id, 0)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, ComputerErrorCode::UncertainOutcome);
+            assert_eq!(audit.audit_status().open_intents, 0);
+        }
+    }
+
     #[test]
     fn configured_service_pairs_computer_intent_and_outcome_in_orchestration_audit() {
         let dir = tempdir().unwrap();
         let audit =
             crate::orchestration::OrchStore::open(dir.path().join("orchestration")).unwrap();
-        let service = ComputerUseService::new(
+        let service = ComputerUseService::new_with_audit_store(
             Arc::new(SimulatorBackend::new()),
             ComputerStore::open(dir.path().join("computer-use")).unwrap(),
-        )
-        .with_audit_store(audit.clone());
+            audit.clone(),
+        );
         service
             .create_run(
                 "computer-create",

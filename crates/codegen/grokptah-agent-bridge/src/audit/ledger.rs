@@ -11,7 +11,7 @@ use super::files;
 use super::import::{
     bootstrap_path, plan_legacy_import, write_imported_journal, BootstrapMarker, LegacyImportPlan,
 };
-use super::keys::{sha256_hex, AuditKeys};
+use super::keys::{sha256_hex, AuditKeyProvider, AuditKeys, StaticAuditKeyProvider};
 use super::witness::{
     AuditWitness, UnwitnessedBoundary, WitnessBeacon, WitnessState, WitnessVerdict,
 };
@@ -35,24 +35,24 @@ pub enum CrashPoint {
 /// keyed digests on the way in, so a path, prompt or native id cannot reach the
 /// journal even if a producer passes one.
 #[derive(Debug, Clone)]
-pub struct AuditEntryInput {
-    pub op: String,
-    pub phase: EntryPhase,
-    pub outcome: EntryOutcome,
-    pub reason: Option<EntryReason>,
-    pub code: Option<String>,
-    pub actor: Option<String>,
-    pub request: Option<String>,
-    pub scope: Option<String>,
-    pub authz_rev: Option<u64>,
-    pub cap_rev: Option<u64>,
-    pub policy_rev: Option<u64>,
-    pub intent_id: Option<String>,
-    pub intent_digest: Option<String>,
+pub(crate) struct AuditEntryInput {
+    pub(crate) op: String,
+    pub(crate) phase: EntryPhase,
+    pub(crate) outcome: EntryOutcome,
+    pub(crate) reason: Option<EntryReason>,
+    pub(crate) code: Option<String>,
+    pub(crate) actor: Option<String>,
+    pub(crate) request: Option<String>,
+    pub(crate) scope: Option<String>,
+    pub(crate) authz_rev: Option<u64>,
+    pub(crate) cap_rev: Option<u64>,
+    pub(crate) policy_rev: Option<u64>,
+    pub(crate) intent_id: Option<String>,
+    intent_digest: Option<String>,
 }
 
 impl AuditEntryInput {
-    pub fn new(op: impl Into<String>, phase: EntryPhase, outcome: EntryOutcome) -> Self {
+    pub(crate) fn new(op: impl Into<String>, phase: EntryPhase, outcome: EntryOutcome) -> Self {
         Self {
             op: op.into(),
             phase,
@@ -70,32 +70,32 @@ impl AuditEntryInput {
         }
     }
 
-    pub fn with_reason(mut self, reason: EntryReason) -> Self {
+    pub(crate) fn with_reason(mut self, reason: EntryReason) -> Self {
         self.reason = Some(reason);
         self
     }
 
-    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+    pub(crate) fn with_code(mut self, code: impl Into<String>) -> Self {
         self.code = Some(code.into());
         self
     }
 
-    pub fn with_actor(mut self, actor: impl Into<String>) -> Self {
+    pub(crate) fn with_actor(mut self, actor: impl Into<String>) -> Self {
         self.actor = Some(actor.into());
         self
     }
 
-    pub fn with_request(mut self, request: impl Into<String>) -> Self {
+    pub(crate) fn with_request(mut self, request: impl Into<String>) -> Self {
         self.request = Some(request.into());
         self
     }
 
-    pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
+    pub(crate) fn with_scope(mut self, scope: impl Into<String>) -> Self {
         self.scope = Some(scope.into());
         self
     }
 
-    pub fn with_intent_id(mut self, intent_id: impl Into<String>) -> Self {
+    pub(crate) fn with_intent_id(mut self, intent_id: impl Into<String>) -> Self {
         self.intent_id = Some(intent_id.into());
         self
     }
@@ -110,15 +110,15 @@ impl AuditEntryInput {
 /// always an outcome with no producer identity and therefore can never add,
 /// remove, or otherwise alter the set of open producer intents.
 #[derive(Debug, Clone)]
-pub struct AuditHousekeepingInput {
-    pub op: String,
-    pub outcome: EntryOutcome,
-    pub reason: Option<EntryReason>,
-    pub code: Option<String>,
+pub(crate) struct AuditHousekeepingInput {
+    pub(crate) op: String,
+    pub(crate) outcome: EntryOutcome,
+    pub(crate) reason: Option<EntryReason>,
+    pub(crate) code: Option<String>,
 }
 
 impl AuditHousekeepingInput {
-    pub fn new(op: impl Into<String>, outcome: EntryOutcome) -> Self {
+    pub(crate) fn new(op: impl Into<String>, outcome: EntryOutcome) -> Self {
         Self {
             op: op.into(),
             outcome,
@@ -127,12 +127,12 @@ impl AuditHousekeepingInput {
         }
     }
 
-    pub fn with_reason(mut self, reason: EntryReason) -> Self {
+    pub(crate) fn with_reason(mut self, reason: EntryReason) -> Self {
         self.reason = Some(reason);
         self
     }
 
-    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+    pub(crate) fn with_code(mut self, code: impl Into<String>) -> Self {
         self.code = Some(code.into());
         self
     }
@@ -146,6 +146,9 @@ pub struct AuditLedgerOptions {
     /// Directory holding legacy v1 `audit.jsonl` / `audit.jsonl.1`. Imported
     /// only when this root has never committed a manifest.
     pub legacy_v1_dir: Option<PathBuf>,
+    /// Custody-owned key retrieval/rotation. A static key ring refuses key
+    /// rotation instead of deriving or persisting material inside the ledger.
+    pub key_provider: Option<Arc<dyn AuditKeyProvider>>,
 }
 
 /// What recovery actually did, so an operator never has to infer it.
@@ -182,6 +185,13 @@ pub struct AuditStatus {
     pub recovery: RecoverySummary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuditIntentState {
+    Missing,
+    Open,
+    Settled(EntryOutcome),
+}
+
 #[derive(Debug, Clone)]
 pub struct GenerationVerification {
     pub generation_id: String,
@@ -214,6 +224,7 @@ struct Inner {
 pub struct AuditLedger {
     root: PathBuf,
     legacy_v1_dir: Option<PathBuf>,
+    key_provider: Arc<dyn AuditKeyProvider>,
     keys: RwLock<Arc<AuditKeys>>,
     keyring: RwLock<Vec<Arc<AuditKeys>>>,
     witness: Arc<dyn AuditWitness>,
@@ -286,6 +297,10 @@ impl AuditLedger {
         if keys.is_empty() {
             return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
         }
+        let key_provider: Arc<dyn AuditKeyProvider> = options
+            .key_provider
+            .clone()
+            .unwrap_or_else(|| Arc::new(StaticAuditKeyProvider::new(keys.clone())));
         let witness: Arc<dyn AuditWitness> = options
             .witness
             .unwrap_or_else(|| Arc::new(UnwitnessedBoundary));
@@ -339,6 +354,7 @@ impl AuditLedger {
         let ledger = Self {
             root,
             legacy_v1_dir: options.legacy_v1_dir,
+            key_provider,
             keys: RwLock::new(selected_key),
             keyring: RwLock::new(keys),
             witness,
@@ -412,13 +428,6 @@ impl AuditLedger {
 
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    fn custody_root(&self) -> &Path {
-        self.root
-            .parent()
-            .filter(|parent| parent.join(".audit-key").is_file())
-            .unwrap_or(&self.root)
     }
 
     pub(crate) fn keys(&self) -> Arc<AuditKeys> {
@@ -1272,6 +1281,42 @@ impl AuditLedger {
             .cloned()
             .ok_or(AuditError::Poisoned(PoisonReason::KeyUnavailable))
     }
+
+    pub(crate) fn producer_intent_state(&self, intent_id: &str) -> AuditResult<AuditIntentState> {
+        let digest = self.keys().opaque_digest(intent_id);
+        let manifest = self.manifest_snapshot();
+        let mut state = AuditIntentState::Missing;
+        for generation in manifest.generations {
+            if generation.state == GenerationState::Tombstoned {
+                continue;
+            }
+            let path = Self::journal_path(&self.root, &generation.generation_id);
+            if !path.is_file() {
+                return Err(AuditError::Poisoned(match generation.state {
+                    GenerationState::Active => PoisonReason::ActiveGenerationInvalid,
+                    GenerationState::Sealed => PoisonReason::SealedGenerationChanged,
+                    GenerationState::Tombstoned => PoisonReason::TombstoneInconsistent,
+                }));
+            }
+            for line in files::read_bytes(&path)?.split(|byte| *byte == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let record: AuditRecord = serde_json::from_slice(line)
+                    .map_err(|_| AuditError::Poisoned(PoisonReason::EntryMalformed))?;
+                if record.kind != AuditRecordKind::Producer
+                    || record.intent.as_deref() != Some(digest.as_str())
+                {
+                    continue;
+                }
+                state = match record.phase {
+                    EntryPhase::Intent => AuditIntentState::Open,
+                    EntryPhase::Outcome => AuditIntentState::Settled(record.outcome),
+                };
+            }
+        }
+        Ok(state)
+    }
 }
 
 /// Replay and authenticate one journal file. Free-standing on purpose: export
@@ -1427,7 +1472,7 @@ pub(crate) fn scan_journal_at(
 impl AuditLedger {
     // --------------------------------------------------------------- append
 
-    pub fn append(&self, entry: AuditEntryInput) -> AuditResult<u64> {
+    pub(crate) fn append(&self, entry: AuditEntryInput) -> AuditResult<u64> {
         let _transaction = self.operation_lock.lock();
         let seq = self.append_internal(entry, None, false)?;
         let should_rotate = {
@@ -1452,7 +1497,7 @@ impl AuditLedger {
         self.append_internal(entry, recovery, false)
     }
 
-    pub fn append_housekeeping(
+    pub(crate) fn append_housekeeping(
         &self,
         input: AuditHousekeepingInput,
         recovery: Option<RecoveryEvidence>,
@@ -1707,9 +1752,7 @@ impl AuditLedger {
             .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
         let next_id = generation_id(next_index);
         let next_keys = if reason == RotationReason::KeyRotation {
-            let next = outgoing_key.rotated()?;
-            next.persist_epoch(self.custody_root())?;
-            Arc::new(next)
+            self.key_provider.rotate(&outgoing_key)?
         } else {
             Arc::clone(&outgoing_key)
         };

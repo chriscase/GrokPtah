@@ -85,21 +85,31 @@ pub enum AuditKeyMode {
     ExternalConsumer,
 }
 
+pub trait AuditKeyProvider: Send + Sync + std::fmt::Debug {
+    fn keyring(&self) -> Vec<Arc<AuditKeys>>;
+    fn rotate(&self, current: &AuditKeys) -> AuditResult<Arc<AuditKeys>>;
+}
+
 /// Key custody boundary used by the shipped store. The mode is observable
 /// only as a label; the key path and key bytes never appear in this value's
 /// debug output or in audit status/projections.
 #[derive(Clone)]
 pub struct AuditKeyCustody {
     mode: AuditKeyMode,
-    keys: Arc<AuditKeys>,
-    additional_keys: Vec<Arc<AuditKeys>>,
+    provider: Arc<dyn AuditKeyProvider>,
 }
 
 impl std::fmt::Debug for AuditKeyCustody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key_id = self
+            .provider
+            .keyring()
+            .first()
+            .map(|key| key.key_id())
+            .unwrap_or("unavailable");
         f.debug_struct("AuditKeyCustody")
             .field("mode", &self.mode)
-            .field("keyId", &self.keys.key_id())
+            .field("keyId", &key_id)
             .finish()
     }
 }
@@ -113,15 +123,17 @@ impl AuditKeyCustody {
         Self::file_backed(root, AuditKeyMode::HeadlessService)
     }
 
-    /// External consumers must supply an already-held key. There is no
-    /// fallback to an environment variable, provider credential, or guessed
-    /// file path.
-    pub fn external_consumer(keys: Arc<AuditKeys>) -> Self {
-        Self {
-            mode: AuditKeyMode::ExternalConsumer,
-            keys,
-            additional_keys: Vec::new(),
+    /// External consumers must supply a provider that owns key retrieval and
+    /// rotation. The ledger never persists or derives the next epoch for an
+    /// external consumer.
+    pub fn external_consumer(provider: Arc<dyn AuditKeyProvider>) -> AuditResult<Self> {
+        if provider.keyring().is_empty() {
+            return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
         }
+        Ok(Self {
+            mode: AuditKeyMode::ExternalConsumer,
+            provider,
+        })
     }
 
     pub fn mode(&self) -> AuditKeyMode {
@@ -129,10 +141,11 @@ impl AuditKeyCustody {
     }
 
     pub(crate) fn all_keys(&self) -> Vec<Arc<AuditKeys>> {
-        let mut keys = Vec::with_capacity(self.additional_keys.len() + 1);
-        keys.push(Arc::clone(&self.keys));
-        keys.extend(self.additional_keys.iter().cloned());
-        keys
+        self.provider.keyring()
+    }
+
+    pub(crate) fn provider(&self) -> Arc<dyn AuditKeyProvider> {
+        Arc::clone(&self.provider)
     }
 
     fn file_backed(root: &Path, mode: AuditKeyMode) -> AuditResult<Self> {
@@ -145,7 +158,7 @@ impl AuditKeyCustody {
             super::files::reject_symlink(&path)?;
         }
         let keys = Arc::new(AuditKeys::load_or_create_file(&path)?);
-        let mut additional_keys = Vec::new();
+        let mut keyring = vec![Arc::clone(&keys)];
         let epochs = root.join(".audit-key-epochs");
         if epochs.exists() {
             super::files::reject_symlink(&epochs)?;
@@ -173,14 +186,68 @@ impl AuditKeyCustody {
                 if epoch_keys.installation_id() != keys.installation_id() {
                     return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
                 }
-                additional_keys.push(Arc::new(epoch_keys));
+                keyring.push(Arc::new(epoch_keys));
             }
         }
         Ok(Self {
             mode,
-            keys,
-            additional_keys,
+            provider: Arc::new(FileAuditKeyProvider {
+                root: root.to_path_buf(),
+                root_key: Arc::clone(&keys),
+                keys: parking_lot::Mutex::new(keyring),
+            }),
         })
+    }
+}
+
+#[derive(Debug)]
+struct FileAuditKeyProvider {
+    root: std::path::PathBuf,
+    root_key: Arc<AuditKeys>,
+    keys: parking_lot::Mutex<Vec<Arc<AuditKeys>>>,
+}
+
+impl AuditKeyProvider for FileAuditKeyProvider {
+    fn keyring(&self) -> Vec<Arc<AuditKeys>> {
+        self.keys.lock().clone()
+    }
+
+    fn rotate(&self, current: &AuditKeys) -> AuditResult<Arc<AuditKeys>> {
+        let epoch = current
+            .key_epoch()
+            .checked_add(1)
+            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
+        let next = Arc::new(AuditKeys::derive_for_epoch(
+            &self.root_key.root_material,
+            epoch,
+        ));
+        next.persist_epoch(&self.root)?;
+        let mut keys = self.keys.lock();
+        if !keys.iter().any(|key| key.key_id() == next.key_id()) {
+            keys.push(Arc::clone(&next));
+        }
+        Ok(next)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct StaticAuditKeyProvider {
+    keys: Vec<Arc<AuditKeys>>,
+}
+
+impl StaticAuditKeyProvider {
+    pub(crate) fn new(keys: Vec<Arc<AuditKeys>>) -> Self {
+        Self { keys }
+    }
+}
+
+impl AuditKeyProvider for StaticAuditKeyProvider {
+    fn keyring(&self) -> Vec<Arc<AuditKeys>> {
+        self.keys.clone()
+    }
+
+    fn rotate(&self, _current: &AuditKeys) -> AuditResult<Arc<AuditKeys>> {
+        Err(AuditError::Poisoned(PoisonReason::KeyUnavailable))
     }
 }
 
@@ -227,17 +294,6 @@ impl AuditKeys {
         }
     }
 
-    /// Derive the next custody epoch without exposing the installation
-    /// material.  Older epochs remain verifiable by a key ring held by the
-    /// owner; a new epoch never overwrites the old key's identity.
-    pub(crate) fn rotated(&self) -> AuditResult<Self> {
-        let epoch = self
-            .epoch
-            .checked_add(1)
-            .ok_or(AuditError::Poisoned(PoisonReason::SequenceExhausted))?;
-        Ok(Self::derive_for_epoch(&self.root_material, epoch))
-    }
-
     pub(crate) fn persist_epoch(&self, root: &Path) -> AuditResult<()> {
         let dir = root.join(".audit-key-epochs");
         super::files::create_private_dir_all(&dir)?;
@@ -249,12 +305,35 @@ impl AuditKeys {
             }
             return Ok(());
         }
-        write_private_key(&path, &self.root_material)
+        let bundle = EpochKeyBundle {
+            epoch: self.epoch,
+            key_id: self.key_id.clone(),
+            installation_id: self.installation_id.clone(),
+            chain: hex32(&self.chain),
+            manifest: hex32(&self.manifest),
+            anchor: hex32(&self.anchor),
+            seal: hex32(&self.seal),
+            actor: hex32(&self.actor),
+        };
+        write_private_epoch(&path, &bundle)
     }
 
     fn load_epoch_file(path: &Path, epoch: u32) -> AuditResult<Self> {
-        let material = read_private_key(path)?;
-        Ok(Self::derive_for_epoch(&material, epoch))
+        let bundle = read_private_epoch(path)?;
+        if bundle.epoch != epoch || bundle.key_id.is_empty() || bundle.installation_id.is_empty() {
+            return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+        }
+        Ok(Self {
+            root_material: Vec::new(),
+            chain: decode_key_component(&bundle.chain)?,
+            manifest: decode_key_component(&bundle.manifest)?,
+            anchor: decode_key_component(&bundle.anchor)?,
+            seal: decode_key_component(&bundle.seal)?,
+            actor: decode_key_component(&bundle.actor)?,
+            key_id: bundle.key_id,
+            installation_id: bundle.installation_id,
+            epoch,
+        })
     }
 
     pub(crate) fn key_epoch(&self) -> u32 {
@@ -330,6 +409,83 @@ impl AuditKeys {
     pub(crate) fn opaque_digest(&self, value: &str) -> String {
         hex32(&hmac_sha256(&self.actor, value.as_bytes()))[..32].to_string()
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EpochKeyBundle {
+    epoch: u32,
+    key_id: String,
+    installation_id: String,
+    chain: String,
+    manifest: String,
+    anchor: String,
+    seal: String,
+    actor: String,
+}
+
+fn decode_key_component(value: &str) -> AuditResult<[u8; 32]> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+    }
+    let mut decoded = [0u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let high = (pair[0] as char)
+            .to_digit(16)
+            .ok_or(AuditError::Poisoned(PoisonReason::KeyUnavailable))?;
+        let low = (pair[1] as char)
+            .to_digit(16)
+            .ok_or(AuditError::Poisoned(PoisonReason::KeyUnavailable))?;
+        decoded[index] = ((high << 4) | low) as u8;
+    }
+    Ok(decoded)
+}
+
+fn write_private_epoch(path: &Path, bundle: &EpochKeyBundle) -> AuditResult<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| AuditError::Io(format!("audit epoch create: {error}")))?;
+    let bytes = serde_json::to_vec(bundle)
+        .map_err(|error| AuditError::Io(format!("audit epoch serialize: {error}")))?;
+    file.write_all(&bytes)
+        .map_err(|error| AuditError::Io(format!("audit epoch write: {error}")))?;
+    file.sync_all()
+        .map_err(|error| AuditError::Io(format!("audit epoch sync: {error}")))?;
+    if let Some(parent) = path.parent() {
+        super::files::fsync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn read_private_epoch(path: &Path) -> AuditResult<EpochKeyBundle> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| AuditError::Io(format!("audit epoch metadata: {error}")))?;
+    if !metadata.is_file() {
+        return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current_uid = unsafe { libc::getuid() };
+        if metadata.uid() != current_uid
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+        {
+            return Err(AuditError::Poisoned(PoisonReason::KeyUnavailable));
+        }
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| AuditError::Io(format!("audit epoch read: {error}")))?;
+    serde_json::from_slice(&bytes).map_err(|_| AuditError::Poisoned(PoisonReason::KeyUnavailable))
 }
 
 fn read_private_key(path: &Path) -> AuditResult<Vec<u8>> {

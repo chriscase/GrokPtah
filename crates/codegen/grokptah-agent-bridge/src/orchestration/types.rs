@@ -1251,15 +1251,15 @@ fn default_receipt_status() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AuditEntry {
-    pub ts: DateTime<Utc>,
-    pub tool: String,
-    pub request_id: Option<String>,
-    pub session_id: Option<Uuid>,
-    pub workspace: Option<String>,
-    pub outcome: String,
-    pub error_code: Option<String>,
-    pub detail: String,
+pub(crate) struct AuditEntry {
+    pub(crate) ts: DateTime<Utc>,
+    pub(crate) tool: String,
+    pub(crate) request_id: Option<String>,
+    pub(crate) session_id: Option<Uuid>,
+    pub(crate) workspace: Option<String>,
+    pub(crate) outcome: String,
+    pub(crate) error_code: Option<String>,
+    pub(crate) detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

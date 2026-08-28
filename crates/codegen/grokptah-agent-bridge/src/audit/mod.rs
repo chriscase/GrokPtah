@@ -58,20 +58,22 @@ pub mod witness;
 mod tests;
 
 pub use documents::{
-    Anchor, AuditRecord, AuditRecordKind, EntryOutcome, EntryPhase, EntryReason, GapRecord,
-    GenerationDescriptor, GenerationState, Manifest, RecoveryEvidence, RetentionReason,
-    RotationReason, SequenceOrigin, Tombstone, MAX_LINE_BYTES, MAX_TRACKED_INTENTS,
+    Anchor, EntryOutcome, EntryPhase, EntryReason, GapRecord, GenerationDescriptor,
+    GenerationState, Manifest, RecoveryEvidence, RetentionReason, RotationReason, SequenceOrigin,
+    Tombstone, MAX_LINE_BYTES, MAX_TRACKED_INTENTS,
 };
 pub use export::{
     verify_export, CoverageElement, CoverageKind, ExportFormat, ExportManifest, ExportReceipt,
     ExportVerification, WithheldReason,
 };
-pub use keys::{AuditKeyCustody, AuditKeyMode, AuditKeys};
+pub use keys::{AuditKeyCustody, AuditKeyMode, AuditKeyProvider, AuditKeys};
+pub(crate) use ledger::AuditIntentState;
 #[cfg(test)]
 pub(crate) use ledger::CrashPoint;
+pub(crate) use ledger::{AuditEntryInput, AuditHousekeepingInput};
 pub use ledger::{
-    AuditEntryInput, AuditHousekeepingInput, AuditLedger, AuditLedgerOptions, AuditStatus,
-    GenerationVerification, RecoverySummary, MAX_GENERATION_BYTES,
+    AuditLedger, AuditLedgerOptions, AuditStatus, GenerationVerification, RecoverySummary,
+    MAX_GENERATION_BYTES,
 };
 pub use retention::{RetentionReceipt, RetentionRequest};
 pub use witness::{AuditWitness, UnwitnessedBoundary, WitnessBeacon, WitnessState, WitnessVerdict};

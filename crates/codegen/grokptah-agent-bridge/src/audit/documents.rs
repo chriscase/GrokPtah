@@ -78,7 +78,7 @@ pub enum EntryOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AuditRecordKind {
+pub(crate) enum AuditRecordKind {
     Producer,
     Housekeeping,
 }
@@ -124,7 +124,7 @@ pub struct RecoveryEvidence {
 /// makes renumbering an entry and moving one between generations detectable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AuditRecord {
+pub(crate) struct AuditRecord {
     pub v: u32,
     pub kind: AuditRecordKind,
     #[serde(rename = "gen")]

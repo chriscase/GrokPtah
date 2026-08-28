@@ -533,7 +533,9 @@ fn retention_refuses_an_unexported_generation_without_an_override() {
     );
     // The override is allowed, and is recorded permanently in the tombstone.
     ledger
-        .retain(RetentionRequest::new("g-000001").allow_unexported())
+        .retain(
+            RetentionRequest::new("g-000001").with_operator_seal(ledger.operator_seal("g-000001")),
+        )
         .unwrap();
     assert!(ledger.manifest_snapshot().tombstones[0].allow_unexported);
 }
@@ -579,7 +581,9 @@ fn crash_cut_t3_resumes_removal_at_open() {
     ledger.append_housekeeping(entry("post"), None).unwrap();
     let ledger = ledger.with_crash_at(CrashPoint::T3Committed);
     assert!(ledger
-        .retain(RetentionRequest::new("g-000001").allow_unexported())
+        .retain(
+            RetentionRequest::new("g-000001").with_operator_seal(ledger.operator_seal("g-000001")),
+        )
         .is_err());
     assert!(
         AuditLedger::generation_dir(dir.path(), "g-000001").exists(),
@@ -609,7 +613,9 @@ fn crash_cut_t4_converges_without_loss() {
     ledger.append_housekeeping(entry("post"), None).unwrap();
     let ledger = ledger.with_crash_at(CrashPoint::T4Removed);
     assert!(ledger
-        .retain(RetentionRequest::new("g-000001").allow_unexported())
+        .retain(
+            RetentionRequest::new("g-000001").with_operator_seal(ledger.operator_seal("g-000001")),
+        )
         .is_err());
     drop(ledger);
 
@@ -638,7 +644,9 @@ fn retention_refuses_a_sealed_generation_whose_bytes_changed() {
     file.sync_all().unwrap();
 
     let error = ledger
-        .retain(RetentionRequest::new("g-000001").allow_unexported())
+        .retain(
+            RetentionRequest::new("g-000001").with_operator_seal(ledger.operator_seal("g-000001")),
+        )
         .unwrap_err();
     assert_eq!(poison_of(error), PoisonReason::SealedGenerationChanged);
     assert!(
@@ -700,7 +708,9 @@ fn export_after_retention_is_incomplete_with_an_explicit_hole() {
     ledger.rotate(RotationReason::Bytes).unwrap();
     ledger.append_housekeeping(entry("post"), None).unwrap();
     ledger
-        .retain(RetentionRequest::new("g-000001").allow_unexported())
+        .retain(
+            RetentionRequest::new("g-000001").with_operator_seal(ledger.operator_seal("g-000001")),
+        )
         .unwrap();
 
     let dest = out.path().join("after");
@@ -1495,7 +1505,9 @@ fn retention_refuses_unauthenticated_import_even_with_override() {
     let legacy = legacy_v1_dir(dir.path(), "{\"old\":1}\n", "{\"new\":2}\n");
     let ledger = open_with_legacy(&dir.path().join("audit"), &legacy).unwrap();
     let error = ledger
-        .retain(RetentionRequest::new("g-000001").allow_unexported())
+        .retain(
+            RetentionRequest::new("g-000001").with_operator_seal(ledger.operator_seal("g-000001")),
+        )
         .unwrap_err();
     assert_eq!(refusal_of(error), RefuseReason::GenerationUnverified);
 }

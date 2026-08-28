@@ -100,10 +100,11 @@ impl DesktopComputerUse {
             .clone()
             .zip(audit_store.clone())
             .map(|(store, audit)| {
-                Arc::new(
-                    ComputerUseService::new(Arc::new(SimulatorBackend::new()), store)
-                        .with_audit_store(audit),
-                )
+                Arc::new(ComputerUseService::new_with_audit_store(
+                    Arc::new(SimulatorBackend::new()),
+                    store,
+                    audit,
+                ))
             });
         Self {
             host: host.clone(),
@@ -211,7 +212,7 @@ impl DesktopComputerUse {
             .audit_store
             .clone()
             .ok_or_else(|| self.initialization_error())?;
-        let service = ComputerUseService::new(backend, store).with_audit_store(audit_store);
+        let service = ComputerUseService::new_with_audit_store(backend, store, audit_store);
         let limits = ComputerUseLimits {
             max_actions: 1,
             max_duration_secs: 5 * 60,
@@ -406,8 +407,11 @@ impl DesktopComputerUse {
             .audit_store
             .clone()
             .ok_or_else(|| self.initialization_error())?;
-        let service =
-            Arc::new(ComputerUseService::new(backend, store).with_audit_store(audit_store));
+        let service = Arc::new(ComputerUseService::new_with_audit_store(
+            backend,
+            store,
+            audit_store,
+        ));
         let limits = ComputerUseLimits {
             max_actions: 8,
             max_duration_secs: 10 * 60,
@@ -1084,9 +1088,11 @@ mod tests {
         // Tests deliberately open an isolated store in the fixture directory;
         // production `new()` must borrow the host's shared handle instead.
         let store = ComputerStore::open(dir.path().join("computer-use")).unwrap();
-        let simulator = Arc::new(ComputerUseService::new(
+        let audit = OrchStore::open(dir.path().join("orchestration")).unwrap();
+        let simulator = Arc::new(ComputerUseService::new_with_audit_store(
             Arc::new(SimulatorBackend::new()),
             store.clone(),
+            audit.clone(),
         ));
         // Build the host before `dir` moves into the returned tuple.
         let host = test_host(dir.path());
@@ -1096,7 +1102,7 @@ mod tests {
                 host,
                 platform: None,
                 store: Some(store),
-                audit_store: None,
+                audit_store: Some(audit),
                 initialization_error: None,
                 operation: Mutex::new(()),
                 selections: std::sync::Mutex::new(HashMap::new()),

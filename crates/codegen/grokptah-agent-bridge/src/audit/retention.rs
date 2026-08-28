@@ -20,13 +20,34 @@ use super::{AuditError, AuditResult, PoisonReason, RefuseReason};
 
 #[derive(Debug, Clone)]
 pub struct RetentionRequest {
-    pub generation_id: String,
+    generation_id: String,
     /// Seal id of a verified export that already preserved this range.
-    pub export_seal_id: Option<String>,
-    /// Operator override for retaining a generation that was never exported.
-    /// Recorded permanently in the tombstone.
-    pub allow_unexported: bool,
-    pub reason: RetentionReason,
+    export_seal_id: Option<String>,
+    operator_seal: Option<OperatorSeal>,
+    reason: RetentionReason,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OperatorSeal {
+    generation_id: String,
+    mac: String,
+}
+
+impl OperatorSeal {
+    fn issue(keys: &super::keys::AuditKeys, generation_id: &str) -> Self {
+        Self {
+            generation_id: generation_id.to_string(),
+            mac: keys.seal_mac(generation_id.as_bytes()),
+        }
+    }
+
+    fn verify(&self, keys: &super::keys::AuditKeys, generation_id: &str) -> bool {
+        self.generation_id == generation_id
+            && crate::orchestration::constant_time_eq(
+                self.mac.as_bytes(),
+                keys.seal_mac(generation_id.as_bytes()).as_bytes(),
+            )
+    }
 }
 
 impl RetentionRequest {
@@ -34,7 +55,7 @@ impl RetentionRequest {
         Self {
             generation_id: generation_id.into(),
             export_seal_id: None,
-            allow_unexported: false,
+            operator_seal: None,
             reason: RetentionReason::OperatorRetention,
         }
     }
@@ -44,8 +65,8 @@ impl RetentionRequest {
         self
     }
 
-    pub fn allow_unexported(mut self) -> Self {
-        self.allow_unexported = true;
+    pub(crate) fn with_operator_seal(mut self, seal: OperatorSeal) -> Self {
+        self.operator_seal = Some(seal);
         self
     }
 }
@@ -94,7 +115,15 @@ impl AuditLedger {
         if descriptor.index >= active.index {
             return Err(AuditError::Refused(RefuseReason::GenerationIsActive));
         }
-        if request.export_seal_id.is_none() && !request.allow_unexported {
+        if request.export_seal_id.is_none() && request.operator_seal.is_none() {
+            return Err(AuditError::Refused(RefuseReason::GenerationUnexported));
+        }
+        if request.export_seal_id.is_none()
+            && !request
+                .operator_seal
+                .as_ref()
+                .is_some_and(|seal| seal.verify(&self.keys(), &descriptor.generation_id))
+        {
             return Err(AuditError::Refused(RefuseReason::GenerationUnexported));
         }
         if let Some(seal_id) = request.export_seal_id.as_deref() {
@@ -173,7 +202,7 @@ impl AuditLedger {
             retention_epoch,
             reason: request.reason,
             export_seal_id: request.export_seal_id.clone(),
-            allow_unexported: request.allow_unexported,
+            allow_unexported: request.operator_seal.is_some(),
             committed_at: now,
             removed_at: None,
         });
@@ -228,7 +257,13 @@ impl AuditLedger {
             bytes_removed: descriptor.journal_bytes,
             retention_epoch,
             export_seal_id: request.export_seal_id,
-            allow_unexported: request.allow_unexported,
+            allow_unexported: request.operator_seal.is_some(),
         })
+    }
+}
+
+impl AuditLedger {
+    pub(crate) fn operator_seal(&self, generation_id: &str) -> OperatorSeal {
+        OperatorSeal::issue(&self.keys(), generation_id)
     }
 }
