@@ -1027,10 +1027,7 @@ mod tests {
             let transition = controller
                 .enforce_risk_floor(risk)
                 .expect("risk increase must transition");
-            assert_eq!(
-                transition,
-                ProfileTransition::Escalate { from, to, reason }
-            );
+            assert_eq!(transition, ProfileTransition::Escalate { from, to, reason });
             assert_eq!(controller.profile(), to);
             assert_eq!(controller.risk(), risk);
             assert!(!controller.state().terminal.is_some());
@@ -1046,7 +1043,9 @@ mod tests {
         let revision = controller.revision();
         let escalation_count = controller.escalations().len();
 
-        assert!(controller.enforce_risk_floor(TaskRisk::Consequential).is_none());
+        assert!(controller
+            .enforce_risk_floor(TaskRisk::Consequential)
+            .is_none());
         assert_eq!(controller.profile(), AdaptiveProfile::Balanced);
         assert_eq!(controller.risk(), TaskRisk::Consequential);
         assert_eq!(controller.revision(), revision);
@@ -1083,9 +1082,14 @@ mod tests {
                     ceiling: controller.state().capability_ceiling,
                 })
             );
-            assert_eq!(controller.terminal().map(|terminal| terminal.reason), Some(reason));
             assert_eq!(
-                controller.terminal().and_then(|terminal| terminal.required_profile),
+                controller.terminal().map(|terminal| terminal.reason),
+                Some(reason)
+            );
+            assert_eq!(
+                controller
+                    .terminal()
+                    .and_then(|terminal| terminal.required_profile),
                 Some(required_profile)
             );
         }

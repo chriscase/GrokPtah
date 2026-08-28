@@ -304,7 +304,15 @@ impl AdaptivePolicyEngine {
             RuntimeSignal::DestructiveIntentDetected => AdaptiveProfile::HighAssurance,
             _ => current.escalated().unwrap_or(current),
         };
-        self.transition_toward(current, evidence, required, reason)
+        let capability_failure_reason = matches!(signal, RuntimeSignal::DestructiveIntentDetected)
+            .then(|| Self::risk_floor_failure_reason(required, evidence));
+        self.transition_toward(
+            current,
+            evidence,
+            required,
+            reason,
+            capability_failure_reason,
+        )
     }
 
     /// Reassess the monotonic risk floor independently of transient runtime
@@ -326,7 +334,13 @@ impl AdaptivePolicyEngine {
             TaskRisk::Consequential => ProfileReason::ConsequentialIntent,
             TaskRisk::Destructive => ProfileReason::DestructiveIntent,
         };
-        Some(self.transition_toward(current, evidence, required, reason))
+        Some(self.transition_toward(
+            current,
+            evidence,
+            required,
+            reason,
+            Some(Self::risk_floor_failure_reason(required, evidence)),
+        ))
     }
 
     fn transition_toward(
@@ -335,18 +349,12 @@ impl AdaptivePolicyEngine {
         evidence: &CapabilityEvidence,
         required: AdaptiveProfile,
         reason: ProfileReason,
+        capability_failure_reason: Option<ProfileReason>,
     ) -> ProfileTransition {
         let ceiling = evidence.ceiling();
         if required > ceiling {
-            let reason = if required == AdaptiveProfile::HighAssurance
-                && !evidence.host.independent_verifier
-            {
-                ProfileReason::IndependentVerifierUnavailable
-            } else {
-                ProfileReason::InsufficientCapabilityForRisk
-            };
             return ProfileTransition::Stop(PolicyStop {
-                reason,
+                reason: capability_failure_reason.unwrap_or(reason),
                 profile: current,
                 required_profile: Some(required),
                 ceiling,
@@ -362,13 +370,7 @@ impl AdaptivePolicyEngine {
         };
         if next > ceiling {
             return ProfileTransition::Stop(PolicyStop {
-                reason: if required == AdaptiveProfile::HighAssurance
-                    && !evidence.host.independent_verifier
-                {
-                    ProfileReason::IndependentVerifierUnavailable
-                } else {
-                    ProfileReason::InsufficientCapabilityForRisk
-                },
+                reason: capability_failure_reason.unwrap_or(reason),
                 profile: current,
                 required_profile: Some(required),
                 ceiling,
@@ -378,6 +380,17 @@ impl AdaptivePolicyEngine {
             from: current,
             to: next,
             reason,
+        }
+    }
+
+    fn risk_floor_failure_reason(
+        required: AdaptiveProfile,
+        evidence: &CapabilityEvidence,
+    ) -> ProfileReason {
+        if required == AdaptiveProfile::HighAssurance && !evidence.host.independent_verifier {
+            ProfileReason::IndependentVerifierUnavailable
+        } else {
+            ProfileReason::InsufficientCapabilityForRisk
         }
     }
 

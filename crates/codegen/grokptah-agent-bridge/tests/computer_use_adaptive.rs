@@ -167,7 +167,7 @@ fn same_objective_rechecks_new_destructive_observation_before_provider_work() {
     assert!(matches!(transition, Some(ProfileTransition::Stop(_))));
     assert_eq!(
         controller.terminal().map(|terminal| terminal.reason),
-        Some(ProfileReason::DestructiveIntent)
+        Some(ProfileReason::InsufficientCapabilityForRisk)
     );
     assert!(controller.begin_turn(controller.revision()).is_err());
 }
