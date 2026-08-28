@@ -198,6 +198,11 @@ pub(crate) fn write_verified_reconciliation(
         payload: record,
         signature: hex(signature.to_bytes().as_slice()),
     })?)?;
+    // Reconciliation records contain operator identity and provider truth.
+    // Apply the private mode to the temporary before the atomic rename so the
+    // verifier's permission check succeeds even when the process umask is
+    // permissive.
+    set_private_permissions(&file)?;
     file.sync_all()?;
     drop(file);
     fs::rename(temporary, directory.join(format!("{attempt_id}.json")))?;
