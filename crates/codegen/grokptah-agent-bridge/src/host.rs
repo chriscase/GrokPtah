@@ -1379,7 +1379,10 @@ impl AgentHostHandle {
             .load_agent(&agent_id)?
             .ok_or_else(|| anyhow!("canonical Agent record is unavailable"))?;
         let spec = agent.current_spec()?;
-        let principal = agent.owner_principal_id.clone().unwrap_or(agent.agent_id);
+        let principal = agent
+            .owner_principal_id
+            .clone()
+            .unwrap_or_else(|| agent.agent_id.clone());
         let policy_digest = crate::orchestration::hash_payload(
             &serde_json::to_value(spec).map_err(|error| anyhow!(error.to_string()))?,
         );
