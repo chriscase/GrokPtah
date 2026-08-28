@@ -511,6 +511,43 @@ impl CapabilityAuthority {
         Ok(capability)
     }
 
+    /// Install one exact provider-send envelope from a host-owned principal.
+    /// This is a policy-installation API, not a request or physical-send API;
+    /// the returned authority is never exposed to the caller.
+    pub fn install_provider_envelope(
+        &self,
+        principal: &CapabilityPrincipal,
+        provider_id: &str,
+        model_id: &str,
+        base_url: &str,
+        wire_model_id: &str,
+        dialect: &str,
+        credential_fingerprint: &str,
+        capabilities: &ModelCapabilities,
+    ) -> Result<()> {
+        let snapshot = CapabilitySnapshot::provider(
+            principal,
+            provider_id,
+            model_id,
+            base_url,
+            wire_model_id,
+            dialect,
+            credential_fingerprint,
+            capabilities,
+        )?;
+        self.install_canonical_envelope(
+            &format!("provider-send:{}:{model_id}", principal.id()),
+            snapshot,
+            principal.id(),
+            principal.auth_generation(),
+            principal.policy_generation(),
+            ["provider.send"],
+            &format!("provider:{provider_id}:{wire_model_id}"),
+            Utc::now(),
+        )?;
+        Ok(())
+    }
+
     /// Lease an effect from an already-installed envelope. This method never
     /// calls `issue`; arbitrary request data is only checked against the
     /// envelope's closed operation/resource scope.

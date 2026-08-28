@@ -107,6 +107,58 @@ fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn replay_credential_fingerprint() -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"grokptah.provider-qualification-identity.v1\0");
+    fn field(digest: &mut Sha256, label: &str, value: Option<&str>) {
+        digest.update(label.len().to_be_bytes());
+        digest.update(label.as_bytes());
+        match value {
+            Some(value) => {
+                digest.update([1]);
+                digest.update(value.len().to_be_bytes());
+                digest.update(value.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+    }
+    field(&mut digest, "provider", Some("provider-contract-loopback"));
+    field(&mut digest, "mode", Some("oidc"));
+    field(&mut digest, "issuer", None);
+    field(&mut digest, "client", None);
+    field(&mut digest, "principal_type", None);
+    field(&mut digest, "principal_id", None);
+    field(&mut digest, "user", Some("synthetic-user"));
+    field(&mut digest, "team", Some("synthetic-team"));
+    field(&mut digest, "scope", None);
+    format!("v1-sha256:{digest:x}")
+}
+
+fn install_replay_provider_envelope(
+    authority: &grokptah_agent_bridge::CapabilityAuthority,
+    principal: &grokptah_agent_bridge::CapabilityPrincipal,
+    base_url: &str,
+) {
+    authority
+        .install_provider_envelope(
+            principal,
+            "provider-contract-loopback",
+            "grok-fixture",
+            base_url,
+            "grok-fixture",
+            "XaiChatCompletions",
+            &replay_credential_fingerprint(),
+            &grokptah_agent_bridge::ModelCapabilities {
+                tools: true,
+                stream: true,
+                parallel_tool_calls: true,
+                source: grokptah_agent_bridge::CapabilitySource::Declared,
+                ..grokptah_agent_bridge::ModelCapabilities::default()
+            },
+        )
+        .expect("install canonical replay envelope");
+}
+
 fn canonical_replay_context() -> (
     tempfile::TempDir,
     grokptah_agent_bridge::AgentHostHandle,
@@ -176,10 +228,12 @@ async fn synthetic_xai_fixture_replays_through_the_production_provider_path() {
     let tools = serde_json::json!([]);
     let (_runtime, host, principal) = canonical_replay_context();
     let authority = host.capability_authority();
+    let replay_base = format!("{}/v1", gateway.base_url());
+    install_replay_provider_envelope(authority.as_ref(), &principal, &replay_base);
     let replay = replay_xai_provider_contract_on_loopback(
         authority.as_ref(),
         &principal,
-        &format!("{}/v1", gateway.base_url()),
+        &replay_base,
         "grok-fixture",
         messages.as_array().unwrap(),
         &tools,
@@ -241,10 +295,12 @@ async fn production_provider_path_rejects_a_fixture_without_its_terminal_marker(
     .await;
     let (_runtime, host, principal) = canonical_replay_context();
     let authority = host.capability_authority();
+    let replay_base = format!("{}/v1", gateway.base_url());
+    install_replay_provider_envelope(authority.as_ref(), &principal, &replay_base);
     let error = replay_xai_provider_contract_on_loopback(
         authority.as_ref(),
         &principal,
-        &format!("{}/v1", gateway.base_url()),
+        &replay_base,
         "grok-fixture",
         &[serde_json::json!({"role": "user", "content": "synthetic"})],
         &serde_json::json!([]),
