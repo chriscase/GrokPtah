@@ -3,7 +3,7 @@ use grokptah_cu_adaptive_eval::host::{
 };
 use grokptah_cu_adaptive_eval::policy::{safety_authorize, safety_is_profile_invariant};
 use grokptah_cu_adaptive_eval::types::{
-    ActionClass, AdapterId, Geometry, ProfileId, Sensitivity, TypedAction,
+    ActionClass, AdapterId, Geometry, LeaseState, ProfileId, Sensitivity, TypedAction,
 };
 
 fn world() -> WorldSpec {
@@ -45,14 +45,13 @@ fn world() -> WorldSpec {
             expires_at_ms: 50_000,
             remaining_uses: Some(4),
         },
-        visual_grant: false,
-        visual_grant_id: None,
+        visual_grant: None,
         agents: vec![AgentSpec {
             agent_id: "agent_a".into(),
             work_attempt_id: "wa_a".into(),
             lease_id: "lease_a".into(),
             surface_id: "surface_a".into(),
-            lease_granted: true,
+            lease_state: LeaseState::Granted,
         }],
         ax_pixel_contradiction: false,
         consequential: false,
@@ -74,7 +73,7 @@ fn host(profile: ProfileId) -> Host {
 fn mutations_of_valid_request_never_physically_dispatch() {
     for profile in ProfileId::ALL {
         let mut h = host(profile);
-        let obs = h.observe("surface_a");
+        let obs = h.observe("surface_a").unwrap();
         let el = obs.elements[0].element_id.clone();
         let action = TypedAction::Invoke {
             element_id: el.clone(),
@@ -126,9 +125,9 @@ fn mutations_of_valid_request_never_physically_dispatch() {
 fn takeover_and_expired_grant_are_denied_on_every_profile() {
     for profile in ProfileId::ALL {
         let mut h = host(profile);
-        let obs = h.observe("surface_a");
+        let obs = h.observe("surface_a").unwrap();
         let el = obs.elements[0].element_id.clone();
-        h.apply_event(grokptah_cu_adaptive_eval::host::EventKind::Takeover);
+        h.apply_event(grokptah_cu_adaptive_eval::host::EventKind::Takeover {});
         let err = h.try_dispatch(
             "surface_a",
             "lease_a",
@@ -143,9 +142,9 @@ fn takeover_and_expired_grant_are_denied_on_every_profile() {
 #[test]
 fn two_restarts_do_not_replay_physical_input() {
     let mut h = host(ProfileId::Balanced);
-    let obs = h.observe("surface_a");
+    let obs = h.observe("surface_a").unwrap();
     let el = obs.elements[0].element_id.clone();
-    h.apply_event(grokptah_cu_adaptive_eval::host::EventKind::CrashAfterInput);
+    h.apply_event(grokptah_cu_adaptive_eval::host::EventKind::CrashAfterInput {});
     let _ = h.try_dispatch(
         "surface_a",
         "lease_a",
@@ -159,4 +158,17 @@ fn two_restarts_do_not_replay_physical_input() {
     assert_eq!(h.physical.len(), physical);
     assert_eq!(h.recovery_converged(), Some(true));
     assert!(h.physical.iter().all(|p| p.permitted));
+}
+
+#[test]
+fn unknown_surface_observe_is_error_not_panic() {
+    let mut h = host(ProfileId::Economy);
+    let err = h.observe("missing_surface").unwrap_err();
+    match err {
+        grokptah_cu_adaptive_eval::types::EvalError::Host(msg) => {
+            assert!(msg.contains("unknown surface"), "{msg}");
+        }
+        other => panic!("expected host error, got {other}"),
+    }
+    assert!(h.physical.is_empty());
 }

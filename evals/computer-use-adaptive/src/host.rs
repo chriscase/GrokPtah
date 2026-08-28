@@ -7,13 +7,16 @@ use serde::{Deserialize, Serialize};
 use crate::policy::{authorize, DenyCode, PolicyView};
 use crate::profile::ProfileBudget;
 use crate::types::{
-    ActionClass, CompactElement, CompactObservation, CrashCut, FrameRegion, Geometry,
-    ModelCapability, ProfileId, Sensitivity, TimeoutClass, TypedAction, STATIONARITY_WINDOW,
+    ActionClass, CompactElement, CompactObservation, CrashCut, EvalError, EvalResult, FrameRegion,
+    Geometry, ModelCapability, ProfileId, Sensitivity, TimeoutClass, TypedAction,
+    STATIONARITY_WINDOW,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct EffectSpec {
+    #[serde(rename = "type")]
     pub kind: String,
     pub flag: Option<String>,
     pub key: Option<String>,
@@ -22,6 +25,7 @@ pub struct EffectSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ElementSpec {
     pub stable_key: String,
     pub role: String,
@@ -38,6 +42,7 @@ pub struct ElementSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct SurfaceSpec {
     pub surface_id: String,
     pub conflict_domain: String,
@@ -54,6 +59,7 @@ pub struct SurfaceSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct GrantSpec {
     pub grant_id: String,
     pub action_classes: Vec<ActionClass>,
@@ -63,50 +69,67 @@ pub struct GrantSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct VisualGrant {
+    pub granted: bool,
+    pub grant_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct AgentSpec {
     pub agent_id: String,
     pub work_attempt_id: String,
     pub lease_id: String,
     pub surface_id: String,
-    pub lease_granted: bool,
+    pub lease_state: crate::types::LeaseState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct WorldSpec {
     pub run_id: String,
     pub surfaces: Vec<SurfaceSpec>,
     pub grant: GrantSpec,
-    pub visual_grant: bool,
-    pub visual_grant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visual_grant: Option<VisualGrant>,
     pub agents: Vec<AgentSpec>,
     pub ax_pixel_contradiction: bool,
     pub consequential: bool,
     pub success_flag: String,
 }
 
+impl WorldSpec {
+    pub fn visual_granted(&self) -> bool {
+        self.visual_grant.as_ref().is_some_and(|g| g.granted)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
 pub enum EventKind {
-    Takeover,
-    Cancel,
-    TimeoutBeforeSend,
-    TimeoutAfterSend,
-    TimeoutAfterInput,
-    CrashBeforeSend,
-    CrashAfterSend,
-    CrashAfterInput,
-    Restart,
-    DowngradeVision,
-    DowngradeTools,
-    MoveTarget,
-    ResizeTarget,
-    RestartTarget,
-    AdvanceOtherAgent,
-    GrantVisual,
-    ExpireGrant,
-    SecondAgentSameDomain,
-    SecondAgentIsolated,
+    Takeover {},
+    Cancel {},
+    TimeoutBeforeSend {},
+    TimeoutAfterSend {},
+    TimeoutAfterInput {},
+    CrashBeforeSend {},
+    CrashAfterSend {},
+    CrashAfterInput {},
+    Restart {},
+    DowngradeVision {},
+    DowngradeTools {},
+    MoveTarget {},
+    ResizeTarget {},
+    RestartTarget {},
+    AdvanceOtherAgent {},
+    GrantVisual {},
+    ExpireGrant {},
+    SecondAgentSameDomain {},
+    SecondAgentIsolated {},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +142,7 @@ pub enum EventPhase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ScheduledEvent {
     pub at_step: u32,
     pub phase: EventPhase,
@@ -127,6 +151,7 @@ pub struct ScheduledEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct TraceEvent {
     pub step: u32,
     pub clock_ms: u64,
@@ -245,7 +270,10 @@ impl Host {
                     agent_id: agent.agent_id.clone(),
                     surface_id: agent.surface_id.clone(),
                     conflict_domain: domain,
-                    granted: agent.lease_granted,
+                    granted: matches!(
+                        agent.lease_state,
+                        crate::types::LeaseState::Granted | crate::types::LeaseState::Dispatching
+                    ),
                     dispatching: false,
                     incarnation: 1,
                     revoked: false,
@@ -253,6 +281,12 @@ impl Host {
             );
         }
         let primary = world.agents.first();
+        let visual_granted = world.visual_granted();
+        let visual_grant_id = world
+            .visual_grant
+            .as_ref()
+            .filter(|g| g.granted)
+            .map(|g| g.grant_id.clone());
         Self {
             clock: 0,
             step: 0,
@@ -262,8 +296,8 @@ impl Host {
             run_id: world.run_id,
             surfaces,
             grant: world.grant,
-            visual_grant: world.visual_grant,
-            visual_grant_id: world.visual_grant_id,
+            visual_grant: visual_granted,
+            visual_grant_id,
             leases,
             observations: BTreeMap::new(),
             current_obs: BTreeMap::new(),
@@ -340,7 +374,7 @@ impl Host {
 
     pub fn apply_event(&mut self, event: EventKind) {
         match event {
-            EventKind::Takeover => {
+            EventKind::Takeover {} => {
                 self.takeover = true;
                 for lease in self.leases.values_mut() {
                     lease.revoked = true;
@@ -350,44 +384,44 @@ impl Host {
                 self.domain_busy.clear();
                 self.log("takeover", "operator takeover is absorbing");
             }
-            EventKind::Cancel => {
+            EventKind::Cancel {} => {
                 self.cancelled = true;
                 self.log("cancel", "run cancelled");
             }
-            EventKind::TimeoutBeforeSend => {
+            EventKind::TimeoutBeforeSend {} => {
                 self.timeout = Some(TimeoutClass::DefinitelyBeforeSend);
                 self.log("timeout", "definitely_before_send");
             }
-            EventKind::TimeoutAfterSend => {
+            EventKind::TimeoutAfterSend {} => {
                 self.timeout = Some(TimeoutClass::UncertainAfterSend);
                 self.log("timeout", "uncertain_after_send");
             }
-            EventKind::TimeoutAfterInput => {
+            EventKind::TimeoutAfterInput {} => {
                 self.timeout = Some(TimeoutClass::UncertainAfterInput);
                 self.log("timeout", "uncertain_after_input");
             }
-            EventKind::CrashBeforeSend => {
+            EventKind::CrashBeforeSend {} => {
                 self.crash = Some(CrashCut::BeforeSend);
                 self.log("crash", "before_send");
             }
-            EventKind::CrashAfterSend => {
+            EventKind::CrashAfterSend {} => {
                 self.crash = Some(CrashCut::AfterSend);
                 self.log("crash", "after_send");
             }
-            EventKind::CrashAfterInput => {
+            EventKind::CrashAfterInput {} => {
                 self.crash = Some(CrashCut::AfterInput);
                 self.log("crash", "after_input");
             }
-            EventKind::Restart => self.restart(),
-            EventKind::DowngradeVision => {
+            EventKind::Restart {} => self.restart(),
+            EventKind::DowngradeVision {} => {
                 self.caps.vision = false;
                 self.log("downgrade", "vision removed; higher tier not retained");
             }
-            EventKind::DowngradeTools => {
+            EventKind::DowngradeTools {} => {
                 self.caps.tools = false;
                 self.log("downgrade", "tools removed");
             }
-            EventKind::MoveTarget => {
+            EventKind::MoveTarget {} => {
                 if let Some(s) = self.surfaces.get_mut(&self.primary_surface) {
                     s.spec.geometry.x += 40;
                     s.spec.geometry.y += 12;
@@ -395,14 +429,14 @@ impl Host {
                 self.invalidate_obs(&self.primary_surface.clone());
                 self.log("target", "moved");
             }
-            EventKind::ResizeTarget => {
+            EventKind::ResizeTarget {} => {
                 if let Some(s) = self.surfaces.get_mut(&self.primary_surface) {
                     s.spec.geometry.width = s.spec.geometry.width.saturating_add(80);
                 }
                 self.invalidate_obs(&self.primary_surface.clone());
                 self.log("target", "resized");
             }
-            EventKind::RestartTarget => {
+            EventKind::RestartTarget {} => {
                 if let Some(s) = self.surfaces.get_mut(&self.primary_surface) {
                     s.spec.generation += 1;
                     s.incarnation += 1;
@@ -410,28 +444,28 @@ impl Host {
                 self.invalidate_obs(&self.primary_surface.clone());
                 self.log("target", "restarted generation");
             }
-            EventKind::AdvanceOtherAgent => {
+            EventKind::AdvanceOtherAgent {} => {
                 if let Some(s) = self.surfaces.get_mut(&self.primary_surface) {
                     s.spec.generation += 1;
                 }
                 self.invalidate_obs(&self.primary_surface.clone());
                 self.log("contention", "other agent advanced shared surface");
             }
-            EventKind::GrantVisual => {
+            EventKind::GrantVisual {} => {
                 self.visual_grant = true;
                 if self.visual_grant_id.is_none() {
                     self.visual_grant_id = Some("vgrant_eval".into());
                 }
                 self.log("grant", "visual grounding authorized separately");
             }
-            EventKind::ExpireGrant => {
+            EventKind::ExpireGrant {} => {
                 self.grant.expires_at_ms = self.clock;
                 self.log("grant", "expired");
             }
-            EventKind::SecondAgentSameDomain => {
+            EventKind::SecondAgentSameDomain {} => {
                 self.ensure_second_agent(false);
             }
-            EventKind::SecondAgentIsolated => {
+            EventKind::SecondAgentIsolated {} => {
                 self.ensure_second_agent(true);
             }
         }
@@ -559,11 +593,15 @@ impl Host {
         // required for further dispatch; the eval does not mint one.
     }
 
-    pub fn observe(&mut self, surface_id: &str) -> CompactObservation {
+    pub fn observe(&mut self, surface_id: &str) -> EvalResult<CompactObservation> {
         self.obs_seq += 1;
         self.tick(5);
         let budget = ProfileBudget::for_profile(self.profile);
-        let surface = self.surfaces.get(surface_id).expect("surface");
+        let surface = self
+            .surfaces
+            .get(surface_id)
+            .cloned()
+            .ok_or_else(|| EvalError::Host(format!("unknown surface {surface_id}")))?;
         let mut elements = Vec::new();
         let mut owner = Vec::new();
         for (i, el) in surface.elements.iter().enumerate() {
@@ -649,7 +687,7 @@ impl Host {
             self.element_owner.insert(eid, own);
         }
         self.log("observe", obs.observation_id.clone());
-        obs
+        Ok(obs)
     }
 
     pub fn policy_view(&self, surface_id: &str, lease_id: &str) -> PolicyView {
@@ -1045,14 +1083,13 @@ mod tests {
                 expires_at_ms: 1_000_000,
                 remaining_uses: Some(8),
             },
-            visual_grant: false,
-            visual_grant_id: None,
+            visual_grant: None,
             agents: vec![AgentSpec {
                 agent_id: "agent_a".into(),
                 work_attempt_id: "wa_a".into(),
                 lease_id: "lease_a".into(),
                 surface_id: "surface_a".into(),
-                lease_granted: true,
+                lease_state: crate::types::LeaseState::Granted,
             }],
             ax_pixel_contradiction: false,
             consequential: false,
@@ -1069,7 +1106,7 @@ mod tests {
             1,
             vec![],
         );
-        let obs = host.observe("surface_a");
+        let obs = host.observe("surface_a").unwrap();
         let el = obs.elements[0].element_id.clone();
         let id = host
             .try_dispatch(
@@ -1093,9 +1130,9 @@ mod tests {
             1,
             vec![],
         );
-        let first = host.observe("surface_a");
+        let first = host.observe("surface_a").unwrap();
         let el = first.elements[0].element_id.clone();
-        let _ = host.observe("surface_a");
+        let _ = host.observe("surface_a").unwrap();
         let err = host
             .try_dispatch(
                 "surface_a",

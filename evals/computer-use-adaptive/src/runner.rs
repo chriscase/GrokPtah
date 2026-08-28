@@ -5,8 +5,8 @@ use crate::catalog::Scenario;
 use crate::host::{EventKind, EventPhase, Host};
 use crate::profile::ProfileBudget;
 use crate::types::{
-    AdapterId, ClosedModelOutput, Eligibility, FamilyId, OutcomeClass, ProfileId, TypedAction,
-    MAX_STEPS, RESULT_SCHEMA, SOURCE_GATE_SHA,
+    AdapterId, ClosedModelOutput, Eligibility, EvalResult, FamilyId, OutcomeClass, ProfileId,
+    TypedAction, MAX_STEPS, RESULT_SCHEMA, SOURCE_GATE_SHA,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -45,6 +45,7 @@ pub struct EpisodeMetrics {
     pub escalations: u64,
     pub postcondition_failures: u64,
     pub physical_dispatches: u64,
+    pub observation_count: u64,
     pub observation_bytes: u64,
     pub image_bytes: u64,
     pub model_input_units: u64,
@@ -73,11 +74,13 @@ pub struct EvidenceBundle {
     pub scenario_id: String,
     pub profile: ProfileId,
     pub adapter: AdapterId,
+    pub repetition: u32,
     pub observation_ids: Vec<String>,
     pub dispatch_ids: Vec<String>,
     pub authority: AuthorityEvidence,
     pub trace: Vec<crate::host::TraceEvent>,
     pub redacted: bool,
+    pub content_sha256: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -100,17 +103,21 @@ pub fn run_episode(
     profile: ProfileId,
     adapter: AdapterId,
     repetition: u32,
-) -> EpisodeBundle {
-    let seed = scenario.seed.wrapping_add(u64::from(repetition) * 17);
+    campaign_seed: u64,
+) -> EvalResult<EpisodeBundle> {
+    let host_seed = scenario.seed.wrapping_add(u64::from(repetition) * 17);
+    let seed =
+        crate::matrix::episode_seed(campaign_seed, scenario.seed, profile, adapter, repetition);
     let mut host = Host::new(
         scenario.world.clone(),
         profile,
         adapter.capabilities(),
-        seed,
+        host_seed,
         scenario.script.clone(),
     );
     let expected = scenario
         .expected
+        .cells
         .iter()
         .find(|c| c.profile == profile && c.adapter == adapter)
         .cloned();
@@ -125,14 +132,14 @@ pub fn run_episode(
         }
         let surface = host.primary_surface.clone();
         let lease = host.primary_lease.clone();
-        let obs = host.observe(&surface);
+        let obs = host.observe(&surface)?;
         host.apply_script(EventPhase::AfterObserve);
 
         let ctx = InferenceContext {
             profile,
             objective: &scenario.objective,
             observation: &obs,
-            visual_grant: scenario.world.visual_grant,
+            visual_grant: scenario.world.visual_granted(),
             caps: host.caps,
             step: host.step,
             seed,
@@ -167,13 +174,13 @@ pub fn run_episode(
                 host.escalations += 1;
                 outcome = OutcomeClass::Escalate;
                 if scenario.split_visual
-                    && scenario.world.visual_grant
+                    && scenario.world.visual_granted()
                     && ProfileBudget::for_profile(profile).allow_pointer
                     && adapter == AdapterId::TextOnlyTools
                 {
                     let planner_caps = host.caps;
                     host.caps = AdapterId::FrontierMultimodal.capabilities();
-                    let vis_obs = host.observe(&surface);
+                    let vis_obs = host.observe(&surface)?;
                     host.caps = planner_caps;
                     if vis_obs.frame_regions.is_some() || profile != ProfileId::Economy {
                         let vis_ctx = InferenceContext {
@@ -228,7 +235,7 @@ pub fn run_episode(
                 action,
             } => {
                 if scenario.pair_dispatch {
-                    run_pair(&mut host, scenario, adapter, &observation_id, &action);
+                    run_pair(&mut host, scenario, adapter, &observation_id, &action, seed)?;
                 } else {
                     let _ = host.try_dispatch(&surface, &lease, &observation_id, &action);
                 }
@@ -306,12 +313,13 @@ pub fn run_episode(
         adapter.as_str(),
         repetition
     );
-    let evidence = EvidenceBundle {
+    let mut evidence = EvidenceBundle {
         schema_version: crate::types::EVIDENCE_SCHEMA.into(),
         evidence_id: evidence_id.clone(),
         scenario_id: scenario.id.clone(),
         profile,
         adapter,
+        repetition,
         observation_ids: host.observation_ids(),
         dispatch_ids: host.dispatch_ids(),
         authority: AuthorityEvidence {
@@ -322,7 +330,9 @@ pub fn run_episode(
         },
         trace: host.trace.clone(),
         redacted: true,
+        content_sha256: String::new(),
     };
+    evidence.content_sha256 = crate::digest::evidence_body_digest(&evidence)?;
 
     let result = EpisodeResult {
         schema_version: RESULT_SCHEMA.into(),
@@ -356,6 +366,7 @@ pub fn run_episode(
             escalations: host.escalations,
             postcondition_failures: host.postcondition_failures,
             physical_dispatches: host.physical.len() as u64,
+            observation_count: host.observation_ids().len() as u64,
             observation_bytes: host.observation_bytes,
             image_bytes: host.image_bytes,
             model_input_units: host.model_input_units,
@@ -373,14 +384,14 @@ pub fn run_episode(
         evidence_ref: evidence_id,
     };
     let _ = FamilyId::ALL;
-    EpisodeBundle { result, evidence }
+    Ok(EpisodeBundle { result, evidence })
 }
 
 fn flush_restarts(host: &mut Host, scenario: &Scenario) {
     let needed = scenario
         .script
         .iter()
-        .filter(|e| matches!(e.event, EventKind::Restart))
+        .filter(|e| matches!(e.event, EventKind::Restart {}))
         .count() as u32;
     while host.restarts < needed && host.restarts < 8 {
         host.step += 1;
@@ -388,7 +399,7 @@ fn flush_restarts(host: &mut Host, scenario: &Scenario) {
         if !scenario
             .script
             .iter()
-            .any(|e| e.at_step == host.step && matches!(e.event, EventKind::Restart))
+            .any(|e| e.at_step == host.step && matches!(e.event, EventKind::Restart {}))
         {
             if host.restarts < needed {
                 host.restart();
@@ -405,21 +416,22 @@ fn run_pair(
     adapter: AdapterId,
     observation_id: &str,
     action: &TypedAction,
-) {
+    seed: u64,
+) -> EvalResult<()> {
     let surface_a = host.primary_surface.clone();
     let lease_a = host.primary_lease.clone();
     let isolated = host.lease_ids().iter().any(|id| id == "lease_b")
         && host.trace.iter().any(|t| t.detail.contains("isolated"));
     if isolated {
-        let obs_b = host.observe("surface_b");
+        let obs_b = host.observe("surface_b")?;
         let ctx = InferenceContext {
             profile: host.profile,
             objective: &scenario.objective,
             observation: &obs_b,
-            visual_grant: scenario.world.visual_grant,
+            visual_grant: scenario.world.visual_granted(),
             caps: adapter.capabilities(),
             step: host.step,
-            seed: host.seed,
+            seed,
             allow_visual_subtask: false,
         };
         let (out_b, units) = infer_counted(adapter, &ctx);
@@ -438,6 +450,7 @@ fn run_pair(
             (&surface_a, "lease_b", observation_id, action),
         );
     }
+    Ok(())
 }
 
 pub fn expected_cell(
@@ -447,6 +460,7 @@ pub fn expected_cell(
 ) -> Option<&crate::types::ExpectedCell> {
     scenario
         .expected
+        .cells
         .iter()
         .find(|c| c.profile == profile && c.adapter == adapter)
 }

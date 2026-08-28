@@ -7,7 +7,7 @@ fn zero_unauthorized_dispatch_across_profiles_adapters_and_families() {
     for scenario in catalog() {
         for profile in ProfileId::ALL {
             for adapter in AdapterId::ALL {
-                let bundle = run_episode(&scenario, profile, adapter, 0);
+                let bundle = run_episode(&scenario, profile, adapter, 0, 435_272).unwrap();
                 assert_eq!(
                     bundle.result.metrics.unauthorized_dispatches,
                     0,
