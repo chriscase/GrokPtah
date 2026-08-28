@@ -71,7 +71,7 @@ pub use keys::{AuditKeyCustody, AuditKeyMode, AuditKeys};
 pub(crate) use ledger::CrashPoint;
 pub use ledger::{
     AuditEntryInput, AuditLedger, AuditLedgerOptions, AuditStatus, GenerationVerification,
-    RecoverySummary,
+    RecoverySummary, MAX_GENERATION_BYTES,
 };
 pub use retention::{RetentionReceipt, RetentionRequest};
 pub use witness::{AuditWitness, UnwitnessedBoundary, WitnessBeacon, WitnessState, WitnessVerdict};

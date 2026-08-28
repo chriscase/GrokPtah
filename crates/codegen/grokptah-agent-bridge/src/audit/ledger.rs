@@ -17,6 +17,8 @@ use super::witness::{
 };
 use super::{AuditError, AuditResult, PoisonReason, RefuseReason};
 
+pub const MAX_GENERATION_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Deterministic crash-injection points. In non-test builds [`AuditLedger::cut`]
 /// is a no-op, so no injection state exists in a shipped binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1395,7 +1397,19 @@ impl AuditLedger {
 
     pub fn append(&self, entry: AuditEntryInput) -> AuditResult<u64> {
         let _transaction = self.operation_lock.lock();
-        self.append_internal(entry, None)
+        let seq = self.append_internal(entry, None)?;
+        let should_rotate = {
+            let guard = self.inner.lock();
+            guard.live.journal_bytes >= MAX_GENERATION_BYTES
+                && guard.live.open_intent_ids.is_empty()
+        };
+        if should_rotate {
+            if let Err(error) = self.rotate_locked(RotationReason::Bytes) {
+                self.inner.lock().poisoned = Some(PoisonReason::PartialPersistence);
+                return Err(error);
+            }
+        }
+        Ok(seq)
     }
 
     pub(crate) fn append_transaction_record(
@@ -1584,6 +1598,10 @@ impl AuditLedger {
 
     pub fn rotate(&self, reason: RotationReason) -> AuditResult<String> {
         let _transaction = self.operation_lock.lock();
+        self.rotate_locked(reason)
+    }
+
+    fn rotate_locked(&self, reason: RotationReason) -> AuditResult<String> {
         {
             let guard = self.inner.lock();
             if let Some(poison) = guard.poisoned {
