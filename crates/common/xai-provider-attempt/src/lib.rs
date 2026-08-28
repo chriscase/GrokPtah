@@ -271,6 +271,54 @@ pub struct ProviderAttemptStore {
     root: Arc<PathBuf>,
 }
 
+/// Host-supplied context shared by bridge, SDK, and worker adapters. It owns
+/// no policy; it only carries an immutable authority snapshot and a callback
+/// to re-read the canonical host authorities at the physical-send boundary.
+#[derive(Clone)]
+pub struct AttemptContext {
+    store: ProviderAttemptStore,
+    operation_id: String,
+    authority: AuthorityBinding,
+    revalidate: Arc<dyn Fn() -> Option<AuthorityBinding> + Send + Sync>,
+}
+
+impl AttemptContext {
+    pub fn new(
+        store: ProviderAttemptStore,
+        operation_id: impl Into<String>,
+        authority: AuthorityBinding,
+        revalidate: Arc<dyn Fn() -> Option<AuthorityBinding> + Send + Sync>,
+    ) -> Result<Self, AttemptError> {
+        let operation_id = operation_id.into();
+        validate_id(&operation_id, "operation id")?;
+        Ok(Self {
+            store,
+            operation_id,
+            authority,
+            revalidate,
+        })
+    }
+
+    pub fn begin(
+        &self,
+        provider_id: &str,
+        body: &[u8],
+        supports_idempotency: bool,
+    ) -> Result<PhysicalSendPermit, AttemptError> {
+        let spec = AttemptSpec::new(
+            self.operation_id.clone(),
+            provider_id.to_owned(),
+            AttemptSpec::fingerprint_bytes(body),
+            supports_idempotency,
+            self.authority.clone(),
+        )?;
+        let attempt = self.store.create(spec)?;
+        attempt.admit(&self.authority)?;
+        let current = (self.revalidate)().ok_or(AttemptError::InvalidAuthority)?;
+        attempt.begin_send(&current)
+    }
+}
+
 impl fmt::Debug for ProviderAttemptStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ProviderAttemptStore([durable-root])")

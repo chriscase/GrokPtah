@@ -3029,6 +3029,25 @@ pub async fn replay_xai_provider_contract_on_loopback(
     };
     let mut deltas = Vec::new();
     let mut thought_deltas = Vec::new();
+    let attempt_root = std::env::temp_dir().join(format!(
+        "grokptah-provider-contract-{}",
+        Uuid::new_v4()
+    ));
+    let attempt_store = xai_provider_attempt::ProviderAttemptStore::open(&attempt_root)
+        .map_err(|error| anyhow!("open provider contract attempt ledger: {error}"))?;
+    let attempt_authority = xai_provider_attempt::AuthorityBinding::new(
+        "provider-contract-replay",
+        1,
+        1,
+        "provider-contract-replay-lease",
+    )
+    .map_err(|error| anyhow!("create provider contract authority: {error}"))?;
+    let provider_attempt = ProviderAttemptContext::new(
+        attempt_store,
+        "provider-contract-replay".into(),
+        attempt_authority.clone(),
+        Arc::new(move || Some(attempt_authority.clone())),
+    );
     let step = call_provider_agent_step(
         credentials,
         target,
@@ -3039,6 +3058,7 @@ pub async fn replay_xai_provider_contract_on_loopback(
         &CancellationToken::new(),
         None,
         None,
+        &provider_attempt,
         |delta| deltas.push(delta.to_string()),
         |delta| thought_deltas.push(delta.to_string()),
     )
@@ -3096,6 +3116,27 @@ mod compatible_stream_tests {
             principal_id: None,
             expires_at: None,
         }
+    }
+
+    fn provider_attempt_context() -> ProviderAttemptContext {
+        let root = std::env::temp_dir().join(format!(
+            "grokptah-provider-test-{}",
+            Uuid::new_v4()
+        ));
+        let store = xai_provider_attempt::ProviderAttemptStore::open(root).unwrap();
+        let authority = xai_provider_attempt::AuthorityBinding::new(
+            "provider-test",
+            1,
+            1,
+            "provider-test-lease",
+        )
+        .unwrap();
+        ProviderAttemptContext::new(
+            store,
+            "provider-test-operation".into(),
+            authority.clone(),
+            Arc::new(move || Some(authority.clone())),
+        )
     }
 
     fn install_compatible_profile(home: &std::path::Path, base_url: &str) -> String {
@@ -3419,6 +3460,7 @@ mod compatible_stream_tests {
                     true,
                     &CancellationToken::new(),
                     Some(&context),
+                    &provider_attempt_context(),
                     |_| {},
                     |_| {},
                 )
@@ -3505,6 +3547,7 @@ mod compatible_stream_tests {
                     &serde_json::json!([]),
                     true,
                     &CancellationToken::new(),
+                    &provider_attempt_context(),
                     |_| {},
                     |_| {},
                 )
@@ -3569,6 +3612,7 @@ mod compatible_stream_tests {
                         &serde_json::json!([]),
                         true,
                         &cancel,
+                        &provider_attempt_context(),
                         move |_| cancel_after_delta.cancel(),
                         |_| {},
                     ),
@@ -3606,6 +3650,7 @@ mod compatible_stream_tests {
                     None,
                     temp.path(),
                     SessionKind::Chat,
+                    &provider_attempt_context(),
                 )
                 .await;
                 let error = match result {
