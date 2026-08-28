@@ -1467,10 +1467,11 @@ impl AgentHostHandle {
         let credentials = crate::auth_store::resolve_wire_credentials_for_model(&model)
             .map_err(anyhow::Error::msg)?
             .ok_or_else(|| anyhow!("canonical Agent principal is unavailable"))?;
+        let credential_identity = credentials.qualification_identity_fingerprint();
         let principal_owner = credentials
             .principal_id
             .or(credentials.user_id)
-            .unwrap_or_else(|| credentials.qualification_identity_fingerprint());
+            .unwrap_or(credential_identity);
         let workspace = cwd.display().to_string();
         let agent_id = existing_id
             .clone()
