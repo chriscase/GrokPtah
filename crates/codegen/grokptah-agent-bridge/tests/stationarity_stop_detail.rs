@@ -3,8 +3,6 @@
 //! Synthetic fixtures only: no provider, no VM, no Computer Use. These drive the
 //! shipped store and types, not a reimplementation.
 
-mod common;
-
 use chrono::Utc;
 use grokptah_agent_bridge::orchestration::{
     OrchStore, RunBounds, RunRecord, RunState, RunStopCause, RunStopDetail, RunStopDetailKind,
