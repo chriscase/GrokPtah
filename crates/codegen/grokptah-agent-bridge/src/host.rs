@@ -1211,7 +1211,7 @@ impl AgentHostHandle {
                         }
                         if controller.profile() < AdaptivePolicyEngine::risk_floor(task_policy.risk)
                         {
-                            controller.apply_signal(RuntimeSignal::ConsequentialIntentDetected);
+                            controller.apply_signal(RuntimeSignal::DestructiveIntentDetected);
                         }
                     }
                 }
