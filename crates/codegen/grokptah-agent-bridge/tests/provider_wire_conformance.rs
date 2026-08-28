@@ -12,7 +12,7 @@ use grokptah_agent_bridge::{
 use grokptah_agent_bridge::orchestration::{
     OrchStore, OrchestrationConfig, OrchestrationService, RunBounds, WorkspaceAllowlist,
 };
-use grokptah_test_gateway::{split_at, MockGateway, Response, Step};
+use grokptah_test_gateway::{split_at, Frame, MockGateway, Response, Step};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -252,7 +252,7 @@ fn physical_provider_tool_and_qualification_boundaries_never_issue() {
 #[tokio::test]
 async fn replay_without_an_outer_envelope_has_zero_provider_requests() {
     let gateway = MockGateway::start_ordered(vec![Step::respond(Response::sse_stream(
-        b"data: [DONE]\n\n".to_vec(),
+        vec![Frame::new(b"data: [DONE]\n\n")],
     ))])
     .await;
     let (_runtime, host, principal) = canonical_replay_context();
