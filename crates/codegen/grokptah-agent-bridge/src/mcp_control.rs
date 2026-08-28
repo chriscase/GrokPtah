@@ -132,6 +132,7 @@ struct LiveStreamState {
     receiver: EventReceiver,
     last_seq: u64,
     observed_global_seq: u64,
+    delivered_since_recovery: u64,
     replay_cursor: Option<u64>,
     pending: VecDeque<Bytes>,
     heartbeat: tokio::time::Interval,
@@ -162,7 +163,13 @@ impl LiveStreamState {
     }
 
     fn queue_serialized_entry(&mut self, seq: u64, ts: String, update: Value, terminal: bool) {
-        if seq <= self.last_seq || seq < self.start_seq {
+        if self.done || seq <= self.last_seq || seq < self.start_seq {
+            return;
+        }
+        if self.delivered_since_recovery >= LIVE_STREAM_REPLAY_WINDOW {
+            self.queue_recovery(
+                "live event stream reached its bounded delivery window; resynchronize from the durable journal",
+            );
             return;
         }
         if let Some(end_seq) = self.end_seq {
@@ -172,6 +179,7 @@ impl LiveStreamState {
             }
         }
         self.last_seq = seq;
+        self.delivered_since_recovery = self.delivered_since_recovery.saturating_add(1);
         self.pending.push_back(sse_message(
             Some(seq),
             json!({
@@ -786,6 +794,7 @@ async fn streamable_get_handler(
         receiver,
         last_seq,
         observed_global_seq: state.orch.bus().current_seq(),
+        delivered_since_recovery: 0,
         replay_cursor: None,
         pending: VecDeque::new(),
         heartbeat: tokio::time::interval(Duration::from_secs(10)),
